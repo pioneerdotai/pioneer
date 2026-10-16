@@ -423,6 +423,34 @@ impl ThreadRegistry {
     pub(crate) fn timeline_has_unread(&self, thread: &str) -> bool {
         self.directory.has_unread(thread)
     }
+    pub(crate) fn timeline_read_is_confirmed(
+        &self,
+        thread: &str,
+        turn: &str,
+        position: Option<&pioneer_protocol::ThreadReadPosition>,
+    ) -> bool {
+        let sort_key = position
+            .map(|position| position.sort_key.as_str())
+            .or_else(|| {
+                // A legacy read acknowledges only the prompt, never a later answer
+                // in the same Turn. If it is not loaded, keep the read eligible.
+                self.stores
+                    .get(thread)?
+                    .semantic
+                    .thread(thread)?
+                    .top_level
+                    .ordered_blocks()
+                    .find(|block| {
+                        block.turn_id.as_deref() == Some(turn)
+                            && matches!(
+                                &block.kind,
+                                pioneer_protocol::TimelineBlockKind::UserMessage { .. }
+                            )
+                    })
+                    .map(|block| block.sort_key.as_str())
+            });
+        sort_key.is_some_and(|key| self.directory.read_position_is_confirmed(thread, key))
+    }
     pub(crate) fn timeline_revision_matches(&self, thread: &str, revision: u64) -> bool {
         self.stores.get(thread).is_some_and(|store| {
             !store.presentation_blocked
@@ -436,6 +464,12 @@ impl ThreadRegistry {
         self.stores
             .get(thread)
             .is_some_and(|store| store.coordinator.workspace_id == workspace)
+    }
+
+    pub(crate) fn timeline_operation_matches(&self, token: &ThreadOperationToken) -> bool {
+        self.stores
+            .get(&token.id)
+            .is_some_and(|store| store.generation == token.generation)
     }
 }
 
@@ -5590,6 +5624,498 @@ mod tests {
         })
     }
 
+    fn viewed_read_plan(
+        core: &ClientCore,
+        ids: &[&str],
+    ) -> crate::timeline::controller::TimelineEffectPlan {
+        use crate::timeline::controller::{TimelineDemand, TimelineIntent};
+        let timeline = core.thread_presentation_snapshot("a").unwrap().timeline();
+        core.plan_timeline_intent(
+            TimelineIntent::Update {
+                demand: TimelineDemand {
+                    thread_id: "a".into(),
+                    consumer_id: "read-viewport".into(),
+                    generation: 1,
+                    source_revision: timeline.source_revision(),
+                    row_ids: ids.iter().map(|id| (*id).into()).collect(),
+                    viewed_row_ids: ids.iter().map(|id| (*id).into()).collect(),
+                    viewed_through_block: None,
+                    latest_user_turn_id: None,
+                    viewed_through_turn_id: None,
+                    threshold: 0,
+                    before: false,
+                    after: false,
+                    work: false,
+                    presented_rows: true,
+                    scroll_generation: 0,
+                    read_requires_unread: false,
+                    prefetch_on_visibility: false,
+                    boundary_request_limit: 1,
+                },
+            },
+            0,
+        )
+    }
+
+    #[test]
+    fn legacy_work_view_uses_confirmed_prompt_position_and_suppresses_peer_retry() {
+        use crate::timeline::controller::{TimelineDemand, TimelineIntent};
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        let _lease = core.subscribe(
+            ClientScope::Timeline {
+                thread_id: "a".into(),
+            },
+            NonZeroUsize::new(16).unwrap(),
+        );
+        let mut page = presentation_page(&[
+            ("prompt", "Prompt"),
+            ("work", ""),
+            ("other-answer", "Completed answer"),
+            ("answer", "Completed answer"),
+        ]);
+        let mut work = run_work();
+        work.turn_id = "turn-prompt".into();
+        page.blocks[1].turn_id = Some(work.turn_id.clone());
+        page.blocks[1].kind = TimelineBlockKind::TurnWork { work };
+        for (index, turn) in [(2, "turn-earlier"), (3, "turn-prompt")] {
+            page.blocks[index].turn_id = Some(turn.into());
+            page.blocks[index].kind = TimelineBlockKind::AssistantMessage {
+                item_id: page.blocks[index].block_id.clone(),
+                text: "Completed answer".into(),
+                html_publications: Vec::new(),
+                status: TurnWorkItemStatus::Completed,
+                markdown: None,
+                author: None,
+                route: None,
+            };
+        }
+        core.apply_thread_timeline_page(
+            page.clone(),
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        core.materialize_demanded_timelines();
+        let plan = |generation, turn: &str| {
+            let timeline = core.thread_presentation_snapshot("a").unwrap().timeline();
+            core.plan_timeline_intent(
+                TimelineIntent::Update {
+                    demand: TimelineDemand {
+                        thread_id: "a".into(),
+                        consumer_id: "legacy-work".into(),
+                        generation,
+                        source_revision: timeline.source_revision(),
+                        row_ids: vec!["work".into()],
+                        viewed_row_ids: vec!["work".into()],
+                        viewed_through_block: None,
+                        latest_user_turn_id: Some(turn.into()),
+                        viewed_through_turn_id: Some(turn.into()),
+                        threshold: 0,
+                        before: false,
+                        after: false,
+                        work: false,
+                        presented_rows: true,
+                        scroll_generation: 0,
+                        read_requires_unread: false,
+                        prefetch_on_visibility: false,
+                        boundary_request_limit: 1,
+                    },
+                },
+                0,
+            )
+        };
+        let exit = |generation| {
+            core.plan_timeline_intent(
+                TimelineIntent::Exit {
+                    thread_id: "a".into(),
+                    consumer_id: "legacy-work".into(),
+                    generation,
+                },
+                0,
+            )
+        };
+        let first = plan(1, "turn-prompt").reads.remove(0);
+        assert_eq!(first.through_turn_id, "turn-prompt");
+        assert_eq!(first.through_block, None, "unseen answer is not an anchor");
+        exit(1);
+        let unconfirmed = plan(2, "turn-prompt").reads.remove(0);
+        assert_ne!(first.generation, unconfirmed.generation);
+        core.thread_registry
+            .lock()
+            .unwrap()
+            .timeline
+            .finish_read(&unconfirmed, false, 0);
+        let retry = core
+            .thread_registry
+            .lock()
+            .unwrap()
+            .timeline
+            .due_reads(u64::MAX)
+            .remove(0);
+        assert!(retry.through_block.is_none());
+        assert!(core.observe_workspace_notification(
+            &GatewayNotification::ThreadReadCursorChanged(ThreadReadCursorChangedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                cursor: ThreadReadCursor {
+                    sort_key: "0000".into(),
+                    through_turn_id: "turn-prompt".into(),
+                },
+                unread_count: 0,
+            })
+        ));
+        core.execute_timeline_read(retry.clone());
+        let mut registry = core.thread_registry.lock().unwrap();
+        assert!(!registry.timeline.accepts_read(&retry));
+        assert!(registry.timeline.due_reads(u64::MAX).is_empty());
+        drop(registry);
+        exit(2);
+        assert!(plan(3, "turn-prompt").reads.is_empty());
+        // A cursor in a different Turn also covers the prompt by sort_key,
+        // independently of the lexical order of the Turn identifiers.
+        core.apply_directory_read(
+            "ws",
+            "a",
+            &ThreadReadCursor {
+                sort_key: "0002".into(),
+                through_turn_id: "turn-earlier".into(),
+            },
+            0,
+        );
+        assert!(plan(3, "turn-prompt").reads.is_empty());
+        assert_eq!(
+            plan(3, "unloaded-prompt").reads.len(),
+            1,
+            "without a loaded prompt position the legacy read stays eligible"
+        );
+        assert!(plan(3, "turn-prompt").reads.is_empty());
+        let answer = viewed_read_plan(&core, &["answer"]).reads.remove(0);
+        assert_eq!(answer.through_block.as_ref().unwrap().sort_key, "0003");
+        core.apply_directory_read(
+            "ws",
+            "a",
+            &ThreadReadCursor {
+                sort_key: "0003".into(),
+                through_turn_id: "turn-prompt".into(),
+            },
+            0,
+        );
+        page.blocks[3].sort_key = "0004".into();
+        core.apply_thread_timeline_page(
+            page,
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        core.materialize_demanded_timelines();
+        let late = viewed_read_plan(&core, &["answer"]).reads.remove(0);
+        assert_eq!(late.through_block.as_ref().unwrap().sort_key, "0004");
+        assert!(
+            !core
+                .thread_registry
+                .lock()
+                .unwrap()
+                .timeline_has_unread("a")
+        );
+    }
+
+    #[test]
+    fn visible_agent_authored_message_is_an_exact_read_anchor_after_a_final_answer() {
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        let _lease = core.subscribe(
+            ClientScope::Timeline {
+                thread_id: "a".into(),
+            },
+            NonZeroUsize::new(16).unwrap(),
+        );
+        let mut page =
+            presentation_page(&[("answer", "Finished"), ("agent-message", "Agent message")]);
+        page.blocks[0].kind = TimelineBlockKind::AssistantMessage {
+            item_id: "answer".into(),
+            text: "Finished".into(),
+            html_publications: Vec::new(),
+            status: TurnWorkItemStatus::Completed,
+            markdown: None,
+            author: None,
+            route: None,
+        };
+        if let TimelineBlockKind::UserMessage { author, .. } = &mut page.blocks[1].kind {
+            *author = composer_occurrence().author;
+        }
+        core.apply_thread_timeline_page(
+            page,
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        core.materialize_demanded_timelines();
+        core.apply_directory_read(
+            "ws",
+            "a",
+            &ThreadReadCursor {
+                sort_key: "-1".into(),
+                through_turn_id: "earlier".into(),
+            },
+            1,
+        );
+        let request = viewed_read_plan(&core, &["answer", "agent-message"])
+            .reads
+            .remove(0);
+        let position = request.through_block.unwrap();
+        assert_eq!(position.block_id, "agent-message");
+        assert_eq!(request.through_turn_id, "turn-agent-message");
+        // The server accepts this exact message position independently of its
+        // author's unread eligibility (covered by the CRUD read regression).
+        core.apply_directory_read(
+            "ws",
+            "a",
+            &ThreadReadCursor {
+                sort_key: position.sort_key,
+                through_turn_id: request.through_turn_id,
+            },
+            0,
+        );
+        assert!(
+            !core
+                .thread_registry
+                .lock()
+                .unwrap()
+                .timeline_has_unread("a")
+        );
+        assert!(
+            viewed_read_plan(&core, &["answer", "agent-message"])
+                .reads
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn confirmed_cursor_suppresses_history_reads_but_allows_new_and_late_answers() {
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        let _lease = core.subscribe(
+            ClientScope::Timeline {
+                thread_id: "a".into(),
+            },
+            NonZeroUsize::new(16).unwrap(),
+        );
+        let mut page = presentation_page(&[
+            ("old", "Old"),
+            ("middle", "Middle"),
+            ("answer", ""),
+            ("next", ""),
+        ]);
+        for block in &mut page.blocks[2..] {
+            block.turn_id = Some("same-turn".into());
+            block.kind = TimelineBlockKind::AssistantMessage {
+                item_id: block.block_id.clone(),
+                text: String::new(),
+                html_publications: Vec::new(),
+                status: TurnWorkItemStatus::Completed,
+                markdown: None,
+                author: None,
+                route: None,
+            };
+        }
+        core.apply_thread_timeline_page(
+            page.clone(),
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        core.materialize_demanded_timelines();
+        assert!(
+            !core
+                .thread_registry
+                .lock()
+                .unwrap()
+                .timeline_has_unread("a")
+        );
+        let first = viewed_read_plan(&core, &["answer"]).reads.remove(0);
+        assert!(viewed_read_plan(&core, &["answer"]).reads.is_empty());
+        assert!(viewed_read_plan(&core, &[]).reads.is_empty());
+        let unconfirmed = viewed_read_plan(&core, &["answer"]).reads.remove(0);
+        assert_ne!(
+            first.generation, unconfirmed.generation,
+            "a local request is not a confirmed cursor when returning to the row"
+        );
+        // Successful RPCs use this same authoritative directory reduction.
+        core.thread_registry
+            .lock()
+            .unwrap()
+            .timeline
+            .finish_read(&unconfirmed, true, 0);
+        core.apply_directory_read(
+            "ws",
+            "a",
+            &ThreadReadCursor {
+                sort_key: "0002".into(),
+                through_turn_id: "same-turn".into(),
+            },
+            0,
+        );
+        for ids in [
+            &["old"][..],
+            &["middle"][..],
+            &[][..],
+            &["answer"][..],
+            &["old", "middle"][..],
+            &["middle"][..],
+        ] {
+            assert!(
+                viewed_read_plan(&core, ids).reads.is_empty(),
+                "confirmed history never queues another read"
+            );
+        }
+        let next = viewed_read_plan(&core, &["next"]).reads.remove(0);
+        assert_eq!(first.through_turn_id, next.through_turn_id);
+        assert_ne!(first.through_block, next.through_block);
+        core.thread_registry
+            .lock()
+            .unwrap()
+            .timeline
+            .finish_read(&next, false, 0);
+        assert!(core.observe_workspace_notification(
+            &GatewayNotification::ThreadReadCursorChanged(ThreadReadCursorChangedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                cursor: ThreadReadCursor {
+                    sort_key: "0003".into(),
+                    through_turn_id: "same-turn".into()
+                },
+                unread_count: 0,
+            })
+        ));
+        // An already queued retry must also consult the other session's cursor
+        // before it touches the transport or starts a server transaction.
+        let retry = core
+            .thread_registry
+            .lock()
+            .unwrap()
+            .timeline
+            .due_reads(u64::MAX)
+            .remove(0);
+        core.execute_timeline_read(retry.clone());
+        assert!(
+            !core
+                .thread_registry
+                .lock()
+                .unwrap()
+                .timeline
+                .accepts_read(&retry)
+        );
+        assert!(
+            core.thread_registry
+                .lock()
+                .unwrap()
+                .timeline
+                .due_reads(u64::MAX)
+                .is_empty()
+        );
+        assert!(viewed_read_plan(&core, &["next"]).reads.is_empty());
+        page.blocks[2].sort_key = "0004".into();
+        core.apply_thread_timeline_page(
+            page,
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        core.materialize_demanded_timelines();
+        let late = viewed_read_plan(&core, &["answer"]).reads.remove(0);
+        assert_eq!(
+            late.through_block.as_ref().unwrap().block_id,
+            first.through_block.as_ref().unwrap().block_id
+        );
+        assert_eq!(late.through_block.as_ref().unwrap().sort_key, "0004");
+        assert!(
+            !core
+                .thread_registry
+                .lock()
+                .unwrap()
+                .timeline_has_unread("a"),
+            "lagging zero unread is not a read gate"
+        );
+    }
+
+    #[test]
+    fn actual_viewed_rows_resolve_completed_html_answers_in_the_working_read_path() {
+        use crate::timeline::controller::{TimelineDemand, TimelineIntent};
+        use pioneer_protocol::{TimelineBlockKind, TurnWorkItemStatus};
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        let _lease = core.subscribe(
+            ClientScope::Timeline {
+                thread_id: "a".into(),
+            },
+            NonZeroUsize::new(16).unwrap(),
+        );
+        let mut page = presentation_page(&[("answer", "")]);
+        page.blocks[0].kind = TimelineBlockKind::AssistantMessage {
+            html_publications: Vec::new(),
+            item_id: "answer".into(),
+            text: String::new(),
+            status: TurnWorkItemStatus::Running,
+            markdown: None,
+            author: None,
+            route: None,
+        };
+        core.apply_thread_timeline_page(
+            page.clone(),
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        core.materialize_demanded_timelines();
+        let plan = |viewed: Vec<String>, generation: u64| {
+            let timeline = core.thread_presentation_snapshot("a").unwrap().timeline();
+            core.plan_timeline_intent(
+                TimelineIntent::Update {
+                    demand: TimelineDemand {
+                        thread_id: "a".into(),
+                        consumer_id: "viewport".into(),
+                        generation,
+                        source_revision: timeline.source_revision(),
+                        row_ids: vec!["answer".into()],
+                        viewed_row_ids: viewed,
+                        viewed_through_block: None,
+                        latest_user_turn_id: None,
+                        viewed_through_turn_id: None,
+                        threshold: 0,
+                        before: false,
+                        after: false,
+                        work: false,
+                        presented_rows: true,
+                        scroll_generation: 0,
+                        read_requires_unread: false,
+                        prefetch_on_visibility: false,
+                        boundary_request_limit: 1,
+                    },
+                },
+                0,
+            )
+        };
+        assert!(
+            plan(vec!["answer".into()], 1).reads.is_empty(),
+            "streaming final block is not yet a read position"
+        );
+        if let TimelineBlockKind::AssistantMessage { status, .. } = &mut page.blocks[0].kind {
+            *status = TurnWorkItemStatus::Completed;
+        }
+        core.apply_thread_timeline_page(
+            page,
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        core.materialize_demanded_timelines();
+        assert!(
+            plan(Vec::new(), 1).reads.is_empty(),
+            "prefetch row ids are not viewability"
+        );
+        let read = plan(vec!["answer".into()], 1).reads;
+        assert_eq!(
+            read.len(),
+            1,
+            "empty-text canonical final answer remains readable"
+        );
+        assert_eq!(
+            read[0]
+                .through_block
+                .as_ref()
+                .map(|position| position.block_id.as_str()),
+            Some("answer")
+        );
+        assert!(plan(vec!["answer".into()], 1).reads.is_empty());
+    }
+
     #[test]
     fn changed_old_parent_range_discovers_unknown_and_boundary_results_without_duplicates() {
         let (core, receiver) = reconciliation_core();
@@ -6943,6 +7469,8 @@ mod tests {
                 presented_rows: false,
                 scroll_generation: 17,
                 latest_user_turn_id: None,
+                viewed_row_ids: Vec::new(),
+                viewed_through_block: None,
                 viewed_through_turn_id: None,
                 read_requires_unread: false,
                 prefetch_on_visibility: false,
@@ -7288,6 +7816,8 @@ mod tests {
             presented_rows: true,
             scroll_generation: 1,
             latest_user_turn_id: None,
+            viewed_row_ids: Vec::new(),
+            viewed_through_block: None,
             viewed_through_turn_id: None,
             read_requires_unread: false,
             prefetch_on_visibility: true,

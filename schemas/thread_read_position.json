@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadReadPosition",
+  "type": "object",
+  "properties": {
+    "block_id": {
+      "type": "string"
+    },
+    "sort_key": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "block_id",
+    "sort_key"
+  ]
+}

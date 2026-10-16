@@ -91,6 +91,49 @@ pub(crate) async fn project_semantic_timeline_live_turn_event<C: ConnectionTrait
     Ok(())
 }
 
+async fn user_message_sort_key<C: ConnectionTrait>(
+    db: &C,
+    turn: &turn_entity::Model,
+) -> Result<String> {
+    if let Some(existing) =
+        timeline_repository::find_user_message_block_by_turn_id(db, &turn.thread_id, &turn.id)
+            .await?
+    {
+        return Ok(existing.sort_key);
+    }
+    timeline_repository::new_message_sort_key(
+        db,
+        &turn.thread_id,
+        turn_block_sort_key(turn, 0, "user"),
+    )
+    .await
+}
+
+// If a prompt needed a logical tick after a recent response, its related
+// blocks must retain the existing rank order within that published domain.
+async fn projected_turn_block_sort_key<C: ConnectionTrait>(
+    db: &C,
+    turn: &turn_entity::Model,
+    rank: u16,
+    suffix: &str,
+) -> Result<String> {
+    let candidate = turn_block_sort_key(turn, rank, suffix);
+    let Some(prompt) =
+        timeline_repository::find_user_message_block_by_turn_id(db, &turn.thread_id, &turn.id)
+            .await?
+    else {
+        return Ok(candidate);
+    };
+    let (millis, _) = prompt
+        .sort_key
+        .split_once(':')
+        .context("invalid prompt position")?;
+    let (_, rest) = candidate
+        .split_once(':')
+        .context("invalid Turn block position")?;
+    Ok(format!("{millis}:{rest}"))
+}
+
 async fn project_turn_message_mutation<C: ConnectionTrait>(
     db: &C,
     event: &AppendedTurnEvent,
@@ -113,7 +156,7 @@ async fn project_turn_message_mutation<C: ConnectionTrait>(
             thread_id: thread_model.id,
             turn_id: Some(turn_model.id.clone()),
             block_kind: timeline_repository::BLOCK_KIND_USER_MESSAGE.to_owned(),
-            sort_key: turn_block_sort_key(&turn_model, 0, "user"),
+            sort_key: user_message_sort_key(db, &turn_model).await?,
             source_kind: Some("turn_input".to_owned()),
             source_key: Some(turn_model.id),
             started_at: Some(turn_model.created_at),
@@ -157,6 +200,14 @@ pub(crate) async fn project_cli_runtime_pending_request<C: ConnectionTrait>(
             .await;
     }
 
+    let original = approval_block_sort_key(&turn_model, request);
+    let suffix = format!("approval:{}", request.request_id);
+    let after_prompt = projected_turn_block_sort_key(db, &turn_model, 150, &suffix).await?;
+    let sort_key = if after_prompt > turn_block_sort_key(&turn_model, 150, &suffix) {
+        original.max(after_prompt)
+    } else {
+        original
+    };
     timeline_repository::upsert_thread_timeline_block(
         db,
         ThreadTimelineBlockRecord {
@@ -165,7 +216,7 @@ pub(crate) async fn project_cli_runtime_pending_request<C: ConnectionTrait>(
             thread_id: thread_model.id.clone(),
             turn_id: Some(turn_model.id.clone()),
             block_kind: timeline_repository::BLOCK_KIND_APPROVAL.to_owned(),
-            sort_key: approval_block_sort_key(&turn_model, request),
+            sort_key,
             source_kind: Some("cli_runtime_pending_request".to_owned()),
             source_key: Some(request.request_id.clone()),
             started_at: Some(request.created_at),
@@ -247,7 +298,7 @@ async fn project_turn_started<C: ConnectionTrait>(
                 thread_id: thread_model.id.clone(),
                 turn_id: Some(turn_model.id.clone()),
                 block_kind: timeline_repository::BLOCK_KIND_USER_MESSAGE.to_owned(),
-                sort_key: turn_block_sort_key(&turn_model, 0, "user"),
+                sort_key: user_message_sort_key(db, &turn_model).await?,
                 source_kind: Some("turn_input".to_owned()),
                 source_key: Some(turn_model.id.clone()),
                 started_at: Some(turn_model.created_at),
@@ -330,7 +381,7 @@ async fn project_terminal_turn_state<C: ConnectionTrait>(
             thread_id: thread_model.id.clone(),
             turn_id: Some(turn_model.id.clone()),
             block_kind: timeline_repository::BLOCK_KIND_SYSTEM.to_owned(),
-            sort_key: turn_block_sort_key(turn_model, 300, "terminal-state"),
+            sort_key: projected_turn_block_sort_key(db, turn_model, 300, "terminal-state").await?,
             source_kind: Some("turn_terminal_state".to_owned()),
             source_key: Some(turn_model.id.clone()),
             started_at: Some(projected_at),
@@ -548,28 +599,54 @@ async fn project_turn_item_row<C: ConnectionTrait>(
                 item_model.item_id.as_str(),
             )
             .await?;
+            let block_id = assistant_block_id(&turn_model.id, &item_model.item_id);
+            let existing = timeline_repository::find_thread_timeline_block_by_id(
+                db,
+                &thread_model.id,
+                &block_id,
+            )
+            .await?;
+            let completed = item_model
+                .status
+                .as_deref()
+                .is_some_and(|status| status == "completed");
+            let was_completed = existing.as_ref().is_some_and(|block| {
+                serde_json::from_str::<serde_json::Value>(&block.metadata_json)
+                    .ok()
+                    .and_then(|value| value.get("messageCompleted").and_then(|v| v.as_bool()))
+                    // Legacy completed rows have no marker. Content updates
+                    // must adopt them without moving history; an actual first
+                    // completion still promotes a pre-upgrade running row.
+                    .unwrap_or(
+                        completed && !matches!(&event.payload, TurnEventPayload::ItemCompleted(_)),
+                    )
+            });
+            let candidate = if turn_has_detached_task_run_block(db, turn_model.id.as_str()).await? {
+                timeline_event_block_sort_key(
+                    item_model.created_at,
+                    turn_model.id.as_str(),
+                    200,
+                    order_key.as_str(),
+                )
+            } else {
+                projected_turn_block_sort_key(db, turn_model, 200, order_key.as_str()).await?
+            };
             timeline_repository::upsert_thread_timeline_block(
                 db,
                 ThreadTimelineBlockRecord {
-                    block_id: assistant_block_id(
-                        turn_model.id.as_str(),
-                        item_model.item_id.as_str(),
-                    ),
+                    block_id,
                     workspace_id: thread_model.workspace_id.clone(),
                     thread_id: thread_model.id.clone(),
                     turn_id: Some(turn_model.id.clone()),
                     block_kind: timeline_repository::BLOCK_KIND_ASSISTANT_MESSAGE.to_owned(),
-                    sort_key: if turn_has_detached_task_run_block(db, turn_model.id.as_str())
-                        .await?
-                    {
-                        timeline_event_block_sort_key(
-                            item_model.created_at,
-                            turn_model.id.as_str(),
-                            200,
-                            order_key.as_str(),
-                        )
+                    sort_key: if completed && !was_completed {
+                        timeline_repository::new_message_sort_key(db, &thread_model.id, candidate)
+                            .await?
                     } else {
-                        turn_block_sort_key(turn_model, 200, order_key.as_str())
+                        existing
+                            .as_ref()
+                            .map(|block| block.sort_key.clone())
+                            .unwrap_or(candidate)
                     },
                     source_kind: Some("turn_item".to_owned()),
                     source_key: Some(item_model.item_id.clone()),
@@ -579,6 +656,9 @@ async fn project_turn_item_row<C: ConnectionTrait>(
                         "turnId": turn_model.id,
                         "itemId": item_model.item_id,
                         "classification": classification.classification_str(),
+                        // A replayed started/completed lifecycle still refers
+                        // to the same canonical response and read position.
+                        "messageCompleted": completed || was_completed,
                     })
                     .to_string(),
                     created_at: item_model.created_at,
@@ -676,28 +756,39 @@ async fn project_snapshot_turn_item_row<C: ConnectionTrait>(
                 item_model.item_id.as_str(),
             )
             .await?;
+            let block_id = assistant_block_id(&turn_model.id, &item_model.item_id);
+            let existing = timeline_repository::find_thread_timeline_block_by_id(
+                db,
+                &thread_model.id,
+                &block_id,
+            )
+            .await?;
+            let completed = item_model
+                .status
+                .as_deref()
+                .is_some_and(|status| status == "completed");
             timeline_repository::upsert_thread_timeline_block(
                 db,
                 ThreadTimelineBlockRecord {
-                    block_id: assistant_block_id(
-                        turn_model.id.as_str(),
-                        item_model.item_id.as_str(),
-                    ),
+                    block_id,
                     workspace_id: thread_model.workspace_id.clone(),
                     thread_id: thread_model.id.clone(),
                     turn_id: Some(turn_model.id.clone()),
                     block_kind: timeline_repository::BLOCK_KIND_ASSISTANT_MESSAGE.to_owned(),
-                    sort_key: if turn_has_detached_task_run_block(db, turn_model.id.as_str())
-                        .await?
-                    {
-                        timeline_event_block_sort_key(
-                            item_model.created_at,
-                            turn_model.id.as_str(),
-                            200,
-                            order_key.as_str(),
-                        )
+                    sort_key: if let Some(existing) = &existing {
+                        existing.sort_key.clone()
                     } else {
-                        turn_block_sort_key(turn_model, 200, order_key.as_str())
+                        if turn_has_detached_task_run_block(db, turn_model.id.as_str()).await? {
+                            timeline_event_block_sort_key(
+                                item_model.created_at,
+                                turn_model.id.as_str(),
+                                200,
+                                order_key.as_str(),
+                            )
+                        } else {
+                            projected_turn_block_sort_key(db, turn_model, 200, order_key.as_str())
+                                .await?
+                        }
                     },
                     source_kind: Some("turn_item".to_owned()),
                     source_key: Some(item_model.item_id.clone()),
@@ -707,6 +798,12 @@ async fn project_snapshot_turn_item_row<C: ConnectionTrait>(
                         "turnId": turn_model.id,
                         "itemId": item_model.item_id,
                         "classification": classification.classification_str(),
+                        "messageCompleted": completed || existing.as_ref().is_some_and(|block| {
+                            serde_json::from_str::<serde_json::Value>(&block.metadata_json)
+                                .ok()
+                                .and_then(|value| value.get("messageCompleted").and_then(|v| v.as_bool()))
+                                .unwrap_or(false)
+                        }),
                     })
                     .to_string(),
                     created_at: item_model.created_at,
@@ -810,11 +907,13 @@ async fn project_detached_task_run_block<C: ConnectionTrait>(
             thread_id: thread_model.id.clone(),
             turn_id: Some(turn_model.id.clone()),
             block_kind: timeline_repository::BLOCK_KIND_DETACHED_TASK_RUN.to_owned(),
-            sort_key: turn_block_sort_key(
+            sort_key: projected_turn_block_sort_key(
+                db,
                 sort_turn,
                 100,
                 format!("detached-task-run:{}", item_model.item_id).as_str(),
-            ),
+            )
+            .await?,
             source_kind: Some("turn_item".to_owned()),
             source_key: Some(item_model.item_id.clone()),
             started_at: Some(timing.started_at),
@@ -1137,7 +1236,7 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
             thread_id: thread_model.id.clone(),
             turn_id: Some(turn_model.id.clone()),
             block_kind: timeline_repository::BLOCK_KIND_TURN_WORK.to_owned(),
-            sort_key: turn_block_sort_key(turn_model, 100, "work"),
+            sort_key: projected_turn_block_sort_key(db, turn_model, 100, "work").await?,
             source_kind: Some("turn_work".to_owned()),
             source_key: Some(turn_model.id.clone()),
             started_at: Some(turn_model.created_at),

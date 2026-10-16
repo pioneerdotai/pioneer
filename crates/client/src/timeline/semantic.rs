@@ -2994,7 +2994,15 @@ fn work_item_projection_id(turn_id: &str, item_id: &str) -> String {
 }
 
 fn turn_sort_base(thread: &ThreadSemanticTimelineState, turn_id: &str, now_unix_ms: i64) -> String {
-    for block in thread.top_level.blocks_by_id.values() {
+    // A completed response may be positioned after newer Turns. Keep live
+    // work in the known prompt's sort domain when that prompt is cached.
+    for block in thread
+        .top_level
+        .blocks_by_id
+        .values()
+        .filter(|block| matches!(&block.kind, TimelineBlockKind::UserMessage { .. }))
+        .chain(thread.top_level.blocks_by_id.values())
+    {
         let causal_match = matches!(&block.kind, TimelineBlockKind::DetachedTaskRun { task, .. }
             if task.created_by_turn_id.as_deref() == Some(turn_id)
                 && task.trigger_kind == TaskTriggerKind::Immediate);
@@ -5715,6 +5723,48 @@ mod tests {
         let decoded: TurnWorkRangeCache = serde_json::from_value(legacy).unwrap();
         assert!(!decoded.has_loaded_page);
         assert_eq!(decoded.initial_request_status, TimelineRequestStatus::Idle);
+    }
+
+    #[test]
+    fn late_final_does_not_move_live_work_out_of_prompt_sort_domain() {
+        let mut state = SemanticTimelineState::default();
+        let prompt_key = "00000000000000000001:turn_a:000:user";
+        let final_key = "00000000000000001000:turn_a:200:answer";
+        apply_thread_timeline_page(
+            &mut state,
+            thread_page(vec![
+                user_block("thread_a", "prompt", prompt_key, "turn_a"),
+                user_block(
+                    "thread_a",
+                    "later",
+                    "00000000000000000500:turn_b:000:user",
+                    "turn_b",
+                ),
+                assistant_block("thread_a", "answer", final_key, "turn_a", None),
+            ]),
+            TopLevelPageMergeMode::Reset,
+        );
+        apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemStarted {
+                thread_id: "thread_a".into(),
+                turn_id: "turn_a".into(),
+                item: TurnItem::AgentMessage {
+                    id: "commentary".into(),
+                    text: "more work".into(),
+                    phase: AgentMessagePhase::Commentary,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            2_000,
+        );
+        let cache = &state.thread("thread_a").unwrap().top_level;
+        let work = cache.block(&work_block_id("turn_a")).unwrap();
+        assert!(work.sort_key.starts_with("00000000000000000001:turn_a:"));
+        assert_eq!(cache.block("prompt").unwrap().sort_key, prompt_key);
+        assert_eq!(cache.block("answer").unwrap().sort_key, final_key);
     }
 
     #[test]

@@ -24,6 +24,13 @@ pub struct TimelineDemand {
     pub scroll_generation: u64,
     pub latest_user_turn_id: Option<String>,
     pub viewed_through_turn_id: Option<String>,
+    /// Actual viewability, separate from pagination/prefetch row demand.
+    #[serde(default)]
+    pub viewed_row_ids: Vec<String>,
+    // Resolved against the immutable canonical snapshot by ClientCore, never
+    // accepted from the shell's serialized demand.
+    #[serde(skip)]
+    pub viewed_through_block: Option<pioneer_protocol::ThreadReadPosition>,
     #[serde(default)]
     pub read_requires_unread: bool,
     pub prefetch_on_visibility: bool,
@@ -67,7 +74,29 @@ pub enum RetryState {
 pub struct TimelineReadRequest {
     pub thread_id: String,
     pub through_turn_id: String,
+    pub through_block: Option<pioneer_protocol::ThreadReadPosition>,
     pub generation: u64,
+}
+
+impl TimelineDemand {
+    fn read_key(&self) -> Option<String> {
+        self.viewed_through_block
+            .as_ref()
+            .map(|position| format!("block:{}\0{}", position.block_id, position.sort_key))
+            .or_else(|| {
+                self.viewed_through_turn_id
+                    .as_ref()
+                    .map(|turn| format!("turn:{turn}"))
+            })
+    }
+}
+impl TimelineReadRequest {
+    fn read_key(&self) -> String {
+        self.through_block
+            .as_ref()
+            .map(|position| format!("block:{}\0{}", position.block_id, position.sort_key))
+            .unwrap_or_else(|| format!("turn:{}", self.through_turn_id))
+    }
 }
 
 #[derive(Clone)]
@@ -443,17 +472,17 @@ impl ThreadTimelineController {
             self.consumed_scroll
                 .insert(id.clone(), demand.scroll_generation);
         }
-        if let Some(turn) = demand
-            .viewed_through_turn_id
-            .as_ref()
-            .filter(|turn| Some(*turn) == demand.latest_user_turn_id.as_ref())
-        {
-            let read_key = (demand.thread_id.clone(), turn.clone());
+        if let Some(turn) = demand.viewed_through_turn_id.as_ref().filter(|turn| {
+            demand.viewed_through_block.is_some()
+                || Some(*turn) == demand.latest_user_turn_id.as_ref()
+        }) {
+            let read_key = (demand.thread_id.clone(), demand.read_key().unwrap());
             if !self.reads.contains_key(&read_key) {
                 self.clock = self.clock.saturating_add(1);
                 let request = TimelineReadRequest {
                     thread_id: read_key.0.clone(),
                     through_turn_id: turn.clone(),
+                    through_block: demand.viewed_through_block.clone(),
                     generation: self.clock,
                 };
                 self.reads.insert(
@@ -528,14 +557,14 @@ impl ThreadTimelineController {
         self.reads.retain(|(thread, turn), _| {
             self.demands
                 .values()
-                .any(|d| &d.thread_id == thread && d.viewed_through_turn_id.as_ref() == Some(turn))
+                .any(|d| &d.thread_id == thread && d.read_key().as_deref() == Some(turn.as_str()))
         });
         active
     }
 
     pub(crate) fn accepts_read(&self, request: &TimelineReadRequest) -> bool {
         self.reads
-            .get(&(request.thread_id.clone(), request.through_turn_id.clone()))
+            .get(&(request.thread_id.clone(), request.read_key()))
             .is_some_and(|r| r.request == *request && r.state == RetryState::Loading)
     }
 
@@ -560,7 +589,7 @@ impl ThreadTimelineController {
         }
         let read = self
             .reads
-            .get_mut(&(request.thread_id.clone(), request.through_turn_id.clone()))
+            .get_mut(&(request.thread_id.clone(), request.read_key()))
             .unwrap();
         read.state = if succeeded {
             RetryState::Ready
@@ -615,7 +644,7 @@ impl ThreadTimelineController {
             .clone();
         self.reads.retain(|(id, turn), r| {
             id != thread
-                || demand.viewed_through_turn_id.as_ref() != Some(turn)
+                || demand.read_key().as_deref() != Some(turn.as_str())
                 || r.state != RetryState::Terminal
         });
         if let Some(keys) = self.demand_pages.get(&id) {
@@ -704,6 +733,8 @@ mod tests {
             presented_rows: false,
             scroll_generation: 1,
             latest_user_turn_id: Some("turn".into()),
+            viewed_row_ids: Vec::new(),
+            viewed_through_block: None,
             viewed_through_turn_id: Some("turn".into()),
             read_requires_unread: false,
             prefetch_on_visibility: true,
@@ -736,6 +767,59 @@ mod tests {
                 limit: Some(12),
             },
         }
+    }
+
+    #[test]
+    fn canonical_position_can_retry_after_a_speculative_live_position_failed() {
+        let mut policy = ThreadTimelineController::default();
+        let mut input = demand("mobile");
+        input.viewed_through_block = Some(pioneer_protocol::ThreadReadPosition {
+            block_id: "answer".into(),
+            sort_key: "old".into(),
+        });
+        let old = policy.update(input.clone(), Vec::new(), 0).reads.remove(0);
+        assert!(policy.finish_read(&old, false, 0));
+        input.source_revision += 1;
+        input.viewed_through_block.as_mut().unwrap().sort_key = "canonical".into();
+        let canonical = policy.update(input, Vec::new(), 1).reads.remove(0);
+        assert_eq!(
+            old.through_block.as_ref().unwrap().block_id,
+            canonical.through_block.as_ref().unwrap().block_id
+        );
+        assert!(!policy.accepts_read(&old));
+        assert!(
+            policy.due_reads(u64::MAX).is_empty(),
+            "old-position retries are retired"
+        );
+        assert!(policy.finish_read(&canonical, true, 1));
+    }
+
+    #[test]
+    fn separate_final_blocks_in_one_turn_are_read_and_deduplicated_by_block() {
+        let mut policy = ThreadTimelineController::default();
+        let mut input = demand("desktop");
+        input.viewed_through_block = Some(pioneer_protocol::ThreadReadPosition {
+            block_id: "turn:turn:assistant:first".into(),
+            sort_key: "1".into(),
+        });
+        let first = policy.update(input.clone(), Vec::new(), 0).reads.remove(0);
+        assert!(policy.finish_read(&first, true, 0));
+        input.source_revision += 1;
+        assert!(policy.update(input.clone(), Vec::new(), 1).reads.is_empty());
+        input.viewed_through_block = Some(pioneer_protocol::ThreadReadPosition {
+            block_id: "turn:turn:assistant:second".into(),
+            sort_key: "2".into(),
+        });
+        let second = policy.update(input.clone(), Vec::new(), 2).reads.remove(0);
+        assert_eq!(first.through_turn_id, second.through_turn_id);
+        assert_ne!(first.through_block, second.through_block);
+        assert!(!policy.accepts_read(&first));
+        assert!(policy.finish_read(&second, false, 2));
+        policy.exit("a", "desktop", input.generation);
+        assert!(
+            policy.due_reads(u64::MAX).is_empty(),
+            "background/retired view cannot retry reads"
+        );
     }
 
     #[test]
@@ -919,7 +1003,7 @@ mod tests {
         assert!(policy.finish_read(&third, false, 3_000));
         assert!(policy.due_reads(u64::MAX).is_empty());
         assert_eq!(
-            policy.reads[&("a".into(), "turn".into())].state,
+            policy.reads[&("a".into(), first.read_key())].state,
             RetryState::Terminal
         );
         assert!(
@@ -1157,8 +1241,59 @@ impl crate::core::ClientCore {
         if !registry.timeline_revision_matches(&demand.thread_id, demand.source_revision) {
             return TimelineEffectPlan::default();
         }
-        if demand.read_requires_unread && !registry.timeline_has_unread(&demand.thread_id) {
+        demand.viewed_through_block = None;
+        let semantic_ids = snapshot.timeline().semantic_row_ids();
+        let viewed_blocks = demand
+            .viewed_row_ids
+            .iter()
+            .filter_map(|id| semantic_ids.get(id))
+            .filter_map(|id| match id {
+                super::semantic::SemanticTimelineRowId::TopLevelBlock { block_id } => {
+                    Some(block_id)
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let semantic_rows = snapshot.timeline().semantic_rows();
+        let viewed = semantic_rows
+            .rows
+            .iter()
+            .filter_map(|row| match &row.kind {
+                super::semantic::SemanticTimelineRowKind::UserBlock { block } => Some(block),
+                super::semantic::SemanticTimelineRowKind::AssistantMessage { block }
+                    if matches!(
+                        &block.kind,
+                        pioneer_protocol::TimelineBlockKind::AssistantMessage {
+                            status: pioneer_protocol::TurnWorkItemStatus::Completed,
+                            ..
+                        }
+                    ) =>
+                {
+                    Some(block)
+                }
+                _ => None,
+            })
+            .filter(|block| viewed_blocks.contains(&block.block_id))
+            .max_by(|a, b| a.sort_key.cmp(&b.sort_key));
+        if let Some(block) = viewed {
+            demand.viewed_through_turn_id = block.turn_id.clone();
+            demand.viewed_through_block = Some(pioneer_protocol::ThreadReadPosition {
+                block_id: block.block_id.clone(),
+                sort_key: block.sort_key.clone(),
+            });
+        }
+        let already_read = demand.viewed_through_turn_id.as_ref().is_some_and(|turn| {
+            registry.timeline_read_is_confirmed(
+                &demand.thread_id,
+                turn,
+                demand.viewed_through_block.as_ref(),
+            )
+        });
+        if already_read
+            || (demand.read_requires_unread && !registry.timeline_has_unread(&demand.thread_id))
+        {
             demand.viewed_through_turn_id = None;
+            demand.viewed_through_block = None;
         }
         registry.timeline.reconcile_topology(
             &demand,
@@ -1222,24 +1357,55 @@ impl crate::core::ClientCore {
     }
 
     pub(crate) fn execute_timeline_read(&self, request: TimelineReadRequest) {
-        if self.is_stopped()
-            || !self
-                .thread_registry
-                .lock()
-                .expect("thread registry poisoned")
-                .timeline
-                .accepts_read(&request)
-        {
+        if self.is_stopped() {
             return;
         }
+        let Some(token) = self.thread_operation_token(&request.thread_id) else {
+            return;
+        };
+        let auth = self.current_auth_ticket();
+        {
+            let mut registry = self
+                .thread_registry
+                .lock()
+                .expect("thread registry poisoned");
+            if !registry.timeline.accepts_read(&request)
+                || !registry.timeline_operation_matches(&token)
+            {
+                return;
+            }
+            // Another session can advance the confirmed cursor while this
+            // request is queued or waiting for retry.
+            if registry.timeline_read_is_confirmed(
+                &request.thread_id,
+                &request.through_turn_id,
+                request.through_block.as_ref(),
+            ) {
+                registry
+                    .timeline
+                    .finish_read(&request, true, self.timeline_now_ms());
+                return;
+            }
+        }
         let result = self.read_thread_cursor(pioneer_protocol::ThreadReadParams {
+            through_block: request.through_block.clone(),
             thread_id: request.thread_id.clone(),
             through_turn_id: request.through_turn_id.clone(),
         });
+        let auth_is_current = self.current_auth_ticket() == auth;
         let mut registry = self
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
+        if self.is_stopped() || !registry.timeline_operation_matches(&token) {
+            return;
+        }
+        if !auth_is_current {
+            registry
+                .timeline
+                .finish_read(&request, false, self.timeline_now_ms());
+            return;
+        }
         if let Ok(response) = &result {
             if response.thread_id != request.thread_id
                 || !registry.timeline_workspace_matches(&request.thread_id, &response.workspace_id)
@@ -1253,11 +1419,12 @@ impl crate::core::ClientCore {
                 return;
             }
         }
-        let accepted =
-            registry
-                .timeline
-                .finish_read(&request, result.is_ok(), self.timeline_now_ms());
-        if accepted && let Ok(response) = result {
+        registry
+            .timeline
+            .finish_read(&request, result.is_ok(), self.timeline_now_ms());
+        // read_thread_cursor already fences auth/thread lifetime. A successful
+        // server cursor stays authoritative even if the viewport has moved.
+        if let Ok(response) = result {
             self.apply_directory_read_locked(
                 &mut registry,
                 &response.workspace_id,

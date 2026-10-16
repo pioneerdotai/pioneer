@@ -3775,7 +3775,7 @@ impl MessageProcessor {
                     notification.thread_id.as_str(),
                     notification.turn_id.as_str(),
                     &notification.item,
-                    None,
+                    Some("completed"),
                 )
                 .await;
             }
@@ -6354,7 +6354,7 @@ impl MessageProcessor {
                             completed.thread_id.as_str(),
                             completed.turn_id.as_str(),
                             &completed.item,
-                            None,
+                            Some("completed"),
                         )
                         .await;
                     }
