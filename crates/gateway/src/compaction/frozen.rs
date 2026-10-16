@@ -875,6 +875,26 @@ impl PreparedHistory {
         workspace: &str,
         thread: &str,
     ) -> Result<()> {
+        // A transfer may have just published this execution's own working-
+        // context checkpoint. Reuse it against the accepted current projection,
+        // including canonical revisions restored from the immutable Task basis.
+        if let Some(head) = &self.expected_checkpoint {
+            self.checkpoint = super::checkpoint::project_compatible_checkpoint_with_resolver(
+                store,
+                super::checkpoint::ProjectionContext {
+                    workspace,
+                    context_thread: thread,
+                    source_thread: thread,
+                    owner: &super::native::native_owner(workspace, thread),
+                    allowed: &self.accepted_scopes,
+                    allow_historical_gaps: false,
+                },
+                head,
+                &mut self.messages,
+                &mut self.checkpoint_graphs,
+            )
+            .await?;
+        }
         super::checkpoint::project_accepted_checkpoints_with_resolver(
             store,
             workspace,

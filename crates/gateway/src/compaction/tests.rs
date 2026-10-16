@@ -23269,7 +23269,18 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
         .compaction_projection_version("ws", "child-thread")
         .await
         .unwrap();
-    operation.source_epochs = prepared.source_epochs.clone();
+    // capture_prepared freezes canonical references; the admission caller
+    // supplies epochs, as production execution/conversation preparation does.
+    operation.source_epochs.clear();
+    for scope in &prepared.accepted_scopes {
+        operation.source_epochs.insert(
+            scope.clone(),
+            f.store
+                .compaction_projection_version("ws", scope)
+                .await
+                .unwrap(),
+        );
+    }
     let runner_budget = ModelBudget::new(Some(4096), None, Some(512));
     let manifest = [
         ManifestEntry {
@@ -23358,12 +23369,45 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
             .iter()
             .any(|edge| edge.replay.source.id == "copy-input")
     );
-    let exact_capture = super::frozen::capture_execution_basis_prepared(
+    // CLI reuses the current execution's checkpoint against its already
+    // accepted projection, including the launch-copy proof. Its immutable
+    // descriptor remains the authority when only the sent messages change.
+    let mut cli_projection = super::frozen::capture_prepared(
         &f.store,
         "ws",
         "child-thread",
-        Some("child-turn"),
-        None,
+        &prepared.accepted_scopes,
+        &prepared.messages,
+    )
+    .await
+    .unwrap();
+    let accepted_descriptor = cli_projection.descriptor.clone();
+    cli_projection.expected_checkpoint = Some(checkpoint_id.clone());
+    cli_projection
+        .project_accepted_checkpoints(&f.store, "ws", "child-thread")
+        .await
+        .unwrap();
+    assert_eq!(
+        cli_projection.checkpoint.as_deref(),
+        Some(checkpoint_id.as_str())
+    );
+    assert_eq!(cli_projection.descriptor, accepted_descriptor);
+    assert!(cli_projection.messages.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == checkpoint_id)
+        })
+    }));
+
+    // This assertion concerns replay of the accepted Task basis. A new
+    // conversation excludes the parent Composer launch and reads its child copy.
+    let exact_capture = super::frozen::prepare_exact_task_fixture(
+        &f.store,
+        "ws",
+        "child-thread",
+        "child-turn",
         None,
     )
     .await
@@ -23400,7 +23444,7 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
         None,
     )
     .await
-    .expect("head alias must precede hydration of removed B");
+    .expect("new conversation must read current own input without the removed launch copy");
     assert!(!external_capture.messages.iter().any(|message| {
         message.provenance.as_ref().is_some_and(|origin| {
             origin

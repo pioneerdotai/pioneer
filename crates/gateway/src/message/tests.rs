@@ -27157,6 +27157,16 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
         )
         .await
         .unwrap();
+    assert_eq!(prepared.checkpoint.as_deref(), Some(checkpoint_id.as_str()));
+    assert_eq!(
+        prepared
+            .messages
+            .iter()
+            .filter(|message| { message.content.contains("ACCEPTED TASK HISTORY SUMMARY") })
+            .count(),
+        1,
+        "recapture must reuse the published checkpoint over the accepted edited sources"
+    );
     processor
         .compact_cli_transfer_history(
             &workspace,
