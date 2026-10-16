@@ -97,6 +97,8 @@ impl TurnStartFailure {
     }
 
     fn into_public_error(self) -> pioneer_protocol::PublicError {
+        #[cfg(test)]
+        eprintln!("native admission fixture diagnostic: {}", self.diagnostic);
         let public_error = crate::public_error::build_public_error(
             self.public_code,
             pioneer_protocol::PublicErrorStage::Admission,

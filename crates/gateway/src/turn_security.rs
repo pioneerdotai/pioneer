@@ -1706,7 +1706,7 @@ mod tests {
         let mut parent =
             TurnExecutionSecuritySnapshot::unrestricted_full_access("/tmp/frozen-task-process", 1);
         parent.process.command_risk.denied_commands = vec!["rm".into()];
-        parent.process.command_risk.allowed_command_families = vec!["sh".into(), "python".into()];
+        parent.process.command_risk.allowed_command_families = vec!["python".into(), "sh".into()];
         parent.authority_cap.process = parent.process.clone();
         let cap = task_security_cap_from_snapshot(&parent);
         let child = resolve_task_child_execution_security(

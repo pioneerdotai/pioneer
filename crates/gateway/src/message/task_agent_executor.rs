@@ -7893,12 +7893,15 @@ mod prepared_snapshot_tests {
 
         let db = store.database_connection();
         for sql in [
-            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('execution-turn','execution','in_progress','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,initiated_by_actor_kind,initiated_by_actor_id,created_at,updated_at) VALUES ('execution-turn','execution','in_progress','conversation','user','principal','P00000000000000000001',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
             "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('execution','parent','parent',1,CURRENT_TIMESTAMP)",
             "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('execution-run-turn','race-task','race-run','execution','execution-turn','initial',0,1,'in_progress',CURRENT_TIMESTAMP)",
         ] {
             db.execute_unprepared(sql).await.unwrap();
         }
+        db.execute_unprepared("UPDATE thread SET access_class='internal' WHERE id='execution'")
+            .await
+            .unwrap();
         let processor = MessageProcessor::new(
             Arc::new(ThreadManager::new("gpt-4", "echo")),
             Arc::new(ProviderRegistry::with_provider(
@@ -7926,7 +7929,7 @@ mod prepared_snapshot_tests {
         let mut authority = crate::authorization::ExecutionAuthorizationContext::for_test(
             principal.as_ref(),
             "race-legacy-ws",
-            "execution",
+            "parent",
             &permission,
             None,
         );

@@ -3622,6 +3622,7 @@ struct DelayedProvider {
 }
 
 struct CancellationBarrierProvider {
+    name: &'static str,
     entered: Arc<Notify>,
     release: Arc<Notify>,
 }
@@ -3638,7 +3639,7 @@ impl Provider for CancellationBarrierProvider {
     }
 
     fn name(&self) -> &str {
-        "delayed"
+        self.name
     }
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
@@ -6870,7 +6871,11 @@ impl Provider for SequencedToolProvider {
                 pioneer_provider::ProviderTermination::ToolCalls
             };
             return Ok(ChatResponse {
-                text: String::new(),
+                text: if self.first_tool_calls.is_empty() {
+                    self.second_text.clone()
+                } else {
+                    String::new()
+                },
                 usage: None,
                 reasoning_content: None,
                 provider_replay_state: None,
@@ -13003,6 +13008,7 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "delayed",
         Arc::new(CancellationBarrierProvider {
+            name: "delayed",
             entered: provider_entered.clone(),
             release: provider_release,
         }),
@@ -54984,9 +54990,38 @@ async fn command_heartbeats_keep_default_policy_alive_for_four_hours() {
         heartbeat_at = started_at
             .saturating_add(hour.saturating_mul(60 * 60))
             .saturating_sub(hour);
+        let before = turn_item_attempt::Entity::find()
+            .filter(turn_item_attempt::Column::TurnId.eq("codex-turn-command"))
+            .filter(turn_item_attempt::Column::ItemId.eq("codex-item-four-hour-command"))
+            .one(&crud_store.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
         processor
             .timeout_supervisor
             .heartbeat_item_attempt(
+                "codex-turn-command",
+                "codex-item-four-hour-command",
+                TurnItemType::CommandExecution,
+                heartbeat_at,
+            )
+            .await
+            .unwrap();
+        let owner_only = turn_item_attempt::Entity::find()
+            .filter(turn_item_attempt::Column::TurnId.eq("codex-turn-command"))
+            .filter(turn_item_attempt::Column::ItemId.eq("codex-item-four-hour-command"))
+            .one(&crud_store.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            owner_only.hard_deadline_at, before.hard_deadline_at,
+            "hour {hour}: an owner lease cannot advance a command work horizon"
+        );
+        assert_eq!(owner_only.idle_deadline_at, before.idle_deadline_at);
+        processor
+            .timeout_supervisor
+            .heartbeat_item_attempt_from_confirmed_external_activity(
                 "codex-turn-command",
                 "codex-item-four-hour-command",
                 TurnItemType::CommandExecution,
@@ -56575,7 +56610,7 @@ async fn persist_agent_skill_snapshot_for_resolution_tests(
             turn_id,
             ThreadMode::Agent,
             &pioneer_agent::AgentTurnHookRuntimeContext::default(),
-            "o4-mini",
+            "test-model",
             "openai",
             None,
             &workspace_skill_policies,
@@ -57004,6 +57039,7 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
         let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
             "openai",
             Arc::new(CancellationBarrierProvider {
+                name: "openai",
                 entered: provider_entered.clone(),
                 release: provider_release,
             }),
@@ -57515,6 +57551,7 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
     let release = Arc::new(Notify::new());
     let provider: Arc<dyn Provider> = if busy_native {
         Arc::new(CancellationBarrierProvider {
+            name: "delayed",
             entered: entered.clone(),
             release: release.clone(),
         })
@@ -58454,6 +58491,7 @@ async fn turn_cancel_allows_authorized_non_subscribed_collaborator_user() {
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "delayed",
         Arc::new(CancellationBarrierProvider {
+            name: "delayed",
             entered: provider_entered.clone(),
             release: provider_release.clone(),
         }),
@@ -76567,6 +76605,26 @@ async fn compaction_failed_partial_writer_preserves_event_but_excludes_observati
         .await
         .unwrap();
     assert_eq!(restored, history);
+    let mut authority =
+        crate::authorization::ExecutionAuthorizationContext::load_for_turn(store.as_ref(), turn)
+            .await
+            .unwrap();
+    authority.bind_test_provider_authority(
+        "openai",
+        "o4-mini",
+        processor
+            .provider_registry
+            .authority_fingerprint_for_workspace(&workspace, "openai")
+            .unwrap()
+            .as_str(),
+    );
+    assert!(
+        store
+            .set_turn_execution_authorization_context(turn, &authority.to_persisted_json().unwrap())
+            .await
+            .unwrap()
+    );
+    ensure_test_native_snapshot_owner(&processor, &workspace, thread, turn).await;
     processor
         .persist_turn_runtime_snapshot(
             thread,
@@ -76574,8 +76632,8 @@ async fn compaction_failed_partial_writer_preserves_event_but_excludes_observati
             turn,
             pioneer_protocol::ThreadMode::Agent,
             &pioneer_agent::AgentTurnHookRuntimeContext::default(),
-            "fixture-model",
-            "fixture-provider",
+            "o4-mini",
+            "openai",
             None,
             &std::collections::HashMap::new(),
             &[],
@@ -76978,11 +77036,23 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
         .unwrap()
         .unwrap()
         .1;
+    let window = store
+        .latest_turn_execution_window("native-controller-turn")
+        .await
+        .unwrap();
+    let checkpoints = if let Some(window) = &window {
+        store
+            .list_turn_execution_checkpoints_for_window(&window.id)
+            .await
+            .unwrap()
+    } else {
+        Vec::new()
+    };
     let requests = provider.0.lock().unwrap();
     assert_eq!(
         requests.len(),
         2 + usize::from(with_tool),
-        "one original request and exactly one main retry, plus the initial tool round; terminal={terminal:?}"
+        "one original request and exactly one main retry, plus the initial tool round; terminal={terminal:?}; window={window:?}; checkpoints={checkpoints:?}"
     );
     assert!(requests.iter().all(|request| request.max_tokens.is_some()));
     drop(requests);
@@ -83576,6 +83646,7 @@ fn native_cancellation_race_fallback_preserves_materialization_error_and_require
             let release = Arc::new(Notify::new());
             let provider: Arc<dyn Provider> = if busy_native {
                 Arc::new(CancellationBarrierProvider {
+                    name: "delayed",
                     entered: entered.clone(),
                     release: release.clone(),
                 })

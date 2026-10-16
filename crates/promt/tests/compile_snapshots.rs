@@ -355,7 +355,7 @@ This is the same user turn continuing in a new execution window. Continue from t
 
 Initiating thread: initiating_thread_snapshot
 Execution thread: thread_snapshot (internal child)
-Checkpoint: schema_version=2, workspace_id=workspace_snapshot, turn_id=turn_snapshot
+Checkpoint: schema_version=3, workspace_id=workspace_snapshot, turn_id=turn_snapshot
 Original request preview: Create report from checked files.
 Completed window: index=1, agent_rounds=4, tool_calls=9, provider_tokens=456
 Window exhaustion reason: max_tool_calls_per_window
@@ -406,7 +406,7 @@ This is the same user turn continuing in a new execution window. Continue from t
 
 Initiating thread: initiating_thread_snapshot
 Execution thread: thread_snapshot (internal child)
-Checkpoint: schema_version=2, workspace_id=workspace_snapshot, turn_id=turn_snapshot
+Checkpoint: schema_version=3, workspace_id=workspace_snapshot, turn_id=turn_snapshot
 Original request preview: Create report from checked files.
 Completed window: index=1, agent_rounds=4, tool_calls=9, provider_tokens=456
 Window exhaustion reason: max_tool_calls_per_window

@@ -1301,7 +1301,10 @@ mod tests {
                 r#"{"schema_version":1,"catalog":{"version":0,"generated_at_unix":0,"skills":[]}}"#
                     .into(),
             ),
-            hook_runtime_context_json: "{}".to_owned(),
+            hook_runtime_context_json: serde_json::to_string(
+                &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+            )
+            .unwrap(),
             workspace_skill_policies_json: "[]".to_owned(),
             input_json: "[]".to_owned(),
             capabilities_json: "[]".to_owned(),
@@ -1319,6 +1322,9 @@ mod tests {
         snapshot.mode_json = serde_json::to_string(&pioneer_protocol::ThreadMode::Agent).unwrap();
         assert!(super::validate_runtime_snapshot_for_resume(&snapshot).is_ok());
         let original = snapshot.clone();
+        snapshot.hook_runtime_context_json = "{}".into();
+        assert!(super::validate_runtime_snapshot_for_resume(&snapshot).is_err());
+        snapshot = original.clone();
         snapshot.provider_model_contract_json = None;
         assert!(super::validate_runtime_snapshot_for_resume(&snapshot).is_err());
         snapshot = original.clone();
