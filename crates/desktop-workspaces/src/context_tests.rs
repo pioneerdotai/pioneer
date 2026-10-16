@@ -52,6 +52,7 @@ fn folder_pointer_and_keyboard_expansion_survives_reconciliation(cx: &mut TestAp
     use pioneer_client::workspaces::projection::thread_tree_snapshot_from_parts;
 
     cx.update(gpui_kit::init);
+    cx.update(|cx| cx.set_reduce_motion(true));
     let core = Arc::new(ClientCore::new());
     core.open_workspace_thread("w".into(), None, None);
     let saves = Rc::new(RefCell::new(Vec::new()));
@@ -71,6 +72,7 @@ fn folder_pointer_and_keyboard_expansion_survives_reconciliation(cx: &mut TestAp
     let snapshot = thread_tree_snapshot_from_parts(
         "w".into(),
         vec![thread],
+        vec![],
         vec![
             serde_json::from_value(serde_json::json!({"thread_id":"t","unread_count":9})).unwrap(),
         ],
@@ -151,8 +153,13 @@ fn folder_pointer_and_keyboard_expansion_survives_reconciliation(cx: &mut TestAp
     // Counter-only publications must keep the selected folder and its expansion.
     let selected = tree.read_with(cx, |tree, _| tree.selected_index());
     assert!(selected.is_some());
-    for (revision, count) in [(2, 5), (3, 0)] {
+    for (revision, count, running) in [(2, 5, false), (3, 0, true), (4, 0, false)] {
         let mut next = snapshot.clone();
+        if running {
+            next.running_task_thread_ids.insert("t".into());
+            next.running_task_folder_ids
+                .extend(["parent".into(), "child".into()]);
+        }
         next.unread[0].unread_count = count;
         for total in next.unread_by_folder_id.values_mut() {
             *total = count;
@@ -166,6 +173,10 @@ fn folder_pointer_and_keyboard_expansion_survives_reconciliation(cx: &mut TestAp
             sidebar.rebuild_sidebar_tree_state(cx);
         });
         cx.run_until_parked();
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.task_activity_indicators.len()),
+            if running { 3 } else { 0 }
+        );
         assert_eq!(
             tree.read_with(cx, |tree, _| tree.selected_index()),
             selected

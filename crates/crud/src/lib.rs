@@ -139,11 +139,11 @@ pub use repositories::authorization_persistence::{
 };
 pub use repositories::authorization_scope::{
     ArtifactAuthorizationScope, CapabilityAuthorizationScope, PersistedCapabilityScopeKind,
-    RuntimeDraftArtifactAuthorizationScope, SessionAuthorizationScope, TaskAuthorizationScope,
-    ThreadAuthorizationScope, ThreadStartAuthorizationScope, TurnAuthorizationScope,
-    WorkspaceAuthorizationScope, list_abandoned_runtime_draft_artifact_ids,
-    resolve_artifact_authorization_scope, resolve_artifact_binding_authorization_root,
-    resolve_persisted_capability_authorization_scope,
+    RunningTaskScopePage, RuntimeDraftArtifactAuthorizationScope, SessionAuthorizationScope,
+    TaskAuthorizationScope, ThreadAuthorizationScope, ThreadStartAuthorizationScope,
+    TurnAuthorizationScope, WorkspaceAuthorizationScope, list_abandoned_runtime_draft_artifact_ids,
+    list_running_task_scopes, resolve_artifact_authorization_scope,
+    resolve_artifact_binding_authorization_root, resolve_persisted_capability_authorization_scope,
     resolve_runtime_draft_artifact_authorization_scope, resolve_session_authorization_scope,
     resolve_task_authorization_scope, resolve_thread_authorization_scope,
     resolve_thread_start_authorization_scope, resolve_turn_authorization_scope,
@@ -17332,6 +17332,19 @@ impl CrudStore {
         run_id: &str,
         claimed_at: i64,
     ) -> Result<Option<TaskRun>> {
+        Ok(self
+            .claim_task_run_for_dispatch_with_event(run_id, claimed_at)
+            .await?
+            .map(|(run, _)| run))
+    }
+
+    /// Claim and durable activity notification commit together. The caller may
+    /// wake the existing event fanout only after this operation has committed.
+    pub async fn claim_task_run_for_dispatch_with_event(
+        &self,
+        run_id: &str,
+        claimed_at: i64,
+    ) -> Result<Option<(TaskRun, AppendedTaskEvent)>> {
         self.run_serialized_write(|| {
             self.claim_task_run_for_dispatch_once(run_id.to_owned(), claimed_at)
         })
@@ -17342,24 +17355,48 @@ impl CrudStore {
         &self,
         run_id: String,
         claimed_at: i64,
-    ) -> Result<Option<TaskRun>> {
+    ) -> Result<Option<(TaskRun, AppendedTaskEvent)>> {
+        // Prepare serialization before reserving the writer. Task identity is
+        // revalidated inside the atomic claim + durable fanout write set.
+        let Some(candidate) = task_run::find_run_by_id(&self.connection, &run_id).await? else {
+            return Ok(None);
+        };
+        let prepared = self
+            .prepare_task_events_for_write(vec![TaskEventPayload::RunStarting {
+                task_id: candidate.task_id.clone(),
+                run_id: run_id.clone(),
+                claimed_at,
+            }])
+            .await?;
         let transaction = self
             .connection
             .begin()
             .await
             .context("failed to begin Task dispatch claim transaction")?;
         let result = async {
-            let Some(_) = task_run::find_run_by_id(&transaction, run_id.as_str()).await? else {
+            let Some(current) = task_run::find_run_by_id(&transaction, run_id.as_str()).await?
+            else {
                 return Ok(None);
             };
-            task_run::claim_run_for_dispatch(
+            anyhow::ensure!(
+                current.task_id == candidate.task_id,
+                "dispatch claim task identity changed"
+            );
+            let claimed = task_run::claim_run_for_dispatch(
                 &transaction,
                 run_id.as_str(),
                 unix_to_datetime(claimed_at),
             )
             .await?
             .map(task_run_from_db_model)
-            .transpose()
+            .transpose()?;
+            let Some(run) = claimed else { return Ok(None) };
+            let event = self
+                .append_task_events_in_connection(&transaction, prepared, claimed_at)
+                .await?
+                .pop()
+                .context("dispatch claim event missing")?;
+            Ok(Some((run, event)))
         }
         .await;
         match result {
@@ -33981,7 +34018,7 @@ mod tests {
         WORK_ITEM_STATUS_RUNNING, WORK_VISIBILITY_VISIBLE, WorkspaceSkillPolicyRecord,
         create_gateway_singleton, create_member_principal, create_superuser,
         delete_workspace_membership, ensure_pioneer_for_workspace, insert_workspace_membership,
-        list_abandoned_runtime_draft_artifact_ids,
+        list_abandoned_runtime_draft_artifact_ids, list_running_task_scopes,
         message_mutation_actor_current_thread_write_kind, principal_current_thread_access_kind,
         resolve_artifact_authorization_scope, resolve_runtime_draft_artifact_authorization_scope,
         tool_call_status, upsert_thread_timeline_block, work_item_projection_id,
@@ -45699,6 +45736,61 @@ mod tests {
         }
 
         (store, thread, run)
+    }
+
+    #[tokio::test]
+    async fn tree_task_activity_is_a_bounded_read_without_history_or_conversation_status() {
+        let (store, counter) = test_store_with_workspace_and_query_counter("ws_task").await;
+        let (store, mut thread, _) =
+            terminal_task_run_occurrence_fixture_with_store(store, None).await;
+        thread.status = ThreadStatus::Idle;
+        store
+            .upsert_thread_model(&thread, PersistedActorRef::System)
+            .await
+            .unwrap();
+        // The fixture's task has a legacy creating-turn reference. Make this
+        // background task thread-owned, without a foreground turn.
+        store
+            .connection
+            .execute_unprepared(
+                "UPDATE task SET created_by_turn_id=NULL; UPDATE task_run SET status='running'",
+            )
+            .await
+            .unwrap();
+        let principal = PrincipalId::new("P00000000000000000001").unwrap();
+        counter.store(0, Ordering::Relaxed);
+        let page = list_running_task_scopes(
+            &store.connection,
+            "ws_task",
+            &[thread.id.clone(), "missing-thread".into()],
+            &principal,
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "one reader SELECT for the whole batch"
+        );
+        assert_eq!(page.scopes.len(), 1);
+        assert_eq!(
+            page.scopes[0].0.root_thread_id.as_deref(),
+            Some(thread.id.as_str())
+        );
+        assert!(
+            list_running_task_scopes(
+                &store.with_maintenance_access().connection,
+                "ws_task",
+                &[thread.id],
+                &principal,
+                page.after_task_id.as_deref().unwrap()
+            )
+            .await
+            .unwrap()
+            .scopes
+            .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -58016,6 +58108,47 @@ mod tests {
                     "each bounded read must release capacity"
                 );
             }
+        }
+        // Tree task activity uses the same physical readers and scheduling
+        // classes, even while the writer is occupied by another operation.
+        for (store, class) in [
+            (&interactive, SqliteReadClass::Interactive),
+            (&maintenance, SqliteReadClass::Maintenance),
+            (&critical, SqliteReadClass::Maintenance),
+        ] {
+            reader_statements.lock().unwrap().clear();
+            writer_statements.lock().unwrap().clear();
+            reads.events.lock().unwrap().clear();
+            let page = tokio::time::timeout(
+                Duration::from_secs(5),
+                list_running_task_scopes(
+                    &store.connection,
+                    "ws",
+                    &["thread".into()],
+                    &PrincipalId::new("P00000000000000000001").unwrap(),
+                    "",
+                ),
+            )
+            .await
+            .expect("task activity must not wait for the writer")
+            .unwrap();
+            assert!(page.scopes.is_empty());
+            assert_eq!(reader_statements.lock().unwrap().len(), 1);
+            assert!(writer_statements.lock().unwrap().is_empty());
+            assert_eq!(
+                reads
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|event| match event {
+                        SqliteReadEvent::OperationFinished { class, outcome, .. } =>
+                            Some((*class, *outcome)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                vec![(class, SqliteReadOutcome::Ok)]
+            );
         }
         held_writer.rollback().await.unwrap();
 
