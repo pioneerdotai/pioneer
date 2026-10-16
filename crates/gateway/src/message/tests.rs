@@ -29275,10 +29275,26 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
         ));
         processor.release_completed_history_preparation_barrier();
         let starts = wait_for_cli_runtime_turn_starts(&cli_session, 1).await;
+        let admission_failure = if starts.len() != 1 {
+            Some((
+                crud_store
+                    .get_task_run(&run.id)
+                    .await
+                    .unwrap()
+                    .map(|run| (run.status, run.error)),
+                crud_store
+                    .get_turn(&lineage.child_thread_id, &lineage.child_turn_id)
+                    .await
+                    .unwrap()
+                    .map(|(_, turn)| (turn.status, turn.error)),
+            ))
+        } else {
+            None
+        };
         assert_eq!(
             starts.len(),
             1,
-            "{runtime_id} Task must dispatch exactly one native turn"
+            "{runtime_id} Task must dispatch exactly one native turn; admission={admission_failure:?}"
         );
         assert_eq!(
             cli_session.mcp_preparations.lock().await.as_slice(),

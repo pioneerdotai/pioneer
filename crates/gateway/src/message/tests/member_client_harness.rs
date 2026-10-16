@@ -224,6 +224,7 @@ async fn hermetic_member_shared_client_covers_policy_and_access_loss_without_log
         Arc::new(pioneer_provider::ProviderRegistry::with_provider(
             "openai",
             Arc::new(DelayedProvider {
+                name: "openai",
                 delay: Duration::from_secs(2),
                 text: "member harness delayed response".to_owned(),
             }),
