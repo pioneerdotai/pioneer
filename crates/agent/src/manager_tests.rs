@@ -4295,7 +4295,7 @@ impl crate::compaction::controller::NativeContextController for FixtureControlCo
                     ))
                     .ok_or_else(|| anyhow::anyhow!("fixture control source is unavailable"))?;
                 anyhow::ensure!(
-                    record.reference()? == *reference,
+                    record.reference().map_err(anyhow::Error::msg)? == *reference,
                     "fixture control source changed"
                 );
                 Ok(record.clone())
@@ -4377,7 +4377,7 @@ async fn subscribe_agent_events(
     let (tx, rx) = tokio::sync::mpsc::channel(256);
     tokio::spawn(async move {
         while let Some(event) = durable_rx.recv().await {
-            if let AgentDurableEvent::ItemCompleted(notification) = &event {
+            if let AgentDurableEvent::ItemCompleted { notification } = &event {
                 if let TurnItem::SystemEvent {
                     code,
                     details: Some(details),
@@ -5606,7 +5606,7 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
                         None,
                         Some(accepted_contract),
                         Some(
-                            NativeInitialPreparation::restore(
+                            crate::NativeInitialPreparation::restore(
                                 initial_phase_json.as_deref().unwrap(),
                                 workspace_id,
                                 thread_id,
@@ -5633,7 +5633,7 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
                         restart_checkpoint,
                         None,
                         pioneer_protocol::default_turn_permission_profile_snapshot(),
-                        test_full_access_security_snapshot(),
+                        Some(test_full_access_security_snapshot()),
                     )
                     .await
                     .unwrap();
