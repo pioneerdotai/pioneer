@@ -4692,6 +4692,43 @@ async fn restore_accepted_execution_basis_prepared(
         })
         .collect::<Vec<_>>();
     projected_imports.extend(absorbed_imports);
+    // The execution's captured head is composed after this restore. It can
+    // already cover accepted OWN inputs omitted above, so carry their exact
+    // grants onto that head through the same checkpoint-import proof boundary.
+    // Replay aliases and working-context coverage do not grant OWN authority.
+    if let (Some(graph), Some(head)) = (external_graph, external_head) {
+        let import_ordinals = accepted
+            .iter()
+            .filter(|(ordinal, imports)| {
+                externally_omitted.contains(ordinal)
+                    && imports.sources.iter().all(|source| {
+                        graph.leaves.contains(source)
+                            || (source.source.scope.starts_with("checkpoint:")
+                                && graph.checkpoints.contains(&source.source))
+                    })
+            })
+            .flat_map(|(_, imports)| imports.import_ordinals.iter().copied())
+            .collect::<Vec<_>>();
+        if !import_ordinals.is_empty()
+            && checkpoint_graphs
+                .projection_metadata(store, workspace, graph)
+                .await?
+                .coverage_domain
+                == pioneer_compaction::CoverageDomain::OwnContribution
+        {
+            let source = store
+                .compaction_checkpoint_source(workspace, execution_thread, head)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("accepted checkpoint head disappeared"))?;
+            projected_imports.push(ProjectedAcceptedImports {
+                target: ScopedHistorySource {
+                    thread: execution_thread.to_owned(),
+                    source,
+                },
+                import_ordinals,
+            });
+        }
+    }
     let retained = references
         .iter()
         .enumerate()

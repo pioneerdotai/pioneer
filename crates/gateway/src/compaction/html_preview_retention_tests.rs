@@ -900,6 +900,43 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
                 && p.source == archived.source
                 && p.delivery_id == archived.delivery_id)
     );
+    assert_eq!(checkpoint_imports.len(), forwarded_imports.len());
+    assert!(
+        forwarded_imports.iter().all(|original| {
+            checkpoint_imports.iter().any(|stored| {
+                let mut expected = original.clone();
+                expected.message_ordinal = stored.message_ordinal;
+                stored == &expected
+            })
+        }),
+        "checkpoint projection preserves every original import grant"
+    );
+    let repeated_checkpoint = processor
+        .capture_authorized_task_basis_prepared(
+            &f.store,
+            &principal,
+            "ws",
+            "forward-archive",
+            Some("turn-forward-archive"),
+            Some("turn-forward-archive"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(checkpoint_basis.descriptor, repeated_checkpoint.descriptor);
+    assert_eq!(
+        f.store
+            .compaction_frozen_import_page(
+                "ws",
+                "forward-archive",
+                &repeated_checkpoint.descriptor.manifest_id,
+                0,
+            )
+            .await
+            .unwrap(),
+        checkpoint_imports,
+        "repeated head preparation keeps the same delivery proofs"
+    );
     let checkpoint_replay = crate::turn_runtime_snapshot::restore_history_json(
         &f.store,
         "ws",
