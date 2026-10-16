@@ -143,15 +143,14 @@ impl ToolWireManifest {
     }
 
     fn restore_name(&self, name: &mut String, advertised: bool) -> anyhow::Result<()> {
-        let canonical = self.wire_to_canonical.get(name).ok_or_else(|| {
-            crate::failure::ProviderTransportFailure {
-                classification: crate::ProviderFailureClassification::new(
-                    pioneer_protocol::ProviderFailureClass::ProviderRejected,
-                ),
-            }
-        })?;
+        let rejected = || crate::failure::ProviderTransportFailure {
+            classification: crate::ProviderFailureClassification::new(
+                pioneer_protocol::ProviderFailureClass::ProviderRejected,
+            ),
+        };
+        let canonical = self.wire_to_canonical.get(name).ok_or_else(rejected)?;
         if advertised && !self.advertised.contains(canonical) {
-            return Err(super::schema::rejected());
+            return Err(rejected());
         }
         *name = canonical.clone();
         Ok(())
@@ -321,6 +320,34 @@ mod tests {
         let cold_manifest = ToolWireManifest::new("gemini", &cold).unwrap();
         assert_eq!(manifest.canonical_to_wire, cold_manifest.canonical_to_wire);
     }
+    #[test]
+    fn returned_history_only_tool_is_a_provider_rejection_not_a_schema_error() {
+        let mut request = request(&[]);
+        request.messages.push(ChatMessage::assistant_tool_calls(
+            None::<String>,
+            vec![ProviderToolCall {
+                id: "prior-call".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }],
+        ));
+        let manifest = ToolWireManifest::new("openai", &request).unwrap();
+        let mut calls = vec![ProviderToolCall {
+            id: "undeclared-call".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        }];
+        let error = manifest.restore_calls(&mut calls).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::failure::ProviderTransportFailure>()
+                .unwrap()
+                .classification
+                .class,
+            pioneer_protocol::ProviderFailureClass::ProviderRejected
+        );
+    }
+
     #[test]
     fn reserved_alias_collision_duplicate_and_unknown_return_fail_closed() {
         let reserved = alias("skill.12.render");
