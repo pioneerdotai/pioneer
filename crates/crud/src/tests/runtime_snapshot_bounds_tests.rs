@@ -550,3 +550,77 @@ async fn native_initial_mcp_projection_header_cannot_materialize_oversized_legac
             .is_some()
     );
 }
+
+#[tokio::test]
+async fn native_and_legacy_snapshot_publication_revalidate_prepared_source_epochs() {
+    for native in [false, true] {
+        let workspace = if native {
+            "ws_native_epochs"
+        } else {
+            "ws_legacy_epochs"
+        };
+        let store = test_store_with_workspace(workspace).await;
+        let snapshot = candidate_snapshot(workspace, unix_to_datetime(1_700_000_000));
+        seed_native_owner(&store, &snapshot).await;
+        let epoch = store
+            .compaction_projection_version(workspace, &snapshot.thread_id)
+            .await
+            .unwrap();
+        let mut epochs =
+            std::collections::BTreeMap::from([(snapshot.thread_id.clone(), epoch + 1)]);
+        let rejected = if native {
+            store
+                .insert_native_turn_runtime_snapshot_with_source_epochs(snapshot.clone(), &epochs)
+                .await
+        } else {
+            store
+                .upsert_turn_runtime_snapshot_with_source_epochs(snapshot.clone(), &epochs)
+                .await
+        };
+        assert!(
+            format!("{:#}", rejected.unwrap_err())
+                .contains("history changed before runtime publication")
+        );
+        assert!(
+            store
+                .get_turn_runtime_snapshot(&snapshot.turn_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        epochs.insert(snapshot.thread_id.clone(), epoch);
+        let accepted = if native {
+            store
+                .insert_native_turn_runtime_snapshot_with_source_epochs(snapshot.clone(), &epochs)
+                .await
+        } else {
+            store
+                .upsert_turn_runtime_snapshot_with_source_epochs(snapshot.clone(), &epochs)
+                .await
+        }
+        .unwrap();
+        assert_eq!(accepted.history_json, snapshot.history_json);
+        assert_eq!(accepted.model, snapshot.model);
+        // A retry with a different source proof cannot replace even an already
+        // accepted row. Preparation does not bypass the publication fence.
+        epochs.insert(snapshot.thread_id.clone(), epoch + 1);
+        let rejected = if native {
+            store
+                .insert_native_turn_runtime_snapshot_with_source_epochs(snapshot.clone(), &epochs)
+                .await
+        } else {
+            store
+                .upsert_turn_runtime_snapshot_with_source_epochs(snapshot.clone(), &epochs)
+                .await
+        };
+        assert!(rejected.is_err());
+        assert_eq!(
+            store
+                .get_turn_runtime_snapshot(&snapshot.turn_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            accepted
+        );
+    }
+}
