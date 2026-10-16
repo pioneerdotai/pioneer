@@ -816,7 +816,14 @@ impl CredentialStore for PersistentCredentials {
         let file = self
             .persistence
             .file_guard(&self.id, &self.cancellation)
-            .await?;
+            .await
+            .map_err(|error| {
+                if self.cancellation.is_cancelled() {
+                    AuthError::AuthorizationRequired
+                } else {
+                    error
+                }
+            })?;
         if self.cancellation.is_cancelled() {
             return Err(AuthError::AuthorizationRequired);
         }
