@@ -2669,7 +2669,7 @@ mod tests {
             )
             .await;
             let expected = match index {
-                1 => ProviderFailureClass::NetworkTransient, // Physical response body ended early.
+                1 => ProviderFailureClass::Unknown, // No confirmed native completion or classified network cause.
                 4 => ProviderFailureClass::Unknown, // Malformed JSON shape has no typed transport proof.
                 _ => ProviderFailureClass::StreamTruncated, // Decoder proved an incomplete native stream.
             };

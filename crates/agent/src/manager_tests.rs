@@ -1771,6 +1771,7 @@ fn visible_test_requests(requests: Vec<ChatRequest>) -> Vec<ChatRequest> {
 
 #[derive(Default)]
 struct CaptureStandardProvider {
+    fail_first_main: std::sync::atomic::AtomicBool,
     requests: std::sync::Mutex<Vec<ChatRequest>>,
 }
 
@@ -2495,6 +2496,7 @@ enum LoopBudgetProviderMode {
 }
 
 struct LoopBudgetProvider {
+    fail_first_main: std::sync::atomic::AtomicBool,
     requests: std::sync::Mutex<Vec<ChatRequest>>,
     next_index: AtomicUsize,
     mode: LoopBudgetProviderMode,
@@ -2505,6 +2507,7 @@ struct LoopBudgetProvider {
 impl LoopBudgetProvider {
     fn new(mode: LoopBudgetProviderMode, tool_calls_per_round: usize) -> Self {
         Self {
+            fail_first_main: std::sync::atomic::AtomicBool::new(false),
             requests: std::sync::Mutex::new(Vec::new()),
             next_index: AtomicUsize::new(0),
             mode,
@@ -2519,6 +2522,7 @@ impl LoopBudgetProvider {
         preflight_response_text: impl Into<String>,
     ) -> Self {
         Self {
+            fail_first_main: std::sync::atomic::AtomicBool::new(false),
             requests: std::sync::Mutex::new(Vec::new()),
             next_index: AtomicUsize::new(0),
             mode,
@@ -3204,6 +3208,14 @@ impl Provider for CaptureStandardProvider {
         if preflight {
             return Ok(test_preflight_response());
         }
+        if self.fail_first_main.swap(false, Ordering::SeqCst) {
+            return Err(pioneer_provider::failure::ProviderTransportFailure {
+                classification: pioneer_provider::ProviderFailureClassification::new(
+                    ProviderFailureClass::Provider5xx,
+                ),
+            }
+            .into());
+        }
         Ok(ChatResponse {
             text: "done".to_owned(),
             usage: None,
@@ -3370,6 +3382,14 @@ impl Provider for LoopBudgetProvider {
             });
         }
 
+        if self.fail_first_main.swap(false, Ordering::SeqCst) {
+            return Err(pioneer_provider::failure::ProviderTransportFailure {
+                classification: pioneer_provider::ProviderFailureClassification::new(
+                    ProviderFailureClass::Provider5xx,
+                ),
+            }
+            .into());
+        }
         let round_index = self.next_index.fetch_add(1, Ordering::SeqCst);
         let tool_calls = match self.mode {
             LoopBudgetProviderMode::ToolWhileAvailableThenFinal if tools_available => {
@@ -3557,8 +3577,8 @@ impl Provider for ProviderRecoveryBoundaryProvider {
                 reasoning_content: None,
                 tool_calls: vec![ProviderToolCall {
                     id: "call_provider_boundary_1".to_owned(),
-                    name: "missing_tool_for_boundary".to_owned(),
-                    arguments: "{}".to_owned(),
+                    name: "list_dir".to_owned(),
+                    arguments: r#"{"path":".","depth":0,"limit":1}"#.to_owned(),
                 }],
                 provider_replay_state: None,
                 termination: pioneer_provider::ProviderTermination::ToolCalls,
@@ -4379,6 +4399,20 @@ async fn subscribe_agent_events(
     manager: &AgentManager,
     thread_id: &str,
 ) -> tokio::sync::mpsc::Receiver<AgentEvent> {
+    subscribe_agent_events_with_checkpoints(manager, thread_id)
+        .await
+        .0
+}
+
+type FixtureCheckpoints =
+    Arc<std::sync::Mutex<std::collections::BTreeMap<String, ExecutionCheckpointContext>>>;
+
+async fn subscribe_agent_events_with_checkpoints(
+    manager: &AgentManager,
+    thread_id: &str,
+) -> (tokio::sync::mpsc::Receiver<AgentEvent>, FixtureCheckpoints) {
+    let checkpoints: FixtureCheckpoints = Default::default();
+    let recorded_checkpoints = checkpoints.clone();
     let controller = Arc::new(FixtureControlContext {
         delegate: manager
             .runtime_dependencies
@@ -4398,6 +4432,32 @@ async fn subscribe_agent_events(
     let (tx, rx) = tokio::sync::mpsc::channel(256);
     tokio::spawn(async move {
         while let Some(event) = durable_rx.recv().await {
+            if let AgentDurableEvent::TurnExecutionWindowCheckpointed {
+                notification,
+                payload,
+            } = &event
+            {
+                let mut checkpoints = recorded_checkpoints.lock().unwrap();
+                assert!(checkpoints.len() < 128);
+                let usage = crate::ExecutionWindowUsageSnapshot {
+                    total_windows: notification.window_index,
+                    total_tool_calls: payload.window.tool_call_count,
+                    total_provider_tokens: payload.window.provider_token_count.unwrap_or(0),
+                    provider_token_usage_unknown: !payload.provider_budget.provider_usage_available,
+                    ..Default::default()
+                };
+                checkpoints.insert(
+                    payload.turn_id.clone(),
+                    ExecutionCheckpointContext {
+                        window_id: notification.window_id.clone(),
+                        window_index: notification.window_index,
+                        checkpoint_id: notification.checkpoint_id.clone(),
+                        checkpoint_kind: notification.checkpoint_kind.clone(),
+                        payload: payload.clone(),
+                        usage,
+                    },
+                );
+            }
             if let AgentDurableEvent::NativeSemanticCheckpoint {
                 checkpoint,
                 control: Some(record),
@@ -4452,7 +4512,7 @@ async fn subscribe_agent_events(
             }
         }
     });
-    rx
+    (rx, checkpoints)
 }
 
 async fn recv_events_until_terminal(
@@ -4466,7 +4526,10 @@ async fn recv_events_until_terminal(
             Ok(None) => {
                 panic!("agent event channel should stay open")
             }
-            Err(_) => panic!("timed out waiting for terminal agent event"),
+            Err(_) => panic!(
+                "timed out waiting for terminal agent event; last={:?}",
+                observed.last()
+            ),
         };
         let terminal = matches!(
             event,
@@ -13111,6 +13174,7 @@ async fn provider_recovery_success_boundary_survives_execution_window_continuati
         LoopBudgetProviderMode::TwoToolRoundsThenFinal,
         1,
     ));
+    provider.fail_first_main.store(true, Ordering::SeqCst);
     let mut config = test_tool_loop_config();
     set_execution_window_budget(&mut config, 2, 16);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
@@ -13121,13 +13185,43 @@ async fn provider_recovery_success_boundary_survives_execution_window_continuati
     let recovery_job_id = "recovery_job_window_continuation";
     let recovery_attempt_id = "recovery_attempt_window_continuation";
 
-    let mut events = start_loop_budget_turn(&manager, thread_id, turn_id).await;
-    let initial_events = recv_events_until_terminal(&mut events).await;
-    assert!(matches!(
-        initial_events.last(),
-        Some(AgentEvent::TurnCompleted { .. })
-    ));
-
+    manager
+        .ensure_thread(thread_id, "ws_loop_budget")
+        .await
+        .unwrap();
+    let (mut events, checkpoints) =
+        subscribe_agent_events_with_checkpoints(&manager, thread_id).await;
+    manager
+        .start_test_turn_with_default_profile(
+            thread_id,
+            turn_id,
+            ThreadMode::Agent,
+            "test-model",
+            "loop-budget",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "run loop budget test".into(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    loop {
+        let event = timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(event, AgentEvent::ProviderFailureDetected { .. }) {
+            break;
+        }
+        assert!(!matches!(
+            event,
+            AgentEvent::TurnCompleted { .. }
+                | AgentEvent::TurnFailed { .. }
+                | AgentEvent::TurnBlocked { .. }
+        ));
+    }
     provider.next_index.store(0, Ordering::SeqCst);
     provider
         .requests
@@ -13136,6 +13230,7 @@ async fn provider_recovery_success_boundary_survives_execution_window_continuati
         .clear();
     while events.try_recv().is_ok() {}
 
+    let checkpoint = checkpoints.lock().unwrap().get(turn_id).cloned().unwrap();
     manager
         .start_recovery_attempt(
             thread_id,
@@ -13154,11 +13249,11 @@ async fn provider_recovery_success_boundary_survives_execution_window_continuati
                 continue_generation: true,
                 model_override: None,
                 retained_provider_history: Vec::new(),
-                execution_checkpoint_context: None,
+                execution_checkpoint_context: Some(checkpoint),
             },
         )
         .await
-        .expect("recovery request should restart completed turn");
+        .expect("recovery request should continue the failed semantic turn");
 
     let mut recovery_events = Vec::new();
     let mut saw_recovery_success = false;
@@ -14487,6 +14582,7 @@ async fn non_tool_recovery_request_restarts_turn_without_failing() {
 #[tokio::test]
 async fn continue_generation_recovery_is_compiled_into_system_prompt() {
     let provider = Arc::new(CaptureStandardProvider::default());
+    provider.fail_first_main.store(true, Ordering::SeqCst);
     let registry = Arc::new(ProviderRegistry::with_provider(
         "capture-standard",
         provider.clone(),
@@ -14500,7 +14596,8 @@ async fn continue_generation_recovery_is_compiled_into_system_prompt() {
         .await
         .expect("thread should be created");
 
-    let mut events = subscribe_agent_events(&manager, thread_id).await;
+    let (mut events, checkpoints) =
+        subscribe_agent_events_with_checkpoints(&manager, thread_id).await;
 
     manager
         .start_test_turn_with_default_profile_and_capabilities(
@@ -14526,13 +14623,19 @@ async fn continue_generation_recovery_is_compiled_into_system_prompt() {
             .expect("must receive agent event in time")
             .expect("broadcast should remain open");
 
-        if matches!(event, AgentEvent::TurnCompleted { .. }) {
+        if matches!(event, AgentEvent::ProviderFailureDetected { .. }) {
             break;
         }
     }
 
     let recovery_job_id = "recovery_job_2";
     let recovery_attempt_id = "recovery_attempt_2";
+    let checkpoint = checkpoints
+        .lock()
+        .unwrap()
+        .get(turn_id)
+        .cloned()
+        .expect("failed native attempt must close its checkpoint");
     manager
         .start_recovery_attempt(
             thread_id,
@@ -14551,11 +14654,11 @@ async fn continue_generation_recovery_is_compiled_into_system_prompt() {
                 continue_generation: true,
                 model_override: None,
                 retained_provider_history: Vec::new(),
-                execution_checkpoint_context: None,
+                execution_checkpoint_context: Some(checkpoint),
             },
         )
         .await
-        .expect("recovery request should restart completed turn");
+        .expect("recovery request should continue the failed semantic turn");
 
     let mut saw_recovery_success = false;
     for _ in 0..40 {
@@ -14625,7 +14728,8 @@ async fn provider_recovery_success_boundary_clears_recovery_before_later_provide
         .ensure_thread(thread_id, "ws_000000000000000004b")
         .await
         .expect("thread should be created");
-    let mut events = subscribe_agent_events(&manager, thread_id).await;
+    let (mut events, checkpoints) =
+        subscribe_agent_events_with_checkpoints(&manager, thread_id).await;
 
     manager
         .start_test_turn_with_default_profile_and_capabilities(
@@ -14665,6 +14769,7 @@ async fn provider_recovery_success_boundary_clears_recovery_before_later_provide
         "initial provider failure should be emitted before recovery starts"
     );
 
+    let checkpoint = checkpoints.lock().unwrap().get(turn_id).cloned().unwrap();
     manager
         .start_recovery_attempt(
             thread_id,
@@ -14683,7 +14788,7 @@ async fn provider_recovery_success_boundary_clears_recovery_before_later_provide
                 continue_generation: false,
                 model_override: None,
                 retained_provider_history: Vec::new(),
-                execution_checkpoint_context: None,
+                execution_checkpoint_context: Some(checkpoint),
             },
         )
         .await
@@ -14705,12 +14810,7 @@ async fn provider_recovery_success_boundary_clears_recovery_before_later_provide
             }
             AgentEvent::ProviderFailureDetected {
                 failure, recovery, ..
-            } if failure
-                .message
-                .as_deref()
-                .unwrap_or_default()
-                .contains("late provider failure") =>
-            {
+            } if failure.class == ProviderFailureClass::Unknown => {
                 assert!(
                     saw_recovery_success,
                     "recovery success must be emitted before the later provider failure"

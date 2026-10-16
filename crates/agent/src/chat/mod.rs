@@ -12324,7 +12324,7 @@ mod tests {
         capabilities.vision = true;
         capabilities.input_types.image = pioneer_provider::InputTypeSupport::data_url_inline_only();
         let error = pioneer_provider::attachments::prepare_messages_for_provider_with_config(
-            "fixture",
+            "openai",
             &capabilities,
             &messages,
             &config,
