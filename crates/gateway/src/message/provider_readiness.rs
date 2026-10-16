@@ -744,6 +744,25 @@ impl MessageProcessor {
         }))
     }
 
+    #[cfg(test)]
+    pub(super) async fn refresh_cli_readiness_for_tests(
+        &self,
+        workspace_id: &str,
+    ) -> anyhow::Result<()> {
+        self.invalidate_cli_runtime_readiness_snapshot(workspace_id)
+            .await?;
+        let trace = GatewayProviderWarmupTrace::start(GatewayProviderWarmupScope::Cli);
+        let generation = self.provider_readiness.cli_generation(workspace_id).await;
+        self.perform_cli_runtime_warmup(
+            workspace_id,
+            &trace,
+            &Arc::new(Semaphore::new(1)),
+            generation,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Test-only seam for message integration fixtures that replace the real
     /// CLI process manager with an in-memory recording runtime.
     ///
@@ -1133,13 +1152,17 @@ impl MessageProcessor {
                             .await?;
                         let mut summary = live_readiness.summary;
                         let models = if matches!(summary.status, RuntimeStatus::Ready) {
-                            let result = self
-                                .cli_runtime_model_list_from_instance_with_trace(
-                                    &instance,
-                                    summary.proxy_url.as_deref(),
-                                    Some(trace),
-                                )
-                                .await;
+                            let result = match live_readiness.models {
+                                Some(models) => models,
+                                None => {
+                                    self.cli_runtime_model_list_from_instance_with_trace(
+                                        &instance,
+                                        summary.proxy_url.as_deref(),
+                                        Some(trace),
+                                    )
+                                    .await
+                                }
+                            };
                             let refreshed_at_unix_ms = chrono::Utc::now().timestamp_millis();
                             summary.models_refreshed_at_unix_ms = Some(refreshed_at_unix_ms);
                             if let Some(error) = result.error_message.as_deref() {

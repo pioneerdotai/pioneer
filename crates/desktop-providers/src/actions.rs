@@ -153,6 +153,9 @@ impl ProviderCatalogView {
         use cli_provider_settings::{
             CLIRuntimeProviderSettingsPlan, CLIRuntimeProviderSettingsRejection,
         };
+        if !self.settings_controls_available() {
+            return Err(CLIRuntimeProviderSettingsRejection::MissingSettings);
+        }
         if let CLIRuntimeProviderSettingsPlan::Reject(rejection) =
             cli_provider_settings::plan_cli_runtime_provider_draft_update(
                 self.gateway.settings.as_ref(),
@@ -216,6 +219,9 @@ impl ProviderCatalogView {
         let Some(workspace_id) = self.active_workspace_id().map(str::to_owned) else {
             return;
         };
+        if !self.settings_controls_available() {
+            return;
+        }
         self.run_command(
             ProviderCommand::SetRuntimeEnabled {
                 workspace_id,
