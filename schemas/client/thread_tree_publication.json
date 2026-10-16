@@ -805,6 +805,15 @@
             "$ref": "#/$defs/ThreadUnreadSummary"
           }
         },
+        "unread_by_folder_id": {
+          "description": "Unread messages in each folder and all descendants, including zero totals.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        },
         "workspace_id": {
           "type": "string"
         }
@@ -814,6 +823,7 @@
         "workspace_id",
         "threads_by_id",
         "unread",
+        "unread_by_folder_id",
         "folders_by_id",
         "placements_by_thread_id",
         "child_folder_ids_by_parent_id",

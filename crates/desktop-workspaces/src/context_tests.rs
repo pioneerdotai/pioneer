@@ -56,14 +56,33 @@ fn folder_pointer_and_keyboard_expansion_survives_reconciliation(cx: &mut TestAp
     core.open_workspace_thread("w".into(), None, None);
     let saves = Rc::new(RefCell::new(Vec::new()));
     let saved = saves.clone();
-    let mut config = config(core, Rc::new(RefCell::new(HashSet::new())));
+    let mut config = config(core.clone(), Rc::new(RefCell::new(HashSet::new())));
     config.save_expansion = Rc::new(move |_, state, _| saved.borrow_mut().push(state));
     let folders = vec![
         serde_json::from_value(serde_json::json!({"id":"parent","workspace_id":"w","name":"Parent","created_at":1,"updated_at":1})).unwrap(),
         serde_json::from_value(serde_json::json!({"id":"child","workspace_id":"w","parent_folder_id":"parent","name":"Child","created_at":1,"updated_at":1})).unwrap(),
     ];
-    let snapshot =
-        thread_tree_snapshot_from_parts("w".into(), vec![], vec![], folders, vec![], vec![]);
+    let thread: pioneer_client::workspaces::Thread = serde_json::from_value(serde_json::json!({
+        "id":"t","workspace_id":"w","name":"Thread","preview":"","mode":"Chat",
+        "model":"m","model_provider":"p","created_at":1,"updated_at":1,"status":"Idle","turns":[]
+    }))
+    .unwrap();
+    core.upsert_thread(thread.clone());
+    let snapshot = thread_tree_snapshot_from_parts(
+        "w".into(),
+        vec![thread],
+        vec![
+            serde_json::from_value(serde_json::json!({"thread_id":"t","unread_count":9})).unwrap(),
+        ],
+        folders,
+        vec![
+            serde_json::from_value(serde_json::json!({
+                "thread_id":"t","workspace_id":"w","folder_id":"child"
+            }))
+            .unwrap(),
+        ],
+        vec![],
+    );
     let publication = Arc::new(serde_json::from_value(serde_json::json!({
         "revision":1,"snapshot":snapshot,"changes":{"changed":[],"removed":[],"reordered_folders":[]},"loading":false,"error":null
     })).unwrap());
@@ -108,6 +127,15 @@ fn folder_pointer_and_keyboard_expansion_survives_reconciliation(cx: &mut TestAp
             saves.borrow().last().unwrap().get("parent"),
             Some(&expanded)
         );
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar
+                .input
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .unread_by_folder_id["parent"]),
+            9
+        );
         sidebar.update(cx, |sidebar, cx| sidebar.rebuild_sidebar_tree_state(cx));
         cx.run_until_parked();
         assert_eq!(
@@ -118,6 +146,43 @@ fn folder_pointer_and_keyboard_expansion_survives_reconciliation(cx: &mut TestAp
                 tree.index_of(&child_id).is_some(),
             )),
             (expanded, expanded)
+        );
+    }
+    // Counter-only publications must keep the selected folder and its expansion.
+    let selected = tree.read_with(cx, |tree, _| tree.selected_index());
+    assert!(selected.is_some());
+    for (revision, count) in [(2, 5), (3, 0)] {
+        let mut next = snapshot.clone();
+        next.unread[0].unread_count = count;
+        for total in next.unread_by_folder_id.values_mut() {
+            *total = count;
+        }
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.input = Some(Arc::new(serde_json::from_value(serde_json::json!({
+                "revision": revision, "snapshot": next,
+                "changes":{"changed":[{"kind":"folder","id":"parent"},{"kind":"folder","id":"child"}],
+                           "removed":[],"reordered_folders":[]},"loading":false,"error":null
+            })).unwrap()));
+            sidebar.rebuild_sidebar_tree_state(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            tree.read_with(cx, |tree, _| tree.selected_index()),
+            selected
+        );
+        assert!(!tree.read_with(cx, |tree, _| {
+            tree.entry(tree.index_of(&folder_id).unwrap())
+                .unwrap()
+                .is_expanded()
+        }));
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar
+                .input
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .unread_by_folder_id["parent"]),
+            count
         );
     }
     cx.update(|window, cx| tree.update(cx, |tree, cx| tree.focus(window, cx)));

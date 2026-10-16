@@ -155,6 +155,14 @@ impl SidebarProjectionStore {
                 changes.changed.push(SidebarNodeId::Thread(id.clone()));
             }
         }
+        for id in next.folders_by_id.keys() {
+            let node = SidebarNodeId::Folder(id.clone());
+            if before.unread_by_folder_id.get(id) != next.unread_by_folder_id.get(id)
+                && !changes.changed.contains(&node)
+            {
+                changes.changed.push(node);
+            }
+        }
         let folders = before
             .thread_ids_by_folder_id
             .keys()
@@ -1052,6 +1060,218 @@ mod tests {
         );
         assert!(next.changes.reordered_folders.is_empty());
     }
+    fn folder_directory() -> ThreadDirectoryStore {
+        let mut directory = ThreadDirectoryStore::default();
+        directory.threads.insert("t".into(), thread("t", "a", 1));
+        directory.unread.insert("t".into(), 3);
+        for (id, parent) in [
+            ("root", None),
+            ("left", Some("root")),
+            ("child", Some("left")),
+            ("right", Some("root")),
+        ] {
+            directory.folders.insert(
+                id.into(),
+                ThreadFolder {
+                    id: id.into(),
+                    workspace_id: "a".into(),
+                    parent_folder_id: parent.map(str::to_owned),
+                    name: id.into(),
+                    created_at: 1,
+                    updated_at: 1,
+                },
+            );
+        }
+        directory.placements.insert(
+            "t".into(),
+            ThreadPlacement {
+                thread_id: "t".into(),
+                workspace_id: "a".into(),
+                folder_id: Some("child".into()),
+            },
+        );
+        directory
+    }
+
+    #[test]
+    fn folder_unread_read_updates_publish_ancestors_without_reordering() {
+        let core = ClientCore::new();
+        {
+            let mut registry = core.thread_registry.lock().unwrap();
+            registry.directory = folder_directory();
+            let publication = registry.directory.project("a", None, false, None).unwrap();
+            core.publish_workspace_tree(publication);
+        }
+        let navigation = core.navigation_snapshot();
+        let mut revision = core.workspace_tree("a").unwrap().revision();
+        for (sort_key, count) in [("1", 8), ("2", 0)] {
+            core.apply_directory_read(
+                "a",
+                "t",
+                &pioneer_protocol::ThreadReadCursor {
+                    sort_key: sort_key.into(),
+                    through_turn_id: "turn".into(),
+                },
+                count,
+            );
+            let publication = core.workspace_tree("a").unwrap();
+            assert_eq!(publication.revision(), revision + 1);
+            revision = publication.revision();
+            for id in ["root", "left", "child"] {
+                assert_eq!(publication.snapshot().unread_by_folder_id[id], count);
+                assert!(
+                    publication
+                        .changes()
+                        .changed()
+                        .contains(&SidebarNodeId::Folder(id.into()))
+                );
+            }
+            assert_eq!(publication.snapshot().unread_by_folder_id["right"], 0);
+            assert!(publication.changes().reordered_folders().is_empty());
+            let decoded: ThreadTreePublication =
+                serde_json::from_value(serde_json::to_value(publication.as_ref()).unwrap())
+                    .unwrap();
+            assert_eq!(&decoded, publication.as_ref());
+        }
+        assert_eq!(core.navigation_snapshot().as_ref(), navigation.as_ref());
+    }
+
+    #[test]
+    fn folder_unread_moves_remove_old_ancestors_and_add_new_ones() {
+        let mut directory = folder_directory();
+        directory.project("a", None, false, None).unwrap();
+        directory.placements.get_mut("t").unwrap().folder_id = Some("right".into());
+        let moved = directory.project("a", None, false, None).unwrap();
+        assert_eq!(moved.snapshot.unread_by_folder_id["left"], 0);
+        assert_eq!(moved.snapshot.unread_by_folder_id["child"], 0);
+        assert_eq!(moved.snapshot.unread_by_folder_id["right"], 3);
+        assert_eq!(moved.snapshot.unread_by_folder_id["root"], 3);
+        for id in ["left", "child", "right"] {
+            assert!(
+                moved
+                    .changes
+                    .changed
+                    .contains(&SidebarNodeId::Folder(id.into()))
+            );
+        }
+        directory.placements.get_mut("t").unwrap().folder_id = Some("child".into());
+        directory.project("a", None, false, None);
+        directory.folders.get_mut("child").unwrap().parent_folder_id = Some("right".into());
+        let moved = directory.project("a", None, false, None).unwrap();
+        assert_eq!(moved.snapshot.unread_by_folder_id["left"], 0);
+        assert_eq!(moved.snapshot.unread_by_folder_id["right"], 3);
+        assert_eq!(moved.snapshot.unread_by_folder_id["root"], 3);
+        assert!(
+            moved
+                .changes
+                .changed
+                .contains(&SidebarNodeId::Folder("left".into()))
+        );
+        assert!(
+            moved
+                .changes
+                .changed
+                .contains(&SidebarNodeId::Folder("right".into()))
+        );
+        directory.folders.get_mut("child").unwrap().parent_folder_id = None;
+        let root = directory.project("a", None, false, None).unwrap();
+        assert_eq!(root.snapshot.unread_by_folder_id["root"], 0);
+        assert_eq!(root.snapshot.unread_by_folder_id["right"], 0);
+        assert_eq!(root.snapshot.unread_by_folder_id["child"], 3);
+        directory.placements.get_mut("t").unwrap().folder_id = None;
+        let root = directory.project("a", None, false, None).unwrap();
+        assert!(
+            root.snapshot
+                .unread_by_folder_id
+                .values()
+                .all(|count| *count == 0)
+        );
+        directory.placements.get_mut("t").unwrap().folder_id = Some("child".into());
+        directory.project("a", None, false, None);
+        directory.folders.get_mut("child").unwrap().name = "Renamed".into();
+        let renamed = directory.project("a", None, false, None).unwrap();
+        assert_eq!(renamed.snapshot.unread_by_folder_id["child"], 3);
+        directory.folders.remove("child");
+        let deleted = directory.project("a", None, false, None).unwrap();
+        assert!(!deleted.snapshot.unread_by_folder_id.contains_key("child"));
+        assert!(
+            deleted
+                .snapshot
+                .unread_by_folder_id
+                .values()
+                .all(|count| *count == 0)
+        );
+        assert!(
+            deleted
+                .changes
+                .removed
+                .contains(&SidebarNodeId::Folder("child".into()))
+        );
+    }
+
+    #[test]
+    fn folder_unread_filters_visibility_drafts_foreign_and_removed_threads_and_reconnects() {
+        let mut directory = folder_directory();
+        directory
+            .threads
+            .insert("foreign".into(), thread("foreign", "b", 1));
+        directory.unread.insert("foreign".into(), 90);
+        directory.unread.insert("inaccessible".into(), 80);
+        for id in ["foreign", "inaccessible"] {
+            directory.placements.insert(
+                id.into(),
+                ThreadPlacement {
+                    thread_id: id.into(),
+                    workspace_id: "a".into(),
+                    folder_id: Some("child".into()),
+                },
+            );
+        }
+        let initial = directory.project("a", None, false, None).unwrap();
+        assert_eq!(initial.snapshot.unread_by_folder_id["root"], 3);
+        let foreign = directory.project("b", None, false, None).unwrap();
+        assert!(foreign.snapshot.unread_by_folder_id.is_empty());
+        assert!(Arc::ptr_eq(&initial, &directory.snapshot("a").unwrap()));
+        directory.threads.get_mut("t").unwrap().sidebar_visibility =
+            pioneer_protocol::ThreadSidebarVisibility::Hidden;
+        let hidden = directory.project("a", None, false, None).unwrap();
+        assert_eq!(hidden.snapshot.unread_by_folder_id["root"], 0);
+        assert!(
+            hidden
+                .changes
+                .changed
+                .contains(&SidebarNodeId::Folder("root".into()))
+        );
+        directory.threads.get_mut("t").unwrap().sidebar_visibility =
+            pioneer_protocol::ThreadSidebarVisibility::Visible;
+        directory.project("a", None, false, None).unwrap();
+        let draft = directory.project("a", Some("t"), false, None).unwrap();
+        assert_eq!(draft.snapshot.unread_by_folder_id["root"], 0);
+        directory.project("a", None, false, None).unwrap();
+        directory.threads.remove("t");
+        let deleted = directory.project("a", None, false, None).unwrap();
+        assert_eq!(deleted.snapshot.unread_by_folder_id["root"], 0);
+        directory.invalidate();
+        assert!(directory.snapshot("a").is_none());
+        assert!(directory.snapshot("b").is_none());
+        let generation = directory.begin("a");
+        assert!(directory.complete(
+            "a",
+            generation,
+            ThreadTreeResponse {
+                workspace_id: "a".into(),
+                threads: vec![],
+                unread: vec![],
+                folders: vec![],
+                placements: vec![],
+                agents_docs: vec![],
+            }
+        ));
+        let reconnected = directory.project("a", None, false, None).unwrap();
+        assert!(reconnected.snapshot.unread_by_folder_id.is_empty());
+        assert!(reconnected.revision > deleted.revision);
+    }
+
     #[test]
     fn node_actions_complete_once_and_last_subscription_cancels_old_operation() {
         let core = Arc::new(ClientCore::new());
