@@ -6774,6 +6774,29 @@ fn is_child_task_main_request(request: &ChatRequest) -> bool {
     request.compiled_prompt.is_some() && is_child_task_request(request)
 }
 
+fn fixture_skill_wire_name(name: &str) -> String {
+    if name.starts_with("skill.") {
+        use sha2::Digest;
+        format!(
+            "p1v1{}",
+            &hex::encode(sha2::Sha256::digest(name.as_bytes()))[..60]
+        )
+    } else {
+        name.to_owned()
+    }
+}
+
+fn fixture_wire_tool_calls(calls: &[ProviderToolCall]) -> Vec<ProviderToolCall> {
+    calls
+        .iter()
+        .cloned()
+        .map(|mut call| {
+            call.name = fixture_skill_wire_name(&call.name);
+            call
+        })
+        .collect()
+}
+
 #[async_trait::async_trait]
 impl Provider for SequencedToolProvider {
     fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
@@ -6837,7 +6860,7 @@ impl Provider for SequencedToolProvider {
                 reasoning_content: None,
                 provider_replay_state: None,
                 termination: pioneer_provider::ProviderTermination::ToolCalls,
-                tool_calls: tool_calls.clone(),
+                tool_calls: fixture_wire_tool_calls(tool_calls),
             });
         }
         if index == 0 {
@@ -6852,7 +6875,7 @@ impl Provider for SequencedToolProvider {
                 reasoning_content: None,
                 provider_replay_state: None,
                 termination,
-                tool_calls: self.first_tool_calls.clone(),
+                tool_calls: fixture_wire_tool_calls(&self.first_tool_calls),
             });
         }
 
@@ -33922,7 +33945,7 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
     for expected_tool in [
         "task_create",
         "read_skill",
-        dynamic_skill_tool_name.as_str(),
+        fixture_skill_wire_name(&dynamic_skill_tool_name).as_str(),
         "mcp_resend_send",
     ] {
         assert!(
@@ -56301,7 +56324,7 @@ fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
     });
 }
 
-async fn ensure_test_native_snapshot_owner(
+pub(super) async fn ensure_test_native_snapshot_owner(
     processor: &MessageProcessor,
     workspace: &str,
     thread: &str,
@@ -57699,40 +57722,44 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                 .ensure_agent_listener_task(thread_id)
                 .await
                 .unwrap();
-            let checkpoint = if cycle == 0 {
-                None
-            } else {
-                let stored = crud_store_for_assert
-                    .native_semantic_checkpoint_for_turn(turn_id)
-                    .await
-                    .unwrap()
-                    .expect("resumed cancellation keeps its actual semantic state");
-                let payload: pioneer_protocol::ExecutionCheckpointPayload =
-                    serde_json::from_value(stored.payload_json).unwrap();
-                Some(pioneer_agent::ExecutionCheckpointContext {
-                    window_id: payload.window.window_id.clone().unwrap(),
-                    window_index: payload.window.window_index,
-                    checkpoint_id: stored.id,
-                    checkpoint_kind: "semantic_state".into(),
-                    payload,
-                    usage: crate::turn_runtime_snapshot::execution_window_usage_snapshot(
-                        crud_store_for_assert.as_ref(),
+            if cycle == 0 {
+                processor
+                    .start_admitted_native_snapshot_turn(
+                        thread_id,
                         turn_id,
+                        default_test_permission_profile(),
+                        security.clone(),
+                        None,
                     )
                     .await
-                    .unwrap(),
-                })
-            };
-            processor
-                .start_admitted_native_snapshot_turn(
-                    thread_id,
-                    turn_id,
-                    default_test_permission_profile(),
-                    security.clone(),
-                    checkpoint,
-                )
-                .await
-                .unwrap();
+                    .unwrap();
+            } else {
+                // Close the actual Running predecessor before continuing it.
+                // A semantic checkpoint alone is not a recovery-close receipt.
+                let weak = Arc::downgrade(&processor);
+                processor
+                    .recovery_coordinator
+                    .set_listener_starter(Arc::new(move |thread| {
+                        let weak = weak.clone();
+                        Box::pin(async move {
+                            weak.upgrade()
+                                .expect("cancellation fixture stays alive")
+                                .ensure_agent_listener_task(&thread)
+                                .await
+                                .map_err(|e| e.to_string())
+                        })
+                    }))
+                    .await;
+                let now = now_timestamp_secs();
+                let events = processor
+                    .recovery_coordinator
+                    .run_ready_jobs(now, 8)
+                    .await
+                    .unwrap();
+                for event in events {
+                    processor.handle_recovery_event(event, now).await;
+                }
+            }
             tokio::time::timeout(Duration::from_secs(5), entered.notified())
                 .await
                 .unwrap();
@@ -66414,7 +66441,7 @@ Gateway skill body"#,
         .expect("second round must include dynamic tool result");
     assert_eq!(
         dynamic_result.name.as_deref(),
-        Some(dynamic_tool_name.as_str())
+        Some(fixture_skill_wire_name(&dynamic_tool_name).as_str())
     );
     assert!(dynamic_result.content.contains("gw-shell-ok"));
 
@@ -66747,7 +66774,7 @@ Gateway HTTP skill body"#
         .expect("second round must include dynamic http tool result");
     assert_eq!(
         dynamic_result.name.as_deref(),
-        Some(dynamic_tool_name.as_str())
+        Some(fixture_skill_wire_name(&dynamic_tool_name).as_str())
     );
     assert!(dynamic_result.content.contains(SECRET));
 
@@ -75853,13 +75880,22 @@ async fn wait_for_task_status(
         }
         sleep(Duration::from_millis(25)).await;
     }
-    crud_store
+    let response = crud_store
         .get_task(task_id)
         .await
         .expect("task query should succeed")
-        .expect("task should exist")
-        .task
-        .status
+        .expect("task should exist");
+    for child in &response.task_run_turns {
+        let canonical = crud_store.get_turn(&child.thread_id, &child.turn_id).await;
+        let execution = crud_store.get_turn_execution(&child.turn_id).await;
+        let checkpoint = crud_store
+            .native_semantic_checkpoint_for_turn(&child.turn_id)
+            .await;
+        eprintln!(
+            "Task completion timeout: canonical={canonical:?}; execution={execution:?}; checkpoint={checkpoint:?}"
+        );
+    }
+    response.task.status
 }
 
 async fn wait_for_run_status(
@@ -76936,11 +76972,17 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
     })
     .await
     .expect("second overflow must terminate bounded recovery");
+    let terminal = store
+        .get_turn("native-controller", "native-controller-turn")
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
     let requests = provider.0.lock().unwrap();
     assert_eq!(
         requests.len(),
         2 + usize::from(with_tool),
-        "one original request and exactly one main retry, plus the initial tool round"
+        "one original request and exactly one main retry, plus the initial tool round; terminal={terminal:?}"
     );
     assert!(requests.iter().all(|request| request.max_tokens.is_some()));
     drop(requests);

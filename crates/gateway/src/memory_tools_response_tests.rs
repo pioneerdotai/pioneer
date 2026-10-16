@@ -210,10 +210,24 @@ async fn stream_errors_require_typed_proof_for_completion_retry_policy() {
             .unwrap_err();
         assert_eq!(
             error.code.as_str(),
-            "memory.post_turn_extractor.provider_stream_stall"
+            "memory.post_turn_extractor.provider_unknown"
         );
-        assert!(error.retryable);
+        assert!(!error.retryable);
     }
+    let failure = pioneer_provider::failure::ProviderTransportFailure {
+        classification: pioneer_provider::ProviderFailureClassification::new(
+            pioneer_provider::ProviderFailureClass::StreamStall,
+        ),
+    };
+    let stream = Box::pin(stream::iter(vec![Err(anyhow::Error::from(failure))]));
+    let error = collect_post_turn_extractor_stream(stream, &provider, "model", "initial")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.code.as_str(),
+        "memory.post_turn_extractor.provider_stream_stall"
+    );
+    assert!(error.retryable);
     for cause in [
         pioneer_provider::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker,
         pioneer_provider::failure::ProviderStreamIncomplete::DoneWithoutFinishReason,

@@ -7900,9 +7900,9 @@ mod prepared_snapshot_tests {
             db.execute_unprepared(sql).await.unwrap();
         }
         let processor = MessageProcessor::new(
-            Arc::new(ThreadManager::new("gpt-4", "openai")),
+            Arc::new(ThreadManager::new("gpt-4", "echo")),
             Arc::new(ProviderRegistry::with_provider(
-                "openai",
+                "echo",
                 Arc::new(EchoProvider::new()),
             )),
             Arc::new(SessionManager::new()),
@@ -7911,12 +7911,50 @@ mod prepared_snapshot_tests {
             Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
             summary::SummaryConfig {
                 summary_model: Some("gpt-4".into()),
-                summary_model_provider: Some("openai".into()),
+                summary_model_provider: Some("echo".into()),
                 title_model: Some("gpt-4".into()),
-                title_model_provider: Some("openai".into()),
+                title_model_provider: Some("echo".into()),
             },
             crate::message::tests::test_tool_loop_config(),
         );
+        crate::session::test_support::ensure_test_superuser_execution_authority(&store).await;
+        let principal = crate::session::test_support::authenticated_test_superuser();
+        let permission = pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+            pioneer_protocol::TurnPermissionMode::FullAccess,
+            pioneer_protocol::TurnPermissionProfileSource::Composer,
+        );
+        let mut authority = crate::authorization::ExecutionAuthorizationContext::for_test(
+            principal.as_ref(),
+            "race-legacy-ws",
+            "execution",
+            &permission,
+            None,
+        );
+        authority.bind_test_provider_authority(
+            "echo",
+            "gpt-4",
+            processor
+                .provider_registry
+                .authority_fingerprint_for_workspace("race-legacy-ws", "echo")
+                .unwrap()
+                .as_str(),
+        );
+        assert!(
+            store
+                .set_turn_execution_authorization_context(
+                    "execution-turn",
+                    &authority.to_persisted_json().unwrap()
+                )
+                .await
+                .unwrap()
+        );
+        crate::message::tests::ensure_test_native_snapshot_owner(
+            &processor,
+            "race-legacy-ws",
+            "execution",
+            "execution-turn",
+        )
+        .await;
         let mut hook = AgentTurnHookRuntimeContext::default();
         hook.conversation_thread_id = Some("parent".into());
         processor
@@ -7927,7 +7965,7 @@ mod prepared_snapshot_tests {
                 ThreadMode::Agent,
                 &hook,
                 "gpt-4",
-                "openai",
+                "echo",
                 None,
                 &std::collections::HashMap::new(),
                 &[],
