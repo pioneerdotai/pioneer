@@ -57651,7 +57651,7 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                 .unwrap()
         );
         ensure_test_native_snapshot_owner(&processor, &workspace_id, thread_id, turn_id).await;
-        let security = test_full_access_execution_security_snapshot().unwrap();
+        let security = test_full_access_execution_security_snapshot();
         assert!(
             crud_store_for_assert
                 .set_turn_execution_security_snapshot(turn_id, &security)
