@@ -76691,7 +76691,7 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
             })
             .collect::<Vec<_>>()
             .join("\n"),
-    ));
+    ).named("summary-capture"));
     let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         provider.clone(),
@@ -77715,7 +77715,7 @@ async fn compaction_native_controller_runs_on_real_turn_and_checks_short_complet
     sessions
         .set_connection_workspace(connection, Some(workspace.clone()))
         .await;
-    let provider = Arc::new(CaptureSummaryProvider::new("controller answer"));
+    let provider = Arc::new(CaptureSummaryProvider::new("controller answer").named("openai"));
     let processor = Arc::new(MessageProcessor::new(
         threads.clone(),
         Arc::new(pioneer_provider::ProviderRegistry::with_provider(
