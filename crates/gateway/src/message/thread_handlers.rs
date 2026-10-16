@@ -1149,6 +1149,11 @@ impl MessageProcessor {
         });
         let scoped_principal_id =
             (!authorization.decision().is_absolute()).then(|| authorization.principal_id());
+        // Serialize the committed snapshot, memory update and publication with
+        // automatic titles. No database reservation survives into fanout.
+        let publication = self
+            .thread_title_publication_guard(authorization.thread_id())
+            .await;
         let mutation = match self
             .crud_store
             .update_user_thread_management(
@@ -1298,6 +1303,9 @@ impl MessageProcessor {
                 .await;
                 self.notify_thread_tree_changed(workspace_id).await;
             }
+        }
+        drop(publication);
+        if changed {
             if let Some(name) = name {
                 self.best_effort_sync_cli_runtime_thread_name(
                     thread.workspace_id.as_str(),

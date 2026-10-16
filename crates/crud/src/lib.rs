@@ -23498,6 +23498,28 @@ impl CrudStore {
         .await
     }
 
+    pub async fn update_automatic_thread_name(
+        &self,
+        thread_id: &str,
+        name: &str,
+        fallback: Option<&str>,
+        binding: Option<&CliRuntimeThreadBindingRecord>,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            let now = unix_to_datetime(chrono::Utc::now().timestamp());
+            thread::update_automatic_thread_name(
+                &self.connection,
+                thread_id,
+                name,
+                fallback,
+                binding,
+                now,
+            )
+            .await
+        })
+        .await
+    }
+
     pub async fn get_thread_summary(&self, thread_id: &str) -> Result<Option<(String, i64)>> {
         let model = thread::find_thread_by_id(&self.connection, thread_id).await?;
         match model {
