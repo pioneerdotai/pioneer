@@ -117,7 +117,7 @@ pub(super) fn history_roots_valid(roots: &[pioneer_compaction::SourceRef]) -> bo
                 && root.scope.len() > "checkpoint:".len()
                 && root.scope.len() <= 512
                 && !root.id.is_empty()
-                && root.id.len() <= 21
+                && root.id.len() <= pioneer_compaction::CHECKPOINT_ID_MAX_BYTES
                 && !root.version.is_empty()
                 && root.version.len() <= 256
                 && !roots[..index].contains(root)
@@ -136,7 +136,7 @@ pub(super) fn history_roots_from_request(
     {
         if source.scope.len() > 512
             || source.id.is_empty()
-            || source.id.len() > 21
+            || source.id.len() > pioneer_compaction::CHECKPOINT_ID_MAX_BYTES
             || source.version.is_empty()
             || source.version.len() > 256
         {
@@ -351,4 +351,28 @@ pub(super) fn capture(
     let state: NativeSemanticState = serde_json::from_slice(&encoded).map_err(|_| unavailable())?;
     state.validate(turn, budget)?;
     serde_json::from_slice(&encoded).map_err(|_| unavailable())
+}
+
+#[cfg(test)]
+mod history_root_tests {
+    use super::*;
+
+    #[test]
+    fn compound_summary_roots_roundtrip_and_remain_bounded() {
+        let root = pioneer_compaction::SourceRef {
+            scope: "checkpoint:native:workspace:thread".into(),
+            id: format!("{}:summary:{}", "o".repeat(21), u32::MAX),
+            version: "a".repeat(64),
+        };
+        assert!(root.id.len() > 21);
+        let decoded = serde_json::from_slice::<Vec<pioneer_compaction::SourceRef>>(
+            &encode(&vec![root.clone()]).unwrap(),
+        )
+        .unwrap();
+        assert!(history_roots_valid(&decoded));
+        let mut oversized = root.clone();
+        oversized.id = "x".repeat(pioneer_compaction::CHECKPOINT_ID_MAX_BYTES + 1);
+        assert!(!history_roots_valid(&[oversized]));
+        assert!(!history_roots_valid(&[root.clone(), root]));
+    }
 }

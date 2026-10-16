@@ -66,7 +66,7 @@ pub(super) async fn restore_native_history_roots_with_scope(
             root.scope.starts_with("checkpoint:")
                 && root.scope.len() <= 512
                 && !root.id.is_empty()
-                && root.id.len() <= 21
+                && root.id.len() <= pioneer_compaction::CHECKPOINT_ID_MAX_BYTES
                 && !root.version.is_empty()
                 && root.version.len() <= 256
                 && !roots[..index].contains(root),

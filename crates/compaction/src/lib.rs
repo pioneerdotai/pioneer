@@ -13,6 +13,9 @@ pub use history::*;
 pub use selection::*;
 
 pub const FORMAT_VERSION: u32 = 1;
+/// Compound `<operation>:summary:<attempt>` identity, including legacy roots.
+/// This is distinct from the shorter operation ID and remains byte bounded.
+pub const CHECKPOINT_ID_MAX_BYTES: usize = 64;
 /// Maximum exact replay aliases published by one checkpoint. Accepted frozen
 /// histories may contain more, because only selected coverage contributes.
 pub const REPLAY_ALIAS_LIMIT: usize = 256;
