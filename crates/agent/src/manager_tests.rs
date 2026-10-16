@@ -2672,7 +2672,9 @@ impl AgentMemoryProvider for RecordingMemoryProvider {
             .iter()
             .map(|bundle| bundle.specs.clone())
             .collect::<Vec<_>>();
-        if actual != accepted_specs {
+        if serde_json::to_value(&actual).map_err(|e| e.to_string())?
+            != serde_json::to_value(accepted_specs).map_err(|e| e.to_string())?
+        {
             return Err("fixture memory tool contract changed".into());
         }
         Ok(materialized)
