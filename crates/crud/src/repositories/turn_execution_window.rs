@@ -681,7 +681,9 @@ pub fn aggregate_turn_execution_window_records(
         aggregate.total_provider_tokens = aggregate
             .total_provider_tokens
             .saturating_add(window.provider_token_count);
-        if window.agent_round_count > 0
+        if (window.agent_round_count > 0
+            || window.provider_token_count > 0
+            || window.metadata_json["providerUsageAvailable"].as_bool() == Some(false))
             && (window
                 .metadata_json
                 .get("accountingSchemaVersion")

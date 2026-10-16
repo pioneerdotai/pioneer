@@ -4114,9 +4114,13 @@ mod tests {
                     paths,
                     vec![format!("POST /{secret}/v1/files HTTP/1.1"); attempts]
                 );
-                assert!(
-                    logs.contains(&format!("HTTP {}", status.unwrap())),
-                    "{logs}"
+                // Observability emits the safe class; HTTP status belongs to the
+                // typed failure source, rather than raw error text in the log.
+                assert_eq!(
+                    crate::failure::classify_transport_error(&error)
+                        .unwrap()
+                        .http_status,
+                    status
                 );
             }
         }
