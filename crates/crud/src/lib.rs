@@ -336,6 +336,7 @@ pub struct TurnEventProjectionAfterAppendError {
     sequence: i64,
     projection_error: String,
     projection_failure_record_error: Option<String>,
+    pending: bool,
 }
 
 impl TurnEventProjectionAfterAppendError {
@@ -352,7 +353,20 @@ impl TurnEventProjectionAfterAppendError {
             sequence,
             projection_error,
             projection_failure_record_error,
+            pending: false,
         }
+    }
+
+    fn pending(event_id: String, turn_id: String, sequence: i64, message: String) -> Self {
+        let mut error = Self::new(event_id, turn_id, sequence, message, None);
+        error.pending = true;
+        error
+    }
+
+    /// A durable append whose authoritative receipt is owned by projection replay.
+    /// This never acknowledges completion and never describes a failed projector.
+    pub fn is_pending(&self) -> bool {
+        self.pending
     }
 }
 
@@ -29831,12 +29845,11 @@ impl CrudStore {
                         "failed to release deferred turn event projection claim; lease expiry will retry it"
                     ),
                 }
-                return Err(TurnEventProjectionAfterAppendError::new(
+                return Err(TurnEventProjectionAfterAppendError::pending(
                     appended_event.id,
                     appended_event.turn_id,
                     appended_event.sequence,
                     "authoritative projection is waiting for an earlier turn event".to_owned(),
-                    None,
                 )
                 .into());
             }
@@ -30543,12 +30556,11 @@ impl CrudStore {
             // and still be projecting it. Its durable append is just as
             // authoritative as our own: callers must not roll back local
             // terminal state while the original projection is in flight.
-            return Err(TurnEventProjectionAfterAppendError::new(
+            return Err(TurnEventProjectionAfterAppendError::pending(
                 appended_event.id,
                 appended_event.turn_id,
                 appended_event.sequence,
                 "idempotent canonical event is waiting for its authoritative projection".to_owned(),
-                None,
             )
             .into());
         }
@@ -48775,6 +48787,12 @@ mod tests {
             .materialize_native_agent_turn_event(event.clone(), timestamp + 2, None)
             .await
             .expect_err("projection remains pending behind the original producer");
+        assert!(
+            duplicate_error
+                .downcast_ref::<super::TurnEventProjectionAfterAppendError>()
+                .expect("typed after-append outcome")
+                .is_pending()
+        );
         assert!(
             super::turn_event_was_appended_before_error(&duplicate_error),
             "Gateway must preserve the terminal state and ACK the already committed event"
