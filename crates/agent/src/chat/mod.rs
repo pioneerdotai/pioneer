@@ -12305,9 +12305,17 @@ mod tests {
             image.source = pioneer_provider::attachments::owned_bytes_source(&bytes);
             image.size_bytes = Some(bytes.len() as u64);
         }
-        let mut messages = vec![frame];
+        let call = pioneer_provider::ProviderToolCall {
+            id: "current".into(),
+            name: "computer_use".into(),
+            arguments: "{}".into(),
+        };
+        let mut messages = vec![
+            ChatMessage::assistant_tool_calls(None::<String>, vec![call]),
+            frame,
+        ];
         retain_agent_attachment_messages(&mut messages);
-        assert!(messages[0].has_attachments());
+        assert!(messages[1].has_attachments());
         let config = pioneer_provider::attachments::AttachmentPipelineConfig {
             max_total_bytes_per_request: 32,
             ..Default::default()
@@ -12326,9 +12334,10 @@ mod tests {
             error.to_string().contains("ATTACHMENT_TOO_LARGE")
                 || error
                     .to_string()
-                    .contains("ATTACHMENT_TOTAL_BUDGET_EXCEEDED")
+                    .contains("ATTACHMENT_TOTAL_BUDGET_EXCEEDED"),
+            "{error:#}"
         );
-        assert!(messages[0].has_attachments());
+        assert!(messages[1].has_attachments());
     }
 
     #[test]

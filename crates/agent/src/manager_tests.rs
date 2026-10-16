@@ -4264,10 +4264,112 @@ fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent>
     }
 }
 
+// Deterministic durable control source for manager-level fixtures. ACK only
+// follows recording, and reads revalidate scope plus the exact content hash.
+struct FixtureControlContext {
+    delegate: Option<Arc<dyn crate::compaction::controller::NativeContextController>>,
+    records: std::sync::Mutex<
+        std::collections::BTreeMap<
+            (String, String, String, String),
+            pioneer_protocol::NativeControlRecord,
+        >,
+    >,
+}
+#[async_trait::async_trait]
+impl crate::compaction::controller::NativeContextController for FixtureControlContext {
+    async fn load_native_controls(
+        &self,
+        context: &crate::compaction::controller::NativeContext,
+        references: &[pioneer_protocol::NativeControlRef],
+    ) -> anyhow::Result<Vec<pioneer_protocol::NativeControlRecord>> {
+        let records = self.records.lock().unwrap();
+        references
+            .iter()
+            .map(|reference| {
+                let record = records
+                    .get(&(
+                        context.workspace_id.clone(),
+                        context.thread_id.clone(),
+                        context.turn_id.clone(),
+                        reference.item_id.clone(),
+                    ))
+                    .ok_or_else(|| anyhow::anyhow!("fixture control source is unavailable"))?;
+                anyhow::ensure!(
+                    record.reference()? == *reference,
+                    "fixture control source changed"
+                );
+                Ok(record.clone())
+            })
+            .collect()
+    }
+    async fn load_native_history_roots(
+        &self,
+        context: &crate::compaction::controller::NativeContext,
+        roots: &[pioneer_compaction::SourceRef],
+    ) -> anyhow::Result<Vec<ChatMessage>> {
+        if let Some(delegate) = &self.delegate {
+            return delegate.load_native_history_roots(context, roots).await;
+        }
+        anyhow::ensure!(roots.is_empty(), "fixture has no checkpoint history source");
+        Ok(Vec::new())
+    }
+    async fn stop(
+        &self,
+        context: &crate::compaction::controller::NativeContext,
+    ) -> anyhow::Result<()> {
+        if let Some(delegate) = &self.delegate {
+            return delegate.stop(context).await;
+        }
+        Ok(())
+    }
+    async fn prepare(
+        &self,
+        context: &crate::compaction::controller::NativeContext,
+        request: ChatRequest,
+        measurement: Option<crate::compaction::controller::NativeUsageMeasurement>,
+        recovery: bool,
+    ) -> anyhow::Result<crate::compaction::controller::NativePreparedRequest> {
+        if let Some(delegate) = &self.delegate {
+            return delegate
+                .prepare(context, request, measurement, recovery)
+                .await;
+        }
+        let prepared = context.provider.prepare_input_budget(request).await?;
+        let receipt = crate::compaction::controller::NativeInputReceipt::for_request(
+            &prepared.request,
+            &context.provider_instance,
+            context.provider.usage_api(),
+            0,
+            None,
+        )?;
+        Ok(crate::compaction::controller::NativePreparedRequest {
+            history_check: crate::compaction::controller::NativeHistoryCheckMetadata {
+                target_output_cap: prepared.request.max_tokens.unwrap_or(4096),
+                fixed_input_tokens: 0,
+            },
+            request: prepared.request,
+            receipt,
+            covered_native_control_ids: Vec::new(),
+        })
+    }
+}
+
 async fn subscribe_agent_events(
     manager: &AgentManager,
     thread_id: &str,
 ) -> tokio::sync::mpsc::Receiver<AgentEvent> {
+    let controller = Arc::new(FixtureControlContext {
+        delegate: manager
+            .runtime_dependencies
+            .snapshot()
+            .await
+            .context_controller
+            .clone(),
+        records: Default::default(),
+    });
+    manager
+        .set_context_controller(Some(controller.clone()))
+        .await;
     let mut durable_rx = manager
         .take_durable_receiver(thread_id)
         .await
@@ -4275,6 +4377,31 @@ async fn subscribe_agent_events(
     let (tx, rx) = tokio::sync::mpsc::channel(256);
     tokio::spawn(async move {
         while let Some(event) = durable_rx.recv().await {
+            if let AgentDurableEvent::ItemCompleted(notification) = &event {
+                if let TurnItem::SystemEvent {
+                    code,
+                    details: Some(details),
+                    ..
+                } = &notification.item
+                {
+                    if code.as_deref() == Some("native.control") {
+                        let record: pioneer_protocol::NativeControlRecord =
+                            serde_json::from_value(details["nativeControl"].clone()).unwrap();
+                        record.validate().unwrap();
+                        let mut records = controller.records.lock().unwrap();
+                        assert!(records.len() < 4096);
+                        records.insert(
+                            (
+                                notification.workspace_id.clone(),
+                                notification.thread_id.clone(),
+                                notification.turn_id.clone(),
+                                record.id.clone(),
+                            ),
+                            record,
+                        );
+                    }
+                }
+            }
             let event = test_agent_event_from_durable(event);
             durable_rx.acknowledge_last(Ok(()));
             let Some(event) = event else {
@@ -17211,7 +17338,10 @@ async fn required_context_helpers_preserve_runtime_policy_on_both_phases() {
                     "required fallback"
                 );
             }
-            assert_eq!(snapshot_hook_calls(&calls).len(), 1);
+            assert_eq!(
+                snapshot_hook_calls(&calls).len(),
+                usize::from(policy != HookFailurePolicy::Skip)
+            );
         }
     }
 }

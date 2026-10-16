@@ -2640,7 +2640,7 @@ mod tests {
                 Some(expected)
             );
         }
-        for (suffix, truncated_transport) in [
+        for (index, (suffix, truncated_transport)) in [
             ("", false),
             ("", true),
             ("data: {", false),
@@ -2652,7 +2652,10 @@ mod tests {
                 "data: {\"id\": \"private_fixture\", \"choices\": \"private_fixture\"}\n\n",
                 false,
             ),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let body = format!("data: {{\"id\":\"gen-body\",\"choices\":[]}}\n\n{suffix}");
             let failure = failure_from_local_endpoint(
                 "openrouter",
@@ -2665,7 +2668,12 @@ mod tests {
                 truncated_transport,
             )
             .await;
-            assert_eq!(failure.class, ProviderFailureClass::StreamTruncated);
+            let expected = match index {
+                1 => ProviderFailureClass::NetworkTransient, // Physical response body ended early.
+                4 => ProviderFailureClass::Unknown, // Malformed JSON shape has no typed transport proof.
+                _ => ProviderFailureClass::StreamTruncated, // Decoder proved an incomplete native stream.
+            };
+            assert_eq!(failure.class, expected, "case {index}");
             assert_eq!(failure.http_status, None);
             let diagnostic = RecoveryDiagnostic::provider(&failure);
             assert_eq!(
