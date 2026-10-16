@@ -6606,6 +6606,17 @@ impl MessageProcessor {
                         return;
                     }
                 } };
+            if let Some(name) = native_thread.name.as_ref() {
+                self.handle_cli_runtime_event(
+                    session_handle.instance(),
+                    pioneer_cli_agent_runtime::event::RuntimeEvent::ThreadNameUpdated(
+                        pioneer_cli_agent_runtime::event::RuntimeThreadNameUpdated {
+                            native_thread_id: native_thread.binding.native_thread_id.clone(),
+                            name: name.clone(),
+                        },
+                    ),
+                ).await;
+            }
             let input_mapping_json = match pioneer_crud::serialize_cli_runtime_json(&input_mapping)
                 .and_then(|json| match sent_context_basis.as_ref() {
                     Some(basis) => crate::cli_runtime::thread_binding::persist_sent_context_basis_in_input_mapping(

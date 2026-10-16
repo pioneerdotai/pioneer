@@ -697,7 +697,33 @@ impl MessageProcessor {
             agents_docs.len() as u64,
         );
 
+        let running_task_thread_ids =
+            match crate::authorization::AuthorizationResolver::new((*self.crud_store).clone())
+                .running_task_thread_ids(
+                    request_context.principal(),
+                    &workspace_id,
+                    &accessible_thread_ids.iter().cloned().collect::<Vec<_>>(),
+                )
+                .await
+            {
+                Ok(ids) => ids,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to load thread task activity: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    trace.finish_failure();
+                    return;
+                }
+            };
+
         let response_payload = ThreadTreeResponse {
+            running_task_thread_ids,
             workspace_id,
             threads,
             unread,
@@ -1123,6 +1149,11 @@ impl MessageProcessor {
         });
         let scoped_principal_id =
             (!authorization.decision().is_absolute()).then(|| authorization.principal_id());
+        // Serialize the committed snapshot, memory update and publication with
+        // automatic titles. No database reservation survives into fanout.
+        let publication = self
+            .thread_title_publication_guard(authorization.thread_id())
+            .await;
         let mutation = match self
             .crud_store
             .update_user_thread_management(
@@ -1272,6 +1303,9 @@ impl MessageProcessor {
                 .await;
                 self.notify_thread_tree_changed(workspace_id).await;
             }
+        }
+        drop(publication);
+        if changed {
             if let Some(name) = name {
                 self.best_effort_sync_cli_runtime_thread_name(
                     thread.workspace_id.as_str(),

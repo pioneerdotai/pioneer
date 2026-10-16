@@ -10320,26 +10320,31 @@ async fn repeated_title_triggers_are_singleflight_per_thread() {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let counting_provider = Arc::new(CountingDelayedProvider::new(
-        Duration::from_millis(200),
-        "Единый заголовок",
-    ));
+    let counting_provider = Arc::new(
+        CaptureSummaryProvider::new("Единый заголовок")
+            .with_first_delay(Duration::from_millis(200)),
+    );
     let mut summary_config = test_summary_config();
     summary_config.title_model_provider = Some("openai".to_owned());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         counting_provider.clone(),
     ));
-    let processor = Arc::new(MessageProcessor::new(
-        thread_manager,
-        provider_registry,
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        summary_config,
-        test_tool_loop_config(),
-    ));
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = Arc::new(
+        MessageProcessor::new(
+            thread_manager,
+            provider_registry,
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            summary_config,
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+    );
 
     let thread_id = "thr_title_singleflight_0001";
     let thread = pioneer_protocol::Thread {
@@ -10408,6 +10413,185 @@ async fn repeated_title_triggers_are_singleflight_per_thread() {
         "singleflight should keep one active title generation job"
     );
     assert_eq!(thread.name.as_deref(), Some("Единый заголовок"));
+
+    let key = CLIAgentRuntimeSessionKey::new(&workspace_id, "codex", thread_id).unwrap();
+    let handle = cli_manager.get_or_start(key.clone()).await.unwrap();
+    let binding = crud_store
+        .upsert_cli_runtime_thread_binding(pioneer_crud::NewCliRuntimeThreadBinding {
+            thread_id: thread_id.into(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".into(),
+            runtime_kind: "codex".into(),
+            native_thread_id: "native-title".into(),
+            native_session_id: None,
+            native_root_thread_id: None,
+            native_cwd: None,
+            native_model: None,
+            resume_cursor_json: "{}".into(),
+            status: "active".into(),
+            created_at: chrono::Utc::now().fixed_offset(),
+            updated_at: chrono::Utc::now().fixed_offset(),
+        })
+        .await
+        .unwrap();
+    let fallback = "первый текст для заголовка";
+    let persisted_name = || async {
+        crud_store
+            .get_thread_by_id(thread_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .name
+    };
+    // Exercise the same job and writer boundary with a rename arriving while
+    // the provider is in flight. Both a person and a native name must win.
+    for (index, winner) in ["Ручное название", "Имя Codex"].into_iter().enumerate()
+    {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while processor
+                .title_job_runtime
+                .lock()
+                .await
+                .contains_key(thread_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        crud_store.update_thread_name(thread_id, "").await.unwrap();
+        counting_provider.pause_first.store(true, Ordering::SeqCst);
+        processor.spawn_initial_thread_title_task(thread_id.into(), Some(fallback.into()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while counting_provider.call_count() < index + 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        if index == 0 {
+            crud_store
+                .update_thread_name(thread_id, winner)
+                .await
+                .unwrap();
+        } else {
+            use pioneer_cli_agent_runtime::event::RuntimeThreadNameUpdated;
+            for (workspace, runtime, pioneer, native, name) in [
+                (
+                    "other-workspace",
+                    "codex",
+                    thread_id,
+                    "native-title",
+                    winner,
+                ),
+                (
+                    workspace_id.as_str(),
+                    "other-runtime",
+                    thread_id,
+                    "native-title",
+                    winner,
+                ),
+                (
+                    workspace_id.as_str(),
+                    "codex",
+                    "other-thread",
+                    "native-title",
+                    winner,
+                ),
+                (
+                    workspace_id.as_str(),
+                    "codex",
+                    thread_id,
+                    "detached-child-native",
+                    winner,
+                ),
+                (
+                    workspace_id.as_str(),
+                    "codex",
+                    thread_id,
+                    "native-title",
+                    " ",
+                ),
+                (
+                    workspace_id.as_str(),
+                    "codex",
+                    thread_id,
+                    "native-title",
+                    "bad\0name",
+                ),
+            ] {
+                let wrong_key =
+                    CLIAgentRuntimeSessionKey::new(workspace, runtime, pioneer).unwrap();
+                let origin = cli_manager.get_or_start(wrong_key).await.unwrap();
+                processor
+                    .handle_cli_runtime_event(
+                        origin.instance(),
+                        RuntimeEvent::ThreadNameUpdated(RuntimeThreadNameUpdated {
+                            native_thread_id: native.into(),
+                            name: name.into(),
+                        }),
+                    )
+                    .await;
+                assert_eq!(persisted_name().await.as_deref(), Some(fallback));
+            }
+            // Even a matching old native binding snapshot cannot pass the
+            // writer predicate after the durable runtime owner has changed.
+            let mut stale = binding.clone();
+            stale.native_thread_id = "stale-native".into();
+            assert!(
+                !crud_store
+                    .with_maintenance_access()
+                    .update_automatic_thread_name(thread_id, winner, Some(fallback), Some(&stale))
+                    .await
+                    .unwrap()
+            );
+            cli_manager.remove_if_generation(handle.instance()).await;
+            processor
+                .handle_cli_runtime_event(
+                    handle.instance(),
+                    RuntimeEvent::ThreadNameUpdated(RuntimeThreadNameUpdated {
+                        native_thread_id: "native-title".into(),
+                        name: winner.into(),
+                    }),
+                )
+                .await;
+            assert_eq!(persisted_name().await.as_deref(), Some(fallback));
+            let current = cli_manager.get_or_start(key.clone()).await.unwrap();
+            processor
+                .handle_cli_runtime_event(
+                    current.instance(),
+                    RuntimeEvent::ThreadNameUpdated(RuntimeThreadNameUpdated {
+                        native_thread_id: "native-title".into(),
+                        name: winner.into(),
+                    }),
+                )
+                .await;
+        }
+        counting_provider.release_paused_call();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while processor
+                .title_job_runtime
+                .lock()
+                .await
+                .contains_key(thread_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(persisted_name().await.as_deref(), Some(winner));
+        assert!(
+            !processor
+                .accept_automatic_thread_title(thread_id, "Поздний fallback", None)
+                .await
+                .unwrap()
+        );
+    }
+    assert!(
+        cli_session.thread_name_sets.lock().await.is_empty(),
+        "incoming native names must not echo back to Codex"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -43409,6 +43593,113 @@ async fn thread_read_rpc_is_monotonic_and_converges_all_principal_sessions() {
         assert_eq!(secondary_notification.cursor, response.cursor);
         assert_eq!(secondary_notification.unread_count, response.unread_count);
     }
+    // A workspace-only observer must learn about a final answer without a
+    // timeline subscription, then receive the same principal's read cursor.
+    processor
+        .session_manager
+        .set_connection_workspace(_secondary_connection_id, Some(workspace_id.clone()))
+        .await;
+    let answer = pioneer_protocol::TurnItem::AgentMessage {
+        id: pioneer_protocol::task_delivery_result_item_id("read-rpc-delivery"),
+        text: "Finished answer".into(),
+        phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+        markdown: None,
+        markdown_version: None,
+    };
+    processor
+        .crud_store
+        .materialize_item_started(
+            pioneer_protocol::ItemStartedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: THREAD_ID.into(),
+                turn_id: FIRST_TURN_ID.into(),
+                item: answer.clone(),
+            },
+            now_timestamp_secs(),
+        )
+        .await
+        .unwrap();
+    let streaming_request_id = generate_test_request_id("readreply", "stream");
+    let streaming = request_thread_timeline_page_for_test(
+        &processor,
+        primary_connection_id,
+        &mut primary_rx,
+        THREAD_ID,
+        &streaming_request_id,
+    )
+    .await;
+    assert!(streaming.blocks.iter().any(|block| matches!(&block.kind, pioneer_protocol::TimelineBlockKind::AssistantMessage { status: pioneer_protocol::TurnWorkItemStatus::Running, item_id, .. } if item_id == answer.item_id())), "canonical lifecycle status must survive Gateway batching");
+    processor
+        .crud_store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: THREAD_ID.into(),
+                turn_id: FIRST_TURN_ID.into(),
+                item: answer.clone(),
+            },
+            now_timestamp_secs(),
+        )
+        .await
+        .unwrap();
+    processor
+        .notify_semantic_timeline_item_changed(
+            &workspace_id,
+            THREAD_ID,
+            FIRST_TURN_ID,
+            &answer,
+            Some("completed"),
+        )
+        .await;
+    let tree = recv_notification_by_method(&mut secondary_rx, events::THREAD_TREE_CHANGED).await;
+    assert_eq!(tree.params.unwrap()["workspace_id"], workspace_id);
+    let principal = authenticated_test_superuser().principal_id.clone();
+    assert_eq!(
+        processor
+            .crud_store
+            .unread_counts_for_threads(&principal, &[THREAD_ID.into()])
+            .await
+            .unwrap()
+            .get(THREAD_ID),
+        Some(&1)
+    );
+    let block_id = pioneer_crud::assistant_block_id(FIRST_TURN_ID, answer.item_id());
+    let canonical_request_id = generate_test_request_id("readreply", "final");
+    let canonical = request_thread_timeline_page_for_test(
+        &processor,
+        primary_connection_id,
+        &mut primary_rx,
+        THREAD_ID,
+        &canonical_request_id,
+    )
+    .await;
+    let sort_key = &canonical
+        .blocks
+        .iter()
+        .find(|block| block.block_id == block_id)
+        .unwrap()
+        .sort_key;
+    let read_request_id = generate_test_request_id("readreply", "exact");
+    processor.process_request_for_connection(primary_connection_id, &json!({
+        "jsonrpc": "2.0", "id": read_request_id, "method": "thread/read",
+        "params": { "thread_id": THREAD_ID, "through_turn_id": FIRST_TURN_ID, "through_block": { "block_id": block_id, "sort_key": sort_key } }
+    }).to_string()).await;
+    let (response, _) = recv_response_and_notification_by_id_method(
+        &mut primary_rx,
+        &read_request_id,
+        events::THREAD_READ_CURSOR_CHANGED,
+    )
+    .await;
+    let response: pioneer_protocol::ThreadReadResponse =
+        serde_json::from_value(response.result).unwrap();
+    assert_eq!(response.cursor.through_turn_id, FIRST_TURN_ID);
+    assert_eq!(response.unread_count, 0);
+    let peer =
+        recv_notification_by_method(&mut secondary_rx, events::THREAD_READ_CURSOR_CHANGED).await;
+    let peer: pioneer_protocol::ThreadReadCursorChangedNotification =
+        serde_json::from_value(peer.params.unwrap()).unwrap();
+    assert_eq!(peer.cursor, response.cursor);
+    assert_eq!(peer.unread_count, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -46103,6 +46394,110 @@ async fn codex_thread_ops_name_sync_failure_does_not_break_pioneer_rename() {
     assert_eq!(name_sets.len(), 1);
     assert_eq!(name_sets[0].native_thread_id, "codex-native-rename");
     assert_eq!(name_sets[0].name, "After active rename");
+
+    drop(name_sets);
+    while rx.try_recv().is_ok() {}
+    // Freeze real persisted timestamps, so the race cannot be fixed by a
+    // seconds-resolution updated_at comparison. No clock sleeps are needed.
+    use sea_orm::ConnectionTrait as _;
+    crud_store
+        .database_connection()
+        .execute_unprepared(
+            "CREATE TRIGGER freeze_title_time AFTER UPDATE OF name ON thread BEGIN \
+         UPDATE thread SET updated_at = OLD.updated_at WHERE id = NEW.id; END",
+        )
+        .await
+        .unwrap();
+    let thread_id = "thread_codex_ops_rename";
+    crud_store.update_thread_name(thread_id, "").await.unwrap();
+    let read_completed = Arc::new(Notify::new());
+    let continue_publication = Arc::new(Notify::new());
+    *processor.thread_title_publication_barrier.lock().await =
+        Some((read_completed.clone(), continue_publication.clone()));
+    let automatic = async {
+        assert!(
+            processor
+                .accept_automatic_thread_title(thread_id, "Automatic name", None)
+                .await
+                .unwrap()
+        );
+    };
+    let manual = async {
+        read_completed.notified().await;
+        let gate = processor
+            .thread_title_publication_mutexes
+            .lock()
+            .await
+            .get(thread_id)
+            .unwrap()
+            .upgrade()
+            .unwrap();
+        assert!(
+            gate.try_lock().is_err(),
+            "automatic snapshot must retain its per-thread publication gate"
+        );
+        // Consume the automatic publisher's acquisition notification.
+        processor
+            .thread_title_publication_attempted
+            .notified()
+            .await;
+        let request = json!({
+            "jsonrpc":"2.0", "id":generate_test_request_id("rename", "publicationrace"), "method":"thread/update",
+            "params":{"workspace_id":workspace_id, "thread_id":thread_id, "name":"Manual winner"}
+        })
+        .to_string();
+        serde_json::from_str::<pioneer_protocol::JsonRpcRequest>(&request)
+            .expect("publication race request must match the protocol");
+        let mut rename =
+            Box::pin(processor.process_request_for_connection(connection_id, &request));
+        tokio::select! {
+            _ = &mut rename => panic!("manual rename passed an automatic snapshot awaiting publication"),
+            _ = processor.thread_title_publication_attempted.notified() => {}
+        }
+        assert_eq!(
+            crud_store
+                .get_thread_model(thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("Automatic name")
+        );
+        continue_publication.notify_one();
+        rename.await;
+    };
+    timeout(Duration::from_secs(5), async {
+        tokio::join!(automatic, manual);
+    })
+    .await
+    .unwrap();
+    let persisted = crud_store
+        .get_thread_model(thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let memory = processor
+        .thread_manager
+        .thread_get(thread_id)
+        .await
+        .unwrap();
+    assert_eq!(persisted.name.as_deref(), Some("Manual winner"));
+    assert_eq!(memory.name, persisted.name);
+    let mut published = Vec::new();
+    while let Ok(Message::Text(payload)) = rx.try_recv() {
+        let value: JsonValue = serde_json::from_str(&payload).unwrap();
+        if value["method"] == events::THREAD_UPDATED {
+            let notification: pioneer_protocol::ThreadUpdatedNotification =
+                serde_json::from_value(value["params"].clone()).unwrap();
+            published.push(notification.thread);
+        }
+    }
+    assert_eq!(published.len(), 2);
+    assert_eq!(published[0].name.as_deref(), Some("Automatic name"));
+    assert_eq!(published[1].name.as_deref(), Some("Manual winner"));
+    assert_eq!(published[0].updated_at, persisted.updated_at);
+    assert_eq!(published[1].updated_at, persisted.updated_at);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -57763,6 +58158,7 @@ async fn turn_cancel_completed_turn_returns_completed_snapshot() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_tree_returns_folders_and_placements_after_moves() {
+    use sea_orm::Statement;
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -57871,6 +58267,81 @@ async fn thread_tree_returns_folders_and_placements_after_moves() {
         }),
         "thread/tree should include placement into folder"
     );
+    assert!(tree.running_task_thread_ids.is_empty());
+    // The connection now stays only in the list: activity must arrive without
+    // any thread/timeline subscription, and a fresh tree must restore it.
+    processor
+        .thread_manager
+        .thread_unsubscribe(connection_id, thread_id)
+        .await;
+    let db = processor.crud_store.database_connection();
+    db.execute_raw(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,executor_kind,status,title,goal)
+         VALUES('tree-activity-task',?,'thread',?,'tool','waiting','Activity','fixture')",
+        vec![workspace_id.clone().into(), thread_id.into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_unprepared("INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind)
+        VALUES('tree-activity-run','tree-activity-task','tree-activity-run',1,1,'queued','tool')").await.unwrap();
+    let (_, event) = processor
+        .crud_store
+        .claim_task_run_for_dispatch_with_event("tree-activity-run", now_timestamp_secs())
+        .await
+        .unwrap()
+        .unwrap();
+    processor.emit_task_event(event).await.unwrap();
+    let notification = recv_notification_by_method(&mut rx, events::THREAD_TREE_CHANGED).await;
+    assert_eq!(notification.params.unwrap()["workspace_id"], workspace_id);
+    processor
+        .process_request_for_connection(connection_id, &tree_request.to_string())
+        .await;
+    let response = recv_response_by_id(&mut rx, "ddddddddddddddddddddd").await;
+    let tree: ThreadTreeResponse = serde_json::from_value(response.result).unwrap();
+    assert_eq!(tree.running_task_thread_ids, vec![thread_id]);
+    let event = processor
+        .crud_store
+        .append_task_event(
+            TaskEventPayload::RunCancelled {
+                task_id: "tree-activity-task".into(),
+                run_id: "tree-activity-run".into(),
+                reason: None,
+                cancelled_at: now_timestamp_secs(),
+            },
+            now_timestamp_secs(),
+        )
+        .await
+        .unwrap();
+    processor.emit_task_event(event).await.unwrap();
+    recv_notification_by_method(&mut rx, events::THREAD_TREE_CHANGED).await;
+    processor
+        .process_request_for_connection(connection_id, &tree_request.to_string())
+        .await;
+    let response = recv_response_by_id(&mut rx, "ddddddddddddddddddddd").await;
+    let tree: ThreadTreeResponse = serde_json::from_value(response.result).unwrap();
+    assert!(tree.running_task_thread_ids.is_empty());
+    // A service run with no user-tree authorization root creates neither a
+    // row indicator nor an unrelated tree refresh/loading spinner.
+    while rx.try_recv().is_ok() {}
+    db.execute_raw(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        "INSERT INTO task(id,workspace_id,owner_kind,executor_kind,status,title,goal)
+         VALUES('tree-service-task',?,'system','system','waiting','Service','fixture')",
+        [workspace_id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_unprepared("INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind)
+        VALUES('tree-service-run','tree-service-task','tree-service-run',1,1,'queued','system')").await.unwrap();
+    let (_, event) = processor
+        .crud_store
+        .claim_task_run_for_dispatch_with_event("tree-service-run", now_timestamp_secs())
+        .await
+        .unwrap()
+        .unwrap();
+    processor.emit_task_event(event).await.unwrap();
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

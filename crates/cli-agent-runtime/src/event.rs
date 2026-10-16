@@ -17,6 +17,7 @@ pub struct RuntimeEventMappingOptions {
 pub enum RuntimeEvent {
     SessionStateChanged(RuntimeSessionStateChanged),
     ThreadStateChanged(RuntimeThreadStateChanged),
+    ThreadNameUpdated(RuntimeThreadNameUpdated),
     ThreadGoalUpdated(RuntimeThreadGoalUpdated),
     ThreadGoalCleared(RuntimeThreadGoalCleared),
     TurnStarted(RuntimeTurnStarted),
@@ -262,6 +263,12 @@ pub struct RuntimeSessionStateChanged {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native: Option<RuntimeNativeEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeThreadNameUpdated {
+    pub native_thread_id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -591,6 +598,29 @@ pub fn map_codex_notification_event(
             status: "started".to_owned(),
             native: native_notification(notification, options),
         }),
+        // Confirmed in Codex 0.144.1 and 0.159.2:
+        // v2/ThreadNameUpdatedNotification.ts (threadName is optional).
+        "thread/name/updated" => {
+            let fields = params.and_then(|params| {
+                Some((
+                    params.get("threadId")?.as_str()?,
+                    params.get("threadName")?.as_str()?,
+                ))
+            });
+            match fields {
+                Some((id, name)) if !id.is_empty() && !name.trim().is_empty() => {
+                    RuntimeEvent::ThreadNameUpdated(RuntimeThreadNameUpdated {
+                        native_thread_id: id.into(),
+                        name: name.into(),
+                    })
+                }
+                _ => raw_notification(
+                    notification,
+                    options,
+                    "thread name update missing valid name or owner",
+                ),
+            }
+        }
         "thread/status/changed" => RuntimeEvent::ThreadStateChanged(RuntimeThreadStateChanged {
             native_thread_id: params.and_then(|params| string_path(params, &["threadId"])),
             status: params
@@ -1915,6 +1945,33 @@ mod tests {
         assert_eq!(turn.native_thread_id.as_deref(), Some("native_thread_1"));
         assert_eq!(turn.native_turn_id, "native_turn_1");
         assert!(turn.native.is_none());
+    }
+
+    #[test]
+    fn codex_thread_name_update_uses_confirmed_fields_and_ignores_absent_names() {
+        for (params, valid) in [
+            (json!({"threadId":"native", "threadName":"Название"}), true),
+            (json!({"threadId":"native"}), false),
+            (json!({"threadId":"native", "threadName":null}), false),
+            (json!({"threadId":"native", "threadName":" "}), false),
+            (json!({"threadId":"native", "threadName":17}), false),
+            (json!({"threadId":"native", "name":"wrong field"}), false),
+            (json!({"threadName":"no owner"}), false),
+        ] {
+            let event = map_codex_notification_event(
+                &CodexJsonlRpcNotificationEvent {
+                    method: "thread/name/updated".into(),
+                    params: Some(params),
+                    raw: json!({}),
+                },
+                RuntimeEventMappingOptions::default(),
+            );
+            assert_eq!(matches!(event, RuntimeEvent::ThreadNameUpdated(_)), valid);
+            if let RuntimeEvent::ThreadNameUpdated(name) = event {
+                assert_eq!(name.native_thread_id, "native");
+                assert_eq!(name.name, "Название");
+            }
+        }
     }
 
     #[test]

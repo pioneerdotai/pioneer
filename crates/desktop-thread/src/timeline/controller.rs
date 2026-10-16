@@ -321,6 +321,8 @@ impl DesktopTimelineController {
                 consumer_id: format!("desktop:{}", view.mount),
                 generation: view.thread_timeline_view_state.demand_generation,
                 source_revision: prepared.model.source_revision,
+                viewed_row_ids: ids.clone(),
+                viewed_through_block: None,
                 row_ids: ids,
                 threshold: pioneer_client::timeline::semantic::DEFAULT_PREFETCH_THRESHOLD_ROWS,
                 before: maximum > px(1.) && scroll.offset().y >= px(-24.),

@@ -8875,6 +8875,14 @@
           "format": "uint",
           "minimum": 0
         },
+        "viewed_row_ids": {
+          "description": "Actual viewability, separate from pagination/prefetch row demand.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
         "viewed_through_turn_id": {
           "type": [
             "string",

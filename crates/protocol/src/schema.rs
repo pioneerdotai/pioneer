@@ -250,7 +250,7 @@ use crate::{
     ThreadParticipantMutationParams, ThreadParticipantSummary,
     ThreadParticipantsChangedNotification, ThreadParticipantsListParams,
     ThreadParticipantsResponse, ThreadPlacement, ThreadReadCursor,
-    ThreadReadCursorChangedNotification, ThreadReadParams, ThreadReadResponse,
+    ThreadReadCursorChangedNotification, ThreadReadParams, ThreadReadPosition, ThreadReadResponse,
     ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse, ThreadStartedNotification,
     ThreadStatus, ThreadTreeChangedNotification, ThreadTreeParams, ThreadTreeResponse,
     ThreadUnreadSummary, ThreadUnsubscribeParams, ThreadUnsubscribeResponse,
@@ -1507,6 +1507,7 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("turn_message_edited_event.json", TurnMessageEditedEvent),
         schema_doc!("turn_message_deleted_event.json", TurnMessageDeletedEvent),
         schema_doc!("thread_read_params.json", ThreadReadParams),
+        schema_doc!("thread_read_position.json", ThreadReadPosition),
         schema_doc!("thread_read_cursor.json", ThreadReadCursor),
         schema_doc!("thread_read_response.json", ThreadReadResponse),
         schema_doc!(
