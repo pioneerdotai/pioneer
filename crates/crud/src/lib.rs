@@ -33993,7 +33993,7 @@ mod tests {
         WORK_ITEM_STATUS_RUNNING, WORK_VISIBILITY_VISIBLE, WorkspaceSkillPolicyRecord,
         create_gateway_singleton, create_member_principal, create_superuser,
         delete_workspace_membership, ensure_pioneer_for_workspace, insert_workspace_membership,
-        list_abandoned_runtime_draft_artifact_ids,
+        list_abandoned_runtime_draft_artifact_ids, list_running_task_scopes,
         message_mutation_actor_current_thread_write_kind, principal_current_thread_access_kind,
         resolve_artifact_authorization_scope, resolve_runtime_draft_artifact_authorization_scope,
         tool_call_status, upsert_thread_timeline_block, work_item_projection_id,
