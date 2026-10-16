@@ -1024,6 +1024,20 @@ async fn prepare_accepted_task_basis_prepared(
         select_task_history(&mut restored, policy)?;
     }
     super::history::normalize_task_input_copies(store, workspace, &mut restored).await?;
+    // The accepted snapshot belongs to the parent. Persist the same inherited
+    // role that NativeHistoryLayout uses in this execution's context. Accepted
+    // own imports already have execution_thread as their context owner.
+    for message in &mut restored {
+        let origin = message
+            .provenance
+            .as_mut()
+            .context("accepted Task projection lost provenance")?;
+        origin.inherited |= origin
+            .context_thread
+            .as_deref()
+            .unwrap_or(&origin.thread_id)
+            != thread;
+    }
     let mut records = Vec::new();
     loop {
         let page = store

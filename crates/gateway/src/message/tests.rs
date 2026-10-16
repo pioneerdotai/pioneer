@@ -15159,7 +15159,7 @@ async fn task_run_voice_composer_stays_foreground() {
             vec![],
         ),
         (
-            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES('run_voice_task_run','task_voice_task_run',?,'thr_voice_task_root','turn_voice_task_root','[]',CURRENT_TIMESTAMP)",
+            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) VALUES('run_voice_task_run','task_voice_task_run',?,'thr_voice_task_root','turn_voice_task_root','[]',CURRENT_TIMESTAMP,NULL)",
             vec![workspace_id.clone().into()],
         ),
     ] {

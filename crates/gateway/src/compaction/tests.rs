@@ -8426,11 +8426,50 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         .await
         .unwrap();
     assert!(
+        e_imports.iter().any(|grant| {
+            grant.source == retained_import.source
+                && grant.source_thread == retained_import.source_thread
+                && grant.output_ordinal == retained_import.output_ordinal
+        }),
+        "the uncovered accepted own output keeps its forwarded grant"
+    );
+    assert!(
         e_imports
             .iter()
-            .any(|grant| grant.source.id == output_summary.id),
-        "an accepted atomic checkpoint needs its own forwarded grant, not only its raw leaves"
+            .all(|grant| grant.source.id != output_summary.id),
+        "the parent's own checkpoint is inherited, not a delivered own import"
     );
+    let parent_summary = e_history
+        .iter()
+        .find_map(|message| {
+            message.provenance.as_ref().filter(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == output_summary.id)
+            })
+        })
+        .expect("the accepted parent checkpoint remains represented");
+    assert!(parent_summary.inherited);
+    assert!(e_history.iter().all(|message| {
+        let origin = message.provenance.as_ref().unwrap();
+        origin
+            .context_thread
+            .as_deref()
+            .unwrap_or(&origin.thread_id)
+            == "context-e"
+            || origin.inherited
+    }));
+    assert!(e_history.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            !origin.inherited
+                && origin.context_thread.as_deref() == Some("context-e")
+                && origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == d_retained_source.id)
+        })
+    }));
     assert_eq!(
         e_history
             .iter()
@@ -22422,7 +22461,7 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
     let own = super::history::load_task_line_history(&f.store, "ws", "child-thread", None, &fence)
         .await
         .unwrap();
-    let messages = super::frozen::compose_frozen_basis(
+    let mut messages = super::frozen::compose_frozen_basis(
         &f.store,
         "ws",
         "child-thread",
@@ -22432,6 +22471,9 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
     )
     .await
     .unwrap();
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut messages)
+        .await
+        .unwrap();
     let prepared = super::frozen::capture_prepared(
         &f.store,
         "ws",
