@@ -552,7 +552,7 @@ mod tests {
             "INSERT INTO workspace (id,name,is_active,is_current) VALUES ('workspace','fixture',1,1)",
             "INSERT INTO thread (id,workspace_id,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at) VALUES ('thread','workspace','','agent','fixture','openai','active','user','visible','internal','2026-10-12T00:00:00Z','2026-10-12T00:00:00Z')",
             "INSERT INTO \"turn\" (id,thread_id,status,prompt_manifest_json,created_at,updated_at) VALUES ('turn','thread','in_progress','{}','2026-10-12T00:00:00Z','2026-10-12T00:00:00Z')",
-            "INSERT INTO turn_execution (turn_id,thread_id,workspace_id,executor_kind,status,owner_id,owner_generation,lease_until,heartbeat_at,created_at,updated_at) VALUES ('turn','thread','workspace','native_agent','running','owner',1,'2026-10-12T01:00:00Z','2026-10-12T00:00:00Z','2026-10-12T00:00:00Z','2026-10-12T00:00:00Z')",
+            "INSERT INTO turn_execution (turn_id,thread_id,workspace_id,executor_kind,status,owner_id,owner_generation,lease_until,heartbeat_at,created_at,updated_at,started_at) VALUES ('turn','thread','workspace','native_agent','running','owner',1,'2026-10-12T01:00:00Z','2026-10-12T00:00:00Z','2026-10-12T00:00:00Z','2026-10-12T00:00:00Z','2026-10-12T00:00:00Z')",
         ] {
             database.execute_unprepared(statement).await.unwrap();
         }
