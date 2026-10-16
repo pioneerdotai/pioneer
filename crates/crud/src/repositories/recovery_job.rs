@@ -1699,7 +1699,10 @@ mod progress_tests {
         let connection = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&connection, None).await.unwrap();
         let store = crate::CrudStore::new(connection).with_maintenance_access();
-        let now = chrono::Utc::now().fixed_offset();
+        // The claim API accepts whole Unix seconds; schedule at that same precision.
+        let now = chrono::DateTime::from_timestamp(1_792_000_000, 0)
+            .unwrap()
+            .fixed_offset();
         store.run_serialized_write(|| async {
             for sql in [
                 "INSERT INTO workspace (id,name,is_active,is_current,created_at,updated_at) VALUES ('ws_progress_cas','test',1,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
