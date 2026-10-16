@@ -709,18 +709,17 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
         "the diagnostic and ordinary attachment are exact-current before forwarding"
     );
     retain_as_task_basis(&f, "forward-archive", &accepted.descriptor).await;
-    let forwarded = processor
-        .capture_authorized_task_basis_prepared(
-            &f.store,
-            &principal,
-            "ws",
-            "forward-archive",
-            Some("turn-forward-archive"),
-            Some("turn-forward-archive"),
-            None,
-        )
-        .await
-        .unwrap();
+    // Running Task bootstrap restores its exact accepted input; a subsequent
+    // conversation request uses the separate authorized history reader.
+    let forwarded = super::super::frozen::prepare_task_history_for_execution(
+        &f.store,
+        "ws",
+        "forward-archive",
+        "turn-forward-archive",
+    )
+    .await
+    .unwrap()
+    .expect("running Task uses its accepted input");
     let forwarded_imports = f
         .store
         .compaction_frozen_import_page(
@@ -871,18 +870,15 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
             .unwrap(),
         CommitOutcome::Applied
     );
-    let checkpoint_basis = processor
-        .capture_authorized_task_basis_prepared(
-            &f.store,
-            &principal,
-            "ws",
-            "forward-archive",
-            Some("turn-forward-archive"),
-            Some("turn-forward-archive"),
-            None,
-        )
-        .await
-        .unwrap();
+    let checkpoint_basis = super::super::frozen::prepare_task_history_for_execution(
+        &f.store,
+        "ws",
+        "forward-archive",
+        "turn-forward-archive",
+    )
+    .await
+    .unwrap()
+    .expect("running Task uses its accepted input");
     let checkpoint_imports = f
         .store
         .compaction_frozen_import_page(
@@ -911,18 +907,15 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
         }),
         "checkpoint projection preserves every original import grant"
     );
-    let repeated_checkpoint = processor
-        .capture_authorized_task_basis_prepared(
-            &f.store,
-            &principal,
-            "ws",
-            "forward-archive",
-            Some("turn-forward-archive"),
-            Some("turn-forward-archive"),
-            None,
-        )
-        .await
-        .unwrap();
+    let repeated_checkpoint = super::super::frozen::prepare_task_history_for_execution(
+        &f.store,
+        "ws",
+        "forward-archive",
+        "turn-forward-archive",
+    )
+    .await
+    .unwrap()
+    .expect("running Task uses its accepted input");
     assert_eq!(checkpoint_basis.descriptor, repeated_checkpoint.descriptor);
     assert_eq!(
         f.store

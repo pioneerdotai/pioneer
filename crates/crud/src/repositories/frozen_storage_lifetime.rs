@@ -9,9 +9,12 @@ use pioneer_entity::{
     compaction_coverage as coverage, compaction_frozen_history as history,
     compaction_frozen_layout as layout, compaction_frozen_span as span,
     compaction_operation as operation, compaction_operation_projection as projection,
-    compaction_runner_state as runner, task, task_run_conversation_snapshot as task_input,
+    compaction_runner_plan as plan, compaction_runner_state as runner, task,
+    task_run_conversation_snapshot as task_input,
 };
-use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func, JoinType, Order, Query, UnionType};
+use sea_orm::sea_query::{
+    Alias, Expr, ExprTrait, Func, JoinType, Order, Query, SimpleExpr, UnionType,
+};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryOrder,
     QuerySelect, QueryTrait, Statement, TransactionTrait,
@@ -422,6 +425,62 @@ fn terminal(status: &str, generation: Option<i64>, state: Option<&str>) -> Resul
         _ => false,
     })
 }
+// Failed admission can finish before activation creates a runner. Activation
+// requires running; both failed-operation resume paths require a saved state.
+// Supported writers cannot revive this failed operation without a saved state
+// or replace its admitted projection. Recheck current facts in the expiry
+// writer, without caching bindings or deriving a generation. CASE fails closed
+// for missing/corrupt nullable joins. Closed portions still need the ordinary
+// checkpoint proof/reachability checks; their count is not a lifecycle root.
+fn pre_runner_failure(header: &history::Model) -> SimpleExpr {
+    Expr::case(
+        Condition::all()
+            .add(Expr::col((operation::Entity, operation::Column::Status)).eq("failed"))
+            .add(Expr::col((operation::Entity, operation::Column::Owner)).ne(""))
+            .add(
+                Expr::col((operation::Entity, operation::Column::Outcome))
+                    .is_in(["invalid_source_manifest", "deadline"]),
+            )
+            .add(Expr::col((operation::Entity, operation::Column::Attempts)).eq(0))
+            .add(Expr::col((operation::Entity, operation::Column::TransientRetries)).eq(0))
+            .add(Expr::col((operation::Entity, operation::Column::Correction)).eq(0))
+            .add(Expr::col((operation::Entity, operation::Column::NextPortion)).gte(0))
+            .add(Expr::col((runner::Entity, runner::Column::OperationId)).is_null())
+            .add(Expr::col((projection::Entity, projection::Column::TerminalGeneration)).is_null())
+            .add(
+                Expr::col((context::Entity, context::Column::WorkspaceId)).eq(&header.workspace_id),
+            )
+            .add(Expr::col((context::Entity, context::Column::FormatVersion)).eq(1))
+            .add(Expr::col((context::Entity, context::Column::ThreadId)).ne(""))
+            .add(Expr::col((projection::Entity, projection::Column::ManifestId)).eq(&header.id))
+            .add(
+                Expr::col((projection::Entity, projection::Column::IdentitySha256))
+                    .eq(&header.identity_sha256),
+            )
+            .add(
+                Expr::col((projection::Entity, projection::Column::ImportsSha256))
+                    .eq(&header.imports_sha256),
+            )
+            .add(
+                Expr::col((projection::Entity, projection::Column::ImportCount))
+                    .eq(header.import_count),
+            )
+            .add(Expr::exists(
+                Query::select()
+                    .expr(Expr::val(1))
+                    .from(plan::Entity)
+                    .and_where(
+                        Expr::col((plan::Entity, plan::Column::OperationId))
+                            .eq(Expr::col((operation::Entity, operation::Column::Id))),
+                    )
+                    .and_where(Expr::col((plan::Entity, plan::Column::Ready)).eq(0))
+                    .to_owned(),
+            )),
+        true,
+    )
+    .finally(false)
+    .into()
+}
 struct ExpiryPreparation {
     header: history::Model,
     operations_after: String,
@@ -465,6 +524,7 @@ impl ExpiryPreparation {
                 .column((projection::Entity,projection::Column::OperationId))
                 .columns([operation::Column::Owner,operation::Column::Status].map(|c| (operation::Entity,c)))
                 .column((runner::Entity,runner::Column::Generation)).column((context::Entity,context::Column::WorkspaceId))
+                .expr_as(pre_runner_failure(&self.header),Alias::new("pre_runner_failure"))
                 .expr_as(Expr::cust("CASE WHEN length(CAST(compaction_runner_state.state AS BLOB))<=262144 THEN compaction_runner_state.state END"),Alias::new("state"))
                 .join(JoinType::LeftJoin,operation::Entity,
                     Expr::col((operation::Entity,operation::Column::Id)).eq(Expr::col((projection::Entity,projection::Column::OperationId))))
@@ -485,6 +545,12 @@ impl ExpiryPreparation {
                 let status: String = row.try_get("", "status")?;
                 let generation: Option<i64> = row.try_get("", "generation")?;
                 let state: Option<String> = row.try_get("", "state")?;
+                if row.try_get::<bool>("", "pre_runner_failure")? {
+                    // No synthetic state/terminal_generation. Checkpoints below
+                    // still need their ordinary proof/reachability validation.
+                    self.operations_after = id;
+                    return Ok(false);
+                }
                 if !terminal(&status, generation, state.as_deref())? {
                     accounting.held += 1;
                     return Ok(true);
@@ -679,8 +745,9 @@ async fn expire(store: &CrudStore, header: &history::Model) -> Result<bool> {
                 tx.commit().await?;
                 return Ok(false);
             }
-            // The per-binding terminal generation was verified in bounded steps.
-            // All state/status writes invalidate it before becoming visible.
+            // Saved runners retain the derived generation guard. Absent-runner
+            // failures instead recheck their current durable facts in this writer.
+            // Activation requires running; state insertion invalidates the marker.
             let active = tx
                 .query_one(
                     &Query::select()
@@ -746,6 +813,7 @@ async fn expire(store: &CrudStore, header: &history::Model) -> Result<bool> {
                                         .ne(&h.workspace_id),
                                 ),
                         )
+                        .and_where(pre_runner_failure(&h).eq(false))
                         .limit(1)
                         .to_owned(),
                 )
@@ -4160,6 +4228,166 @@ mod tests {
         );
         assert!(store.frozen_readers.lock().unwrap().is_empty());
     }
+    #[tokio::test]
+    async fn closed_unpublished_portions_without_runner_do_not_retain_frozen_input() {
+        let (store, _) = fixture(false).await;
+        store
+            .connection
+            .execute_unprepared("DELETE FROM compaction_runner_state WHERE operation_id='op'")
+            .await
+            .unwrap();
+        store
+            .connection
+            .execute_unprepared("UPDATE compaction_runner_plan SET ready=0 WHERE operation_id='op'")
+            .await
+            .unwrap();
+        store
+            .connection
+            .execute_unprepared("UPDATE compaction_operation SET status='running' WHERE id='op'")
+            .await
+            .unwrap();
+        let candidate = store.compaction_checkpoint("cp-1").await.unwrap().unwrap();
+        // The repository closes portions without creating a runner or attempts.
+        store
+            .compaction_save_candidate(&candidate, 1)
+            .await
+            .unwrap();
+        store
+            .compaction_finish("op", "failed", "deadline")
+            .await
+            .unwrap();
+        let op = operation::Entity::find_by_id("op")
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(op.next_portion, 2);
+        assert_eq!(op.attempts, 0);
+        assert!(store.compaction_runner_state("op").await.unwrap().is_none());
+        assert!(
+            !store
+                .compaction_resume_deadline("op", "next-turn", 2000)
+                .await
+                .unwrap()
+        );
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        for _ in 0..2500 {
+            progress.quantum(&store).await.unwrap();
+        }
+        assert_eq!(
+            history::Entity::find_by_id("origin")
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap()
+                .expired,
+            1
+        );
+        let physical = store.connection.query_one_raw(Statement::from_string(DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM compaction_frozen_message_data WHERE manifest_id='origin'"))
+            .await.unwrap().unwrap();
+        assert_eq!(physical.try_get::<i64>("", "n").unwrap(), 0);
+        assert_eq!(
+            operation::Entity::find_by_id("op")
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap()
+                .next_portion,
+            2
+        );
+        for id in ["cp-0", "cp-1"] {
+            let cp = compaction::checkpoint_row(&store.connection, id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(cp.proof_version, 0);
+            assert_eq!(cp.status, "candidate");
+        }
+        assert!(
+            projection::Entity::find_by_id("op")
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap()
+                .terminal_generation
+                .is_none()
+        );
+        assert!(store.compaction_runner_state("op").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn pre_runner_expiry_writer_rechecks_failure_and_absent_state() {
+        for change in [
+            "UPDATE compaction_operation SET status='running',outcome=NULL WHERE id='op'",
+            "UPDATE compaction_operation SET outcome=NULL WHERE id='op'",
+            "UPDATE compaction_operation SET attempts=1 WHERE id='op'",
+            "runner appeared",
+            "UPDATE compaction_operation_projection SET identity_sha256='changed' WHERE operation_id='op'",
+            "UPDATE compaction_runner_plan SET ready=1 WHERE operation_id='op'",
+        ] {
+            let (store, _) = fixture(false).await;
+            let saved = runner::Entity::find_by_id("op")
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap();
+            store
+                .connection
+                .execute_unprepared("DELETE FROM compaction_runner_state WHERE operation_id='op'")
+                .await
+                .unwrap();
+            store
+                .connection
+                .execute_unprepared(
+                    "UPDATE compaction_operation SET outcome='deadline' WHERE id='op'",
+                )
+                .await
+                .unwrap();
+            store
+                .connection
+                .execute_unprepared(
+                    "UPDATE compaction_runner_plan SET ready=0 WHERE operation_id='op'",
+                )
+                .await
+                .unwrap();
+            // Candidate checkpoints with no published incoming path still go
+            // through the ordinary reverse traversal; attempts=0 is no proof.
+            let mut prepared = prepared_expiry(&store).await;
+            if change == "runner appeared" {
+                store.connection.execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "INSERT INTO compaction_runner_state(operation_id,generation,state) VALUES('op',?1,?2)",
+                    [saved.generation.into(),saved.state.into()],
+                )).await.unwrap();
+                // Activation also makes the plan ready. The insert trigger
+                // invalidates terminal_generation; current writer facts refuse.
+                store
+                    .connection
+                    .execute_unprepared(
+                        "UPDATE compaction_runner_plan SET ready=1 WHERE operation_id='op'",
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                store.connection.execute_unprepared(change).await.unwrap();
+            }
+            let mut accounting = SweepAccounting::default();
+            assert!(prepared.step(&store, &mut accounting).await.unwrap());
+            assert_eq!(accounting.expired, 0, "{change}");
+            assert_eq!(
+                history::Entity::find_by_id("origin")
+                    .one(&store.connection)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .expired,
+                0,
+                "{change}",
+            );
+        }
+    }
+
     #[tokio::test]
     async fn unused_staging_reset_delete_rollback_and_restart_never_publish_partial_ready() {
         let (store, _) = fixture(false).await;

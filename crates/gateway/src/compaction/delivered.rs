@@ -36,7 +36,7 @@ pub(crate) struct AuthorizedOutputSet {
     pub(super) branches: Vec<AuthorizedOutputBranch>,
 }
 
-async fn can_read_originals(
+pub(super) async fn can_read_originals(
     resolver: &AuthorizationResolver,
     principal: &AuthenticatedSessionPrincipal,
     workspace: &str,
@@ -78,12 +78,14 @@ impl MessageProcessor {
     /// Select only a queue-bound manifest acknowledged before the common fence,
     /// then authorize every original source scope before reading any payload.
     /// A denied branch leaves its previously delivered summary in the context.
-    pub(crate) async fn authorize_delivered_output_branches(
+    async fn authorize_delivered_output_branches_before(
         &self,
         store: &CrudStore,
         principal: &AuthenticatedSessionPrincipal,
         workspace: &str,
         destination: &str,
+        before: Option<chrono::DateTime<chrono::FixedOffset>>,
+        excluded_turn: Option<&str>,
     ) -> Result<AuthorizedOutputSet> {
         scope_current_stage(Stage::HistoryOutputs, async {
             let authorization_revision = self.current_authorization_revision().await?;
@@ -106,7 +108,8 @@ impl MessageProcessor {
             let checkpoint = store
                 .compaction_head(&super::native::native_owner(workspace, destination))
                 .await?;
-            let fence = store.compaction_history_read_fence().await?;
+            let mut fence = store.compaction_history_read_fence().await?;
+            fence.before = before;
             let mut source_epochs = BTreeMap::from([(destination.to_owned(), epoch)]);
             access.insert(destination.to_owned(), true);
             loop {
@@ -114,6 +117,11 @@ impl MessageProcessor {
                     .compaction_delivered_output_page(workspace, destination, &cursor, &fence)
                     .await?;
                 record_work(Work::Pages, 1);
+                page.unprojected_events
+                    .retain(|source| source.scope.strip_prefix("event:") != excluded_turn);
+                page.entries.retain(|entry| {
+                    entry.acknowledgement.scope.strip_prefix("event:") != excluded_turn
+                });
                 if !page.unprojected_events.is_empty() {
                     for source in &page.unprojected_events {
                         let payload = super::history::reference_payload(
@@ -146,6 +154,9 @@ impl MessageProcessor {
                         )
                         .await?;
                     record_work(Work::Pages, 1);
+                    page.entries.retain(|entry| {
+                        entry.acknowledgement.scope.strip_prefix("event:") != excluded_turn
+                    });
                 }
                 references.extend(page.entries);
                 if page.done {
@@ -293,40 +304,56 @@ impl MessageProcessor {
         // existing frozen read hold, including CLI and background preparation.
         let _preview_activity = self.artifact_service.html_preview_activity().await;
         scope_current_stage(Stage::HistoryAuthority, async {
-            if policy.is_some_and(|policy| {
-                matches!(
-                    policy.mode,
-                    pioneer_protocol::TaskAgentContextMode::Empty
-                        | pioneer_protocol::TaskAgentContextMode::Custom
-                ) || (policy.mode == pioneer_protocol::TaskAgentContextMode::SummaryOnly
-                    && !policy.include_parent_summary)
-            }) {
-                return super::frozen::capture_execution_basis_prepared(
-                    store,
-                    workspace,
-                    destination,
-                    basis_turn,
-                    excluded_turn,
-                    policy,
-                )
-                .await;
-            }
-            let outputs = self
-                .authorize_delivered_output_branches(store, principal, workspace, destination)
-                .await?;
-            let prepared = super::frozen::capture_execution_basis_prepared_with_outputs(
+            let authorization_revision = self.current_authorization_revision().await?;
+            let resolver = AuthorizationResolver::new(store.clone());
+            let mut lines = super::frozen::conversation_history_lines(
                 store,
                 workspace,
                 destination,
-                basis_turn,
                 excluded_turn,
                 policy,
-                Some(&outputs),
+                Some((&resolver, principal)),
+            )
+            .await?;
+            lines.last_mut().expect("destination line").source_turn = basis_turn.map(str::to_owned);
+            let mut outputs = Vec::with_capacity(lines.len());
+            for line in &lines {
+                outputs.push(
+                    if super::frozen::policy_omits_history(line.policy.as_ref()) {
+                        None
+                    } else {
+                        Some(
+                            self.authorize_delivered_output_branches_before(
+                                store,
+                                principal,
+                                workspace,
+                                &line.thread,
+                                line.before,
+                                line.excluded_turn.as_deref(),
+                            )
+                            .await?,
+                        )
+                    },
+                );
+            }
+            ensure!(
+                outputs
+                    .iter()
+                    .flatten()
+                    .all(|outputs| outputs.authorization_revision == authorization_revision),
+                "authorization changed between history lines"
+            );
+            let selections = outputs.iter().map(Option::as_ref).collect::<Vec<_>>();
+            let prepared = super::frozen::capture_conversation_lines_prepared(
+                store,
+                workspace,
+                &lines,
+                &selections,
             )
             .await?;
             ensure!(
-                self.current_authorization_revision().await? == outputs.authorization_revision,
-                "authorization changed while freezing Task originals"
+                self.current_authorization_revision().await? == authorization_revision,
+                "authorization changed while freezing conversation history"
             );
             Ok(prepared)
         })

@@ -3390,42 +3390,8 @@ impl CodexProbe {
             }
         };
 
-        let account = account_response
-            .account
-            .as_ref()
-            .map(codex_account_snapshot_from_value);
-        let status = if account.is_some() {
-            CodexAccountProbeStatus::Ready
-        } else if account_response.requires_openai_auth {
-            CodexAccountProbeStatus::NeedsAuth
-        } else {
-            CodexAccountProbeStatus::Ready
-        };
-        let (message, diagnostics) = if status == CodexAccountProbeStatus::NeedsAuth {
-            let message = "Codex CLI is not authenticated".to_owned();
-            (
-                Some(message.clone()),
-                vec![CodexProbeDiagnostic {
-                    level: CodexProbeDiagnosticLevel::Warning,
-                    code: "codex_probe.needs_auth".to_owned(),
-                    message,
-                }],
-            )
-        } else {
-            (None, Vec::new())
-        };
-
         let stderr = shutdown_probe_process(&rpc, &mut process, &stderr_ring, &config).await;
-        CodexAccountProbeSnapshot {
-            status,
-            message,
-            user_agent,
-            version,
-            account,
-            requires_openai_auth: account_response.requires_openai_auth,
-            diagnostics,
-            stderr,
-        }
+        codex_account_probe_snapshot(account_response, user_agent, version, stderr)
     }
 
     pub async fn model_list(config: CodexAccountProbeConfig) -> CodexModelListProbeSnapshot {
@@ -3450,6 +3416,7 @@ impl CodexProbe {
                     message: Some(message.clone()),
                     user_agent: None,
                     version: None,
+                    account_probe: None,
                     models: Vec::new(),
                     requires_openai_auth: false,
                     diagnostics: vec![CodexProbeDiagnostic {
@@ -3476,6 +3443,7 @@ impl CodexProbe {
                     message: Some(message.clone()),
                     user_agent: None,
                     version: None,
+                    account_probe: None,
                     models: Vec::new(),
                     requires_openai_auth: false,
                     diagnostics: vec![CodexProbeDiagnostic {
@@ -3503,8 +3471,9 @@ impl CodexProbe {
                 return CodexModelListProbeSnapshot {
                     status: CodexModelListProbeStatus::Error,
                     message: Some(message.clone()),
-                    user_agent,
-                    version,
+                    user_agent: user_agent.clone(),
+                    version: version.clone(),
+                    account_probe: None,
                     models: Vec::new(),
                     requires_openai_auth: false,
                     diagnostics: vec![CodexProbeDiagnostic {
@@ -3523,8 +3492,14 @@ impl CodexProbe {
             return CodexModelListProbeSnapshot {
                 status: CodexModelListProbeStatus::NeedsAuth,
                 message: Some(message.clone()),
-                user_agent,
-                version,
+                user_agent: user_agent.clone(),
+                version: version.clone(),
+                account_probe: Some(codex_account_probe_snapshot(
+                    account_response.clone(),
+                    user_agent.clone(),
+                    version.clone(),
+                    stderr.clone(),
+                )),
                 models: Vec::new(),
                 requires_openai_auth: true,
                 diagnostics: vec![CodexProbeDiagnostic {
@@ -3545,8 +3520,14 @@ impl CodexProbe {
                 return CodexModelListProbeSnapshot {
                     status: CodexModelListProbeStatus::Error,
                     message: Some(message.clone()),
-                    user_agent,
-                    version,
+                    user_agent: user_agent.clone(),
+                    version: version.clone(),
+                    account_probe: Some(codex_account_probe_snapshot(
+                        account_response.clone(),
+                        user_agent.clone(),
+                        version.clone(),
+                        stderr.clone(),
+                    )),
                     models: Vec::new(),
                     requires_openai_auth: account_response.requires_openai_auth,
                     diagnostics: vec![CodexProbeDiagnostic {
@@ -3563,6 +3544,12 @@ impl CodexProbe {
         CodexModelListProbeSnapshot {
             status: CodexModelListProbeStatus::Ready,
             message: None,
+            account_probe: Some(codex_account_probe_snapshot(
+                account_response.clone(),
+                user_agent.clone(),
+                version.clone(),
+                stderr.clone(),
+            )),
             user_agent,
             version,
             models,
@@ -3735,6 +3722,49 @@ impl CodexProbe {
             cancelled: result.is_ok(),
             message: result.err().map(|error| error.to_string()),
         }
+    }
+}
+
+fn codex_account_probe_snapshot(
+    account_response: CodexAccountReadResponse,
+    user_agent: Option<String>,
+    version: Option<String>,
+    stderr: Vec<String>,
+) -> CodexAccountProbeSnapshot {
+    let account = account_response
+        .account
+        .as_ref()
+        .map(codex_account_snapshot_from_value);
+    let status = if account.is_some() {
+        CodexAccountProbeStatus::Ready
+    } else if account_response.requires_openai_auth {
+        CodexAccountProbeStatus::NeedsAuth
+    } else {
+        CodexAccountProbeStatus::Ready
+    };
+    let (message, diagnostics) = if status == CodexAccountProbeStatus::NeedsAuth {
+        let message = "Codex CLI is not authenticated".to_owned();
+        (
+            Some(message.clone()),
+            vec![CodexProbeDiagnostic {
+                level: CodexProbeDiagnosticLevel::Warning,
+                code: "codex_probe.needs_auth".to_owned(),
+                message,
+            }],
+        )
+    } else {
+        (None, Vec::new())
+    };
+
+    CodexAccountProbeSnapshot {
+        status,
+        message,
+        user_agent,
+        version,
+        account,
+        requires_openai_auth: account_response.requires_openai_auth,
+        diagnostics,
+        stderr,
     }
 }
 
@@ -4485,6 +4515,8 @@ fn normalize_optional_string(value: Option<&str>) -> Option<String> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodexModelListProbeSnapshot {
+    /// Account result from the same app-server session, before model discovery.
+    pub account_probe: Option<CodexAccountProbeSnapshot>,
     pub status: CodexModelListProbeStatus,
     pub message: Option<String>,
     pub user_agent: Option<String>,
@@ -4493,6 +4525,31 @@ pub struct CodexModelListProbeSnapshot {
     pub requires_openai_auth: bool,
     pub diagnostics: Vec<CodexProbeDiagnostic>,
     pub stderr: Vec<String>,
+}
+
+impl CodexModelListProbeSnapshot {
+    pub fn account_probe_snapshot(&self) -> CodexAccountProbeSnapshot {
+        self.account_probe
+            .clone()
+            .unwrap_or_else(|| CodexAccountProbeSnapshot {
+                status: match self.status {
+                    CodexModelListProbeStatus::MissingBinary => {
+                        CodexAccountProbeStatus::MissingBinary
+                    }
+                    CodexModelListProbeStatus::SpawnFailed => CodexAccountProbeStatus::SpawnFailed,
+                    CodexModelListProbeStatus::Ready => CodexAccountProbeStatus::Ready,
+                    CodexModelListProbeStatus::NeedsAuth => CodexAccountProbeStatus::NeedsAuth,
+                    CodexModelListProbeStatus::Error => CodexAccountProbeStatus::Error,
+                },
+                message: self.message.clone(),
+                user_agent: self.user_agent.clone(),
+                version: self.version.clone(),
+                account: None,
+                requires_openai_auth: self.requires_openai_auth,
+                diagnostics: self.diagnostics.clone(),
+                stderr: self.stderr.clone(),
+            })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4777,6 +4834,7 @@ fn shadow_home_model_list_probe_snapshot(
     error: CodexShadowHomeError,
 ) -> CodexModelListProbeSnapshot {
     CodexModelListProbeSnapshot {
+        account_probe: None,
         status: CodexModelListProbeStatus::Error,
         message: Some(error.to_string()),
         user_agent: None,
@@ -4828,6 +4886,7 @@ fn model_list_spawn_error_probe_snapshot(
     };
 
     CodexModelListProbeSnapshot {
+        account_probe: None,
         status,
         message: Some(message.clone()),
         user_agent: None,

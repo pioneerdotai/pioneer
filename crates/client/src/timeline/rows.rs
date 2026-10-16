@@ -260,6 +260,7 @@ mod tests {
     fn mutation_actions_require_owned_explicit_live_message() {
         let current = principal("PCCCCCCCCCCCCCCCCCCCC");
         let author = TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::Principal(current.clone()),
             display_name: "Current".to_owned(),
             nickname: "current".to_owned(),
@@ -285,6 +286,7 @@ mod tests {
         message.author = None;
         assert!(!user_message_mutation_availability(&message, &current).can_edit);
         message.author = Some(TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::Principal(principal("PDDDDDDDDDDDDDDDDDDDD")),
             display_name: "Other".to_owned(),
             nickname: "other".to_owned(),
@@ -299,6 +301,7 @@ mod tests {
         let alice = principal("PAAAAAAAAAAAAAAAAAAAA");
         let bob = principal("PBBBBBBBBBBBBBBBBBBBB");
         let historical = TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::Principal(alice.clone()),
             display_name: "Removed Alice".to_owned(),
             nickname: "alice-old".to_owned(),

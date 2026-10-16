@@ -133,6 +133,31 @@ impl CrudStore {
         )
         .await
     }
+    /// Apply the historical cutoff during metadata discovery, before payloads.
+    pub async fn compaction_source_metadata_page_before(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        kind: PagedSource,
+        after: i64,
+        capture_order: i64,
+        before: Option<sea_orm::prelude::DateTimeWithTimeZone>,
+    ) -> Result<SourcePage> {
+        repositories::compaction::compaction_source_page_inner_bounded(
+            &self.connection,
+            workspace,
+            thread,
+            turn,
+            kind,
+            after,
+            false,
+            capture_order,
+            before,
+        )
+        .await
+    }
+
     pub async fn compaction_item_created_at(
         &self,
         workspace: &str,
@@ -1072,6 +1097,7 @@ impl CrudStore {
         command: Option<&str>,
         source: Option<&SourceRef>,
         event_fence: i64,
+        before: Option<sea_orm::prelude::DateTimeWithTimeZone>,
     ) -> Result<Option<String>> {
         repositories::compaction::history::compaction_failed_delivery_command(
             &self.connection,
@@ -1080,6 +1106,7 @@ impl CrudStore {
             command,
             source,
             event_fence,
+            before,
         )
         .await
     }
@@ -1099,6 +1126,35 @@ impl CrudStore {
         )
         .await
     }
+    /// Resolve the durable parent and initial child turn without reading Task input.
+    pub async fn compaction_child_history_parent(
+        &self,
+        workspace: &str,
+        child: &str,
+    ) -> Result<Option<crate::compaction::ChildHistoryParent>> {
+        repositories::compaction::history::compaction_child_history_parent(
+            &self.connection,
+            workspace,
+            child,
+        )
+        .await
+    }
+
+    pub async fn compaction_history_source_created_at(
+        &self,
+        workspace: &str,
+        thread: &str,
+        source: &SourceRef,
+    ) -> Result<Option<sea_orm::prelude::DateTimeWithTimeZone>> {
+        repositories::compaction::history::compaction_history_source_created_at(
+            &self.connection,
+            workspace,
+            thread,
+            source,
+        )
+        .await
+    }
+
     /// One read fixes the append boundary before enumerating any turns. Source
     /// bounds use retained metadata with explicit insertion order; deleting or
     /// vacuuming canonical rows cannot change that order. MAX uses indexes and

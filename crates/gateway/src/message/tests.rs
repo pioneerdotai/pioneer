@@ -528,6 +528,7 @@ async fn persist_test_cli_execution_authorization_context_with_profile(
     let runtime_kind = match runtime_kind {
         "codex" => CLIAgentRuntimeKind::Codex,
         "claude" => CLIAgentRuntimeKind::Claude,
+        "opencode" => CLIAgentRuntimeKind::OpenCode,
         other => panic!("unsupported test CLI runtime kind `{other}`"),
     };
     let execution_backend = AgentExecutionBackend::CLIAgentRuntime {
@@ -591,6 +592,10 @@ async fn persist_test_cli_instruction_projection(
         CLIAgentRuntimeKind::Claude => (
             "claude",
             CLIRuntimeElevatedInstructionTransport::ClaudeAppendSystemPromptFile,
+        ),
+        CLIAgentRuntimeKind::OpenCode => (
+            "opencode",
+            CLIRuntimeElevatedInstructionTransport::OpenCodeSystemPrompt,
         ),
     };
     let now = chrono::Utc::now().fixed_offset();
@@ -1286,6 +1291,10 @@ fn supported_test_cli_mcp_readiness(
             pioneer_protocol::CliMcpInjectionKind::ClaudeStrictStdioMcp,
             pioneer_protocol::CliMcpProjectionUpdateKind::ClaudeRestartProcessResumeSession,
         ),
+        CLIAgentRuntimeKind::OpenCode => (
+            pioneer_protocol::CliMcpInjectionKind::OpenCodeDynamicStdioMcp,
+            pioneer_protocol::CliMcpProjectionUpdateKind::OpenCodeRestartServerResumeSession,
+        ),
     };
     pioneer_protocol::CliMcpAdapterReadiness {
         supported: true,
@@ -1404,6 +1413,130 @@ async fn setup_cli_runtime_security_harness_for_principal(
         self_improvement_supervisor,
         processor: Arc::new(processor),
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn codex_readiness_shares_one_account_read_and_process_and_preserves_auth_failures() {
+    use std::os::unix::fs::PermissionsExt;
+    run_gateway_message_test("codex-readiness-single-probe", || async {
+        for (name, response, expected) in [
+            (
+                "ready",
+                r#"{"id":1,"result":{"account":{"type":"chatgpt","email":"test@example.com"},"requiresOpenaiAuth":false}}"#,
+                pioneer_protocol::RuntimeStatus::Ready,
+            ),
+            (
+                "needs-auth",
+                r#"{"id":1,"result":{"requiresOpenaiAuth":true}}"#,
+                pioneer_protocol::RuntimeStatus::NeedsAuth,
+            ),
+            (
+                "account-error",
+                r#"{"id":1,"error":{"code":-32603,"message":"account unavailable"}}"#,
+                pioneer_protocol::RuntimeStatus::Error {
+                    message: "unused".into(),
+                },
+            ),
+        ] {
+            let harness =
+                setup_cli_runtime_security_harness(Some(CLIAgentRuntimeKind::Codex)).await;
+            let processor = &harness.processor;
+            let temp = tempfile::tempdir().unwrap();
+            let script = temp.path().join("fake-codex");
+            std::fs::write(&script, format!(r#"#!/bin/sh
+cd "$(dirname "$0")" || exit 1
+printf '%s\n' started >> probe-starts
+printf '%s\n' 'synthetic probe stderr' >&2
+read initialize
+printf '%s\n' "$initialize" >> probe-requests
+printf '%s\n' '{{"id":0,"result":{{"userAgent":"codex/1.2.3 test"}}}}'
+read initialized
+read account
+printf '%s\n' "$account" >> probe-requests
+printf '%s\n' '{response}'
+while read line; do
+  printf '%s\n' "$line" >> probe-requests
+  case "$line" in
+    *model/list*) printf '%s\n' '{{"id":2,"result":{{"data":[{{"id":"test-model"}}]}}}}' ;;
+    *account/read*) printf '%s\n' '{{"id":2,"error":{{"code":-32603,"message":"duplicate account/read"}}}}' ;;
+  esac
+done
+"#)).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let config = crate::isolated_test_app_config().unwrap();
+            let settings_name = config.gateway.settings_file_name.as_str();
+            let settings_path = processor.artifact_runtime_home.join(settings_name);
+            let mut settings = crate::settings::load_or_create_gateway_settings(
+                &settings_path,
+                config.gateway.settings_version,
+                settings_name,
+            )
+            .unwrap();
+            let mut instance = pioneer_protocol::GatewayCliRuntimeInstanceSettings::default_codex();
+            instance.enabled = true;
+            instance.binary_path = script.to_string_lossy().into_owned();
+            instance.home_path = temp
+                .path()
+                .join("codex-home")
+                .to_string_lossy()
+                .into_owned();
+            settings
+                .set_cli_runtime_settings_for_tests(pioneer_protocol::GatewayCliRuntimeSettings {
+                    instances: vec![instance],
+                })
+                .unwrap();
+            crate::settings::save_gateway_settings(&settings_path, &settings).unwrap();
+            processor
+                .refresh_cli_readiness_for_tests(&harness.workspace_id)
+                .await
+                .unwrap();
+            let probe = processor
+                .cli_runtime_probe_snapshot(&harness.workspace_id, "codex")
+                .await
+                .unwrap()
+                .expect("published readiness probe");
+            assert_eq!(
+                std::mem::discriminant(&probe.summary.status),
+                std::mem::discriminant(&expected),
+                "{name}: {:?}",
+                probe.summary
+            );
+            assert_eq!(probe.summary.version.as_deref(), Some("1.2.3"));
+            assert!(
+                probe
+                    .summary
+                    .recent_stderr
+                    .iter()
+                    .any(|line| line.contains("synthetic probe stderr"))
+            );
+            let requests = std::fs::read_to_string(temp.path().join("probe-requests")).unwrap();
+            assert_eq!(requests.matches("account/read").count(), 1, "{name}");
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join("probe-starts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1,
+                "{name}"
+            );
+            if expected == pioneer_protocol::RuntimeStatus::Ready {
+                assert_eq!(requests.matches("model/list").count(), 1);
+                assert_eq!(probe.models.unwrap().result.models[0].id, "test-model");
+                assert_eq!(
+                    probe.summary.account.unwrap().email.as_deref(),
+                    Some("test@example.com")
+                );
+                assert!(probe.summary.capabilities.supports_mcp_tools);
+                assert!(probe.mcp_readiness.is_some());
+            } else {
+                assert!(!requests.contains("model/list"));
+                assert!(probe.models.is_none());
+                assert!(!probe.summary.capabilities.supports_mcp_tools);
+                assert!(!probe.summary.diagnostics.is_empty());
+            }
+        }
+    });
 }
 
 #[test]
@@ -1775,6 +1908,7 @@ async fn setup_cli_runtime_skill_preflight_harness(
     let runtime_id = match runtime_kind {
         CLIAgentRuntimeKind::Codex => "codex_proposal_51",
         CLIAgentRuntimeKind::Claude => "claude_proposal_51",
+        CLIAgentRuntimeKind::OpenCode => "opencode_proposal_51",
     }
     .to_owned();
     settings
@@ -1977,6 +2111,7 @@ async fn seed_cli_runtime_skill_preflight_thread(
                     match harness.runtime_kind {
                         CLIAgentRuntimeKind::Codex => "o4-mini",
                         CLIAgentRuntimeKind::Claude => "claude-sonnet",
+                        CLIAgentRuntimeKind::OpenCode => "openai/gpt-5",
                     }
                     .to_owned(),
                 ),
@@ -2053,7 +2188,11 @@ where
 }
 
 async fn capability_persistence_order_impl() {
-    for runtime_kind in [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude] {
+    for runtime_kind in [
+        CLIAgentRuntimeKind::Codex,
+        CLIAgentRuntimeKind::Claude,
+        CLIAgentRuntimeKind::OpenCode,
+    ] {
         let harness = setup_cli_runtime_skill_preflight_harness(runtime_kind, false).await;
         let alpha_path = write_test_skill(&harness.user_root, "alpha", "", "# alpha\n");
         let beta_path = write_test_skill(&harness.registry_root, "beta", "", "# beta\n");
@@ -2091,6 +2230,7 @@ async fn capability_persistence_order_impl() {
             match runtime_kind {
                 CLIAgentRuntimeKind::Codex => "codex",
                 CLIAgentRuntimeKind::Claude => "claude",
+                CLIAgentRuntimeKind::OpenCode => "opencode",
             },
         );
         let request = cli_runtime_turn_start_request_with_capabilities(
@@ -2201,7 +2341,10 @@ async fn capability_persistence_order_impl() {
                 ..
             } if committed_turn_id == turn_id && bindings.len() == 2
         ));
-        if matches!(runtime_kind, CLIAgentRuntimeKind::Codex) {
+        if matches!(
+            runtime_kind,
+            CLIAgentRuntimeKind::Codex | CLIAgentRuntimeKind::OpenCode
+        ) {
             let input = native_turn.input.as_array().unwrap();
             let skill_items = input
                 .iter()
@@ -2224,19 +2367,29 @@ async fn capability_persistence_order_impl() {
                 ]
             );
             let instructions = native_turn.elevated_instructions.text();
-            assert!(instructions.contains("selected Skill input"));
+            let (directive, beta_label, alpha_label, runtime_label) = match runtime_kind {
+                CLIAgentRuntimeKind::Codex => {
+                    ("selected Skill input", "- $beta", "- $alpha", "Codex")
+                }
+                CLIAgentRuntimeKind::OpenCode => ("OpenCode turn", "- beta", "- alpha", "OpenCode"),
+                CLIAgentRuntimeKind::Claude => unreachable!(),
+            };
+            assert!(instructions.contains(directive));
             let beta = instructions
-                .find("- $beta")
-                .expect("Codex elevated instructions should include beta");
+                .find(beta_label)
+                .unwrap_or_else(|| panic!("{runtime_label} instructions should include beta"));
             let alpha = instructions
-                .find("- $alpha")
-                .expect("Codex elevated instructions should include alpha");
-            assert!(beta < alpha, "selected Codex skill order must be preserved");
+                .find(alpha_label)
+                .unwrap_or_else(|| panic!("{runtime_label} instructions should include alpha"));
+            assert!(
+                beta < alpha,
+                "selected {runtime_label} skill order must be preserved"
+            );
             assert!(input.iter().all(|item| {
                 item["type"] != "text"
                     || item["text"]
                         .as_str()
-                        .is_none_or(|text| !text.contains("selected Skill input"))
+                        .is_none_or(|text| !text.contains(directive))
             }));
         } else {
             let input = native_turn.input.as_array().unwrap();
@@ -2272,7 +2425,11 @@ fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix() {
 }
 
 async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_impl() {
-    for runtime_kind in [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude] {
+    for runtime_kind in [
+        CLIAgentRuntimeKind::Codex,
+        CLIAgentRuntimeKind::Claude,
+        CLIAgentRuntimeKind::OpenCode,
+    ] {
         let harness = setup_cli_runtime_skill_preflight_harness(runtime_kind, false).await;
         let source = write_test_skill(&harness.user_root, "lifecycle", "", "# first\n");
         let lifecycle_id = seed_cli_runtime_skill_installation(
@@ -11741,9 +11898,8 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         .unwrap()
         .unwrap();
     assert!(import_count > 0);
-    // Re-capture a real admitted child basis, as native/background compaction
-    // does after execution. The source bodies and their own-import grants must
-    // survive together, including repeated captures and the latest-basis path.
+    // Exact execution projections must forward the accepted own-import grants.
+    // New conversations have separate bounded inheritance and no such grants.
     let db = crud_store.database_connection();
     for (sql, values) in [
         (
@@ -11791,19 +11947,17 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         .await
         .unwrap();
     }
-    for basis_turn in [Some("recapture-turn"), None] {
-        let recaptured = crate::compaction::frozen::capture_execution_basis_json(
+    for pass in 0..2 {
+        let recaptured = crate::compaction::frozen::prepare_exact_task_fixture(
             crud_store.as_ref(),
             &workspace_id,
             "new-child-context",
-            basis_turn,
-            None,
+            "recapture-turn",
             None,
         )
         .await
         .unwrap();
-        let descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
-            serde_json::from_str(&recaptured).unwrap();
+        let descriptor = recaptured.descriptor;
         let (forwarded, _) = crud_store
             .compaction_frozen_import_state(
                 &workspace_id,
@@ -11815,7 +11969,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             .unwrap();
         assert_eq!(
             forwarded, import_count,
-            "recapture must preserve every accepted own source grant (basis turn: {basis_turn:?})"
+            "recapture must preserve every accepted own source grant (pass {pass})"
         );
     }
 
@@ -15141,6 +15295,41 @@ async fn task_run_voice_composer_stays_foreground() {
         )
         .await
         .expect("persist task-run voice lineage");
+
+    // A Task child has a durable initial execution as well as lineage. The
+    // voice turn below is a later conversation, not the creating Task attempt.
+    for (sql, values) in [
+        (
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('turn_voice_task_initial','thr_voice_task_run','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            vec![],
+        ),
+        (
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('task_voice_task_run',?,'thread','thr_voice_task_root','thr_voice_task_root','turn_voice_task_root','agent','completed','Voice child','fixture')",
+            vec![workspace_id.clone().into()],
+        ),
+        (
+            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('run_voice_task_run','task_voice_task_run','run_voice_task_run',1,1,'succeeded','agent')",
+            vec![],
+        ),
+        (
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES('rt_voice_task_run','task_voice_task_run','run_voice_task_run','thr_voice_task_run','turn_voice_task_initial','initial',0,1,'review_recorded',CURRENT_TIMESTAMP)",
+            vec![],
+        ),
+        (
+            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) VALUES('run_voice_task_run','task_voice_task_run',?,'thr_voice_task_root','turn_voice_task_root','[]',CURRENT_TIMESTAMP,NULL)",
+            vec![workspace_id.clone().into()],
+        ),
+    ] {
+        crud_store
+            .database_connection()
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                sql,
+                values,
+            ))
+            .await
+            .unwrap();
+    }
 
     let turn_id = "turn_voice_task_run";
     let result = submit_test_voice_turn(
@@ -24939,6 +25128,7 @@ fn composer_cli_skill_pack_matches_individual_members_and_preserves_presentation
                 let model = match runtime_kind {
                     CLIAgentRuntimeKind::Codex => "gpt-5",
                     CLIAgentRuntimeKind::Claude => "claude-sonnet",
+                    CLIAgentRuntimeKind::OpenCode => "openai/gpt-5",
                 };
                 let thread = harness
                     .thread_manager
@@ -25847,12 +26037,25 @@ async fn a_child_first_continued_by_another_provider_or_after_source_edit_transf
             TaskStatus::Completed
         );
         if edit_source || edit_after_ready {
-            seed_completed_task_parent_with_history(
+            let cutoff = store
+                .compaction_child_history_parent(&workspace, &lineage.child_thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .started_at
+                .timestamp()
+                + 1;
+            seed_completed_task_parent_with_inputs_at(
                 &processor,
                 &workspace,
                 &parent,
                 &format!("switch-late-parent-{source_id}"),
                 "LATE PARENT AFTER CHILD ANSWER",
+                vec![UserInput::Text {
+                    text: "LATE PARENT AFTER CHILD ANSWER".into(),
+                    text_elements: vec![],
+                }],
+                cutoff,
             )
             .await;
         }
@@ -26604,8 +26807,14 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
         .await
         .unwrap();
     sync_test_cli_runtime_identities(&processor).await.unwrap();
+    let max_input_tokens = 50_000;
     processor
-        .mark_cli_reasoning_model_ready_for_tests(&workspace, "codex", "gpt-5")
+        .mark_cli_reasoning_model_with_limit_ready_for_tests(
+            &workspace,
+            "codex",
+            "gpt-5",
+            Some(max_input_tokens),
+        )
         .await
         .unwrap();
     processor
@@ -26617,15 +26826,18 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
     processor.bind_task_bridge().await;
     processor.start_task_event_listener().await;
     let parent = "accepted-large-task-parent";
-    let mut raw_bytes = 0usize;
+    // Force real transfer compaction through the discovered input limit.
+    // The separate CLI frame fixture covers the 8 MiB limit; these cases need
+    // accepted revisions, checkpoint reuse and cancellation, not that volume.
+    let mut history_tokens = 0;
+    let mut history_chars = 0;
     for index in 0..12 {
-        // Keep the provider frame above the 8 MiB cap without making a
-        // single giant BPE word dominate history-transfer timing.
         let text = format!(
             "ACCEPTED TASK CHUNK {index:02} {}",
-            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx ".repeat(22_200)
+            "accepted history ".repeat(6_500)
         );
-        raw_bytes += text.len();
+        history_tokens += pioneer_compaction::text_tokens(&text);
+        history_chars += text.chars().count();
         seed_completed_task_parent_with_inputs(
             &processor,
             &workspace,
@@ -26639,7 +26851,8 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
         )
         .await;
     }
-    assert!(raw_bytes > crate::cli_runtime::context::MAX_CLI_TURN_INPUT_FRAME_BYTES);
+    assert!(history_tokens > max_input_tokens);
+    assert!(history_chars > crate::cli_runtime::context::MAX_CODEX_INPUT_TEXT_CHARS);
     let launch = "accepted-large-task-launch";
     let params = detached_cli_task_create_params(
         &workspace,
@@ -26660,9 +26873,8 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
     });
     let result = create_task_for_test(&processor, params).await.unwrap();
     let run = result.run.unwrap();
-    // This barrier follows projection of more than 8 MiB of accepted history.
-    // A concurrent workspace test run can spend well over ten seconds there;
-    // keep the test wait bounded without imposing an unrelated product deadline.
+    // Keep the observation bounded while the accepted projection is prepared.
+    // Editing below must happen at the selected capture/compaction boundary.
     timeout(
         Duration::from_secs(180),
         processor.wait_for_completed_history_preparation_barrier(),
@@ -26679,16 +26891,33 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
     let child = wait_for_child_lineage_for_run(store.clone(), run.id.as_str()).await;
     let late_parent_body = format!(
         "LATER PARENT MUST NOT ENTER TASK CHECKPOINT {}",
-        "q".repeat(3_000_000)
+        "later context ".repeat(50_000)
     );
-    seed_completed_task_parent_with_history(
+    let cutoff = store
+        .compaction_child_history_parent(&workspace, &child.child_thread_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .started_at
+        .timestamp()
+        + 1;
+    seed_completed_task_parent_with_inputs_at(
         &processor,
         &workspace,
         parent,
         "parent-later-than-task-snapshot",
         late_parent_body.as_str(),
+        vec![UserInput::Text {
+            text: late_parent_body.clone(),
+            text_elements: vec![],
+        }],
+        cutoff,
     )
     .await;
+    // Make the edited unit exceed the transfer token target so it must enter
+    // the summary, even if its replacement row sorts into the retained tail.
+    let edited_body = format!("EDITED ACCEPTED SOURCE 00 {}", "b ".repeat(70_000));
+    assert!(pioneer_compaction::text_tokens(&edited_body) > max_input_tokens);
     store
         .edit_turn_message(pioneer_crud::EditTurnMessageRequest {
             workspace_id: workspace.clone(),
@@ -26696,10 +26925,7 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
             turn_id: "accepted-source-00".to_owned(),
             expected_revision: 0,
             input: vec![UserInput::Text {
-                text: format!(
-                    "EDITED ACCEPTED SOURCE 00 {}",
-                    "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy ".repeat(22_200)
-                ),
+                text: edited_body,
                 text_elements: Vec::new(),
             }],
             mentions: Vec::new(),
@@ -27089,6 +27315,16 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
         )
         .await
         .unwrap();
+    assert_eq!(prepared.checkpoint.as_deref(), Some(checkpoint_id.as_str()));
+    assert_eq!(
+        prepared
+            .messages
+            .iter()
+            .filter(|message| { message.content.contains("ACCEPTED TASK HISTORY SUMMARY") })
+            .count(),
+        1,
+        "recapture must reuse the published checkpoint over the accepted edited sources"
+    );
     processor
         .compact_cli_transfer_history(
             &workspace,
@@ -27153,6 +27389,8 @@ fn cancelling_cli_history_transfer_stops_before_provider_start_and_releases_sess
 
 #[derive(Default)]
 struct PausedCliHeartbeatWriter {
+    /// `None` pauses the next write regardless of its workload.
+    workload: Option<pioneer_observability::DatabaseWorkload>,
     armed: std::sync::atomic::AtomicBool,
     entered: Notify,
     release: Arc<Notify>,
@@ -27167,7 +27405,11 @@ impl pioneer_sqlite::SqliteWriteObserver for PausedCliHeartbeatWriter {
         &self,
         class: pioneer_sqlite::SqliteWriteClass,
     ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> {
-        if !self.armed.swap(false, Ordering::SeqCst) {
+        // Leave the pause armed when another workload acquires the writer.
+        if self.workload.is_some_and(|workload| {
+            crate::database::attribution::current_database_workload() != Some(workload)
+        }) || !self.armed.swap(false, Ordering::SeqCst)
+        {
             return None;
         }
         *self.acquired_class.lock().unwrap() = Some(class);
@@ -27208,7 +27450,10 @@ fn cli_deadline_drops_pending_monitor_before_compaction_cleanup() {
 async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(cases: &[&str]) {
     for &case in cases {
         let outer_deadline = case == "outer-deadline";
-        let writer_pause = Arc::new(PausedCliHeartbeatWriter::default());
+        let writer_pause = Arc::new(PausedCliHeartbeatWriter {
+            workload: Some(pioneer_observability::DatabaseWorkload::AgentProgress),
+            ..Default::default()
+        });
         let (tx, mut rx) = mpsc::channel(128);
         let sessions = Arc::new(SessionManager::new());
         let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
@@ -27337,6 +27582,14 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
             processor.release_completed_history_preparation_barrier();
         } else {
             writer_pause.armed.store(true, Ordering::SeqCst);
+            assert!(
+                pioneer_sqlite::SqliteWriteObserver::pause_execute_raw_after_acquire_for_test(
+                    writer_pause.as_ref(),
+                    pioneer_sqlite::SqliteWriteClass::Critical,
+                )
+                .is_none(),
+                "an unrelated writer must leave the heartbeat pause armed"
+            );
             processor.release_completed_history_preparation_barrier();
             timeout(Duration::from_secs(10), writer_pause.entered.notified())
                 .await
@@ -28758,6 +29011,9 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 }
                 CLIAgentRuntimeKind::Claude => {
                     pioneer_protocol::TurnSecurityExecutionBackendKind::ClaudeCli
+                }
+                CLIAgentRuntimeKind::OpenCode => {
+                    pioneer_protocol::TurnSecurityExecutionBackendKind::OpenCodeCli
                 }
             }
         );
@@ -30371,12 +30627,9 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             "foreground CLI presentation must identify the actual runtime executor, not generic Agent"
         );
         assert_eq!(
-            manual_author.and_then(|author| author.avatar_revision.as_deref()),
-            Some(match runtime_kind {
-                CLIAgentRuntimeKind::Codex => pioneer_protocol::CODEX_AGENT_AVATAR_REVISION,
-                CLIAgentRuntimeKind::Claude => pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION,
-            }),
-            "timeline projection must carry the explicit runtime-executor discriminator consumed by desktop"
+            manual_author.and_then(|author| author.cli_runtime_kind),
+            Some(runtime_kind),
+            "timeline projection must carry provider identity independently of artwork"
         );
         let before_delivery = processor
             .task_runtime
@@ -30796,12 +31049,25 @@ async fn nested_cli_children_bootstrap_their_accepted_lineage_only_impl() {
     }
 
     let late_parent_marker = "LATE ROOT APPEND AFTER CHILD BASIS";
-    seed_completed_task_parent_with_history(
+    let root_cutoff = crud_store
+        .compaction_child_history_parent(&workspace_id, &lineages[0].child_thread_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .started_at
+        .timestamp()
+        + 1;
+    seed_completed_task_parent_with_inputs_at(
         &processor,
         workspace_id.as_str(),
         root_thread_id,
         "turn_nested_cli_late_root",
         late_parent_marker,
+        vec![UserInput::Text {
+            text: late_parent_marker.into(),
+            text_elements: vec![],
+        }],
+        root_cutoff,
     )
     .await;
     cli_session
@@ -54546,6 +54812,7 @@ async fn materialize_cli_runtime_turn_with_execution(
             execution_principal.principal_id.clone(),
         );
         turn.author = Some(pioneer_protocol::TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: actor.clone(),
             display_name: "Superuser".into(),
             nickname: "superuser".into(),
@@ -55333,6 +55600,7 @@ async fn agent_skill_snapshot_failure_retries_the_gateway_path_without_overlay()
             &runtime_environment,
             &[],
             &mut overlay,
+            None,
         )
         .await
         .expect("optional Agent pin failure must preserve the base Gateway turn path");
@@ -55408,6 +55676,7 @@ async fn persist_agent_skill_snapshot_for_resolution_tests(
             &runtime_environment,
             &[],
             &mut overlay,
+            None,
         )
         .await
         .expect("Agent skill snapshot fixture must persist");
@@ -75188,6 +75457,7 @@ async fn compaction_failed_partial_writer_preserves_event_but_excludes_observati
             &std::collections::HashMap::new(),
             &history,
             &[],
+            None,
         )
         .await
         .unwrap();

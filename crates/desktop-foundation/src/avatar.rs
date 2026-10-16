@@ -1,10 +1,11 @@
 use gpui_kit::{
-    App, ImageSource, IntoElement, RenderOnce, SharedString, Window, component::avatar::Avatar,
-    prelude::FluentBuilder,
+    App, ImageSource, IntoElement, RenderOnce, SharedString, Styled, Window,
+    component::avatar::Avatar, prelude::FluentBuilder, transparent_black,
 };
 
 /// Value adapter that applies authenticated avatar output to a caller-owned
-/// stock `Avatar` configuration.
+/// stock `Avatar` configuration. Images keep their alpha without a tinted backdrop;
+/// initials retain the stock fallback appearance.
 #[derive(IntoElement)]
 pub struct AvatarSurface {
     avatar: Avatar,
@@ -36,6 +37,8 @@ impl RenderOnce for AvatarSurface {
     fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
         self.avatar
             .when_some(self.fallback_name, |avatar, name| avatar.name(name))
-            .when_some(self.source, |avatar, source| avatar.src(source))
+            .when_some(self.source, |avatar, source| {
+                avatar.src(source).bg(transparent_black())
+            })
     }
 }

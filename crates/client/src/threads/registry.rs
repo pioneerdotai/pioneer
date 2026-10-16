@@ -183,6 +183,12 @@ fn confirm_admission_page(
     }));
 }
 
+// Request-local evidence: Thread metadata alone can lag live Conversation state.
+struct ThreadSubscriptionBaseline {
+    thread: Option<Thread>,
+    turn_phase_markers: HashMap<String, Arc<crate::conversation::reducer::TurnPhase>>,
+}
+
 struct ThreadDomainStore {
     coordinator: ThreadCoordinator,
     semantic: SemanticTimelineState,
@@ -211,6 +217,127 @@ impl ThreadDomainStore {
             &thread,
         );
         self.coordinator.set_snapshot(thread);
+    }
+
+    fn subscription_baseline(&self) -> ThreadSubscriptionBaseline {
+        ThreadSubscriptionBaseline {
+            thread: self.coordinator.thread().cloned(),
+            turn_phase_markers: self
+                .coordinator
+                .conversation
+                .projection()
+                .turns
+                .iter()
+                .filter_map(|turn| {
+                    self.coordinator
+                        .conversation
+                        .turn_phase_marker(&turn.id)
+                        .map(|marker| (turn.id.clone(), marker))
+                })
+                .collect(),
+        }
+    }
+
+    fn reconcile_subscription_snapshot(
+        &mut self,
+        before: Option<&ThreadSubscriptionBaseline>,
+        mut thread: Thread,
+    ) {
+        let current = self.coordinator.thread();
+        let older = current.is_some_and(|current| thread.updated_at < current.updated_at);
+        if let Some(current) = current {
+            // updated_at has second precision. Compare request-local values as well,
+            // so a local send/live update in that same second wins field conflicts.
+            // ThreadStarted has no request identity: keep existing metadata when
+            // its relation to local changes is unknown. The RPC can resolve it.
+            let metadata = before.and_then(|before| before.thread.as_ref());
+            macro_rules! preserve_changes {
+                ($($($field:ident),+);+ $(;)?) => {$({
+                    if older || metadata.is_none_or(|old| $(old.$field != current.$field)||+) {
+                        $(thread.$field = current.$field.clone();)+
+                    }
+                })+};
+            }
+            preserve_changes! {
+                name;
+                preview, preview_author;
+                mode, model, model_provider, reasoning_effort;
+                status;
+                origin_kind;
+                sidebar_visibility;
+                agent_nickname;
+                agent_role;
+                visibility;
+            }
+            thread.updated_at = thread.updated_at.max(current.updated_at);
+        }
+        let accepts_turn =
+            |turn: &pioneer_protocol::Turn, baseline: Option<&ThreadSubscriptionBaseline>| {
+                use crate::conversation::reducer::TurnPhase;
+                use pioneer_protocol::TurnStatus;
+                let Some(view) = self
+                    .coordinator
+                    .conversation
+                    .projection()
+                    .turns
+                    .iter()
+                    .find(|view| view.id == turn.id)
+                else {
+                    return true;
+                };
+                let unchanged = !older
+                    && baseline.is_some_and(|before| {
+                        before.turn_phase_markers.get(&turn.id).is_some_and(|old| {
+                            self.coordinator
+                                .conversation
+                                .turn_phase_marker(&turn.id)
+                                .is_some_and(|current| Arc::ptr_eq(old, &current))
+                        })
+                    });
+                match view.phase {
+                    // Completion animation still owns this turn until tick().
+                    TurnPhase::Completing => false,
+                    TurnPhase::Completed => turn.status == TurnStatus::Completed,
+                    TurnPhase::Failed => turn.status == TurnStatus::Failed,
+                    TurnPhase::Cancelled => turn.status == TurnStatus::Interrupted,
+                    // Blocked is resumable. Only an RPC begun in this same state can
+                    // confirm resumption; an unversioned echo cannot undo a live block.
+                    TurnPhase::Blocked => turn.status == TurnStatus::Blocked || unchanged,
+                    TurnPhase::Starting | TurnPhase::Running => match turn.status {
+                        TurnStatus::InProgress => true,
+                        TurnStatus::Blocked => unchanged,
+                        // An RPC can supply a missing terminal outcome. An echo
+                        // without causal evidence must leave live flow intact.
+                        _ => baseline.is_some(),
+                    },
+                }
+            };
+        // Stored Thread turns can themselves lag live events. Do not feed stale
+        // retained evidence back into Conversation while merging a response.
+        let mut turns = current
+            .into_iter()
+            .flat_map(|thread| &thread.turns)
+            .filter(|turn| accepts_turn(turn, None))
+            .cloned()
+            .collect::<Vec<_>>();
+        for incoming in std::mem::take(&mut thread.turns) {
+            if !accepts_turn(&incoming, before) {
+                continue;
+            }
+            if let Some(turn) = turns.iter_mut().find(|turn| turn.id == incoming.id) {
+                *turn = incoming;
+            } else {
+                turns.push(incoming);
+            }
+        }
+        thread.turns = turns;
+        if self.coordinator.thread() == Some(&thread) {
+            // A live block may have left Thread unchanged. Its fresh subscription
+            // still needs to restore Conversation even when metadata is equal.
+            self.coordinator.conversation.sync_thread_snapshot(&thread);
+        } else {
+            self.set_snapshot(thread);
+        }
     }
 
     fn new(id: &str, workspace: &str) -> Self {
@@ -268,6 +395,31 @@ pub struct ThreadRegistry {
 }
 
 impl ThreadRegistry {
+    pub(crate) fn next_timeline_request_deadline(&self) -> Option<u64> {
+        [
+            self.timeline.next_read_deadline(),
+            self.timeline.next_refresh_deadline_where(|id| {
+                self.stores.get(id).is_some_and(|store| {
+                    !store.presentation_blocked && store.demand != ClientDemand::Suspended
+                })
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    pub(crate) fn due_timeline_refreshes(
+        &mut self,
+        now_ms: u64,
+    ) -> Vec<crate::timeline::controller::TimelinePageRequest> {
+        self.timeline.due_refreshes(now_ms, |id| {
+            self.stores.get(id).is_some_and(|store| {
+                !store.presentation_blocked && store.demand != ClientDemand::Suspended
+            })
+        })
+    }
+
     pub(crate) fn timeline_has_unread(&self, thread: &str) -> bool {
         self.directory.has_unread(thread)
     }
@@ -471,7 +623,6 @@ impl ThreadRegistry {
             ),
         );
         store.snapshot = Some(snapshot);
-        drafts.extend(self.evict_inactive());
         drafts
     }
 }
@@ -1276,6 +1427,17 @@ impl ClientCore {
         // Read intent survives a duplicate invalidation, but only for IDs accepted
         // into the stale sets by the semantic reducer (including tombstone fences).
         let requests = thread_reconcile_actions(&state, &update);
+        let store = &state.registry.stores[id];
+        // Any accepted change for this timeline can signal recovery, including
+        // duplicates and removal-only updates that produce no ordinary request.
+        let rearmed = !store.presentation_blocked
+            && store.demand == ClientDemand::Visible
+            && state.registry.timeline.rearm_exhausted_refresh(id);
+        drop(state);
+        if rearmed {
+            // Preserve the wake even when admission below returns no request.
+            self.wake_thread_timeline_requests();
+        }
         Some((changed, generation, requests))
     }
     pub fn thread_semantic_in_flight(&self, id: &str) -> HashSet<SemanticTimelineRequestKey> {
@@ -2035,7 +2197,14 @@ impl ClientCore {
         use crate::runtime::ClientRuntimeNotification::*;
         match crate::runtime::reduce_gateway_notification(notification, context) {
             Some(ThreadStarted(r)) => {
-                self.upsert_thread(r.thread);
+                if let Some(mut mutation) = self.thread_mutation(&r.thread_id, &r.workspace_id) {
+                    mutation
+                        .registry
+                        .stores
+                        .get_mut(&r.thread_id)
+                        .expect("retained thread")
+                        .reconcile_subscription_snapshot(None, r.thread);
+                }
                 if let Some(id) = r.set_draft_thread_id {
                     self.remember_thread_draft(&r.workspace_id, Some(id));
                 }
@@ -2048,6 +2217,7 @@ impl ClientCore {
                 if r.clear_thread_start_queue {
                     self.clear_thread_start_request();
                 }
+                self.resume_created_thread_delivery(&r.thread_id, &r.workspace_id);
             }
             Some(ThreadUpdated(r)) => {
                 let id = r.thread.id.clone();
@@ -2324,6 +2494,7 @@ impl ClientCore {
             self.request_thread_presentation(id);
             if let Some(workspace) = restored_workspace {
                 self.schedule_thread_subscription(id, &workspace);
+                self.recover_visible_thread_timeline(id);
             }
         }
     }
@@ -2350,6 +2521,14 @@ impl ClientCore {
         let became_visible = registry.stores.get(id).is_some_and(|store| {
             store.demand != ClientDemand::Visible && combined == ClientDemand::Visible
         });
+        let resumed_prefetch = registry.stores.get(id).is_some_and(|store| {
+            store.demand == ClientDemand::Suspended
+                && combined == ClientDemand::Prefetch
+                && !store.presentation_blocked
+        }) && registry
+            .timeline
+            .next_refresh_deadline_where(|thread| thread == id)
+            .is_some();
         if let Some(store) = registry.stores.get_mut(id) {
             store.demand = combined;
         }
@@ -2370,6 +2549,46 @@ impl ClientCore {
         }
         if became_visible && let Some(workspace) = workspace {
             self.schedule_thread_subscription(id, &workspace);
+            self.recover_visible_thread_timeline(id);
+        }
+        if resumed_prefetch {
+            // Prefetch resumes an existing budget; only Visible may rearm it.
+            self.wake_thread_timeline_requests();
+        }
+    }
+
+    fn recover_visible_thread_timeline(&self, id: &str) {
+        let mut registry = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned");
+        if self.is_stopped()
+            || !registry.stores.get(id).is_some_and(|store| {
+                !store.presentation_blocked && store.demand == ClientDemand::Visible
+            })
+        {
+            return;
+        }
+        registry.timeline.rearm_exhausted_refresh(id);
+        // Also wake an unexhausted Backoff that was paused while Suspended.
+        let wake = registry
+            .timeline
+            .next_refresh_deadline_where(|thread| thread == id)
+            .is_some();
+        drop(registry);
+        if wake {
+            self.wake_thread_timeline_requests();
+        }
+    }
+
+    fn wake_thread_timeline_requests(&self) {
+        if let Some(sender) = self
+            .thread_request_sender
+            .lock()
+            .expect("thread request sender poisoned")
+            .as_ref()
+        {
+            let _ = sender.send(ThreadControllerRequest::Resume);
         }
     }
 }
@@ -2403,6 +2622,7 @@ mod tests {
     fn composer_admission() -> Turn {
         let mut turn = running_turn("admission");
         turn.author = Some(TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::Principal(PrincipalId::new("P".repeat(21)).unwrap()),
             display_name: "User".into(),
             nickname: "user".into(),
@@ -2417,6 +2637,7 @@ mod tests {
         turn.turn_kind = TurnKind::TaskRun;
         turn.origin = TurnOrigin::DetachedTask;
         turn.author = Some(TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::AgentExecution(
                 AgentExecutionId::new("E".repeat(21)).unwrap(),
             ),
@@ -5328,7 +5549,15 @@ mod tests {
         Arc<ClientCore>,
         std::sync::mpsc::Receiver<ThreadControllerRequest>,
     ) {
-        let core = core();
+        reconciliation_core_with(core())
+    }
+
+    fn reconciliation_core_with(
+        core: Arc<ClientCore>,
+    ) -> (
+        Arc<ClientCore>,
+        std::sync::mpsc::Receiver<ThreadControllerRequest>,
+    ) {
         core.upsert_thread(thread("a", "ws"));
         core.apply_thread_timeline_page(
             reconciliation_page(reconciliation_history()[80..=210].to_vec(), true, true),
@@ -5506,16 +5735,54 @@ mod tests {
     }
 
     #[test]
-    fn refresh_worker_recovers_without_notifications_and_stops_at_the_budget() {
+    fn refresh_worker_is_bounded_and_recovers_on_later_timeline_triggers() {
         use crate::timeline::semantic::TimelineRequestStatus;
-        for exhaust in [false, true] {
-            let (core, receiver) = reconciliation_core();
+        for trigger in [
+            "automatic",
+            "notification",
+            "removal",
+            "visible",
+            "reacquire",
+        ] {
+            let exhaust = trigger != "automatic";
+            let (core, receiver) =
+                reconciliation_core_with(crate::catalog_test_support::settings_client());
+            {
+                let mut session = core.gateway_session.lock().unwrap();
+                session.observe_transport(&crate::transport::ws::GatewayWsEvent::Connected {
+                    connection_id: 7,
+                    endpoint_id: "endpoint".into(),
+                    endpoint_name: "Synthetic".into(),
+                    gateway_base_url: pioneer_protocol::GatewayBaseUrl::parse_presentation(
+                        "https://synthetic.invalid",
+                    )
+                    .unwrap(),
+                });
+                core.publish_gateway_session(&session);
+            }
+            let revision = core.gateway_session().startup.transport_revision;
+            core.thread_registry
+                .lock()
+                .unwrap()
+                .stores
+                .get_mut("a")
+                .unwrap()
+                .subscription_revision = Some(revision);
+            let auth = core.current_auth_ticket();
             let scope = ClientScope::Timeline {
                 thread_id: "a".into(),
             };
-            let _lease = core.subscribe(scope.clone(), NonZeroUsize::new(16).unwrap());
+            let mut lease = Some(core.subscribe(scope.clone(), NonZeroUsize::new(16).unwrap()));
             core.apply_thread_notification(reconciliation_notification(&["result-140"]));
             let mut request = reconciliation_request(&receiver);
+            let request_store_generation = request.generation;
+            let retired = ThreadSemanticRequest {
+                id: request.id.clone(),
+                generation: request.generation,
+                request_generation: request.request_generation,
+                action: request.action.clone(),
+                reconciliation: None,
+            };
             let mut history = reconciliation_history();
             history.push(reconciliation_result(140));
             history.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
@@ -5625,8 +5892,134 @@ mod tests {
                         .get("Failed")
                         .is_some()
                 );
-                core.apply_thread_notification(reconciliation_notification(&["result-140"]));
+                // Without a later event, exhaustion has no deadline and does not poll.
+                if trigger == "reacquire" {
+                    drop(lease.take());
+                } else if trigger == "visible" {
+                    core.thread_demand_changed(&scope, ClientDemand::Suspended);
+                }
+                for _ in 0..10 {
+                    let notification = if trigger == "removal" {
+                        history
+                            .borrow_mut()
+                            .retain(|block| block.block_id != "block-100");
+                        let GatewayNotification::ThreadTimelineBlocksChanged(mut update) =
+                            reconciliation_notification(&[])
+                        else {
+                            unreachable!()
+                        };
+                        update.removed_block_ids = vec!["block-100".into()];
+                        GatewayNotification::ThreadTimelineBlocksChanged(update)
+                    } else {
+                        reconciliation_notification(&["result-140"])
+                    };
+                    core.apply_thread_notification(notification);
+                }
+                if trigger == "visible" || trigger == "reacquire" {
+                    assert_eq!(core.next_timeline_request_delay(), None);
+                    core.drive_timeline_requests_at(u64::MAX);
+                    assert_eq!(
+                        receiver.try_iter().count(),
+                        0,
+                        "hidden parent does not poll"
+                    );
+                    if trigger == "reacquire" {
+                        lease = Some(core.subscribe(scope.clone(), NonZeroUsize::new(16).unwrap()));
+                    } else {
+                        core.thread_demand_changed(&scope, ClientDemand::Visible);
+                        core.thread_demand_changed(&scope, ClientDemand::Visible);
+                    }
+                }
+                assert!(matches!(
+                    receiver.try_recv().unwrap(),
+                    ThreadControllerRequest::Resume
+                ));
+                assert_eq!(
+                    receiver.try_iter().count(),
+                    0,
+                    "one wake for the saved obligation"
+                );
+                let deadline = core
+                    .thread_registry
+                    .lock()
+                    .unwrap()
+                    .timeline
+                    .next_refresh_deadline()
+                    .unwrap();
+                core.drive_timeline_requests_at(deadline - 1);
+                assert_eq!(
+                    receiver.try_iter().count(),
+                    0,
+                    "cooldown survives the trigger"
+                );
+                assert_eq!(
+                    core.thread_semantic_snapshot("a")
+                        .thread("a")
+                        .unwrap()
+                        .top_level
+                        .request_status,
+                    cached.request_status,
+                    "rearming cannot acknowledge stale data"
+                );
+                // Hiding after the trigger preserves the deferred obligation too.
+                core.thread_demand_changed(&scope, ClientDemand::Suspended);
+                assert_eq!(core.next_timeline_request_delay(), None);
+                core.drive_timeline_requests_at(u64::MAX);
                 assert_eq!(receiver.try_iter().count(), 0);
+                core.thread_demand_changed(&scope, ClientDemand::Visible);
+                assert!(matches!(
+                    receiver.try_recv().unwrap(),
+                    ThreadControllerRequest::Resume
+                ));
+                assert_eq!(
+                    core.thread_registry
+                        .lock()
+                        .unwrap()
+                        .timeline
+                        .next_refresh_deadline(),
+                    Some(deadline)
+                );
+                core.drive_timeline_requests_at(deadline);
+                let request = reconciliation_request(&receiver);
+                assert!(request.request_generation > retired.request_generation);
+                let transport = ReconciliationTransport {
+                    calls: Default::default(),
+                    reply: |_: usize, params: &ThreadTimelinePageParams| {
+                        Ok(reconciliation_server_page(&history.borrow(), params))
+                    },
+                };
+                core.fail_timeline_dispatch(&retired);
+                core.execute_thread_semantic_request(&transport, retired);
+                assert!(
+                    transport.calls.borrow().is_empty(),
+                    "retired request cannot read or finish"
+                );
+                assert_eq!(core.thread_semantic_in_flight("a").len(), 1);
+                core.execute_thread_semantic_request(&transport, request);
+                assert_eq!(receiver.try_iter().count(), 0);
+                core.materialize_demanded_timelines();
+                assert_eq!(
+                    core.thread_semantic_snapshot("a")
+                        .thread("a")
+                        .unwrap()
+                        .top_level
+                        .request_status,
+                    TimelineRequestStatus::Ready
+                );
+                assert!(
+                    core.snapshot(&scope)
+                        .unwrap()
+                        .snapshot()
+                        .serialized_payload()
+                        .to_string()
+                        .contains("child result")
+                );
+                let registry = core.thread_registry.lock().unwrap();
+                assert_eq!(registry.stores["a"].subscription_revision, Some(revision));
+                assert_eq!(registry.stores["a"].generation, request_store_generation);
+                drop(registry);
+                assert_eq!(core.gateway_session().startup.transport_revision, revision);
+                assert_eq!(core.current_auth_ticket(), auth);
             } else {
                 assert_eq!(cached.request_status, TimelineRequestStatus::Ready);
                 assert!(cached.block("result-140").is_some());
@@ -5637,7 +6030,88 @@ mod tests {
                         .contains("recovered latest child result")
                 );
             }
+            drop(lease);
         }
+    }
+
+    #[test]
+    fn prefetch_wakes_suspended_refresh_without_replenishing_its_budget() {
+        let (core, receiver) = reconciliation_core();
+        let scope = ClientScope::Timeline {
+            thread_id: "a".into(),
+        };
+        let _lease = core.subscribe(scope.clone(), NonZeroUsize::new(16).unwrap());
+        core.apply_thread_notification(reconciliation_notification(&["result-140"]));
+        let mut request = reconciliation_request(&receiver);
+        let action = request.action.clone();
+        let transport = ReconciliationTransport {
+            calls: Default::default(),
+            reply: |_: usize, _: &ThreadTimelinePageParams| Err("temporary read failure".into()),
+        };
+        for attempt in 1..=3 {
+            core.execute_thread_semantic_request(&transport, request);
+            if attempt == 3 {
+                break;
+            }
+            let deadline = core
+                .thread_registry
+                .lock()
+                .unwrap()
+                .timeline
+                .next_refresh_deadline()
+                .unwrap();
+            if attempt == 1 {
+                core.thread_demand_changed(&scope, ClientDemand::Suspended);
+                assert_eq!(core.next_timeline_request_delay(), None);
+                core.drive_timeline_requests_at(u64::MAX);
+                assert!(receiver.try_recv().is_err());
+                core.thread_demand_changed(&scope, ClientDemand::Prefetch);
+                assert!(matches!(
+                    receiver.try_recv().unwrap(),
+                    ThreadControllerRequest::Resume
+                ));
+                core.thread_demand_changed(&scope, ClientDemand::Prefetch);
+                assert!(
+                    receiver.try_recv().is_err(),
+                    "duplicate demand does not wake"
+                );
+                assert_eq!(
+                    core.thread_registry
+                        .lock()
+                        .unwrap()
+                        .next_timeline_request_deadline(),
+                    Some(deadline)
+                );
+            }
+            core.drive_timeline_requests_at(deadline - 1);
+            assert!(receiver.try_recv().is_err());
+            core.drive_timeline_requests_at(deadline);
+            request = reconciliation_request(&receiver);
+            assert_eq!(
+                request.action, action,
+                "retry preserves the exact Newest action"
+            );
+            core.drive_timeline_requests_at(u64::MAX);
+            assert!(receiver.try_recv().is_err(), "one active request per key");
+        }
+        assert_eq!(transport.calls.borrow().len(), 3, "original attempt budget");
+        assert_eq!(core.next_timeline_request_delay(), None);
+        core.thread_demand_changed(&scope, ClientDemand::Suspended);
+        core.thread_demand_changed(&scope, ClientDemand::Prefetch);
+        core.thread_demand_changed(&scope, ClientDemand::Prefetch);
+        core.drive_timeline_requests_at(u64::MAX);
+        assert!(
+            receiver.try_recv().is_err(),
+            "Prefetch cannot rearm exhaustion"
+        );
+        assert!(core.thread_semantic_in_flight("a").is_empty());
+        assert!(
+            core.thread_registry
+                .lock()
+                .unwrap()
+                .timeline
+                .has_failed_refresh("a")
+        );
     }
 
     #[test]
@@ -5727,6 +6201,12 @@ mod tests {
                 },
             ] {
                 let (core, receiver) = reconciliation_core();
+                let _lease = core.subscribe(
+                    ClientScope::Timeline {
+                        thread_id: "a".into(),
+                    },
+                    NonZeroUsize::new(16).unwrap(),
+                );
                 let mut history = reconciliation_history();
                 history.push(reconciliation_result(140));
                 history.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
@@ -6011,17 +6491,30 @@ mod tests {
 
     #[test]
     fn missed_result_is_read_only_after_subscription_ack_with_cached_or_initial_timeline() {
-        for cached in [false, true] {
+        for (cached, notification_first, finish_live_completion) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, false),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            let echo = std::cell::RefCell::new(None);
             let (core, receiver) = reconciliation_core();
             if !cached {
-                core.apply_thread_timeline_page(
-                    presentation_page(&[]),
-                    crate::timeline::semantic::TopLevelPageMergeMode::Reset,
-                );
+                core.remove_thread_store("a");
+                // No history page has loaded yet. An empty page would mark the
+                // cache loaded, leaving the later local send without range cursors.
+                drop(core.thread_mutation("a", "ws").unwrap());
             }
             struct AckTransport<'a> {
+                core: &'a ClientCore,
                 receiver: &'a std::sync::mpsc::Receiver<ThreadControllerRequest>,
                 fail: bool,
+                terminal_before_response: bool,
+                notification_first: bool,
+                finish_live_completion: bool,
+                echo: &'a std::cell::RefCell<Option<Thread>>,
             }
             impl crate::rpc::JsonRpcRequestTransport for AckTransport<'_> {
                 fn send_json_rpc_request(
@@ -6038,9 +6531,60 @@ mod tests {
                     if self.fail {
                         return Err("subscription failed".into());
                     }
+                    // Advance metadata after the request began, without advancing
+                    // its second-resolution timestamp. The empty-source case also
+                    // receives a live snapshot before this old response arrives.
+                    let mut live = thread("a", "ws");
+                    live.name = Some("Live title".into());
+                    live.preview_author = composer_admission().author;
+                    self.core.upsert_thread(live);
+                    self.core.remember_thread_draft("ws", Some("a".into()));
+                    self.core.commit_prepared_thread_turn(
+                        "a",
+                        "ws",
+                        ThreadMode::Chat,
+                        &crate::composer::turn_prepare::PreparedComposerThreadSnapshotUpdate {
+                            selected_model: Some("local-model".into()),
+                            selected_provider: Some("local-provider".into()),
+                            selected_reasoning_effort: Some("high".into()),
+                            user_text: "First local message".into(),
+                            updated_at_unix: 2,
+                        },
+                        local("a"),
+                        ThreadComposerExecutionMode::ForegroundTurn,
+                    );
+                    let mut snapshot = thread("a", "ws");
+                    snapshot.name = Some("Server title".into());
+                    let mut terminal = running_turn("turn");
+                    terminal.status = TurnStatus::Completed;
+                    if self.terminal_before_response {
+                        self.core.apply_thread_conversation_event(
+                            "ws",
+                            ConversationEvent::TurnCompleted {
+                                thread_id: "a".into(),
+                                turn: terminal,
+                            },
+                            None,
+                        );
+                        if self.finish_live_completion {
+                            assert!(self.core.tick_thread_conversations());
+                        }
+                        snapshot.turns.push(running_turn("turn"));
+                    } else {
+                        snapshot.turns.push(terminal);
+                    }
+                    *self.echo.borrow_mut() = Some(snapshot.clone());
+                    if self.notification_first {
+                        self.core
+                            .apply_thread_notification(GatewayNotification::ThreadStarted(
+                                ThreadStartedNotification {
+                                    thread: snapshot.clone(),
+                                },
+                            ));
+                    }
                     response
                         .send(Ok(serde_json::to_value(ThreadStartResponse {
-                            thread: thread("a", "ws"),
+                            thread: snapshot,
                             sandbox: SandboxPolicy::from_mode(SandboxMode::FullAccess),
                         })
                         .unwrap()))
@@ -6080,8 +6624,13 @@ mod tests {
             assert!(
                 core.refresh_opened_thread_subscription(
                     &AckTransport {
+                        core: &core,
                         receiver: &receiver,
-                        fail: true
+                        fail: true,
+                        terminal_before_response: false,
+                        notification_first,
+                        finish_live_completion,
+                        echo: &echo,
                     },
                     token(),
                     "ws"
@@ -6091,13 +6640,59 @@ mod tests {
             assert_eq!(receiver.try_iter().count(), 0);
             core.refresh_opened_thread_subscription(
                 &AckTransport {
+                    core: &core,
                     receiver: &receiver,
                     fail: false,
+                    terminal_before_response: cached,
+                    notification_first,
+                    finish_live_completion,
+                    echo: &echo,
                 },
                 token(),
                 "ws",
             )
             .unwrap();
+            if !notification_first {
+                core.apply_thread_notification(GatewayNotification::ThreadStarted(
+                    ThreadStartedNotification {
+                        thread: echo.borrow_mut().take().unwrap(),
+                    },
+                ));
+            }
+            if cached && !finish_live_completion {
+                assert_eq!(
+                    core.thread_snapshot("a")
+                        .unwrap()
+                        .coordinator()
+                        .conversation
+                        .status_label(),
+                    "completing"
+                );
+                assert!(
+                    core.tick_thread_conversations(),
+                    "live completion can still finish"
+                );
+            }
+            let accepted = core
+                .snapshot(&scope("a"))
+                .unwrap()
+                .typed::<ThreadDomainSnapshot>()
+                .unwrap()
+                .payload();
+            let coordinator = accepted.coordinator();
+            let metadata = coordinator.thread().unwrap();
+            assert_eq!(metadata.preview, "First local message");
+            assert_eq!(metadata.model, "local-model");
+            assert_eq!(metadata.model_provider, "local-provider");
+            assert_eq!(metadata.reasoning_effort.as_deref(), Some("high"));
+            assert_eq!(metadata.name.as_deref(), Some("Live title"));
+            assert_eq!(metadata.preview_author, composer_admission().author);
+            assert_eq!(coordinator.conversation.status_label(), "completed");
+            assert!(core.thread_workspace_draft("ws").is_none());
+            assert!(
+                coordinator.conversation.in_flight_turn_id().is_none(),
+                "terminal response still applies"
+            );
             let request = reconciliation_request(&receiver);
             let result_ix = if cached { 140 } else { 279 };
             let mut history = reconciliation_history();
@@ -6126,6 +6721,195 @@ mod tests {
                     .top_level
                     .request_status,
                 crate::timeline::semantic::TimelineRequestStatus::Ready
+            );
+        }
+    }
+
+    #[test]
+    fn subscription_snapshot_resumes_blocked_turn_without_reapplying_a_stale_block() {
+        for (live_resume, live_reblock, snapshot_resume, snapshot_reblock) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (true, true, false, false),
+            (true, true, true, true),
+            (true, true, true, false),
+        ] {
+            let core = core();
+            let mut blocked = running_turn("resumable");
+            blocked.status = TurnStatus::Blocked;
+            let mut snapshot = thread("a", "ws");
+            // Include both forms of lag: a running Thread with a live blocked
+            // Conversation, and a blocked Thread followed by a live resumption.
+            snapshot.turns = vec![if live_resume && !live_reblock {
+                blocked.clone()
+            } else {
+                running_turn("resumable")
+            }];
+            core.upsert_thread(snapshot.clone());
+            core.apply_thread_conversation_event(
+                "ws",
+                ConversationEvent::TurnBlocked {
+                    thread_id: "a".into(),
+                    turn: blocked.clone(),
+                    resume: None,
+                },
+                None,
+            );
+            assert_eq!(
+                core.thread_snapshot("a")
+                    .unwrap()
+                    .coordinator()
+                    .conversation
+                    .status_label(),
+                "blocked"
+            );
+            struct ResumeTransport<'a> {
+                core: &'a ClientCore,
+                snapshot: Thread,
+                live_resume: bool,
+                live_reblock: bool,
+                snapshot_resume: bool,
+                snapshot_reblock: bool,
+            }
+            impl crate::rpc::JsonRpcRequestTransport for ResumeTransport<'_> {
+                fn send_json_rpc_request(
+                    &self,
+                    _: String,
+                    _: String,
+                    response: crate::rpc::JsonRpcResponseSender,
+                ) -> Result<(), String> {
+                    if !self.live_resume {
+                        // Repeating the current Blocked phase via a snapshot must
+                        // still allow the fresh RPC to confirm resumption.
+                        let mut thread = self.snapshot.clone();
+                        thread.turns[0].status = TurnStatus::Blocked;
+                        self.core
+                            .apply_thread_notification(GatewayNotification::ThreadUpdated(
+                                ThreadUpdatedNotification {
+                                    thread,
+                                    placement: None,
+                                },
+                            ));
+                    }
+                    if self.live_resume {
+                        let turn = running_turn("resumable");
+                        self.core
+                            .apply_thread_notification(if self.snapshot_resume {
+                                let mut thread = self.snapshot.clone();
+                                thread.turns = vec![turn];
+                                GatewayNotification::ThreadUpdated(ThreadUpdatedNotification {
+                                    thread,
+                                    placement: None,
+                                })
+                            } else {
+                                GatewayNotification::TurnStarted(TurnStartedNotification {
+                                    workspace_id: "ws".into(),
+                                    thread_id: "a".into(),
+                                    turn,
+                                })
+                            });
+                    }
+                    if self.live_reblock {
+                        let mut turn = running_turn("resumable");
+                        turn.status = TurnStatus::Blocked;
+                        self.core
+                            .apply_thread_notification(if self.snapshot_reblock {
+                                let mut thread = self.snapshot.clone();
+                                thread.turns = vec![turn];
+                                GatewayNotification::ThreadUpdated(ThreadUpdatedNotification {
+                                    thread,
+                                    placement: None,
+                                })
+                            } else {
+                                GatewayNotification::TurnBlocked(TurnBlockedNotification {
+                                    workspace_id: "ws".into(),
+                                    thread_id: "a".into(),
+                                    turn,
+                                    resume: None,
+                                })
+                            });
+                    }
+                    response
+                        .send(Ok(serde_json::to_value(ThreadStartResponse {
+                            thread: self.snapshot.clone(),
+                            sandbox: SandboxPolicy::from_mode(SandboxMode::FullAccess),
+                        })
+                        .unwrap()))
+                        .unwrap();
+                    Ok(())
+                }
+            }
+            if live_resume {
+                snapshot.name = Some("Resumed remotely".into());
+            }
+            core.refresh_thread_subscription(
+                &ResumeTransport {
+                    core: &core,
+                    snapshot: snapshot.clone(),
+                    live_resume,
+                    live_reblock,
+                    snapshot_resume,
+                    snapshot_reblock,
+                },
+                "a",
+                "ws",
+            )
+            .unwrap();
+            let acknowledged = core
+                .snapshot(&scope("a"))
+                .unwrap()
+                .typed::<ThreadDomainSnapshot>()
+                .unwrap()
+                .payload();
+            assert_eq!(
+                acknowledged.coordinator().conversation.status_label(),
+                if live_reblock { "blocked" } else { "running" }
+            );
+            if live_reblock {
+                assert!(
+                    acknowledged
+                        .coordinator()
+                        .conversation
+                        .in_flight_turn_id()
+                        .is_none()
+                );
+                assert!(core.begin_thread_turn_cancellation("a", None).is_none());
+            }
+            assert_eq!(
+                acknowledged.coordinator().thread().unwrap().name,
+                snapshot.name
+            );
+            // Deliver the matching opening echo after the RPC as well.
+            core.apply_thread_notification(GatewayNotification::ThreadStarted(
+                ThreadStartedNotification { thread: snapshot },
+            ));
+            let source = core
+                .snapshot(&scope("a"))
+                .unwrap()
+                .typed::<ThreadDomainSnapshot>()
+                .unwrap()
+                .payload();
+            assert_eq!(
+                source.coordinator().conversation.status_label(),
+                if live_reblock { "blocked" } else { "running" }
+            );
+            assert_eq!(
+                source.coordinator().conversation.in_flight_turn_id(),
+                if live_reblock {
+                    None
+                } else {
+                    Some("resumable")
+                }
+            );
+            if live_reblock {
+                assert!(core.begin_thread_turn_cancellation("a", None).is_none());
+            } else {
+                let (_, cancel) = core.begin_thread_turn_cancellation("a", None).unwrap();
+                assert_eq!(cancel.turn_id, "resumable");
+            }
+            assert_eq!(
+                core.thread_registry.lock().unwrap().stores["a"].subscription_revision,
+                Some(core.gateway_session().startup.transport_revision)
             );
         }
     }
@@ -7495,6 +8279,7 @@ mod tests {
         let mut child = running_turn("child");
         child.mode = ThreadMode::Agent;
         child.author = Some(TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::System,
             display_name: "Child Agent".into(),
             nickname: "child-agent".into(),
@@ -7920,10 +8705,31 @@ mod tests {
         ));
     }
 
+    fn draft_subscription_core() -> (
+        Arc<ClientCore>,
+        std::sync::mpsc::Receiver<ThreadControllerRequest>,
+    ) {
+        let core = crate::catalog_test_support::settings_client();
+        {
+            let mut session = core.gateway_session.lock().unwrap();
+            session.observe_transport(&crate::transport::ws::GatewayWsEvent::Connected {
+                connection_id: 7,
+                endpoint_id: "endpoint".into(),
+                endpoint_name: "Synthetic".into(),
+                gateway_base_url: GatewayBaseUrl::parse_presentation("https://synthetic.invalid")
+                    .unwrap(),
+            });
+            core.publish_gateway_session(&session);
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        *core.thread_request_sender.lock().unwrap() = Some(sender);
+        (core, receiver)
+    }
+
     #[test]
     fn prepared_draft_keeps_identity_and_text_through_creation() {
         use crate::composer::store::ComposerIntent;
-        let core = core();
+        let (core, receiver) = draft_subscription_core();
         let navigation = core.subscribe(ClientScope::Navigation, NonZeroUsize::new(8).unwrap());
         let id = core.prepare_thread_draft().unwrap();
         assert_eq!(core.prepare_thread_draft().as_deref(), Some(id.as_str()));
@@ -7941,6 +8747,17 @@ mod tests {
             text: "typed before bootstrap".into(),
         });
         core.activate_thread(None, Some("ws"));
+        drop(core.thread_mutation(&id, "ws").unwrap());
+        let timeline_scope = ClientScope::Timeline {
+            thread_id: id.clone(),
+        };
+        let _visible = core.subscribe(timeline_scope.clone(), NonZeroUsize::new(8).unwrap());
+        core.thread_demand_changed(&timeline_scope, ClientDemand::Suspended);
+        core.thread_demand_changed(&timeline_scope, ClientDemand::Visible);
+        assert!(
+            receiver.try_recv().is_err(),
+            "reserved identity cannot open a thread"
+        );
         let transport = DraftTransport(Default::default());
         assert_eq!(
             core.create_workspace_thread_draft(&transport, "ws", ThreadVisibility::Private)
@@ -7956,6 +8773,13 @@ mod tests {
         assert_eq!(composer.draft_id(), draft);
         assert_eq!(composer.draft().text, "typed before bootstrap");
         assert_eq!(transport.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(
+            matches!(receiver.try_recv(), Ok(ThreadControllerRequest::Subscribe(request)) if request.id == id)
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "one subscription after creation"
+        );
     }
 
     #[test]
@@ -7971,22 +8795,70 @@ mod tests {
                 Err("synthetic unavailable transport".into())
             }
         }
-        let core = core();
-        core.activate_thread(None, Some("ws"));
-        let id = core.prepare_thread_draft().unwrap();
-        assert!(
-            core.create_workspace_thread_draft(&FailedTransport, "ws", ThreadVisibility::Private)
+        for dispatch_before_failure in [false, true] {
+            let (core, receiver) = draft_subscription_core();
+            core.activate_thread(None, Some("ws"));
+            let id = core.prepare_thread_draft().unwrap();
+            drop(core.thread_mutation(&id, "ws").unwrap());
+            // A request queued before creation claimed this identity must also retire.
+            core.thread_start_mutation().pending_thread_id = None;
+            let _visible = core.subscribe(
+                ClientScope::Timeline {
+                    thread_id: id.clone(),
+                },
+                NonZeroUsize::new(8).unwrap(),
+            );
+            let ThreadControllerRequest::Subscribe(queued) = receiver.try_recv().unwrap() else {
+                panic!()
+            };
+            core.thread_start_mutation().pending_thread_id = Some(id.clone());
+            if dispatch_before_failure {
+                core.execute_thread_subscription_request(queued.clone());
+            } else {
+                core.thread_demand_changed(
+                    &ClientScope::Timeline {
+                        thread_id: id.clone(),
+                    },
+                    ClientDemand::Suspended,
+                );
+            }
+            assert!(
+                core.create_workspace_thread_draft(
+                    &FailedTransport,
+                    "ws",
+                    ThreadVisibility::Private
+                )
                 .is_err()
-        );
-        assert!(!core.thread_start_snapshot().in_progress);
-        assert!(!core.thread_start_requested());
-        assert_eq!(core.prepare_thread_draft().as_deref(), Some(id.as_str()));
-        let transport = DraftTransport(Default::default());
-        assert_eq!(
-            core.create_workspace_thread_draft(&transport, "ws", ThreadVisibility::Private)
-                .unwrap(),
-            id
-        );
+            );
+            assert!(!core.thread_start_snapshot().in_progress);
+            assert!(!core.thread_start_requested());
+            assert_eq!(core.prepare_thread_draft().as_deref(), Some(id.as_str()));
+            core.execute_thread_subscription_request(queued);
+            core.schedule_thread_subscription(&id, "ws");
+            assert!(receiver.try_recv().is_err());
+            {
+                let registry = core.thread_registry.lock().unwrap();
+                let store = &registry.stores[&id];
+                assert!(!store.coordinator.history_loading);
+                assert!(store.subscription_request.is_none());
+                assert!(store.subscription_retry_at.is_none());
+            }
+            core.thread_demand_changed(
+                &ClientScope::Timeline {
+                    thread_id: id.clone(),
+                },
+                ClientDemand::Visible,
+            );
+            let transport = DraftTransport(Default::default());
+            assert_eq!(
+                core.create_workspace_thread_draft(&transport, "ws", ThreadVisibility::Private)
+                    .unwrap(),
+                id
+            );
+            assert!(
+                matches!(receiver.try_recv(), Ok(ThreadControllerRequest::Subscribe(request)) if request.id == id)
+            );
+        }
     }
 
     #[test]
@@ -8698,6 +9570,7 @@ mod tests {
         assert_eq!(last.rows()[0].item().unwrap().partial_text, "latest");
         if let TimelineBlockKind::UserMessage { author, .. } = &mut page.blocks[0].kind {
             *author = Some(pioneer_protocol::TurnAuthorSnapshot {
+                cli_runtime_kind: None,
                 actor: pioneer_protocol::PersistedActorRef::Principal(
                     pioneer_protocol::PrincipalId::new("PAAAAAAAAAAAAAAAAAAAA").unwrap(),
                 ),
@@ -8813,6 +9686,7 @@ mod tests {
         }
         if let TimelineBlockKind::UserMessage { author, .. } = &mut page.blocks[1].kind {
             *author = Some(pioneer_protocol::TurnAuthorSnapshot {
+                cli_runtime_kind: None,
                 actor: pioneer_protocol::PersistedActorRef::Principal(
                     pioneer_protocol::PrincipalId::new(principal).unwrap(),
                 ),
@@ -9088,6 +9962,89 @@ mod tests {
         assert_eq!(core.pending_request_snapshot().len(), 1);
     }
     #[test]
+    fn hidden_request_completion_at_cache_limit_keeps_publications_consistent() {
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        core.activate_thread(Some("a"), Some("ws"));
+        let request = core
+            .begin_thread_semantic_request(SemanticTimelineRequestAction::ThreadTimelinePage {
+                key: SemanticTimelineRequestKey::ThreadNewest {
+                    thread_id: "a".into(),
+                },
+                params: ThreadTimelinePageParams {
+                    thread_id: "a".into(),
+                    anchor: TimelinePageAnchor::Newest,
+                    limit: Some(12),
+                },
+            })
+            .unwrap();
+        core.upsert_thread(thread("b", "ws"));
+        core.activate_thread(Some("b"), Some("ws"));
+        for i in 0..INACTIVE_THREAD_LIMIT {
+            core.upsert_thread(thread(&format!("idle-{i}"), "ws"));
+        }
+        let before = core.snapshot(&scope("a")).unwrap().revisions();
+        core.execute_thread_semantic_request(
+            &ReconciliationTransport {
+                calls: Default::default(),
+                reply: |_: usize, _: &ThreadTimelinePageParams| {
+                    Ok(presentation_page(&[("answer", "completed read")]))
+                },
+            },
+            request,
+        );
+        let retired = core.snapshot(&scope("a")).unwrap();
+        assert!(retired.snapshot().serialized_payload().is_null());
+        assert_eq!(
+            retired.revisions().scoped().get(),
+            before.scoped().get() + 2,
+            "both the completed update and subsequent retirement were accepted"
+        );
+        assert_eq!(
+            core.thread_registry.lock().unwrap().stores.len(),
+            INACTIVE_THREAD_LIMIT + 1
+        );
+
+        // Recreate the evicted source, then exercise the directory + Navigation
+        // publication path that a rejected completion used to poison.
+        let mut updated = thread("a", "ws");
+        updated.name = Some("Updated after completion".into());
+        core.upsert_thread(updated);
+        core.activate_thread(Some("a"), Some("ws"));
+        let published = core.snapshot(&scope("a")).unwrap();
+        let source = published.typed::<ThreadDomainSnapshot>().unwrap().payload();
+        assert_eq!(
+            source.coordinator.thread().unwrap().name.as_deref(),
+            Some("Updated after completion")
+        );
+        assert_eq!(source.revision(), published.revisions().scoped().get());
+        let tree_scope = ClientScope::WorkspaceTree {
+            workspace_id: Some("ws".into()),
+        };
+        let published_tree = core
+            .snapshot(&tree_scope)
+            .unwrap()
+            .typed::<crate::workspaces::directory::ThreadTreePublication>()
+            .unwrap()
+            .payload();
+        assert_eq!(
+            published_tree.snapshot().threads_by_id["a"].name.as_deref(),
+            Some("Updated after completion")
+        );
+        assert_eq!(
+            published_tree.revision(),
+            core.workspace_tree("ws").unwrap().revision()
+        );
+        let navigation = core
+            .snapshot(&ClientScope::Navigation)
+            .unwrap()
+            .typed::<crate::navigation::ClientNavigationState>()
+            .unwrap()
+            .payload();
+        assert_eq!(navigation.active_thread_id(), Some("a"));
+    }
+
+    #[test]
     fn inactive_stores_are_bounded_without_discarding_running_work_or_drafts() {
         let core = core();
         core.upsert_thread(thread("running", "ws"));
@@ -9333,9 +10290,9 @@ impl ClientCore {
                 return None;
             }
         }
-        // Notifications retain invalidation without bypassing an owned recovery's
-        // backoff or exhausted budget. The request worker drives retries;
-        // explicit Retry and confirmed subscriptions can start fresh recovery.
+        // Live reduction may have rearmed an exhausted cycle. The worker owns
+        // its exact Newest action and deadline; notification admission must not
+        // bypass that cooldown or an existing recovery's backoff/budget.
         if notification
             && matches!(
                 crate::timeline::semantic::semantic_timeline_request_key(&action),
@@ -10499,11 +11456,15 @@ impl ClientCore {
     ) -> anyhow::Result<()> {
         let auth = self.current_auth_ticket();
         let transport_revision = self.gateway_session().startup.transport_revision;
-        let generation = {
+        let (generation, before) = {
             let mut registry = self
                 .thread_registry
                 .lock()
                 .expect("thread registry poisoned");
+            anyhow::ensure!(
+                registry.start.pending_thread_id.as_deref() != Some(id),
+                "Thread is awaiting creation"
+            );
             if let Some(expected) = expected {
                 anyhow::ensure!(
                     registry
@@ -10517,7 +11478,8 @@ impl ClientCore {
                 !self.is_stopped() && registry.require(id, workspace),
                 "Thread subscription cancelled"
             );
-            registry.stores[id].generation
+            let store = &registry.stores[id];
+            (store.generation, store.subscription_baseline())
         };
         let response = crate::transport::ws::command_sender::thread_start(
             transport,
@@ -10537,6 +11499,10 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
+        anyhow::ensure!(
+            registry.start.pending_thread_id.as_deref() != Some(id),
+            "Thread is awaiting creation"
+        );
         let store = registry
             .stores
             .get_mut(id)
@@ -10545,7 +11511,7 @@ impl ClientCore {
             !self.is_stopped() && store.generation == generation,
             "Thread subscription cancelled"
         );
-        store.set_snapshot(reduction.thread);
+        store.reconcile_subscription_snapshot(Some(&before), reduction.thread);
         store.subscription_revision = Some(transport_revision);
         let drafts = registry.publish(id);
         self.transition_directory(
@@ -10665,6 +11631,20 @@ impl ClientCore {
                     registry.timeline.invalidate(Some(&id));
                     registry.stores.remove(&id);
                 }
+                if let Some(store) = registry.stores.get_mut(&id)
+                    && store.subscription_request.take().is_some()
+                {
+                    store.subscription_retry_at = None;
+                    store.coordinator.history_loading = false;
+                    store.subscription_failed = false;
+                    let drafts = registry.publish(&id);
+                    self.transition_directory(
+                        &mut registry,
+                        &ClientMutationAuthority { _private: () },
+                        drafts,
+                        vec![],
+                    );
+                }
                 let retry = matches!(
                     super::start::plan_thread_start_bootstrap_failure(&id, &format!("{error:#}")),
                     super::start::ThreadStartBootstrapFailurePlan::Retry { .. }
@@ -10724,6 +11704,8 @@ impl ClientCore {
             drafts,
             vec![],
         );
+        drop(registry);
+        self.resume_created_thread_delivery(&id, workspace);
         Ok(id)
     }
 }
@@ -10792,6 +11774,19 @@ impl ClientCore {
         result
     }
 
+    fn resume_created_thread_delivery(&self, id: &str, workspace: &str) {
+        let visible = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned")
+            .stores
+            .get(id)
+            .is_some_and(|store| store.demand == ClientDemand::Visible);
+        if visible {
+            self.schedule_thread_subscription(id, workspace);
+        }
+    }
+
     pub(crate) fn resume_visible_thread_delivery(&self) {
         let visible = {
             let registry = self
@@ -10831,7 +11826,10 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
-        if self.is_stopped() || !registry.require(id, workspace) {
+        if self.is_stopped()
+            || registry.start.pending_thread_id.as_deref() == Some(id)
+            || !registry.require(id, workspace)
+        {
             return;
         }
         let store = registry.stores.get_mut(id).expect("retained thread");
@@ -10916,16 +11914,17 @@ impl ClientCore {
             && !session.startup.identity_pending
             && session.startup.transport_revision == request.transport_revision
             && self.current_auth_ticket() == request.auth
-            && self
-                .thread_registry
-                .lock()
-                .expect("thread registry poisoned")
-                .stores
-                .get(&request.id)
-                .is_some_and(|store| {
-                    store.generation == request.generation
-                        && store.subscription_request.as_ref() == Some(request)
-                })
+            && {
+                let registry = self
+                    .thread_registry
+                    .lock()
+                    .expect("thread registry poisoned");
+                registry.start.pending_thread_id.as_ref() != Some(&request.id)
+                    && registry.stores.get(&request.id).is_some_and(|store| {
+                        store.generation == request.generation
+                            && store.subscription_request.as_ref() == Some(request)
+                    })
+            }
     }
 
     pub(crate) fn execute_thread_subscription_request(&self, request: ThreadSubscriptionRequest) {
@@ -11771,7 +12770,21 @@ impl ClientCore {
                 ));
             }
         }
-        self.transition(authority, drafts, effects)
+        // Publish the whole mutation before releasing cache ownership. In particular,
+        // publish() callers may still read a store, or publish other stores into this
+        // batch. Retirement must be a subsequent transition, never a duplicate scope.
+        let transition = self.transition(authority, drafts, effects);
+        if matches!(
+            transition.outcome(),
+            crate::core::ClientTransitionOutcome::Changed
+                | crate::core::ClientTransitionOutcome::Noop
+        ) {
+            let retired = registry.evict_inactive();
+            if !retired.is_empty() {
+                self.transition(authority, retired, vec![]);
+            }
+        }
+        transition
     }
 }
 

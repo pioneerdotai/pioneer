@@ -433,13 +433,14 @@ async fn metadata(
     let mut after = 0;
     while after < high_water {
         let page = store
-            .compaction_source_metadata_page_at_fence(
+            .compaction_source_metadata_page_before(
                 workspace,
                 thread,
                 turn,
                 kind,
                 after,
                 capture_order,
+                fence.before,
             )
             .await?;
         record_work(Work::Pages, 1);
@@ -2348,6 +2349,7 @@ async fn load_line_history_inner(
                     .flat_map(|(_, messages)| messages)
                     .any(|message| matches!(message.role, Role::Assistant | Role::Tool));
                 if boundary.delegated_command
+                    && fence.source_turn.as_deref() != Some(turn.id.as_str())
                     && !completed_work
                     && failure_sequences.is_empty()
                     && !boundary.delivered_outcome

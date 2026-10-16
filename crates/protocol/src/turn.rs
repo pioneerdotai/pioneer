@@ -1001,6 +1001,8 @@ pub enum TurnSecurityExecutionBackendKind {
     Native,
     CodexCli,
     ClaudeCli,
+    #[serde(rename = "opencode_cli")]
+    OpenCodeCli,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1502,6 +1504,8 @@ pub enum AgentExecutionBackend {
 pub enum CLIAgentRuntimeKind {
     Codex,
     Claude,
+    #[serde(rename = "opencode")]
+    OpenCode,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
@@ -2296,6 +2300,9 @@ pub struct TurnAuthorSnapshot {
     pub nickname: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_revision: Option<String>,
+    /// CLI provider identity projected from persisted execution bindings, independent of artwork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_runtime_kind: Option<CLIAgentRuntimeKind>,
     /// Full immutable identity presentation for an agent-authored Turn.  This
     /// is carried with the Turn instead of being reconstructed from mutable
     /// identity/runtime state. Non-agent actors leave it absent.
@@ -5798,6 +5805,27 @@ mod tests {
                 serde_json::from_value(encoded).expect("behavior should deserialize");
             assert_eq!(decoded, value);
         }
+    }
+
+    #[test]
+    fn opencode_runtime_and_security_backend_use_stable_wire_values() {
+        let runtime = serde_json::to_value(CLIAgentRuntimeKind::OpenCode)
+            .expect("OpenCode runtime kind should serialize");
+        assert_eq!(runtime, json!("opencode"));
+        assert_eq!(
+            serde_json::from_value::<CLIAgentRuntimeKind>(runtime)
+                .expect("OpenCode runtime kind should deserialize"),
+            CLIAgentRuntimeKind::OpenCode
+        );
+
+        let backend = serde_json::to_value(TurnSecurityExecutionBackendKind::OpenCodeCli)
+            .expect("OpenCode security backend should serialize");
+        assert_eq!(backend, json!("opencode_cli"));
+        assert_eq!(
+            serde_json::from_value::<TurnSecurityExecutionBackendKind>(backend)
+                .expect("OpenCode security backend should deserialize"),
+            TurnSecurityExecutionBackendKind::OpenCodeCli
+        );
     }
 
     #[test]

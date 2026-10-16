@@ -666,7 +666,7 @@ pub(crate) fn binding_has_prepared_child_fork(
     binding: &CliRuntimeThreadBindingRecord,
     source: &pioneer_crud::CliRuntimeTurnBindingRecord,
 ) -> Result<bool> {
-    if binding.runtime_kind != "codex"
+    if !matches!(binding.runtime_kind.as_str(), "codex" | "opencode")
         || binding.status != "active"
         || binding.thread_id != source.thread_id
         || binding.workspace_id != source.workspace_id
@@ -728,8 +728,8 @@ pub(crate) fn pending_codex_fork_intent(
         return Ok(None);
     }
     anyhow::ensure!(
-        binding.runtime_kind == "codex",
-        "non-Codex fork intent is unsupported"
+        matches!(binding.runtime_kind.as_str(), "codex" | "opencode"),
+        "provider fork intent is unsupported"
     );
     let cursor = deserialize_cli_runtime_json::<CliRuntimeResumeCursor>(
         binding.resume_cursor_json.as_str(),
@@ -957,12 +957,17 @@ async fn context_basis_from_acknowledged_turn(
         }
         let descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
             serde_json::from_str(history_json.as_str())?;
-        let direct_sources = crate::compaction::frozen::frozen_history_direct_sources(
+        let direct_sources = match crate::compaction::frozen::frozen_history_direct_sources(
             store,
             source.workspace_id.as_str(),
             &descriptor,
         )
-        .await?;
+        .await
+        {
+            Ok(sources) => sources,
+            Err(error) if expired_context_authority(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let Some((_, turn)) = store
             .get_turn(source.thread_id.as_str(), source.turn_id.as_str())
             .await?
@@ -1074,20 +1079,32 @@ async fn context_basis_from_acknowledged_turn(
     Ok(Some(basis))
 }
 
+/// Expiry retires a continuity proof; it cannot authorize a provider fork.
+/// The ordinary new-session bridge can prepare a fresh conversation context.
+/// Corruption, ownership changes and database failures remain errors.
+fn expired_context_authority(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().starts_with("frozen_input_expired:"))
+}
+
 pub(crate) async fn completed_context_basis_is_current(
     store: &CrudStore,
     workspace_id: &str,
     basis: &CliRuntimeContextBasis,
 ) -> Result<bool> {
-    if !crate::compaction::frozen::validate_frozen_history_authority(
+    match crate::compaction::frozen::validate_frozen_history_authority(
         store,
         workspace_id,
         basis.manifest_owner_thread_id.as_str(),
         basis.history_json.as_str(),
     )
-    .await?
+    .await
     {
-        return Ok(false);
+        Ok(true) => {}
+        Ok(false) => return Ok(false),
+        Err(error) if expired_context_authority(&error) => return Ok(false),
+        Err(error) => return Err(error),
     }
     let authority: pioneer_compaction::frozen::FrozenHistoryRef =
         serde_json::from_str(basis.history_json.as_str())?;

@@ -379,7 +379,8 @@
       "type": "string",
       "enum": [
         "codex",
-        "claude"
+        "claude",
+        "opencode"
       ]
     },
     "McpScopeKind": {

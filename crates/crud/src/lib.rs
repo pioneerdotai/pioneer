@@ -916,7 +916,7 @@ pub use crate::repositories::cli_runtime_binding::{
     PrepareClaudeProviderSessionBinding, PreparedClaudeProviderSessionBinding,
     PreparedClaudeProviderSessionMode, ResolveCliRuntimePendingRequest,
     TransitionCliRuntimePendingRequestDelivery, deserialize_cli_runtime_json,
-    serialize_cli_runtime_json,
+    load_runtime_kinds_for_turns as load_cli_runtime_kinds_for_turns, serialize_cli_runtime_json,
 };
 /// Facts used by terminal projection repair. Captured in one reader snapshot;
 /// validated again in the binding/attempt/projection writer transaction.
@@ -5211,10 +5211,35 @@ impl CrudStore {
         &self,
         snapshot: NewTurnRuntimeSnapshot,
     ) -> Result<TurnRuntimeSnapshotRecord> {
+        self.upsert_turn_runtime_snapshot_with_source_epochs(
+            snapshot,
+            &std::collections::BTreeMap::new(),
+        )
+        .await
+    }
+
+    pub async fn upsert_turn_runtime_snapshot_with_source_epochs(
+        &self,
+        snapshot: NewTurnRuntimeSnapshot,
+        source_epochs: &std::collections::BTreeMap<String, u64>,
+    ) -> Result<TurnRuntimeSnapshotRecord> {
         let root = frozen_lifetime::PreparedFrozenRoot::history(&snapshot.history_json)?;
+        // Preparation reads these epochs without writer capacity. Edits can
+        // race the handoff, so revalidate them in the runtime-root transaction.
+        let source_epochs_json = serde_json::to_string(source_epochs)?;
+        anyhow::ensure!(
+            source_epochs_json.len() <= compaction::SOURCE_PAGE_BYTES,
+            "runtime source epochs exceed metadata byte bound"
+        );
         self.run_serialized_write(|| async {
             let transaction = self.connection.begin().await?;
             let result = async {
+                turn_runtime_snapshot::verify_source_epochs(
+                    &transaction,
+                    &snapshot.workspace_id,
+                    &source_epochs_json,
+                )
+                .await?;
                 turn_runtime_snapshot::upsert_turn_runtime_snapshot(
                     &transaction,
                     snapshot.clone(),
@@ -55645,6 +55670,7 @@ mod tests {
 
         let actor = PersistedActorRef::Principal(principal_id.clone());
         let author = pioneer_protocol::TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: actor.clone(),
             display_name: "Author".to_owned(),
             nickname: "author".to_owned(),
@@ -55758,6 +55784,7 @@ mod tests {
             PrincipalId::new("P00000000000000000001").expect("principal id should be valid");
         let principal_actor = PersistedActorRef::Principal(principal_id.clone());
         let principal_author = pioneer_protocol::TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: principal_actor.clone(),
             display_name: "Principal".to_owned(),
             nickname: "principal".to_owned(),
@@ -55790,6 +55817,7 @@ mod tests {
             event_thread.preview = format!("message from {suffix}");
             let expected_read_author = match (&actor, &author) {
                 (PersistedActorRef::System, None) => Some(pioneer_protocol::TurnAuthorSnapshot {
+                    cli_runtime_kind: None,
                     actor: PersistedActorRef::System,
                     display_name: "System".to_owned(),
                     nickname: "system".to_owned(),
@@ -55936,6 +55964,7 @@ mod tests {
         thread.updated_at = timestamp + 1;
         let permission_profile = pioneer_protocol::default_turn_permission_profile_snapshot();
         let author_snapshot = pioneer_protocol::TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::Principal(author.clone()),
             display_name: "Author".to_owned(),
             nickname: "author".to_owned(),

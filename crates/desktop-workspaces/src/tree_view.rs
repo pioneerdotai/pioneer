@@ -102,6 +102,7 @@ impl ThreadSidebarView {
         let scoped_thread_capabilities = self.thread_scope_capabilities;
         let active_workspace_id = self.active_workspace_id().map(str::to_owned);
         let rows_by_thread_id = self.sidebar_rows_by_thread_id();
+        let publication = self.input.clone();
         let folders_by_id: Arc<HashMap<String, ThreadFolder>> = Arc::new(
             active_workspace_id
                 .as_deref()
@@ -395,6 +396,11 @@ impl ThreadSidebarView {
                     render_agents_doc_file_row(item_id, entry.depth(), selected, open_listener, cx)
                 }
                 SidebarTreeNodeKey::Folder(folder_id) => {
+                    let unread_count = publication
+                        .as_ref()
+                        .and_then(|p| p.snapshot().unread_by_folder_id.get(folder_id))
+                        .copied()
+                        .unwrap_or(0);
                     let folder = folders_by_id.get(folder_id).cloned();
                     let folder_name = folder
                         .as_ref()
@@ -579,7 +585,8 @@ impl ThreadSidebarView {
                                         .child(
                                             h_flex()
                                                 .id(format!("thread-tree-folder-hover-{item_id}"))
-                                                .w_full()
+                                                .flex_1()
+                                                .min_w_0()
                                                 .h(px(TREE_ROW_CONTENT_HEIGHT_PX))
                                                 .items_center()
                                                 .gap(px(TREE_ROW_GAP_PX))
@@ -604,13 +611,35 @@ impl ThreadSidebarView {
                                                 )
                                                 .child(
                                                     div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .overflow_hidden()
+                                                        .text_ellipsis()
                                                         .text_sm()
                                                         .text_color(cx.theme().foreground)
                                                         .line_height(relative(1.0))
                                                         .font_normal()
                                                         .opacity(SIDEBAR_MENU_ITEM_OPACITY)
                                                         .child(folder_name),
-                                                ),
+                                                )
+                                                .when(unread_count > 0, |this| {
+                                                    this.child(
+                                                        div()
+                                                            .min_w_5()
+                                                            .h_5()
+                                                            .px_1()
+                                                            .rounded_full()
+                                                            .flex()
+                                                            .flex_shrink_0()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .text_xs()
+                                                            .bg(cx.theme().muted)
+                                                            .child(div().opacity(0.8).child(
+                                                                unread_count.to_string(),
+                                                            )),
+                                                    )
+                                                }),
                                         ),
                                 ),
                         )

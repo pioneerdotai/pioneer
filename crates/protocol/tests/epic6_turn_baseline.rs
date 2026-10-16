@@ -52,6 +52,7 @@ fn epic6_turn_collaboration_fields_round_trip_on_the_canonical_turn() {
         origin: TurnOrigin::User,
         mode: ThreadMode::Message,
         author: Some(TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::Principal(principal_id.clone()),
             display_name: "Member".to_owned(),
             nickname: "member".to_owned(),

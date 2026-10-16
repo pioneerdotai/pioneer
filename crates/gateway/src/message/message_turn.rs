@@ -274,6 +274,7 @@ pub(super) async fn resolve_turn_author_snapshot(
         .context("failed to resolve Turn author avatar")?
         .map(|avatar| hex::encode(avatar.content_hash));
     Ok(Some(pioneer_protocol::TurnAuthorSnapshot {
+        cli_runtime_kind: None,
         actor: actor.clone(),
         display_name: principal.display_name,
         nickname: principal.nickname,
@@ -287,6 +288,7 @@ pub(super) async fn resolve_turn_author_snapshot(
 /// instead of calling this helper.
 pub(super) fn system_turn_author_snapshot() -> pioneer_protocol::TurnAuthorSnapshot {
     pioneer_protocol::TurnAuthorSnapshot {
+        cli_runtime_kind: None,
         actor: pioneer_protocol::PersistedActorRef::System,
         display_name: "System".to_owned(),
         nickname: "system".to_owned(),

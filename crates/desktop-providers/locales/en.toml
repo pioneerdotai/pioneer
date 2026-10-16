@@ -33,6 +33,8 @@ proxy_hint = "Optional workspace-scoped proxy for this provider."
 replace_hint = "A key is already configured for %{provider}. Saving will replace it."
 
 [providers.error]
+configure_failed = "Failed to save settings for %{provider}"
+disconnect_failed = "Failed to remove the API key for %{provider}"
 gateway_not_connected = "Gateway is not connected."
 workspace_not_selected = "Workspace is not selected."
 load_failed = "Failed to load provider configuration"
@@ -127,6 +129,12 @@ unsupported = "Unsupported"
 error = "Error"
 
 [providers.cli.error]
+settings_load_failed = "Failed to load CLI provider settings"
+settings_forbidden = "This account cannot manage Gateway settings"
+login_failed = "Failed to start login for %{runtime}"
+proxy_failed = "Failed to update the proxy for %{runtime}"
+save_failed = "Failed to save settings for %{runtime}"
+enabled_failed = "Failed to change the enabled state of %{runtime}"
 open_path_failed = "Open path failed"
 
 [providers.catalog.anthropic]

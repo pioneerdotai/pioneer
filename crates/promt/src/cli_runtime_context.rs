@@ -189,7 +189,7 @@ fn render_pioneer_runtime_instructions(runtime_kind: CLIAgentRuntimeKind) -> Str
         "For text work use the projected Pioneer filesystem hierarchy: read_file, list_dir, grep_files, and one general apply_patch mutator. Do not infer tools that are absent from the current catalog.",
     ];
     lines.push(match runtime_kind {
-        CLIAgentRuntimeKind::Codex => {
+        CLIAgentRuntimeKind::Codex | CLIAgentRuntimeKind::OpenCode => {
             "Follow each available filesystem tool's current description and input schema exactly; they define the complete call format for this turn."
         }
         CLIAgentRuntimeKind::Claude => {
@@ -244,6 +244,10 @@ fn render_selected_skills(input: &CliRuntimeSelectedSkillsInput) -> CliRuntimeCo
             "Pioneer selected {} Claude skill(s) for this turn. Invoke every selected skill through Claude's native Skill tool in the listed order before completing the user's task.",
             input.skill_names.len()
         )],
+        CLIAgentRuntimeKind::OpenCode => vec![format!(
+            "Pioneer selected {} skill(s) for this OpenCode turn. Read every selected Skill input supplied with the turn in the listed order before completing the user's task.",
+            input.skill_names.len()
+        )],
     };
     if !names.is_empty() {
         lines.push(String::new());
@@ -251,6 +255,7 @@ fn render_selected_skills(input: &CliRuntimeSelectedSkillsInput) -> CliRuntimeCo
         lines.extend(names.into_iter().map(|name| match input.runtime_kind {
             CLIAgentRuntimeKind::Codex => format!("- ${name}"),
             CLIAgentRuntimeKind::Claude => format!("- {name}"),
+            CLIAgentRuntimeKind::OpenCode => format!("- {name}"),
         }));
     }
     if omitted > 0 {
