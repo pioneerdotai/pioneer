@@ -76683,15 +76683,18 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
         Vec::new()
     };
     let provider = Arc::new(OverflowProvider(std::sync::Mutex::new(Vec::new()), calls));
-    let summary = Arc::new(CaptureSummaryProvider::new(
-        pioneer_compaction::summary::HEADINGS
-            .iter()
-            .map(|heading| {
-                format!("{heading}\nПользователь ожидает ответ; продолжить текущую задачу.")
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    ).named("summary-capture"));
+    let summary = Arc::new(
+        CaptureSummaryProvider::new(
+            pioneer_compaction::summary::HEADINGS
+                .iter()
+                .map(|heading| {
+                    format!("{heading}\nПользователь ожидает ответ; продолжить текущую задачу.")
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .named("summary-capture"),
+    );
     let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         provider.clone(),
@@ -77168,7 +77171,7 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
         .set_connection_workspace(connection, Some(workspace.clone()))
         .await;
     let threads = Arc::new(ThreadManager::new("test-model", "openai"));
-    let provider = Arc::new(CaptureSummaryProvider::new("foreground answer"));
+    let provider = Arc::new(CaptureSummaryProvider::new("foreground answer").named("openai"));
     let processor = Arc::new(MessageProcessor::new(
         threads.clone(),
         Arc::new(pioneer_provider::ProviderRegistry::with_provider(
