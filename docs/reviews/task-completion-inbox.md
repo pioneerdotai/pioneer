@@ -123,6 +123,8 @@ The CRUD fixture now uses 21-character alphanumeric workspace/thread IDs through
 
 Local follow-up checks are limited to Rust formatting, diff review/`git diff --check` and source-contract matching. Neither local `cargo check` nor local tests or SQL fixture execution were run for this fix, as requested. The updated cases still need the next remote CI run.
 
+The subsequent [Linux CI run](https://github.com/pioneerdotai/pioneer/actions/runs/38915036253/job/117020205443) passed all nine CRUD inbox integration cases and the Gateway inbox RPC scenario. Its only Gateway failure was the authorization registry's fixed expected method count: 153 predates the three new inbox RPCs, while the actual count is 156. The registry/protocol set equality and duplicate checks already passed. The expected count is now 156; all coverage assertions remain in place. This follow-up changes no production behavior or contract inputs. Local verification is limited to formatting and `git diff --check`; no local `cargo check` or tests were run.
+
 ## Reviewer-only test commands
 
 Run only after full external review and explicit acceptance by the originating-thread reviewer:
