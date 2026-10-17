@@ -95,6 +95,7 @@ pub enum CliMcpInjectionKind {
     AcpStandardStdioMcp,
     CodexManagedStdioMcp,
     ClaudeStrictStdioMcp,
+    OpenCodeDynamicStdioMcp,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -103,6 +104,7 @@ pub enum CliMcpProjectionUpdateKind {
     AcpNewOrNegotiatedSession,
     CodexRestartAppServerResumeThread,
     ClaudeRestartProcessResumeSession,
+    OpenCodeRestartServerResumeSession,
 }
 
 /// Provider-specific MCP readiness evidence retained inside the Gateway.

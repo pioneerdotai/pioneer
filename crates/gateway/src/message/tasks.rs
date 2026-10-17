@@ -397,6 +397,32 @@ impl MessageProcessor {
                 .await;
             }
         }
+        // Activity changes use the existing authorized tree invalidation path.
+        // Progress/heartbeat/streaming deltas deliberately do not enter it.
+        if task_event_changes_tree_activity(&event.payload)
+            && pioneer_crud::resolve_task_authorization_scope(
+                &self.crud_store.database_connection(),
+                &task_response.task.id,
+                Some(&task_response.task.workspace_id),
+                None,
+            )
+            .await?
+            .is_some_and(|scope| scope.root_thread_id.is_some())
+        {
+            self.send_notification_to_task_workspace_connections(
+                task_response.task.id.as_str(),
+                task_response.task.workspace_id.as_str(),
+                events::THREAD_TREE_CHANGED,
+                &ThreadTreeChangedNotification {
+                    workspace_id: task_response.task.workspace_id.clone(),
+                },
+            )
+            .await;
+        }
+        if matches!(event.payload, TaskEventPayload::RunStarting { .. }) {
+            // The dispatch claim has no conversation/timeline side effects.
+            return Ok(());
+        }
         let context = pioneer_protocol::TaskNotificationContext {
             workspace_id: task_response.task.workspace_id.clone(),
             task_id: task_response.task.id.clone(),
@@ -412,6 +438,41 @@ impl MessageProcessor {
         let notification_task_id = context.task_id.clone();
         let is_progress_event = matches!(event.payload, TaskEventPayload::Progress { .. });
         let is_terminal_event = event.payload.is_terminal();
+        // Saved runs are already committed. Invalidate independently of timeline
+        // projection and delivery so offline history and deliveryPolicy=none use
+        // the same source. This small hint also avoids coupling inbox refresh to
+        // the richer Task/TaskRun presentation notification payloads.
+        if matches!(
+            &event.payload,
+            TaskEventPayload::RunCompleted { .. }
+                | TaskEventPayload::RunFailed { .. }
+                | TaskEventPayload::RunBlocked { .. }
+                | TaskEventPayload::RunCancelled { .. }
+                | TaskEventPayload::RunCreated { .. }
+                | TaskEventPayload::RunStarted { .. }
+                | TaskEventPayload::TaskCompleted { .. }
+                | TaskEventPayload::TaskFailed { .. }
+                | TaskEventPayload::TaskBlocked { .. }
+                | TaskEventPayload::TaskCancelled { .. }
+                | TaskEventPayload::TaskResumed { .. }
+                | TaskEventPayload::TaskUpdated { .. }
+                | TaskEventPayload::TaskRecovered { .. }
+                | TaskEventPayload::TaskRevisionRequested { .. }
+                | TaskEventPayload::TaskRunEnteredReview { .. }
+                | TaskEventPayload::DepthLimitExceeded { .. }
+                | TaskEventPayload::TaskThreadLineageCreated { .. }
+                | TaskEventPayload::ChildThreadLinked { .. }
+        ) {
+            self.send_notification_to_task_workspace_connections(
+                &notification_task_id,
+                &workspace_id,
+                events::TASK_COMPLETION_INBOX_CHANGED,
+                &pioneer_protocol::TaskCompletionInboxChangedNotification {
+                    workspace_id: workspace_id.clone(),
+                },
+            )
+            .await;
+        }
         let awaits_occurrence_thread_delivery = match event.payload.run_id() {
             Some(run_id) => {
                 self.task_run_awaits_occurrence_thread_delivery(&task_response, run_id)
@@ -523,6 +584,7 @@ impl MessageProcessor {
                 )
                 .await;
             }
+            TaskEventPayload::RunStarting { .. } => {}
             TaskEventPayload::RunStarted { run_id, .. } => {
                 if let Some(run) = task_response.run.as_ref().filter(|run| run.id == run_id) {
                     self.send_notification_to_task_workspace_connections(
@@ -1042,7 +1104,7 @@ impl MessageProcessor {
             notification.thread_id.as_str(),
             notification.turn_id.as_str(),
             &notification.item,
-            None,
+            Some("completed"),
         )
         .await;
         Ok(true)
@@ -1475,10 +1537,126 @@ async fn task_delivery_child_lineage(
     }
 }
 
+fn task_event_changes_tree_activity(payload: &TaskEventPayload) -> bool {
+    matches!(
+        payload,
+        TaskEventPayload::RunStarting { .. }
+            | TaskEventPayload::RunStarted { .. }
+            | TaskEventPayload::RunCompleted { .. }
+            | TaskEventPayload::RunFailed { .. }
+            | TaskEventPayload::RunBlocked { .. }
+            | TaskEventPayload::RunCancelled { .. }
+            | TaskEventPayload::RunCreated {
+                run: pioneer_protocol::TaskRun {
+                    status: pioneer_protocol::TaskRunStatus::Starting
+                        | pioneer_protocol::TaskRunStatus::Running,
+                    ..
+                },
+                ..
+            }
+            | TaskEventPayload::RunRetryScheduled {
+                retry_run: pioneer_protocol::TaskRun {
+                    status: pioneer_protocol::TaskRunStatus::Starting
+                        | pioneer_protocol::TaskRunStatus::Running,
+                    ..
+                },
+                ..
+            }
+            | TaskEventPayload::DepthLimitExceeded {
+                run_id: Some(_),
+                ..
+            }
+            | TaskEventPayload::TaskRunEnteredReview { .. }
+            | TaskEventPayload::TaskRevisionRequested { .. }
+            | TaskEventPayload::TaskThreadLineageCreated { .. }
+            | TaskEventPayload::ChildThreadLinked { .. }
+            | TaskEventPayload::TaskRecovered { .. }
+    )
+}
+
 #[cfg(test)]
 mod task_child_failure_tests {
     use super::*;
     use pioneer_tasks::{TaskStartCause, TaskStartFailure, TaskStartStage};
+
+    #[test]
+    fn task_activity_invalidates_on_execution_changes_but_not_progress_or_future_work() {
+        for payload in [
+            TaskEventPayload::RunStarting {
+                task_id: "t".into(),
+                run_id: "r".into(),
+                claimed_at: 1,
+            },
+            TaskEventPayload::RunStarted {
+                task_id: "t".into(),
+                run_id: "r".into(),
+                started_at: 1,
+            },
+            TaskEventPayload::RunCompleted {
+                task_id: "t".into(),
+                run_id: "r".into(),
+                result: None,
+                completed_at: 1,
+            },
+            TaskEventPayload::RunFailed {
+                task_id: "t".into(),
+                run_id: "r".into(),
+                error: None,
+                completed_at: 1,
+            },
+            TaskEventPayload::RunBlocked {
+                task_id: "t".into(),
+                run_id: "r".into(),
+                error: None,
+                blocked_at: 1,
+            },
+            TaskEventPayload::RunCancelled {
+                task_id: "t".into(),
+                run_id: "r".into(),
+                reason: None,
+                cancelled_at: 1,
+            },
+            TaskEventPayload::DepthLimitExceeded {
+                task_id: "t".into(),
+                run_id: Some("r".into()),
+                depth: 10,
+                max_depth: 9,
+            },
+            TaskEventPayload::TaskRunEnteredReview {
+                task_id: "t".into(),
+                run_id: "r".into(),
+                candidate_id: "c".into(),
+                entered_at: 1,
+            },
+        ] {
+            assert!(task_event_changes_tree_activity(&payload));
+        }
+        for payload in [
+            TaskEventPayload::Progress {
+                task_id: "t".into(),
+                run_id: Some("r".into()),
+                message: "delta".into(),
+                details: None,
+            },
+            TaskEventPayload::TaskQueued {
+                task_id: "t".into(),
+                run_id: Some("r".into()),
+            },
+            TaskEventPayload::DepthLimitExceeded {
+                task_id: "t".into(),
+                run_id: None,
+                depth: 10,
+                max_depth: 9,
+            },
+            TaskEventPayload::TaskScheduled {
+                task_id: "t".into(),
+                trigger_id: "future".into(),
+                next_fire_at: Some(i64::MAX),
+            },
+        ] {
+            assert!(!task_event_changes_tree_activity(&payload));
+        }
+    }
 
     #[test]
     fn aggregate_owns_only_safe_reported_descriptors_and_preserves_independent_retry_input() {

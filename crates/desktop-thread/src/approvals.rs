@@ -13,7 +13,8 @@ use gpui_kit::{prelude::*, *};
 use pioneer_client::cli_runtime::approvals::{
     PendingRequestActionKind, PendingRequestAvailableAction, PendingRequestDetailRow,
     PendingRequestDetailStyle, PendingRequestKind, PendingRequestPresentation,
-    PendingRequestResolution, PendingRequestUserInputQuestion, present_pending_request,
+    PendingRequestResolution, PendingRequestUserInputQuestion, pending_request_answered_resolution,
+    present_pending_request,
 };
 use pioneer_client::cli_runtime::{
     approval_actions::{ApprovalActionIntent, ApprovalActionPublication, ApprovalActionState},
@@ -450,6 +451,9 @@ impl PendingRequestView {
             })
             .collect::<Vec<_>>();
         let inputs = Rc::new(inputs);
+        let selections = Rc::new(RefCell::new(
+            std::collections::HashMap::<String, Vec<String>>::new(),
+        ));
         let desktop_entity = cx.weak_entity();
         let submit_request = request.clone();
 
@@ -459,22 +463,47 @@ impl PendingRequestView {
             let inputs = inputs.clone();
             let request = submit_request;
             let validation_error = validation_error.clone();
+            let selections = selections.clone();
+            let questions = questions.clone();
             move |cx| {
-                let answers = inputs
-                    .iter()
-                    .map(|(id, input)| (id.clone(), input.value(cx)));
-                let resolution = match pioneer_client::cli_runtime::acp_human::answered_resolution(
-                    &request, answers,
-                ) {
-                    Ok(resolution) => resolution,
-                    Err(error) => {
-                        validation_error.update(cx, |value, cx| {
-                            *value = Some(error.to_string());
-                            cx.notify();
-                        });
-                        cx.refresh_windows();
-                        return false;
+                let resolution = if questions.iter().any(|q| q.value_schema.is_some()) {
+                    let answers = inputs
+                        .iter()
+                        .map(|(id, input)| (id.clone(), input.value(cx)));
+                    match pioneer_client::cli_runtime::acp_human::answered_resolution(
+                        &request, answers,
+                    ) {
+                        Ok(resolution) => resolution,
+                        Err(error) => {
+                            validation_error.update(cx, |value, cx| {
+                                *value = Some(error.to_string());
+                                cx.notify();
+                            });
+                            cx.refresh_windows();
+                            return false;
+                        }
                     }
+                } else {
+                    let answers = inputs.iter().map(|(id, input)| {
+                        let question = questions.iter().find(|q| &q.id == id).unwrap();
+                        let value = input.value(cx);
+                        let mut selected = selections.borrow().get(id).cloned().unwrap_or_default();
+                        let answer = if question.multiple {
+                            if question.allow_custom
+                                && !value.trim().is_empty()
+                                && !selected.contains(&value)
+                            {
+                                selected.push(value);
+                            }
+                            serde_json::json!(selected)
+                        } else if question.allow_custom {
+                            serde_json::json!(value)
+                        } else {
+                            serde_json::json!(selected.first().cloned().unwrap_or_default())
+                        };
+                        (id.clone(), answer)
+                    });
+                    pending_request_answered_resolution(answers)
                 };
 
                 let _ = desktop_entity.update(cx, |view, cx| {
@@ -494,7 +523,10 @@ impl PendingRequestView {
         self.dialog_generation.set(Some(request_generation));
         self.dialog_open.set(true);
         let dialog_open = self.dialog_open.clone();
-        let first_input = inputs.first().map(|(_, input)| input.clone());
+        let first_input = inputs
+            .iter()
+            .find(|(id, _)| questions.iter().any(|q| &q.id == id && q.allow_custom))
+            .map(|(_, input)| input.clone());
         window.open_dialog(cx, move |dialog, _window, cx| {
             let error = validation_error.read(cx).clone();
             dialog
@@ -563,7 +595,12 @@ impl PendingRequestView {
                                 .iter()
                                 .find(|(id, _)| id == &question.id)
                                 .map(|(_, input)| input.clone())?;
-                            Some(render_user_input_question(question.clone(), input, cx))
+                            Some(render_user_input_question(
+                                question.clone(),
+                                input,
+                                selections.clone(),
+                                cx,
+                            ))
                         })),
                 )
         });
@@ -701,6 +738,7 @@ fn pending_request_action_element_prefix(kind: PendingRequestActionKind) -> &'st
 fn render_user_input_question(
     question: PendingRequestUserInputQuestion,
     input: PendingRequestAnswerInput,
+    selections: Rc<RefCell<std::collections::HashMap<String, Vec<String>>>>,
     cx: &mut App,
 ) -> Field {
     let label = question
@@ -728,36 +766,79 @@ fn render_user_input_question(
                                 format!("{}-{}", question.id, option.label).as_str(),
                             ))
                             .label(option.label.clone())
+                            .selected(if question.value_schema.is_some() {
+                                let value = option.value.as_deref().unwrap_or(&option.label);
+                                if question.multiple {
+                                    serde_json::from_str::<Vec<String>>(&input.value(cx))
+                                        .unwrap_or_default()
+                                        .iter()
+                                        .any(|selected| selected == value)
+                                } else {
+                                    input.value(cx) == value
+                                }
+                            } else if question.multiple || !question.allow_custom {
+                                selections
+                                    .borrow()
+                                    .get(&question.id)
+                                    .is_some_and(|values| values.contains(&option.label))
+                            } else {
+                                input.value(cx) == option.label
+                            })
                             .on_click({
                                 let input = input.clone();
                                 let label =
                                     option.value.clone().unwrap_or_else(|| option.label.clone());
-                                let multiple = question
-                                    .value_schema
-                                    .as_ref()
-                                    .is_some_and(|schema| schema["type"] == "array");
+                                let has_schema = question.value_schema.is_some();
+                                let id = question.id.clone();
+                                let selections = selections.clone();
+                                let multiple = question.multiple
+                                    || question
+                                        .value_schema
+                                        .as_ref()
+                                        .is_some_and(|s| s["type"] == "array");
+                                let allow_custom = question.allow_custom;
                                 move |_, window, cx| {
-                                    let value = if multiple {
-                                        let mut selected: Vec<String> =
-                                            serde_json::from_str(&input.value(cx))
-                                                .unwrap_or_default();
-                                        if selected.contains(&label) {
-                                            selected.retain(|value| value != &label);
+                                    if has_schema {
+                                        let value = if multiple {
+                                            let mut selected: Vec<String> =
+                                                serde_json::from_str(&input.value(cx))
+                                                    .unwrap_or_default();
+                                            if selected.contains(&label) {
+                                                selected.retain(|v| v != &label);
+                                            } else {
+                                                selected.push(label.clone());
+                                            }
+                                            serde_json::to_string(&selected).unwrap_or_default()
+                                        } else {
+                                            label.clone()
+                                        };
+                                        input.set_value(value, window, cx);
+                                        return;
+                                    }
+                                    let mut selections = selections.borrow_mut();
+                                    let selected = selections.entry(id.clone()).or_default();
+                                    if multiple {
+                                        if let Some(index) =
+                                            selected.iter().position(|value| value == &label)
+                                        {
+                                            selected.remove(index);
                                         } else {
                                             selected.push(label.clone());
                                         }
-                                        serde_json::to_string(&selected).unwrap_or_default()
                                     } else {
-                                        label.clone()
-                                    };
-                                    input.set_value(value, window, cx);
+                                        *selected = vec![label.clone()];
+                                        if allow_custom {
+                                            input.set_value(label.clone(), window, cx);
+                                        }
+                                    }
+                                    window.refresh();
                                 }
                             })
                             .into_any_element()
                         })),
                 )
             })
-            .child(input.render())
+            .when(question.allow_custom, |this| this.child(input.render()))
             .when(question.is_secret, |this| {
                 this.child(
                     div()

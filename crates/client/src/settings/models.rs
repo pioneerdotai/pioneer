@@ -24,6 +24,7 @@ pub fn from_selector(
                     CLIAgentRuntimeKind::Acp => return None,
                     CLIAgentRuntimeKind::Codex => ModelSelectionTransport::Codex,
                     CLIAgentRuntimeKind::Claude => ModelSelectionTransport::Claude,
+                    CLIAgentRuntimeKind::OpenCode => ModelSelectionTransport::OpenCode,
                 },
                 id.to_owned(),
             )

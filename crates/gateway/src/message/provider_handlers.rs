@@ -1309,15 +1309,28 @@ impl MessageProcessor {
 
     /// Restore canonical history without generating summaries or truncating sources.
     /// The native request controller owns admission and full-request budgeting.
+    #[cfg(test)]
     pub(super) async fn load_conversation_history_for_workspace(
         &self,
         workspace_id: &str,
         thread_id: &str,
         turn_id: &str,
     ) -> anyhow::Result<Vec<ChatMessage>> {
+        Ok(self
+            .load_prepared_conversation_history_for_workspace(workspace_id, thread_id, turn_id)
+            .await?
+            .messages)
+    }
+
+    pub(super) async fn load_prepared_conversation_history_for_workspace(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> anyhow::Result<crate::compaction::frozen::PreparedHistory> {
         let store = self.crud_store.as_ref();
         let prepared = self
-            .capture_current_context_basis_prepared(
+            .capture_running_context_basis_prepared(
                 store,
                 workspace_id,
                 thread_id,
@@ -1325,7 +1338,7 @@ impl MessageProcessor {
                 Some(turn_id),
             )
             .await?;
-        Ok(prepared.messages)
+        Ok(prepared)
     }
 
     #[cfg(test)]

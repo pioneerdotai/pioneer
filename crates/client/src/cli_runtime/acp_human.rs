@@ -169,6 +169,8 @@ pub fn present(request: &PendingRequest) -> Option<PendingRequestPresentation> {
                                 // Stable ACP forms have no password format.
                                 // Credential authorization uses explicit URL/terminal flows.
                                 is_secret: false,
+                                multiple: field["type"] == "array",
+                                allow_custom: true,
                                 value_schema: Some(value_schema),
                             });
                     }

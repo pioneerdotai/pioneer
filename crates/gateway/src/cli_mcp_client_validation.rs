@@ -22,6 +22,7 @@ pub enum CliMcpClientTarget {
     Acp,
     Codex,
     Claude,
+    OpenCode,
 }
 
 impl CliMcpClientTarget {
@@ -31,6 +32,7 @@ impl CliMcpClientTarget {
             Self::Api => "api",
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::OpenCode => "opencode",
         }
     }
 }

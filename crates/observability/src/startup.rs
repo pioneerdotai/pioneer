@@ -88,6 +88,23 @@ pub enum DesktopStartupStage {
     UiEventLoopEnter,
     UiComponentsInitialize,
     WindowOpen,
+    GatewayEffectQueueWait,
+    DesktopKeystorePrepare,
+    GatewayRetiredCredentialsCleanup,
+    GatewayEnvironmentLoad,
+    GatewayLocalPrepare,
+    GatewayRegistryLoad,
+    GatewayRegistrySave,
+    GatewayInstallationCheck,
+    GatewayUpdateCheck,
+    GatewayServiceCheck,
+    GatewayReadinessCheck,
+    GatewayReachabilityCheck,
+    GatewayEnvironmentCredentialsLoad,
+    GatewaySessionCredentialsLoad,
+    GatewaySessionRefreshIntentPersist,
+    GatewaySessionRefreshRequest,
+    GatewaySessionCredentialsPersist,
     GatewayRuntimeLoad,
     GatewayRuntimeUpdateCheck,
     GatewayRuntimeStateLoad,
@@ -165,6 +182,27 @@ impl DesktopStartupStage {
             Self::UiEventLoopEnter => "ui_runtime.event_loop.enter",
             Self::UiComponentsInitialize => "ui_components.initialize",
             Self::WindowOpen => "window.open",
+            Self::GatewayEffectQueueWait => "gateway_preconnect.effect.queue_wait",
+            Self::DesktopKeystorePrepare => "gateway_preconnect.keystore.prepare",
+            Self::GatewayRetiredCredentialsCleanup => {
+                "gateway_preconnect.retired_credentials.cleanup"
+            }
+            Self::GatewayEnvironmentLoad => "gateway_preconnect.environment.load",
+            Self::GatewayLocalPrepare => "gateway_preconnect.local.prepare",
+            Self::GatewayRegistryLoad => "gateway_preconnect.registry.load",
+            Self::GatewayRegistrySave => "gateway_preconnect.registry.save",
+            Self::GatewayInstallationCheck => "gateway_preconnect.installation.check",
+            Self::GatewayUpdateCheck => "gateway_preconnect.update.check",
+            Self::GatewayServiceCheck => "gateway_preconnect.service.check",
+            Self::GatewayReadinessCheck => "gateway_preconnect.readiness.check",
+            Self::GatewayReachabilityCheck => "gateway_preconnect.reachability.check",
+            Self::GatewayEnvironmentCredentialsLoad => {
+                "gateway_preconnect.environment.credentials.load"
+            }
+            Self::GatewaySessionCredentialsLoad => "gateway_session.credentials.load",
+            Self::GatewaySessionRefreshIntentPersist => "gateway_session.refresh_intent.persist",
+            Self::GatewaySessionRefreshRequest => "gateway_session.refresh.request",
+            Self::GatewaySessionCredentialsPersist => "gateway_session.credentials.persist",
             Self::GatewayRuntimeLoad => "gateway_runtime.load",
             Self::GatewayRuntimeUpdateCheck => "gateway_runtime.update_check",
             Self::GatewayRuntimeStateLoad => "gateway_runtime.state_load",
@@ -355,6 +393,7 @@ pub enum MobileStartupStage {
     ThreadTreeResponseApply,
     ComposerPrepare,
     OperationalFrame,
+    ShellFrame,
     SplashHide,
 }
 
@@ -382,6 +421,7 @@ impl MobileStartupStage {
             Self::ThreadTreeResponseApply => "thread_tree.response.apply",
             Self::ComposerPrepare => "composer.prepare",
             Self::OperationalFrame => "ui.operational_frame",
+            Self::ShellFrame => "ui.shell_frame",
             Self::SplashHide => "splash.hide",
         }
     }
@@ -409,6 +449,7 @@ impl MobileStartupStage {
             "thread_tree.response.apply" => Self::ThreadTreeResponseApply,
             "composer.prepare" => Self::ComposerPrepare,
             "ui.operational_frame" => Self::OperationalFrame,
+            "ui.shell_frame" => Self::ShellFrame,
             "splash.hide" => Self::SplashHide,
             _ => return None,
         })
@@ -417,6 +458,7 @@ impl MobileStartupStage {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MobileStartupOutcome {
+    Cancelled,
     Ready,
     SetupRequired,
     AuthenticationRequired,
@@ -426,6 +468,7 @@ pub enum MobileStartupOutcome {
 impl MobileStartupOutcome {
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
+            "cancelled" => Self::Cancelled,
             "ready" => Self::Ready,
             "setup_required" => Self::SetupRequired,
             "authentication_required" => Self::AuthenticationRequired,
@@ -436,6 +479,7 @@ impl MobileStartupOutcome {
 
     const fn as_str(self) -> &'static str {
         match self {
+            Self::Cancelled => "cancelled",
             Self::Ready => "ready",
             Self::SetupRequired => "setup_required",
             Self::AuthenticationRequired => "authentication_required",
@@ -494,6 +538,37 @@ pub fn record_mobile_startup(report: MobileStartupReport) {
         outcome: report.outcome.as_str(),
         failed: report.outcome.failed(),
     });
+}
+
+/// A navigation-to-composer measurement, independent of app and turn startup.
+/// Reuses the bounded mobile report and process-wide consent-gated exporter.
+pub fn record_mobile_thread_open(report: MobileStartupReport) {
+    let (enabled, generation) = super::telemetry_consent_snapshot();
+    if !super::telemetry_sample_allowed(enabled.then_some(generation)) {
+        return;
+    }
+    let Some(state) = super::telemetry::state() else {
+        return;
+    };
+    if state.target != TelemetryTarget::Mobile {
+        return;
+    }
+    let attributes = [KeyValue::new("outcome", report.outcome.as_str())];
+    if let Some(metric) = &state.mobile_thread_open_duration {
+        metric.record(report.duration.as_secs_f64() * 1_000.0, &attributes);
+    }
+    let mut span = state.tracer.build(
+        SpanBuilder::from_name("mobile.thread.open")
+            .with_kind(SpanKind::Internal)
+            .with_start_time(report.started_at)
+            .with_attributes(attributes),
+    );
+    span.set_status(match report.outcome {
+        MobileStartupOutcome::Cancelled => Status::Unset,
+        MobileStartupOutcome::Degraded => Status::error("thread screen did not become ready"),
+        _ => Status::Ok,
+    });
+    span.end_with_timestamp(end_timestamp(report.started_at, report.duration));
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -555,6 +630,8 @@ struct StartupState {
     post_update_stall_scheduled: bool,
     post_update_failure_emitted: bool,
     finalized: bool,
+    gateway_preconnect_observations: usize,
+    session_diagnostic_stages: HashSet<&'static str>,
 }
 
 #[derive(Clone, Debug)]
@@ -578,6 +655,8 @@ impl StartupTimeline {
                 post_update_handoff_emitted: false,
                 post_update_stall_scheduled: false,
                 post_update_failure_emitted: false,
+                gateway_preconnect_observations: 0,
+                session_diagnostic_stages: HashSet::new(),
                 finalized: false,
             })),
         }
@@ -915,6 +994,73 @@ impl DesktopStartupTrace {
         DesktopStartupStageGuard(self.timeline.stage(stage.as_str()))
     }
 
+    /// Bounded synchronous platform observations, captured even before the UI observer exists.
+    /// The timeline owns consent and discards completions after startup finalization.
+    pub fn gateway_preconnect_stage(
+        &self,
+        stage: DesktopStartupStage,
+    ) -> Option<DesktopStartupStageGuard> {
+        let mut state = self.timeline.lock();
+        if state.finalized || state.gateway_preconnect_observations >= 128 {
+            return None;
+        }
+        state.gateway_preconnect_observations += 1;
+        drop(state);
+        Some(self.stage(stage))
+    }
+
+    /// `published` is the enqueue instant of this concrete native effect, never worker idle time.
+    pub fn record_gateway_effect_queue_wait(&self, published: Instant) {
+        self.record_gateway_effect_queue_wait_at(published, Instant::now());
+    }
+
+    fn record_gateway_effect_queue_wait_at(&self, published: Instant, handled: Instant) {
+        let mut state = self.timeline.lock();
+        if state.finalized || state.gateway_preconnect_observations >= 128 {
+            return;
+        }
+        state.gateway_preconnect_observations += 1;
+        let started_at = end_timestamp(
+            state.started_at,
+            published.saturating_duration_since(state.started_instant),
+        );
+        state.stages.push(StageRecord {
+            name: DesktopStartupStage::GatewayEffectQueueWait.as_str(),
+            started_at,
+            elapsed: handled.saturating_duration_since(published),
+            outcome: StageOutcome::Ok,
+            diagnostics: StageDiagnostics::default(),
+        });
+    }
+
+    /// Imports the original session diagnostic timing, including cancellation.
+    pub fn record_session_diagnostic(
+        &self,
+        stage: DesktopStartupStage,
+        started_at: SystemTime,
+        elapsed: Duration,
+        succeeded: bool,
+        cancelled: bool,
+    ) {
+        let mut state = self.timeline.lock();
+        if state.finalized || !state.session_diagnostic_stages.insert(stage.as_str()) {
+            return;
+        }
+        state.stages.push(StageRecord {
+            name: stage.as_str(),
+            started_at,
+            elapsed,
+            outcome: if cancelled {
+                StageOutcome::Cancelled
+            } else if succeeded {
+                StageOutcome::Ok
+            } else {
+                StageOutcome::Error
+            },
+            diagnostics: StageDiagnostics::default(),
+        });
+    }
+
     pub fn set_post_update_context(&self, context: DesktopPostUpdateContext) {
         self.timeline.set_post_update_context(context);
     }
@@ -1077,11 +1223,15 @@ fn emit_startup_observability(snapshot: &StartupSnapshot) {
     } else {
         "cold"
     };
-    let metric_root_attributes = [
+    let mut metric_root_attributes = vec![
         KeyValue::new("outcome", snapshot.outcome),
         KeyValue::new("startup.failed_stage", failed_stage),
         KeyValue::new("startup.type", startup_type),
     ];
+    if snapshot.target == TelemetryTarget::Mobile {
+        // Historical shell-ready samples are not comparable with this boundary.
+        metric_root_attributes.push(KeyValue::new("startup.boundary", "tree_operational_v2"));
+    }
     state.startup_metrics.duration.record(
         snapshot.elapsed.as_secs_f64() * 1_000.0,
         &metric_root_attributes,
@@ -1157,13 +1307,17 @@ fn emit_startup_observability(snapshot: &StartupSnapshot) {
         span.end_with_timestamp(end_timestamp(stage.started_at, stage.elapsed));
     }
 
-    root_context.span().set_status(if snapshot.failed {
-        Status::Error {
-            description: std::borrow::Cow::Borrowed("startup did not reach a healthy state"),
-        }
-    } else {
-        Status::Ok
-    });
+    root_context.span().set_status(
+        if snapshot.target == TelemetryTarget::Mobile && snapshot.outcome == "cancelled" {
+            Status::Unset
+        } else if snapshot.failed {
+            Status::Error {
+                description: std::borrow::Cow::Borrowed("startup did not reach a healthy state"),
+            }
+        } else {
+            Status::Ok
+        },
+    );
     root_context
         .span()
         .end_with_timestamp(end_timestamp(snapshot.started_at, snapshot.elapsed));
@@ -1338,6 +1492,121 @@ mod tests {
         GatewayStartupTrace, MobileStartupOutcome, MobileStartupStage, StageOutcome,
     };
     use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn preconnect_queue_uses_publication_and_handler_instants() {
+        let trace = DesktopStartupTrace::start();
+        let origin = std::time::Instant::now();
+        {
+            let mut state = trace.timeline.lock();
+            state.started_at = SystemTime::UNIX_EPOCH;
+            state.started_instant = origin;
+        }
+        // An idle worker before +20 ms is not part of this work's queue wait.
+        trace.record_gateway_effect_queue_wait_at(
+            origin + Duration::from_millis(20),
+            origin + Duration::from_millis(27),
+        );
+        let state = trace.timeline.lock();
+        assert_eq!(state.stages.len(), 1);
+        assert_eq!(
+            state.stages[0].started_at,
+            SystemTime::UNIX_EPOCH + Duration::from_millis(20)
+        );
+        assert_eq!(state.stages[0].elapsed, Duration::from_millis(7));
+    }
+
+    #[test]
+    fn imported_diagnostics_keep_original_times_outcomes_and_only_one_completion() {
+        let trace = DesktopStartupTrace::start();
+        let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
+        for _ in 0..2 {
+            trace.record_session_diagnostic(
+                DesktopStartupStage::GatewaySessionRefreshRequest,
+                started_at,
+                Duration::from_millis(42),
+                false,
+                true,
+            );
+        }
+        trace.record_session_diagnostic(
+            DesktopStartupStage::GatewaySessionCredentialsLoad,
+            started_at,
+            Duration::from_millis(3),
+            false,
+            false,
+        );
+        let state = trace.timeline.lock();
+        assert_eq!(state.stages.len(), 2);
+        assert_eq!(state.stages[0].started_at, started_at);
+        assert_eq!(state.stages[0].elapsed, Duration::from_millis(42));
+        assert_eq!(state.stages[0].outcome, StageOutcome::Cancelled);
+        assert_eq!(state.stages[1].outcome, StageOutcome::Error);
+        assert!(
+            !state.stages.iter().any(|stage| stage.name
+                == DesktopStartupStage::GatewaySessionCredentialsPersist.as_str())
+        );
+    }
+
+    #[test]
+    fn preconnect_capture_is_bounded_and_late_completions_stay_on_their_timeline() {
+        let trace = DesktopStartupTrace::start();
+        let other = DesktopStartupTrace::start();
+        let late = trace
+            .gateway_preconnect_stage(DesktopStartupStage::GatewayEnvironmentLoad)
+            .unwrap();
+        for _ in 1..128 {
+            trace
+                .gateway_preconnect_stage(DesktopStartupStage::GatewayServiceCheck)
+                .unwrap()
+                .succeed();
+        }
+        assert!(
+            trace
+                .gateway_preconnect_stage(DesktopStartupStage::GatewayServiceCheck)
+                .is_none()
+        );
+        trace.finish(DesktopStartupOutcome::SetupRequired);
+        late.succeed();
+        trace.record_session_diagnostic(
+            DesktopStartupStage::GatewaySessionAttempt,
+            SystemTime::UNIX_EPOCH,
+            Duration::ZERO,
+            true,
+            false,
+        );
+        assert_eq!(trace.timeline.lock().stages.len(), 127);
+        assert!(other.timeline.lock().stages.is_empty());
+    }
+
+    #[test]
+    fn early_preconnect_capture_uses_the_bound_consent_generation() {
+        let trace = DesktopStartupTrace::start();
+        trace
+            .gateway_preconnect_stage(DesktopStartupStage::DesktopKeystorePrepare)
+            .unwrap()
+            .succeed();
+        assert_eq!(trace.timeline.lock().consent_generation, None);
+        // Exercise the actual startup export gate without changing global consent in parallel tests.
+        trace.timeline.lock().consent_generation = Some(7);
+        let state = trace.timeline.lock();
+        assert_eq!(state.stages.len(), 1);
+        assert!(crate::telemetry_sample_allowed_for_state(
+            state.consent_generation,
+            true,
+            7
+        ));
+        assert!(!crate::telemetry_sample_allowed_for_state(
+            state.consent_generation,
+            false,
+            8
+        ));
+        assert!(!crate::telemetry_sample_allowed_for_state(
+            state.consent_generation,
+            true,
+            9
+        ));
+    }
 
     #[test]
     fn successful_and_dropped_gateway_stages_have_bounded_outcomes() {

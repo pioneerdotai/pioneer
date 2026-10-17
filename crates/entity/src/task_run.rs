@@ -36,6 +36,8 @@ pub struct Model {
     pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(has_many)]
     pub compaction_task_outputs: HasMany<super::compaction_task_output::Entity>,
+    #[sea_orm(has_many)]
+    pub task_run_reads: HasMany<super::task_run_read::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -768,7 +768,8 @@
       "enum": [
         "native",
         "codex_cli",
-        "claude_cli"
+        "claude_cli",
+        "opencode_cli"
       ]
     },
     "TurnSecurityParentCapSnapshot": {

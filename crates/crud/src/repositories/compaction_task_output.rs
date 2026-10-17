@@ -938,18 +938,26 @@ pub(crate) async fn compaction_delivered_output_page<C: ConnectionTrait>(
     let (selected_turn, high_water) = if let Some(turn) = &cursor.active_turn {
         (turn.clone(), cursor.event_high_water)
     } else {
-        let row = DeliveryTurnRow::find_by_statement(sqlite_specific_sql(
-            DELIVERY_TURN_SQL,
-            [
-                workspace.into(),
-                thread.into(),
-                cursor.after_turn.clone().into(),
-                fence.turn_id.clone().into(),
-                fence.turn_order.into(),
-            ],
-        ))
-        .one(db)
-        .await?;
+        let mut turn_sql = DELIVERY_TURN_SQL.to_owned();
+        let mut values = vec![
+            workspace.into(),
+            thread.into(),
+            cursor.after_turn.clone().into(),
+            fence.turn_id.clone().into(),
+            fence.turn_order.into(),
+        ];
+        if let Some(before) = fence.before {
+            let timestamp =
+                super::compaction_history::HISTORY_WHOLE_SECOND_SQL.replace("?", "t.created_at");
+            turn_sql = turn_sql.replace(
+                "  AND d.status=",
+                &format!("  AND {timestamp}<? AND d.status="),
+            );
+            values.push(before.timestamp().into());
+        }
+        let row = DeliveryTurnRow::find_by_statement(sqlite_specific_sql(&turn_sql, values))
+            .one(db)
+            .await?;
         let Some(row) = row else {
             page.done = true;
             return Ok(page);
@@ -964,11 +972,19 @@ pub(crate) async fn compaction_delivered_output_page<C: ConnectionTrait>(
         };
         return Ok(page);
     };
-    let quantum = if cursor.after_sequence.is_some() {
+    let mut quantum = if cursor.after_sequence.is_some() {
         DELIVERY_EVENT_QUANTUM_SQL.to_owned()
     } else {
         DELIVERY_EVENT_QUANTUM_SQL.replace(" AND e.sequence>?", "")
     };
+    if fence.before.is_some() {
+        let timestamp =
+            super::compaction_history::HISTORY_WHOLE_SECOND_SQL.replace("?", "e.created_at");
+        quantum = quantum.replace(
+            "AND r.capture_order<=?",
+            &format!("AND r.capture_order<=? AND {timestamp}<?"),
+        );
+    }
     let sql = quantum + DELIVERY_BINDINGS_SQL;
     let mut values = vec![
         selected_turn.clone().into(),
@@ -979,6 +995,9 @@ pub(crate) async fn compaction_delivered_output_page<C: ConnectionTrait>(
         values.push(sequence.into());
     }
     values.extend([high_water.into(), fence.event_order.into()]);
+    if let Some(before) = fence.before {
+        values.push(before.timestamp().into());
+    }
     values.extend(delivery_binding_values(workspace));
     let rows = DeliveredOutputRow::find_by_statement(sqlite_specific_sql(&sql, values))
         .all(db)

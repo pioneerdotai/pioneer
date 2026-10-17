@@ -100,7 +100,7 @@ pub use output_policy::{
     mcp_output_policy, model_only_metadata_policy, shell_output_policy, web_fetch_output_policy,
     web_search_output_policy,
 };
-pub use output_projection::{ToolProjectionInput, project_tool_result};
+pub use output_projection::{ToolProjectionInput, bounded_summary_for_chars, project_tool_result};
 pub use permissions::{
     PermissionActionKind, PermissionApprovalBroker, PermissionApprovalResolution,
     PermissionDecision, PermissionDecisionReason, PermissionEvaluationContext, PermissionIntent,

@@ -747,6 +747,7 @@ impl AgentPresentationSnapshot {
     /// committed with the action.
     pub fn to_turn_author_snapshot(&self) -> crate::TurnAuthorSnapshot {
         crate::TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::AgentExecution(self.agent_execution_id.clone()),
             display_name: self.display_name.clone(),
             nickname: self.nickname.clone(),

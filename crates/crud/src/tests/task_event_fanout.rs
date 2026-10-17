@@ -1679,3 +1679,77 @@ async fn late_budget_result_cannot_undo_prefix_progress_or_real_error_bookkeepin
         );
     }
 }
+
+#[tokio::test]
+async fn dispatch_claim_commits_starting_activity_event_once_and_rolls_back_together() {
+    let store = store().await;
+    let task = created(&store, "activity-task").await;
+    let mut run = sample_task_run(task.created_at);
+    run.task_id = task.id.clone();
+    run.trigger_id = None;
+    store
+        .append_task_event(
+            TaskEventPayload::RunCreated {
+                run: run.clone(),
+                agent_spec: None,
+            },
+            task.created_at,
+        )
+        .await
+        .unwrap();
+    // Inject failure into the durable event write: the preceding Starting claim
+    // must roll back with it, retaining a claimable Queued run.
+    store
+        .connection
+        .execute_unprepared(
+            "CREATE TRIGGER reject_starting BEFORE INSERT ON task_event
+        WHEN json_extract(NEW.payload_json, '$.kind') = 'run_starting'
+        BEGIN SELECT RAISE(ABORT, 'injected activity event failure'); END;",
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .claim_task_run_for_dispatch_with_event(&run.id, task.created_at + 1)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store.get_task_run(&run.id).await.unwrap().unwrap().status,
+        TaskRunStatus::Queued
+    );
+    store
+        .connection
+        .execute_unprepared("DROP TRIGGER reject_starting")
+        .await
+        .unwrap();
+    let (claimed, event) = store
+        .claim_task_run_for_dispatch_with_event(&run.id, task.created_at + 2)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.status, TaskRunStatus::Starting);
+    assert!(matches!(
+        event.payload,
+        TaskEventPayload::RunStarting { .. }
+    ));
+    assert_eq!(
+        event.workspace_id.as_deref(),
+        Some(task.workspace_id.as_str())
+    );
+    assert_eq!(
+        row(&store, &task.id).await.unwrap().newest_sequence,
+        event.sequence
+    );
+    assert!(
+        store
+            .claim_task_run_for_dispatch_with_event(&run.id, task.created_at + 3)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        row(&store, &task.id).await.unwrap().newest_sequence,
+        event.sequence
+    );
+}

@@ -136,6 +136,10 @@ pub(crate) fn cli_runtime_native_skills_root(
             .shadow_home_path
             .as_deref()
             .unwrap_or(runtime.home_path.as_str()),
+        pioneer_protocol::CLIAgentRuntimeKind::OpenCode => runtime
+            .shadow_home_path
+            .as_deref()
+            .unwrap_or(runtime.home_path.as_str()),
     };
     let expanded = pioneer_cli_agent_runtime::process::expand_home_path(configured_root, None)?;
     normalized_destination(&expanded.join("skills"))
@@ -173,6 +177,7 @@ pub(crate) fn build_cli_runtime_skill_install_plans(
                 pioneer_protocol::CLIAgentRuntimeKind::Codex => "codex",
                 pioneer_protocol::CLIAgentRuntimeKind::Claude => "claude",
                 pioneer_protocol::CLIAgentRuntimeKind::Acp => "acp",
+                pioneer_protocol::CLIAgentRuntimeKind::OpenCode => "opencode",
             }
             .to_owned(),
             install_name,
@@ -201,6 +206,7 @@ pub(crate) fn restore_cli_runtime_selected_skills(
         pioneer_protocol::CLIAgentRuntimeKind::Codex => "codex",
         pioneer_protocol::CLIAgentRuntimeKind::Claude => "claude",
         pioneer_protocol::CLIAgentRuntimeKind::Acp => "acp",
+        pioneer_protocol::CLIAgentRuntimeKind::OpenCode => "opencode",
     };
     let native_skills_root = cli_runtime_native_skills_root(runtime, runtime_kind)?;
     let receipt = read_external_runtime_receipt(receipt_path)?;
@@ -585,7 +591,7 @@ pub(crate) async fn install_one_cli_runtime_skill(
     })
 }
 
-pub(crate) fn prepend_codex_installed_skill_items(
+pub(crate) fn prepend_installed_skill_items(
     installed: &[CliRuntimeSkillInstallResult],
     mapping: &mut pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputMapping,
 ) {
@@ -882,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn user_controlled_system_browser_reaches_codex_and_claude_install_plans() {
+    fn user_controlled_system_browser_reaches_all_cli_runtime_install_plans() {
         use pioneer_config::GatewayCliAgentRuntimeKindConfig;
         use pioneer_protocol::CLIAgentRuntimeKind;
 
@@ -908,6 +914,19 @@ mod tests {
                     Some(
                         temp.path()
                             .join("claude-shadow")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                ),
+            ),
+            (
+                CLIAgentRuntimeKind::OpenCode,
+                runtime_instance(
+                    GatewayCliAgentRuntimeKindConfig::OpenCode,
+                    temp.path().join("opencode").to_string_lossy().into_owned(),
+                    Some(
+                        temp.path()
+                            .join("opencode-shadow")
                             .to_string_lossy()
                             .into_owned(),
                     ),
@@ -971,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_runtime_skill_destination_plan_uses_codex_shared_and_claude_effective_homes() {
+    fn cli_runtime_skill_destination_plan_uses_runtime_specific_effective_homes() {
         use pioneer_config::GatewayCliAgentRuntimeKindConfig;
         use pioneer_protocol::CLIAgentRuntimeKind;
 
@@ -1014,6 +1033,26 @@ mod tests {
         .unwrap();
         assert_eq!(plans[0].native_skills_root, claude_shadow.join("skills"));
         assert_eq!(plans[0].destination, claude_shadow.join("skills/my-skill"));
+
+        let opencode_home = temp.path().join("opencode-home");
+        let opencode_shadow = temp.path().join("opencode-effective");
+        let opencode = runtime_instance(
+            GatewayCliAgentRuntimeKindConfig::OpenCode,
+            opencode_home.to_string_lossy().into_owned(),
+            Some(opencode_shadow.to_string_lossy().into_owned()),
+        );
+        let plans = build_cli_runtime_skill_install_plans(
+            &opencode,
+            CLIAgentRuntimeKind::OpenCode,
+            &resolved,
+            &receipt,
+        )
+        .unwrap();
+        assert_eq!(plans[0].native_skills_root, opencode_shadow.join("skills"));
+        assert_eq!(
+            plans[0].destination,
+            opencode_shadow.join("skills/my-skill")
+        );
     }
 
     #[test]
@@ -1058,6 +1097,23 @@ mod tests {
         assert_eq!(
             claude_plans[0].native_skills_root,
             home.join(".claude/skills")
+        );
+
+        let opencode = runtime_instance(
+            GatewayCliAgentRuntimeKindConfig::OpenCode,
+            "~/.config/opencode".to_owned(),
+            None,
+        );
+        let opencode_plans = build_cli_runtime_skill_install_plans(
+            &opencode,
+            CLIAgentRuntimeKind::OpenCode,
+            &selected,
+            &receipt,
+        )
+        .unwrap();
+        assert_eq!(
+            opencode_plans[0].native_skills_root,
+            home.join(".config/opencode/skills")
         );
     }
 
@@ -1190,7 +1246,7 @@ mod tests {
             diagnostics: Vec::new(),
         };
         let before = mapping.clone();
-        prepend_codex_installed_skill_items(&[], &mut mapping);
+        prepend_installed_skill_items(&[], &mut mapping);
         assert_eq!(mapping, before);
     }
 
@@ -1204,7 +1260,7 @@ mod tests {
             ],
             diagnostics: Vec::new(),
         };
-        prepend_codex_installed_skill_items(
+        prepend_installed_skill_items(
             &[
                 installed_skill("pdf", "/native/skills/pdf"),
                 installed_skill("slides", "/native/skills/slides"),
@@ -1260,7 +1316,7 @@ mod tests {
             diagnostics: Vec::new(),
         };
 
-        prepend_codex_installed_skill_items(&[installed], &mut mapping);
+        prepend_installed_skill_items(&[installed], &mut mapping);
 
         assert_eq!(
             mapping.input,

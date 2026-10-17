@@ -1,4 +1,6 @@
+mod blob_mutation;
 pub mod blob_store;
+pub use blob_mutation::ArtifactBlobMutationGuard;
 pub mod error;
 pub mod gc;
 pub mod ids;
@@ -57,3 +59,5 @@ pub use tools::{
     ArtifactToolNotificationSink, ArtifactToolState, NoopArtifactToolNotificationSink,
     PreparedArtifactOutput, PreparedArtifactOutputStatus, artifact_tool_specs,
 };
+
+pub use service::HtmlPreviewMaintenanceProgress;

@@ -1722,6 +1722,9 @@ impl TaskAgentExecutor {
                     pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude => {
                         CLIAgentRuntimeKind::Claude
                     }
+                    pioneer_config::GatewayCliAgentRuntimeKindConfig::OpenCode => {
+                        CLIAgentRuntimeKind::OpenCode
+                    }
                 };
                 (
                     Some((runtime_instance_id.clone(), runtime_kind)),
@@ -2713,6 +2716,7 @@ impl TaskAgentExecutor {
                 &runtime_environment,
                 history.as_slice(),
                 &mut agent_skill_overlay,
+                None,
             )
             .await
         {
@@ -3728,6 +3732,7 @@ impl TaskAgentExecutor {
                 &runtime_environment,
                 history.as_slice(),
                 &mut agent_skill_overlay,
+                None,
             )
             .await
         {
@@ -3958,6 +3963,7 @@ impl TaskAgentExecutor {
                         "codex" => CLIAgentRuntimeKind::Codex,
                         "claude" => CLIAgentRuntimeKind::Claude,
                         "acp" => CLIAgentRuntimeKind::Acp,
+                        "opencode" => CLIAgentRuntimeKind::OpenCode,
                         _ => {
                             return Err(anyhow!(
                                 "unknown CLI runtime kind `{}` during task recovery",
@@ -5363,6 +5369,7 @@ impl TaskAgentExecutor {
                                         CLIAgentRuntimeKind::Codex => "codex",
                                         CLIAgentRuntimeKind::Claude => "claude",
                                         pioneer_protocol::CLIAgentRuntimeKind::Acp => "acp",
+                                        CLIAgentRuntimeKind::OpenCode => "opencode",
                                     } => {}
                         (None, None) => {}
                         _ => bail!(
@@ -5928,6 +5935,7 @@ impl TaskAgentExecutor {
                 &runtime_environment,
                 history.as_slice(),
                 &mut agent_skill_overlay,
+                None,
             )
             .await
         {
@@ -7529,6 +7537,7 @@ mod prepared_snapshot_tests {
             version: imported.sources[0].version.clone(),
         };
         let record = FrozenImportRecord {
+            preview_archive: None,
             message_ordinal: 2,
             source_thread: "parent".into(),
             source: source.clone(),
@@ -7908,6 +7917,7 @@ mod prepared_snapshot_tests {
                 &std::collections::HashMap::new(),
                 &history,
                 &[],
+                None,
             )
             .await
             .unwrap();
@@ -8405,7 +8415,7 @@ async fn ensure_task_run_occurrence_anchor(
             completed.thread_id.as_str(),
             completed.turn_id.as_str(),
             &completed.item,
-            None,
+            Some("completed"),
         )
         .await;
     Ok(())
@@ -9260,6 +9270,9 @@ async fn resolved_task_execution_turn_settings(
                 pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude => {
                     CLIAgentRuntimeKind::Claude
                 }
+                pioneer_config::GatewayCliAgentRuntimeKindConfig::OpenCode => {
+                    CLIAgentRuntimeKind::OpenCode
+                }
             };
             (
                 AgentExecutionBackend::CLIAgentRuntime {
@@ -9454,6 +9467,11 @@ async fn resolve_task_child_cli_execution_security_snapshot(
             }
             CLIAgentRuntimeKind::Claude => {
                 crate::turn_security::TurnSecurityResolverExecutionBackend::ClaudeCli {
+                    runtime_id: runtime_id.to_owned(),
+                }
+            }
+            CLIAgentRuntimeKind::OpenCode => {
+                crate::turn_security::TurnSecurityResolverExecutionBackend::OpenCodeCli {
                     runtime_id: runtime_id.to_owned(),
                 }
             }
@@ -11950,6 +11968,11 @@ mod tests {
             .upsert_task_run_turn(execution.clone())
             .await
             .expect("source execution provenance");
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES (?,?,'completed','conversation','scheduled_task',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            [execution.run_id.clone().into(), lineage.parent_thread_id.clone().into()],
+        )).await.expect("canonical delivery destination Turn");
         let final_source = pioneer_protocol::TurnItem::AgentMessage {
             id: "source-final".into(),
             text: "Final text".into(),
@@ -11963,7 +11986,7 @@ mod tests {
                 &execution.run_id,
                 pioneer_protocol::TurnItem::AgentMessage {
                     id: pioneer_protocol::task_delivery_result_item_id("html-delivery"),
-                    text: "Final text".into(),
+                    text: String::new(),
                     markdown: None,
                     markdown_version: None,
                     phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
@@ -11976,6 +11999,7 @@ mod tests {
                 turn_id: Set(turn.clone()),
                 item_id: Set(item.item_id().into()),
                 item_type: Set("agent_message".into()),
+                status: Set(Some("completed".into())),
                 payload: Set(serde_json::to_string(&item).expect("item payload")),
                 active_attempt_number: Set(0),
                 created_at: Set(now),
@@ -12059,6 +12083,50 @@ mod tests {
             .await
             .expect("legacy replay");
         assert_eq!(restored.len(), 2);
+        for (turn_id, item_id) in [
+            (&execution.turn_id, "source-final".to_owned()),
+            (&execution.run_id, item_id.clone()),
+        ] {
+            let (thread_id, _) = processor
+                .crud_store
+                .get_turn_location(turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let count = || pioneer_crud::count_unread_message_blocks(&db, &thread_id, "reader", "");
+            let before = count().await.unwrap();
+            pioneer_crud::upsert_thread_timeline_block(
+                &db,
+                pioneer_crud::ThreadTimelineBlockRecord {
+                    block_id: pioneer_crud::assistant_block_id(turn_id, &item_id),
+                    workspace_id: task.workspace_id.clone(),
+                    thread_id: thread_id.clone(),
+                    turn_id: Some(turn_id.clone()),
+                    block_kind: pioneer_crud::BLOCK_KIND_ASSISTANT_MESSAGE.into(),
+                    sort_key: "html-count-fixture".into(),
+                    source_kind: Some("turn_item".into()),
+                    source_key: Some(item_id),
+                    started_at: Some(now),
+                    completed_at: Some(now),
+                    metadata_json: "{}".into(),
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                count().await.unwrap(),
+                before + 1,
+                "HTML-only delivery and mixed source each count once despite multiple HTML publications"
+            );
+            assert_eq!(
+                count().await.unwrap(),
+                before + 1,
+                "repeated projections do not add unread units"
+            );
+        }
+
         assert!(
             restored
                 .iter()

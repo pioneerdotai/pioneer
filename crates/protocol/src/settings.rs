@@ -540,6 +540,7 @@ impl Default for GatewayCliRuntimeSettings {
             instances: vec![
                 GatewayCliRuntimeInstanceSettings::default_codex(),
                 GatewayCliRuntimeInstanceSettings::default_claude(),
+                GatewayCliRuntimeInstanceSettings::default_opencode(),
             ],
         }
     }
@@ -600,6 +601,22 @@ impl GatewayCliRuntimeInstanceSettings {
             enabled: true,
             binary_path: "claude".to_owned(),
             home_path: "~/.claude".to_owned(),
+            shadow_home_path: None,
+            args: Vec::new(),
+            env_from: Default::default(),
+        }
+    }
+
+    pub fn default_opencode() -> Self {
+        Self {
+            compaction_model: None,
+            id: "opencode".to_owned(),
+            kind: CLIAgentRuntimeKind::OpenCode,
+            display_name: "OpenCode".to_owned(),
+            nickname: "opencode".to_owned(),
+            enabled: true,
+            binary_path: "opencode".to_owned(),
+            home_path: "~/.config/opencode".to_owned(),
             shadow_home_path: None,
             args: Vec::new(),
             env_from: Default::default(),
@@ -938,7 +955,7 @@ mod tests {
     fn cli_runtime_settings_default_to_enabled_cli_runtimes() {
         let settings = GatewayCliRuntimeSettings::default();
 
-        assert_eq!(settings.instances.len(), 2);
+        assert_eq!(settings.instances.len(), 3);
         assert_eq!(settings.instances[0].id, "codex");
         assert_eq!(settings.instances[0].kind, CLIAgentRuntimeKind::Codex);
         assert_eq!(settings.instances[0].display_name, "Codex");
@@ -955,6 +972,10 @@ mod tests {
         assert_eq!(settings.instances[1].binary_path, "claude");
         assert_eq!(settings.instances[1].home_path, "~/.claude");
         assert!(settings.instances[1].shadow_home_path.is_none());
+        assert_eq!(
+            settings.instances[2],
+            GatewayCliRuntimeInstanceSettings::default_opencode()
+        );
     }
 
     #[test]

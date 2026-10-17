@@ -14,6 +14,7 @@ use pioneer_client::{
 };
 use pioneer_desktop_foundation::ClientBindingRegistrar;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
+pub use view::format_local_timestamp;
 
 pub(crate) struct ThreadArtifactsView {
     client: Arc<ClientCore>,

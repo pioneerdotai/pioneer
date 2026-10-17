@@ -27,6 +27,12 @@ impl MessageProcessor {
         db_status: Option<&str>,
     ) {
         let classification = classify_turn_item_with_db_status(item, db_status);
+        if classification.placement == ProjectionPlacement::TopLevelAssistantMessage
+            && db_status == Some("completed")
+        {
+            self.notify_thread_tree_changed(workspace_id.to_owned())
+                .await;
+        }
         let item_id = item.item_id();
         let detached_task_run = self.is_detached_task_run_turn(thread_id, turn_id).await;
         let mut changed_block_ids = Vec::new();

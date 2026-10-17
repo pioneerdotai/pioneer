@@ -22,7 +22,8 @@ use pioneer_protocol::{
     MemoryRememberParams, MemorySearchParams, SkillListParams, SkillsHealthParams,
     SkillsInstallParams, SkillsPackInstallParams, SkillsPackUninstallParams,
     SkillsPackUpdateParams, SkillsPolicyListParams, SkillsPolicySetParams, SkillsUninstallParams,
-    SkillsUpdateParams, TaskAcceptParams, TaskAgendaParams, TaskCancelParams, TaskCreateParams,
+    SkillsUpdateParams, TaskAcceptParams, TaskAgendaParams, TaskCancelParams,
+    TaskCompletionInboxEntryParams, TaskCompletionInboxListParams, TaskCreateParams,
     TaskDeliveriesParams, TaskDetachParams, TaskEventsParams, TaskGetParams, TaskListParams,
     TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
     TaskTreeParams as TaskTreeTaskParams, TaskUserNotificationAcknowledgeParams,
@@ -1535,6 +1536,9 @@ impl MessageProcessor {
                         | methods::CLI_RUNTIME_REFRESH
                         | methods::CLI_RUNTIME_LIST_MODELS
                         | methods::MCP_LIST
+                        | methods::TASK_COMPLETION_INBOX_LIST
+                        | methods::TASK_COMPLETION_INBOX_GET
+                        | methods::TASK_COMPLETION_INBOX_READ
                         | methods::TASK_USER_NOTIFICATION_LIST
                         | methods::TASK_USER_NOTIFICATION_ACKNOWLEDGE
                 ) =>
@@ -1591,6 +1595,16 @@ impl MessageProcessor {
                     }
                     methods::MCP_LIST => {
                         serde_json::from_value::<McpListParams>(params)
+                            .map_err(|_| invalid_params())?
+                            .workspace_id
+                    }
+                    methods::TASK_COMPLETION_INBOX_LIST => {
+                        serde_json::from_value::<TaskCompletionInboxListParams>(params)
+                            .map_err(|_| invalid_params())?
+                            .workspace_id
+                    }
+                    methods::TASK_COMPLETION_INBOX_GET | methods::TASK_COMPLETION_INBOX_READ => {
+                        serde_json::from_value::<TaskCompletionInboxEntryParams>(params)
                             .map_err(|_| invalid_params())?
                             .workspace_id
                     }
@@ -7123,6 +7137,58 @@ impl MessageProcessor {
                                         "invalid params for `{}`: {error}",
                                         methods::TASK_DELIVERIES
                                     ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::TASK_COMPLETION_INBOX_LIST => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<TaskCompletionInboxListParams>(params_value) {
+                        Ok(params) => {
+                            self.task_completion_inbox_list(
+                                &context,
+                                admission.workspace().expect("inbox workspace admission"),
+                                request.id,
+                                params,
+                            )
+                            .await
+                        }
+                        Err(_) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    "invalid task inbox params",
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::TASK_COMPLETION_INBOX_GET | methods::TASK_COMPLETION_INBOX_READ => {
+                    let mark_read = request.method == methods::TASK_COMPLETION_INBOX_READ;
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<TaskCompletionInboxEntryParams>(params_value) {
+                        Ok(params) => {
+                            self.task_completion_inbox_entry(
+                                &context,
+                                admission.workspace().expect("inbox workspace admission"),
+                                request.id,
+                                params,
+                                mark_read,
+                            )
+                            .await
+                        }
+                        Err(_) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    "invalid task inbox params",
                                 ),
                             )
                             .await;

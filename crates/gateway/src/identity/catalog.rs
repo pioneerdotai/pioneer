@@ -22,6 +22,9 @@ pub(crate) fn from_effective_settings(
                     pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex => "codex".to_owned(),
                     pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude => "claude".to_owned(),
                     pioneer_config::GatewayCliAgentRuntimeKindConfig::Acp => "acp".to_owned(),
+                    pioneer_config::GatewayCliAgentRuntimeKindConfig::OpenCode => {
+                        "opencode".to_owned()
+                    }
                 },
                 display_name: instance.display_name,
                 enabled: instance.enabled,

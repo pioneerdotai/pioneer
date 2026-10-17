@@ -50,6 +50,7 @@ impl ProviderCatalogView {
             self.active_workspace_id().unwrap_or("no-workspace")
         );
         let is_connected = self.gateway.connection_state == GatewayConnectionState::Connected;
+        let settings_available = self.settings_controls_available();
         let configured_provider_names = self.providers.configured_names().clone();
         let cli_runtimes = self.providers.cli_runtimes().to_vec();
         let expanded_cli_runtime_ids = self.providers.expanded_cli_runtime_ids().clone();
@@ -109,7 +110,7 @@ impl ProviderCatalogView {
                         h_flex()
                             .gap_2()
                             .items_center()
-                            .when(self.providers.cli_loading(), |this| {
+                            .when(self.providers.cli_loading() || self.gateway.settings_loading, |this| {
                                 this.child(
                                     div()
                                         .text_xs()
@@ -117,13 +118,14 @@ impl ProviderCatalogView {
                                         .child(t!("providers.cli.refreshing").to_string()),
                                 )
                             })
+                            .child(self.refresh_button.clone())
                             .child(
                                 Button::new(self.ui_id("toolbar", "add-runtime"))
                                     .small()
                                     .ghost()
                                     .icon(IconName::Plus)
                                     .tooltip(t!("providers.cli.action.add").to_string())
-                                    .disabled(!is_connected)
+                                    .disabled(!settings_available)
                                     .dropdown_menu_with_anchor(Anchor::TopRight, {
                                         let desktop_entity = desktop_entity.clone();
                                         move |menu, _, _| {
@@ -247,7 +249,8 @@ impl ProviderCatalogView {
                                     cli_error,
                                     cli_login_message,
                                     is_connected,
-                                    self.providers.cli_loading(),
+                                    settings_available,
+                                    self.providers.cli_loading() || self.gateway.settings_loading,
                                     &expanded_cli_runtime_ids,
                                     cli_runtime_input_scope_key.as_str(),
                                     &self.inline_inputs,
@@ -388,6 +391,7 @@ impl ProviderCatalogView {
         error: Option<String>,
         login_message: Option<String>,
         is_connected: bool,
+        settings_available: bool,
         is_loading: bool,
         expanded_runtime_ids: &HashSet<String>,
         input_scope_key: &str,
@@ -464,6 +468,7 @@ impl ProviderCatalogView {
                                     runtime,
                                     expanded_runtime_ids.contains(runtime.runtime_id.as_str()),
                                     is_connected,
+                                    settings_available,
                                     is_loading,
                                     input_scope_key,
                                     inline_inputs,
@@ -483,6 +488,7 @@ impl ProviderCatalogView {
         runtime: &RuntimeSummary,
         expanded: bool,
         is_connected: bool,
+        settings_available: bool,
         is_loading: bool,
         input_scope_key: &str,
         inline_inputs: &std::collections::BTreeMap<
@@ -586,7 +592,7 @@ impl ProviderCatalogView {
                     .separator()
                     .item(
                         PopupMenuItem::new(t!("providers.cli.action.duplicate").to_string())
-                            .disabled(!is_connected)
+                            .disabled(!settings_available)
                             .on_click({
                                 let runtime_id = runtime_id.clone();
                                 let desktop_entity = desktop_entity.clone();
@@ -757,7 +763,7 @@ impl ProviderCatalogView {
                             .child(
                                 Switch::new(SharedString::from(format!("providers:{input_scope_key}:runtimes:{runtime_id}:enabled")))
                                     .checked(runtime.enabled)
-                                    .disabled(!is_connected)
+                                    .disabled(!settings_available)
                                     .on_click({
                                         let runtime_id = runtime_id.clone();
                                         let desktop_entity = desktop_entity.clone();
@@ -800,7 +806,7 @@ impl ProviderCatalogView {
                                                 runtime,
                                                 CLIRuntimeProviderDraftField::DisplayName,
                                             ),
-                                            is_connected,
+                                            settings_available,
                                             true,
                                             input_scope_key,
                                             inline_inputs,
@@ -817,7 +823,7 @@ impl ProviderCatalogView {
                                                 runtime,
                                                 CLIRuntimeProviderDraftField::BinaryPath,
                                             ),
-                                            is_connected,
+                                            settings_available,
                                             true,
                                             input_scope_key,
                                             inline_inputs,
@@ -835,7 +841,7 @@ impl ProviderCatalogView {
                                                 runtime,
                                                 CLIRuntimeProviderDraftField::HomePath,
                                             ),
-                                            is_connected,
+                                            settings_available,
                                             true,
                                             input_scope_key,
                                             inline_inputs,
@@ -853,7 +859,7 @@ impl ProviderCatalogView {
                                                     .to_string(),
                                             ),
                                             t!("providers.cli.value.disabled").to_string(),
-                                            is_connected,
+                                            settings_available,
                                             true,
                                             input_scope_key,
                                             inline_inputs,
@@ -974,6 +980,7 @@ fn cli_runtime_provider_logo(kind: CLIAgentRuntimeKind) -> (&'static str, &'stat
         CLIAgentRuntimeKind::Codex => ("openai", "logos/providers/openai.svg"),
         CLIAgentRuntimeKind::Claude => ("claude", "logos/providers/claude.svg"),
         CLIAgentRuntimeKind::Acp => ("acp", "icons/terminal.svg"),
+        CLIAgentRuntimeKind::OpenCode => ("opencode", "logos/providers/opencode.svg"),
     }
 }
 
@@ -1028,6 +1035,7 @@ fn cli_runtime_default_display_order(runtime_id: &str) -> usize {
     match runtime_id {
         "codex" => 0,
         "claude" => 1,
+        "opencode" => 2,
         _ => usize::MAX,
     }
 }

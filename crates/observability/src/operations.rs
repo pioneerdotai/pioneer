@@ -11,6 +11,7 @@ pub enum GatewayCliRuntimeKind {
     Codex,
     Claude,
     Acp,
+    OpenCode,
 }
 
 impl GatewayCliRuntimeKind {
@@ -19,6 +20,7 @@ impl GatewayCliRuntimeKind {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Acp => "acp",
+            Self::OpenCode => "opencode",
         }
     }
 }

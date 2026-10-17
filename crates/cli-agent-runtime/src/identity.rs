@@ -128,6 +128,7 @@ impl CliRuntimeAgentBinding {
                 CLIAgentRuntimeKind::Codex => "Codex CLI".to_owned(),
                 CLIAgentRuntimeKind::Claude => "Claude CLI".to_owned(),
                 CLIAgentRuntimeKind::Acp => "ACP agent".to_owned(),
+                CLIAgentRuntimeKind::OpenCode => "OpenCode CLI".to_owned(),
             }),
             source_revision: self.source_revision,
             source_fingerprint: self.source_fingerprint.clone(),
@@ -144,7 +145,9 @@ impl CliRuntimeAgentBinding {
                     AgentExecutionProfileBackend::AcpAgentRuntime { runtime_id },
                 ) => runtime_id == &self.runtime_instance_id,
                 (
-                    CLIAgentRuntimeKind::Codex | CLIAgentRuntimeKind::Claude,
+                    CLIAgentRuntimeKind::Codex
+                    | CLIAgentRuntimeKind::Claude
+                    | CLIAgentRuntimeKind::OpenCode,
                     AgentExecutionProfileBackend::CliRuntime {
                         runtime_instance_id,
                     },
@@ -234,6 +237,7 @@ const fn runtime_kind_name(kind: CLIAgentRuntimeKind) -> &'static str {
         CLIAgentRuntimeKind::Codex => "codex",
         CLIAgentRuntimeKind::Claude => "claude",
         CLIAgentRuntimeKind::Acp => "acp",
+        CLIAgentRuntimeKind::OpenCode => "opencode",
     }
 }
 

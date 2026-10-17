@@ -236,7 +236,11 @@ fn main() {
         let ui_components_stage = startup_for_app
             .stage(pioneer_observability::DesktopStartupStage::UiComponentsInitialize);
         gpui_kit::init(cx);
-        client_runtime::DesktopRuntimeCoordinator::install(cx);
+        pioneer_desktop_task_notifications::init(cx);
+        client_runtime::DesktopRuntimeCoordinator::install_with_startup(
+            Some(startup_for_app.clone()),
+            cx,
+        );
         theme::init(cx);
         menu::init_system_menus(cx);
 

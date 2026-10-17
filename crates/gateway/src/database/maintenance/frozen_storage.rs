@@ -465,4 +465,188 @@ mod tests {
         assert_eq!(pause_after_batch(true), Duration::from_millis(1));
         assert_eq!(pause_after_batch(false), Duration::from_secs(60));
     }
+    #[tokio::test]
+    async fn html_preview_index_uses_scoped_readers_and_serial_writer_and_cancels_admission() {
+        let (directory, store, observer) = fixture().await;
+        use pioneer_entity::{
+            compaction_frozen_history as history, html_preview_frozen_index as index,
+            html_preview_frozen_result as receipt, html_preview_frozen_turn as preview_turn,
+            html_preview_index_backfill as backfill,
+        };
+        use sea_orm::sea_query::Expr;
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
+        let maintenance = store.with_maintenance_access();
+        let db = maintenance.database_connection();
+        let tx = db.begin().await.unwrap();
+        let fk = tx
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "PRAGMA foreign_keys",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fk.try_get::<i64>("", "foreign_keys").unwrap(), 0);
+        let seed = backfill::Entity::find_by_id(1_i64)
+            .one(&tx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((seed.complete, seed.inputs_complete), (0, 0));
+        let marker = index::Entity::find_by_id("metadata-0000")
+            .one(&tx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                marker.ready,
+                marker.expired,
+                marker.next_ordinal,
+                marker.complete,
+                marker.unknown
+            ),
+            (0, 0, 0, 0, 0)
+        );
+        // No cascade is available: header triggers must make derived markers
+        // conservative on the actual FK OFF writer, with rollback preserving both.
+        history::Entity::update_many()
+            .col_expr(history::Column::Expired, Expr::val(1))
+            .filter(history::Column::Id.eq("metadata-0000"))
+            .exec(&tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            index::Entity::find_by_id("metadata-0000")
+                .one(&tx)
+                .await
+                .unwrap()
+                .unwrap()
+                .expired,
+            1
+        );
+        preview_turn::Entity::insert(preview_turn::ActiveModel {
+            manifest_id: Set("metadata-0000".into()),
+            turn_id: Set("preview-fixture".into()),
+        })
+        .exec(&tx)
+        .await
+        .unwrap();
+        receipt::Entity::insert(receipt::ActiveModel {
+            manifest_id: Set("metadata-0000".into()),
+            ordinal: Set(0),
+            reference_json: Set("{}".into()),
+            turn_id: Set("preview-fixture".into()),
+            source_id: Set("preview-source".into()),
+            source_version: Set("revision:1".into()),
+            archive_wire_sha256: Set(None),
+        })
+        .exec(&tx)
+        .await
+        .unwrap();
+        assert!(
+            preview_turn::Entity::find_by_id((
+                "metadata-0000".to_owned(),
+                "preview-fixture".to_owned()
+            ))
+            .one(&tx)
+            .await
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            receipt::Entity::find_by_id(("metadata-0000".to_owned(), 0_i64))
+                .one(&tx)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            index::Entity::delete_by_id("metadata-0000")
+                .exec(&tx)
+                .await
+                .is_err()
+        );
+        tx.rollback().await.unwrap();
+        assert_eq!(
+            index::Entity::find_by_id("metadata-0000")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .expired,
+            0
+        );
+        assert!(
+            preview_turn::Entity::find_by_id((
+                "metadata-0000".to_owned(),
+                "preview-fixture".to_owned()
+            ))
+            .one(&db)
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            receipt::Entity::find_by_id(("metadata-0000".to_owned(), 0_i64))
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let service = Arc::new(pioneer_artifacts::ArtifactService::new(
+            Arc::new(store.clone()),
+            Arc::new(pioneer_artifacts::LocalArtifactBlobStore::new(
+                directory.path(),
+            )),
+        ));
+        let mut progress = pioneer_artifacts::HtmlPreviewMaintenanceProgress::default();
+        service
+            .html_preview_maintenance_quantum(&mut progress)
+            .await
+            .unwrap();
+        assert!(observer.reads.lock().unwrap().iter().any(|e| matches!(
+            e,
+            SqliteReadEvent::OperationFinished {
+                class: SqliteReadClass::Maintenance,
+                ..
+            }
+        )));
+        assert!(observer.writes.lock().unwrap().iter().any(|e| matches!(
+            e,
+            SqliteWriteEvent::Acquired {
+                class: SqliteWriteClass::Maintenance,
+                ..
+            }
+        )));
+        assert!(
+            store
+                .database_connection()
+                .reader_query_only_enabled()
+                .await
+                .unwrap()
+        );
+        let held = store.database_connection().begin_read().await.unwrap();
+        let cancellation = CancellationToken::new();
+        let worker = tokio::spawn(super::super::html_previews::run(
+            Arc::new(store.clone()),
+            service,
+            cancellation.clone(),
+        ));
+        observer.queued().await;
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(held);
+        assert!(observer.reads.lock().unwrap().iter().any(|e| matches!(
+            e,
+            SqliteReadEvent::AdmissionCancelled {
+                class: SqliteReadClass::Maintenance,
+                queue_depth: 0,
+                ..
+            }
+        )));
+    }
 }

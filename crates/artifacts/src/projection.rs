@@ -157,6 +157,7 @@ async fn create_thumbnail_projection(
         }
     };
 
+    let _mutation_guard = blob_store.acquire_mutation_guard(workspace_id).await?;
     let stored_blob = blob_store
         .put_bytes(workspace_id, ArtifactBlobInput::Bytes(thumbnail.bytes))
         .await?;

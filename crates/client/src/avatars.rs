@@ -32,6 +32,24 @@ use crate::transport::http::{
 const AVATAR_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const AVATAR_CACHE_MAX_FILES: usize = 2_048;
 
+/// Resolve built-in CLI artwork from provider identity and the shell's appearance.
+pub fn cli_runtime_avatar_revision(
+    kind: pioneer_protocol::CLIAgentRuntimeKind,
+    dark: bool,
+) -> &'static str {
+    use pioneer_protocol::{
+        CLAUDE_AGENT_AVATAR_REVISION, CLIAgentRuntimeKind, CODEX_AGENT_AVATAR_REVISION,
+        OPENCODE_AGENT_AVATAR_DARK_REVISION, OPENCODE_AGENT_AVATAR_LIGHT_REVISION,
+    };
+    match kind {
+        CLIAgentRuntimeKind::Codex => CODEX_AGENT_AVATAR_REVISION,
+        CLIAgentRuntimeKind::Claude => CLAUDE_AGENT_AVATAR_REVISION,
+        CLIAgentRuntimeKind::Acp => pioneer_protocol::PIONEER_AGENT_AVATAR_REVISION,
+        CLIAgentRuntimeKind::OpenCode if dark => OPENCODE_AGENT_AVATAR_DARK_REVISION,
+        CLIAgentRuntimeKind::OpenCode => OPENCODE_AGENT_AVATAR_LIGHT_REVISION,
+    }
+}
+
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

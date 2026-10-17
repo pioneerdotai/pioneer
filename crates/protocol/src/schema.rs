@@ -250,7 +250,7 @@ use crate::{
     ThreadParticipantMutationParams, ThreadParticipantSummary,
     ThreadParticipantsChangedNotification, ThreadParticipantsListParams,
     ThreadParticipantsResponse, ThreadPlacement, ThreadReadCursor,
-    ThreadReadCursorChangedNotification, ThreadReadParams, ThreadReadResponse,
+    ThreadReadCursorChangedNotification, ThreadReadParams, ThreadReadPosition, ThreadReadResponse,
     ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse, ThreadStartedNotification,
     ThreadStatus, ThreadTreeChangedNotification, ThreadTreeParams, ThreadTreeResponse,
     ThreadUnreadSummary, ThreadUnsubscribeParams, ThreadUnsubscribeResponse,
@@ -1361,6 +1361,30 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("public_task_agenda_response.json", PublicTaskAgendaResponse),
         schema_doc!("task_deliveries_params.json", TaskDeliveriesParams),
         schema_doc!("task_deliveries_response.json", TaskDeliveriesResponse),
+        schema_doc!(
+            "task_completion_inbox_entry.json",
+            crate::TaskCompletionInboxEntry
+        ),
+        schema_doc!(
+            "task_completion_inbox_list_params.json",
+            crate::TaskCompletionInboxListParams
+        ),
+        schema_doc!(
+            "task_completion_inbox_list_response.json",
+            crate::TaskCompletionInboxListResponse
+        ),
+        schema_doc!(
+            "task_completion_inbox_entry_params.json",
+            crate::TaskCompletionInboxEntryParams
+        ),
+        schema_doc!(
+            "task_completion_inbox_entry_response.json",
+            crate::TaskCompletionInboxEntryResponse
+        ),
+        schema_doc!(
+            "task_completion_inbox_changed_notification.json",
+            crate::TaskCompletionInboxChangedNotification
+        ),
         schema_doc!("task_user_notification.json", TaskUserNotification),
         schema_doc!(
             "task_user_notification_list_params.json",
@@ -1507,6 +1531,7 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("turn_message_edited_event.json", TurnMessageEditedEvent),
         schema_doc!("turn_message_deleted_event.json", TurnMessageDeletedEvent),
         schema_doc!("thread_read_params.json", ThreadReadParams),
+        schema_doc!("thread_read_position.json", ThreadReadPosition),
         schema_doc!("thread_read_cursor.json", ThreadReadCursor),
         schema_doc!("thread_read_response.json", ThreadReadResponse),
         schema_doc!(

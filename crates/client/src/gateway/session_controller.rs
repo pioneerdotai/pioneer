@@ -80,6 +80,58 @@ impl StartupCoordinator {
     }
 }
 
+// First-session diagnostics remain bounded to six stages. This identity is process-local
+// and is never projected/serialized. It prevents later endpoints/flights filling gaps
+// in the initial preparation waterfall.
+#[derive(Clone)]
+pub(crate) struct SessionDiagnosticOwner {
+    endpoint: String,
+    operation_epoch: u64,
+    connection_epoch: Option<u64>,
+    flight: std::sync::Weak<super::session_connection::GatewaySessionConnectionFlight>,
+}
+
+impl PartialEq for SessionDiagnosticOwner {
+    fn eq(&self, other: &Self) -> bool {
+        self.endpoint == other.endpoint
+            && self.operation_epoch == other.operation_epoch
+            && self.connection_epoch == other.connection_epoch
+            && self.flight.ptr_eq(&other.flight)
+    }
+}
+
+/// Local proof of the identity changes made by one terminal operation. Consecutive
+/// mutations must meet exactly; an intervening cancellation invalidates the proof.
+/// This receipt is neither retained by the controller nor published/serialized.
+pub(crate) struct SessionDiagnosticTerminalOutcome {
+    before: SessionDiagnosticOwner,
+    after: SessionDiagnosticOwner,
+    contiguous: bool,
+}
+
+impl SessionDiagnosticTerminalOutcome {
+    pub(crate) fn record(
+        receipt: &mut Option<Self>,
+        before: SessionDiagnosticOwner,
+        after: SessionDiagnosticOwner,
+    ) {
+        if let Some(receipt) = receipt {
+            receipt.contiguous &= receipt.after == before;
+            receipt.after = after;
+        } else {
+            *receipt = Some(Self {
+                before,
+                after,
+                contiguous: true,
+            });
+        }
+    }
+
+    fn proves(&self, before: &SessionDiagnosticOwner, after: &SessionDiagnosticOwner) -> bool {
+        self.contiguous && self.before == *before && self.after == *after
+    }
+}
+
 pub(crate) struct GatewaySessionController {
     pub(crate) endpoints: BTreeMap<String, super::types::GatewayEndpoint>,
     unverified_transport: Option<crate::transport::ws::GatewayWsEvent>,
@@ -93,6 +145,8 @@ pub(crate) struct GatewaySessionController {
     status: Option<GatewayStatusProjection>,
     gateway_error: Option<String>,
     startup: StartupCoordinator,
+    diagnostic_owner: Option<SessionDiagnosticOwner>,
+    diagnostics_closed: bool,
     lifecycles: BTreeMap<String, SessionLifecycle>,
     access_expiries: BTreeMap<String, u64>,
 }
@@ -111,6 +165,8 @@ impl Default for GatewaySessionController {
             status: None,
             gateway_error: None,
             startup: StartupCoordinator::default(),
+            diagnostic_owner: None,
+            diagnostics_closed: false,
             lifecycles: BTreeMap::new(),
             access_expiries: BTreeMap::new(),
         }
@@ -124,14 +180,41 @@ impl crate::core::ClientCore {
         stage: SessionDiagnosticStage,
         operation: impl FnOnce() -> Result<T, E>,
     ) -> Result<T, E> {
+        self.observe_session_stage_with_terminal_outcome(endpoint, stage, |_| operation())
+    }
+
+    pub(super) fn observe_session_stage_with_terminal_outcome<T, E>(
+        &self,
+        endpoint: &str,
+        stage: SessionDiagnosticStage,
+        operation: impl FnOnce(&mut Option<SessionDiagnosticTerminalOutcome>) -> Result<T, E>,
+    ) -> Result<T, E> {
         let started = std::time::Instant::now();
         let observed = {
             let mut owner = self
                 .gateway_session
                 .lock()
                 .expect("Gateway session owner poisoned");
-            if self.is_stopped() || owner.startup.session_diagnostics.contains_key(&stage) {
-                false
+            let identity = owner.diagnostic_identity(endpoint);
+            // A caller can prepare credentials before registering a transport flight.
+            // Adopt that first flight, but never switch an already captured flight.
+            if let Some(first) = owner.diagnostic_owner.as_mut() {
+                if first.endpoint == identity.endpoint
+                    && first.operation_epoch == identity.operation_epoch
+                    && first.connection_epoch.is_none()
+                {
+                    first.connection_epoch = identity.connection_epoch;
+                    first.flight = identity.flight.clone();
+                }
+            } else {
+                owner.diagnostic_owner = Some(identity.clone());
+            }
+            if self.is_stopped()
+                || owner.diagnostics_closed
+                || owner.diagnostic_owner.as_ref() != Some(&identity)
+                || owner.startup.session_diagnostics.contains_key(&stage)
+            {
+                None
             } else {
                 let started_at_unix_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -147,25 +230,45 @@ impl crate::core::ClientCore {
                     },
                 );
                 self.publish_gateway_session(&owner);
-                true
+                Some(identity)
             }
         };
-        let result = operation();
-        if observed {
+        let mut terminal_outcome = None;
+        let result = operation(&mut terminal_outcome);
+        if let Some(identity) = observed {
             let mut owner = self
                 .gateway_session
                 .lock()
                 .expect("Gateway session owner poisoned");
+            let current = owner.diagnostic_identity(endpoint);
+            // Err alone cannot distinguish a terminal self-invalidation from a late
+            // error after external cancellation. Only this operation's exact chain
+            // of mutations may explain the identity change; shutdown always wins.
+            let own_terminal = result.is_err()
+                && terminal_outcome
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.proves(&identity, &current));
+            let cancelled = self.is_stopped() || (current != identity && !own_terminal);
+            if let Some(timing) = owner.startup.session_diagnostics.get_mut(&stage) {
+                timing.duration_ms =
+                    Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+                timing.state = if cancelled {
+                    StartupStageState::Cancelled
+                } else if result.is_ok() {
+                    StartupStageState::Succeeded
+                } else {
+                    StartupStageState::Failed
+                };
+            }
+            // Do not fill a failed transport attempt with a later retry's identity,
+            // or an initial skipped refresh stage with background renewal work.
+            if cancelled
+                || stage == SessionDiagnosticStage::IdentityVerify
+                || (stage == SessionDiagnosticStage::ConnectAttempt && result.is_err())
+            {
+                owner.diagnostics_closed = true;
+            }
             if !self.is_stopped() {
-                if let Some(timing) = owner.startup.session_diagnostics.get_mut(&stage) {
-                    timing.duration_ms =
-                        Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
-                    timing.state = if result.is_ok() {
-                        StartupStageState::Succeeded
-                    } else {
-                        StartupStageState::Failed
-                    };
-                }
                 self.publish_gateway_session(&owner);
             }
         }
@@ -336,6 +439,21 @@ impl GatewaySessionTransition {
 }
 
 impl GatewaySessionController {
+    pub(crate) fn diagnostic_identity(&self, endpoint: &str) -> SessionDiagnosticOwner {
+        SessionDiagnosticOwner {
+            endpoint: endpoint.into(),
+            operation_epoch: self.operation_epoch,
+            connection_epoch: self.connections.get(endpoint).map(|state| state.epoch),
+            // Keeping only a Weak retains identity without extending the flight's work.
+            // Its allocation cannot be reused while this initial capture still exists.
+            flight: self
+                .connections
+                .get(endpoint)
+                .map(|state| state.diagnostic_flight())
+                .unwrap_or_default(),
+        }
+    }
+
     pub(crate) fn stop(&mut self) {
         for connection in self.connections.values_mut() {
             connection.invalidate();
@@ -616,6 +734,113 @@ mod tests {
     use super::super::session_lifecycle::{GatewaySessionMetadata, SessionTerminalReason};
     use super::*;
     use crate::core::{ClientCore, ClientScope};
+
+    #[test]
+    fn session_diagnostics_do_not_change_results_or_collect_later_flights() {
+        let core = ClientCore::new();
+        let first =
+            core.observe_session_stage("first", SessionDiagnosticStage::CredentialsLoad, || {
+                Ok::<_, ()>(11)
+            });
+        assert_eq!(first, Ok(11));
+        let original = core.gateway_session().startup.session_diagnostics.clone();
+        // Repetition still executes, but it must not rewrite the first completion.
+        let repeated =
+            core.observe_session_stage("first", SessionDiagnosticStage::CredentialsLoad, || {
+                Ok::<_, ()>(22)
+            });
+        assert_eq!(repeated, Ok(22));
+        core.observe_session_stage("other", SessionDiagnosticStage::RefreshRequest, || {
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(core.gateway_session().startup.session_diagnostics, original);
+        core.begin_gateway_operation();
+        core.observe_session_stage("first", SessionDiagnosticStage::RefreshRequest, || {
+            Err::<(), _>("unchanged error")
+        })
+        .unwrap_err();
+        assert_eq!(core.gateway_session().startup.session_diagnostics, original);
+    }
+
+    #[test]
+    fn failed_connect_and_completed_identity_close_initial_diagnostic_capture() {
+        for failed_connect in [false, true] {
+            let core = ClientCore::new();
+            if failed_connect {
+                core.observe_session_stage(
+                    "endpoint",
+                    SessionDiagnosticStage::ConnectAttempt,
+                    || Err::<(), _>("synthetic connect failure"),
+                )
+                .unwrap_err();
+            } else {
+                core.observe_session_stage(
+                    "endpoint",
+                    SessionDiagnosticStage::IdentityVerify,
+                    || Ok::<_, ()>(()),
+                )
+                .unwrap();
+            }
+            let original = core.gateway_session().startup.session_diagnostics.clone();
+            let mut ran = false;
+            core.observe_session_stage(
+                "endpoint",
+                SessionDiagnosticStage::RefreshIntentPersist,
+                || {
+                    ran = true;
+                    Ok::<_, ()>(())
+                },
+            )
+            .unwrap();
+            assert!(ran);
+            assert_eq!(core.gateway_session().startup.session_diagnostics, original);
+        }
+    }
+
+    #[test]
+    fn session_diagnostic_cancellation_is_not_an_error_or_success() {
+        let core = ClientCore::new();
+        let result =
+            core.observe_session_stage("endpoint", SessionDiagnosticStage::RefreshRequest, || {
+                core.begin_gateway_operation();
+                Ok::<_, ()>(17)
+            });
+        assert_eq!(result, Ok(17));
+        let session = core.gateway_session();
+        let timing = &session.startup.session_diagnostics[&SessionDiagnosticStage::RefreshRequest];
+        assert_eq!(timing.state, StartupStageState::Cancelled);
+        assert!(timing.duration_ms.is_some());
+        assert!(!session.startup.has_failed());
+    }
+
+    #[test]
+    fn session_diagnostics_reject_same_endpoint_replacement_flight() {
+        let core = ClientCore::new();
+        core.gateway_session
+            .lock()
+            .unwrap()
+            .connections
+            .entry("endpoint".into())
+            .or_default()
+            .epoch = 1;
+        core.observe_session_stage("endpoint", SessionDiagnosticStage::CredentialsLoad, || {
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        core.gateway_session
+            .lock()
+            .unwrap()
+            .connections
+            .get_mut("endpoint")
+            .unwrap()
+            .epoch = 2;
+        core.observe_session_stage("endpoint", SessionDiagnosticStage::RefreshRequest, || {
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(core.gateway_session().startup.session_diagnostics.len(), 1);
+    }
 
     #[test]
     fn refresh_clock_and_operation_generations_reject_duplicate_and_superseded_callbacks() {

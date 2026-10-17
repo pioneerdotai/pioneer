@@ -38,6 +38,7 @@ pub(super) struct ThreadSidebarView {
     pub rename_workspace_dialog: crate::DialogPresenter,
     pub create_workspace_dialog: crate::DialogPresenter,
     pub tree_structure: Vec<(String, usize, bool, bool)>,
+    pub task_activity_indicators: HashMap<String, Entity<crate::tree_view::TaskActivityIndicator>>,
 
     registrar: Arc<dyn ClientBindingRegistrar>,
     binding: Arc<Binding>,
@@ -122,6 +123,7 @@ impl ThreadSidebarView {
             rename_workspace_dialog: config.rename_workspace_dialog,
             create_workspace_dialog: config.create_workspace_dialog,
             tree_structure: vec![],
+            task_activity_indicators: HashMap::new(),
             client: config.client,
             registrar: config.registrar,
             binding,

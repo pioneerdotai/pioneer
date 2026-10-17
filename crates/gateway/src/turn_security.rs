@@ -44,6 +44,7 @@ pub(crate) enum TurnSecurityResolverExecutionBackend {
     CodexCli { runtime_id: String },
     ClaudeCli { runtime_id: String },
     Acp { runtime_id: String },
+    OpenCodeCli { runtime_id: String },
 }
 
 impl TurnSecurityResolverExecutionBackend {
@@ -54,6 +55,7 @@ impl TurnSecurityResolverExecutionBackend {
             Self::CodexCli { .. } => TurnSecurityExecutionBackendKind::CodexCli,
             Self::ClaudeCli { .. } => TurnSecurityExecutionBackendKind::ClaudeCli,
             Self::Acp { .. } => TurnSecurityExecutionBackendKind::Acp,
+            Self::OpenCodeCli { .. } => TurnSecurityExecutionBackendKind::OpenCodeCli,
         }
     }
 }
@@ -479,6 +481,16 @@ fn backend_snapshot_for(input: &TurnSecurityResolverInput) -> TurnSecurityBacken
                     supports_turn_scope_approval: true,
                     ..BackendSecurityCapabilities::unrestricted()
                 },
+            }
+        }
+        TurnSecurityResolverExecutionBackend::OpenCodeCli { runtime_id } => {
+            let capabilities =
+                cli_runtime_provider_capabilities(CLIAgentRuntimeProviderKind::OpenCode);
+            TurnSecurityBackendSnapshot {
+                execution_backend: TurnSecurityExecutionBackendKind::OpenCodeCli,
+                sandbox_backend: cli_provider_sandbox_backend(capabilities),
+                provider: Some(runtime_id.clone()),
+                capabilities: backend_capabilities_from_cli_provider(capabilities),
             }
         }
     }
@@ -1180,6 +1192,9 @@ fn resolve_execution_backend(
                 }
                 CLIAgentRuntimeKind::Acp => {
                     Ok(TurnSecurityResolverExecutionBackend::Acp { runtime_id })
+                }
+                CLIAgentRuntimeKind::OpenCode => {
+                    Ok(TurnSecurityResolverExecutionBackend::OpenCodeCli { runtime_id })
                 }
             }
         }

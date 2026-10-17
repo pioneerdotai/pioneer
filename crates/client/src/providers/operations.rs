@@ -839,6 +839,7 @@ impl ClientCore {
         }
     }
     pub fn cancel_provider_operations(&self, workspace: &str) {
+        let epoch = self.provider_runtime_epoch();
         let mut owner = self
             .provider_controller
             .lock()
@@ -855,6 +856,21 @@ impl ClientCore {
             owner.active = None;
             owner.prepared = None;
             self.publish_provider_operation(&identity, ProviderLoadState::Cancelled);
+        } else if let Some(publication) = self.provider_operation_snapshot(workspace)
+            && publication.request() == ProviderLoadState::Failed
+        {
+            // Releasing a surface retires its completed error too. Keep the
+            // generation so a late completion cannot replace a newer command.
+            self.publish_provider_operation(
+                &Identity {
+                    generation: publication.generation(),
+                    epoch,
+                    workspace_id: workspace.into(),
+                    target: publication.target().into(),
+                    kind: publication.action(),
+                },
+                ProviderLoadState::Cancelled,
+            );
         }
     }
 }
@@ -1557,6 +1573,242 @@ mod tests {
         ));
     }
     #[test]
+    fn cli_save_ack_survives_queued_refresh_and_both_old_read_response_orders() {
+        use crate::settings::runtime::SettingsIntent;
+        let initial = GatewaySettingsSnapshot {
+            general: Default::default(),
+            memory: Default::default(),
+            self_improvement: Default::default(),
+            self_improvement_status: None,
+            thread_episodic: Default::default(),
+            cli_runtimes: Default::default(),
+            remote_access: Default::default(),
+            voice_input: Default::default(),
+        };
+        // None: Refresh is queued but has not reserved a read ticket yet.
+        // Some: the old read replies before/after the write ACK.
+        for old_read_before_ack in [None, Some(true), Some(false)] {
+            let core = crate::catalog_test_support::settings_model_picker_client();
+            let load = core.request_gateway_settings().unwrap();
+            assert!(core.finish_gateway_settings(load, &mut Ok(initial.clone())));
+            assert_eq!(
+                core.settings_intent(SettingsIntent::Refresh).outcome(),
+                ClientTransitionOutcome::Changed
+            );
+            let epoch = core.take_settings_refresh_for_test().unwrap();
+            let old_read = old_read_before_ack.map(|_| {
+                core.request_gateway_settings_for_epoch(&epoch)
+                    .unwrap()
+                    .unwrap()
+            });
+            let operation = core
+                .prepare_provider_command(ProviderCommand::SetRuntimeEnabled {
+                    workspace_id: "workspace".into(),
+                    runtime_id: "codex".into(),
+                    enabled: false,
+                })
+                .unwrap();
+            let CLIRuntimeProviderSettingsPlan::Send(plan) =
+                plan_cli_runtime_provider_enabled_update(
+                    core.gateway_settings().settings.as_ref(),
+                    "codex",
+                    false,
+                )
+            else {
+                panic!("loaded CLI settings")
+            };
+            let disabled = plan.snapshot;
+            let save = core
+                .prepare_gateway_settings_update(Some(disabled.clone()))
+                .unwrap();
+            if old_read.is_none() {
+                // The provider worker wins the gap between dequeue and RPC admission.
+                assert!(
+                    core.request_gateway_settings_for_epoch(&epoch)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(core.gateway_settings().saving);
+                assert!(!core.gateway_settings().loading);
+            }
+            if old_read_before_ack == Some(true) {
+                assert!(!core.finish_gateway_settings(old_read.unwrap(), &mut Ok(initial.clone())));
+                core.complete_settings_refresh_for_test(&epoch, false);
+            }
+            assert_eq!(
+                core.settings_intent(SettingsIntent::Refresh).outcome(),
+                ClientTransitionOutcome::Noop
+            );
+            let mut ack = Ok(disabled.clone());
+            let accepted = core.finish_gateway_settings(save, &mut ack);
+            // Use the same ACK gate and terminal operation owner as the provider worker.
+            let result = if accepted {
+                ack.map(|_| ProviderOperationCompletion::Completed)
+            } else {
+                Err(anyhow::anyhow!("provider_action_cancelled"))
+            };
+            core.finish_provider_operation(&operation.identity, result)
+                .unwrap();
+            assert_eq!(
+                core.provider_operation_snapshot("workspace")
+                    .unwrap()
+                    .request(),
+                ProviderLoadState::Ready
+            );
+            if old_read_before_ack == Some(false) {
+                assert!(!core.finish_gateway_settings(old_read.unwrap(), &mut Ok(initial.clone())));
+                core.complete_settings_refresh_for_test(&epoch, false);
+            }
+            assert!(
+                !core
+                    .gateway_settings()
+                    .settings
+                    .unwrap()
+                    .cli_runtimes
+                    .instances[0]
+                    .enabled
+            );
+            assert_eq!(
+                core.settings_intent(SettingsIntent::Refresh).outcome(),
+                ClientTransitionOutcome::Noop
+            );
+            let followup = core
+                .take_settings_refresh_for_test()
+                .expect("one coalesced refresh after save");
+            assert!(core.take_settings_refresh_for_test().is_none());
+            let load = core
+                .request_gateway_settings_for_epoch(&followup)
+                .unwrap()
+                .unwrap();
+            assert!(core.finish_gateway_settings(load, &mut Ok(disabled)));
+            core.complete_settings_refresh_for_test(&followup, true);
+            let settings = core.gateway_settings();
+            assert!(!settings.settings.unwrap().cli_runtimes.instances[0].enabled);
+            assert!(settings.error.is_none());
+            assert!(!settings.loading && !settings.saving);
+            assert_eq!(
+                core.settings_intent(SettingsIntent::Refresh).outcome(),
+                ClientTransitionOutcome::Changed
+            );
+        }
+
+        // ACK arrives in B either without a replacement ticket or after a read of B.
+        for replace_save_with_read in [false, true] {
+            let core = crate::catalog_test_support::settings_model_picker_client();
+            let select_workspace = |id: &str| {
+                core.navigate(
+                    crate::navigation::NavigationIntent::SelectWorkspace {
+                        workspace_id: Some(id.into()),
+                    },
+                    None,
+                );
+            };
+            let load = core.request_gateway_settings().unwrap();
+            assert!(core.finish_gateway_settings(load, &mut Ok(initial.clone())));
+            let mut disabled = initial.clone();
+            disabled.cli_runtimes.instances[0].enabled = false;
+            let save = core
+                .prepare_gateway_settings_update(Some(disabled.clone()))
+                .unwrap();
+            if replace_save_with_read {
+                core.settings_intent(SettingsIntent::Refresh);
+                let deferred = core.take_settings_refresh_for_test().unwrap();
+                assert!(
+                    core.request_gateway_settings_for_epoch(&deferred)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            select_workspace("other-workspace");
+            let replacement = replace_save_with_read.then(|| {
+                core.settings_intent(SettingsIntent::Refresh);
+                let epoch = core.take_settings_refresh_for_test().unwrap();
+                let read = core
+                    .request_gateway_settings_for_epoch(&epoch)
+                    .unwrap()
+                    .unwrap();
+                (epoch, read)
+            });
+            let before = core.gateway_settings();
+            let mut stale_ack = disabled.clone();
+            stale_ack.general.keepawake = !stale_ack.general.keepawake;
+            assert!(!core.finish_gateway_settings(save, &mut Ok(stale_ack.clone())));
+            if let Some((epoch, read)) = replacement {
+                // An old ACK must not release the newer read or its coalescing owner.
+                assert_eq!(core.gateway_settings(), before);
+                assert_eq!(
+                    core.settings_intent(SettingsIntent::Refresh).outcome(),
+                    ClientTransitionOutcome::Noop
+                );
+                assert!(core.finish_gateway_settings(read, &mut Ok(initial.clone())));
+                core.complete_settings_refresh_for_test(&epoch, true);
+            } else {
+                let released = core.gateway_settings();
+                assert!(!released.saving && !released.loading);
+                assert_eq!(released.settings, before.settings);
+                assert_eq!(released.error, before.error);
+            }
+
+            select_workspace("workspace");
+            assert_eq!(
+                core.settings_intent(SettingsIntent::Refresh).outcome(),
+                ClientTransitionOutcome::Changed
+            );
+            let epoch = core.take_settings_refresh_for_test().unwrap();
+            let read = core
+                .request_gateway_settings_for_epoch(&epoch)
+                .unwrap()
+                .expect("completed save cannot defer a new read");
+            let before = core.gateway_settings();
+            assert!(!core.finish_gateway_settings(save, &mut Ok(stale_ack.clone())));
+            assert_eq!(core.gateway_settings(), before);
+            assert_eq!(
+                core.settings_intent(SettingsIntent::Refresh).outcome(),
+                ClientTransitionOutcome::Noop
+            );
+            assert!(core.finish_gateway_settings(read, &mut Ok(disabled)));
+            core.complete_settings_refresh_for_test(&epoch, true);
+            assert_eq!(
+                core.settings_intent(SettingsIntent::Refresh).outcome(),
+                ClientTransitionOutcome::Changed
+            );
+
+            // A late ACK must also preserve a newer save and its deferred refresh.
+            let epoch = core.take_settings_refresh_for_test().unwrap();
+            let newer_save = core
+                .prepare_gateway_settings_update(Some(initial.clone()))
+                .unwrap();
+            assert!(
+                core.request_gateway_settings_for_epoch(&epoch)
+                    .unwrap()
+                    .is_none()
+            );
+            let before = core.gateway_settings();
+            assert!(!core.finish_gateway_settings(save, &mut Ok(stale_ack)));
+            assert_eq!(core.gateway_settings(), before);
+            assert_eq!(
+                core.settings_intent(SettingsIntent::Refresh).outcome(),
+                ClientTransitionOutcome::Noop
+            );
+            assert!(core.finish_gateway_settings(newer_save, &mut Ok(initial.clone())));
+            let followup = core
+                .take_settings_refresh_for_test()
+                .expect("new save keeps its refresh");
+            assert!(core.take_settings_refresh_for_test().is_none());
+            let read = core
+                .request_gateway_settings_for_epoch(&followup)
+                .unwrap()
+                .unwrap();
+            assert!(core.finish_gateway_settings(read, &mut Ok(initial.clone())));
+            core.complete_settings_refresh_for_test(&followup, true);
+            assert_eq!(
+                core.settings_intent(SettingsIntent::Refresh).outcome(),
+                ClientTransitionOutcome::Changed
+            );
+        }
+    }
+
+    #[test]
     fn cancellation_and_auth_fence_reject_late_mutation_completion_and_explicit_retry_gets_a_new_generation()
      {
         let core = fixture();
@@ -1576,8 +1828,36 @@ mod tests {
             &cancelled,
             &core.provider_operation_snapshot("workspace").unwrap()
         ));
+        let failed = core.prepare_provider_command(configure()).unwrap();
+        assert!(
+            core.finish_provider_operation(&failed.identity, Err(anyhow::anyhow!("synthetic")))
+                .is_err()
+        );
+        core.cancel_provider_operations("other");
+        assert_eq!(
+            core.provider_operation_snapshot("workspace")
+                .unwrap()
+                .request(),
+            ProviderLoadState::Failed
+        );
+        core.cancel_provider_operations("workspace");
+        assert_eq!(
+            core.provider_operation_snapshot("workspace")
+                .unwrap()
+                .request(),
+            ProviderLoadState::Cancelled
+        );
         let retry = core.prepare_provider_command(configure()).unwrap();
         assert!(retry.identity.generation > first.identity.generation);
+        let pending = core.provider_operation_snapshot("workspace").unwrap();
+        assert!(
+            core.finish_provider_operation(&failed.identity, Err(anyhow::anyhow!("late")))
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(
+            &pending,
+            &core.provider_operation_snapshot("workspace").unwrap()
+        ));
         core.clear_authorization_projections();
         assert!(
             core.finish_provider_operation(

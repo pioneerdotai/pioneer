@@ -93,6 +93,7 @@ fn adapter_base_mapping(
         CLIAgentRuntimeKind::Acp => BaseMapping { approval_policy: "client_callbacks", mapping_quality: CLIRuntimePermissionMappingQuality::StricterFallback, notes: vec!["ACP permission callbacks authorize individual operations; they do not establish isolation of the agent process".into()] },
         CLIAgentRuntimeKind::Codex => codex_base_mapping(mode),
         CLIAgentRuntimeKind::Claude => claude_base_mapping(mode),
+        CLIAgentRuntimeKind::OpenCode => opencode_base_mapping(mode),
     }
 }
 
@@ -132,6 +133,26 @@ fn claude_base_mapping(mode: TurnPermissionMode) -> BaseMapping {
         },
         TurnPermissionMode::Supervised => BaseMapping {
             approval_policy: "default",
+            mapping_quality: CLIRuntimePermissionMappingQuality::Exact,
+            notes: Vec::new(),
+        },
+    }
+}
+
+fn opencode_base_mapping(mode: TurnPermissionMode) -> BaseMapping {
+    match mode {
+        TurnPermissionMode::FullAccess => BaseMapping {
+            approval_policy: "allow",
+            mapping_quality: CLIRuntimePermissionMappingQuality::Exact,
+            notes: Vec::new(),
+        },
+        TurnPermissionMode::AutoAcceptEdits => BaseMapping {
+            approval_policy: "auto_accept_edits",
+            mapping_quality: CLIRuntimePermissionMappingQuality::Exact,
+            notes: Vec::new(),
+        },
+        TurnPermissionMode::Supervised => BaseMapping {
+            approval_policy: "ask",
             mapping_quality: CLIRuntimePermissionMappingQuality::Exact,
             notes: Vec::new(),
         },
@@ -311,6 +332,30 @@ mod tests {
 
             assert_eq!(result.output.approval_policy, expected_policy);
             assert_eq!(result.output.mapping_quality, expected_quality);
+        }
+    }
+
+    #[test]
+    fn opencode_profiles_map_exactly_to_server_permission_rules() {
+        let cases = [
+            (TurnPermissionMode::FullAccess, "allow"),
+            (TurnPermissionMode::AutoAcceptEdits, "auto_accept_edits"),
+            (TurnPermissionMode::Supervised, "ask"),
+        ];
+
+        for (mode, expected_policy) in cases {
+            let result = adapt_cli_runtime_permissions_for_turn(
+                CLIAgentRuntimeKind::OpenCode,
+                Some(&selection(mode)),
+                None,
+            );
+
+            assert_eq!(result.output.approval_policy, expected_policy);
+            assert_eq!(
+                result.output.mapping_quality,
+                CLIRuntimePermissionMappingQuality::Exact
+            );
+            assert_eq!(result.options.sandbox, None);
         }
     }
 

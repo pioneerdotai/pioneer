@@ -7,6 +7,8 @@ pub enum Transport {
     Acp,
     Codex,
     Claude,
+    #[serde(rename = "opencode")]
+    OpenCode,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelSelection {

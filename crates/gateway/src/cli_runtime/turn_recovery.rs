@@ -390,6 +390,7 @@ fn cli_agent_runtime_kind_label(kind: CLIAgentRuntimeKind) -> &'static str {
         CLIAgentRuntimeKind::Codex => "codex",
         CLIAgentRuntimeKind::Claude => "claude",
         pioneer_protocol::CLIAgentRuntimeKind::Acp => "acp",
+        CLIAgentRuntimeKind::OpenCode => "opencode",
     }
 }
 

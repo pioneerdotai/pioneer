@@ -85,6 +85,10 @@ pub use super::gateway_principal::Entity as GatewayPrincipal;
 pub use super::hook_audit_event::Entity as HookAuditEvent;
 pub use super::hook_run::Entity as HookRun;
 pub use super::hook_run_attempt::Entity as HookRunAttempt;
+pub use super::html_preview_frozen_index::Entity as HtmlPreviewFrozenIndex;
+pub use super::html_preview_frozen_result::Entity as HtmlPreviewFrozenResult;
+pub use super::html_preview_frozen_turn::Entity as HtmlPreviewFrozenTurn;
+pub use super::html_preview_index_backfill::Entity as HtmlPreviewIndexBackfill;
 pub use super::invitation::Entity as Invitation;
 pub use super::invitation_workspace_grant::Entity as InvitationWorkspaceGrant;
 pub use super::mcp_audit_event::Entity as McpAuditEvent;
@@ -142,6 +146,7 @@ pub use super::task_run_conversation_snapshot::Entity as TaskRunConversationSnap
 pub use super::task_run_execution::Entity as TaskRunExecution;
 pub use super::task_run_occurrence_reconcile_pending::Entity as TaskRunOccurrenceReconcilePending;
 pub use super::task_run_occurrence_reconcile_sequence::Entity as TaskRunOccurrenceReconcileSequence;
+pub use super::task_run_read::Entity as TaskRunRead;
 pub use super::task_run_thread_binding::Entity as TaskRunThreadBinding;
 pub use super::task_run_turn::Entity as TaskRunTurn;
 pub use super::task_trigger::Entity as TaskTrigger;

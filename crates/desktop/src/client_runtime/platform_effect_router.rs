@@ -1,3 +1,5 @@
+use crate::gateway::onboarding_platform::observe_preconnect;
+use pioneer_observability::{DesktopStartupStage as Stage, DesktopStartupTrace};
 use std::sync::Arc;
 
 use pioneer_client::{
@@ -5,7 +7,10 @@ use pioneer_client::{
         ClientCore, ClientEffectCompletion, ClientEffectPlan, ClientEffectResult,
         ClientPlannedEffect,
     },
-    gateway::session_refresh::{GatewaySessionStorage, GatewaySessionStorageEffect},
+    gateway::{
+        onboarding_effects::OnboardingPlatformEffect,
+        session_refresh::{GatewaySessionStorage, GatewaySessionStorageEffect},
+    },
 };
 
 /// Dispatches native work and returns its typed completion to the originating core.
@@ -18,10 +23,26 @@ impl DesktopPlatformEffectRouter {
         core: &ClientCore,
         plan: ClientEffectPlan,
         storage: &dyn GatewaySessionStorage,
+        trace: Option<&DesktopStartupTrace>,
     ) {
         let result = match plan.effect() {
             ClientPlannedEffect::OnboardingPlatform(effect) => {
-                crate::gateway::onboarding_platform::execute(effect, storage)
+                let stage = match effect {
+                    OnboardingPlatformEffect::LoadGatewayEnvironment => {
+                        Some(Stage::GatewayEnvironmentLoad)
+                    }
+                    OnboardingPlatformEffect::PrepareLocalGateway { .. } => {
+                        Some(Stage::GatewayLocalPrepare)
+                    }
+                    _ => None,
+                };
+                if let Some(stage) = stage {
+                    observe_preconnect(trace, stage, || {
+                        crate::gateway::onboarding_platform::execute(effect, storage, trace)
+                    })
+                } else {
+                    crate::gateway::onboarding_platform::execute(effect, storage, trace)
+                }
             }
             ClientPlannedEffect::GatewaySessionStorage(
                 GatewaySessionStorageEffect::DeleteGatewaySession { endpoint },
@@ -57,7 +78,11 @@ pub(super) struct DesktopSessionStorageAdapter {
 }
 
 impl DesktopSessionStorageAdapter {
-    pub(super) fn start(core: Arc<ClientCore>, router: &Arc<DesktopPlatformEffectRouter>) -> Self {
+    pub(super) fn start(
+        core: Arc<ClientCore>,
+        router: &Arc<DesktopPlatformEffectRouter>,
+        trace: Option<DesktopStartupTrace>,
+    ) -> Self {
         let owner = Arc::downgrade(&core);
         let router = Arc::downgrade(router);
         let worker = std::thread::Builder::new()
@@ -69,7 +94,13 @@ impl DesktopSessionStorageAdapter {
                     let batch = core.wait_for_publications(sequence);
                     sequence = batch.sequence;
                     for plan in batch.effects {
-                        if !matches!(plan.effect(), ClientPlannedEffect::GatewaySessionStorage(_) | ClientPlannedEffect::OnboardingPlatform(_)) { continue; }
+                        if !matches!(
+                            plan.effect(),
+                            ClientPlannedEffect::GatewaySessionStorage(_)
+                                | ClientPlannedEffect::OnboardingPlatform(_)
+                        ) {
+                            continue;
+                        }
 
                         if core.is_stopped() {
                             break;
@@ -77,19 +108,40 @@ impl DesktopSessionStorageAdapter {
                         let Some(router) = router.upgrade() else {
                             break;
                         };
+                        if let Some(trace) = trace.as_ref() {
+                            if let Some(published) = core.native_effect_published_at(&plan) {
+                                trace.record_gateway_effect_queue_wait(published);
+                            }
+                        }
                         if secrets.is_none() {
-                            secrets = pioneer_config::AppConfig::load()
-                                .map_err(anyhow::Error::from)
-                                .and_then(|config| config.runtime_home_dir())
-                                .and_then(|home| crate::gateway::DesktopSecrets::open(&home))
-                                .ok();
+                            secrets = observe_preconnect(
+                                trace.as_ref(),
+                                Stage::DesktopKeystorePrepare,
+                                || {
+                                    pioneer_config::AppConfig::load()
+                                        .map_err(anyhow::Error::from)
+                                        .and_then(|config| config.runtime_home_dir())
+                                        .and_then(|home| crate::gateway::DesktopSecrets::open(&home))
+                                },
+                            ).ok();
                         }
                         match secrets.as_ref() {
                             Some(secrets) => {
-                                if matches!(plan.effect(),ClientPlannedEffect::OnboardingPlatform(pioneer_client::gateway::onboarding_effects::OnboardingPlatformEffect::LoadGatewayEnvironment)) {
-                                    if secrets.purge_retired_gateway_auth_tokens().is_err(){tracing::warn!("retired Gateway credential cleanup deferred until the next startup");}
+                                if matches!(
+                                    plan.effect(),
+                                    ClientPlannedEffect::OnboardingPlatform(
+                                        OnboardingPlatformEffect::LoadGatewayEnvironment
+                                    )
+                                ) {
+                                    if observe_preconnect(
+                                        trace.as_ref(),
+                                        Stage::GatewayRetiredCredentialsCleanup,
+                                        || secrets.purge_retired_gateway_auth_tokens(),
+                                    ).is_err() {
+                                        tracing::warn!("retired Gateway credential cleanup deferred until the next startup");
+                                    }
                                 }
-                                router.dispatch(&core, plan, secrets)
+                                router.dispatch(&core, plan, secrets, trace.as_ref())
                             },
                             None => {
                                 core.complete_effect(ClientEffectCompletion::new(
@@ -189,7 +241,7 @@ mod tests {
             ClientTransitionOutcome::Rejected
         );
         let storage = Storage(std::sync::atomic::AtomicUsize::new(0));
-        DesktopPlatformEffectRouter.dispatch(&core, plan, &storage);
+        DesktopPlatformEffectRouter.dispatch(&core, plan, &storage, None);
         assert!(worker.join().unwrap().unwrap().is_none());
         assert_eq!(storage.0.load(std::sync::atomic::Ordering::SeqCst), 1);
         core.shutdown();

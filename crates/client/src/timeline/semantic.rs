@@ -832,11 +832,7 @@ pub fn timeline_cli_runtime_execution_author(
 ) -> Option<&pioneer_protocol::TurnAuthorSnapshot> {
     author.filter(|author| {
         matches!(&author.actor, pioneer_protocol::PersistedActorRef::System)
-            && matches!(
-                author.avatar_revision.as_deref(),
-                Some(pioneer_protocol::CODEX_AGENT_AVATAR_REVISION)
-                    | Some(pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION)
-            )
+            && author.cli_runtime_kind.is_some()
             && author.agent.is_none()
     })
 }
@@ -2998,7 +2994,15 @@ fn work_item_projection_id(turn_id: &str, item_id: &str) -> String {
 }
 
 fn turn_sort_base(thread: &ThreadSemanticTimelineState, turn_id: &str, now_unix_ms: i64) -> String {
-    for block in thread.top_level.blocks_by_id.values() {
+    // A completed response may be positioned after newer Turns. Keep live
+    // work in the known prompt's sort domain when that prompt is cached.
+    for block in thread
+        .top_level
+        .blocks_by_id
+        .values()
+        .filter(|block| matches!(&block.kind, TimelineBlockKind::UserMessage { .. }))
+        .chain(thread.top_level.blocks_by_id.values())
+    {
         let causal_match = matches!(&block.kind, TimelineBlockKind::DetachedTaskRun { task, .. }
             if task.created_by_turn_id.as_deref() == Some(turn_id)
                 && task.trigger_kind == TaskTriggerKind::Immediate);
@@ -3213,6 +3217,9 @@ fn preserve_turn_author(
         return;
     };
     if incoming_author.actor == existing.actor {
+        if incoming_author.cli_runtime_kind.is_none() {
+            incoming_author.cli_runtime_kind = existing.cli_runtime_kind;
+        }
         if incoming_author.avatar_revision.is_none() {
             incoming_author.avatar_revision = existing.avatar_revision.clone();
         }
@@ -4444,6 +4451,7 @@ mod tests {
         assert_eq!(ready_agent_timeline_author(None), Some(None));
 
         let principal_author = TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::Principal(
                 PrincipalId::new("P0000000000000000000A").expect("principal id"),
             ),
@@ -4454,8 +4462,9 @@ mod tests {
         };
         assert!(ready_agent_timeline_author(Some(&principal_author)).is_none());
         let mut runtime_author = TurnAuthorSnapshot {
+            cli_runtime_kind: Some(pioneer_protocol::CLIAgentRuntimeKind::Codex),
             actor: PersistedActorRef::System,
-            avatar_revision: Some(pioneer_protocol::CODEX_AGENT_AVATAR_REVISION.to_owned()),
+            avatar_revision: Some("arbitrary-old-avatar".to_owned()),
             ..principal_author.clone()
         };
         assert_eq!(
@@ -4466,11 +4475,18 @@ mod tests {
         assert!(ready_agent_timeline_author(Some(&runtime_author)).is_none());
         runtime_author.actor = PersistedActorRef::System;
         runtime_author.avatar_revision = Some("unrelated-system-avatar".to_owned());
+        assert_eq!(
+            ready_agent_timeline_author(Some(&runtime_author)),
+            Some(Some(&runtime_author))
+        );
+        runtime_author.cli_runtime_kind = None;
         assert!(ready_agent_timeline_author(Some(&runtime_author)).is_none());
+        runtime_author.cli_runtime_kind = Some(pioneer_protocol::CLIAgentRuntimeKind::Codex);
 
         let execution_id =
             AgentExecutionId::new("E0000000000000000000A").expect("agent execution id");
         let legacy_agent_author = TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::AgentExecution(execution_id.clone()),
             display_name: "Legacy agent".to_owned(),
             nickname: "legacy-agent".to_owned(),
@@ -4483,6 +4499,7 @@ mod tests {
         );
 
         let mismatched_agent_author = TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             agent: Some(AgentPresentationSnapshot {
                 agent_identity_id: AgentIdentityId::new("A0000000000000000000A")
                     .expect("agent identity id"),
@@ -4498,23 +4515,24 @@ mod tests {
             ..legacy_agent_author
         };
         assert!(ready_agent_timeline_author(Some(&mismatched_agent_author)).is_none());
-        runtime_author.avatar_revision =
-            Some(pioneer_protocol::CODEX_AGENT_AVATAR_REVISION.to_owned());
+        runtime_author.avatar_revision = None;
         runtime_author.agent = mismatched_agent_author.agent;
         assert!(ready_agent_timeline_author(Some(&runtime_author)).is_none());
     }
 
     #[test]
     fn direct_cli_answer_and_work_survive_author_hydration_and_reload() {
-        for avatar in [
-            pioneer_protocol::CODEX_AGENT_AVATAR_REVISION,
-            pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION,
+        for runtime_kind in [
+            pioneer_protocol::CLIAgentRuntimeKind::Codex,
+            pioneer_protocol::CLIAgentRuntimeKind::Claude,
+            pioneer_protocol::CLIAgentRuntimeKind::OpenCode,
         ] {
             let author = TurnAuthorSnapshot {
+                cli_runtime_kind: Some(runtime_kind),
                 actor: PersistedActorRef::System,
                 display_name: "CLI runtime".to_owned(),
                 nickname: "cli".to_owned(),
-                avatar_revision: Some(avatar.to_owned()),
+                avatar_revision: None,
                 agent: None,
             };
             let publication: pioneer_protocol::HtmlPublication = serde_json::from_value(serde_json::json!({
@@ -4712,6 +4730,7 @@ mod tests {
     fn authoritative_user_message_snapshot_replaces_optimism_and_preserves_exact_refs() {
         let principal_id = PrincipalId::new("PAAAAAAAAAAAAAAAAAAAA").expect("valid principal id");
         let author = TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::Principal(principal_id.clone()),
             display_name: "Alice".to_owned(),
             nickname: "alice".to_owned(),
@@ -5704,6 +5723,48 @@ mod tests {
         let decoded: TurnWorkRangeCache = serde_json::from_value(legacy).unwrap();
         assert!(!decoded.has_loaded_page);
         assert_eq!(decoded.initial_request_status, TimelineRequestStatus::Idle);
+    }
+
+    #[test]
+    fn late_final_does_not_move_live_work_out_of_prompt_sort_domain() {
+        let mut state = SemanticTimelineState::default();
+        let prompt_key = "00000000000000000001:turn_a:000:user";
+        let final_key = "00000000000000001000:turn_a:200:answer";
+        apply_thread_timeline_page(
+            &mut state,
+            thread_page(vec![
+                user_block("thread_a", "prompt", prompt_key, "turn_a"),
+                user_block(
+                    "thread_a",
+                    "later",
+                    "00000000000000000500:turn_b:000:user",
+                    "turn_b",
+                ),
+                assistant_block("thread_a", "answer", final_key, "turn_a", None),
+            ]),
+            TopLevelPageMergeMode::Reset,
+        );
+        apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemStarted {
+                thread_id: "thread_a".into(),
+                turn_id: "turn_a".into(),
+                item: TurnItem::AgentMessage {
+                    id: "commentary".into(),
+                    text: "more work".into(),
+                    phase: AgentMessagePhase::Commentary,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            2_000,
+        );
+        let cache = &state.thread("thread_a").unwrap().top_level;
+        let work = cache.block(&work_block_id("turn_a")).unwrap();
+        assert!(work.sort_key.starts_with("00000000000000000001:turn_a:"));
+        assert_eq!(cache.block("prompt").unwrap().sort_key, prompt_key);
+        assert_eq!(cache.block("answer").unwrap().sort_key, final_key);
     }
 
     #[test]

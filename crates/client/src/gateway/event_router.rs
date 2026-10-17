@@ -75,6 +75,7 @@ impl GatewayEventRoute {
             | TaskDeliveryDelivered(_)
             | TaskDeliveryFailed(_)
             | TaskDeliveryCancelled(_)
+            | TaskCompletionInboxChanged(_)
             | TaskUserNotificationDelivered(_)
             | TaskTreeChanged(_)
             | TaskRecovered(_) => Self::TaskNotification,

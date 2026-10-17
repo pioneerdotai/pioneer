@@ -61,11 +61,9 @@ use pioneer_config::{
     EffectiveGatewayCliAgentRuntimeInstanceConfig, GatewayCliAgentRuntimeKindConfig,
 };
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::BufReader;
@@ -349,25 +347,10 @@ pub(crate) async fn run_codex_mcp_local_provider_probe(
         Ok::<_, anyhow::Error>(server)
     };
     let probe_result = async {
-        let initialize = client
+        client
             .initialize(timeout)
             .await
             .map_err(|error| anyhow!("Codex readiness initialization failed: {error}"))?;
-        if initialize
-            .version
-            .as_deref()
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
-            && initialize
-                .user_agent
-                .as_deref()
-                .unwrap_or_default()
-                .trim()
-                .is_empty()
-        {
-            bail!("Codex readiness initialize identity is unavailable");
-        }
         let cwd = probe_config
             .cwd
             .as_deref()
@@ -545,6 +528,16 @@ impl CLIAgentRuntimeSessionFactory for DispatchingCLIAgentRuntimeSessionFactory 
                 .start_session_with_launch_spec(process_instance, launch_spec)
                 .await
             }
+            GatewayCliAgentRuntimeKindConfig::OpenCode => {
+                crate::cli_runtime::opencode_session::OpenCodeCLIAgentRuntimeSessionFactory::new(
+                    self.runtime_home.clone(),
+                    self.bridge_supervisor.clone(),
+                    self.mcp_limits,
+                    self.turn_mcp_invoker.clone(),
+                )
+                .start_session_with_launch_spec(process_instance, launch_spec)
+                .await
+            }
         }
     }
 }
@@ -581,144 +574,11 @@ struct CodexRequiredMcpBridge {
     state: tokio::sync::Mutex<CodexRequiredMcpBridgeState>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct CodexNativeMcpItemKey {
-    native_thread_id: String,
-    native_turn_id: String,
-    native_item_id: String,
-}
-
-struct CodexNativeMcpItemCorrelation {
-    canonical_callable_name: String,
-    arguments_fingerprint: String,
-    sequence: u64,
-    facade_request_id: Option<String>,
-}
-
-#[derive(Default)]
-struct CodexNativeMcpCorrelationLedger {
-    items: StdMutex<HashMap<CodexNativeMcpItemKey, CodexNativeMcpItemCorrelation>>,
-    next_sequence: AtomicU64,
-    changed: tokio::sync::Notify,
-}
-
-impl CodexNativeMcpCorrelationLedger {
-    fn register(
-        &self,
-        binding: crate::cli_runtime::codex_mcp::CodexNativeMcpItemBinding,
-    ) -> Result<()> {
-        let key = CodexNativeMcpItemKey {
-            native_thread_id: binding.native_thread_id,
-            native_turn_id: binding.native_turn_id,
-            native_item_id: binding.native_item_id,
-        };
-        let mut items = self
-            .items
-            .lock()
-            .expect("Codex native MCP correlation ledger should not be poisoned");
-        if let Some(existing) = items.get(&key) {
-            if existing.canonical_callable_name != binding.canonical_callable_name
-                || existing.arguments_fingerprint != binding.arguments_fingerprint
-            {
-                bail!("Codex native MCP item identity changed during replay")
-            }
-            return Ok(());
-        }
-        items.insert(
-            key,
-            CodexNativeMcpItemCorrelation {
-                canonical_callable_name: binding.canonical_callable_name,
-                arguments_fingerprint: binding.arguments_fingerprint,
-                sequence: self.next_sequence.fetch_add(1, AtomicOrdering::Relaxed),
-                facade_request_id: None,
-            },
-        );
-        drop(items);
-        self.changed.notify_waiters();
-        Ok(())
-    }
-
-    fn callable(&self, key: &CodexNativeMcpItemKey) -> Option<String> {
-        self.items
-            .lock()
-            .expect("Codex native MCP correlation ledger should not be poisoned")
-            .get(key)
-            .map(|item| item.canonical_callable_name.clone())
-    }
-
-    fn contains(&self, key: &CodexNativeMcpItemKey) -> bool {
-        self.items
-            .lock()
-            .expect("Codex native MCP correlation ledger should not be poisoned")
-            .contains_key(key)
-    }
-
-    async fn claim(
-        &self,
-        canonical_callable_name: &str,
-        arguments_fingerprint: &str,
-        facade_request_id: &str,
-    ) -> Option<CodexNativeMcpItemKey> {
-        let notified = self.changed.notified();
-        if let Some(key) = self.claim_now(
-            canonical_callable_name,
-            arguments_fingerprint,
-            facade_request_id,
-        ) {
-            return Some(key);
-        }
-        let _ = tokio_timeout(Duration::from_millis(250), notified).await;
-        self.claim_now(
-            canonical_callable_name,
-            arguments_fingerprint,
-            facade_request_id,
-        )
-    }
-
-    fn claim_now(
-        &self,
-        canonical_callable_name: &str,
-        arguments_fingerprint: &str,
-        facade_request_id: &str,
-    ) -> Option<CodexNativeMcpItemKey> {
-        let mut items = self
-            .items
-            .lock()
-            .expect("Codex native MCP correlation ledger should not be poisoned");
-        let key = items
-            .iter()
-            .filter(|(_, item)| {
-                item.facade_request_id.is_none()
-                    && item.canonical_callable_name == canonical_callable_name
-                    && item.arguments_fingerprint == arguments_fingerprint
-            })
-            .min_by_key(|(_, item)| item.sequence)
-            .map(|(key, _)| key.clone())?;
-        items
-            .get_mut(&key)
-            .expect("selected Codex MCP correlation must exist")
-            .facade_request_id = Some(facade_request_id.to_owned());
-        Some(key)
-    }
-
-    fn clear_turn(&self, native_thread_id: Option<&str>, native_turn_id: Option<&str>) {
-        let (Some(native_thread_id), Some(native_turn_id)) = (native_thread_id, native_turn_id)
-        else {
-            return;
-        };
-        self.items
-            .lock()
-            .expect("Codex native MCP correlation ledger should not be poisoned")
-            .retain(|key, _| {
-                key.native_thread_id != native_thread_id || key.native_turn_id != native_turn_id
-            });
-    }
-}
-
-struct CodexCorrelatingTurnMcpInvoker {
-    inner: Arc<dyn TurnMcpInvoker>,
-    native_items: Arc<CodexNativeMcpCorrelationLedger>,
-}
+use crate::cli_runtime::mcp::native_correlation::{
+    CorrelatingTurnMcpInvoker as CodexCorrelatingTurnMcpInvoker,
+    NativeMcpCorrelationLedger as CodexNativeMcpCorrelationLedger,
+    NativeMcpItemKey as CodexNativeMcpItemKey,
+};
 
 pub(crate) fn codex_native_approval_fallback_response(
     requested_permissions: JsonValue,
@@ -736,45 +596,6 @@ pub(crate) fn codex_native_approval_fallback_response(
             "strictAutoReview": true,
         })
     })
-}
-
-#[async_trait]
-impl TurnMcpInvoker for CodexCorrelatingTurnMcpInvoker {
-    async fn invoke(
-        &self,
-        mut invocation: crate::turn_mcp::invoker::TurnMcpInvocation,
-        cancellation: CancellationToken,
-    ) -> std::result::Result<
-        crate::turn_mcp::result::CanonicalMcpToolResult,
-        crate::turn_mcp::invoker::TurnMcpInvocationError,
-    > {
-        let arguments_fingerprint =
-            crate::cli_runtime::codex_mcp::canonical_value_fingerprint(&invocation.arguments)
-                .map_err(|_| {
-                    crate::turn_mcp::invoker::TurnMcpInvocationError::new(
-                        crate::turn_mcp::invoker::TurnMcpInvocationErrorCode::InvalidRequest,
-                        "Codex MCP invocation arguments are not canonicalizable",
-                    )
-                })?;
-        let facade_request_id = invocation.provider_call_id.clone();
-        let native_item = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => None,
-            native_item = self.native_items.claim(
-                invocation.canonical_callable_name.as_str(),
-                arguments_fingerprint.as_str(),
-                facade_request_id.as_str(),
-            ) => native_item,
-        }
-        .ok_or_else(|| {
-            crate::turn_mcp::invoker::TurnMcpInvocationError::new(
-                crate::turn_mcp::invoker::TurnMcpInvocationErrorCode::SessionBindingUnavailable,
-                "Codex MCP facade call has no matching native lifecycle item",
-            )
-        })?;
-        invocation.provider_call_id = native_item.native_item_id;
-        self.inner.invoke(invocation, cancellation).await
-    }
 }
 
 struct CodexActiveMcpTurn {
@@ -1154,6 +975,7 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
             CliProviderContinuation::AcpSession { .. }
             | CliProviderContinuation::ClaudeNew { .. }
             | CliProviderContinuation::ClaudeResume { .. }
+            | CliProviderContinuation::OpenCodeServerSession { .. }
             | CliProviderContinuation::ClaudeFork { .. } => {
                 bail!("Codex CLI runtime requires a typed Codex thread continuation")
             }
@@ -1161,8 +983,10 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
         let launch_projection = match &launch_spec.mcp {
             CliMcpSessionLaunch::Disabled | CliMcpSessionLaunch::ManagementOnly => None,
             CliMcpSessionLaunch::Codex(projection) => Some(projection),
-            CliMcpSessionLaunch::Acp(_) | CliMcpSessionLaunch::Claude(_) => {
-                bail!("Codex CLI runtime cannot consume a Claude MCP launch projection")
+            CliMcpSessionLaunch::Acp(_)
+            | CliMcpSessionLaunch::Claude(_)
+            | CliMcpSessionLaunch::OpenCode(_) => {
+                bail!("Codex CLI runtime cannot consume another provider's MCP launch projection")
             }
         };
         let mcp_launch_projection = launch_projection.cloned();

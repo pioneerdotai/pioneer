@@ -1,7 +1,7 @@
 //! Retained task inbox presentation over Client publications.
 use gpui_kit::component::{
-    Icon, IconName, Sizable, StyledExt, button::*, h_flex, popover::Popover, theme::ActiveTheme,
-    v_flex,
+    Disableable, Icon, IconName, Sizable, StyledExt, VirtualListScrollHandle, button::*, h_flex,
+    popover::Popover, scroll::Scrollbar, theme::ActiveTheme, v_flex, v_virtual_list,
 };
 use gpui_kit::{prelude::*, *};
 use pioneer_client::{
@@ -22,6 +22,17 @@ pub struct TaskNotificationLabels {
     empty: String,
     completed: String,
     mark_read: String,
+    open: String,
+    more: String,
+    read: String,
+    unread: String,
+    retry: String,
+    failed: String,
+    blocked: String,
+    cancelled: String,
+    timed_out: String,
+    loading_failed: String,
+    format_time: fn(i64) -> String,
 }
 impl TaskNotificationLabels {
     pub fn new(
@@ -33,13 +44,58 @@ impl TaskNotificationLabels {
         mark_read: String,
     ) -> Self {
         Self {
+            open: task.clone(),
+            more: loading.clone(),
+            read: mark_read.clone(),
+            unread: title.clone(),
+            retry: loading.clone(),
+            failed: completed.clone(),
+            blocked: completed.clone(),
+            cancelled: completed.clone(),
+            timed_out: completed.clone(),
+            loading_failed: empty.clone(),
+            format_time: |at| at.to_string(),
+            mark_read,
             title,
             task,
             loading,
             empty,
             completed,
-            mark_read,
         }
+    }
+    pub fn history(
+        mut self,
+        open: String,
+        more: String,
+        read: String,
+        unread: String,
+        retry: String,
+        loading_failed: String,
+    ) -> Self {
+        self.open = open;
+        self.more = more;
+        self.read = read;
+        self.unread = unread;
+        self.retry = retry;
+        self.loading_failed = loading_failed;
+        self
+    }
+    pub fn terminal_statuses(
+        mut self,
+        failed: String,
+        blocked: String,
+        cancelled: String,
+        timed_out: String,
+    ) -> Self {
+        self.failed = failed;
+        self.blocked = blocked;
+        self.cancelled = cancelled;
+        self.timed_out = timed_out;
+        self
+    }
+    pub fn time_formatter(mut self, formatter: fn(i64) -> String) -> Self {
+        self.format_time = formatter;
+        self
     }
 }
 pub use pioneer_client::tasks::notifications::TaskNotificationEffect as TaskNotificationIdentity;
@@ -102,7 +158,18 @@ impl ClientPublicationSink for Binding {
         self.changed.send_modify(|serial| *serial += 1);
     }
 }
-actions!(task_notifications, [RetryTask]);
+actions!(
+    task_notifications,
+    [RetryTask, NextResult, PreviousResult, OpenSelectedResult]
+);
+
+pub fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("down", NextResult, Some("TaskCompletionInbox")),
+        KeyBinding::new("up", PreviousResult, Some("TaskCompletionInbox")),
+        KeyBinding::new("enter", OpenSelectedResult, Some("TaskCompletionInbox")),
+    ]);
+}
 #[derive(Clone, Debug, PartialEq, gpui_kit::Action, serde::Deserialize)]
 #[action(no_json)]
 pub struct DismissTask {
@@ -143,6 +210,10 @@ pub struct TaskNotificationView {
     focus: FocusHandle,
     permissions_epoch: (Option<(u64, u64)>, Option<u64>),
     opened_operation: u64,
+    scroll: VirtualListScrollHandle,
+    inbox_open: bool,
+    inbox_focus: FocusHandle,
+    selected_run: Option<String>,
 }
 impl EventEmitter<TaskNotificationEvent> for TaskNotificationView {}
 impl TaskNotificationView {
@@ -179,6 +250,10 @@ impl TaskNotificationView {
             focus: cx.focus_handle(),
             permissions_epoch: (None, None),
             opened_operation: 0,
+            scroll: VirtualListScrollHandle::new(),
+            inbox_open: false,
+            inbox_focus: cx.focus_handle(),
+            selected_run: None,
         };
         view.sync(cx);
         view
@@ -194,6 +269,9 @@ impl TaskNotificationView {
             self.clear_native();
             self.inbox_registration.take();
             self.input = None;
+            self.scroll = VirtualListScrollHandle::new();
+            self.inbox_open = false;
+            self.selected_run = None;
             self.binding
                 .publications
                 .borrow_mut()
@@ -215,8 +293,15 @@ impl TaskNotificationView {
             self.client.gateway_session().startup.connection_id,
         );
         if workspace_changed || permissions_epoch != self.permissions_epoch {
+            self.clear_native();
+            self.input = None;
+            self.binding
+                .publications
+                .borrow_mut()
+                .retain(|scope, _| !matches!(scope, ClientScope::TaskInbox { .. }));
             self.permissions_epoch = permissions_epoch;
             self.refresh();
+            cx.notify();
         }
         let next = self
             .workspace
@@ -229,6 +314,7 @@ impl TaskNotificationView {
         if let Some(opened) = self.input.as_ref().and_then(|inbox| inbox.opened()) {
             if opened.operation_id() > self.opened_operation {
                 self.opened_operation = opened.operation_id();
+                self.inbox_open = false;
                 cx.emit(TaskNotificationEvent::OpenThread {
                     thread_id: opened.thread_id().to_owned(),
                 });
@@ -290,10 +376,9 @@ impl TaskNotificationView {
                         port.remove(&previous.identity);
                     }
                     let summary = notification
-                        .result
-                        .as_ref()
-                        .and_then(|r| r.summary.clone())
-                        .or_else(|| notification.error.as_ref().map(|e| e.error.message.clone()))
+                        .summary
+                        .clone()
+                        .or_else(|| notification.error.clone())
                         .unwrap_or_else(|| self.labels.completed.clone());
                     let client = Arc::downgrade(&self.client);
                     let effect = identity.clone();
@@ -358,23 +443,164 @@ impl Drop for TaskNotificationView {
         self.close();
     }
 }
+impl TaskNotificationView {
+    fn open(&self, id: String, revision: u64) {
+        if let Some(workspace) = &self.workspace {
+            self.client.dispatch(ClientIntent::TaskNotification {
+                intent: TaskNotificationIntent::Open {
+                    workspace_id: workspace.clone(),
+                    notification_id: id,
+                    revision,
+                },
+            });
+        }
+    }
+    fn load_more(&self) {
+        if let Some(workspace) = &self.workspace {
+            self.client.dispatch(ClientIntent::TaskNotification {
+                intent: TaskNotificationIntent::LoadMore {
+                    workspace_id: workspace.clone(),
+                },
+            });
+        }
+    }
+    fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(input) = &self.input else { return };
+        let items = input.items();
+        if items.is_empty() {
+            self.selected_run = None;
+            return;
+        }
+        let ix = self.selected_run.as_deref().and_then(|id| {
+            items
+                .iter()
+                .position(|item| item.notification().run_id == id)
+        });
+        let ix = ix.map_or(if delta < 0 { items.len() - 1 } else { 0 }, |ix| {
+            ix.saturating_add_signed(delta).min(items.len() - 1)
+        });
+        self.selected_run = Some(items[ix].notification().run_id.clone());
+        self.scroll.scroll_to_item(ix, ScrollStrategy::Top);
+        cx.notify();
+    }
+    fn render_row(
+        &self,
+        item: &pioneer_client::tasks::notifications::TaskInboxItem,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let entry = item.notification();
+        let status = match entry.status {
+            pioneer_client::tasks::notifications::TaskRunStatus::Succeeded => {
+                &self.labels.completed
+            }
+            pioneer_client::tasks::notifications::TaskRunStatus::Failed => &self.labels.failed,
+            pioneer_client::tasks::notifications::TaskRunStatus::Blocked => &self.labels.blocked,
+            pioneer_client::tasks::notifications::TaskRunStatus::Cancelled => {
+                &self.labels.cancelled
+            }
+            pioneer_client::tasks::notifications::TaskRunStatus::TimedOut => &self.labels.timed_out,
+            _ => &self.labels.completed,
+        };
+        let summary = entry
+            .error
+            .clone()
+            .or_else(|| entry.summary.clone())
+            .unwrap_or_default();
+        let open_id = entry.run_id.clone();
+        let read_id = open_id.clone();
+        let revision = item.revision();
+        let busy = item.is_dismissing();
+        v_flex()
+            .id(SharedString::from(format!(
+                "task-inbox-row-{}",
+                entry.run_id
+            )))
+            .w_full()
+            .h(rems(8.))
+            .p_2()
+            .gap_1()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .when(
+                self.selected_run.as_deref() == Some(entry.run_id.as_str()),
+                |this| this.bg(cx.theme().muted),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .truncate()
+                    .child(if entry.title.is_empty() {
+                        self.labels.task.clone()
+                    } else {
+                        entry.title.clone()
+                    }),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(div().flex_1().min_w_0().truncate().child(
+                        if entry.thread_title.trim().is_empty() {
+                            entry.thread_id.clone()
+                        } else {
+                            entry.thread_title.clone()
+                        },
+                    ))
+                    .child((self.labels.format_time)(entry.completed_at)),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .text_xs()
+                    .child(status.clone())
+                    .child(div().text_color(cx.theme().muted_foreground).child(
+                        if item.is_actionable() {
+                            self.labels.unread.clone()
+                        } else {
+                            self.labels.read.clone()
+                        },
+                    )),
+            )
+            .child(div().text_xs().truncate().child(summary))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new(format!("open-task-inbox-{open_id}"))
+                            .ghost()
+                            .small()
+                            .label(self.labels.open.clone())
+                            .disabled(busy)
+                            .on_click(cx.listener(move |view, _, _, _| {
+                                view.open(open_id.clone(), revision)
+                            })),
+                    )
+                    .when(item.is_actionable(), |this| {
+                        this.child(
+                            Button::new(format!("read-task-inbox-{read_id}"))
+                                .ghost()
+                                .small()
+                                .label(self.labels.mark_read.clone())
+                                .disabled(busy)
+                                .on_click(cx.listener(move |view, _, _, _| {
+                                    view.dismiss(read_id.clone(), revision)
+                                })),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+}
 impl Render for TaskNotificationView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let unread = self.input.as_ref().map_or(0, |p| {
-            p.items().iter().filter(|i| i.is_actionable()).count()
-        });
-        let notifications = self
-            .input
-            .as_ref()
-            .map(|p| p.items().iter().take(20).cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        let loading = self.input.as_ref().is_some_and(|p| p.is_loading());
-        let error = self
-            .input
-            .as_ref()
-            .and_then(|p| p.error().map(str::to_owned));
+        let unread = self.input.as_ref().map_or(0, |p| p.unread_count());
         let labels = self.labels.clone();
-        let view = cx.weak_entity();
+        let owner = cx.weak_entity();
+        let open_owner = owner.clone();
         div()
             .track_focus(&self.focus)
             .key_context("TaskNotifications")
@@ -383,25 +609,26 @@ impl Render for TaskNotificationView {
                 view.dismiss(action.notification_id.clone(), action.revision)
             }))
             .on_action(cx.listener(|view, action: &OpenTask, _, _| {
-                if let Some(workspace_id) = &view.workspace {
-                    view.client.dispatch(ClientIntent::TaskNotification {
-                        intent: TaskNotificationIntent::Open {
-                            workspace_id: workspace_id.clone(),
-                            notification_id: action.notification_id.clone(),
-                            revision: action.revision,
-                        },
-                    });
-                }
+                view.open(action.notification_id.clone(), action.revision)
             }))
             .child(
                 Popover::new("task-user-notifications-popover")
                     .anchor(Anchor::TopRight)
+                    .open(self.inbox_open)
+                    .track_focus(&self.inbox_focus)
+                    .on_open_change(move |open, _, cx| {
+                        let _ = open_owner.update(cx, |view, cx| {
+                            view.inbox_open = *open;
+                            cx.notify();
+                        });
+                    })
                     .trigger(
                         Button::new("task-user-notifications-trigger")
                             .ghost()
                             .small()
                             .compact()
                             .tooltip(labels.title.clone())
+                            .accessibility_label(labels.title.clone())
                             .child(
                                 h_flex()
                                     .gap_1()
@@ -414,85 +641,177 @@ impl Render for TaskNotificationView {
                                         this.child(
                                             div()
                                                 .text_xs()
-                                                .text_color(cx.theme().blue)
+                                                .text_color(cx.theme().primary)
                                                 .child(unread.to_string()),
                                         )
                                     }),
                             ),
                     )
-                    .content(move |_, _, cx| {
+                    .content(move |_, window, cx| {
+                        let Some(owner) = owner.upgrade() else {
+                            return div().into_any_element();
+                        };
+                        let view = owner.read(cx);
+                        let input = view.input.clone();
+                        let scroll = view.scroll.clone();
+                        let focus = view.inbox_focus.clone();
                         let labels = labels.clone();
-                        let view = view.clone();
+                        let loading = input.as_ref().is_some_and(|p| p.is_loading());
+                        let failed = input.as_ref().is_some_and(|p| p.error().is_some());
+                        let count = input.as_ref().map_or(0, |p| p.items().len());
+                        let more = input.as_ref().is_some_and(|p| p.next_cursor().is_some());
+                        // Fixed row geometry follows interface zoom. Only visible
+                        // rows create elements; run IDs retain each control's identity.
+                        let sizes =
+                            std::rc::Rc::new(vec![
+                                size(Pixels::ZERO, window.rem_size() * 8.);
+                                count
+                            ]);
+                        let retry_owner = owner.downgrade();
+                        let more_owner = owner.downgrade();
                         v_flex()
-                            .w(px(380.))
-                            .max_h(px(460.))
+                            .track_focus(&focus)
+                            .key_context("TaskCompletionInbox")
+                            .on_action(window.listener_for(
+                                &owner,
+                                |view, _: &NextResult, window, cx| {
+                                    view.inbox_focus.focus(window, cx);
+                                    view.move_selection(1, cx);
+                                },
+                            ))
+                            .on_action(window.listener_for(
+                                &owner,
+                                |view, _: &PreviousResult, window, cx| {
+                                    view.inbox_focus.focus(window, cx);
+                                    view.move_selection(-1, cx);
+                                },
+                            ))
+                            .on_action(window.listener_for(
+                                &owner,
+                                |view, _: &OpenSelectedResult, window, cx| {
+                                    // Preserve Enter activation on focused row buttons.
+                                    if !view.inbox_focus.is_focused(window) {
+                                        cx.propagate();
+                                        return;
+                                    }
+                                    let selected = view
+                                        .input
+                                        .as_ref()
+                                        .and_then(|input| {
+                                            input.items().iter().find(|item| {
+                                                Some(item.notification().run_id.as_str())
+                                                    == view.selected_run.as_deref()
+                                            })
+                                        })
+                                        .cloned();
+                                    if let Some(item) = selected {
+                                        view.open(
+                                            item.notification().run_id.clone(),
+                                            item.revision(),
+                                        );
+                                    }
+                                },
+                            ))
+                            .w_96()
                             .gap_2()
-                            .p_2()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .child(labels.title.clone()),
+                            )
                             .when(loading, |this| {
                                 this.child(
-                                    div().text_xs().opacity(0.6).child(labels.loading.clone()),
+                                    div()
+                                        .px_2()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(labels.loading.clone()),
                                 )
                             })
-                            .when_some(error.clone(), |this, error| {
+                            .when(failed, |this| {
                                 this.child(
-                                    div().text_xs().text_color(cx.theme().danger).child(error),
+                                    v_flex()
+                                        .px_2()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().danger)
+                                                .child(labels.loading_failed.clone()),
+                                        )
+                                        .child(
+                                            Button::new("retry-task-inbox")
+                                                .ghost()
+                                                .small()
+                                                .label(labels.retry.clone())
+                                                .on_click(move |_, _, cx| {
+                                                    let _ = retry_owner
+                                                        .update(cx, |view, _| view.refresh());
+                                                }),
+                                        ),
                                 )
                             })
-                            .when(notifications.is_empty() && !loading, |this| {
-                                this.child(div().text_xs().opacity(0.6).child(labels.empty.clone()))
+                            .when(count == 0 && !loading && !failed, |this| {
+                                this.child(
+                                    div()
+                                        .p_2()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(labels.empty.clone()),
+                                )
                             })
-                            .children(notifications.iter().map(|item| {
-                                let notification = item.notification();
-                                let id = notification.notification_id.clone();
-                                let revision = item.revision();
-                                let view = view.clone();
-                                let summary = notification
-                                    .result
-                                    .as_ref()
-                                    .map(|r| {
-                                        r.summary
-                                            .clone()
-                                            .unwrap_or_else(|| labels.completed.clone())
-                                    })
-                                    .unwrap_or_else(|| {
-                                        notification
-                                            .error
-                                            .as_ref()
-                                            .map(|e| e.error.message.clone())
-                                            .unwrap_or_else(|| labels.completed.clone())
-                                    });
-                                v_flex()
-                                    .w_full()
-                                    .gap_1()
-                                    .p_2()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(cx.theme().border)
-                                    .child(div().text_xs().font_semibold().child(format!(
-                                        "{} · {}",
-                                        labels.task, notification.task_id
-                                    )))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .line_height(relative(1.3))
-                                            .whitespace_normal()
-                                            .child(summary),
-                                    )
-                                    .when(item.is_actionable(), |this| {
-                                        this.child(
-                                            Button::new(format!("ack-task-notification-{id}"))
-                                                .ghost()
-                                                .xsmall()
-                                                .label(labels.mark_read.clone())
-                                                .on_click(move |_, _, cx| {
-                                                    let _ = view.update(cx, |view, _| {
-                                                        view.dismiss(id.clone(), revision)
-                                                    });
-                                                }),
+                            .when(count > 0, |this| {
+                                this.child(
+                                    div()
+                                        .h_80()
+                                        .w_full()
+                                        .relative()
+                                        .child(
+                                            v_virtual_list(
+                                                owner.clone(),
+                                                "task-inbox-list",
+                                                sizes,
+                                                |view, range, _, cx| {
+                                                    let Some(input) = view.input.clone() else {
+                                                        return Vec::new();
+                                                    };
+                                                    range
+                                                        .filter_map(|ix| {
+                                                            input.items().get(ix).map(|item| {
+                                                                view.render_row(item, cx)
+                                                            })
+                                                        })
+                                                        .collect::<Vec<_>>()
+                                                },
+                                            )
+                                            .track_scroll(&scroll),
                                         )
-                                    })
-                            }))
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .top_0()
+                                                .right_0()
+                                                .bottom_0()
+                                                .child(Scrollbar::vertical(&scroll)),
+                                        ),
+                                )
+                            })
+                            .when(more, |this| {
+                                this.child(
+                                    Button::new("more-task-inbox")
+                                        .ghost()
+                                        .small()
+                                        .label(labels.more.clone())
+                                        .disabled(loading)
+                                        .on_click(move |_, _, cx| {
+                                            let _ =
+                                                more_owner.update(cx, |view, _| view.load_more());
+                                        }),
+                                )
+                            })
+                            .into_any_element()
                     }),
             )
     }

@@ -206,6 +206,14 @@ pub struct PendingRequestUserInputQuestion {
     pub is_secret: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_schema: Option<serde_json::Value>,
+    #[serde(default)]
+    pub multiple: bool,
+    #[serde(default = "default_allow_custom_answer")]
+    pub allow_custom: bool,
+}
+
+fn default_allow_custom_answer() -> bool {
+    true
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -364,12 +372,12 @@ fn cli_runtime_request_supports_session_approval(request: &PendingRequest) -> bo
         .unwrap_or(false)
 }
 
-pub fn pending_request_answered_resolution(
-    answers: impl IntoIterator<Item = (String, String)>,
+pub fn pending_request_answered_resolution<A: Into<JsonValue>>(
+    answers: impl IntoIterator<Item = (String, A)>,
 ) -> PendingRequestResolution {
     let mut answer_map = JsonMap::new();
     for (id, answer) in answers {
-        answer_map.insert(id, JsonValue::String(answer));
+        answer_map.insert(id, answer.into());
     }
 
     PendingRequestResolution::Answered {
@@ -1098,6 +1106,14 @@ fn cli_runtime_user_input_questions(
                 options,
                 is_secret,
                 value_schema: None,
+                multiple: value
+                    .get("multiple")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false),
+                allow_custom: value
+                    .get("isOther")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(true),
             }
         })
         .collect()
@@ -2023,5 +2039,22 @@ mod tests {
 
         assert_eq!(state.requests().len(), 1);
         assert_eq!(state.requests()[0].request_id, "req_b");
+    }
+    #[test]
+    fn user_input_selection_flags_default_compatibly_and_preserve_opencode_constraints() {
+        let payload = serde_json::json!({"questions":[
+            {"id":"legacy","question":"Answer"},
+            {"id":"multiple","question":"Choose","multiple":true,"isOther":false,"options":[{"label":"A"},{"label":"B"}]}
+        ]});
+        let questions = super::cli_runtime_user_input_questions(Some(&payload));
+        assert!(!questions[0].multiple && questions[0].allow_custom);
+        assert!(questions[1].multiple && !questions[1].allow_custom);
+        let resolution = super::pending_request_answered_resolution([(
+            "multiple".into(),
+            serde_json::json!(["A", "B"]),
+        )]);
+        assert!(
+            matches!(resolution, super::PendingRequestResolution::Answered {response: Some(value)} if value["answers"]["multiple"] == serde_json::json!(["A","B"]))
+        );
     }
 }

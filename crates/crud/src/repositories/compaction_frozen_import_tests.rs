@@ -249,7 +249,9 @@ async fn prepared(store: &CrudStore, manifest: &str, source: SourceRef) -> Prepa
         destination: "child".into(),
         output_digest: String::new(),
         original_json: String::new(),
+        archive_guards: None,
         record: FrozenImportRecord {
+            preview_archive: None,
             message_ordinal: 0,
             source_thread: "source-thread".into(),
             source,

@@ -53,11 +53,14 @@ pub(super) async fn make_summarizer(
     let proxy = processor
         .prepare_cli_runtime_proxy_url(workspace, &instance.id)
         .await?;
+    let opencode_data_home = (selection.transport == Transport::OpenCode)
+        .then(|| processor.opencode_managed_data_home(&instance));
     make_cli_summarizer(
         instance,
         selection,
         crate::cli_runtime::config::proxy_env(proxy.as_deref()),
         Some((store.clone(), workspace.into())),
+        opencode_data_home,
     )
 }
 
@@ -66,6 +69,7 @@ fn make_cli_summarizer(
     selection: ModelSelection,
     environment: pioneer_cli_agent_runtime::process::SensitiveEnvironment,
     usage_scope: Option<(pioneer_crud::CrudStore, String)>,
+    opencode_data_home: Option<std::path::PathBuf>,
 ) -> Result<Arc<dyn Summarizer>> {
     ensure!(
         instance.id == selection.instance,
@@ -81,6 +85,7 @@ fn make_cli_summarizer(
         ),
         GatewayCliAgentRuntimeKindConfig::Codex => Transport::Codex,
         GatewayCliAgentRuntimeKindConfig::Claude => Transport::Claude,
+        GatewayCliAgentRuntimeKindConfig::OpenCode => Transport::OpenCode,
     };
     ensure!(
         kind == selection.transport,
@@ -104,9 +109,29 @@ fn make_cli_summarizer(
             "anthropic",
         ),
         Transport::Acp => anyhow::bail!("ACP is not a native summary service"),
+        Transport::OpenCode => (
+            CliService::OpenCode(
+                crate::cli_runtime::opencode_session::OpenCodeSummaryService::new(
+                    instance,
+                    environment,
+                    opencode_data_home.ok_or_else(|| {
+                        anyhow::anyhow!("OpenCode V2 summary data home is unavailable")
+                    })?,
+                ),
+            ),
+            "opencode",
+        ),
         Transport::Api => unreachable!(),
     };
-    let limits = pioneer_provider::catalog::model_catalog()?.limits(catalog, &selection.model);
+    let (catalog, catalog_model) = if kind == Transport::OpenCode {
+        selection
+            .model
+            .split_once('/')
+            .unwrap_or((catalog, &selection.model))
+    } else {
+        (catalog, selection.model.as_str())
+    };
+    let limits = pioneer_provider::catalog::model_catalog()?.limits(catalog, catalog_model);
     Ok(Arc::new(CliSummarizer {
         usage_scope,
         selection,
@@ -122,6 +147,7 @@ fn make_cli_summarizer(
 enum CliService {
     Codex(CodexService),
     Claude(ClaudeService),
+    OpenCode(crate::cli_runtime::opencode_session::OpenCodeSummaryService),
 }
 struct CliSummarizer {
     usage_scope: Option<(pioneer_crud::CrudStore, String)>,
@@ -312,6 +338,7 @@ impl Summarizer for CliSummarizer {
             provider: Some(
                 match self.selection.transport {
                     Transport::Codex => "codex-cli",
+                    Transport::OpenCode => "opencode-cli",
                     _ => "claude-cli",
                 }
                 .into(),
@@ -320,6 +347,7 @@ impl Summarizer for CliSummarizer {
             api: Some(
                 match self.selection.transport {
                     Transport::Codex => "codex_exec_json",
+                    Transport::OpenCode => "opencode_http",
                     _ => "claude_print_json",
                 }
                 .into(),
@@ -339,6 +367,10 @@ impl Summarizer for CliSummarizer {
         };
         let completion = async {
         let (text, input_tokens, output_tokens, raw) = match &self.service {
+            CliService::OpenCode(service) => service.summarize(request.selection.model, request.selection.effort, INSTRUCTIONS, input, timeout).await.map_err(|error| {
+                if let Some(usage)=error.downcast_ref::<pioneer_cli_agent_runtime::service::ObservedServiceUsage>() { apply_cli_usage(&mut observed,&usage.0); }
+                failure(error)
+            })?,
             CliService::Codex(service) => {
                 let result = service
                     .summarize(
@@ -377,10 +409,7 @@ impl Summarizer for CliSummarizer {
                 (result.text, result.input_tokens, result.output_tokens, result.observed_usage)
             }
         };
-        apply_cli_usage(&mut observed, &raw);
-        observed.input_tokens=input_tokens;
-        observed.output_tokens=output_tokens;
-        Ok(SummaryCompletion {text,kind:CompletionKind::Complete,input_tokens,output_tokens})
+        Ok(finish_cli_summary(&mut observed, text, input_tokens, output_tokens, &raw))
         }.await;
         if let Some(call) = call {
             call.record(
@@ -400,8 +429,31 @@ impl Summarizer for CliSummarizer {
         match &self.service {
             CliService::Codex(service) => service.cleanup().await,
             CliService::Claude(service) => service.cleanup().await,
+            CliService::OpenCode(service) => service.cleanup().await,
         }
         .map_err(failure)
+    }
+}
+
+// OpenCode supplies normalized Pioneer totals and the exclusive native
+// breakdown together. Keep SummaryCompletion and the journal on that boundary.
+pub(crate) fn finish_cli_summary(
+    observed: &mut pioneer_provider::TokenUsage,
+    text: String,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    raw: &serde_json::Value,
+) -> SummaryCompletion {
+    apply_cli_usage(observed, raw);
+    if observed.provider.as_deref() != Some("opencode-cli") {
+        observed.input_tokens = input_tokens;
+        observed.output_tokens = output_tokens;
+    }
+    SummaryCompletion {
+        text,
+        kind: CompletionKind::Complete,
+        input_tokens: observed.input_tokens,
+        output_tokens: observed.output_tokens,
     }
 }
 
@@ -409,7 +461,12 @@ pub(crate) fn apply_cli_usage(
     observed: &mut pioneer_provider::TokenUsage,
     raw: &serde_json::Value,
 ) {
-    observed.uncached_input_tokens = raw["input_tokens"].as_u64();
+    let opencode = observed.provider.as_deref() == Some("opencode-cli");
+    observed.uncached_input_tokens = if opencode {
+        raw["uncached_input_tokens"].as_u64()
+    } else {
+        raw["input_tokens"].as_u64()
+    };
     observed.cache_read_input_tokens = raw["cache_read_input_tokens"]
         .as_u64()
         .or_else(|| raw["cached_input_tokens"].as_u64());
@@ -424,7 +481,7 @@ pub(crate) fn apply_cli_usage(
     } else {
         raw["input_tokens"].as_u64()
     };
-    if !claude {
+    if !claude && !opencode {
         observed.uncached_input_tokens = None;
     }
     observed.output_tokens = raw["output_tokens"].as_u64();
@@ -436,7 +493,9 @@ pub(crate) fn apply_cli_usage(
         .flatten();
     observed.reasoning_tokens = codex_reasoning.or_else(|| raw["reasoning_tokens"].as_u64());
     observed.semantics = Some(
-        if claude {
+        if opencode {
+            "opencode_v2_exclusive_cache_separate_reasoning"
+        } else if claude {
             "exclusive_cache"
         } else {
             "cli_native"
@@ -731,6 +790,7 @@ print(json.dumps([{'type':'system','subtype':'init','model':'claude-sonnet-4-6'}
             selection.clone(),
             SensitiveEnvironment::new(),
             None,
+            None,
         )
         .unwrap();
         let request = SummaryRequest {
@@ -764,6 +824,8 @@ print(json.dumps([{'type':'system','subtype':'init','model':'claude-sonnet-4-6'}
         );
         let mut wrong = selection;
         wrong.transport = Transport::Codex;
-        assert!(make_cli_summarizer(instance, wrong, SensitiveEnvironment::new(), None).is_err());
+        assert!(
+            make_cli_summarizer(instance, wrong, SensitiveEnvironment::new(), None, None).is_err()
+        );
     }
 }

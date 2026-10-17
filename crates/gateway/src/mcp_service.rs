@@ -3275,6 +3275,13 @@ impl McpService {
                     "HTML Gateway handler is unavailable",
                 )
             })?;
+        // Includes all three image reads and MCP result construction, even if
+        // terminal cancellation releases the durable runtime in parallel.
+        let _activity = tokio::select! { biased;
+            _ = cancel.cancelled() => return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::Cancelled, "HTML image delivery was cancelled")),
+            guard = processor.artifact_service.html_preview_activity() => guard,
+        };
         let context = pioneer_agent::TurnToolContext {
             workspace_id: validated.invocation.workspace_id.clone(),
             thread_id: validated.invocation.thread_id.clone(),

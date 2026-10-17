@@ -909,6 +909,7 @@ struct DemandState {
 }
 
 struct PendingPlatformEffect {
+    published_at: std::time::Instant,
     plan: ClientEffectPlan,
     reply: std::sync::mpsc::Sender<ClientEffectResult>,
 }
@@ -1258,6 +1259,23 @@ impl ClientCore {
         event: crate::gateway::session_lifecycle::SessionLifecycleEvent,
         invalidate_suspended_identity: bool,
     ) -> crate::gateway::session_controller::GatewaySessionTransition {
+        self.reduce_gateway_session_lifecycle_with_diagnostic(
+            endpoint_id,
+            event,
+            invalidate_suspended_identity,
+            None,
+        )
+    }
+
+    pub(crate) fn reduce_gateway_session_lifecycle_with_diagnostic(
+        &self,
+        endpoint_id: &str,
+        event: crate::gateway::session_lifecycle::SessionLifecycleEvent,
+        invalidate_suspended_identity: bool,
+        terminal_outcome: Option<
+            &mut Option<crate::gateway::session_controller::SessionDiagnosticTerminalOutcome>,
+        >,
+    ) -> crate::gateway::session_controller::GatewaySessionTransition {
         if self.is_stopped() {
             return crate::gateway::session_controller::GatewaySessionTransition::stopped();
         }
@@ -1281,7 +1299,17 @@ impl ClientCore {
             return crate::gateway::session_controller::GatewaySessionTransition::stopped();
         }
         let before = owner.publication();
+        let diagnostic_before = terminal_outcome
+            .as_ref()
+            .map(|_| owner.diagnostic_identity(endpoint_id));
         let result = owner.reduce(endpoint_id, event);
+        if let (Some(receipt), Some(diagnostic_before)) = (terminal_outcome, diagnostic_before) {
+            crate::gateway::session_controller::SessionDiagnosticTerminalOutcome::record(
+                receipt,
+                diagnostic_before,
+                owner.diagnostic_identity(endpoint_id),
+            );
+        }
         if before == owner.publication() {
             return result;
         }
@@ -1436,6 +1464,21 @@ impl ClientCore {
 
     pub fn watch_publications(&self) -> tokio::sync::watch::Receiver<ClientChangeSequence> {
         self.publication_signal.subscribe()
+    }
+
+    /// Process-local enqueue time for native shell queue diagnostics. Not part of the wire plan.
+    /// Repeated publications retain the original instant; retired plans return None.
+    pub fn native_effect_published_at(
+        &self,
+        plan: &ClientEffectPlan,
+    ) -> Option<std::time::Instant> {
+        self.partitions
+            .lock()
+            .expect("client partitions poisoned")
+            .platform_effects
+            .get(plan.operation_id())
+            .filter(|pending| pending.plan.generation() == plan.generation())
+            .map(|pending| pending.published_at)
     }
 
     pub fn wait_for_publications(&self, after: ClientChangeSequence) -> ClientPublicationBatch {
@@ -2311,10 +2354,16 @@ impl ClientCore {
                 ClientOperationId::new(format!("gateway-session-storage/{}", generation.get()))
                     .expect("nonempty operation identity");
             let plan = ClientEffectPlan::new(id.clone(), generation, effect);
+            let published_at = std::time::Instant::now();
             self.commit_publications(&mut partitions, vec![], vec![plan.clone()]);
-            partitions
-                .platform_effects
-                .insert(id, PendingPlatformEffect { plan, reply });
+            partitions.platform_effects.insert(
+                id,
+                PendingPlatformEffect {
+                    plan,
+                    reply,
+                    published_at,
+                },
+            );
             self.publication_ready.notify_all();
         }
         received
@@ -3174,6 +3223,34 @@ mod tests {
             }
         }
         panic!("storage effect was not delivered");
+    }
+
+    #[test]
+    fn native_effect_enqueue_time_survives_republication_and_retires_with_plan() {
+        let core = Arc::new(ClientCore::new());
+        let worker_core = core.clone();
+        let before = std::time::Instant::now();
+        let worker =
+            std::thread::spawn(move || worker_core.request_platform_effect(storage_read_effect()));
+        let plan = next_storage_effect(&core);
+        let published = core.native_effect_published_at(&plan).unwrap();
+        assert!(published >= before && published <= std::time::Instant::now());
+        let repeated = next_storage_effect(&core);
+        assert_eq!(core.native_effect_published_at(&repeated), Some(published));
+        let stale = ClientEffectPlan::new(
+            plan.operation_id().clone(),
+            ClientGeneration::new(plan.generation().get() + 1),
+            storage_read_effect(),
+        );
+        assert_eq!(core.native_effect_published_at(&stale), None);
+        core.complete_effect(ClientEffectCompletion::new(
+            plan.operation_id().clone(),
+            plan.generation(),
+            ClientEffectResult::GatewaySessionEnvelopeLoaded { envelope: None },
+        ));
+        worker.join().unwrap().unwrap();
+        assert_eq!(core.native_effect_published_at(&plan), None);
+        core.shutdown();
     }
 
     #[test]

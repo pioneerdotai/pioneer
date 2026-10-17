@@ -82,7 +82,9 @@ impl CLIRuntimeInstructionDelivery {
         let validated = CLIRuntimeElevatedInstructions::try_new(text, fingerprint)?;
         Ok(match kind {
             CLIAgentRuntimeKind::Acp => Self::UserContext(CLIUserContext(validated)),
-            CLIAgentRuntimeKind::Codex | CLIAgentRuntimeKind::Claude => Self::Elevated(validated),
+            CLIAgentRuntimeKind::Codex
+            | CLIAgentRuntimeKind::Claude
+            | CLIAgentRuntimeKind::OpenCode => Self::Elevated(validated),
         })
     }
 
@@ -130,6 +132,7 @@ impl From<CLIRuntimeElevatedInstructions> for CLIRuntimeInstructionDelivery {
 pub enum CLIRuntimeElevatedInstructionTransport {
     CodexTurnCollaborationMode,
     ClaudeAppendSystemPromptFile,
+    OpenCodeInstructionEntry,
 }
 
 impl CLIRuntimeElevatedInstructionTransport {
@@ -137,6 +140,7 @@ impl CLIRuntimeElevatedInstructionTransport {
         match kind {
             CLIAgentRuntimeKind::Codex => Some(Self::CodexTurnCollaborationMode),
             CLIAgentRuntimeKind::Claude => Some(Self::ClaudeAppendSystemPromptFile),
+            CLIAgentRuntimeKind::OpenCode => Some(Self::OpenCodeInstructionEntry),
             CLIAgentRuntimeKind::Acp => None,
         }
     }
@@ -145,6 +149,7 @@ impl CLIRuntimeElevatedInstructionTransport {
         match self {
             Self::CodexTurnCollaborationMode => "codex_turn_collaboration_mode",
             Self::ClaudeAppendSystemPromptFile => "claude_append_system_prompt_file",
+            Self::OpenCodeInstructionEntry => "opencode_instruction_entry",
         }
     }
 }

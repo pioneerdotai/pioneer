@@ -48,9 +48,18 @@ impl std::fmt::Display for GatewayRegistryReconfigurationRequired {
 
 impl std::error::Error for GatewayRegistryReconfigurationRequired {}
 
+#[cfg(test)]
 pub(crate) fn load_registry_for_runtime(
     path: &Path,
     config: &AppConfig,
+) -> Result<LoadedGatewayRegistry> {
+    load_registry_for_runtime_traced(path, config, None)
+}
+
+pub(crate) fn load_registry_for_runtime_traced(
+    path: &Path,
+    config: &AppConfig,
+    trace: Option<&pioneer_observability::DesktopStartupTrace>,
 ) -> Result<LoadedGatewayRegistry> {
     let mut registry = if path.exists() {
         let path_display = path.display().to_string();
@@ -85,7 +94,11 @@ pub(crate) fn load_registry_for_runtime(
 
     normalize_registry(&mut registry, config)?;
     ensure_installation_id(&mut registry);
-    save_registry(path, &registry)?;
+    super::onboarding_platform::observe_preconnect(
+        trace,
+        pioneer_observability::DesktopStartupStage::GatewayRegistrySave,
+        || save_registry(path, &registry),
+    )?;
 
     Ok(LoadedGatewayRegistry { registry })
 }

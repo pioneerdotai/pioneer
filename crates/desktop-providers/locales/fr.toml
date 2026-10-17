@@ -33,6 +33,8 @@ proxy_hint = "Optional workspace-scoped proxy for this provider."
 replace_hint = "Une clé est déjà configurée pour %{provider}. L'enregistrement la remplacera."
 
 [providers.error]
+configure_failed = "Impossible d’enregistrer les paramètres de %{provider}"
+disconnect_failed = "Impossible de supprimer la clé API de %{provider}"
 gateway_not_connected = "La passerelle n'est pas connectée."
 workspace_not_selected = "Aucun espace de travail sélectionné."
 load_failed = "Échec du chargement de la configuration des fournisseurs"
@@ -127,6 +129,12 @@ unsupported = "Unsupported"
 error = "Error"
 
 [providers.cli.error]
+settings_load_failed = "Impossible de charger les paramètres des fournisseurs CLI"
+settings_forbidden = "Ce compte ne peut pas gérer les paramètres de Gateway"
+login_failed = "Impossible de lancer la connexion à %{runtime}"
+proxy_failed = "Impossible de modifier le proxy de %{runtime}"
+save_failed = "Impossible d’enregistrer les paramètres de %{runtime}"
+enabled_failed = "Impossible d’activer ou de désactiver %{runtime}"
 open_path_failed = "Open path failed"
 
 [providers.catalog.anthropic]

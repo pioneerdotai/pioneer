@@ -114,6 +114,7 @@ const fn runtime_kind_label(runtime_kind: CLIAgentRuntimeKind) -> &'static str {
         CLIAgentRuntimeKind::Codex => "codex",
         CLIAgentRuntimeKind::Claude => "claude",
         pioneer_protocol::CLIAgentRuntimeKind::Acp => "acp",
+        CLIAgentRuntimeKind::OpenCode => "opencode",
     }
 }
 

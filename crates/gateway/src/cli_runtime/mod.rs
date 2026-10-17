@@ -16,6 +16,8 @@ pub(crate) mod input_mapping;
 pub(crate) mod instruction_projection;
 pub(crate) mod manager;
 pub(crate) mod mcp;
+pub(crate) mod opencode_mcp;
+pub(crate) mod opencode_session;
 pub(crate) mod permissions;
 pub(crate) mod projector;
 pub(crate) mod session_instance;

@@ -1703,6 +1703,14 @@ task = "タスク"
 mark_read = "既読にする"
 completed = "タスクが完了しました"
 
+open = "スレッドを開く"
+more = "さらに読み込む"
+read = "既読"
+unread = "未読"
+retry = "再試行"
+loading_failed = "タスクの結果を読み込めませんでした"
+timed_out = "タイムアウト"
+
 [settings.self_improvement.status]
 title = "アクティビティ"
 refresh = "更新"
