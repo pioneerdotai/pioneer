@@ -227,7 +227,9 @@ node ./node_modules/jest/bin/jest.js --runInBand src/services/telemetry/mobile-s
    применения ready input в composer текущих thread/draft/provider/workspace.
    Отсутствующий/disabled/missing_binary/needs_auth/unsupported_version runtime —
    setup_required, spawn_failed/degraded/error — degraded, request cancellation —
-   cancelled; discovery loading остаётся pending. Ошибки и отмена не смешаны.
+   cancelled. Обязательное discovery loading остаётся pending; повторное
+   discovery loading/failed при сохранённых Ready prerequisites не блокирует
+   готовый composer (уточнение следующего ревью ниже). Ошибки и отмена не смешаны.
    Подписка provider_runtime только получает публикации: этот scope исключён
    из setScopeDemand, FFI acquire лишь lease существующей publication queue.
    Нет observe/refresh/load или нового ProviderRuntimeDemand. После завершения
@@ -283,6 +285,69 @@ runtime результаты и ускорение по-прежнему не п
 cargo test --locked -p pioneer-client workspaces::directory::tests
 node ./node_modules/jest/bin/jest.js --runInBand src/services/telemetry/mobile-startup-tree-observation.test.ts src/services/telemetry/thread-opening-composer.test.ts src/services/telemetry/thread-opening-runtime.test.tsx src/services/telemetry/thread-opening.test.ts src/hooks/use-thread-tree-startup.test.tsx
 bun test src/client/mobile-client-binding.test.ts
+```
+
+## Следующее повторное ревью: runtime rediscovery и отмена pending Ready
+
+Продолжение commits Rust `66119515ec7cd8bffed761d5581d128e84022900`
+и Mobile `080dd0a5d433931113d7f79251533dfe313e6984`, без переписывания истории.
+
+1. **Повторное runtime discovery.** Helper проверял request state раньше
+   принятой runtime row и применённых composer inputs. По фактическому контракту
+   `providers/runtime.rs` Loading/Failed сохраняют принятые rows, а
+   `composer/runtime_selection.rs` вычисляет selected_provider_ready по ним
+   независимо от request state. Теперь matching workspace/thread/draft/provider,
+   текущая enabled Ready row и оба применённых ready flags допускают Ready при
+   повторном Loading/Failed. Текущая Initializing row остаётся pending, новая
+   unavailable/error row имеет прежний terminal outcome даже при старой
+   позволяющей composer projection. Без доступных prerequisites обязательный
+   discovery failure остаётся degraded, loading — pending; Ready row без
+   применённых inputs остаётся pending даже при Failed повторного discovery.
+   Cancellation не обходит owner contract:
+   retirement composer отменяет его inputs; provider cancellation остаётся
+   cancelled, а authorization invalidation очищает rows. Message и scope guards
+   сохранены. Rust retry, Send semantics и загрузки не менялись.
+2. **Отмена до окончания shell reveal.** `complete` раньше игнорировал любой
+   outcome после первого pending outcome. Теперь единственное дополнительное
+   разрешённое замещение — pending ready → cancelled до финализации. Поздний
+   ready не меняет cancelled; finalize по-прежнему экспортирует один отчёт.
+   Условия снятия splash, два RAF, hide promise, failure и deadline пути не
+   менялись. Это не продлевает lifetime observers и не создаёт новых подписок.
+
+Добавлены/исправлены regressions в `thread-opening-composer.test.ts`: холодный
+failed discovery без rows, повторные Loading/Failed с retained Ready row и
+применёнными inputs, ещё не применённые inputs, текущие Initializing/unavailable/
+error rows, несовпавший workspace, composer owner retirement с retained rows
+другого owner и authorization invalidation без rows. В `mobile-startup.test.ts`
+добавлены Ready → cancelled до двух RAF и во время незавершённого hide promise,
+поздний Ready и повторные complete/deadline без дополнительного отчёта.
+Fixtures используют существующие generated publication/request/status shapes,
+fake timers и управляемый promise, без sleep и выполнения тестов.
+
+Самоаудит до исправлений проследил producers/consumers и различие между
+ретайрментом owner, повторным discovery и authorization invalidation. После
+каждого изменения проверены pending/terminal состояния, текущий scope,
+неизменность подписок и отсутствие новых domain operations. Весь итоговый diff
+обоих репозиториев относительно первоначальных base SHA перечитан, включая
+первоначальную реализацию, тесты и этот отчёт. В этом раунде Rust code не менялся;
+вне mobile telemetry изменён только отчёт.
+Итоговый самоаудит дополнительно сохранил pending между Ready row и применением
+composer inputs даже при failed повторного discovery; регрессия покрывает оба
+ready flags отдельно для Loading и Failed.
+
+Фактически выполнены Prettier затронутых TS и `git diff --check` обоих
+репозиториев. `tsc --noEmit --pretty false --preserveSymlinks` снова завершился
+с теми же восемью baseline diagnostics; нормализованный multiset совпадает,
+новых диагностик нет. `boundary-integrity.mjs check-source` с явным
+`PIONEER_RUST_ROOT` подтвердил пару; schemas, bindings и source fingerprints
+в этом раунде не изменились. Cargo checks и schema generation повторно не
+запускались: Rust code и boundary source-контракт не менялись. Native/runtime
+проверки не выполнялись; совместимость старых artifacts и ускорение не заявляются.
+
+Будущая команда после принятия всей реализации внешним ревьюером (не запускалась):
+
+```sh
+node ./node_modules/jest/bin/jest.js --runInBand src/services/telemetry/mobile-startup.test.ts src/services/telemetry/thread-opening-composer.test.ts
 ```
 
 ## Затронутые файлы относительно исходных base SHA
