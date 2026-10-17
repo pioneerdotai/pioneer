@@ -1137,6 +1137,7 @@ pub async fn replace_turn_input<C: ConnectionTrait>(
 pub(crate) struct PreparedTurnInputProjection {
     turn_id: String,
     rows: Vec<turn_input::ActiveModel>,
+    preview_adoptions: Vec<super::html_preview_retention::PreparedPreviewInputAdoption>,
 }
 
 pub(crate) fn prepare_turn_input_projection(
@@ -1145,7 +1146,23 @@ pub(crate) fn prepare_turn_input_projection(
     created_at: DateTimeWithTimeZone,
 ) -> Result<PreparedTurnInputProjection> {
     let mut rows = Vec::with_capacity(input.len());
+    let mut preview_adoptions = Vec::new();
     for (index, item) in input.iter().enumerate() {
+        if let UserInput::Artifact {
+            artifact_id,
+            version_id,
+        } = item
+        {
+            preview_adoptions.push(
+                super::html_preview_retention::PreparedPreviewInputAdoption::new(
+                    turn_id,
+                    artifact_id,
+                    version_id.as_deref(),
+                    i64::try_from(index).unwrap_or(i64::MAX),
+                    created_at,
+                ),
+            );
+        }
         let (input_type, text) = input_type_and_text(item);
         rows.push(turn_input::ActiveModel {
             id: Set(generate_id(DB_ID_LEN)),
@@ -1162,6 +1179,7 @@ pub(crate) fn prepare_turn_input_projection(
     Ok(PreparedTurnInputProjection {
         turn_id: turn_id.to_owned(),
         rows,
+        preview_adoptions,
     })
 }
 
@@ -1169,6 +1187,9 @@ pub(crate) async fn replace_prepared_turn_input<C: ConnectionTrait>(
     db: &C,
     prepared: PreparedTurnInputProjection,
 ) -> Result<()> {
+    for adoption in &prepared.preview_adoptions {
+        super::html_preview_retention::retain_preview_input(db, adoption).await?;
+    }
     turn_input::Entity::delete_many()
         .filter(turn_input::Column::TurnId.eq(prepared.turn_id))
         .exec(db)

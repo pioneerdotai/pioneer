@@ -1,6 +1,8 @@
 use super::*;
 #[path = "checkpoint_input_alias_tests.rs"]
 mod checkpoint_input_alias_tests;
+#[path = "html_preview_retention_tests.rs"]
+mod html_preview_retention_tests;
 #[path = "invalid_completion_resume_tests.rs"]
 mod invalid_completion_resume_tests;
 #[path = "invalid_completion_tests.rs"]

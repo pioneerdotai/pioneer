@@ -25,7 +25,7 @@ pub use background::CompletedHistoryCheck;
 pub use frozen_import::{CheckpointImportGraphReadObserver, observe_checkpoint_import_graph_reads};
 pub use frozen_import::{
     DeliveryCheckpointImportSource, EMPTY_FROZEN_IMPORT_SHA256, FROZEN_IMPORT_PAGE_BYTES,
-    FrozenImportRecord, PreparedFrozenImport, frozen_import_identity,
+    FrozenImportRecord, PreparedFrozenImport, PreviewArchiveProjection, frozen_import_identity,
 };
 pub use history::{
     AcceptedTaskBasis, ChildHistoryParent, HistoryCausalBoundary, HistoryReadFence,
@@ -1256,7 +1256,7 @@ WHERE
   )
 "#;
 
-fn compaction_sources_current_statement(
+pub(super) fn compaction_sources_current_statement(
     payload: String,
     workspace: &str,
     thread: &str,

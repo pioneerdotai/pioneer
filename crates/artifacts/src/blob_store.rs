@@ -88,8 +88,46 @@ impl AsyncSeek for ArtifactReadHandle {
 
 #[async_trait]
 pub trait ArtifactBlobStore: Send + Sync {
+    /// Hold across filesystem publication and metadata registration, or across
+    /// orphan revalidation and unlink. The guard owns no database resource.
+    async fn acquire_mutation_guard(
+        &self,
+        workspace_id: &str,
+    ) -> ArtifactResult<crate::ArtifactBlobMutationGuard> {
+        crate::blob_mutation::acquire(self.local_artifact_root(), workspace_id).await
+    }
+
+    /// Original immutable content path, when the backend supports it. Temporary
+    /// preview media must not create an additional persistent readable copy.
+    fn local_blob_path(&self, _workspace: &str, _key: &str) -> ArtifactResult<Option<PathBuf>> {
+        Ok(None)
+    }
+
     fn local_artifact_root(&self) -> Option<PathBuf> {
         None
+    }
+
+    /// Carry coordination through outstanding filesystem work on cancellation.
+    /// Defaults support in-memory/test backends; the local backend owns its
+    /// filesystem future through completion, without detached database work.
+    async fn put_bytes_guarded(
+        &self,
+        workspace: &str,
+        input: ArtifactBlobInput,
+        guard: crate::ArtifactBlobMutationGuard,
+    ) -> ArtifactResult<StoredArtifactBlob> {
+        let _guard = guard;
+        self.put_bytes(workspace, input).await
+    }
+
+    async fn delete_unreferenced_guarded(
+        &self,
+        workspace: &str,
+        key: &str,
+        guard: crate::ArtifactBlobMutationGuard,
+    ) -> ArtifactResult<()> {
+        let _guard = guard;
+        self.delete_unreferenced(workspace, key).await
     }
 
     async fn put_bytes(
