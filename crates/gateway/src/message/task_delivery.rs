@@ -243,6 +243,8 @@ impl MessageProcessor {
                 return;
             }
         };
+        self.notify_task_completion_inbox_read(request_context, workspace.workspace_id())
+            .await;
         let response = pioneer_protocol::TaskUserNotificationAcknowledgeResponse { notification };
         match JsonRpcResponse::from_result(request_id.clone(), &response) {
             Ok(response) => {
@@ -1131,7 +1133,7 @@ impl MessageProcessor {
                     item_completed.thread_id.as_str(),
                     item_completed.turn_id.as_str(),
                     &item_completed.item,
-                    None,
+                    Some("completed"),
                 )
                 .await;
                 self.send_notification_to_thread_subscribers(
@@ -1279,7 +1281,7 @@ impl MessageProcessor {
             completed.thread_id.as_str(),
             completed.turn_id.as_str(),
             &completed.item,
-            None,
+            Some("completed"),
         )
         .await;
         Ok(())

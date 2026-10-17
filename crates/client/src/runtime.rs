@@ -644,6 +644,7 @@ pub fn reduce_gateway_notification(
         | GatewayNotification::TaskRecovered(_)
         | GatewayNotification::MemoryChanged(_)
         | GatewayNotification::MemoryCandidateCreated(_)
+        | GatewayNotification::TaskCompletionInboxChanged(_)
         | GatewayNotification::MemoryForgotten(_) => None,
     }
 }

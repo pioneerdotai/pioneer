@@ -6,6 +6,17 @@
     "thread_id": {
       "type": "string"
     },
+    "through_block": {
+      "description": "Exact canonical message viewed by the client. Omission retains the\nlegacy user-message-only Turn anchor.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ThreadReadPosition"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "through_turn_id": {
       "type": "string"
     }
@@ -13,5 +24,22 @@
   "required": [
     "thread_id",
     "through_turn_id"
-  ]
+  ],
+  "$defs": {
+    "ThreadReadPosition": {
+      "type": "object",
+      "properties": {
+        "block_id": {
+          "type": "string"
+        },
+        "sort_key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "block_id",
+        "sort_key"
+      ]
+    }
+  }
 }

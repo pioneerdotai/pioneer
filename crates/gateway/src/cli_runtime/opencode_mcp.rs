@@ -16,8 +16,11 @@ pub(crate) const OPENCODE_MCP_SERVER_NAME: &str = "pioneer";
 const OPENCODE_MCP_TOOL_PREFIX: &str = "pioneer_";
 
 pub(crate) fn projection_limits(mut limits: McpProjectionLimits) -> McpProjectionLimits {
-    // OpenCode adds the server prefix after the facade lists its tools. Reserve
-    // those bytes in the shared, collision-safe canonical name allocator.
+    // V2 McpTool.name/effectiveName use namespace + '_' + the sanitized name
+    // for direct tools (codemode=false). Canonical allocator names already use
+    // only [A-Za-z0-9_-], so sanitization is identity and cannot collide.
+    // V2 imposes no additional name-length limit in Tool.registrationError;
+    // retain Pioneer's shared provider-safe qualified-name budget.
     let qualified_name_limit = McpProjectionLimits::default().max_callable_name_bytes;
     limits.max_callable_name_bytes = limits
         .max_callable_name_bytes
@@ -236,6 +239,8 @@ pub(crate) fn build_opencode_mcp_session_launch_projection(
     }
     let provider_manifest_hash = sha256_json(&json!({
         "provider": "opencode",
+        "serverApi": "v2",
+        "codemode": false,
         "canonicalManifestHash": projection.manifest_hash,
         "providerContractFingerprint": provider_contract_fingerprint,
         "serverName": OPENCODE_MCP_SERVER_NAME,
@@ -409,5 +414,29 @@ mod tests {
         let error = build_opencode_mcp_session_launch_projection(projection, "a".repeat(64))
             .expect_err("unfinalized projection must fail closed");
         assert!(error.to_string().contains("not finalized"));
+    }
+    #[test]
+    fn v2_effective_catalog_requires_exact_names_schemas_and_direct_tools() {
+        use crate::cli_runtime::opencode_session::opencode_catalog_matches;
+        let projection =
+            build_opencode_mcp_session_launch_projection(projection("turn-a"), "b".repeat(64))
+                .unwrap();
+        assert!(
+            !opencode_catalog_matches(&json!([]), Some(&projection)).unwrap(),
+            "connected without the frozen catalog is not ready"
+        );
+        let tool = &projection.canonical_projection.tools[0];
+        let mut catalog = json!([{"id":format!("pioneer_{}",tool.canonical_callable_name),"namespace":"pioneer","codemode":false,"input":tool.input_schema}]);
+        assert!(opencode_catalog_matches(&catalog, Some(&projection)).unwrap());
+        assert!(
+            !opencode_catalog_matches(&catalog, None).unwrap(),
+            "ambient tools cannot enter an empty projection"
+        );
+        catalog[0]["codemode"] = json!(true);
+        assert!(!opencode_catalog_matches(&catalog, Some(&projection)).unwrap());
+        catalog[0]["codemode"] = json!(false);
+        catalog[0]["input"] =
+            json!({"type":"object","properties":{"unexpected":{"type":"string"}}});
+        assert!(!opencode_catalog_matches(&catalog, Some(&projection)).unwrap());
     }
 }

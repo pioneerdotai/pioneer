@@ -197,6 +197,8 @@ pub struct ThreadTreeThreadAction {
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreadTreeRefreshSuccessReduction {
+    #[serde(default)]
+    pub running_task_thread_ids: Vec<String>,
     pub workspace_id: String,
     pub threads: Vec<Thread>,
     pub unread: Vec<ThreadUnreadSummary>,
@@ -260,6 +262,7 @@ pub fn reduce_thread_tree_refresh_success(
     }
 
     ThreadTreeRefreshSuccessReduction {
+        running_task_thread_ids: response.running_task_thread_ids,
         workspace_id: response.workspace_id,
         threads: response.threads,
         unread: response.unread,
@@ -1218,6 +1221,7 @@ mod tests {
 
         let reduction = reduce_thread_tree_refresh_success(
             ThreadTreeResponse {
+                running_task_thread_ids: Vec::new(),
                 workspace_id: "ws_a".to_owned(),
                 threads: vec![response_thread.clone()],
                 unread: vec![response_unread.clone()],
@@ -1268,6 +1272,7 @@ mod tests {
     fn thread_tree_refresh_success_restores_active_thread_subscription_and_timeline() {
         let reduction = reduce_thread_tree_refresh_success(
             ThreadTreeResponse {
+                running_task_thread_ids: Vec::new(),
                 workspace_id: "ws_a".to_owned(),
                 threads: Vec::new(),
                 unread: Vec::new(),

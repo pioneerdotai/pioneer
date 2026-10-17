@@ -1897,6 +1897,7 @@ pub(crate) enum CLIAgentRuntimeThreadBindingOpenMode {
 
 #[derive(Debug, Clone)]
 pub(crate) struct CLIAgentRuntimeThreadBindingOpenResult {
+    pub name: Option<String>,
     pub binding: CliRuntimeThreadBindingRecord,
     pub mode: CLIAgentRuntimeThreadBindingOpenMode,
 }
@@ -2022,7 +2023,20 @@ where
             )
         })?;
 
-    Ok(CLIAgentRuntimeThreadBindingOpenResult { binding, mode })
+    Ok(CLIAgentRuntimeThreadBindingOpenResult {
+        binding,
+        mode,
+        // Keep Codex metadata out of the shared snapshot required by other
+        // runtime adapters. The decoder also checks the exact native identity.
+        name: (request.runtime_kind == "codex")
+            .then(|| {
+                pioneer_cli_agent_runtime::codex::thread_open_name(
+                    &opened.raw,
+                    &opened.native_thread_id,
+                )
+            })
+            .flatten(),
+    })
 }
 
 fn generic_thread_binding_from_opened(
@@ -2692,12 +2706,15 @@ mod tests {
     async fn cli_runtime_binding_first_start_persists_thread_binding() {
         let (_connection, store) = setup_store().await;
         let client = FakeCliRuntimeThreadClient::new();
+        client.start_result.lock().unwrap().as_mut().unwrap().raw["thread"]["name"] =
+            json!("Opened title");
 
         let result =
             open_cli_runtime_thread_binding(&store, &client, open_request("thread_cli_a", 100))
                 .await
                 .expect("first open should succeed");
 
+        assert_eq!(result.name.as_deref(), Some("Opened title"));
         assert_eq!(result.mode, CLIAgentRuntimeThreadBindingOpenMode::Started);
         assert_eq!(result.binding.native_thread_id, "cli-thread-started");
         assert_eq!(result.binding.native_cwd.as_deref(), Some("/tmp/project"));

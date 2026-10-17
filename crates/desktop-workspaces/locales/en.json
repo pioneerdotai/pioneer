@@ -1,4 +1,5 @@
 {
+  "sidebar.taskActivity": "Tasks running",
   "buttons.cancel": "Cancel",
   "buttons.save": "Save",
   "common.name": "Name",

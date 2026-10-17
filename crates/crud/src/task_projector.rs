@@ -405,6 +405,12 @@ impl TaskProjector {
                 }
                 Ok(())
             }),
+            TaskEventPayload::RunStarting {
+                run_id, claimed_at, ..
+            } => project_future(async move {
+                task_run::claim_run_for_dispatch(db, run_id, unix_to_datetime(*claimed_at)).await?;
+                Ok(())
+            }),
             TaskEventPayload::RunStarted {
                 task_id,
                 run_id,

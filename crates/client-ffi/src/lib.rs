@@ -2006,6 +2006,8 @@ mod tests {
                 presented_rows: false,
                 scroll_generation: 0,
                 latest_user_turn_id: Some("turn".into()),
+                viewed_row_ids: Vec::new(),
+                viewed_through_block: None,
                 viewed_through_turn_id: Some("turn".into()),
                 read_requires_unread: false,
                 prefetch_on_visibility: true,

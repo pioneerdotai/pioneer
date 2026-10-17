@@ -1594,7 +1594,11 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
 }
 
-fn bounded_summary_for_chars(summary: ToolOutputSummary, max_chars: usize) -> ToolOutputSummary {
+/// Bounds the combined title and lines character count while preserving metadata.
+pub fn bounded_summary_for_chars(
+    summary: ToolOutputSummary,
+    max_chars: usize,
+) -> ToolOutputSummary {
     let mut remaining = max_chars;
     let mut truncated = summary.truncated;
     let (title, title_truncated) = take_chars_with_status(summary.title.as_str(), remaining);

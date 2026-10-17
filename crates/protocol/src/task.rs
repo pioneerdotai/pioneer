@@ -1406,6 +1406,12 @@ pub enum TaskEventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_spec: Option<TaskAgentSpec>,
     },
+    /// Dispatch claim committed; execution may still be preparing.
+    RunStarting {
+        task_id: String,
+        run_id: String,
+        claimed_at: i64,
+    },
     RunStarted {
         task_id: String,
         run_id: String,
@@ -1657,6 +1663,7 @@ impl TaskEventPayload {
             Self::TaskUpdated { task, .. } => task.id.as_str(),
             Self::TaskScheduled { task_id, .. }
             | Self::TaskQueued { task_id, .. }
+            | Self::RunStarting { task_id, .. }
             | Self::RunStarted { task_id, .. }
             | Self::Progress { task_id, .. }
             | Self::RunCompleted { task_id, .. }
@@ -1718,7 +1725,8 @@ impl TaskEventPayload {
             | Self::TaskRecovered { run_id, .. }
             | Self::DepthLimitExceeded { run_id, .. } => run_id.as_deref(),
             Self::RunCreated { run, .. } => Some(run.id.as_str()),
-            Self::RunStarted { run_id, .. }
+            Self::RunStarting { run_id, .. }
+            | Self::RunStarted { run_id, .. }
             | Self::RunCompleted { run_id, .. }
             | Self::RunFailed { run_id, .. }
             | Self::RunBlocked { run_id, .. }
@@ -1828,6 +1836,7 @@ impl TaskEventPayload {
             Self::TaskScheduled { .. } => events::TASK_SCHEDULED,
             Self::TaskQueued { .. } => events::TASK_QUEUED,
             Self::RunCreated { .. } => events::TASK_RUN_CREATED,
+            Self::RunStarting { .. } => events::TASK_TREE_CHANGED,
             Self::RunStarted { .. } => events::TASK_RUN_STARTED,
             Self::Progress { .. } => events::TASK_PROGRESS,
             Self::RunCompleted { .. } => events::TASK_RUN_COMPLETED,
@@ -1898,6 +1907,7 @@ impl TaskEventPayload {
                 .as_deref()
                 .map(|run_id| format!("task:{task_id}:run:{run_id}:queued")),
             Self::RunCreated { run, .. } => Some(format!("run:{}:created", run.id)),
+            Self::RunStarting { run_id, .. } => Some(format!("run:{run_id}:starting")),
             Self::RunStarted { run_id, .. } => Some(format!("run:{run_id}:started")),
             Self::RunCompleted { run_id, .. }
             | Self::RunFailed { run_id, .. }
@@ -3436,6 +3446,67 @@ pub struct TaskUserNotificationDeliveredNotification {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<PublicTaskFailure>,
     pub created_at: i64,
+}
+
+/// One saved terminal run in the current user's workspace inbox. Contains no
+/// execution-thread identity, raw failure, HTML, or full result payload.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCompletionInboxEntry {
+    pub workspace_id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub title: String,
+    pub thread_id: String,
+    pub thread_title: String,
+    pub status: TaskRunStatus,
+    pub completed_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCompletionInboxListParams {
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCompletionInboxListResponse {
+    pub entries: Vec<TaskCompletionInboxEntry>,
+    pub unread_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCompletionInboxEntryParams {
+    pub workspace_id: String,
+    pub run_id: String,
+}
+
+/// An invalidation only: clients reload authoritative rows and count.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCompletionInboxChangedNotification {
+    pub workspace_id: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCompletionInboxEntryResponse {
+    pub entry: TaskCompletionInboxEntry,
+    pub unread_count: u64,
 }
 
 /// Durable exact-recipient Task notification returned by the user inbox.

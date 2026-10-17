@@ -24,6 +24,14 @@
         "$ref": "#/$defs/ThreadPlacement"
       }
     },
+    "running_task_thread_ids": {
+      "description": "Authorized visible threads with at least one Starting or Running TaskRun.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
     "threads": {
       "type": "array",
       "default": [],

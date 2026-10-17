@@ -16,6 +16,7 @@ use pioneer_protocol::{
     ToolStoragePayload, TurnItem,
 };
 pub(crate) use pioneer_runtime_events::ExecutionSnapshotEvent as AgentSnapshotEvent;
+use pioneer_tools::bounded_summary_for_chars;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +113,7 @@ pub(crate) fn project_cli_runtime_event(
         RuntimeEvent::ThreadStateChanged(thread) => project_thread_state_changed(context, thread),
         RuntimeEvent::Raw(raw) => project_raw_event(context, raw),
         RuntimeEvent::SessionStateChanged(_)
+        | RuntimeEvent::ThreadNameUpdated(_)
         | RuntimeEvent::ThreadGoalUpdated(_)
         | RuntimeEvent::ThreadGoalCleared(_)
         | RuntimeEvent::TurnStarted(_)
@@ -782,7 +784,7 @@ fn command_execution_item(
         status,
         recovery_policy: None,
         // The canonical item kind determines the shell payload policy. Native
-        // names such as OpenCode's `bash` and Claude's `Bash` are not core tools.
+        // names such as OpenCode's `shell` and Claude's `Bash` are not core tools.
         output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
         display,
         storage,
@@ -1073,16 +1075,18 @@ fn summary_payloads_for_policy(
     summary: &ToolOutputSummary,
 ) -> (ToolDisplayPayload, ToolStoragePayload) {
     let display = match &output_policy.timeline {
-        TimelineOutputPolicy::Full { .. } | TimelineOutputPolicy::Summary { .. } => {
-            ToolDisplayPayload::Summary(summary.clone())
+        TimelineOutputPolicy::Full { .. } => ToolDisplayPayload::Summary(summary.clone()),
+        TimelineOutputPolicy::Summary { max_chars } => {
+            ToolDisplayPayload::Summary(bounded_summary_for_chars(summary.clone(), *max_chars))
         }
         TimelineOutputPolicy::MetadataOnly | TimelineOutputPolicy::Hidden => {
             ToolDisplayPayload::Hidden
         }
     };
     let storage = match &output_policy.storage {
-        StorageOutputPolicy::Full { .. } | StorageOutputPolicy::Summary { .. } => {
-            ToolStoragePayload::Summary(summary.clone())
+        StorageOutputPolicy::Full { .. } => ToolStoragePayload::Summary(summary.clone()),
+        StorageOutputPolicy::Summary { max_chars } => {
+            ToolStoragePayload::Summary(bounded_summary_for_chars(summary.clone(), *max_chars))
         }
         StorageOutputPolicy::MetadataOnly => ToolStoragePayload::Metadata {
             metadata: summary.metadata.clone(),
@@ -1448,6 +1452,7 @@ fn event_kind_name(event: &RuntimeEvent) -> &'static str {
     match event {
         RuntimeEvent::SessionStateChanged(_) => "session_state_changed",
         RuntimeEvent::ThreadStateChanged(_) => "thread_state_changed",
+        RuntimeEvent::ThreadNameUpdated(_) => "thread_name_updated",
         RuntimeEvent::ThreadGoalUpdated(_) => "thread_goal_updated",
         RuntimeEvent::ThreadGoalCleared(_) => "thread_goal_cleared",
         RuntimeEvent::TurnStarted(_) => "turn_started",
@@ -1473,7 +1478,10 @@ fn event_kind_name(event: &RuntimeEvent) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{CLIRuntimeProjectorContext, project_cli_runtime_event};
+    use super::{
+        CLIRuntimeProjectorContext, project_cli_runtime_event, summary_payloads_for_policy,
+        tool_summary,
+    };
     use pioneer_cli_agent_runtime::codex::CodexJsonlRpcNotificationEvent;
     use pioneer_cli_agent_runtime::event::{
         RuntimeAgentMessagePhase, RuntimeEvent, RuntimeEventMappingOptions, RuntimeItemCompleted,
@@ -1483,7 +1491,7 @@ mod tests {
     use pioneer_protocol::{
         AgentDurableEvent, AgentMessagePhase, AgentProgressEvent, ItemDeltaStream,
         StorageOutputPolicy, SystemEventLevel, TimelineOutputPolicy, ToolDisplayPayload,
-        ToolStoragePayload, TurnItem,
+        ToolMetadata, ToolOutputPolicySnapshot, ToolStoragePayload, TurnItem,
     };
     use serde_json::{Value as JsonValue, json};
 
@@ -2554,6 +2562,324 @@ mod tests {
         assert!(matches!(display, ToolDisplayPayload::Summary(_)));
         assert!(matches!(storage, ToolStoragePayload::Metadata { .. }));
         assert_eq!(*success, Some(true));
+    }
+
+    #[tokio::test]
+    async fn cli_projector_large_mcp_result_passes_durable_payload_validation() {
+        use migration::{Migrator, MigratorTrait};
+        use pioneer_crud::CrudStore;
+        use pioneer_protocol::{
+            PersistedActorRef, SandboxMode, Thread, ThreadMode, ThreadOriginKind,
+            ThreadSidebarVisibility, ThreadStatus, Turn, TurnItemEventPayload, TurnStatus,
+            UserInput,
+        };
+
+        let connection = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite");
+        Migrator::up(&connection, None)
+            .await
+            .expect("projector fixture migrations");
+        let database = pioneer_sqlite::SqliteDatabase::from_single_connection(connection);
+        let store = CrudStore::new(database);
+        let context = context();
+        let timestamp = 1_700_030_000;
+        let thread = Thread {
+            workspace_id: context.workspace_id.clone(),
+            id: context.thread_id.clone(),
+            name: None,
+            preview: String::new(),
+            preview_author: None,
+            mode: ThreadMode::Agent,
+            model: "test-model".to_owned(),
+            model_provider: "echo".to_owned(),
+            reasoning_effort: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            visibility: None,
+            turns: Vec::new(),
+        };
+        let turn = Turn {
+            id: context.turn_id.clone(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            mode: ThreadMode::Agent,
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        };
+        store
+            .upsert_thread_model(&thread, PersistedActorRef::System)
+            .await
+            .expect("thread fixture");
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[UserInput::Text {
+                    text: "Read MCP result".to_owned(),
+                    text_elements: Vec::new(),
+                }],
+                PersistedActorRef::System,
+            )
+            .await
+            .expect("started turn fixture");
+
+        for (raw_tool_name, chars) in [
+            ("asc_list_app_store_versions", 6_989),
+            ("asc_list_territory_availabilities", 17_278),
+        ] {
+            let message = "界".repeat(chars);
+            let metadata = json!({
+                "canonicalCallableName": format!("mcp__asc__{raw_tool_name}"),
+                "serverName": "App Store Connect",
+                "rawToolName": raw_tool_name,
+                "arguments": {"appId": "app-1"},
+                "status": "completed",
+                "success": true,
+                "message": message,
+                "result": [{"type": "text", "text": message}],
+                "providerCallId": raw_tool_name,
+                "sessionGeneration": 7
+            });
+            let event = RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                native_thread_id: Some("native_thread_1".to_owned()),
+                native_turn_id: "native_turn_1".to_owned(),
+                native_item_id: raw_tool_name.to_owned(),
+                item_kind: "mcpToolCall".to_owned(),
+                text: None,
+                summary: Vec::new(),
+                content: Vec::new(),
+                phase: RuntimeAgentMessagePhase::FinalAnswer,
+                metadata: Some(metadata.clone()),
+                native_item_redacted: None,
+                native: None,
+            });
+            let original_event = event.clone();
+            let projected = project_cli_runtime_event(&context, &event);
+            assert_eq!(event, original_event, "native result must remain intact");
+            assert_eq!(projected.durable.len(), 1);
+            let AgentDurableEvent::ItemCompleted { notification } = &projected.durable[0] else {
+                panic!("expected MCP completion");
+            };
+            let TurnItem::DynamicToolCall {
+                arguments,
+                status,
+                output_policy,
+                display: ToolDisplayPayload::Summary(summary),
+                storage: ToolStoragePayload::Metadata { metadata: stored },
+                success,
+                recovery,
+                outcome,
+                ..
+            } = &notification.item
+            else {
+                panic!("expected MCP summary with metadata-only storage");
+            };
+            let expected_metadata = ToolMetadata::from_json(metadata);
+            assert_eq!(summary.metadata, expected_metadata);
+            assert_eq!(stored, &expected_metadata);
+            assert_eq!(arguments["appId"], "app-1");
+            assert_eq!(arguments["nativeItemId"], raw_tool_name);
+            assert_eq!(*status, pioneer_protocol::ToolCallStatus::Completed);
+            assert_eq!(*success, Some(true));
+            assert!(recovery.is_none());
+            assert!(outcome.is_none());
+            assert_eq!(
+                output_policy.timeline,
+                TimelineOutputPolicy::Summary { max_chars: 2_000 }
+            );
+            assert_eq!(
+                summary.title.chars().count()
+                    + summary
+                        .lines
+                        .iter()
+                        .map(|line| line.chars().count())
+                        .sum::<usize>(),
+                2_000
+            );
+            assert!(summary.truncated);
+            assert!(message.starts_with(&summary.lines[0]));
+
+            // The original unbounded card must still fail the CrudStore guard.
+            let mut unbounded = notification.clone();
+            let TurnItem::DynamicToolCall { display, .. } = &mut unbounded.item else {
+                unreachable!();
+            };
+            let mut unbounded_summary = summary.clone();
+            unbounded_summary.lines = vec![message];
+            unbounded_summary.truncated = false;
+            *display = ToolDisplayPayload::Summary(unbounded_summary);
+            let error = store
+                .materialize_item_completed(unbounded, timestamp + 1)
+                .await
+                .expect_err("oversized display must remain forbidden");
+            assert!(format!("{error:#}").contains("display summary exceeds policy limit"));
+            store
+                .materialize_item_completed(notification.clone(), timestamp + 1)
+                .await
+                .expect("bounded MCP completion must persist");
+            let persisted = store
+                .get_turn_item_events(&context.thread_id, &context.turn_id)
+                .await
+                .expect("read durable events")
+                .expect("fixture thread exists");
+            assert!(persisted.events.iter().any(|event| {
+                matches!(&event.payload, TurnItemEventPayload::ItemCompleted { item, .. }
+                    if item == &notification.item)
+            }));
+        }
+    }
+
+    #[test]
+    fn cli_summary_channels_have_independent_total_character_budgets() {
+        let summary = tool_summary(
+            "Title",
+            vec!["first".to_owned(), "second".to_owned(), "third".to_owned()],
+            json!({"providerCallId": "call-1", "result": "retained by metadata contract"}),
+        );
+        for (display_max, storage_max, display_lines, storage_lines) in [
+            (8, 17, vec!["fir"], vec!["first", "second", "t"]),
+            (17, 8, vec!["first", "second", "t"], vec!["fir"]),
+            (8, 21, vec!["fir"], vec!["first", "second", "third"]),
+            (21, 8, vec!["first", "second", "third"], vec!["fir"]),
+        ] {
+            let mut policy = ToolOutputPolicySnapshot::for_external_runtime_tool_name("tool");
+            policy.timeline = TimelineOutputPolicy::Summary {
+                max_chars: display_max,
+            };
+            policy.storage = StorageOutputPolicy::Summary {
+                max_chars: storage_max,
+            };
+            let (display, storage) = summary_payloads_for_policy(&policy, &summary);
+            let ToolDisplayPayload::Summary(display) = display else {
+                panic!("expected display summary");
+            };
+            let ToolStoragePayload::Summary(storage) = storage else {
+                panic!("expected storage summary");
+            };
+            for (bounded, limit, lines) in [
+                (display, display_max, display_lines),
+                (storage, storage_max, storage_lines),
+            ] {
+                assert_eq!(bounded.title, summary.title);
+                assert_eq!(bounded.lines, lines);
+                assert_eq!(bounded.metadata, summary.metadata);
+                assert_eq!(bounded.truncated, limit < 21);
+                assert_eq!(
+                    bounded.title.chars().count()
+                        + bounded
+                            .lines
+                            .iter()
+                            .map(|line| line.chars().count())
+                            .sum::<usize>(),
+                    limit
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cli_summary_bounds_preserve_unicode_and_truncation_at_boundaries() {
+        for already_truncated in [false, true] {
+            let mut summary = tool_summary(
+                "Заг🦀",
+                vec!["ёж".to_owned(), "🙂界".to_owned()],
+                json!({"providerCallId": "unicode-call"}),
+            );
+            summary.truncated = already_truncated;
+            for (max_chars, title, lines, shortened) in [
+                (0, "", vec![], true),
+                (3, "Заг", vec![], true),
+                (4, "Заг🦀", vec![], true),
+                (6, "Заг🦀", vec!["ёж"], true),
+                (7, "Заг🦀", vec!["ёж", "🙂"], true),
+                (8, "Заг🦀", vec!["ёж", "🙂界"], false),
+                (9, "Заг🦀", vec!["ёж", "🙂界"], false),
+            ] {
+                let mut policy = ToolOutputPolicySnapshot::for_external_runtime_tool_name("tool");
+                policy.timeline = TimelineOutputPolicy::Summary { max_chars };
+                policy.storage = StorageOutputPolicy::Summary { max_chars };
+                let (display, storage) = summary_payloads_for_policy(&policy, &summary);
+                let ToolDisplayPayload::Summary(display) = display else {
+                    panic!("expected display summary");
+                };
+                let ToolStoragePayload::Summary(storage) = storage else {
+                    panic!("expected storage summary");
+                };
+                assert_eq!(display, storage);
+                assert_eq!(display.title, title);
+                assert_eq!(display.lines, lines);
+                assert_eq!(display.metadata, summary.metadata);
+                assert_eq!(display.truncated, already_truncated || shortened);
+                assert!(
+                    display.title.chars().count()
+                        + display
+                            .lines
+                            .iter()
+                            .map(|line| line.chars().count())
+                            .sum::<usize>()
+                        <= max_chars
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cli_summary_projection_preserves_other_policy_variants() {
+        let mut summary = tool_summary(
+            "Full title",
+            vec!["Full line".to_owned()],
+            json!({"providerCallId": "call-1", "result": {"value": 7}}),
+        );
+        summary.truncated = true;
+        for timeline in [
+            TimelineOutputPolicy::Full { max_bytes: 1 },
+            TimelineOutputPolicy::MetadataOnly,
+            TimelineOutputPolicy::Hidden,
+        ] {
+            for storage in [
+                StorageOutputPolicy::Full { max_bytes: 1 },
+                StorageOutputPolicy::MetadataOnly,
+                StorageOutputPolicy::None,
+            ] {
+                let mut policy = ToolOutputPolicySnapshot::for_external_runtime_tool_name("tool");
+                policy.timeline = timeline.clone();
+                policy.storage = storage;
+                let (display, storage) = summary_payloads_for_policy(&policy, &summary);
+                assert_eq!(
+                    display,
+                    match &policy.timeline {
+                        TimelineOutputPolicy::Full { .. } =>
+                            ToolDisplayPayload::Summary(summary.clone()),
+                        _ => ToolDisplayPayload::Hidden,
+                    }
+                );
+                assert_eq!(
+                    storage,
+                    match &policy.storage {
+                        StorageOutputPolicy::Full { .. } =>
+                            ToolStoragePayload::Summary(summary.clone()),
+                        StorageOutputPolicy::MetadataOnly => ToolStoragePayload::Metadata {
+                            metadata: summary.metadata.clone(),
+                        },
+                        _ => ToolStoragePayload::None,
+                    }
+                );
+            }
+        }
     }
 
     #[test]

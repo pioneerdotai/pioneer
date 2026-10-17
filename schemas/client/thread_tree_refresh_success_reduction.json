@@ -43,6 +43,13 @@
     "request_thread_start_if_needed": {
       "type": "boolean"
     },
+    "running_task_thread_ids": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
     "set_active_thread_id": {
       "type": [
         "string",

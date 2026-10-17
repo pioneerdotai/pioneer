@@ -66,6 +66,7 @@ pub mod skill_workspace_policy;
 pub mod task;
 pub mod task_actor_contract;
 pub mod task_agent_spec;
+pub mod task_completion_inbox;
 pub mod task_delivery;
 pub(crate) mod task_delivery_recovery;
 pub mod task_dependency;

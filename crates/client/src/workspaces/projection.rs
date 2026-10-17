@@ -11,6 +11,11 @@ const THREAD_TREE_ROOT_FOLDER_KEY: &str = "__root__";
 #[serde(deny_unknown_fields)]
 pub struct ThreadTreeSnapshot {
     pub workspace_id: String,
+    /// Authorized task activity, independent of conversation/selection state.
+    #[serde(default)]
+    pub running_task_thread_ids: HashSet<String>,
+    #[serde(default)]
+    pub running_task_folder_ids: HashSet<String>,
     pub threads_by_id: HashMap<String, Thread>,
     pub unread: Vec<ThreadUnreadSummary>,
     /// Unread messages in each folder and all descendants, including zero totals.
@@ -61,6 +66,7 @@ pub fn thread_tree_snapshot_from_reduction(
     thread_tree_snapshot_from_parts(
         workspace_id,
         threads,
+        reduction.running_task_thread_ids,
         unread,
         folders,
         placements,
@@ -71,6 +77,7 @@ pub fn thread_tree_snapshot_from_reduction(
 pub fn thread_tree_snapshot_from_parts(
     workspace_id: String,
     threads: Vec<Thread>,
+    running_task_thread_ids: Vec<String>,
     mut unread: Vec<ThreadUnreadSummary>,
     folders: Vec<ThreadFolder>,
     placements: Vec<ThreadPlacement>,
@@ -148,6 +155,29 @@ pub fn thread_tree_snapshot_from_parts(
             .push(thread_id);
     }
 
+    let running_task_thread_ids = running_task_thread_ids
+        .into_iter()
+        .filter(|id| threads_by_id.contains_key(id))
+        .collect::<HashSet<_>>();
+    let mut running_task_folder_ids = HashSet::new();
+    for (folder_id, ids) in &thread_ids_by_folder_id {
+        if !ids.iter().any(|id| running_task_thread_ids.contains(id)) {
+            continue;
+        }
+        let mut current = Some(folder_id.as_str());
+        let mut visited = HashSet::new();
+        while let Some(id) = current {
+            let Some(folder) = folders_by_id.get(id) else {
+                break;
+            };
+            if !visited.insert(id) {
+                break;
+            }
+            running_task_folder_ids.insert(id.to_owned());
+            current = folder.parent_folder_id.as_deref();
+        }
+    }
+
     let unread_by_folder_id =
         folder_unread_counts(&folders_by_id, &thread_ids_by_folder_id, &unread);
 
@@ -163,6 +193,8 @@ pub fn thread_tree_snapshot_from_parts(
         .collect();
 
     ThreadTreeSnapshot {
+        running_task_thread_ids,
+        running_task_folder_ids,
         workspace_id,
         threads_by_id,
         unread,
@@ -335,6 +367,7 @@ mod tests {
     #[test]
     fn thread_tree_snapshot_filters_existing_draft_thread() {
         let reduction = ThreadTreeRefreshSuccessReduction {
+            running_task_thread_ids: Vec::new(),
             workspace_id: "workspace_a".to_owned(),
             threads: vec![
                 thread("thread_visible", "workspace_a", 10),
@@ -375,6 +408,7 @@ mod tests {
     #[test]
     fn thread_tree_snapshot_keeps_unread_only_for_visible_authoritative_threads() {
         let reduction = ThreadTreeRefreshSuccessReduction {
+            running_task_thread_ids: Vec::new(),
             workspace_id: "workspace_a".to_owned(),
             threads: vec![
                 thread("thread_b", "workspace_a", 20),
@@ -449,6 +483,7 @@ mod tests {
                 .iter()
                 .map(|(id, _, _)| thread(id, "w", 1))
                 .collect(),
+            Vec::new(),
             entries
                 .iter()
                 .map(|(id, _, count)| ThreadUnreadSummary {
@@ -523,6 +558,7 @@ mod tests {
         snapshot = thread_tree_snapshot_from_parts(
             "w".into(),
             snapshot.threads_by_id.into_values().collect(),
+            Vec::new(),
             snapshot.unread,
             snapshot.folders_by_id.into_values().collect(),
             vec![],
@@ -535,6 +571,33 @@ mod tests {
                 .all(|count| *count == 0)
         );
         assert_eq!(thread_tree_level(&snapshot, None).folders.len(), 2);
+    }
+
+    #[test]
+    fn task_activity_bounds_cycles_and_ignores_missing_memberships() {
+        let snapshot = thread_tree_snapshot_from_parts(
+            "w".into(),
+            vec![thread("t", "w", 1), thread("root", "w", 1)],
+            vec!["t".into(), "root".into(), "absent".into()],
+            vec![],
+            vec![
+                folder("a", Some("b")),
+                folder("b", Some("a")),
+                folder("orphan", Some("absent")),
+            ],
+            vec![ThreadPlacement {
+                thread_id: "t".into(),
+                workspace_id: "w".into(),
+                folder_id: Some("a".into()),
+            }],
+            vec![],
+        );
+        assert_eq!(
+            snapshot.running_task_folder_ids,
+            HashSet::from(["a".into(), "b".into()])
+        );
+        assert!(!snapshot.running_task_thread_ids.contains("absent"));
+        assert!(snapshot.unread.is_empty());
     }
 
     #[test]

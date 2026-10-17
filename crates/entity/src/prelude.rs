@@ -146,6 +146,7 @@ pub use super::task_run_conversation_snapshot::Entity as TaskRunConversationSnap
 pub use super::task_run_execution::Entity as TaskRunExecution;
 pub use super::task_run_occurrence_reconcile_pending::Entity as TaskRunOccurrenceReconcilePending;
 pub use super::task_run_occurrence_reconcile_sequence::Entity as TaskRunOccurrenceReconcileSequence;
+pub use super::task_run_read::Entity as TaskRunRead;
 pub use super::task_run_thread_binding::Entity as TaskRunThreadBinding;
 pub use super::task_run_turn::Entity as TaskRunTurn;
 pub use super::task_trigger::Entity as TaskTrigger;

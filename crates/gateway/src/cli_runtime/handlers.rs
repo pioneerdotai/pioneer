@@ -233,6 +233,16 @@ fn cli_runtime_ready_for_model_discovery(runtime: &RuntimeSummary) -> bool {
 }
 
 impl MessageProcessor {
+    pub(crate) fn opencode_managed_data_home(
+        &self,
+        instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
+    ) -> PathBuf {
+        crate::cli_runtime::opencode_session::opencode_managed_data_home(
+            &self.artifact_runtime_home,
+            instance,
+        )
+    }
+
     fn uses_collaborator_cli_disclosure(request_context: &RequestContext) -> bool {
         crate::authorization::AuthorizationService::new().role_disclosure_policy(
             request_context.principal().kind,
@@ -4795,6 +4805,11 @@ impl MessageProcessor {
         let instance = origin.to_session_instance();
         let instance = &instance;
         match event {
+            RuntimeEvent::ThreadNameUpdated(name) => {
+                if let Err(error) = self.accept_codex_thread_name(instance, name).await {
+                    warn!(error = %error, "failed to accept Codex thread name");
+                }
+            }
             RuntimeEvent::AccountUpdated(_) | RuntimeEvent::AppListUpdated(_) => {
                 if !self.cli_runtime_instance_is_current(instance).await {
                     self.audit_stale_cli_runtime_process_activity(
@@ -4823,6 +4838,61 @@ impl MessageProcessor {
                     .await
             }
         }
+    }
+
+    async fn accept_codex_thread_name(
+        &self,
+        instance: &CliSessionInstanceId,
+        event: pioneer_cli_agent_runtime::event::RuntimeThreadNameUpdated,
+    ) -> anyhow::Result<()> {
+        let Some(name) = crate::message::summary::incoming_thread_title(&event.name) else {
+            return Ok(());
+        };
+        let key = instance.key();
+        let background = self.crud_store.with_maintenance_access();
+        let Some(binding) = background
+            .get_cli_runtime_thread_binding(&key.thread_id)
+            .await?
+        else {
+            return Ok(());
+        };
+        if binding.workspace_id != key.workspace_id
+            || binding.thread_id != key.thread_id
+            || binding.runtime_id != key.runtime_id
+            || binding.runtime_kind != "codex"
+            || binding.native_thread_id != event.native_thread_id
+            || binding.status != "active"
+        {
+            return Ok(());
+        }
+        // A detached child's native identity must never name its initiating parent.
+        let fallback = background
+            .get_first_thread_user_text(&key.thread_id)
+            .await?
+            .as_deref()
+            .and_then(crate::message::fallback_title_from_first_user_text);
+        let Some(manager) = self.cli_runtime_manager.as_ref() else {
+            return Ok(());
+        };
+        let Some(current) = manager.current_instance_guard(instance).await else {
+            return Ok(());
+        };
+        // Revalidate title AND exact binding in one writer statement while the
+        // instance gate fences retirement. The registry mutex is not retained.
+        // Release the instance gate before acquiring the publication gate/fanout.
+        let changed = background
+            .update_automatic_thread_name(
+                &key.thread_id,
+                &name,
+                fallback.as_deref(),
+                Some(&binding),
+            )
+            .await?;
+        drop(current);
+        if changed {
+            self.send_thread_updated_notification(&key.thread_id).await;
+        }
+        Ok(())
     }
 
     async fn handle_cli_runtime_request_opened_event(
@@ -13184,12 +13254,13 @@ fn opencode_request_response_from_resolution(
                             anyhow::bail!("OpenCode question does not permit custom answers");
                         }
                     }
-                    json!({ "kind": "question", "answers": ordered })
+                    json!({ "kind": "form", "answer": crate::cli_runtime::opencode_session::opencode_form_answer(
+                        payload.get("formFields").context("OpenCode V2 request is missing its native form fields")?, &ordered)? })
                 }
                 CLIRuntimeRequestResolution::Cancelled
                 | CLIRuntimeRequestResolution::Expired
                 | CLIRuntimeRequestResolution::Error { .. } => {
-                    json!({ "kind": "question", "reject": true })
+                    json!({ "kind": "form", "reject": true })
                 }
                 CLIRuntimeRequestResolution::Approved
                 | CLIRuntimeRequestResolution::ApprovedForSession
@@ -13427,6 +13498,7 @@ fn cli_runtime_event_log_label(event: &RuntimeEvent) -> String {
         RuntimeEvent::Raw(raw) => raw.native_method.clone(),
         RuntimeEvent::SessionStateChanged(_) => "session_state_changed".to_owned(),
         RuntimeEvent::ThreadStateChanged(_) => "thread_state_changed".to_owned(),
+        RuntimeEvent::ThreadNameUpdated(_) => "thread_name_updated".to_owned(),
         RuntimeEvent::ThreadGoalUpdated(_) => "thread_goal_updated".to_owned(),
         RuntimeEvent::ThreadGoalCleared(_) => "thread_goal_cleared".to_owned(),
         RuntimeEvent::TurnStarted(_) => "turn_started".to_owned(),
@@ -13468,6 +13540,7 @@ fn cli_runtime_native_turn_id_for_event(event: &RuntimeEvent) -> Option<&str> {
         RuntimeEvent::Raw(event) => event.native_turn_id.as_deref(),
         RuntimeEvent::RequestOpened(event) => event.native_turn_id.as_deref(),
         RuntimeEvent::SessionStateChanged(_)
+        | RuntimeEvent::ThreadNameUpdated(_)
         | RuntimeEvent::ThreadStateChanged(_)
         | RuntimeEvent::ThreadGoalCleared(_)
         | RuntimeEvent::RequestResolved(_)
@@ -13491,6 +13564,7 @@ fn cli_runtime_native_item_id_for_event(event: &RuntimeEvent) -> Option<&str> {
 fn cli_runtime_native_thread_id_for_event(event: &RuntimeEvent) -> Option<&str> {
     match event {
         RuntimeEvent::ThreadStateChanged(event) => event.native_thread_id.as_deref(),
+        RuntimeEvent::ThreadNameUpdated(event) => Some(&event.native_thread_id),
         RuntimeEvent::ThreadGoalUpdated(event) => Some(event.native_thread_id.as_str()),
         RuntimeEvent::ThreadGoalCleared(event) => Some(event.native_thread_id.as_str()),
         RuntimeEvent::TurnStarted(event) => event.native_thread_id.as_deref(),
@@ -13563,6 +13637,7 @@ fn cli_runtime_event_confirms_recovery(event: &RuntimeEvent) -> bool {
             !cli_runtime_item_is_native_user_message(item.item_kind.as_str())
         }
         RuntimeEvent::SessionStateChanged(_)
+        | RuntimeEvent::ThreadNameUpdated(_)
         | RuntimeEvent::ThreadStateChanged(_)
         | RuntimeEvent::ThreadGoalUpdated(_)
         | RuntimeEvent::ThreadGoalCleared(_)

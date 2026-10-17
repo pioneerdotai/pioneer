@@ -1703,6 +1703,14 @@ task = "Задача"
 mark_read = "Отметить прочитанным"
 completed = "Задача завершена"
 
+open = "Открыть тред"
+more = "Загрузить ещё"
+read = "Прочитано"
+unread = "Не прочитано"
+retry = "Повторить"
+loading_failed = "Не удалось загрузить результаты задач"
+timed_out = "Время истекло"
+
 [settings.self_improvement.status]
 title = "Активность"
 refresh = "Обновить"

@@ -976,6 +976,87 @@ impl AuthorizationResolver {
             .map(AuthorizedArtifact))
     }
 
+    /// TaskRead inherits current root-thread access. Use the ordinary service
+    /// policy with batched durable scopes/memberships, never Thread.status.
+    pub(crate) async fn running_task_thread_ids(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        workspace_id: &str,
+        thread_ids: &[String],
+    ) -> Result<Vec<String>> {
+        let action = ResourceAction::TaskRead;
+        let gate =
+            self.service
+                .authorize_action(principal.kind, principal.role_key.as_ref(), action);
+        if self.preflight(&gate, action).is_some() {
+            return Ok(Vec::new());
+        }
+        let mut active = std::collections::BTreeSet::new();
+        for candidates in thread_ids.chunks(500) {
+            let mut after = String::new();
+            loop {
+                let page = pioneer_crud::list_running_task_scopes(
+                    &self.store.database_connection(),
+                    workspace_id,
+                    candidates,
+                    &principal.principal_id,
+                    &after,
+                )
+                .await?;
+                for (scope, workspace_member, thread_member) in page.scopes {
+                    if WorkspaceResourceId::new(scope.workspace_id.clone()).is_err()
+                        || TaskResourceId::new(scope.task_id.clone()).is_err()
+                    {
+                        continue;
+                    }
+                    let Some(root) = scope.root_thread else {
+                        continue;
+                    };
+                    if ThreadResourceId::new(root.thread_id.clone()).is_err() {
+                        continue;
+                    }
+                    let workspace = WorkspaceAccessFacts {
+                        workspace_active: scope.workspace_is_active,
+                        workspace_member,
+                    };
+                    let facts = ThreadAccessFacts {
+                        workspace,
+                        access_class: match root.access_class {
+                            PersistedThreadAccessClass::Private => ThreadAccessClass::Private,
+                            PersistedThreadAccessClass::Workspace => ThreadAccessClass::Workspace,
+                            PersistedThreadAccessClass::Internal => ThreadAccessClass::Internal,
+                        },
+                        resource_class: ThreadResourceClass::Root,
+                        thread_member,
+                        thread_creator: root.creator_principal_id.as_ref()
+                            == Some(&principal.principal_id),
+                    };
+                    if self
+                        .service
+                        .authorize_resource(
+                            &gate,
+                            action,
+                            ResolvedResourceAccess::Task {
+                                workspace,
+                                root_thread: Some(facts),
+                                initiating_principal: scope.initiating_principal_id.as_ref()
+                                    == Some(&principal.principal_id),
+                            },
+                        )
+                        .is_allowed()
+                    {
+                        active.insert(root.thread_id);
+                    }
+                }
+                let Some(next) = page.after_task_id else {
+                    break;
+                };
+                after = next;
+            }
+        }
+        Ok(active.into_iter().collect())
+    }
+
     pub(crate) async fn authorize_task(
         &self,
         principal: &AuthenticatedSessionPrincipal,
@@ -2864,6 +2945,202 @@ mod tests {
                 .is_some(),
             "future artifact authorization must reflect current root visibility"
         );
+    }
+
+    #[tokio::test]
+    async fn tree_task_activity_uses_runs_lineage_and_current_task_authorization() {
+        use sea_orm::{Statement, Value};
+        let (harness, resolver) = resolver_fixture().await;
+        let member = principal(MEMBER_A_ID, PrincipalKind::User);
+        let peer = principal(MEMBER_B_ID, PrincipalKind::User);
+        // The parent waits and remains Idle. The grandchild executes in an
+        // internal thread; a foreground conversation is neither necessary nor sufficient.
+        harness
+            .database
+            .execute_unprepared("UPDATE thread SET status='idle';")
+            .await
+            .unwrap();
+        for (run, task, executor) in [
+            ("run-parent", PRIVATE_ROOT_TASK_ID, "agent"),
+            ("run-a", PRIVATE_CHILD_TASK_ID, "agent"),
+            ("run-b", PRIVATE_GRANDCHILD_TASK_ID, "agent"),
+            ("run-public", WORKSPACE_ROOT_TASK_ID, "agent"),
+        ] {
+            harness.database.execute_raw(Statement::from_sql_and_values(
+                harness.database.get_database_backend(),
+                "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,created_at,updated_at)
+                 VALUES(?,?,?,1,1,'queued',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                vec![Value::from(run), Value::from(task), Value::from(run), Value::from(executor)],
+            )).await.unwrap();
+        }
+        harness.database.execute_unprepared("UPDATE task_run SET status='waiting' WHERE id='run-parent';
+            INSERT INTO task(id,workspace_id,owner_kind,executor_kind,status,title,goal)
+            VALUES('service-only','W00000000000000000001','system','system','running','Service','fixture');
+            INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind)
+            VALUES('service-run','service-only','service-run',1,1,'running','system')").await.unwrap();
+        let ids = vec![PRIVATE_THREAD_ID.to_owned(), WORKSPACE_THREAD_ID.to_owned()];
+        let query = |principal: AuthenticatedSessionPrincipal| {
+            let resolver = resolver.clone();
+            let ids = ids.clone();
+            async move {
+                resolver
+                    .running_task_thread_ids(&principal, WORKSPACE_ID, &ids)
+                    .await
+                    .unwrap()
+            }
+        };
+        for status in [
+            "starting",
+            "running",
+            "queued",
+            "waiting",
+            "waiting_review",
+            "succeeded",
+            "failed",
+            "blocked",
+            "cancelled",
+            "timed_out",
+        ] {
+            harness
+                .database
+                .execute_raw(Statement::from_sql_and_values(
+                    harness.database.get_database_backend(),
+                    "UPDATE task_run SET status=? WHERE id='run-a'",
+                    [Value::from(status)],
+                ))
+                .await
+                .unwrap();
+            let active = query(member.clone()).await;
+            assert_eq!(
+                active.contains(&PRIVATE_THREAD_ID.to_owned()),
+                matches!(status, "starting" | "running"),
+                "{status}"
+            );
+            assert!(query(peer.clone()).await.is_empty());
+        }
+        harness
+            .database
+            .execute_unprepared(
+                "UPDATE task_run SET status='running' WHERE id IN ('run-a','run-b')",
+            )
+            .await
+            .unwrap();
+        assert_eq!(query(member.clone()).await, vec![PRIVATE_THREAD_ID]);
+        harness
+            .database
+            .execute_unprepared("UPDATE task_run SET status='succeeded' WHERE id='run-a'")
+            .await
+            .unwrap();
+        assert_eq!(query(member.clone()).await, vec![PRIVATE_THREAD_ID]);
+        // Exact provenance through an internal causal thread has the same root
+        // as ordinary task reads, even with no visible run-thread binding.
+        harness.database.execute_unprepared("UPDATE task SET created_by_thread_id='T0000000000000000000I', created_by_turn_id='U0000000000000000000I' WHERE id='K0000000000000000000A'").await.unwrap();
+        let scopes = pioneer_crud::list_running_task_scopes(
+            &resolver.store.database_connection(),
+            WORKSPACE_ID,
+            &ids,
+            &member.principal_id,
+            "",
+        )
+        .await
+        .unwrap();
+        for (batch, _, _) in scopes.scopes {
+            let single = pioneer_crud::resolve_task_authorization_scope(
+                &resolver.store.database_connection(),
+                &batch.task_id,
+                Some(WORKSPACE_ID),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(batch, single);
+        }
+        assert_eq!(query(member.clone()).await, vec![PRIVATE_THREAD_ID]);
+        for attachment in [
+            pioneer_protocol::TaskAttachmentMode::Attached,
+            pioneer_protocol::TaskAttachmentMode::Detached,
+        ] {
+            let policy = pioneer_protocol::TaskLifecyclePolicy {
+                attachment,
+                on_parent_cancel: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
+                on_parent_failure: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
+                completion: pioneer_protocol::TaskCompletionBehavior::KeepActiveForRecurring,
+            };
+            harness
+                .database
+                .execute_raw(Statement::from_sql_and_values(
+                    harness.database.get_database_backend(),
+                    "UPDATE task SET lifecycle_policy_json=? WHERE id='K0000000000000000000A'",
+                    [Value::from(serde_json::to_string(&policy).unwrap())],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(query(member.clone()).await, vec![PRIVATE_THREAD_ID]);
+        }
+        for executor in ["agent", "tool", "workflow", "webhook", "system"] {
+            harness
+                .database
+                .execute_raw(Statement::from_sql_and_values(
+                    harness.database.get_database_backend(),
+                    "UPDATE task_run SET executor_kind=? WHERE id='run-b'",
+                    [Value::from(executor)],
+                ))
+                .await
+                .unwrap();
+            harness.database.execute_unprepared("UPDATE task SET executor_kind=(SELECT executor_kind FROM task_run WHERE id='run-b') WHERE id='K0000000000000000000C'").await.unwrap();
+            assert_eq!(query(member.clone()).await, vec![PRIVATE_THREAD_ID]);
+        }
+        harness
+            .database
+            .execute_unprepared("UPDATE task_run SET status='succeeded' WHERE id='run-b'")
+            .await
+            .unwrap();
+        assert!(
+            query(member.clone()).await.is_empty(),
+            "last execution completed"
+        );
+        harness
+            .database
+            .execute_unprepared("UPDATE task_run SET status='running' WHERE id='run-b'")
+            .await
+            .unwrap();
+        assert!(
+            resolver
+                .running_task_thread_ids(&member, WORKSPACE_BLUE_ID, &ids)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            resolver
+                .running_task_thread_ids(&member, WORKSPACE_ID, &[WORKSPACE_THREAD_ID.into()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        harness
+            .database
+            .execute_unprepared(
+                "DELETE FROM thread_membership WHERE thread_id='T0000000000000000000A'",
+            )
+            .await
+            .unwrap();
+        assert!(query(member.clone()).await.is_empty());
+        harness
+            .database
+            .execute_unprepared("UPDATE task_run SET status='running' WHERE id='run-public'")
+            .await
+            .unwrap();
+        assert_eq!(query(peer.clone()).await, vec![WORKSPACE_THREAD_ID]);
+        harness
+            .database
+            .execute_unprepared(
+                "DELETE FROM workspace_membership WHERE workspace_id='W00000000000000000001'",
+            )
+            .await
+            .unwrap();
+        assert!(query(peer).await.is_empty());
     }
 
     #[tokio::test]

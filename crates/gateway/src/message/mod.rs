@@ -33,6 +33,7 @@ pub(crate) mod skills;
 mod summary;
 mod task_agent_executor;
 mod task_artifacts;
+mod task_completion_inbox;
 mod task_delivery;
 mod task_handlers;
 mod tasks;
@@ -656,6 +657,11 @@ pub struct MessageProcessor {
     native_permission_approval_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     artifact_finalization_retry_turns: Arc<Mutex<HashSet<String>>>,
     title_job_runtime: Arc<Mutex<HashMap<String, ThreadTitleJobState>>>,
+    thread_title_publication_mutexes: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
+    #[cfg(test)]
+    thread_title_publication_barrier: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    #[cfg(test)]
+    thread_title_publication_attempted: Arc<tokio::sync::Notify>,
     timeout_supervisor: Arc<TimeoutSupervisor>,
     recovery_coordinator: Arc<RecoveryCoordinator>,
     native_turn_event_delivery_kick_running: Arc<AtomicBool>,
@@ -1303,6 +1309,11 @@ impl MessageProcessor {
             native_permission_approval_worker: Arc::new(Mutex::new(None)),
             artifact_finalization_retry_turns: Arc::new(Mutex::new(HashSet::new())),
             title_job_runtime: Arc::new(Mutex::new(HashMap::new())),
+            thread_title_publication_mutexes: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            thread_title_publication_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            thread_title_publication_attempted: Arc::new(tokio::sync::Notify::new()),
             timeout_supervisor,
             recovery_coordinator,
             native_turn_event_delivery_kick_running: Arc::new(AtomicBool::new(false)),
@@ -4924,6 +4935,11 @@ impl MessageProcessor {
             native_permission_approval_worker: Arc::new(Mutex::new(None)),
             artifact_finalization_retry_turns: Arc::new(Mutex::new(HashSet::new())),
             title_job_runtime: Arc::new(Mutex::new(HashMap::new())),
+            thread_title_publication_mutexes: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            thread_title_publication_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            thread_title_publication_attempted: Arc::new(tokio::sync::Notify::new()),
             timeout_supervisor,
             recovery_coordinator,
             native_turn_event_delivery_kick_running: Arc::new(AtomicBool::new(false)),
