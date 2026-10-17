@@ -620,8 +620,9 @@ mod tests {
     use super::{
         CLIRuntimeContextBuildInput, cli_runtime_mcp_capabilities_input,
         cli_runtime_prompt_manifest_from_plan, compile_cli_runtime_delivery_plan,
+        completed_cli_history_budget, historical_attachment_inputs,
         prepend_cli_turn_context_and_history_input, prepend_cli_turn_context_input,
-        validate_cli_runtime_turn_input_frame,
+        thread_context_from_history, validate_cli_runtime_turn_input_frame,
     };
     use pioneer_cli_agent_runtime::input::{CLIRuntimeTurnInputItem, CLIRuntimeTurnInputMapping};
     use pioneer_protocol::{CLIAgentRuntimeKind, PromptManifestProfile};
