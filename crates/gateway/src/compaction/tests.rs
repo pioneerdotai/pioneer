@@ -3873,6 +3873,294 @@ async fn canonical_inputs_and_contexts_release_each_bounded_raw_payload_batch() 
     assert!(first < last, "context order changed across payload batches");
 }
 
+async fn frozen_recapture_fixture() -> (CrudStore, Vec<pioneer_provider::ChatMessage>) {
+    // The runner fixture has an unbound legacy plan, which deliberately retains
+    // every manifest in its workspace. Capture/GC needs no runner or saved roots.
+    super::load_test_catalog();
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    Migrator::up(&db, None).await.unwrap();
+    let store = CrudStore::new(db);
+    let db = store.database_connection();
+    for sql in [
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1)",
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    let payloads = [("first", "first answer"), ("second", "second answer")]
+        .into_iter()
+        .map(|(id, text)| {
+            serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+                ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item: pioneer_protocol::TurnItem::AgentMessage {
+                        id: id.into(),
+                        text: text.into(),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+            ))
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    for (index, payload) in payloads.iter().enumerate() {
+        let canonical: pioneer_crud::CanonicalTurnEventPayload =
+            serde_json::from_str(payload).unwrap();
+        let id = if index == 0 {
+            "source".to_owned()
+        } else {
+            format!("source-{index}")
+        };
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread','turn',?,?,?,CURRENT_TIMESTAMP)",
+            [id.into(), (index as i64 + 1).into(), canonical.event_type().into(), payload.clone().into()],
+        )).await.unwrap();
+    }
+    super::history::prepare_history(&store, "ws", "thread")
+        .await
+        .unwrap();
+    let fence = store.compaction_history_read_fence().await.unwrap();
+    let messages = super::history::load_line_history(&store, "ws", "thread", None, &fence)
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 2);
+    (store, messages)
+}
+
+#[tokio::test]
+async fn frozen_equivalent_capture_verifies_selected_payloads_once_on_hit_and_miss() {
+    let (store, messages) = frozen_recapture_fixture().await;
+    let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+    let observer = super::frozen::observe_store_restores(&store, "ws");
+    let first = super::frozen::capture_prepared(&store, "ws", "thread", &allowed, &messages)
+        .await
+        .unwrap();
+    assert_eq!(observer.page_calls(), (1, 1));
+    assert_eq!(first.messages, messages);
+    assert!(first.frozen_hold.is_some());
+    let repeated = super::frozen::capture_prepared(&store, "ws", "thread", &allowed, &messages)
+        .await
+        .unwrap();
+    assert_eq!(repeated.descriptor, first.descriptor);
+    assert_eq!(repeated.messages, first.messages);
+    assert_eq!(repeated.accepted_scopes, first.accepted_scopes);
+    assert!(repeated.frozen_hold.is_some());
+    assert_eq!(
+        observer.page_calls(),
+        (2, 2),
+        "hit must run each projection once"
+    );
+    // A different boundary still takes the ordinary new-manifest path.
+    let shorter = super::frozen::capture_prepared(&store, "ws", "thread", &allowed, &messages[..1])
+        .await
+        .unwrap();
+    assert_ne!(shorter.descriptor.manifest_id, first.descriptor.manifest_id);
+    assert_eq!(shorter.messages, messages[..1]);
+    assert_eq!(observer.page_calls(), (3, 3));
+    assert_eq!(
+        super::frozen::restore(&store, "ws", &allowed, &first.descriptor)
+            .await
+            .unwrap(),
+        repeated.messages
+    );
+
+    // The hit must still check exact saved revisions, not return cached messages.
+    store.database_connection().execute_unprepared(
+        "UPDATE turn_event SET payload=replace(payload,'first answer','edited answer') WHERE id='source'"
+    ).await.unwrap();
+    assert!(
+        super::frozen::capture_prepared(&store, "ws", "thread", &allowed, &messages)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn frozen_equivalent_capture_rejects_corrupt_stored_references_without_fallback() {
+    use sea_orm::TransactionTrait;
+
+    for corruption in ["digest", "order", "count", "scope", "invalid", "bytes"] {
+        let (store, messages) = frozen_recapture_fixture().await;
+        let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+        let first = super::frozen::capture_prepared(&store, "ws", "thread", &allowed, &messages)
+            .await
+            .unwrap();
+        let descriptor = first.descriptor.clone();
+        drop(first);
+        let mut references = store
+            .compaction_frozen_history_page("ws", "thread", &descriptor.manifest_id, 0)
+            .await
+            .unwrap();
+        let db = store.database_connection();
+        // Resolve physical backing just as the existing corruption regression does.
+        let backing: String = db.query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT source_manifest FROM compaction_frozen_span WHERE manifest_id=? AND kind=0 AND start<=0 AND end>0 LIMIT 1",
+            [descriptor.manifest_id.clone().into()],
+        )).await.unwrap().map(|row| row.try_get("", "source_manifest").unwrap())
+            .unwrap_or_else(|| descriptor.manifest_id.clone());
+        match corruption {
+            "count" => {
+                db.execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "DELETE FROM compaction_frozen_message_data WHERE manifest_id=? AND ordinal=1",
+                    [backing.clone().into()],
+                ))
+                .await
+                .unwrap();
+            }
+            "bytes" => {
+                let update = Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE compaction_frozen_message_data SET bytes=bytes+1 WHERE manifest_id=? AND ordinal=0",
+                    [backing.clone().into()],
+                );
+                // Seed legacy corruption on one pinned writer connection, then
+                // restore CHECK enforcement before capture reads the manifest.
+                let tx = db.begin().await.unwrap();
+                tx.execute_unprepared("PRAGMA ignore_check_constraints=ON")
+                    .await
+                    .unwrap();
+                tx.execute_raw(update).await.unwrap();
+                tx.execute_unprepared("PRAGMA ignore_check_constraints=OFF")
+                    .await
+                    .unwrap();
+                tx.commit().await.unwrap();
+            }
+            _ => {
+                match corruption {
+                    "digest" => references[0].wire_sha256 = "0".repeat(64),
+                    "order" => references.swap(0, 1),
+                    "scope" => references[0].context_thread = Some("outside".into()),
+                    "invalid" => references[0].sources.clear(),
+                    _ => unreachable!(),
+                }
+                for (ordinal, reference) in references.iter().enumerate() {
+                    let json = serde_json::to_string(reference).unwrap();
+                    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                        "UPDATE compaction_frozen_message_data SET reference_json=?,bytes=? WHERE manifest_id=? AND ordinal=?",
+                        [json.clone().into(), (json.len() as i64).into(), backing.clone().into(), (ordinal as i64).into()],
+                    )).await.unwrap();
+                }
+            }
+        }
+        // The matching header is deliberately unchanged: lookup must find it.
+        assert_eq!(
+            store
+                .compaction_equivalent_frozen_history(
+                    "ws",
+                    "thread",
+                    &descriptor,
+                    0,
+                    pioneer_crud::compaction::EMPTY_FROZEN_IMPORT_SHA256,
+                )
+                .await
+                .unwrap(),
+            Some(descriptor.clone())
+        );
+        let observer = super::frozen::observe_store_restores(&store, "ws");
+        let error = super::frozen::capture_prepared(&store, "ws", "thread", &allowed, &messages)
+            .await
+            .err()
+            .expect(corruption);
+        assert_eq!(observer.page_calls(), (0, 0), "{corruption}: {error:#}");
+        let count: i64 = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT count(*) AS n FROM compaction_frozen_history",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "n")
+            .unwrap();
+        assert_eq!(count, 1, "{corruption} silently created a replacement");
+    }
+}
+
+#[tokio::test]
+async fn frozen_equivalent_capture_holds_selected_manifest_through_handoff_and_cancellation() {
+    async fn sweep(store: &CrudStore) {
+        let mut progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
+        for _ in 0..10_000 {
+            // Layout compaction alone does not expire manifests. Exercise the
+            // lifetime worker's expiry and physical cleanup phases here.
+            if !progress.quantum(store).await.unwrap() {
+                return;
+            }
+        }
+        panic!("fixture lifetime pass did not finish");
+    }
+    for outcome in ["return", "cancel", "error"] {
+        let (store, messages) = frozen_recapture_fixture().await;
+        let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+        let first = super::frozen::capture_prepared(&store, "ws", "thread", &allowed, &messages)
+            .await
+            .unwrap();
+        let descriptor = first.descriptor.clone();
+        drop(first);
+        let observer = super::frozen::observe_store_restores(&store, "ws");
+        let (reached, resume) = observer.pause_next_execution_page();
+        let mut capture = Box::pin(super::frozen::capture_prepared(
+            &store, "ws", "thread", &allowed, &messages,
+        ));
+        tokio::select! {
+            _ = reached.notified() => {},
+            _ = &mut capture => panic!("capture did not pause at execution verification"),
+        }
+        sweep(&store).await;
+        drop(
+            store
+                .compaction_acquire_frozen_history("ws", &descriptor)
+                .await
+                .unwrap(),
+        );
+        if outcome == "cancel" {
+            // Dropping the request future must release the selected outer hold.
+            drop(capture);
+        } else {
+            if outcome == "error" {
+                // Mutate after literal verification, before execution reads the
+                // same exact revisions. Its error must release the outer hold.
+                store.database_connection().execute_unprepared(
+                    "UPDATE turn_event SET payload=replace(payload,'first answer','edited answer') WHERE id='source'"
+                ).await.unwrap();
+            }
+            resume.notify_one();
+            let result = capture.await;
+            if outcome == "error" {
+                assert!(result.is_err());
+            } else {
+                let prepared = result.unwrap();
+                assert_eq!(prepared.descriptor, descriptor);
+                assert_eq!(prepared.messages, messages);
+                sweep(&store).await;
+                drop(
+                    store
+                        .compaction_acquire_frozen_history("ws", &descriptor)
+                        .await
+                        .unwrap(),
+                );
+                drop(prepared);
+            }
+        }
+        sweep(&store).await;
+        assert!(
+            store
+                .compaction_acquire_frozen_history("ws", &descriptor)
+                .await
+                .is_err(),
+            "selected manifest retained after request/result drop ({outcome})"
+        );
+    }
+}
+
 #[tokio::test]
 async fn frozen_capture_rejects_foreign_scope_before_legacy_registration() {
     use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef};
@@ -10999,10 +11287,15 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
     let snapshot = super::frozen::capture(&f.store, "ws", "thread", &allowed, &frozen)
         .await
         .unwrap();
-    let reused = super::frozen::capture(&f.store, "ws", "thread", &allowed, &frozen)
+    let observer = super::frozen::observe_store_restores(&f.store, "ws");
+    let reused = super::frozen::capture_prepared(&f.store, "ws", "thread", &allowed, &frozen)
         .await
         .unwrap();
-    assert_eq!(snapshot, reused);
+    assert_eq!(snapshot, reused.descriptor);
+    assert_eq!(reused.messages, frozen);
+    assert_eq!(observer.page_calls(), (1, 1));
+    drop(observer);
+    drop(reused);
     let descriptor_json = serde_json::to_string(&snapshot).unwrap();
     assert!(!descriptor_json.contains("original request"));
     assert!(!descriptor_json.contains("first completed result"));
@@ -14597,6 +14890,7 @@ async fn exact_task_grants_survive_summary_projection_independently_of_new_conve
     use pioneer_agent::compaction::composition::ScopedHistorySource;
     use pioneer_compaction::runner::{RunnerState, SourceCursor};
     use pioneer_crud::compaction::{CommitOutcome, SourceAssertion};
+    use sea_orm::TransactionTrait;
 
     let f = fixture("unused", vec![], true, false).await;
     let db = f.store.database_connection();
@@ -14729,6 +15023,110 @@ async fn exact_task_grants_survive_summary_projection_independently_of_new_conve
     )
     .await
     .unwrap();
+    // Equal reference identities with different ordered imports cannot reuse
+    // the same manifest. Recapturing with the same grants must select existing.
+    let allowed = std::collections::BTreeSet::from(["thread".into(), "own-source".into()]);
+    let unclaimed =
+        super::frozen::capture_prepared(&f.store, "ws", "thread", &allowed, &output_messages)
+            .await
+            .unwrap();
+    assert_eq!(
+        unclaimed.descriptor.identity_sha256,
+        parent_projection.descriptor.identity_sha256
+    );
+    assert_ne!(
+        unclaimed.descriptor.manifest_id,
+        parent_projection.descriptor.manifest_id
+    );
+    let observer = super::frozen::observe_store_restores(&f.store, "ws");
+    let repeated = super::frozen::capture_with_imports_prepared(
+        &f.store,
+        "ws",
+        "thread",
+        &allowed,
+        &output_messages,
+        &imports,
+        super::coverage::CheckpointGraphResolver::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(repeated.descriptor, parent_projection.descriptor);
+    assert_eq!(repeated.messages, parent_projection.messages);
+    assert_eq!(observer.page_calls(), (1, 1));
+    drop(observer);
+    drop(repeated);
+    drop(unclaimed);
+
+    // Authenticate actual stored proofs at their original message/output
+    // ordinals, even though lookup sees an unchanged matching import header.
+    let records = f
+        .store
+        .compaction_frozen_import_page("ws", "thread", &parent_projection.descriptor.manifest_id, 0)
+        .await
+        .unwrap();
+    let original = serde_json::to_string(&records[0]).unwrap();
+    let backing: String = db.query_one_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT source_manifest FROM compaction_frozen_span WHERE manifest_id=? AND kind=1 AND start<=0 AND end>0 LIMIT 1",
+        [parent_projection.descriptor.manifest_id.clone().into()],
+    )).await.unwrap().map(|row| row.try_get("", "source_manifest").unwrap())
+        .unwrap_or_else(|| parent_projection.descriptor.manifest_id.clone());
+    for corruption in ["message_ordinal", "output_ordinal", "source", "bytes"] {
+        let mut record = records[0].clone();
+        match corruption {
+            "message_ordinal" => record.message_ordinal = output_messages.len() as u64,
+            "output_ordinal" => record.output_ordinal += 1,
+            "source" => record.source.id = "not-the-imported-source".into(),
+            "bytes" => {}
+            _ => unreachable!(),
+        }
+        let json = serde_json::to_string(&record).unwrap();
+        let bytes = json.len() as i64 + i64::from(corruption == "bytes");
+        let update = Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_frozen_import_data SET proof_json=?,bytes=? WHERE manifest_id=? AND ordinal=0",
+            [json.into(), bytes.into(), backing.clone().into()],
+        );
+        if corruption == "bytes" {
+            // Match CRUD's legacy-corruption fixtures: pin the writer and turn
+            // CHECK enforcement back on before exercising the restore path.
+            let tx = db.begin().await.unwrap();
+            tx.execute_unprepared("PRAGMA ignore_check_constraints=ON")
+                .await
+                .unwrap();
+            tx.execute_raw(update).await.unwrap();
+            tx.execute_unprepared("PRAGMA ignore_check_constraints=OFF")
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        } else {
+            db.execute_raw(update).await.unwrap();
+        }
+        let observer = super::frozen::observe_store_restores(&f.store, "ws");
+        let error = super::frozen::capture_with_imports_prepared(
+            &f.store,
+            "ws",
+            "thread",
+            &allowed,
+            &output_messages,
+            &imports,
+            super::coverage::CheckpointGraphResolver::default(),
+        )
+        .await
+        .err()
+        .expect(corruption);
+        assert_eq!(observer.page_calls(), (0, 0), "{corruption}: {error:#}");
+        let count: i64 = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM compaction_frozen_history WHERE owner_thread='thread' AND identity_sha256=?",
+            [parent_projection.descriptor.identity_sha256.clone().into()],
+        )).await.unwrap().unwrap().try_get("", "n").unwrap();
+        assert_eq!(count, 2, "{corruption} silently created a replacement");
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "UPDATE compaction_frozen_import_data SET proof_json=?,bytes=? WHERE manifest_id=? AND ordinal=0",
+            [original.clone().into(), (original.len() as i64).into(), backing.clone().into()],
+        )).await.unwrap();
+    }
+
     let parent_json = serde_json::to_string(&parent_projection.descriptor).unwrap();
 
     async fn install_execution(db: &pioneer_sqlite::SqliteDatabase, id: &str, parent_json: &str) {
