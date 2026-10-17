@@ -4234,7 +4234,7 @@ impl MessageProcessor {
                     CLIAgentRuntimeKind::Codex => {
                         pioneer_observability::turn_startup::Runtime::Codex
                     }
-                    CLIAgentRuntimeKind::Claude => {
+                    CLIAgentRuntimeKind::Claude | CLIAgentRuntimeKind::OpenCode => {
                         pioneer_observability::turn_startup::Runtime::Claude
                     }
                     CLIAgentRuntimeKind::Acp => pioneer_observability::turn_startup::Runtime::Acp,
