@@ -162,6 +162,11 @@ fn classify_cli_runtime_turn_recovery_outcome(
     binding: &CliRuntimeTurnBindingRecord,
     runtime: Option<&CLIAgentRuntimeRecoveryRuntime>,
 ) -> CLIAgentRuntimeTurnRecoveryOutcome {
+    if binding.runtime_kind == "acp" {
+        return blocked_recovery(binding, "acp_outcome_unknown",
+            "ACP execution outcome is unknown after connection loss; the original prompt was not resubmitted.".into(),
+            vec!["Inspect the accepted Pioneer history and external effects before starting a new turn.".into()]);
+    }
     let Some(runtime) = runtime else {
         return blocked_recovery(
             binding,
@@ -295,10 +300,14 @@ fn blocked_recovery(
             reason_class: reason_class.to_owned(),
             human_message,
             resume_requirements,
-            resume_command: format!("turn.resume:{}", binding.turn_id),
+            resume_command: if binding.runtime_kind == "acp" {
+                String::new()
+            } else {
+                format!("turn.resume:{}", binding.turn_id)
+            },
             blocked_recovery_job_id: None,
             latest_checkpoint_id: None,
-            can_resume_same_turn: true,
+            can_resume_same_turn: binding.runtime_kind != "acp",
         },
     }
 }
@@ -380,6 +389,7 @@ fn cli_agent_runtime_kind_label(kind: CLIAgentRuntimeKind) -> &'static str {
     match kind {
         CLIAgentRuntimeKind::Codex => "codex",
         CLIAgentRuntimeKind::Claude => "claude",
+        pioneer_protocol::CLIAgentRuntimeKind::Acp => "acp",
         CLIAgentRuntimeKind::OpenCode => "opencode",
     }
 }
@@ -629,5 +639,34 @@ mod tests {
             }
             _ => false,
         }));
+    }
+    #[tokio::test]
+    async fn ready_acp_session_does_not_prove_unknown_prompt_outcome() {
+        let store = test_store().await;
+        materialize_in_progress_turn(&store, "acp-child", "acp-turn").await;
+        persist_binding(
+            &store,
+            "arbitrary-agent",
+            "acp-child",
+            "acp-turn",
+            CLI_RUNTIME_TURN_STATUS_RUNNING,
+        )
+        .await;
+        let mut binding = store
+            .get_cli_runtime_turn_binding("acp-turn")
+            .await
+            .unwrap()
+            .unwrap();
+        binding.runtime_kind = "acp".into();
+        let mut ready = runtime("arbitrary-agent", RuntimeStatus::Ready);
+        ready.runtime_kind = "acp".into();
+        for current in [None, Some(&ready)] {
+            let outcome = super::classify_cli_runtime_turn_recovery_outcome(&binding, current);
+            assert!(matches!(outcome,
+                CLIAgentRuntimeTurnRecoveryOutcome::Blocked { resume, .. }
+                    if resume.reason_class == "acp_outcome_unknown" && !resume.can_resume_same_turn
+                        && resume.resume_command.is_empty()
+            ));
+        }
     }
 }

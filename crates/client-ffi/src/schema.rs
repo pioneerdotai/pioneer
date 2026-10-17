@@ -23,6 +23,26 @@ macro_rules! schema_doc {
 pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
     let mut documents = vec![
         schema_doc!(
+            "provider_command.json",
+            pioneer_client::providers::operations::ProviderCommand
+        ),
+        schema_doc!(
+            "provider_operation_completion.json",
+            pioneer_client::providers::operations::ProviderOperationCompletion
+        ),
+        schema_doc!(
+            "cli_runtime_provider_drafts.json",
+            Vec<pioneer_client::providers::cli_runtime_settings::CLIRuntimeProviderDraft>
+        ),
+        schema_doc!(
+            "acp_session_params.json",
+            pioneer_client::cli_runtime::acp::AcpSessionParams
+        ),
+        schema_doc!(
+            "acp_session_response.json",
+            pioneer_client::cli_runtime::acp::AcpSessionResponse
+        ),
+        schema_doc!(
             "client_scope_lease_request_dto.json",
             crate::client_binding::ClientScopeLeaseRequestDto
         ),
@@ -620,7 +640,13 @@ pub fn write_client_ffi_schemas(
     fs::create_dir_all(output_directory)?;
 
     for document in client_ffi_schema_documents() {
-        let schema_json = serde_json::to_string_pretty(&document.schema)?;
+        // ACP SDK enables serde_json/preserve_order for the workspace graph.
+        // Keep the established export order independent of feature unification;
+        // Schemars still applies its normal schema keyword presentation order.
+        let mut value = document.schema.to_value();
+        value.sort_all_objects();
+        let schema = Schema::try_from(value)?;
+        let schema_json = serde_json::to_string_pretty(&schema)?;
         let path = output_directory.join(document.file_name);
         fs::write(path, schema_json)?;
     }

@@ -99,6 +99,9 @@ open_shadow_home = "Open shadow home"
 expand = "Show CLI provider details"
 collapse = "Hide CLI provider details"
 
+edit_launch = "Edit launch settings…"
+acp_auth_hint = "Authenticate in the composer agent selector"
+
 [providers.cli.status_detail]
 authenticated = "Authenticated as %{account}"
 authenticated_with_plan = "Authenticated as %{account} · %{plan}"
@@ -132,6 +135,7 @@ error = "Error"
 settings_load_failed = "Failed to load CLI provider settings"
 settings_forbidden = "This account cannot manage Gateway settings"
 login_failed = "Failed to start login for %{runtime}"
+session_failed = "Session action failed for %{runtime}"
 proxy_failed = "Failed to update the proxy for %{runtime}"
 save_failed = "Failed to save settings for %{runtime}"
 enabled_failed = "Failed to change the enabled state of %{runtime}"
@@ -357,3 +361,9 @@ choose = "Choose…"
 reset = "Reset"
 save_first = "Save the CLI provider before choosing its model."
 invalid = "Choose a model and reasoning setting supported by this CLI provider."
+
+[providers.cli.acp]
+arguments = "Arguments (JSON array)"
+environment = "Environment references (JSON object)"
+environment_hint = "Map child variable names to variable names on the Gateway host. Values stay on the host."
+invalid_launch = "Enter arguments as a JSON array of strings and environment references as a JSON object."

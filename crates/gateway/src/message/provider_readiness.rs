@@ -1399,6 +1399,7 @@ fn telemetry_cli_runtime_kind(kind: CLIAgentRuntimeKind) -> GatewayCliRuntimeKin
     match kind {
         CLIAgentRuntimeKind::Codex => GatewayCliRuntimeKind::Codex,
         CLIAgentRuntimeKind::Claude => GatewayCliRuntimeKind::Claude,
+        CLIAgentRuntimeKind::Acp => GatewayCliRuntimeKind::Acp,
         CLIAgentRuntimeKind::OpenCode => GatewayCliRuntimeKind::OpenCode,
     }
 }

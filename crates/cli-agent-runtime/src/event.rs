@@ -16,6 +16,11 @@ pub struct RuntimeEventMappingOptions {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEvent {
     SessionStateChanged(RuntimeSessionStateChanged),
+    /// Client-owned session compaction projection, preserving its first turn.
+    /// This shares ordered runtime ingress but cannot terminalize an execution.
+    SessionCompaction {
+        entries: Vec<RuntimeCompactionProjection>,
+    },
     ThreadStateChanged(RuntimeThreadStateChanged),
     ThreadNameUpdated(RuntimeThreadNameUpdated),
     ThreadGoalUpdated(RuntimeThreadGoalUpdated),
@@ -38,6 +43,12 @@ pub enum RuntimeEvent {
     ReviewModeChanged(RuntimeReviewModeChanged),
     Error(RuntimeErrorEvent),
     Raw(RuntimeRawEvent),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeCompactionProjection {
+    pub started: Option<pioneer_protocol::ItemStartedNotification>,
+    pub updated: pioneer_protocol::ItemUpdatedNotification,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,6 +399,11 @@ impl RuntimeAgentMessagePhase {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeItemStarted {
+    /// A typed item constructed by the client-side standard protocol reducer.
+    /// Native raw payload parsers leave this unset; policy snapshots must not
+    /// be deserialized from an agent's rawInput or metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<pioneer_protocol::TurnItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_thread_id: Option<String>,
     pub native_turn_id: String,
@@ -440,6 +456,8 @@ pub enum RuntimeItemDeltaKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeItemCompleted {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<pioneer_protocol::TurnItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_thread_id: Option<String>,
     pub native_turn_id: String,
     pub native_item_id: String,
@@ -465,6 +483,8 @@ pub struct RuntimeItemCompleted {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeItemUpdated {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<pioneer_protocol::TurnItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_thread_id: Option<String>,
     pub native_turn_id: String,
@@ -946,6 +966,7 @@ fn map_codex_item_started(
     }
     let phase = codex_agent_message_phase(item_kind.as_str(), item);
     RuntimeEvent::ItemStarted(RuntimeItemStarted {
+        item: None,
         native_thread_id: string_path(params, &["threadId"]),
         native_turn_id: string_path(params, &["turnId"]).unwrap_or_default(),
         native_item_id,
@@ -980,6 +1001,7 @@ fn map_codex_item_completed(
     }
     let phase = codex_agent_message_phase(item_kind.as_str(), item);
     RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+        item: None,
         native_thread_id: string_path(params, &["threadId"]),
         native_turn_id: string_path(params, &["turnId"]).unwrap_or_default(),
         native_item_id,

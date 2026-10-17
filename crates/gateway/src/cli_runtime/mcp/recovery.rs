@@ -204,6 +204,9 @@ pub(crate) async fn restore_cli_mcp_session_launch(
 
     let facade_limits = CliMcpFacadeProjectionLimits::transport_bounded(limits.max_tools);
     match runtime_kind {
+        CLIAgentRuntimeKind::Acp => Err(invalid(anyhow!(
+            "ACP execution is not reconstructed for native recovery; known terminal outcomes use the durable delivery journal"
+        ))),
         CLIAgentRuntimeKind::Codex => {
             if metadata.adapter_kind != CODEX_MCP_ADAPTER_KIND {
                 return Err(invalid(anyhow!(

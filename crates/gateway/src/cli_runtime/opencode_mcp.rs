@@ -346,6 +346,7 @@ mod tests {
             .clone();
         let qualified = format!("pioneer_{canonical}");
         let mut event = RuntimeEvent::ItemStarted(RuntimeItemStarted {
+            item: None,
             native_thread_id: Some("session-1".to_owned()),
             native_turn_id: "turn-1".to_owned(),
             native_item_id: "call-1".to_owned(),

@@ -608,7 +608,8 @@ pub fn reduce_gateway_notification(
         GatewayNotification::TaskUserNotificationDelivered(notification) => Some(
             ClientRuntimeNotification::TaskUserNotificationDelivered(notification),
         ),
-        GatewayNotification::AuthSessionRevoked(_)
+        GatewayNotification::AcpSessionChanged(_)
+        | GatewayNotification::AuthSessionRevoked(_)
         | GatewayNotification::AuthAccessExpiring(_)
         | GatewayNotification::ContextCompressing(_)
         | GatewayNotification::ContextCompressed(_)

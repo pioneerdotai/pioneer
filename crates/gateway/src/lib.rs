@@ -809,6 +809,7 @@ async fn run_gateway_until_shutdown_inner(
         cli_mcp_limits,
         message_processor.cli_turn_mcp_invoker(),
         cli_runtime_crud_store,
+        message_processor.acp_runtime_services(),
     )?;
     if let Some(cli_runtime_manager) = cli_runtime_manager {
         message_processor = message_processor.with_cli_runtime_manager(cli_runtime_manager);
@@ -1290,6 +1291,7 @@ fn build_cli_runtime_manager(
     mcp_limits: crate::cli_runtime::mcp::limits::CliMcpRuntimeLimits,
     turn_mcp_invoker: Arc<dyn crate::turn_mcp::invoker::TurnMcpInvoker>,
     crud_store: Arc<CrudStore>,
+    acp_services: crate::cli_runtime::acp_session::AcpRuntimeServices,
 ) -> Result<Option<Arc<crate::cli_runtime::manager::CLIAgentRuntimeManager>>> {
     crate::cli_runtime::codex_session::cli_runtime_manager(
         runtime_home.to_path_buf(),
@@ -1297,6 +1299,7 @@ fn build_cli_runtime_manager(
         mcp_limits,
         turn_mcp_invoker,
         crud_store,
+        acp_services,
     )
     .map(Some)
 }

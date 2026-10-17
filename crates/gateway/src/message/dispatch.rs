@@ -2091,7 +2091,8 @@ impl MessageProcessor {
                             AuthorizationExternalError::Validation.response(request.id.clone())
                         );
                     };
-                    self.crud_store
+                    let pending = self
+                        .crud_store
                         .get_cli_runtime_pending_request(request_id.trim())
                         .await
                         .map_err(|_| {
@@ -2105,12 +2106,30 @@ impl MessageProcessor {
                         .filter(|pending| {
                             pending.workspace_id == requested_workspace_id.trim()
                                 && pending.runtime_id == requested_runtime_id.trim()
-                        })
-                        .and_then(|pending| {
-                            pending
-                                .turn_id
-                                .map(|turn_id| (pending.workspace_id, pending.thread_id, turn_id))
-                        })
+                        });
+                    if let Some(pending) = pending.as_ref().filter(|pending| {
+                        pending.runtime_kind == "acp" && pending.turn_id.is_none()
+                    }) {
+                        // Request-scoped auth/config interactions have no Turn.
+                        // The existing management policy still excludes Members.
+                        if action_gate.is_final_allow()
+                            && crate::authorization::AuthorizationService::new()
+                                .cli_management_details_allowed(
+                                    context.principal().kind,
+                                    context.principal().role_key.as_ref(),
+                                    &pending.runtime_id,
+                                )
+                        {
+                            let decision = AuthorizationDecision::AllowAbsolute;
+                            record_method_decision(entry, &decision);
+                            return Ok(RequestAdmission::Superuser);
+                        }
+                    }
+                    pending.and_then(|pending| {
+                        pending
+                            .turn_id
+                            .map(|turn_id| (pending.workspace_id, pending.thread_id, turn_id))
+                    })
                 } else {
                     None
                 };
@@ -5459,6 +5478,13 @@ impl MessageProcessor {
                             )
                             .await;
                         }
+                    }
+                }
+                methods::CLI_RUNTIME_ACP_SESSION => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<pioneer_protocol::AcpSessionParams>(params_value) {
+                        Ok(params) => self.acp_session_control(&context, request.id, params).await,
+                        Err(error) => self.send_error(connection_id, JsonRpcErrorResponse::new(Some(request.id), INVALID_PARAMS_CODE, format!("invalid ACP session params: {error}"))).await,
                     }
                 }
                 methods::CLI_RUNTIME_LIST_MODELS => {

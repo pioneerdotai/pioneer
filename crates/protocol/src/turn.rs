@@ -1001,6 +1001,7 @@ pub enum TurnSecurityExecutionBackendKind {
     Native,
     CodexCli,
     ClaudeCli,
+    Acp,
     #[serde(rename = "opencode_cli")]
     OpenCodeCli,
 }
@@ -1504,12 +1505,16 @@ pub enum AgentExecutionBackend {
 pub enum CLIAgentRuntimeKind {
     Codex,
     Claude,
+    /// The standard ACP transport, shared by every configured ACP instance.
+    Acp,
     #[serde(rename = "opencode")]
     OpenCode,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 pub struct TurnCLIRuntimeOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_configuration: Option<crate::AcpTurnConfiguration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<CLIAgentRuntimeSandboxPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

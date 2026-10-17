@@ -578,7 +578,7 @@ pub(crate) fn workspace_launch_profile(
             default_model.to_owned(),
         ),
         pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance => {
-            let _runtime = cli_runtimes
+            let runtime = cli_runtimes
                 .iter()
                 .find(|runtime| runtime.id == source_id && runtime.enabled)
                 .ok_or_else(|| anyhow::anyhow!("CLI identity runtime is unavailable"))?;
@@ -587,8 +587,14 @@ pub(crate) fn workspace_launch_profile(
             // replace that pinned model during projection or recovery.
             let model = default_model.to_owned();
             (
-                pioneer_protocol::AgentExecutionProfileBackend::CliRuntime {
-                    runtime_instance_id: source_id.to_owned(),
+                if runtime.kind == pioneer_config::GatewayCliAgentRuntimeKindConfig::Acp {
+                    pioneer_protocol::AgentExecutionProfileBackend::AcpAgentRuntime {
+                        runtime_id: source_id.to_owned(),
+                    }
+                } else {
+                    pioneer_protocol::AgentExecutionProfileBackend::CliRuntime {
+                        runtime_instance_id: source_id.to_owned(),
+                    }
                 },
                 format!("cli_runtime:{source_id}"),
                 model,
@@ -648,7 +654,7 @@ pub(crate) async fn resolve_workspace_task_launch(
             Some(runtime_id.as_str())
         }
         Some(pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime { runtime_id }) => {
-            anyhow::bail!("Task launch selected unsupported ACP runtime `{runtime_id}`")
+            Some(runtime_id.as_str())
         }
         Some(pioneer_protocol::AgentExecutionBackend::ApiProvider { provider }) => {
             if provider != default_provider {
@@ -1374,8 +1380,8 @@ pub(crate) async fn prepare_root_agent_execution_admission(
         Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime { runtime_id, .. }) => {
             Some(runtime_id.as_str())
         }
-        Some(pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime { .. }) => {
-            anyhow::bail!("ACP-backed root Agent execution is unsupported")
+        Some(pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime { runtime_id }) => {
+            Some(runtime_id.as_str())
         }
         Some(pioneer_protocol::AgentExecutionBackend::ApiProvider { .. }) => None,
         None => bound_cli_runtime_id,
@@ -2362,10 +2368,20 @@ async fn dispatch_agent_action_outbox_row(
                 .dispatch_prepared_api_provider_turn_start(prepared)
                 .await;
         }
-        Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime {
-            runtime_id,
-            runtime_kind,
-        }) => {
+        Some(
+            backend @ (pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime { .. }
+            | pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime { .. }),
+        ) => {
+            let (runtime_id, runtime_kind) = match backend {
+                pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime {
+                    runtime_id,
+                    runtime_kind,
+                } => (runtime_id, runtime_kind),
+                pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime { runtime_id } => {
+                    (runtime_id, pioneer_protocol::CLIAgentRuntimeKind::Acp)
+                }
+                _ => unreachable!("matched CLI transports"),
+            };
             let permission_profile =
                 processor.materialized_turn_permission_profile(&outcome.materialization.turn)?;
             let security_snapshot = processor
@@ -2401,11 +2417,6 @@ async fn dispatch_agent_action_outbox_row(
             processor
                 .activate_prepared_committed_agent_cli_runtime_turn(prepared)
                 .await?;
-        }
-        Some(pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime { runtime_id }) => {
-            anyhow::bail!(
-                "committed StartAgent ACP runtime `{runtime_id}` has no installed dispatcher"
-            );
         }
         None => anyhow::bail!("committed StartAgent has no exact execution backend"),
     }
@@ -2752,6 +2763,11 @@ impl AgentActionToolHandler {
                         ToolError::execution_failed("selected CLI runtime is no longer available")
                     })?;
                 let runtime_kind = match runtime.kind {
+                    pioneer_config::GatewayCliAgentRuntimeKindConfig::Acp => {
+                        return Err(ToolError::execution_failed(
+                            "native CLI execution profile cannot select an ACP instance",
+                        ));
+                    }
                     pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex => {
                         pioneer_protocol::CLIAgentRuntimeKind::Codex
                     }
@@ -2829,7 +2845,14 @@ impl AgentActionToolHandler {
             }) => crate::turn_security::TurnSecurityResolverExecutionBackend::OpenCodeCli {
                 runtime_id: runtime_id.clone(),
             },
-            Some(pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime { .. }) | None => {
+            Some(pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime { runtime_id })
+            | Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime {
+                runtime_id,
+                runtime_kind: pioneer_protocol::CLIAgentRuntimeKind::Acp,
+            }) => crate::turn_security::TurnSecurityResolverExecutionBackend::Acp {
+                runtime_id: runtime_id.clone(),
+            },
+            None => {
                 return Err(ToolError::execution_failed(
                     "selected Agent backend has no installed security/runtime adapter",
                 ));

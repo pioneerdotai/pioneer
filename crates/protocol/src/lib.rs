@@ -1,3 +1,7 @@
+pub use agent_client_protocol_schema::v1 as acp;
+mod acp_session;
+pub mod acp_validation;
+pub use acp_session::*;
 mod thread_tool_result;
 pub use thread_tool_result::{
     ThreadToolResultCursor, ThreadToolResultReadParams, ThreadToolResultReadResponse,

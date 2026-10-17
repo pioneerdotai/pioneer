@@ -139,6 +139,7 @@ pub(crate) fn reconcile_composer_policy(
     if !reconciliation.draft.has_attachments {
         domain.attachments.clear();
     }
+    let removed_model = domain.selected_model.is_some() && reconciliation.draft.model.is_none();
     domain.selected_provider = reconciliation.draft.provider.clone();
     domain.selected_model = reconciliation.draft.model.clone();
     if domain.selected_provider.is_none() || domain.selected_model.is_none() {
@@ -151,7 +152,9 @@ pub(crate) fn reconcile_composer_policy(
     if domain.selected_provider.is_none() {
         domain.capability_target = super::capabilities::ComposerCapabilityTarget::native();
     }
-    if domain.selected_provider.is_none() || domain.selected_model.is_none() {
+    // A prepared ACP provider has a descriptor selection instead of a model_id.
+    // Preserve an explicit provider-only choice unless policy removed it.
+    if domain.selected_provider.is_none() || removed_model {
         domain.model_manually_selected = false;
     }
     reconciliation

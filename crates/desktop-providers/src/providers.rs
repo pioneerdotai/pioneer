@@ -509,6 +509,7 @@ fn provider_operation_errors(
         return (None, None);
     }
     let (cli, key) = match operation.action() {
+        ProviderActionKind::AcpSession => (true, "providers.cli.error.session_failed"),
         ProviderActionKind::Configure => (false, "providers.error.configure_failed"),
         ProviderActionKind::Disconnect => (false, "providers.error.disconnect_failed"),
         ProviderActionKind::Connect => (true, "providers.cli.error.login_failed"),

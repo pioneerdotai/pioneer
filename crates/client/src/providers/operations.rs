@@ -1,13 +1,16 @@
 //! Provider mutations share one generation and permission gate per process.
 use super::{cli_runtime_settings::*, runtime::ProviderRuntimeIntent, store::*};
 use crate::core::*;
+use anyhow::Context as _;
 use pioneer_protocol::*;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", content = "params", rename_all = "snake_case")]
 pub enum ProviderCommand {
+    AcpSession(AcpSessionParams),
+    ReleaseAcpAuth(AcpSessionParams),
     Configure(ProviderConfigureParams),
     Disconnect(ProviderDeleteApiKeyParams),
     Connect(CLIRuntimeLoginStartParams),
@@ -39,6 +42,7 @@ impl PartialEq for ProviderCommand {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderActionKind {
+    AcpSession,
     Configure,
     Disconnect,
     Connect,
@@ -90,16 +94,36 @@ pub struct ProviderOperation {
     command: ProviderCommand,
 }
 // Login details are delivered once to the initiating operation, never published.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", content = "result", rename_all = "snake_case")]
 pub enum ProviderOperationCompletion {
+    AcpSession(AcpSessionResponse),
     Completed,
     Login(CLIRuntimeLoginStartResponse),
 }
-struct ProviderWork {
-    operation: ProviderOperation,
-    reply: std::sync::mpsc::SyncSender<anyhow::Result<ProviderOperationCompletion>>,
+enum ProviderWork {
+    Execute {
+        operation: ProviderOperation,
+        reply: std::sync::mpsc::SyncSender<anyhow::Result<ProviderOperationCompletion>>,
+    },
+    LifecycleWake,
+}
+struct AuthInvocation {
+    close: AcpSessionParams,
+    epoch: (u64, u64, Option<u64>),
+    // None is a release-before-start fence; Some binds the prepared action.
+    operation_generation: Option<u64>,
+    retired: bool,
+    dispatched: bool,
+    released: bool,
+    next_cleanup: std::time::Instant,
 }
 #[derive(Default)]
 pub(crate) struct ProviderController {
+    auth_invocations: BTreeMap<String, AuthInvocation>,
+    acp_sessions: BTreeMap<(String, String, String), AcpSessionSnapshot>,
+    acp_epoch: Option<(u64, u64, Option<u64>)>,
     pub(super) credentials: super::credentials::CredentialRequests,
     generation: u64,
     pub(super) effect_generation: u64,
@@ -109,10 +133,66 @@ pub(crate) struct ProviderController {
     task: Option<std::thread::JoinHandle<()>>,
 }
 impl ProviderController {
+    fn retire_auth(&mut self, id: &str) {
+        if let Some(invocation) = self.auth_invocations.get_mut(id) {
+            invocation.retired = true;
+            invocation.dispatched = false;
+            invocation.released = true;
+            invocation.next_cleanup = std::time::Instant::now();
+        }
+        // Only acknowledged/no-dispatch records may be evicted. Early fences
+        // and live remote obligations are never evicted to admit another start.
+        while self.auth_invocations.values().filter(|i| i.retired).count() > 64 {
+            let oldest = self
+                .auth_invocations
+                .iter()
+                .filter(|(_, i)| i.retired)
+                .min_by_key(|(_, i)| i.next_cleanup)
+                .map(|(id, _)| id.clone())
+                .expect("retired entry");
+            self.auth_invocations.remove(&oldest);
+        }
+    }
+    fn retire_undispatched_auth(&mut self, identity: &Identity) {
+        let ids = self
+            .auth_invocations
+            .iter()
+            .filter(|(_, i)| {
+                !i.retired
+                    && !i.dispatched
+                    && i.operation_generation == Some(identity.generation)
+                    && i.epoch == identity.epoch
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.retire_auth(&id);
+        }
+    }
+    fn release_auths(&mut self, workspace: Option<&str>) {
+        let mut undispatched = Vec::new();
+        for (id, invocation) in &mut self.auth_invocations {
+            if workspace.is_some_and(|w| invocation.close.workspace_id != w) {
+                continue;
+            }
+            invocation.released = true;
+            if !invocation.dispatched
+                && invocation.operation_generation.is_some()
+                && !invocation.retired
+            {
+                undispatched.push(id.clone());
+            }
+        }
+        for id in undispatched {
+            self.retire_auth(&id);
+        }
+    }
     pub(crate) fn stop(&mut self) {
         self.active = None;
         self.prepared = None;
         self.credentials.stop();
+        self.acp_sessions.clear();
+        self.release_auths(None);
         self.sender.take();
     }
 }
@@ -129,6 +209,7 @@ impl Drop for ProviderController {
 impl ProviderCommand {
     fn workspace(&self) -> &str {
         match self {
+            Self::AcpSession(p) | Self::ReleaseAcpAuth(p) => &p.workspace_id,
             Self::Configure(p) => &p.workspace_id,
             Self::Disconnect(p) => &p.workspace_id,
             Self::Connect(p) => &p.workspace_id,
@@ -140,6 +221,7 @@ impl ProviderCommand {
     }
     fn target(&self) -> &str {
         match self {
+            Self::AcpSession(p) | Self::ReleaseAcpAuth(p) => &p.runtime_id,
             Self::Configure(p) => &p.provider,
             Self::Disconnect(p) => &p.provider,
             Self::Connect(p) => &p.runtime_id,
@@ -151,6 +233,7 @@ impl ProviderCommand {
     }
     fn kind(&self) -> ProviderActionKind {
         match self {
+            Self::AcpSession(_) | Self::ReleaseAcpAuth(_) => ProviderActionKind::AcpSession,
             Self::Configure(_) => ProviderActionKind::Configure,
             Self::Disconnect(_) => ProviderActionKind::Disconnect,
             Self::Connect(_) => ProviderActionKind::Connect,
@@ -162,6 +245,87 @@ impl ProviderCommand {
     }
 }
 impl ClientCore {
+    pub(crate) fn observe_acp_session_notification(
+        &self,
+        notification: &GatewayNotification,
+    ) -> bool {
+        let GatewayNotification::AcpSessionChanged(snapshot) = notification else {
+            return false;
+        };
+        if !self.capability_management_allowed(&snapshot.workspace_id) {
+            return true;
+        }
+        let epoch = self.provider_runtime_epoch();
+        let mut owner = self
+            .provider_controller
+            .lock()
+            .expect("provider controller poisoned");
+        if owner.acp_epoch != Some(epoch) {
+            owner.acp_sessions.clear();
+            owner.acp_epoch = Some(epoch);
+        }
+        let key = (
+            snapshot.workspace_id.clone(),
+            snapshot.thread_id.clone(),
+            snapshot.runtime_id.clone(),
+        );
+        if owner.acp_sessions.get(&key).is_some_and(|current| {
+            current.generation > snapshot.generation
+                || (current.generation == snapshot.generation
+                    && current.presentation_revision >= snapshot.presentation_revision)
+        }) {
+            return true;
+        }
+        if owner.acp_sessions.len() >= 64 && !owner.acp_sessions.contains_key(&key) {
+            if let Some(old) = owner.acp_sessions.keys().next().cloned() {
+                owner.acp_sessions.remove(&old);
+            }
+        }
+        owner.acp_sessions.insert(key, snapshot.clone());
+        let previous = self.provider_operation_snapshot(&snapshot.workspace_id);
+        let identity = Identity {
+            generation: previous.as_ref().map_or(owner.generation, |p| p.generation),
+            epoch: self.provider_runtime_epoch(),
+            workspace_id: snapshot.workspace_id.clone(),
+            target: previous
+                .as_ref()
+                .map_or_else(|| snapshot.runtime_id.clone(), |p| p.target.clone()),
+            kind: previous
+                .as_ref()
+                .map_or(ProviderActionKind::AcpSession, |p| p.action),
+        };
+        self.publish_provider_operation(
+            &identity,
+            previous
+                .as_ref()
+                .map_or(ProviderLoadState::Ready, |p| p.request.clone()),
+        );
+        drop(owner);
+        self.refresh_composer_acp_picker(snapshot);
+        true
+    }
+    pub fn acp_session_snapshot(
+        &self,
+        workspace: &str,
+        thread: &str,
+        runtime: &str,
+    ) -> Option<AcpSessionSnapshot> {
+        if !self.capability_management_allowed(workspace) {
+            return None;
+        }
+        let epoch = self.provider_runtime_epoch();
+        let owner = self
+            .provider_controller
+            .lock()
+            .expect("provider controller poisoned");
+        if owner.acp_epoch != Some(epoch) {
+            return None;
+        }
+        owner
+            .acp_sessions
+            .get(&(workspace.into(), thread.into(), runtime.into()))
+            .cloned()
+    }
     pub fn provider_operation_snapshot(
         &self,
         workspace_id: &str,
@@ -245,6 +409,60 @@ impl ClientCore {
             target: command.target().into(),
             kind: command.kind(),
         };
+        if let ProviderCommand::AcpSession(params) = &command {
+            if let AcpSessionOperation::TerminalAuthStart {
+                terminal_id,
+                expected_generation,
+                ..
+            } = &params.operation
+            {
+                let mut close = params.clone();
+                close.operation = AcpSessionOperation::TerminalAuthClose {
+                    expected_generation: *expected_generation,
+                    terminal_id: terminal_id.clone(),
+                };
+                if let Some(invocation) = owner.auth_invocations.get(terminal_id) {
+                    anyhow::ensure!(invocation.close == close, "stale_auth_invocation");
+                    if invocation.released && invocation.operation_generation.is_none() {
+                        owner.retire_auth(terminal_id);
+                    }
+                    anyhow::bail!("auth_invocation_already_owned_or_released");
+                }
+                anyhow::ensure!(!owner.auth_invocations.values().any(|invocation|
+                    !invocation.retired && invocation.operation_generation.is_some()
+                    && invocation.epoch.2 == epoch.2
+                    && invocation.close.workspace_id == params.workspace_id
+                    && invocation.close.thread_id == params.thread_id
+                    && invocation.close.runtime_id == params.runtime_id
+                    && matches!(&invocation.close.operation, AcpSessionOperation::TerminalAuthClose { expected_generation: g, .. } if g == expected_generation)),
+                    "auth_terminal_pending_cleanup");
+                anyhow::ensure!(
+                    terminal_id.len() == 32
+                        && terminal_id
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+                        && owner
+                            .auth_invocations
+                            .values()
+                            .filter(|i| !i.retired && i.operation_generation.is_some())
+                            .count()
+                            < 64,
+                    "invalid_auth_invocation_or_active_budget_exceeded"
+                );
+                owner.auth_invocations.insert(
+                    terminal_id.clone(),
+                    AuthInvocation {
+                        close,
+                        epoch,
+                        operation_generation: Some(identity.generation),
+                        retired: false,
+                        dispatched: false,
+                        released: false,
+                        next_cleanup: std::time::Instant::now(),
+                    },
+                );
+            }
+        }
         owner.active = Some(identity.clone());
         self.publish_provider_operation(&identity, ProviderLoadState::Loading);
         Ok(ProviderOperation { identity, command })
@@ -309,6 +527,10 @@ impl ClientCore {
         self: &Arc<Self>,
         command: ProviderCommand,
     ) -> anyhow::Result<ProviderOperationCompletion> {
+        if let ProviderCommand::ReleaseAcpAuth(params) = command {
+            self.release_acp_auth(params)?;
+            return Ok(ProviderOperationCompletion::Completed);
+        }
         self.prepare_provider_command(command)?
             .execute(Arc::downgrade(self))
     }
@@ -318,15 +540,177 @@ impl ClientCore {
     ) -> anyhow::Result<ProviderOperationCompletion> {
         operation.execute(Arc::downgrade(self))
     }
+    /// Transfer the teardown obligation to the existing operation owner. This
+    /// lifecycle intent is accepted while a normal provider action is busy.
+    pub fn release_acp_auth(&self, params: AcpSessionParams) -> anyhow::Result<()> {
+        let AcpSessionOperation::TerminalAuthClose { terminal_id, .. } = &params.operation else {
+            anyhow::bail!("auth_release_requires_exact_terminal");
+        };
+        anyhow::ensure!(
+            terminal_id.len() == 32
+                && terminal_id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-'),
+            "invalid_auth_invocation"
+        );
+        let mut owner = self
+            .provider_controller
+            .lock()
+            .expect("provider controller poisoned");
+        if let Some(invocation) = owner.auth_invocations.get_mut(terminal_id) {
+            anyhow::ensure!(invocation.close == params, "stale_auth_release");
+            if invocation.retired {
+                return Ok(());
+            }
+            invocation.released = true;
+            if !invocation.dispatched && invocation.operation_generation.is_some() {
+                let generation = invocation.operation_generation;
+                let epoch = invocation.epoch;
+                owner.retire_auth(terminal_id);
+                // The shell may drop its prepared task before enqueue. Claim
+                // and release share this lock, so this exact action can never
+                // dispatch; it must not retain the normal provider busy gate.
+                if let Some(identity) = owner
+                    .active
+                    .as_ref()
+                    .filter(|identity| {
+                        Some(identity.generation) == generation && identity.epoch == epoch
+                    })
+                    .cloned()
+                {
+                    owner.active = None;
+                    owner.prepared = None;
+                    self.publish_provider_operation(&identity, ProviderLoadState::Cancelled);
+                }
+            }
+        } else {
+            // Mobile release may cross the FFI worker before start preparation.
+            // Retain a bounded tombstone so that late start cannot create it.
+            anyhow::ensure!(
+                owner
+                    .auth_invocations
+                    .values()
+                    .filter(|i| !i.retired && i.operation_generation.is_none())
+                    .count()
+                    < 64,
+                "auth_release_fence_budget_exceeded"
+            );
+            owner.auth_invocations.insert(
+                terminal_id.clone(),
+                AuthInvocation {
+                    close: params,
+                    epoch: self.provider_runtime_epoch(),
+                    operation_generation: None,
+                    retired: false,
+                    dispatched: false,
+                    released: true,
+                    next_cleanup: std::time::Instant::now(),
+                },
+            );
+        }
+        let sender = owner.sender.clone();
+        drop(owner);
+        if let Some(sender) = sender {
+            let _ = sender.try_send(ProviderWork::LifecycleWake);
+        }
+        Ok(())
+    }
+    fn finish_released_acp_auth(&self) {
+        let epoch = self.provider_runtime_epoch();
+        let releases = {
+            let owner = self
+                .provider_controller
+                .lock()
+                .expect("provider controller poisoned");
+            owner
+                .auth_invocations
+                .iter()
+                .filter(|(_, invocation)| {
+                    invocation.released
+                        && invocation.dispatched
+                        && invocation.epoch.2 == epoch.2
+                        && invocation.next_cleanup <= std::time::Instant::now()
+                })
+                .map(|(id, invocation)| (id.clone(), invocation.close.clone()))
+                .collect::<Vec<_>>()
+        };
+        for (id, close) in releases {
+            // This is the same serialized worker's completion path, independent
+            // of a view or the next prepared operation's busy gate.
+            let Some(connection) = epoch.2 else {
+                continue;
+            };
+            if crate::transport::ws::command_sender::acp_session_control(
+                &self
+                    .transport_runtime()
+                    .ws_command_sender()
+                    .requests_for_connection(connection),
+                close,
+            )
+            .is_ok()
+            {
+                self.provider_controller
+                    .lock()
+                    .expect("provider controller poisoned")
+                    .retire_auth(&id);
+            } else if let Some(invocation) = self
+                .provider_controller
+                .lock()
+                .expect("provider controller poisoned")
+                .auth_invocations
+                .get_mut(&id)
+            {
+                invocation.next_cleanup =
+                    std::time::Instant::now() + std::time::Duration::from_secs(1);
+            }
+        }
+    }
     pub(crate) fn start_provider_operation_controller(self: &Arc<Self>) {
         let (sender, receiver) = std::sync::mpsc::sync_channel::<ProviderWork>(1);
         let weak = Arc::downgrade(self);
         let task = std::thread::Builder::new()
             .name("client-provider-actions".into())
             .spawn(move || {
-                while let Ok(work) = receiver.recv() {
-                    let result = work.operation.execute_direct(weak.clone());
-                    let _ = work.reply.try_send(result);
+                loop {
+                    let Some(core) = weak.upgrade() else {
+                        break;
+                    };
+                    core.finish_released_acp_auth();
+                    let epoch = core.provider_runtime_epoch();
+                    let pending_cleanup = core
+                        .provider_controller
+                        .lock()
+                        .expect("provider controller poisoned")
+                        .auth_invocations
+                        .values()
+                        .any(|invocation| {
+                            invocation.released
+                                && invocation.dispatched
+                                && invocation.epoch.2 == epoch.2
+                        });
+                    drop(core);
+                    let work = if pending_cleanup {
+                        match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+                            Ok(work) => work,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(_) => break,
+                        }
+                    } else {
+                        match receiver.recv() {
+                            Ok(work) => work,
+                            Err(_) => break,
+                        }
+                    };
+                    match work {
+                        ProviderWork::Execute { operation, reply } => {
+                            let result = operation.execute_direct(weak.clone());
+                            if let Some(core) = weak.upgrade() {
+                                core.finish_released_acp_auth();
+                            }
+                            let _ = reply.try_send(result);
+                        }
+                        ProviderWork::LifecycleWake => {}
+                    }
                 }
             })
             .expect("provider action worker");
@@ -361,12 +745,48 @@ impl ClientCore {
             .provider_controller
             .lock()
             .expect("provider controller poisoned");
+        owner.retire_undispatched_auth(identity);
+        if !applicable {
+            for invocation in owner.auth_invocations.values_mut().filter(|i| {
+                !i.retired
+                    && i.operation_generation == Some(identity.generation)
+                    && i.epoch == identity.epoch
+            }) {
+                invocation.released = true;
+            }
+        }
         anyhow::ensure!(
             owner.active.as_ref() == Some(identity),
             "provider_action_cancelled"
         );
         owner.active = None;
         owner.prepared = None;
+        if applicable {
+            if let Ok(ProviderOperationCompletion::AcpSession(response)) = &result {
+                let snapshot = &response.snapshot;
+                if owner.acp_epoch != Some(epoch) {
+                    owner.acp_sessions.clear();
+                    owner.acp_epoch = Some(epoch);
+                }
+                let key = (
+                    snapshot.workspace_id.clone(),
+                    snapshot.thread_id.clone(),
+                    snapshot.runtime_id.clone(),
+                );
+                if owner.acp_sessions.len() >= 64 && !owner.acp_sessions.contains_key(&key) {
+                    if let Some(old) = owner.acp_sessions.keys().next().cloned() {
+                        owner.acp_sessions.remove(&old);
+                    }
+                }
+                if owner.acp_sessions.get(&key).is_none_or(|current| {
+                    current.generation < snapshot.generation
+                        || (current.generation == snapshot.generation
+                            && current.presentation_revision < snapshot.presentation_revision)
+                }) {
+                    owner.acp_sessions.insert(key, snapshot.clone());
+                }
+            }
+        }
         self.publish_provider_operation(
             identity,
             if !applicable {
@@ -378,7 +798,12 @@ impl ClientCore {
             },
         );
         drop(owner);
-        if self.capability_management_allowed(&identity.workspace_id) {
+        if let Ok(ProviderOperationCompletion::AcpSession(response)) = &result {
+            self.refresh_composer_acp_picker(&response.snapshot);
+        }
+        if identity.kind != ProviderActionKind::AcpSession
+            && self.capability_management_allowed(&identity.workspace_id)
+        {
             let provider = if matches!(
                 identity.kind,
                 ProviderActionKind::Configure | ProviderActionKind::Disconnect
@@ -406,6 +831,12 @@ impl ClientCore {
         owner.active = None;
         owner.prepared = None;
         owner.credentials.invalidate();
+        owner.acp_sessions.clear();
+        owner.acp_epoch = None;
+        owner.release_auths(None);
+        if let Some(sender) = &owner.sender {
+            let _ = sender.try_send(ProviderWork::LifecycleWake);
+        }
     }
     pub fn cancel_provider_operations(&self, workspace: &str) {
         let epoch = self.provider_runtime_epoch();
@@ -413,6 +844,10 @@ impl ClientCore {
             .provider_controller
             .lock()
             .expect("provider controller poisoned");
+        owner.release_auths(Some(workspace));
+        if let Some(sender) = &owner.sender {
+            let _ = sender.try_send(ProviderWork::LifecycleWake);
+        }
         if let Some(identity) = owner
             .active
             .clone()
@@ -464,7 +899,7 @@ impl ProviderOperation {
             .as_ref()
             .is_some_and(|sender| {
                 sender
-                    .try_send(ProviderWork {
+                    .try_send(ProviderWork::Execute {
                         operation: self,
                         reply,
                     })
@@ -487,7 +922,15 @@ impl ProviderOperation {
                         "provider_action_cancelled"
                     );
                 }
-                Err(_) => anyhow::bail!("provider_action_cancelled"),
+                Err(_) => {
+                    if let Some(core) = client.upgrade() {
+                        return core.finish_provider_operation(
+                            &identity,
+                            Err(anyhow::anyhow!("provider_action_cancelled")),
+                        );
+                    }
+                    anyhow::bail!("provider_action_cancelled");
+                }
             }
         }
     }
@@ -498,7 +941,40 @@ impl ProviderOperation {
         let core = client
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("provider_action_cancelled"))?;
-        if !core.provider_operation_current(&self.identity) {
+        let epoch = core.provider_runtime_epoch();
+        let claimed = {
+            let mut owner = core
+                .provider_controller
+                .lock()
+                .expect("provider controller poisoned");
+            let current = !core.is_stopped()
+                && epoch == self.identity.epoch
+                && owner.active.as_ref() == Some(&self.identity);
+            if !current {
+                false
+            } else if let ProviderCommand::AcpSession(AcpSessionParams {
+                operation: AcpSessionOperation::TerminalAuthStart { terminal_id, .. },
+                ..
+            }) = &self.command
+            {
+                if let Some(invocation) = owner.auth_invocations.get_mut(terminal_id).filter(|i| {
+                    epoch.2.is_some()
+                        && !i.retired
+                        && !i.released
+                        && !i.dispatched
+                        && i.operation_generation == Some(self.identity.generation)
+                        && i.epoch == epoch
+                }) {
+                    invocation.dispatched = true;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                true
+            }
+        };
+        if !claimed {
             return core.finish_provider_operation(
                 &self.identity,
                 Err(anyhow::anyhow!("provider_action_cancelled")),
@@ -532,8 +1008,41 @@ impl ProviderOperation {
                 plan.update,
             ))
         });
+        let auth_close = match &self.command {
+            ProviderCommand::AcpSession(params)
+                if matches!(
+                    &params.operation,
+                    AcpSessionOperation::TerminalAuthClose { .. }
+                ) =>
+            {
+                Some(params.clone())
+            }
+            _ => None,
+        };
+        let auth_start_id = match &self.command {
+            ProviderCommand::AcpSession(AcpSessionParams {
+                operation: AcpSessionOperation::TerminalAuthStart { terminal_id, .. },
+                ..
+            }) => Some(terminal_id.clone()),
+            _ => None,
+        };
         drop(core);
         let result = match self.command {
+            ProviderCommand::ReleaseAcpAuth(params) => {
+                client
+                    .upgrade()
+                    .ok_or_else(|| anyhow::anyhow!("provider_action_cancelled"))?
+                    .release_acp_auth(params)?;
+                Ok(ProviderOperationCompletion::Completed)
+            }
+            ProviderCommand::AcpSession(params) => {
+                let connection = self.identity.epoch.2.context("provider_action_cancelled")?;
+                crate::transport::ws::command_sender::acp_session_control(
+                    &sender.requests_for_connection(connection),
+                    params,
+                )
+                .map(ProviderOperationCompletion::AcpSession)
+            }
             ProviderCommand::Configure(params) => sender
                 .provider_configure(params)
                 .map(|_| ProviderOperationCompletion::Completed),
@@ -566,10 +1075,35 @@ impl ProviderOperation {
                 })()
             }
         };
-        client
+        let core = client
             .upgrade()
-            .ok_or_else(|| anyhow::anyhow!("provider_action_cancelled"))?
-            .finish_provider_operation(&self.identity, result)
+            .ok_or_else(|| anyhow::anyhow!("provider_action_cancelled"))?;
+        {
+            let mut owner = core
+                .provider_controller
+                .lock()
+                .expect("provider controller poisoned");
+            if result.is_ok() {
+                if let Some(params) = auth_close {
+                    if let AcpSessionOperation::TerminalAuthClose { terminal_id, .. } =
+                        &params.operation
+                    {
+                        if owner
+                            .auth_invocations
+                            .get(terminal_id)
+                            .is_some_and(|i| i.close == params)
+                        {
+                            owner.retire_auth(terminal_id);
+                        }
+                    }
+                }
+            } else if let Some(id) = auth_start_id {
+                if let Some(invocation) = owner.auth_invocations.get_mut(&id) {
+                    invocation.released = true;
+                }
+            }
+        }
+        core.finish_provider_operation(&self.identity, result)
     }
 }
 
@@ -613,6 +1147,349 @@ mod tests {
             clear_base_url: false,
         })
     }
+    fn acp_snapshot(generation: u64, revision: u64) -> AcpSessionSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "workspace_id":"workspace", "thread_id":"parent", "runtime_id":"agent", "generation":generation,
+            "connected":true, "presentation_revision":revision, "capabilities":{}, "auth_methods":[],
+            "session_id":format!("session-{generation}"), "version":{"connection_id":format!("connection-{generation}"), "revision":revision},
+            "has_config_options":true, "config_options":[], "modes":null, "commands":[], "session_info":null,
+            "usage":null, "notice":null, "completed_elicitations":[], "additional_directories":[],
+            "initial_descriptor_fingerprint":pioneer_protocol::acp_descriptor_fingerprint(&[],None).unwrap(),
+            "configuration_replay":[], "continuation_requested":false
+        })).unwrap()
+    }
+
+    #[test]
+    fn execution_snapshot_replacement_second_submission_and_idle_disconnect_are_fenced() {
+        let core = fixture();
+        let prepared = acp_snapshot(1, 1);
+        core.observe_acp_session_notification(&GatewayNotification::AcpSessionChanged(
+            prepared.clone(),
+        ));
+        let executed = acp_snapshot(2, 2);
+        core.observe_acp_session_notification(&GatewayNotification::AcpSessionChanged(
+            executed.clone(),
+        ));
+        core.observe_acp_session_notification(&GatewayNotification::AcpSessionChanged(
+            acp_snapshot(1, 999),
+        ));
+        let current = core
+            .acp_session_snapshot("workspace", "parent", "agent")
+            .unwrap();
+        let next_submission = crate::cli_runtime::acp::capture_configuration(&current).unwrap();
+        assert_eq!(next_submission.session_id, "session-2");
+        assert_eq!(next_submission.expected, executed.version.unwrap());
+        let mut disconnected = acp_snapshot(2, 3);
+        disconnected.connected = false;
+        disconnected.session_id = None;
+        disconnected.version = None;
+        core.observe_acp_session_notification(&GatewayNotification::AcpSessionChanged(
+            disconnected,
+        ));
+        core.observe_acp_session_notification(&GatewayNotification::AcpSessionChanged(
+            acp_snapshot(2, 2),
+        ));
+        assert!(
+            !core
+                .acp_session_snapshot("workspace", "parent", "agent")
+                .unwrap()
+                .connected
+        );
+    }
+
+    fn terminal_start(id: String) -> AcpSessionParams {
+        AcpSessionParams {
+            workspace_id: "workspace".into(),
+            thread_id: "parent".into(),
+            runtime_id: "agent".into(),
+            operation: AcpSessionOperation::TerminalAuthStart {
+                expected_generation: 11,
+                terminal_id: id,
+                method_id: "first-method".into(),
+                columns: 90,
+                rows: 24,
+            },
+        }
+    }
+    #[test]
+    fn live_auth_owner_survives_repeated_methods_until_exact_ack_and_stale_release() {
+        let core = fixture();
+        let a = terminal_start("A".repeat(32));
+        let operation = core
+            .prepare_provider_command(ProviderCommand::AcpSession(a.clone()))
+            .unwrap();
+        core.provider_controller
+            .lock()
+            .unwrap()
+            .auth_invocations
+            .get_mut(&"A".repeat(32))
+            .unwrap()
+            .dispatched = true;
+        core.finish_provider_operation(
+            &operation.identity,
+            Ok(ProviderOperationCompletion::Completed),
+        )
+        .unwrap();
+        let mut b = terminal_start("B".repeat(32));
+        for method in ["first-method", "another-method"] {
+            if let AcpSessionOperation::TerminalAuthStart { method_id, .. } = &mut b.operation {
+                *method_id = method.into();
+            }
+            assert!(
+                core.prepare_provider_command(ProviderCommand::AcpSession(b.clone()))
+                    .is_err()
+            );
+        }
+        let close_a = core.provider_controller.lock().unwrap().auth_invocations[&"A".repeat(32)]
+            .close
+            .clone();
+        core.release_acp_auth(close_a.clone()).unwrap();
+        assert!(
+            core.prepare_provider_command(ProviderCommand::AcpSession(b.clone()))
+                .is_err()
+        );
+        // Existing worker's exact acknowledgement; no UI result owns this state.
+        core.provider_controller
+            .lock()
+            .unwrap()
+            .retire_auth(&"A".repeat(32));
+        let next = core
+            .prepare_provider_command(ProviderCommand::AcpSession(b))
+            .unwrap();
+        core.release_acp_auth(close_a).unwrap();
+        let owner = core.provider_controller.lock().unwrap();
+        assert!(!owner.auth_invocations[&"B".repeat(32)].released);
+        assert!(!owner.auth_invocations[&"B".repeat(32)].retired);
+        assert_eq!(owner.active.as_ref(), Some(&next.identity));
+    }
+
+    #[test]
+    fn completed_and_never_dispatched_auth_cycles_do_not_consume_the_active_budget() {
+        let core = Arc::new(fixture());
+        for cycle in 0..130 {
+            let id = format!("{cycle:032}");
+            let operation = core
+                .prepare_provider_command(ProviderCommand::AcpSession(terminal_start(id.clone())))
+                .unwrap();
+            if cycle % 3 == 0 {
+                core.cancel_provider_operations("workspace");
+                assert!(operation.execute_direct(Arc::downgrade(&core)).is_err());
+            } else if cycle % 3 == 1 {
+                // There is no worker sender in this existing pure Core fixture.
+                assert!(operation.execute(Arc::downgrade(&core)).is_err());
+            } else {
+                core.provider_controller
+                    .lock()
+                    .unwrap()
+                    .auth_invocations
+                    .get_mut(&id)
+                    .unwrap()
+                    .dispatched = true;
+                core.finish_provider_operation(
+                    &operation.identity,
+                    Ok(ProviderOperationCompletion::Completed),
+                )
+                .unwrap();
+                let close = core.provider_controller.lock().unwrap().auth_invocations[&id]
+                    .close
+                    .clone();
+                core.release_acp_auth(close.clone()).unwrap();
+                core.provider_controller.lock().unwrap().retire_auth(&id); // Exact worker acknowledgement.
+                core.release_acp_auth(close).unwrap(); // Unmount then late success release.
+            }
+            let owner = core.provider_controller.lock().unwrap();
+            assert!(owner.auth_invocations[&id].retired);
+            assert!(owner.auth_invocations.len() <= 64);
+            assert!(
+                !owner
+                    .auth_invocations
+                    .values()
+                    .any(|i| !i.retired && i.operation_generation.is_some())
+            );
+        }
+        assert!(
+            core.prepare_provider_command(ProviderCommand::AcpSession(terminal_start(
+                "Z".repeat(32)
+            )))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn auth_release_is_retained_while_busy_and_fences_a_late_start() {
+        let core = Arc::new(fixture());
+        let active = core.prepare_provider_command(configure()).unwrap();
+        let id = "A".repeat(32);
+        let close = AcpSessionParams {
+            workspace_id: "workspace".into(),
+            thread_id: "parent".into(),
+            runtime_id: "agent".into(),
+            operation: AcpSessionOperation::TerminalAuthClose {
+                expected_generation: 1,
+                terminal_id: id.clone(),
+            },
+        };
+        core.release_acp_auth(close.clone()).unwrap();
+        assert!(core.provider_operation_current(&active.identity));
+        core.finish_provider_operation(
+            &active.identity,
+            Ok(ProviderOperationCompletion::Completed),
+        )
+        .unwrap();
+        let start = AcpSessionParams {
+            operation: AcpSessionOperation::TerminalAuthStart {
+                expected_generation: 1,
+                terminal_id: id.clone(),
+                method_id: "opaque".into(),
+                columns: 90,
+                rows: 24,
+            },
+            ..close.clone()
+        };
+        assert!(
+            core.prepare_provider_command(ProviderCommand::AcpSession(start.clone()))
+                .is_err()
+        );
+        let id = "B".repeat(32);
+        let start = AcpSessionParams {
+            operation: AcpSessionOperation::TerminalAuthStart {
+                expected_generation: 1,
+                terminal_id: id.clone(),
+                method_id: "opaque".into(),
+                columns: 90,
+                rows: 24,
+            },
+            ..close.clone()
+        };
+        let pending = core
+            .prepare_provider_command(ProviderCommand::AcpSession(start))
+            .unwrap();
+        let close = AcpSessionParams {
+            operation: AcpSessionOperation::TerminalAuthClose {
+                expected_generation: 1,
+                terminal_id: id.clone(),
+            },
+            ..close
+        };
+        core.release_acp_auth(close).unwrap();
+        let owner = core.provider_controller.lock().unwrap();
+        assert!(owner.auth_invocations[&id].released);
+        assert!(owner.auth_invocations[&id].retired);
+        assert!(owner.active.is_none());
+        drop(owner);
+        let next = core.prepare_provider_command(configure()).unwrap();
+        assert!(pending.execute_direct(Arc::downgrade(&core)).is_err());
+        assert!(core.provider_operation_current(&next.identity));
+    }
+
+    #[test]
+    fn auth_cleanup_completion_survives_busy_owner_and_transient_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CloseTransport {
+            calls: AtomicUsize,
+            id: String,
+        }
+        impl crate::rpc::JsonRpcRequestTransport for CloseTransport {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                payload: String,
+                reply: crate::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                assert_eq!(payload["params"]["operation"]["terminal_id"], self.id);
+                assert_eq!(payload["params"]["operation"]["expected_generation"], 11);
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    reply
+                        .send(Err(crate::rpc::JsonRpcResponseError::transport(
+                            "synthetic close failure",
+                        )))
+                        .unwrap();
+                } else {
+                    reply
+                        .send(Ok(serde_json::to_value(AcpSessionResponse {
+                            snapshot: acp_snapshot(11, 9),
+                            result: Some(serde_json::json!({"already_retired":true})),
+                        })
+                        .unwrap()))
+                        .unwrap();
+                }
+                Ok(())
+            }
+        }
+        let core = crate::catalog_test_support::client();
+        let id = "C".repeat(32);
+        let params = AcpSessionParams {
+            workspace_id: "workspace".into(),
+            thread_id: "parent".into(),
+            runtime_id: "agent".into(),
+            operation: AcpSessionOperation::TerminalAuthStart {
+                expected_generation: 11,
+                terminal_id: id.clone(),
+                method_id: "opaque".into(),
+                columns: 90,
+                rows: 24,
+            },
+        };
+        let started = core
+            .prepare_provider_command(ProviderCommand::AcpSession(params.clone()))
+            .unwrap();
+        core.provider_controller
+            .lock()
+            .unwrap()
+            .auth_invocations
+            .get_mut(&id)
+            .unwrap()
+            .dispatched = true;
+        // The independent worker has created the side effect, but its initiating
+        // view has gone away before consuming the late success.
+        let close = AcpSessionParams {
+            operation: AcpSessionOperation::TerminalAuthClose {
+                terminal_id: id.clone(),
+                expected_generation: 11,
+            },
+            ..params
+        };
+        core.release_acp_auth(close).unwrap();
+        core.finish_provider_operation(
+            &started.identity,
+            Ok(ProviderOperationCompletion::Completed),
+        )
+        .unwrap();
+        let busy = core.prepare_provider_command(configure()).unwrap();
+        let transport = Arc::new(CloseTransport {
+            calls: AtomicUsize::new(0),
+            id: id.clone(),
+        });
+        *core
+            .transport_runtime()
+            .ws_command_sender()
+            .test_requests
+            .lock()
+            .unwrap() = Some(transport.clone());
+        core.finish_released_acp_auth();
+        assert!(core.provider_controller.lock().unwrap().auth_invocations[&id].released);
+        assert!(core.provider_operation_current(&busy.identity));
+        core.provider_controller
+            .lock()
+            .unwrap()
+            .auth_invocations
+            .get_mut(&id)
+            .unwrap()
+            .next_cleanup = std::time::Instant::now();
+        core.finish_released_acp_auth();
+        assert!(core.provider_controller.lock().unwrap().auth_invocations[&id].retired);
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 2);
+        assert!(core.provider_operation_current(&busy.identity));
+        let close = core.provider_controller.lock().unwrap().auth_invocations[&id]
+            .close
+            .clone();
+        core.release_acp_auth(close.clone()).unwrap(); // Late mobile promise after worker ack.
+        core.finish_released_acp_auth();
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 2);
+        assert!(core.provider_controller.lock().unwrap().auth_invocations[&id].retired);
+    }
+
     #[test]
     fn retired_ticket_releases_exact_active_provider_operation() {
         for completed in [true, false] {

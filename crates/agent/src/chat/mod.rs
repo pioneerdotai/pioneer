@@ -1,6 +1,6 @@
 pub(crate) mod preflight;
 mod provider;
-mod skill_tools;
+pub(crate) mod skill_tools;
 mod skills;
 mod tool_recovery_policy;
 mod tool_retry_lifecycle;
@@ -4205,32 +4205,8 @@ async fn execute_agent_provider_response(
             .collect::<HashMap<_, _>>(),
     );
 
-    let runtime_recheck_policy = pioneer_skills::RuntimeExecutionRecheckPolicy {
-        runtime_recheck_on_tool_call: tool_loop_config
-            .skills
-            .dependencies
-            .runtime_recheck_on_tool_call,
-        security: pioneer_skills::SkillSecurityPolicy {
-            allow_untrusted_install: tool_loop_config.skills.security.allow_untrusted_install,
-            min_trust_for_shell_tools: tool_loop_config
-                .skills
-                .security
-                .min_trust_for_shell_tools
-                .clone(),
-            min_trust_for_http_tools: tool_loop_config
-                .skills
-                .security
-                .min_trust_for_http_tools
-                .clone(),
-            min_trust_for_function_proxy_tools: tool_loop_config
-                .skills
-                .security
-                .min_trust_for_function_proxy_tools
-                .clone(),
-            max_install_archive_bytes: tool_loop_config.skills.security.max_install_archive_bytes,
-            max_install_file_bytes: tool_loop_config.skills.security.max_install_file_bytes,
-        },
-    };
+    let runtime_recheck_policy =
+        skill_tools::skill_runtime_recheck_policy(&tool_loop_config.skills);
 
     let turn_preflight = run_agent_turn_preflight_stage(
         event_tx.clone(),

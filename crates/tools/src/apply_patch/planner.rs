@@ -296,10 +296,11 @@ fn plan_add(
             "Add File destination already exists",
         ));
     }
-    let OperationBody::Add(file) = &operation.operation.body else {
-        return Err(invalid_body(operation_index, &path));
+    let bytes = match &operation.operation.body {
+        OperationBody::Add(file) => join_lines(&file.lines),
+        OperationBody::ExactText { text } => text.as_bytes().to_vec(),
+        _ => return Err(invalid_body(operation_index, &path)),
     };
-    let bytes = join_lines(&file.lines);
     let after = VirtualFile::virtual_file(bytes, operation_index, None);
     let snapshot = PlannedSnapshot::from(&after);
     invalidate_move_path(move_edges, &path);
@@ -322,18 +323,14 @@ fn plan_replace(
     path: String,
 ) -> Result<PlannedChange, PlanError> {
     let before = consume_source(workspace, operation_index, operation, &path)?;
-    let OperationBody::Replace(file) = &operation.operation.body else {
-        return Err(invalid_body(operation_index, &path));
+    let bytes = match &operation.operation.body {
+        OperationBody::Replace(file) => render_replacement(&file.lines, &before.bytes),
+        OperationBody::ExactText { text } => text.as_bytes().to_vec(),
+        _ => return Err(invalid_body(operation_index, &path)),
     };
-    // A complete replacement changes the logical lines but keeps the existing
-    // text-file framing unless the patch explicitly supplies a different
-    // format.  In particular, do not silently turn a CRLF/BOM file into LF
-    // without a BOM or drop its final newline.
-    let after = VirtualFile::virtual_file(
-        render_replacement(&file.lines, &before.bytes),
-        operation_index,
-        None,
-    );
+    // Line-oriented replacements retain existing framing; typed full-text
+    // writes explicitly provide every byte, including the final newline.
+    let after = VirtualFile::virtual_file(bytes, operation_index, None);
     let before_snapshot = PlannedSnapshot::from(&before);
     let after_snapshot = PlannedSnapshot::from(&after);
     workspace.files.insert(path.clone(), after);
@@ -707,6 +704,34 @@ mod tests {
         );
         let planned = plan_text(&patch, &[("file.txt", "old")]).unwrap();
         assert_eq!(planned.workspace.files()["file.txt"].bytes, b"new");
+    }
+
+    #[test]
+    fn typed_text_write_replaces_exact_framing_and_can_write_empty_content() {
+        for content in ["", "new", "new\r\n", "\u{feff}new\n"] {
+            let mut document = document(
+                "*** Begin Patch\n*** Replace File: file.txt\n+placeholder\n*** End Patch",
+            );
+            document.operations[0].operation.body = OperationBody::ExactText {
+                text: content.to_owned(),
+            };
+            let planned = plan(
+                &document,
+                BTreeMap::from([("file.txt".to_owned(), b"\xef\xbb\xbfprevious\r\n".to_vec())]),
+            )
+            .unwrap();
+            assert_eq!(
+                planned.workspace.files()["file.txt"].bytes,
+                content.as_bytes()
+            );
+        }
+        let mut document =
+            document("*** Begin Patch\n*** Add File: file.txt\n+placeholder\n*** End Patch");
+        document.operations[0].operation.body = OperationBody::ExactText {
+            text: String::new(),
+        };
+        let planned = plan(&document, BTreeMap::new()).unwrap();
+        assert!(planned.workspace.files()["file.txt"].bytes.is_empty());
     }
 
     #[test]

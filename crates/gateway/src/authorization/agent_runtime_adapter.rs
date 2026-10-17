@@ -1173,6 +1173,10 @@ pub(crate) fn materialize_persisted_task_agent_action_binding(
         | (
             AgentIdentitySourceKind::CliRuntimeInstance,
             AgentExecutionProfileBackend::CliRuntime { .. },
+        )
+        | (
+            AgentIdentitySourceKind::CliRuntimeInstance,
+            AgentExecutionProfileBackend::AcpAgentRuntime { .. },
         ) => {}
         _ => {
             return Err(AgentToolAdapterError::InvalidInput(

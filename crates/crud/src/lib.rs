@@ -5375,6 +5375,24 @@ impl CrudStore {
         .await
     }
 
+    /// Uses this handle's existing scheduling class and physical reader route.
+    pub async fn list_acp_compaction_items(
+        &self,
+        workspace: &str,
+        runtime: &str,
+        continuation: &str,
+        session: &str,
+    ) -> Result<Vec<pioneer_protocol::ItemUpdatedNotification>> {
+        cli_runtime_binding::list_acp_compaction_items(
+            &self.connection,
+            workspace,
+            runtime,
+            continuation,
+            session,
+        )
+        .await
+    }
+
     pub async fn get_cli_runtime_thread_binding(
         &self,
         thread_id: &str,

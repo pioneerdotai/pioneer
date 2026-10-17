@@ -1455,6 +1455,36 @@ where
     )
 }
 
+pub fn acp_session_control<TTransport>(
+    transport: &TTransport,
+    params: pioneer_protocol::AcpSessionParams,
+) -> Result<pioneer_protocol::AcpSessionResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        &params.workspace_id,
+        "workspace_id",
+        methods::CLI_RUNTIME_ACP_SESSION,
+    )?;
+    require_non_empty_field(
+        &params.thread_id,
+        "thread_id",
+        methods::CLI_RUNTIME_ACP_SESSION,
+    )?;
+    require_non_empty_field(
+        &params.runtime_id,
+        "runtime_id",
+        methods::CLI_RUNTIME_ACP_SESSION,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::CLI_RUNTIME_ACP_SESSION,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
 pub fn cli_runtime_list_models<TTransport>(
     transport: &TTransport,
     params: CLIRuntimeListModelsParams,

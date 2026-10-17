@@ -92,6 +92,7 @@ pub struct RuntimeCapabilities {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CliMcpInjectionKind {
+    AcpStandardStdioMcp,
     CodexManagedStdioMcp,
     ClaudeStrictStdioMcp,
     OpenCodeDynamicStdioMcp,
@@ -100,6 +101,7 @@ pub enum CliMcpInjectionKind {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CliMcpProjectionUpdateKind {
+    AcpNewOrNegotiatedSession,
     CodexRestartAppServerResumeThread,
     ClaudeRestartProcessResumeSession,
     OpenCodeRestartServerResumeSession,

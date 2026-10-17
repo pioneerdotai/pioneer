@@ -4,8 +4,7 @@ use pioneer_skills::{
     AgentSkillRuntimeEntry, MAX_ACTIVE_AGENT_SKILLS, ResolvedSkill, SkillAuditEvent,
     SkillCatalogSnapshot, SkillExplicitRef, SkillPolicy, SkillPolicyKey, SkillPolicySet,
     SkillPromptBudget, SkillResolutionInput, SkillResolutionResult, SkillRuntimePlan,
-    SkillValidationPolicy, build_combined_skill_prompt, build_skill_runtime_plan,
-    merge_agent_skill_overlay, resolve_skills,
+    SkillValidationPolicy, build_combined_skill_prompt, merge_agent_skill_overlay, resolve_skills,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -216,23 +215,8 @@ pub(super) fn resolve_turn_skills_with_explicit_refs(
             .then_with(|| left.action.cmp(&right.action))
     });
 
-    let base_runtime_plan = build_skill_runtime_plan(
-        result.active.as_slice(),
-        pioneer_skills::SkillRuntimeBudget {
-            enable_dynamic_tools: skills.runtime.enable_dynamic_tools,
-            max_dynamic_tools_per_skill: skills.runtime.max_dynamic_tools_per_skill,
-            allow_shell_tools: skills.runtime.allow_shell_tools,
-            allow_http_tools: skills.runtime.allow_http_tools,
-            allow_function_proxy_tools: skills.runtime.allow_function_proxy_tools,
-            allow_untrusted_install: skills.security.allow_untrusted_install,
-            min_trust_for_shell_tools: skills.security.min_trust_for_shell_tools.clone(),
-            min_trust_for_http_tools: skills.security.min_trust_for_http_tools.clone(),
-            min_trust_for_function_proxy_tools: skills
-                .security
-                .min_trust_for_function_proxy_tools
-                .clone(),
-        },
-    );
+    let base_runtime_plan =
+        super::skill_tools::resolved_skill_runtime_plan(result.active.as_slice(), skills);
 
     let base_prompt = build_combined_skill_prompt(
         result.active.as_slice(),
