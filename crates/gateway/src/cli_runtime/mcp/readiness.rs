@@ -1239,29 +1239,23 @@ pub(crate) async fn opencode_mcp_readiness_for_instance(
 
 pub(crate) fn opencode_executable_fingerprints(
     configured_binary: &str,
-    version: Option<&str>,
+    _version: Option<&str>,
 ) -> anyhow::Result<(String, String)> {
-    let version = version.map(str::trim).filter(|version| !version.is_empty());
     let base_contract =
-        crate::cli_runtime::opencode_session::opencode_provider_contract_fingerprint(version);
-    let identity = codex_executable_cache_identity(
-        configured_binary,
-        version.unwrap_or_default(),
-        &base_contract,
-    )?;
+        crate::cli_runtime::opencode_session::opencode_provider_contract_fingerprint();
+    let identity = codex_executable_cache_identity(configured_binary, "", &base_contract)?;
     let binary_sha256 = sha256_file_contents(identity.realpath.as_path())?;
     let local_executable_fingerprint = sha256_json(&json!({
         "provider": "opencode",
         "realpath": identity.realpath,
         "size": identity.size,
         "modifiedUnixNanos": identity.modified_unix_nanos,
-        "providerVersion": identity.provider_version,
         "binarySha256": binary_sha256,
     }))?;
     let adapter_contract_fingerprint = sha256_json(&json!({
         "baseContract": base_contract,
         "localExecutableFingerprint": local_executable_fingerprint,
-        "strictIsolation": "disconnect_unmanaged_mcp_and_exact_prompt_tool_map",
+        "strictIsolation": "v2_runtime_mcp_override_and_session_permissions",
         "dynamicMcpServer": "pioneer",
         "projectionUpdate": "restart_server_resume_session",
     }))?;
