@@ -17,6 +17,15 @@ use crate::ids::{
 const LOCAL_STORAGE_BACKEND: &str = "local";
 const BUFFER_SIZE: usize = 64 * 1024;
 
+// HTML's owned filesystem operation runs to completion even on cancellation.
+// Remove its staging file on every error path; no database resource is held.
+struct TemporaryBlobWrite(PathBuf);
+impl Drop for TemporaryBlobWrite {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalArtifactBlobStore {
     runtime_home: PathBuf,
@@ -66,6 +75,142 @@ impl LocalArtifactBlobStore {
 
 #[async_trait]
 impl ArtifactBlobStore for LocalArtifactBlobStore {
+    async fn put_bytes_guarded(
+        &self,
+        workspace: &str,
+        input: ArtifactBlobInput,
+        guard: crate::ArtifactBlobMutationGuard,
+    ) -> ArtifactResult<StoredArtifactBlob> {
+        let ArtifactBlobInput::Bytes(bytes) = input else {
+            return Err(ArtifactError::ContentInvariant {
+                reason: "guarded HTML write requires bytes",
+            });
+        };
+        let store = self.clone();
+        let workspace = workspace.to_owned();
+        // One bounded FS operation owns its lock even if its caller or runtime
+        // is cancelled. No queued rename may outlive coordination. HTML staging
+        // registered an orphan row before starting this operation.
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let _guard = guard;
+            let tmp = store.tmp_path(&workspace)?;
+            let _temporary_write = TemporaryBlobWrite(tmp.clone());
+            let io = |source| ArtifactError::Io {
+                message: "guarded artifact filesystem operation failed".into(),
+                source,
+            };
+            std::fs::create_dir_all(tmp.parent().ok_or_else(|| {
+                ArtifactError::ContentInvariant {
+                    reason: "missing artifact staging parent",
+                }
+            })?)
+            .map_err(io)?;
+            let mut file =
+                std::fs::File::create(&tmp).map_err(|source| ArtifactError::TempWriteFailed {
+                    path: tmp.clone(),
+                    source,
+                })?;
+            file.write_all(&bytes)
+                .map_err(|source| ArtifactError::TempWriteFailed {
+                    path: tmp.clone(),
+                    source,
+                })?;
+            file.flush().map_err(io)?;
+            drop(file);
+            let sha256 = hex::encode(Sha256::digest(&bytes));
+            let size_bytes = bytes.len() as u64;
+            let storage_key = sha256_storage_key(&sha256);
+            let final_path = store.blob_path(&workspace, &storage_key)?;
+            let deduplicated = final_path.try_exists().map_err(io)?;
+            if deduplicated {
+                let actual_size_bytes = std::fs::metadata(&final_path).map_err(io)?.len();
+                if actual_size_bytes != size_bytes {
+                    return Err(ArtifactError::ExistingBlobCorruption {
+                        storage_key,
+                        expected_sha256: sha256,
+                        expected_size_bytes: size_bytes,
+                        actual_sha256: None,
+                        actual_size_bytes: Some(actual_size_bytes),
+                    });
+                }
+                let mut input = std::fs::File::open(&final_path).map_err(io)?;
+                let mut hasher = Sha256::new();
+                let mut buffer = [0u8; BUFFER_SIZE];
+                loop {
+                    let count = input.read(&mut buffer).map_err(io)?;
+                    if count == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..count]);
+                }
+                let actual_sha256 = hex::encode(hasher.finalize());
+                if actual_sha256 != sha256 {
+                    return Err(ArtifactError::ExistingBlobCorruption {
+                        storage_key,
+                        expected_sha256: sha256,
+                        expected_size_bytes: size_bytes,
+                        actual_sha256: Some(actual_sha256),
+                        actual_size_bytes: Some(actual_size_bytes),
+                    });
+                }
+            } else {
+                std::fs::create_dir_all(final_path.parent().ok_or_else(|| {
+                    ArtifactError::ContentInvariant {
+                        reason: "missing artifact blob parent",
+                    }
+                })?)
+                .map_err(io)?;
+                std::fs::rename(&tmp, &final_path).map_err(|source| {
+                    ArtifactError::FinalRenameFailed {
+                        from: tmp.clone(),
+                        to: final_path,
+                        source,
+                    }
+                })?;
+            }
+            Ok(StoredArtifactBlob {
+                sha256,
+                size_bytes,
+                storage_backend: LOCAL_STORAGE_BACKEND.into(),
+                storage_key,
+                deduplicated,
+            })
+        })
+        .await
+        .map_err(|_| ArtifactError::ContentInvariant {
+            reason: "artifact write task failed",
+        })?
+    }
+
+    async fn delete_unreferenced_guarded(
+        &self,
+        workspace: &str,
+        key: &str,
+        guard: crate::ArtifactBlobMutationGuard,
+    ) -> ArtifactResult<()> {
+        let path = self.blob_path(workspace, key)?;
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                Err(source) => Err(ArtifactError::Io {
+                    message: "failed to delete unreferenced artifact blob".into(),
+                    source,
+                }),
+            }
+        })
+        .await
+        .map_err(|_| ArtifactError::ContentInvariant {
+            reason: "artifact unlink task failed",
+        })?
+    }
+
+    fn local_blob_path(&self, workspace: &str, key: &str) -> ArtifactResult<Option<PathBuf>> {
+        self.blob_path(workspace, key).map(Some)
+    }
+
     fn local_artifact_root(&self) -> Option<PathBuf> {
         Some(self.artifact_root())
     }
@@ -76,6 +221,7 @@ impl ArtifactBlobStore for LocalArtifactBlobStore {
         input: ArtifactBlobInput,
     ) -> ArtifactResult<StoredArtifactBlob> {
         let tmp_path = self.tmp_path(workspace_id)?;
+        let _temporary_write = TemporaryBlobWrite(tmp_path.clone());
         let tmp_parent = tmp_path.parent().ok_or_else(|| ArtifactError::Io {
             message: format!("artifact temp path has no parent: {}", tmp_path.display()),
             source: ErrorKind::InvalidInput.into(),

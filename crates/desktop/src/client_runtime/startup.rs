@@ -895,17 +895,29 @@ impl StartupTelemetry {
                 SessionDiagnosticStage::IdentityVerify => {
                     DesktopStartupStage::GatewaySessionIdentityVerify
                 }
-                _ => continue,
+                SessionDiagnosticStage::CredentialsLoad => {
+                    DesktopStartupStage::GatewaySessionCredentialsLoad
+                }
+                SessionDiagnosticStage::RefreshIntentPersist => {
+                    DesktopStartupStage::GatewaySessionRefreshIntentPersist
+                }
+                SessionDiagnosticStage::RefreshRequest => {
+                    DesktopStartupStage::GatewaySessionRefreshRequest
+                }
+                SessionDiagnosticStage::CredentialsPersist => {
+                    DesktopStartupStage::GatewaySessionCredentialsPersist
+                }
             };
             if let Some(duration) = timing.duration_ms {
                 if !self.completed.contains_key(&target) {
                     self.completed.insert(target, timing.state);
-                    self.trace.record_completed_stage(
+                    self.trace.record_session_diagnostic(
                         target,
                         std::time::UNIX_EPOCH
                             + std::time::Duration::from_millis(timing.started_at_unix_ms),
                         std::time::Duration::from_millis(duration),
                         timing.state == StartupStageState::Succeeded,
+                        timing.state == StartupStageState::Cancelled,
                     );
                 }
             }

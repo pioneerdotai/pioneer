@@ -39,6 +39,8 @@ mod task_handlers;
 mod tasks;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::{test_summary_config, test_tool_loop_config};
 mod thread_agents_doc_handlers;
 mod thread_file_handlers;
 mod thread_handlers;

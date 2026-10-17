@@ -618,6 +618,10 @@ impl ToolHandler for HtmlHandler {
                 "HTML tools require function arguments",
             ));
         };
+        let activity = tokio::select! { biased;
+            _ = invocation.cancellation.cancelled() => return Err(ToolError::cancelled("HTML invocation cancelled")),
+            guard = self.processor.artifact_service.html_preview_activity() => guard,
+        };
         let value = self
             .processor
             .execute_html(
@@ -628,11 +632,35 @@ impl ToolHandler for HtmlHandler {
                 &invocation.cancellation,
             )
             .await?;
-        Ok(Box::new(FunctionToolOutput::with_payload(
-            "HTML tool completed",
-            true,
-            value,
-        )))
+        Ok(Box::new(HtmlOutput {
+            inner: FunctionToolOutput::with_payload("HTML tool completed", true, value),
+            _activity: activity,
+        }))
+    }
+}
+
+// Keep temporary bytes through native ToolOutput consumption. Durable turn
+// context/snapshots then protect the subsequent provider request and recovery.
+struct HtmlOutput {
+    inner: FunctionToolOutput,
+    _activity: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+impl ToolOutput for HtmlOutput {
+    fn success(&self) -> bool {
+        self.inner.success()
+    }
+    fn raw_text(&self) -> String {
+        self.inner.raw_text()
+    }
+    fn raw_json(&self) -> Value {
+        self.inner.raw_json()
+    }
+    fn to_model_input_item(
+        &self,
+        call_id: &str,
+        tool_name: &str,
+    ) -> pioneer_provider::ModelInputItem {
+        self.inner.to_model_input_item(call_id, tool_name)
     }
 }
 

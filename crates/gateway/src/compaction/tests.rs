@@ -1,6 +1,10 @@
 use super::*;
 #[path = "checkpoint_input_alias_tests.rs"]
 mod checkpoint_input_alias_tests;
+#[path = "frozen_preparation_tests.rs"]
+mod frozen_preparation_tests;
+#[path = "html_preview_retention_tests.rs"]
+mod html_preview_retention_tests;
 #[path = "invalid_completion_resume_tests.rs"]
 mod invalid_completion_resume_tests;
 #[path = "invalid_completion_tests.rs"]
@@ -4219,12 +4223,39 @@ async fn fixture_with_canonical_payloads(
     target_fits: bool,
     observer_fails: bool,
 ) -> Fixture {
+    fixture_with_canonical_payloads_and_observer(
+        payloads,
+        replies,
+        target_fits,
+        observer_fails,
+        None,
+    )
+    .await
+}
+
+async fn fixture_with_canonical_payloads_and_observer(
+    payloads: Vec<String>,
+    replies: Vec<Reply>,
+    target_fits: bool,
+    observer_fails: bool,
+    database_observer: Option<Arc<HistoryReadObserver>>,
+) -> Fixture {
     assert!(!payloads.is_empty());
     super::load_test_catalog();
     pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
     let db = Database::connect("sqlite::memory:").await.unwrap();
     Migrator::up(&db, None).await.unwrap();
-    let store = CrudStore::new(db);
+    let store = if let Some(observer) = database_observer {
+        CrudStore::new(
+            pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(
+                db.clone(),
+                pioneer_sqlite::SqliteWriteExecutor::with_observer(db, observer.clone()),
+                observer,
+            ),
+        )
+    } else {
+        CrudStore::new(db)
+    };
     for sql in [
         "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1)",
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",

@@ -68,10 +68,29 @@ impl DirectoryActionPublication {
         self.error.as_deref()
     }
 }
+/// Evidence from the existing directory request owner. Local unread/metadata
+/// projections may change `loading`, but cannot complete a full-tree request.
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadTreeLoadReceipt {
+    pub generation: u64,
+    pub state: ThreadTreeLoadState,
+}
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadTreeLoadState {
+    Pending,
+    Ready,
+    Failed,
+}
+
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadTreePublication {
     revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    load: Option<ThreadTreeLoadReceipt>,
     snapshot: ThreadTreeSnapshot,
     changes: SidebarChangeSet,
     #[serde(default)]
@@ -80,6 +99,9 @@ pub struct ThreadTreePublication {
     error: Option<String>,
 }
 impl ThreadTreePublication {
+    pub fn load(&self) -> Option<&ThreadTreeLoadReceipt> {
+        self.load.as_ref()
+    }
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -115,6 +137,7 @@ impl SidebarProjectionStore {
         next: ThreadTreeSnapshot,
         loading: bool,
         error: Option<String>,
+        load: Option<ThreadTreeLoadReceipt>,
     ) -> Option<Arc<ThreadTreePublication>> {
         let previous = self.publications.get(&next.workspace_id);
         let empty = ThreadTreeSnapshot::default();
@@ -184,8 +207,9 @@ impl SidebarProjectionStore {
                 changes.reordered_folders.push(folder);
             }
         }
-        if previous.is_some_and(|p| changes.is_empty() && p.loading == loading && p.error == error)
-        {
+        if previous.is_some_and(|p| {
+            changes.is_empty() && p.loading == loading && p.error == error && p.load == load
+        }) {
             return None;
         }
         let mut actions = previous
@@ -207,6 +231,7 @@ impl SidebarProjectionStore {
             true
         });
         let publication = Arc::new(ThreadTreePublication {
+            load,
             revision: self.revisions.get(&next.workspace_id).copied().unwrap_or(0) + 1,
             snapshot: next,
             actions,
@@ -257,6 +282,7 @@ pub struct ThreadDirectoryStore {
     running_task_thread_ids: std::collections::HashSet<String>,
     cursors: HashMap<String, pioneer_protocol::ThreadReadCursor>,
     requests: HashMap<String, u64>,
+    loads: HashMap<String, ThreadTreeLoadReceipt>,
     subscriptions: HashMap<String, usize>,
     suspended_workspaces: BTreeSet<String>,
     // An access fence clears protected data, but must not erase the need to
@@ -322,7 +348,9 @@ impl ThreadDirectoryStore {
                 .cloned()
                 .collect(),
         );
-        let publication = self.projections.update(snapshot, loading, error);
+        let publication =
+            self.projections
+                .update(snapshot, loading, error, self.loads.get(workspace).cloned());
         if publication
             .as_ref()
             .is_some_and(|publication| !publication.changes.is_empty())
@@ -367,11 +395,29 @@ impl ThreadDirectoryStore {
             .expect("directory request generation exhausted");
         self.requests
             .insert(workspace.to_owned(), self.next_request);
+        self.loads.insert(
+            workspace.to_owned(),
+            ThreadTreeLoadReceipt {
+                generation: self.next_request,
+                state: ThreadTreeLoadState::Pending,
+            },
+        );
         self.request_versions.insert(
             workspace.to_owned(),
             self.semantic_versions.get(workspace).copied().unwrap_or(0),
         );
         self.next_request
+    }
+    fn finish_load(&mut self, workspace: &str, generation: u64, failed: bool) {
+        if let Some(load) = self.loads.get_mut(workspace).filter(|load| {
+            load.generation == generation && load.state == ThreadTreeLoadState::Pending
+        }) {
+            load.state = if failed {
+                ThreadTreeLoadState::Failed
+            } else {
+                ThreadTreeLoadState::Ready
+            };
+        }
     }
     fn complete(&mut self, workspace: &str, generation: u64, response: ThreadTreeResponse) -> bool {
         if response.workspace_id != workspace
@@ -714,6 +760,9 @@ impl ClientCore {
                 Some(format!("{error:#}"))
             }
         };
+        registry
+            .directory
+            .finish_load(workspace, generation, error.is_some());
         let draft = registry.navigation.drafts.get(workspace).cloned();
         if let Some(publication) =
             registry
@@ -1069,8 +1118,8 @@ mod tests {
         let a = thread("a1", "a", 1);
         let b = thread("a2", "a", 2);
         let initial = snapshot(vec![a.clone(), b.clone()], vec![]);
-        let first = store.update(initial.clone(), false, None).unwrap();
-        assert!(store.update(initial, false, None).is_none());
+        let first = store.update(initial.clone(), false, None, None).unwrap();
+        assert!(store.update(initial, false, None, None).is_none());
         assert!(Arc::ptr_eq(&first, &store.snapshot("a").unwrap()));
         let unread = snapshot(
             vec![b, a],
@@ -1079,7 +1128,7 @@ mod tests {
                 unread_count: 2,
             }],
         );
-        let next = store.update(unread, false, None).unwrap();
+        let next = store.update(unread, false, None, None).unwrap();
         assert_eq!(next.revision, first.revision + 1);
         assert_eq!(
             next.changes.changed,
@@ -1544,6 +1593,35 @@ mod tests {
         assert!(!directory.threads.contains_key("foreign"));
     }
     #[test]
+    fn load_receipt_follows_replacement_and_survives_local_projections() {
+        let mut directory = ThreadDirectoryStore::default();
+        let first = directory.begin("a");
+        directory.project("a", None, true, None).unwrap();
+        let replacement = directory.begin("a");
+        let pending = directory.project("a", None, true, None).unwrap();
+        assert_eq!(pending.load().unwrap().generation, replacement);
+        directory.finish_load("a", first, true);
+        // An unrelated metadata/unread projection must not claim that the
+        // still-pending replacement completed, even when its UI loading is false.
+        let local = directory.project("a", None, false, None).unwrap();
+        assert_eq!(local.load().unwrap().state, ThreadTreeLoadState::Pending);
+        directory.finish_load("a", replacement, false);
+        let ready = directory.project("a", None, false, None).unwrap();
+        assert!(ready.snapshot().threads_by_id.is_empty());
+        assert_eq!(ready.load().unwrap().state, ThreadTreeLoadState::Ready);
+        let next = directory.begin("a");
+        directory.finish_load("a", next, true);
+        let failed = directory
+            .project("a", None, false, Some("request failed".into()))
+            .unwrap();
+        assert_eq!(failed.load().unwrap().state, ThreadTreeLoadState::Failed);
+        let local = directory.project("a", None, false, None).unwrap();
+        assert_eq!(local.load(), failed.load());
+        directory.invalidate();
+        assert!(directory.loads.is_empty());
+    }
+
+    #[test]
     fn request_scope_and_generation_reject_late_inputs() {
         let mut directory = ThreadDirectoryStore::default();
         let first = directory.begin("a");
@@ -1571,11 +1649,13 @@ mod tests {
             snapshot(vec![thread("a1", "a", 1), thread("a2", "a", 2)], vec![]),
             false,
             None,
+            None,
         );
         let next = store
             .update(
                 snapshot(vec![thread("a2", "a", 3), thread("a3", "a", 4)], vec![]),
                 false,
+                None,
                 None,
             )
             .unwrap();

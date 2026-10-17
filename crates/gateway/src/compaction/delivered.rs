@@ -300,6 +300,9 @@ impl MessageProcessor {
         excluded_turn: Option<&str>,
         policy: Option<&pioneer_protocol::TaskAgentContextPolicy>,
     ) -> Result<super::frozen::PreparedHistory> {
+        // Keep fresh canonical preview dependencies through admission of the
+        // existing frozen read hold, including CLI and background preparation.
+        let _preview_activity = self.artifact_service.html_preview_activity().await;
         scope_current_stage(Stage::HistoryAuthority, async {
             let authorization_revision = self.current_authorization_revision().await?;
             let resolver = AuthorizationResolver::new(store.clone());

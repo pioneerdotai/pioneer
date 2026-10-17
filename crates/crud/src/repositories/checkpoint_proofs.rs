@@ -452,9 +452,7 @@ impl OriginScan {
             _ => None,
         };
         ensure!(
-            checkpoint_target.is_some()
-                || (target.source_thread == record.source_thread
-                    && target.sources.contains(&record.source)),
+            checkpoint_target.is_some() || record.matches_render_target(&target),
             "selected import target/source mismatch"
         );
         let member = if let Some(checkpoint) = &checkpoint_target {
@@ -465,7 +463,7 @@ impl OriginScan {
                     &target.source_thread,
                     checkpoint,
                     &record.source_thread,
-                    &record.source,
+                    record.render_source(),
                 )
                 .await?,
             )
@@ -532,7 +530,7 @@ fn target_reference_statement(manifest: &str, ordinal: u64) -> Result<Statement>
             .to_owned(),
     ))
 }
-async fn target_reference(
+pub(super) async fn target_reference(
     store: &CrudStore,
     manifest: &str,
     ordinal: u64,
@@ -564,7 +562,7 @@ struct PendingImport {
     record: FrozenImportRecord,
     member: Option<HistoricalMember>,
 }
-struct HistoricalMember {
+pub(super) struct HistoricalMember {
     workspace: String,
     wanted_thread: String,
     wanted: SourceRef,
@@ -575,7 +573,7 @@ struct HistoricalMember {
     topology: Option<(SourceRef, String, compaction::CheckpointTopologyRead)>,
 }
 impl HistoricalMember {
-    async fn new(
+    pub(super) async fn new(
         store: &CrudStore,
         workspace: &str,
         root_thread: &str,
@@ -606,10 +604,13 @@ impl HistoricalMember {
             topology: None,
         })
     }
-    fn done(&self) -> bool {
+    pub(super) fn done(&self) -> bool {
         self.pending.is_empty() && self.topology.is_none()
     }
-    async fn step(&mut self, store: &CrudStore) -> Result<()> {
+    pub(super) fn found(&self) -> bool {
+        self.found
+    }
+    pub(super) async fn step(&mut self, store: &CrudStore) -> Result<()> {
         if self.topology.is_none() {
             let Some((source, thread, exiting)) = self.pending.pop() else {
                 return Ok(());
@@ -690,12 +691,13 @@ impl HistoricalMember {
 
 /// Original acceptance metadata survives canonical source edits. Only a fresh
 /// delivery grant uses current-source predicates in the existing import helper.
-async fn original_binding(
+pub(super) async fn original_binding(
     store: &CrudStore,
     workspace: &str,
     proof: &FrozenImportRecord,
     read_output: bool,
 ) -> Result<()> {
+    proof.validate_preview_archive(store, workspace).await?;
     ensure!(
         !proof.source_thread.is_empty()
             && !proof.source.scope.is_empty()
@@ -1670,7 +1672,7 @@ async fn validate_permanent_import(
             proof.target_source_thread == accepted.source_thread,
             "permanent direct import thread mismatch"
         );
-        accepted.source.clone()
+        accepted.render_source().clone()
     };
     ensure!(
         ownership.get(&target).is_some_and(
@@ -2880,6 +2882,7 @@ mod tests {
     async fn malformed_original_ack_scope_is_consistency_error_without_panic() {
         let store = correction_fixture().await;
         let proof = FrozenImportRecord {
+            preview_archive: None,
             message_ordinal: 0,
             source_thread: "thread".into(),
             source: SourceRef {

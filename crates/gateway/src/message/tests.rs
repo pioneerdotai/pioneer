@@ -9022,7 +9022,7 @@ async fn detach_task_for_test(
     .map_err(|error| anyhow::anyhow!("{error:#}"))
 }
 
-fn test_summary_config() -> super::summary::SummaryConfig {
+pub(crate) fn test_summary_config() -> super::summary::SummaryConfig {
     super::summary::SummaryConfig {
         summary_model: Some("test-model".to_owned()),
         summary_model_provider: Some("echo".to_owned()),
@@ -9031,7 +9031,7 @@ fn test_summary_config() -> super::summary::SummaryConfig {
     }
 }
 
-pub(super) fn test_tool_loop_config() -> ToolLoopConfig {
+pub(crate) fn test_tool_loop_config() -> ToolLoopConfig {
     let web = GatewayWebToolsConfig::default();
     ToolLoopConfig {
         provider: pioneer_provider::ProviderTimeoutPolicy::default(),

@@ -73,7 +73,7 @@ pub use startup::{
     DesktopPostUpdateStageGuard, DesktopStartupOutcome, DesktopStartupStage,
     DesktopStartupStageGuard, DesktopStartupTrace, GatewayStartupStage, GatewayStartupStageGuard,
     GatewayStartupTrace, MobileStartupOutcome, MobileStartupReport, MobileStartupStage,
-    MobileStartupStageTiming, record_mobile_startup,
+    MobileStartupStageTiming, record_mobile_startup, record_mobile_thread_open,
 };
 pub use telemetry::{
     OtlpTelemetryConfig, TelemetryTarget, force_flush_observability, init_otlp_observability,

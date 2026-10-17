@@ -8,7 +8,7 @@ use std::{
 use anyhow::Result;
 use pioneer_protocol::{AuthMeResponse, AuthRefreshGrant, AuthSessionId};
 
-use super::session_controller::SessionDiagnosticStage;
+use super::session_controller::{SessionDiagnosticStage, SessionDiagnosticTerminalOutcome};
 use super::{
     endpoint::GatewayBaseUrl,
     session_lifecycle::{GatewaySessionMetadata, SessionLifecycleEvent, SessionTerminalReason},
@@ -63,7 +63,7 @@ pub(crate) struct GatewaySessionConnectionFlight {
 
 #[derive(Default)]
 pub(crate) struct GatewaySessionConnectionState {
-    epoch: u64,
+    pub(super) epoch: u64,
     pending: bool,
     refresh_requested: bool,
     retry_attempt: u32,
@@ -78,6 +78,10 @@ pub(crate) struct GatewaySessionConnectionState {
 }
 
 impl GatewaySessionConnectionState {
+    pub(super) fn diagnostic_flight(&self) -> Weak<GatewaySessionConnectionFlight> {
+        self.flight.clone()
+    }
+
     pub(crate) fn transport_verified(&self, connection_id: u64) -> bool {
         self.connected
             .as_ref()
@@ -441,16 +445,17 @@ impl ClientCore {
         };
         let connection_id = access.generation;
         let storage = super::session_refresh::GatewaySessionPlatformStorage(self);
-        let result = self.observe_session_stage(
+        let result = self.observe_session_stage_with_terminal_outcome(
             &endpoint.id,
             SessionDiagnosticStage::IdentityVerify,
-            || match self.verify_gateway_session_identity_with_ports(
+            |terminal_outcome| match self.verify_gateway_session_identity_with_ports(
                 endpoint,
                 installation_id,
                 client_kind,
                 access,
                 &storage,
                 || sender.auth_me(),
+                terminal_outcome,
             )? {
                 None => Ok(()),
                 Some(reason) => Err(anyhow::Error::new(
@@ -485,6 +490,7 @@ impl ClientCore {
         access: crate::transport::http::GatewayHttpAccess,
         storage: &dyn GatewaySessionStorage,
         identity: impl FnOnce() -> Result<AuthMeResponse>,
+        terminal_outcome: &mut Option<SessionDiagnosticTerminalOutcome>,
     ) -> Result<Option<SessionTerminalReason>> {
         let (ready, epoch, verified) = {
             let sessions = self
@@ -529,10 +535,16 @@ impl ClientCore {
             _ => {
                 let reason = SessionTerminalReason::SecureStorageFailed;
                 self.begin_authorization_epoch(None);
-                self.retire_session_connection(&endpoint.id, false);
-                self.reduce_gateway_session_lifecycle(
+                self.retire_session_connection_with_diagnostic(
+                    &endpoint.id,
+                    false,
+                    Some(terminal_outcome),
+                );
+                self.reduce_gateway_session_lifecycle_with_diagnostic(
                     &endpoint.id,
                     SessionLifecycleEvent::AuthFailed { reason },
+                    true,
+                    Some(terminal_outcome),
                 );
                 return Ok(Some(reason));
             }
@@ -550,10 +562,16 @@ impl ClientCore {
             &auth,
         ) {
             self.begin_authorization_epoch(None);
-            self.retire_session_connection(&endpoint.id, false);
-            self.reduce_gateway_session_lifecycle(
+            self.retire_session_connection_with_diagnostic(
+                &endpoint.id,
+                false,
+                Some(terminal_outcome),
+            );
+            self.reduce_gateway_session_lifecycle_with_diagnostic(
                 &endpoint.id,
                 SessionLifecycleEvent::AuthFailed { reason },
+                true,
+                Some(terminal_outcome),
             );
             return Ok(Some(reason));
         }
@@ -1172,10 +1190,22 @@ impl ClientCore {
     }
 
     pub(crate) fn retire_session_connection(&self, endpoint: &str, suspended: bool) {
+        self.retire_session_connection_with_diagnostic(endpoint, suspended, None);
+    }
+
+    fn retire_session_connection_with_diagnostic(
+        &self,
+        endpoint: &str,
+        suspended: bool,
+        terminal_outcome: Option<&mut Option<SessionDiagnosticTerminalOutcome>>,
+    ) {
         let mut sessions = self
             .gateway_session
             .lock()
             .expect("Gateway session owner poisoned");
+        let diagnostic_before = terminal_outcome
+            .as_ref()
+            .map(|_| sessions.diagnostic_identity(endpoint));
         let state = sessions.connections.entry(endpoint.to_owned()).or_default();
         state.epoch = state
             .epoch
@@ -1190,6 +1220,13 @@ impl ClientCore {
         state.candidate_connection_id = None;
         state.failure = suspended.then_some(GatewaySessionConnectionFailure::Suspended);
         sessions.finish_transport_verification(endpoint, false);
+        if let (Some(receipt), Some(diagnostic_before)) = (terminal_outcome, diagnostic_before) {
+            SessionDiagnosticTerminalOutcome::record(
+                receipt,
+                diagnostic_before,
+                sessions.diagnostic_identity(endpoint),
+            );
+        }
         self.publish_gateway_session(&sessions);
     }
 
@@ -1495,6 +1532,49 @@ mod tests {
     use pioneer_protocol::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn diagnostic_capture_does_not_join_distinct_flights_with_the_same_epoch() {
+        let core = ClientCore::new();
+        let first = Arc::new(GatewaySessionConnectionFlight {
+            epoch: 0,
+            result: Mutex::new(None),
+            ready: Condvar::new(),
+        });
+        core.gateway_session
+            .lock()
+            .unwrap()
+            .connections
+            .entry("endpoint".into())
+            .or_default()
+            .flight = Arc::downgrade(&first);
+        core.observe_session_stage("endpoint", SessionDiagnosticStage::CredentialsLoad, || {
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        drop(first);
+        let next = Arc::new(GatewaySessionConnectionFlight {
+            epoch: 0,
+            result: Mutex::new(None),
+            ready: Condvar::new(),
+        });
+        core.gateway_session
+            .lock()
+            .unwrap()
+            .connections
+            .get_mut("endpoint")
+            .unwrap()
+            .flight = Arc::downgrade(&next);
+        let mut executed = false;
+        core.observe_session_stage("endpoint", SessionDiagnosticStage::RefreshRequest, || {
+            executed = true;
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert!(executed);
+        assert_eq!(core.gateway_session().startup.session_diagnostics.len(), 1);
+        assert_eq!(core.gateway_session().connections["endpoint"].epoch, 0);
+    }
+
     struct Storage(Mutex<GatewaySessionEnvelope>);
     impl GatewaySessionStorage for Storage {
         fn load(&self, _: &GatewayEndpoint) -> Result<Option<GatewaySessionEnvelope>> {
@@ -1610,6 +1690,264 @@ mod tests {
             || Ok(auth_me()),
             || Ok(()),
         )
+    }
+
+    // The same prepared transport/storage ports as the native startup identity path.
+    fn prepared_startup_access(
+        core: &ClientCore,
+        endpoint: &GatewayEndpoint,
+        storage: &Storage,
+    ) -> crate::transport::http::GatewayHttpAccess {
+        let GatewaySessionPreparation::Ready(ready) = core
+            .prepare_gateway_session(
+                request(endpoint),
+                storage,
+                |_, _, _, _| Ok(grant(1)),
+                |_, _, _| Ok(()),
+            )
+            .unwrap()
+        else {
+            panic!("synthetic preparation");
+        };
+        let access = crate::transport::http::GatewayHttpAccess {
+            gateway_base_url: endpoint.gateway_base_url.clone(),
+            gateway_id: ready.metadata.gateway_id.clone(),
+            session_id: ready.metadata.session_id.clone(),
+            generation: 11,
+            access_expires_at_unix: ready.spec.identity.access_expires_at_unix,
+            access_token: ready.spec.access_token.clone(),
+        };
+        core.start_gateway_session_transport_with_port(
+            ready.spec.into_connect_spec(),
+            true,
+            |_, _| Ok(11),
+        )
+        .unwrap();
+        access
+    }
+
+    #[test]
+    fn terminal_identity_failures_keep_error_unless_the_operation_was_externally_cancelled() {
+        use super::super::session_controller::StartupStageState;
+        struct FailedStorage;
+        impl GatewaySessionStorage for FailedStorage {
+            fn load(&self, _: &GatewayEndpoint) -> Result<Option<GatewaySessionEnvelope>> {
+                anyhow::bail!("synthetic identity storage failure")
+            }
+            fn persist(&self, _: &GatewayEndpoint, _: &GatewaySessionEnvelope) -> Result<()> {
+                panic!("identity verification must not persist")
+            }
+        }
+        for fail_storage in [false, true] {
+            for cancel_after_terminal in [false, true] {
+                let core = ClientCore::new();
+                let endpoint = endpoint("endpoint");
+                let storage = storage();
+                let access = prepared_startup_access(&core, &endpoint, &storage);
+                let epoch = core.gateway_session().connections[&endpoint.id].epoch;
+                let reason = if fail_storage {
+                    SessionTerminalReason::SecureStorageFailed
+                } else {
+                    SessionTerminalReason::GatewayIdentityMismatch
+                };
+                let identity_storage: &dyn GatewaySessionStorage = if fail_storage {
+                    &FailedStorage
+                } else {
+                    &storage
+                };
+                let result = core.observe_session_stage_with_terminal_outcome(
+                    &endpoint.id,
+                    SessionDiagnosticStage::IdentityVerify,
+                    |terminal_outcome| {
+                        let terminal = core.verify_gateway_session_identity_with_ports(
+                            &endpoint,
+                            "synthetic",
+                            ClientKind::Mobile,
+                            access,
+                            identity_storage,
+                            || {
+                                assert!(!fail_storage, "failed storage must skip the identity RPC");
+                                let mut auth = auth_me();
+                                auth.gateway.id = GatewayId::new("G00000000000000000002").unwrap();
+                                Ok(auth)
+                            },
+                            terminal_outcome,
+                        )?;
+                        assert_eq!(terminal, Some(reason));
+                        if cancel_after_terminal {
+                            core.begin_gateway_operation();
+                        }
+                        // The production native wrapper maps this terminal result to the same Err.
+                        Err::<(), _>(anyhow::Error::new(
+                            GatewaySessionConnectionFailure::Terminal { reason },
+                        ))
+                    },
+                );
+                assert_eq!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<GatewaySessionConnectionFailure>(),
+                    Some(&GatewaySessionConnectionFailure::Terminal { reason })
+                );
+                let session = core.gateway_session();
+                assert!(session.connections[&endpoint.id].epoch > epoch);
+                assert_eq!(session.terminal_reason(&endpoint.id), Some(reason));
+                assert!(session.connections[&endpoint.id].connected.is_none());
+                assert!(core.current_auth().is_none());
+                let timing =
+                    &session.startup.session_diagnostics[&SessionDiagnosticStage::IdentityVerify];
+                assert_eq!(
+                    timing.state,
+                    if cancel_after_terminal {
+                        StartupStageState::Cancelled
+                    } else {
+                        StartupStageState::Failed
+                    }
+                );
+                assert!(timing.duration_ms.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn external_identity_cancellation_keeps_late_terminal_errors_cancelled() {
+        use super::super::session_controller::StartupStageState;
+        for cancellation in 0..4 {
+            let core = ClientCore::new();
+            let endpoint = endpoint("endpoint");
+            let storage = storage();
+            let access = prepared_startup_access(&core, &endpoint, &storage);
+            let replacement = Arc::new(GatewaySessionConnectionFlight {
+                epoch: core.gateway_session().connections[&endpoint.id].epoch,
+                result: Mutex::new(None),
+                ready: Condvar::new(),
+            });
+            let result = core.observe_session_stage_with_terminal_outcome(
+                &endpoint.id,
+                SessionDiagnosticStage::IdentityVerify,
+                |terminal_outcome| match core.verify_gateway_session_identity_with_ports(
+                    &endpoint,
+                    "synthetic",
+                    ClientKind::Mobile,
+                    access,
+                    &storage,
+                    || {
+                        match cancellation {
+                            0 => {
+                                core.begin_gateway_operation();
+                            }
+                            1 => core.retire_session_connection(&endpoint.id, true),
+                            2 => {
+                                core.gateway_session
+                                    .lock()
+                                    .unwrap()
+                                    .connections
+                                    .get_mut(&endpoint.id)
+                                    .unwrap()
+                                    .flight = Arc::downgrade(&replacement);
+                            }
+                            _ => core.shutdown(),
+                        }
+                        Err(anyhow::Error::new(
+                            GatewaySessionConnectionFailure::Terminal {
+                                reason: SessionTerminalReason::SessionRevoked,
+                            },
+                        ))
+                    },
+                    terminal_outcome,
+                )? {
+                    None => Ok(()),
+                    Some(reason) => Err(anyhow::Error::new(
+                        GatewaySessionConnectionFailure::Terminal { reason },
+                    )),
+                },
+            );
+            assert_eq!(
+                result
+                    .unwrap_err()
+                    .downcast_ref::<GatewaySessionConnectionFailure>(),
+                Some(&GatewaySessionConnectionFailure::Terminal {
+                    reason: SessionTerminalReason::SessionRevoked
+                })
+            );
+            // Shutdown retires publications; inspect the existing owner projection without exporting late data.
+            let session = core.gateway_session.lock().unwrap().publication();
+            let timing =
+                &session.startup.session_diagnostics[&SessionDiagnosticStage::IdentityVerify];
+            assert_eq!(timing.state, StartupStageState::Cancelled);
+            assert!(timing.duration_ms.is_some());
+            assert!(session.terminal_reason(&endpoint.id).is_none());
+            assert!(core.current_auth().is_none());
+        }
+    }
+
+    #[test]
+    fn cancellation_between_terminal_mutations_invalidates_the_diagnostic_receipt() {
+        use super::super::session_controller::StartupStageState;
+        let core = ClientCore::new();
+        let endpoint = endpoint("endpoint");
+        let _access = prepared_startup_access(&core, &endpoint, &storage());
+        let reason = SessionTerminalReason::SecureStorageFailed;
+        let result = core.observe_session_stage_with_terminal_outcome(
+            &endpoint.id,
+            SessionDiagnosticStage::IdentityVerify,
+            |terminal_outcome| {
+                // Deterministically interleave cancellation at the lock boundary between
+                // the same two mutations used by native terminal verification.
+                core.begin_authorization_epoch(None);
+                core.retire_session_connection_with_diagnostic(
+                    &endpoint.id,
+                    false,
+                    Some(terminal_outcome),
+                );
+                core.begin_gateway_operation();
+                core.reduce_gateway_session_lifecycle_with_diagnostic(
+                    &endpoint.id,
+                    SessionLifecycleEvent::AuthFailed { reason },
+                    true,
+                    Some(terminal_outcome),
+                );
+                Err::<(), _>(GatewaySessionConnectionFailure::Terminal { reason })
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GatewaySessionConnectionFailure::Terminal { reason })
+        );
+        let session = core.gateway_session();
+        assert_eq!(session.terminal_reason(&endpoint.id), Some(reason));
+        assert_eq!(
+            session.startup.session_diagnostics[&SessionDiagnosticStage::IdentityVerify].state,
+            StartupStageState::Cancelled
+        );
+    }
+
+    #[test]
+    fn successful_initial_session_keeps_all_preparation_and_identity_diagnostics() {
+        use super::super::session_controller::StartupStageState;
+        let core = ClientCore::new();
+        let endpoint = endpoint("endpoint");
+        let storage = storage();
+        let connected = connect(&core, &endpoint, &storage, 7).unwrap();
+        assert_eq!(connected.connection_id, 7);
+        assert_eq!(core.current_auth().unwrap().session.refresh_generation, 1);
+        assert_eq!(storage.0.lock().unwrap().refresh_generation, 1);
+        let session = core.gateway_session();
+        let stages = [
+            SessionDiagnosticStage::CredentialsLoad,
+            SessionDiagnosticStage::RefreshIntentPersist,
+            SessionDiagnosticStage::RefreshRequest,
+            SessionDiagnosticStage::CredentialsPersist,
+            SessionDiagnosticStage::ConnectAttempt,
+            SessionDiagnosticStage::IdentityVerify,
+        ];
+        assert_eq!(session.startup.session_diagnostics.len(), stages.len());
+        for stage in stages {
+            let timing = &session.startup.session_diagnostics[&stage];
+            assert_eq!(timing.endpoint_id, endpoint.id);
+            assert_eq!(timing.state, StartupStageState::Succeeded);
+            assert!(timing.duration_ms.is_some());
+        }
     }
 
     #[test]
@@ -2131,7 +2469,8 @@ mod tests {
                 ClientKind::Mobile,
                 access,
                 &CancelledStorage(&core),
-                || panic!("cancelled verification must not request identity")
+                || panic!("cancelled verification must not request identity"),
+                &mut None,
             )
             .is_err()
         );
@@ -2233,6 +2572,7 @@ mod tests {
                             }
                             Ok(auth)
                         },
+                        &mut None,
                     )
                     .unwrap();
                 assert_eq!(result.is_some(), invalid_identity);
@@ -2292,6 +2632,7 @@ mod tests {
                 );
                 Ok(auth_me())
             },
+            &mut None,
         );
         assert!(result.is_err());
         assert!(core.current_auth().is_none());
@@ -2399,6 +2740,7 @@ mod tests {
                         access,
                         &storage,
                         || Ok(auth_me()),
+                        &mut None,
                     )
                 },
                 |_| panic!("unverified reconnect must not request capabilities"),
