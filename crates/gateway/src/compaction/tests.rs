@@ -4087,11 +4087,9 @@ async fn frozen_equivalent_capture_holds_selected_manifest_through_handoff_and_c
     async fn sweep(store: &CrudStore) {
         let mut progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
         for _ in 0..10_000 {
-            if !store
-                .compact_frozen_storage_quantum(&mut progress)
-                .await
-                .unwrap()
-            {
+            // Layout compaction alone does not expire manifests. Exercise the
+            // lifetime worker's expiry and physical cleanup phases here.
+            if !progress.quantum(store).await.unwrap() {
                 return;
             }
         }
