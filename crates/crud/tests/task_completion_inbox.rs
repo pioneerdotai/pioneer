@@ -386,10 +386,96 @@ async fn migration_preserves_legacy_acknowledgement_only_for_its_exact_recipient
     // and its missing acknowledgement cannot undo an exact saved receipt.
     db.execute_unprepared("INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,target_user_id,status,attempt_count,max_attempts,created_at,updated_at) VALUES('delivery-duplicate','W0000000000000000000I','task','run','duplicate-key','user_notification','P0000000000000000000A','delivered',1,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
     db.execute_unprepared("INSERT INTO user_notification_outbox(id,task_delivery_id,workspace_id,recipient_principal_id,task_id,run_id,payload_json,status,created_at,delivered_at) VALUES('unread-duplicate','delivery-duplicate','W0000000000000000000I','P0000000000000000000A','task','run','{}','delivered',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    // FK OFF permits inconsistent historical rows. None may become B's read
+    // receipt by merely pointing at the same run ID or an orphaned parent.
+    task(
+        &store,
+        "other-task",
+        Some("T0000000000000000000P"),
+        None,
+        "agent",
+        "none",
+        "attached",
+    )
+    .await;
+    run(&store, "orphan-run", "other-task", "succeeded", 1).await;
+    db.execute_unprepared("UPDATE task_run SET task_id='missing-task' WHERE id='orphan-run'")
+        .await
+        .unwrap();
+    task(
+        &store,
+        "orphan-workspace-task",
+        Some("T0000000000000000000P"),
+        None,
+        "agent",
+        "none",
+        "attached",
+    )
+    .await;
+    run(
+        &store,
+        "orphan-workspace-run",
+        "orphan-workspace-task",
+        "succeeded",
+        1,
+    )
+    .await;
+    db.execute_unprepared(
+        "UPDATE task SET workspace_id='missing-workspace' WHERE id='orphan-workspace-task'",
+    )
+    .await
+    .unwrap();
+    for (id, task_id, run_id, workspace_id) in [
+        (
+            "missing-run-ack",
+            "task",
+            "missing-run",
+            "W0000000000000000000I",
+        ),
+        (
+            "wrong-task-ack",
+            "other-task",
+            "run",
+            "W0000000000000000000I",
+        ),
+        (
+            "wrong-workspace-ack",
+            "task",
+            "run",
+            "W0000000000000000000O",
+        ),
+        (
+            "missing-task-ack",
+            "missing-task",
+            "orphan-run",
+            "W0000000000000000000I",
+        ),
+        (
+            "missing-workspace-ack",
+            "orphan-workspace-task",
+            "orphan-workspace-run",
+            "missing-workspace",
+        ),
+    ] {
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO user_notification_outbox(id,task_delivery_id,workspace_id,recipient_principal_id,task_id,run_id,payload_json,status,created_at,delivered_at,acknowledged_at) VALUES(?1,?1,?2,?3,?4,?5,'{}','acknowledged',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            [id.into(),workspace_id.into(),B.into(),task_id.into(),run_id.into()])).await.unwrap();
+    }
     writer
         .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
         .await
         .unwrap();
+    let receipts = pioneer_entity::task_run_read::Entity::find()
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        receipts.len(),
+        1,
+        "backfill explicitly validates run/task/workspace existence and belonging without FK enforcement"
+    );
+    assert_eq!(receipts[0].principal_id, A);
+    assert_eq!(receipts[0].run_id, "run");
     writer
         .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
         .await
@@ -783,7 +869,7 @@ async fn empty_and_small_workspaces_page_independently_of_large_foreign_history(
 }
 
 #[tokio::test]
-async fn read_entity_preserves_composite_keys_and_cascades_only_the_deleted_run() {
+async fn read_entity_preserves_personal_keys_and_orphans_do_not_create_cards_with_fk_off() {
     use pioneer_entity::{task_run, task_run_read};
     let (_dir, store, _writer) = fixture(false).await;
     task(
@@ -810,7 +896,19 @@ async fn read_entity_preserves_composite_keys_and_cascades_only_the_deleted_run(
     assert_eq!(receipt.read_at, "2026-10-16 11:00:00 +00:00");
     assert_eq!(receipt.principal_id, A);
     assert_eq!(receipt.run_id, "first");
-    read(&store, A, "first").await;
+    mark_task_completion_inbox_read(&db, &access(A), "first", "2026-10-17 11:00:00 +00:00")
+        .await
+        .unwrap();
+    assert_eq!(
+        task_run_read::Entity::find_by_id((A.to_owned(), "first".to_owned()))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .read_at,
+        receipt.read_at,
+        "a repeated read keeps the original personal receipt"
+    );
     assert_eq!(
         task_run_read::Entity::find()
             .filter(task_run_read::Column::RunId.eq("first"))
@@ -821,22 +919,21 @@ async fn read_entity_preserves_composite_keys_and_cascades_only_the_deleted_run(
         2,
         "the composite key keeps one receipt per principal and run"
     );
-    // Enable FK enforcement on this fixture's single serialized writer after
-    // setup; the physical read-only pool remains unchanged.
-    db.execute_unprepared("PRAGMA foreign_keys=ON")
-        .await
-        .unwrap();
+    // Fixture-only physical deletion: Gateway does not expose a run deletion
+    // operation. OFF leaves orphan receipts; they must never drive the inbox.
     task_run::Entity::delete_by_id("first")
         .exec(&db)
         .await
         .unwrap();
-    assert!(
+    assert_eq!(
         task_run_read::Entity::find()
             .filter(task_run_read::Column::RunId.eq("first"))
             .all(&db)
             .await
             .unwrap()
-            .is_empty()
+            .len(),
+        2,
+        "declarative ON DELETE CASCADE does not clean up with FK enforcement OFF"
     );
     assert!(
         task_run_read::Entity::find_by_id((A.to_owned(), "second".to_owned()))
@@ -845,4 +942,81 @@ async fn read_entity_preserves_composite_keys_and_cascades_only_the_deleted_run(
             .unwrap()
             .is_some()
     );
+    for (principal, expected_unread) in [(A, 0), (B, 1)] {
+        let page = list_task_completion_inbox(&db, &access(principal), None, 30)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].run_id, "second");
+        assert_eq!(unread(&store, principal).await, expected_unread);
+        assert!(
+            find_task_completion_inbox_entry(&db, &access(principal), "first")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn read_requires_an_existing_authorized_terminal_run_with_fk_off() {
+    use pioneer_entity::task_run_read;
+    let (_dir, store, _writer) = fixture(false).await;
+    task(
+        &store,
+        "private",
+        Some("T0000000000000000000V"),
+        None,
+        "agent",
+        "none",
+        "attached",
+    )
+    .await;
+    run(&store, "private-run", "private", "succeeded", 1).await;
+    run(&store, "running-run", "private", "running", 2).await;
+    run(&store, "orphan-run", "private", "succeeded", 3).await;
+    let db = store.with_maintenance_access().database_connection();
+    db.execute_unprepared("DELETE FROM thread_membership WHERE principal_id='P0000000000000000000B' AND thread_id='T0000000000000000000V'").await.unwrap();
+    db.execute_unprepared("UPDATE task_run SET task_id='missing-task' WHERE id='orphan-run'")
+        .await
+        .unwrap();
+    for run_id in ["missing-run", "private-run", "running-run", "orphan-run"] {
+        read(&store, B, run_id).await;
+    }
+    // Absolute TaskRead still cannot substitute a different workspace or skip
+    // run/task existence and terminal checks in the atomic INSERT SELECT.
+    let wrong_workspace = TaskCompletionInboxAccess {
+        workspace_id: "W0000000000000000000O",
+        principal_id: A,
+        absolute: true,
+    };
+    mark_task_completion_inbox_read(
+        &db,
+        &wrong_workspace,
+        "private-run",
+        "2026-10-17 11:00:00 +00:00",
+    )
+    .await
+    .unwrap();
+    let absolute = TaskCompletionInboxAccess {
+        absolute: true,
+        ..access(A)
+    };
+    for run_id in ["missing-run", "running-run", "orphan-run"] {
+        mark_task_completion_inbox_read(&db, &absolute, run_id, "2026-10-17 11:00:00 +00:00")
+            .await
+            .unwrap();
+    }
+    assert!(
+        task_run_read::Entity::find()
+            .all(&db)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    read(&store, A, "private-run").await;
+    let receipts = task_run_read::Entity::find().all(&db).await.unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].principal_id, A);
+    assert_eq!(receipts[0].run_id, "private-run");
 }
