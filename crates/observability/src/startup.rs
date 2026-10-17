@@ -148,6 +148,8 @@ pub enum DesktopStartupStage {
     ThreadCapabilitiesLoad,
     ComposerModelSelectionResolve,
     ComposerPolicyReconcile,
+    ComposerPrepare,
+    ComposerRuntimeWait,
     ReadinessToRender,
     OperationalFrame,
 }
@@ -235,6 +237,8 @@ impl DesktopStartupStage {
             Self::ThreadCapabilitiesLoad => "thread_capabilities.load",
             Self::ComposerModelSelectionResolve => "composer.model_selection.resolve",
             Self::ComposerPolicyReconcile => "composer.policy.reconcile",
+            Self::ComposerPrepare => "composer.prepare",
+            Self::ComposerRuntimeWait => "composer.runtime.wait",
             Self::ReadinessToRender => "ui.readiness_to_render",
             Self::OperationalFrame => "ui.operational_frame",
         }
@@ -1402,6 +1406,14 @@ mod tests {
         assert_eq!(
             GatewayStartupStage::ServicesProviderReadinessStart.as_str(),
             "services.provider_readiness.start"
+        );
+        assert_eq!(
+            DesktopStartupStage::ComposerPrepare.as_str(),
+            "composer.prepare"
+        );
+        assert_eq!(
+            DesktopStartupStage::ComposerRuntimeWait.as_str(),
+            "composer.runtime.wait"
         );
         assert_eq!(
             DesktopStartupStage::GatewaySessionAttempt.as_str(),

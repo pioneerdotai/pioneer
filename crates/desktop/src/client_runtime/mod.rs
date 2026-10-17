@@ -165,8 +165,7 @@ impl DesktopRuntimeCoordinator {
 
     pub(crate) fn observe_startup(trace: pioneer_observability::DesktopStartupTrace, cx: &mut App) {
         let owner = cx.global::<Self>();
-        let startup =
-            startup::DesktopStartupCoordinator::new(trace, owner.core(), owner.registrar(), cx);
+        let startup = startup::DesktopStartupCoordinator::new(trace, owner.core(), cx);
         cx.global_mut::<Self>().startup = Some(startup);
     }
 

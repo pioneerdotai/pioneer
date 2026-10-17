@@ -772,12 +772,30 @@ pub struct ComposerSubmitAvailabilityInput<'a> {
     pub has_capabilities: bool,
 }
 
+/// Content-independent prerequisites shared by Send and startup observation.
+/// An upload or an executing turn is user work, not unfinished application setup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComposerSubmissionPrerequisites {
+    pub gateway_connected: bool,
+    pub has_active_thread: bool,
+    pub selected_mode: ThreadMode,
+    pub has_complete_model_selection: bool,
+}
+
+pub fn composer_submission_prerequisites_met(input: ComposerSubmissionPrerequisites) -> bool {
+    input.gateway_connected
+        && input.has_active_thread
+        && (input.selected_mode == ThreadMode::Message || input.has_complete_model_selection)
+}
+
 pub fn can_submit_composer_message(input: ComposerSubmitAvailabilityInput<'_>) -> bool {
     let is_message = input.selected_mode == ThreadMode::Message;
-    input.gateway_connected
-        && !input.upload_in_progress
-        && input.has_active_thread
-        && (is_message || input.has_complete_model_selection)
+    composer_submission_prerequisites_met(ComposerSubmissionPrerequisites {
+        gateway_connected: input.gateway_connected,
+        has_active_thread: input.has_active_thread,
+        selected_mode: input.selected_mode,
+        has_complete_model_selection: input.has_complete_model_selection,
+    }) && !input.upload_in_progress
         && (is_message || input.conversation_can_submit)
         && composer_has_sendable_content(
             input.text,
@@ -1391,6 +1409,38 @@ mod tests {
                 ..ready
             }
         ));
+    }
+
+    #[test]
+    fn startup_prerequisites_ignore_content_uploads_and_an_executing_turn() {
+        for mode in [ThreadMode::Chat, ThreadMode::Agent, ThreadMode::Message] {
+            let prerequisites = ComposerSubmissionPrerequisites {
+                gateway_connected: true,
+                has_active_thread: true,
+                selected_mode: mode,
+                has_complete_model_selection: mode != ThreadMode::Message,
+            };
+            assert!(composer_submission_prerequisites_met(prerequisites));
+            assert!(!can_submit_composer_message(
+                ComposerSubmitAvailabilityInput {
+                    gateway_connected: true,
+                    has_active_thread: true,
+                    selected_mode: mode,
+                    has_complete_model_selection: prerequisites.has_complete_model_selection,
+                    upload_in_progress: true,
+                    conversation_can_submit: false,
+                    text: "",
+                    has_attachments: false,
+                    has_capabilities: false,
+                }
+            ));
+            assert!(!composer_submission_prerequisites_met(
+                ComposerSubmissionPrerequisites {
+                    gateway_connected: false,
+                    ..prerequisites
+                }
+            ));
+        }
     }
 
     #[test]
