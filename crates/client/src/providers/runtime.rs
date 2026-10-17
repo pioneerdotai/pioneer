@@ -1413,3 +1413,29 @@ impl ClientCore {
         self.complete_provider_runtime(&request, result, Instant::now());
     }
 }
+
+// Fixture completions enter the existing owner; no worker or extra demand is started.
+#[cfg(feature = "test-support")]
+impl ClientMutationAuthority {
+    pub fn complete_provider_runtime_for_test(
+        &self,
+        core: &ClientCore,
+        workspace: &str,
+        result: Result<CLIRuntimeListResponse, ()>,
+    ) {
+        let request = core
+            .provider_runtime_request_for_test(workspace)
+            .expect("pending runtime fixture request");
+        core.complete_provider_runtime_for_test(request, result);
+    }
+
+    pub fn provider_runtime_status_changed_for_test(
+        &self,
+        core: &ClientCore,
+        update: pioneer_protocol::CLIRuntimeStatusChangedNotification,
+    ) {
+        core.observe_provider_runtime_notification(&GatewayNotification::CLIRuntimeStatusChanged(
+            update,
+        ));
+    }
+}

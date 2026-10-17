@@ -74,6 +74,13 @@ pub(crate) struct DesktopShellView {
     mounted_route: Arc<DesktopRouteSnapshot>,
 }
 impl DesktopShellView {
+    pub(crate) fn startup_thread(&self) -> Option<Entity<pioneer_desktop_thread::ThreadView>> {
+        self.navigation
+            .is_visible(MainRoute::Threads)
+            .then(|| self.thread.as_ref().map(|(_, view)| view.clone()))
+            .flatten()
+    }
+
     fn selected_screen(&self) -> Option<AnyView> {
         let route = self.navigation.snapshot();
         if route.window_route() != WindowRoute::Main {
