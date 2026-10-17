@@ -1360,6 +1360,16 @@ fn classified_memory_provider_error(
         "provider_stage",
         provider_failure_stage_name(stage),
     );
+    if let Some(reason) = classification
+        .error_reason
+        .and_then(|reason| serde_json::to_value(reason).ok())
+        .and_then(|value| value.as_str().map(str::to_owned))
+    {
+        insert_hook_text_metadata(&mut metadata, "provider_error_reason", reason);
+    }
+    if let Some(id) = classification.request_id {
+        insert_hook_text_metadata(&mut metadata, "provider_request_id", String::from(id));
+    }
     if let Some(status) = classification.http_status {
         insert_hook_text_metadata(&mut metadata, "http_status", status.to_string());
     }
@@ -2850,6 +2860,39 @@ mod tests {
                 ProviderFailureClassification::new(class),
             );
             assert!(!error.retryable, "{class:?} must be terminal");
+        }
+    }
+
+    #[test]
+    fn memory_denial_preserves_allowlisted_reason_and_request_without_retry() {
+        let mut classification =
+            ProviderFailureClassification::new(ProviderFailureClass::AuthOrPermission);
+        classification.http_status = Some(403);
+        classification.error_reason = Some(pioneer_protocol::ProviderErrorReason::PermissionDenied);
+        classification.request_id = Some(
+            pioneer_protocol::ProviderRequestId::try_from("req-denial_fixture".to_owned()).unwrap(),
+        );
+        let error = classified_memory_provider_error(
+            "openrouter",
+            "fixture",
+            "provider_stream_start",
+            ProviderFailureStage::Connect,
+            classification,
+        );
+        assert!(!error.retryable);
+        for (key, expected) in [
+            ("http_status", "403"),
+            ("provider_error_reason", "permission_denied"),
+            ("provider_request_id", "req-denial_fixture"),
+        ] {
+            assert_eq!(
+                error
+                    .metadata
+                    .iter()
+                    .find(|(name, _)| name.as_str() == key)
+                    .map(|(_, value)| value.as_str()),
+                Some(expected)
+            );
         }
     }
 
