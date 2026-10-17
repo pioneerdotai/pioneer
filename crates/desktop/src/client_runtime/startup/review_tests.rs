@@ -136,9 +136,6 @@ fn prepare(core: &ClientCore, with_thread: bool) {
             defaults: ComposerDomainState {
                 selected_mode: ThreadMode::Message,
                 mode_manually_selected: true,
-                selected_provider: Some("provider".into()),
-                selected_model: Some("model".into()),
-                model_manually_selected: true,
                 ..Default::default()
             },
         });
@@ -159,6 +156,13 @@ fn prepare(core: &ClientCore, with_thread: bool) {
         connection_state: GatewayConnectionState::Connected,
         clear_gateway_error: false,
     });
+    publish_session(core, session);
+    assert!(!core.onboarding_loading());
+    assert!(!core.onboarding_setup_required());
+}
+
+fn publish_session(core: &ClientCore, session: GatewaySessionPublication) {
+    let authority = ClientMutationAuthority::for_test();
     let previous = core
         .snapshot(&ClientScope::Session)
         .map(|p| p.revisions())
@@ -175,8 +179,6 @@ fn prepare(core: &ClientCore, with_thread: bool) {
         Arc::new(session),
         vec![],
     );
-    assert!(!core.onboarding_loading());
-    assert!(!core.onboarding_setup_required());
 }
 
 #[test]
@@ -232,16 +234,18 @@ fn tree_errors_are_scoped_and_background_refresh_is_not_success_or_required_fail
     prepare(&core, true);
     let authority = ClientMutationAuthority::for_test();
     authority.publish_workspace_tree_for_test(&core, "other", false, Some("other scope".into()));
-    // The shared milestone has no workspace/request purpose. Its failure cannot
-    // replace inspection of the required directory publication.
-    core.update_startup_stage(
-        pioneer_client::gateway::session_controller::StartupStage::ThreadTree,
-        StartupStageState::Pending,
+    assert_eq!(
+        readiness(&core, Some(DesktopStartupOutcome::Ready)),
+        Some(DesktopStartupOutcome::Ready)
     );
-    core.update_startup_stage(
+    // Keep the fixture's connected session when injecting an unscoped milestone.
+    // The real session owner has not been initialized by this publication fixture.
+    let mut session = (*core.gateway_session()).clone();
+    session.startup.stages.insert(
         pioneer_client::gateway::session_controller::StartupStage::ThreadTree,
         StartupStageState::Failed,
     );
+    publish_session(&core, session);
     assert_eq!(
         readiness(&core, Some(DesktopStartupOutcome::Ready)),
         Some(DesktopStartupOutcome::Ready)
@@ -313,13 +317,29 @@ fn ready_native_composer_requires_application_draw_and_once_only_acknowledgement
     );
     let stale = FrameCandidate::new(&core, DesktopStartupOutcome::Ready);
     let draft = core.composer_snapshot("a").unwrap();
-    core.composer_intent(ComposerIntent::Domain {
-        thread_id: "a".into(),
-        draft_id: draft.draft_id(),
-        action: ComposerDomainAction::SetModeFromUser {
+    // Message clears execution selection. This empty thread has no previous
+    // turn to restore a model from, so configure Agent through the usual action.
+    for action in [
+        ComposerDomainAction::SetModeFromUser {
             mode: ThreadMode::Agent,
         },
-    });
+        ComposerDomainAction::SetModelSelectionFromUser {
+            provider: Some("provider".into()),
+            model: Some("model".into()),
+            capability_target: None,
+        },
+    ] {
+        core.composer_intent(ComposerIntent::Domain {
+            thread_id: "a".into(),
+            draft_id: draft.draft_id(),
+            action,
+        });
+    }
+    assert!(
+        core.composer_snapshot("a")
+            .unwrap()
+            .has_complete_model_selection()
+    );
     assert_eq!(
         cx.update(|_, cx| readiness(&core, composer_outcome(&shell, cx))),
         None,
