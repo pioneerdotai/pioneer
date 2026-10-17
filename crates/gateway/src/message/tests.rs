@@ -33236,10 +33236,14 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
     // Independently indexed live recall can differ between the two executions.
     harness
         .processor
-        .apply_thread_episodic_runtime_config(crate::thread_episodic::ThreadEpisodicRuntimeConfig {
-            recall_enabled: false,
-            ..Default::default()
-        })
+        .apply_thread_episodic_runtime_config(
+            crate::thread_episodic_runtime_config_from_gateway_config(
+                &pioneer_config::GatewayThreadEpisodicConfig {
+                    recall_enabled: false,
+                    ..Default::default()
+                },
+            ),
+        )
         .await;
     harness.processor.bind_task_bridge().await;
     harness.processor.start_task_event_listener().await;
@@ -33425,6 +33429,17 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
 
     let direct_main = single_prompt_parity_request(&direct_requests, PromptParityRequestKind::Main);
     let child_main = single_prompt_parity_request(&child_requests, PromptParityRequestKind::Main);
+    for request in [direct_main, child_main] {
+        assert!(
+            !request
+                .compiled_prompt
+                .as_ref()
+                .expect("parity main request must have a compiled prompt")
+                .full_system_text
+                .contains("Relevant thread context:"),
+            "fixed-history parity must disable live episodic recall on both routes"
+        );
+    }
     let lineage = wait_for_child_lineage_for_run(
         harness.crud_store.clone(),
         task.run
@@ -33521,10 +33536,14 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
     // can index a current user message for one route before the other starts.
     harness
         .processor
-        .apply_thread_episodic_runtime_config(crate::thread_episodic::ThreadEpisodicRuntimeConfig {
-            recall_enabled: false,
-            ..Default::default()
-        })
+        .apply_thread_episodic_runtime_config(
+            crate::thread_episodic_runtime_config_from_gateway_config(
+                &pioneer_config::GatewayThreadEpisodicConfig {
+                    recall_enabled: false,
+                    ..Default::default()
+                },
+            ),
+        )
         .await;
     harness.processor.bind_task_bridge().await;
     harness.processor.start_task_event_listener().await;
@@ -33956,6 +33975,17 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
 
     let direct_main = single_prompt_parity_request(&direct_requests, PromptParityRequestKind::Main);
     let child_main = single_prompt_parity_request(&child_requests, PromptParityRequestKind::Main);
+    for request in [direct_main, child_main] {
+        assert!(
+            !request
+                .compiled_prompt
+                .as_ref()
+                .expect("parity main request must have a compiled prompt")
+                .full_system_text
+                .contains("Relevant thread context:"),
+            "fixed-history parity must disable live episodic recall on both routes"
+        );
+    }
     let direct_main = canonical_main_request_execution_thread_for_parity(
         direct_main,
         direct_parent_thread_id,
