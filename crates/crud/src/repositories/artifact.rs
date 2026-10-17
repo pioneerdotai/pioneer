@@ -11,7 +11,6 @@ use pioneer_protocol::{
     ArtifactKind, ArtifactPreviewRef, ArtifactProjectionKind, ArtifactProjectionStatus,
     ArtifactRef, ArtifactRole, ArtifactStatus, ArtifactSummary, generate_id,
 };
-use sea_orm::sea_query::ExprTrait;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, IntoActiveModel,
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set,
@@ -971,7 +970,9 @@ impl ArtifactRepository {
             .select_only()
             .column(artifact::Column::Id)
             .filter(artifact::Column::WorkspaceId.eq(workspace_id.to_owned()))
-            .filter(super::html_preview_retention::temporary_preview_predicate("artifact").not());
+            .filter(sea_orm::sea_query::ExprTrait::not(
+                super::html_preview_retention::temporary_preview_predicate("artifact"),
+            ));
         if !filter.include_deleted {
             eligible = eligible.filter(artifact::Column::Status.ne("deleted"));
         }
@@ -1212,7 +1213,9 @@ impl ArtifactRepository {
         let artifacts = artifact::Entity::find()
             .filter(artifact::Column::WorkspaceId.eq(workspace_id.to_owned()))
             .filter(artifact::Column::Id.is_in(artifact_ids.into_iter().collect::<Vec<_>>()))
-            .filter(super::html_preview_retention::temporary_preview_predicate("artifact").not())
+            .filter(sea_orm::sea_query::ExprTrait::not(
+                super::html_preview_retention::temporary_preview_predicate("artifact"),
+            ))
             .all(db)
             .await
             .map_err(|source| ArtifactCrudError::Database {

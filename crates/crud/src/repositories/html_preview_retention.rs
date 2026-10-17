@@ -1080,7 +1080,7 @@ impl CrudStore {
                     super::artifact::ArtifactGcBlobCandidateRecord {
                         blob_id: next.clone(),
                         storage_key: row.try_get("", "storage_key")?,
-                        size_bytes: row.try_get::<i64>("", "size_bytes")?.max(0) as u64,
+                        size_bytes: std::cmp::max(row.try_get::<i64>("", "size_bytes")?, 0) as u64,
                     },
                 ));
             }
@@ -1100,11 +1100,11 @@ impl CrudStore {
             ])
             .column_as(bytes(Expr::col(artifact::Column::MetadataJson)), "bytes")
             .column_as(
-                Func::cust(sea_orm::sea_query::Alias::new("substr")).args([
+                Expr::from(Func::cust(sea_orm::sea_query::Alias::new("substr")).args([
                     Expr::col(artifact::Column::MetadataJson),
                     Expr::val(1),
                     Expr::val(1048576),
-                ]),
+                ])),
                 "metadata_json",
             )
             .filter(artifact::Column::Id.gt(after))
@@ -1352,6 +1352,12 @@ pub(crate) async fn retain_preview_input<C: ConnectionTrait>(
 
 async fn input_adoption_quantum(store: &CrudStore, after: &mut String) -> Result<bool> {
     // Enumerate source IDs first: no request/commit scans all input payloads.
+    let payload_bytes: Expr = Expr::case(
+        Expr::col(turn_input::Column::InputType).eq("artifact"),
+        bytes(Expr::col(turn_input::Column::Payload)),
+    )
+    .finally(0)
+    .into();
     let query = turn_input::Entity::find()
         .select_only()
         .columns([
@@ -1361,14 +1367,7 @@ async fn input_adoption_quantum(store: &CrudStore, after: &mut String) -> Result
             turn_input::Column::InputIndex,
             turn_input::Column::CreatedAt,
         ])
-        .column_as(
-            Expr::case(
-                Expr::col(turn_input::Column::InputType).eq("artifact"),
-                bytes(Expr::col(turn_input::Column::Payload)),
-            )
-            .finally(0),
-            "bytes",
-        )
+        .column_as(payload_bytes, "bytes")
         .filter(turn_input::Column::Id.gt(after.as_str()))
         .order_by_asc(turn_input::Column::Id)
         .limit(1)

@@ -15,7 +15,7 @@ use pioneer_entity::{
 };
 use sea_orm::sea_query::{Alias, BinOper, Expr, ExprTrait, JoinType, OnConflict};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
-use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, TransactionTrait};
 use sha2::{Digest, Sha256};
 
 #[cfg(any(test, feature = "test-support"))]
