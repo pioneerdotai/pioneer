@@ -3768,6 +3768,8 @@ struct FlakyTitleProvider {
 struct GuardAwareProvider {
     requests: std::sync::Mutex<Vec<ChatRequest>>,
     next_index: AtomicUsize,
+    child_entered: Notify,
+    release_premature_final: Notify,
 }
 
 struct CreateThenHangProvider {
@@ -4768,15 +4770,8 @@ impl Provider for GuardAwareProvider {
             });
         }
         if is_child_task_request(&request) {
-            sleep(Duration::from_secs(10)).await;
-            return Ok(ChatResponse {
-                text: "slow child".to_owned(),
-                usage: None,
-                reasoning_content: None,
-                provider_replay_state: None,
-                termination: pioneer_provider::ProviderTermination::Complete,
-                tool_calls: Vec::new(),
-            });
+            self.child_entered.notify_one();
+            return futures_util::future::pending::<anyhow::Result<ChatResponse>>().await;
         }
 
         self.requests
@@ -4801,14 +4796,10 @@ impl Provider for GuardAwareProvider {
                     .to_string(),
                 }],
             },
-            1 => ChatResponse {
-                text: "premature final".to_owned(),
-                usage: None,
-                reasoning_content: None,
-                provider_replay_state: None,
-                termination: pioneer_provider::ProviderTermination::Complete,
-                tool_calls: Vec::new(),
-            },
+            1 => {
+                self.release_premature_final.notified().await;
+                text_response("premature final")
+            }
             2 => {
                 let task_id = extract_task_id_from_messages(&request.messages)
                     .unwrap_or_else(|| "missing_task_id".to_owned());
@@ -4859,6 +4850,8 @@ impl GuardAwareProvider {
         Self {
             requests: std::sync::Mutex::new(Vec::new()),
             next_index: AtomicUsize::new(0),
+            child_entered: Notify::new(),
+            release_premature_final: Notify::new(),
         }
     }
 
@@ -37308,22 +37301,13 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
         let thread_manager = Arc::new(ThreadManager::new("test-model", "parent"));
-        let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+        let (_database_directory, workspace_manager, crud_store, workspace_id) =
+            setup_pooled_file_workspace_manager().await;
         let provider = Arc::new(GuardAwareProvider::new());
         let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
             "parent",
             provider.clone(),
         ));
-        provider_registry
-            .insert(
-                "delayed",
-                Arc::new(DelayedProvider {
-                    name: "delayed",
-                    delay: Duration::from_secs(10),
-                    text: "slow child".to_owned(),
-                }),
-            )
-            .expect("delayed provider should fit the bounded test registry");
         let processor = Arc::new(MessageProcessor::new(
             thread_manager,
             provider_registry,
@@ -37347,6 +37331,85 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
             "parent",
         )
         .await;
+        // A stable running child cannot finish on its own. The parent must
+        // durably wait, then resume only after a real domain control changes
+        // that same Task; elapsed fixture time is not progress.
+        let control_processor = processor.clone();
+        let control_provider = provider.clone();
+        let detach_control = tokio::spawn(async move {
+            timeout(Duration::from_secs(20), async {
+                control_provider.child_entered.notified().await;
+                let task_id = loop {
+                    let requests = control_provider.snapshot_requests();
+                    if let Some(task_id) = requests
+                        .get(1)
+                        .and_then(|request| extract_task_id_from_messages(&request.messages))
+                    {
+                        break task_id;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                };
+                assert_eq!(
+                    wait_for_task_status(
+                        control_processor.crud_store.clone(),
+                        &task_id,
+                        TaskStatus::Running
+                    )
+                    .await,
+                    TaskStatus::Running
+                );
+                control_provider.release_premature_final.notify_one();
+                loop {
+                    let checkpoint = control_processor
+                        .crud_store
+                        .native_semantic_checkpoint_for_turn("turn_task_guard_parent")
+                        .await
+                        .unwrap();
+                    if let Some(checkpoint) = checkpoint {
+                        let payload: pioneer_protocol::ExecutionCheckpointPayload =
+                            serde_json::from_value(checkpoint.payload_json).unwrap();
+                        if payload
+                            .native_semantic_state
+                            .as_ref()
+                            .and_then(|state| state.get("attached_task_wait"))
+                            .is_some_and(|wait| !wait.is_null())
+                        {
+                            break;
+                        }
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(
+                    control_provider.snapshot_requests().len(),
+                    2,
+                    "an unchanged pending Task must not cause a provider busy loop"
+                );
+                assert_eq!(
+                    control_processor
+                        .crud_store
+                        .get_turn("thr_task_guard_parent", "turn_task_guard_parent")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .1
+                        .status,
+                    TurnStatus::InProgress,
+                    "the guard must reject the premature final answer"
+                );
+                let detached = detach_task_for_test(
+                    &control_processor,
+                    pioneer_protocol::TaskDetachParams { task_id },
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    detached.task.lifecycle_policy.unwrap().attachment,
+                    TaskAttachmentMode::Detached
+                );
+            })
+            .await
+            .expect("real Task detach must wake the durable parent wait");
+        });
         let mut observed_notifications = Vec::new();
         let parent_completed = timeout(Duration::from_secs(30), async {
             loop {
@@ -37463,6 +37526,9 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
             }
         };
         assert_eq!(completed.turn.status, TurnStatus::Completed);
+        detach_control
+            .await
+            .expect("Task control driver should finish");
 
         let requests = provider.snapshot_requests();
         assert!(
@@ -37552,6 +37618,11 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
         assert!(
             !task.runs.is_empty(),
             "the detached child Task must retain its run"
+        );
+        assert_eq!(
+            task.task.status,
+            TaskStatus::Running,
+            "parent completion must follow real detachment while the same child remains active"
         );
         cancel_task_for_test(
             &processor,
