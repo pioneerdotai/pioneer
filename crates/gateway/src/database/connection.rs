@@ -203,6 +203,49 @@ impl QueryFingerprintLimiter {
     }
 }
 
+/// Existing DB owner boundary for installer preflight. No writable connection,
+/// migration execution, extension registration, startup repair or journal changes.
+pub(crate) async fn inspect_applied_migration_names(
+    runtime_home: &Path,
+    app_config: &AppConfig,
+) -> Result<Option<Vec<String>>> {
+    let config = GatewayDatabaseRuntimeConfig::from_app_config(app_config)?;
+    let path = gateway_database_path(runtime_home, app_config)?;
+    // Only a positively absent database is a new installation. Metadata errors
+    // (including denied access) must not become an empty applied set.
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("migration inspection metadata unavailable"),
+        Ok(metadata) => anyhow::ensure!(metadata.is_file(), "database is not a regular file"),
+    }
+    let mut options = connect_options(sqlite_read_only_connection_url(&path), 1, &config);
+    options.sqlx_logging(false);
+    options.map_sqlx_sqlite_opts(|options| {
+        options
+            .read_only(true)
+            .create_if_missing(false)
+            .pragma("query_only", "ON")
+    });
+    let reader = Database::connect(options)
+        .await
+        .context("migration inspection unavailable")?;
+    // Both handles are physically read-only; even an accidentally routed write
+    // is rejected by SQLite. There is no additional writable executor/pool.
+    let database = SqliteDatabase::new(reader.clone(), reader).maintenance();
+    let result = async {
+        database.validate_reader().await?;
+        pioneer_crud::CrudStore::new(database.clone())
+            .with_maintenance_access()
+            .inspect_applied_migration_names()
+            .await
+    }
+    .await;
+    let closed = database.close().await;
+    let names = result?;
+    closed.context("failed to close migration inspection")?;
+    Ok(Some(names))
+}
+
 pub async fn initialize(runtime_home: &Path, app_config: &AppConfig) -> Result<SqliteDatabase> {
     initialize_inner(runtime_home, app_config, None).await
 }
@@ -622,6 +665,55 @@ mod tests {
     };
     use sea_orm::{ConnectionTrait, DbBackend, Statement, StreamTrait, TransactionTrait};
     use std::path::Path;
+
+    #[tokio::test]
+    async fn installer_inspection_reads_history_without_migrations_or_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = pioneer_config::AppConfig::load().unwrap();
+        let path = super::gateway_database_path(temp.path(), &config).unwrap();
+        assert_eq!(
+            super::inspect_applied_migration_names(temp.path(), &config)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(!path.exists(), "inspection must not create a DB");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let writer = sea_orm::Database::connect(sqlite_connection_url(&path))
+            .await
+            .unwrap();
+        let db = pioneer_sqlite::SqliteDatabase::from_single_connection(writer);
+        db.execute_unprepared(
+            "CREATE TABLE seaql_migrations (version TEXT PRIMARY KEY, applied_at BIGINT NOT NULL)",
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared(
+            "INSERT INTO seaql_migrations VALUES ('future_unknown_to_installer', 1)",
+        )
+        .await
+        .unwrap();
+        db.close().await.unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            super::inspect_applied_migration_names(temp.path(), &config)
+                .await
+                .unwrap(),
+            Some(vec!["future_unknown_to_installer".into()])
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "no migrations/history writes"
+        );
+        // A malformed history is unknown, never an empty compatible set.
+        std::fs::write(&path, b"not a SQLite database").unwrap();
+        assert!(
+            super::inspect_applied_migration_names(temp.path(), &config)
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn rejects_empty_database_file_name() {

@@ -141,6 +141,8 @@ struct StartOutput {
 #[derive(Debug, Deserialize)]
 struct VersionOutput {
     version: String,
+    #[serde(default)]
+    compiled_database_migrations: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -315,7 +317,15 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
         },
     )?;
 
-    let existing = target_binary.is_file();
+    let existing = match fs::symlink_metadata(&target_binary) {
+        Ok(metadata) if metadata.is_file() => true,
+        Ok(_) => bail!("installed binary has unexpected file type; installation unchanged"),
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error)
+                .context("installed binary metadata unavailable; installation unchanged");
+        }
+    };
     let (was_active, runtime_home) = observe_install_stage(
         &mut stage_timings,
         install_started,
@@ -327,6 +337,46 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
             Ok(query_gateway_status(&target_binary)?
                 .map(|snapshot| (snapshot.service_active, snapshot.runtime_home))
                 .unwrap_or((false, None)))
+        },
+    )?;
+    observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.schema.preflight",
+        || {
+            // A failed status probe must not silently inspect another home.
+            if existing && runtime_home.is_none() {
+                bail!(
+                    "schema compatibility unknown: installed runtime home unavailable; installation unchanged"
+                );
+            }
+            let home = match runtime_home.clone() {
+                Some(home) => home,
+                None => config.runtime_home_dir()?,
+            };
+            let candidate = query_binary_version_output(&staged_binary)?;
+            let config = config.clone();
+            let applied = thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(pioneer_gateway::inspect_applied_database_migrations(
+                        &home, &config,
+                    ))
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("schema inspection worker failed"))??;
+            let applied = match applied {
+                Some(applied) => applied,
+                None if !existing => Vec::new(),
+                None => bail!(
+                    "schema compatibility unknown: installed database missing; installation unchanged"
+                ),
+            };
+            ensure_candidate_schema_compatible(
+                &applied,
+                candidate.compiled_database_migrations.as_deref(),
+            )
         },
     )?;
     let config_backup_dir = observe_install_stage(
@@ -1118,7 +1168,7 @@ fn query_gateway_status(binary: &Path) -> Result<Option<ServiceSnapshot>> {
     }))
 }
 
-fn query_binary_version(binary: &Path) -> Result<String> {
+fn query_binary_version_output(binary: &Path) -> Result<VersionOutput> {
     let output = Command::new(binary)
         .arg("version")
         .arg("--json")
@@ -1140,7 +1190,35 @@ fn query_binary_version(binary: &Path) -> Result<String> {
         bail!("version probe output did not include a version");
     }
 
-    Ok(version.to_owned())
+    Ok(parsed)
+}
+
+fn query_binary_version(binary: &Path) -> Result<String> {
+    Ok(query_binary_version_output(binary)?
+        .version
+        .trim()
+        .to_owned())
+}
+
+fn ensure_candidate_schema_compatible(
+    applied: &[String],
+    compiled: Option<&[String]>,
+) -> Result<()> {
+    let compiled = compiled.context("schema compatibility unknown: candidate does not expose compiled migrations; installation unchanged")?;
+    anyhow::ensure!(
+        !compiled.is_empty() && compiled.len() <= 4096,
+        "schema compatibility unknown: invalid candidate migration set; installation unchanged"
+    );
+    let names: std::collections::HashSet<_> = compiled.iter().collect();
+    anyhow::ensure!(
+        names.len() == compiled.len() && compiled.iter().all(|name| !name.trim().is_empty()),
+        "schema compatibility unknown: invalid candidate migration names; installation unchanged"
+    );
+    anyhow::ensure!(
+        applied.iter().all(|name| names.contains(name)),
+        "candidate is incompatible with applied migration history; installation unchanged"
+    );
+    Ok(())
 }
 
 fn wait_for_gateway_health(binary: &Path, timeout: Duration) -> bool {
@@ -2734,6 +2812,38 @@ fi
             );
             read += received;
         }
+    }
+
+    #[test]
+    fn candidate_must_know_every_applied_migration_without_version_ordering() {
+        let applied = vec!["migration_new".to_owned()];
+        let old_candidate = vec!["migration_old".to_owned()];
+        assert!(super::ensure_candidate_schema_compatible(&applied, Some(&old_candidate)).is_err());
+        let compatible = vec![
+            "migration_old".to_owned(),
+            "migration_new".to_owned(),
+            "migration_future".to_owned(),
+        ];
+        super::ensure_candidate_schema_compatible(&applied, Some(&compatible)).unwrap();
+        assert!(super::ensure_candidate_schema_compatible(&applied, None).is_err());
+        assert!(super::ensure_candidate_schema_compatible(&applied, Some(&[])).is_err());
+        assert!(
+            super::ensure_candidate_schema_compatible(
+                &applied,
+                Some(&["migration_new".into(), "migration_new".into()])
+            )
+            .is_err()
+        );
+        // Legacy version JSON parses, but cannot supply compatibility proof.
+        let legacy: super::VersionOutput =
+            serde_json::from_str(r#"{"version":"999.0.0"}"#).unwrap();
+        assert!(
+            super::ensure_candidate_schema_compatible(
+                &applied,
+                legacy.compiled_database_migrations.as_deref()
+            )
+            .is_err()
+        );
     }
 
     fn http_response(status: u16, reason: &str, body: &[u8]) -> Vec<u8> {
