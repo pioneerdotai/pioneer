@@ -355,6 +355,7 @@ pub enum MobileStartupStage {
     ThreadTreeResponseApply,
     ComposerPrepare,
     OperationalFrame,
+    ShellFrame,
     SplashHide,
 }
 
@@ -382,6 +383,7 @@ impl MobileStartupStage {
             Self::ThreadTreeResponseApply => "thread_tree.response.apply",
             Self::ComposerPrepare => "composer.prepare",
             Self::OperationalFrame => "ui.operational_frame",
+            Self::ShellFrame => "ui.shell_frame",
             Self::SplashHide => "splash.hide",
         }
     }
@@ -409,6 +411,7 @@ impl MobileStartupStage {
             "thread_tree.response.apply" => Self::ThreadTreeResponseApply,
             "composer.prepare" => Self::ComposerPrepare,
             "ui.operational_frame" => Self::OperationalFrame,
+            "ui.shell_frame" => Self::ShellFrame,
             "splash.hide" => Self::SplashHide,
             _ => return None,
         })
@@ -417,6 +420,7 @@ impl MobileStartupStage {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MobileStartupOutcome {
+    Cancelled,
     Ready,
     SetupRequired,
     AuthenticationRequired,
@@ -426,6 +430,7 @@ pub enum MobileStartupOutcome {
 impl MobileStartupOutcome {
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
+            "cancelled" => Self::Cancelled,
             "ready" => Self::Ready,
             "setup_required" => Self::SetupRequired,
             "authentication_required" => Self::AuthenticationRequired,
@@ -436,6 +441,7 @@ impl MobileStartupOutcome {
 
     const fn as_str(self) -> &'static str {
         match self {
+            Self::Cancelled => "cancelled",
             Self::Ready => "ready",
             Self::SetupRequired => "setup_required",
             Self::AuthenticationRequired => "authentication_required",
@@ -494,6 +500,37 @@ pub fn record_mobile_startup(report: MobileStartupReport) {
         outcome: report.outcome.as_str(),
         failed: report.outcome.failed(),
     });
+}
+
+/// A navigation-to-composer measurement, independent of app and turn startup.
+/// Reuses the bounded mobile report and process-wide consent-gated exporter.
+pub fn record_mobile_thread_open(report: MobileStartupReport) {
+    let (enabled, generation) = super::telemetry_consent_snapshot();
+    if !super::telemetry_sample_allowed(enabled.then_some(generation)) {
+        return;
+    }
+    let Some(state) = super::telemetry::state() else {
+        return;
+    };
+    if state.target != TelemetryTarget::Mobile {
+        return;
+    }
+    let attributes = [KeyValue::new("outcome", report.outcome.as_str())];
+    if let Some(metric) = &state.mobile_thread_open_duration {
+        metric.record(report.duration.as_secs_f64() * 1_000.0, &attributes);
+    }
+    let mut span = state.tracer.build(
+        SpanBuilder::from_name("mobile.thread.open")
+            .with_kind(SpanKind::Internal)
+            .with_start_time(report.started_at)
+            .with_attributes(attributes),
+    );
+    span.set_status(match report.outcome {
+        MobileStartupOutcome::Cancelled => Status::Unset,
+        MobileStartupOutcome::Degraded => Status::error("thread screen did not become ready"),
+        _ => Status::Ok,
+    });
+    span.end_with_timestamp(end_timestamp(report.started_at, report.duration));
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1077,11 +1114,15 @@ fn emit_startup_observability(snapshot: &StartupSnapshot) {
     } else {
         "cold"
     };
-    let metric_root_attributes = [
+    let mut metric_root_attributes = vec![
         KeyValue::new("outcome", snapshot.outcome),
         KeyValue::new("startup.failed_stage", failed_stage),
         KeyValue::new("startup.type", startup_type),
     ];
+    if snapshot.target == TelemetryTarget::Mobile {
+        // Historical shell-ready samples are not comparable with this boundary.
+        metric_root_attributes.push(KeyValue::new("startup.boundary", "tree_operational_v2"));
+    }
     state.startup_metrics.duration.record(
         snapshot.elapsed.as_secs_f64() * 1_000.0,
         &metric_root_attributes,
@@ -1157,13 +1198,17 @@ fn emit_startup_observability(snapshot: &StartupSnapshot) {
         span.end_with_timestamp(end_timestamp(stage.started_at, stage.elapsed));
     }
 
-    root_context.span().set_status(if snapshot.failed {
-        Status::Error {
-            description: std::borrow::Cow::Borrowed("startup did not reach a healthy state"),
-        }
-    } else {
-        Status::Ok
-    });
+    root_context.span().set_status(
+        if snapshot.target == TelemetryTarget::Mobile && snapshot.outcome == "cancelled" {
+            Status::Unset
+        } else if snapshot.failed {
+            Status::Error {
+                description: std::borrow::Cow::Borrowed("startup did not reach a healthy state"),
+            }
+        } else {
+            Status::Ok
+        },
+    );
     root_context
         .span()
         .end_with_timestamp(end_timestamp(snapshot.started_at, snapshot.elapsed));
