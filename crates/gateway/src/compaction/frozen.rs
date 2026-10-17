@@ -6325,6 +6325,118 @@ async fn restore_execution_entries_page(
     .await
 }
 
+fn frozen_payload_batchable(reference: &FrozenMessageRef) -> bool {
+    reference.sources.len() == 1
+        && reference.replay_source.is_none()
+        && matches!(
+            reference.sources[0]
+                .scope
+                .split_once(':')
+                .map(|(kind, _)| kind),
+            Some("input" | "context")
+        )
+}
+
+/// Select whole entries from the sequential restore path, scoped to one thread.
+/// Count exact JSON-array bytes before copying an entry and stop at the first
+/// boundary. An oversized entry keeps its old preparation path instead of
+/// introducing a new history size limit.
+fn bounded_preparation_group(references: &[FrozenMessageRef]) -> Result<(usize, Vec<SourceRef>)> {
+    let Some(first) = references.first() else {
+        return Ok((0, Vec::new()));
+    };
+    let mut sources = Vec::new();
+    let mut entries = 0;
+    let mut bytes = 2; // JSON array brackets.
+    'entries: for reference in references {
+        let count = reference.sources.len() + usize::from(reference.replay_source.is_some());
+        if reference.source_thread != first.source_thread
+            || reference.sources.is_empty()
+            || frozen_payload_batchable(reference)
+            || sources.len() + count > pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize
+        {
+            break;
+        }
+        let entry_sources = reference
+            .sources
+            .iter()
+            .chain(reference.replay_source.iter());
+        // Preparation returns without a DB read for noncanonical sources, or
+        // fails before that read for malformed revisions. Keep both on its old
+        // path; only complete canonical source sets can use this precheck.
+        let mut entry_bytes = bytes;
+        for (offset, source) in entry_sources.clone().enumerate() {
+            #[cfg(test)]
+            let _ = PREPARATION_SOURCE_VISITS.try_with(|visits| visits.set(visits.get() + 1));
+            let prefix = match source.scope.split_once(':').map(|(kind, _)| kind) {
+                Some("input") => "input-revision:",
+                Some("context") => "revision:",
+                Some("event") => "event-revision:",
+                Some("item") => "item-revision:",
+                _ => break 'entries,
+            };
+            if !source
+                .version
+                .strip_prefix(prefix)
+                .and_then(|value| value.parse::<i64>().ok())
+                .is_some_and(|revision| source.version == format!("{prefix}{revision}"))
+            {
+                break 'entries;
+            }
+            entry_bytes +=
+                usize::from(!sources.is_empty() || offset > 0) + serde_json::to_vec(source)?.len();
+            if entry_bytes > pioneer_crud::compaction::SOURCE_PAGE_BYTES {
+                break 'entries;
+            }
+        }
+        sources.extend(entry_sources.cloned());
+        bytes = entry_bytes;
+        entries += 1;
+    }
+    Ok((entries, sources))
+}
+
+#[cfg(test)]
+struct PreparationPrecheckPause {
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static PREPARATION_PRECHECK_PAUSE: std::cell::RefCell<Option<PreparationPrecheckPause>>;
+    static PREPARATION_SOURCE_VISITS: std::cell::Cell<usize>;
+}
+
+#[cfg(test)]
+pub(crate) async fn with_preparation_precheck_pause<F: std::future::Future>(
+    future: F,
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) -> F::Output {
+    // Scope only this future, including when another operation on the same
+    // store is polled in the same task. Drop/cancellation drops the channels.
+    PREPARATION_PRECHECK_PAUSE
+        .scope(
+            std::cell::RefCell::new(Some(PreparationPrecheckPause { reached, release })),
+            future,
+        )
+        .await
+}
+
+#[cfg(test)]
+async fn pause_after_preparation_precheck() {
+    let pause = PREPARATION_PRECHECK_PAUSE
+        .try_with(|pause| pause.borrow_mut().take())
+        .ok()
+        .flatten();
+    if let Some(pause) = pause
+        && pause.reached.send(()).is_ok()
+    {
+        let _ = pause.release.await;
+    }
+}
+
 async fn restore_entries_page_with_projection(
     store: &CrudStore,
     workspace: &str,
@@ -6338,51 +6450,55 @@ async fn restore_entries_page_with_projection(
     let mut index = 0usize;
     while index < references.len() {
         let reference = &references[index];
-        let batchable = reference.sources.len() == 1
-            && reference.replay_source.is_none()
-            && matches!(
-                reference.sources[0]
-                    .scope
-                    .split_once(':')
-                    .map(|(kind, _)| kind),
-                Some("input" | "context")
-            );
-        if !batchable {
-            let mut sources = reference.sources.clone();
-            sources.extend(reference.replay_source.iter().cloned());
-            super::history::prepare_references(
-                store,
-                workspace,
-                &reference.source_thread,
-                &sources,
-            )
-            .await?;
-            result.push(
-                restore_entry(
-                    store,
-                    workspace,
-                    allowed_threads,
-                    reference,
-                    checkpoint_graphs,
-                    projection,
-                    state,
-                )
-                .await?,
-            );
-            index += 1;
+        if !frozen_payload_batchable(reference) {
+            let (entries, sources) = bounded_preparation_group(&references[index..])?;
+            // A singleton cannot save a query. False retains legacy registration
+            // immediately before each restore; errors still abort the operation.
+            let prepared = entries > 1
+                && store
+                    .compaction_references_current(workspace, &reference.source_thread, &sources)
+                    .await?;
+            // The completed precheck has released all database capacity.
+            #[cfg(test)]
+            if prepared {
+                pause_after_preparation_precheck().await;
+            }
+            for entry in &references[index..index + entries.max(1)] {
+                if !prepared {
+                    let mut sources = entry.sources.clone();
+                    sources.extend(entry.replay_source.iter().cloned());
+                    super::history::prepare_references(
+                        store,
+                        workspace,
+                        &entry.source_thread,
+                        &sources,
+                    )
+                    .await?;
+                }
+                // This precheck is only a metadata fast path, not an access
+                // grant or a snapshot. Keep exact payload reads and all restore
+                // proofs, including sequential execution-state updates.
+                result.push(
+                    restore_entry(
+                        store,
+                        workspace,
+                        allowed_threads,
+                        entry,
+                        checkpoint_graphs,
+                        projection,
+                        state,
+                    )
+                    .await?,
+                );
+            }
+            index += entries.max(1);
             continue;
         }
         let end = references[index..]
             .iter()
             .take(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize)
             .take_while(|next| {
-                next.source_thread == reference.source_thread
-                    && next.sources.len() == 1
-                    && next.replay_source.is_none()
-                    && matches!(
-                        next.sources[0].scope.split_once(':').map(|(kind, _)| kind),
-                        Some("input" | "context")
-                    )
+                next.source_thread == reference.source_thread && frozen_payload_batchable(next)
             })
             .count();
         let sources = references[index..index + end]
@@ -6416,6 +6532,32 @@ async fn restore_entries_page_with_projection(
         index += consumed;
     }
     Ok(result)
+}
+
+#[cfg(test)]
+pub(crate) async fn restore_entries_page_for_test(
+    store: &CrudStore,
+    workspace: &str,
+    references: &[FrozenMessageRef],
+    execution: bool,
+) -> Result<Vec<Option<ChatMessage>>> {
+    restore_entries_page_with_projection(
+        store,
+        workspace,
+        &references
+            .iter()
+            .map(|entry| entry.source_thread.clone())
+            .collect(),
+        references,
+        &mut super::coverage::CheckpointGraphResolver::default(),
+        if execution {
+            FrozenRestoreProjection::Execution
+        } else {
+            FrozenRestoreProjection::Literal
+        },
+        &mut FrozenExecutionRestoreState::default(),
+    )
+    .await
 }
 
 async fn restore_entry_from_payloads(
@@ -6715,6 +6857,158 @@ async fn finish_restored_entry(
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+
+    fn preparation_reference(index: usize) -> FrozenMessageRef {
+        FrozenMessageRef {
+            logical_turn_id: None,
+            source_thread: "thread".into(),
+            context_thread: None,
+            unit_id: format!("item-{index}"),
+            sources: vec![SourceRef {
+                scope: "item:turn".into(),
+                id: format!("item-{index}"),
+                version: "item-revision:1".into(),
+            }],
+            event_input_role: None,
+            source_aliases: vec![],
+            ambiguous_input_aliases: vec![],
+            publication_aliases: None,
+            inherited: false,
+            complete: true,
+            protected_input: false,
+            wire_sha256: "a".repeat(64),
+            replay_source: Some(SourceRef {
+                scope: "context:turn".into(),
+                id: format!("replay-{index}"),
+                version: "revision:1".into(),
+            }),
+            tool_item_id: None,
+            tool_call_id: None,
+            tool_name: None,
+        }
+    }
+
+    #[test]
+    fn preparation_group_counts_replay_rows_and_stops_at_thread_boundaries() {
+        let row_bound = pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize;
+        let mut references = (0..=row_bound / 2)
+            .map(preparation_reference)
+            .collect::<Vec<_>>();
+        let (entries, sources) = bounded_preparation_group(&references).unwrap();
+        assert_eq!(entries, row_bound / 2);
+        assert_eq!(sources.len(), row_bound);
+        assert_eq!(
+            sources,
+            references[..entries]
+                .iter()
+                .flat_map(|entry| entry.sources.iter().chain(entry.replay_source.iter()))
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+
+        references[2].source_thread = "other-thread".into();
+        assert_eq!(bounded_preparation_group(&references).unwrap().0, 2);
+        assert_eq!(bounded_preparation_group(&references[2..]).unwrap().0, 1);
+        assert_eq!(bounded_preparation_group(&[]).unwrap(), (0, vec![]));
+    }
+
+    #[test]
+    fn preparation_group_obeys_exact_json_bytes_without_splitting_entries() {
+        let limit = pioneer_crud::compaction::SOURCE_PAGE_BYTES;
+        let mut references = vec![preparation_reference(0), preparation_reference(1)];
+        references[0].sources[0].id = "quotes\" slashes\\ unicode🧪".into();
+        let (_, sources) = bounded_preparation_group(&references).unwrap();
+        let padding = limit - serde_json::to_vec(&sources).unwrap().len();
+        references[1]
+            .replay_source
+            .as_mut()
+            .unwrap()
+            .id
+            .push_str(&"x".repeat(padding));
+        let (entries, sources) = bounded_preparation_group(&references).unwrap();
+        assert_eq!(entries, 2);
+        assert_eq!(serde_json::to_vec(&sources).unwrap().len(), limit);
+
+        // Only the replay ref crosses the byte boundary; its entire entry must
+        // be excluded, even though its first source fits in the first page.
+        references[1].replay_source.as_mut().unwrap().id.push('x');
+        let (entries, sources) = bounded_preparation_group(&references).unwrap();
+        assert_eq!(entries, 1);
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[1], references[0].replay_source.clone().unwrap());
+        assert_eq!(bounded_preparation_group(&references[1..]).unwrap().0, 1);
+
+        references[1].replay_source.as_mut().unwrap().id = "x".repeat(limit);
+        assert_eq!(
+            bounded_preparation_group(&references[1..]).unwrap(),
+            (0, vec![])
+        );
+    }
+
+    #[test]
+    fn preparation_group_stops_after_first_nonfitting_wide_entry() {
+        let references = (0..128)
+            .map(|index| {
+                let mut entry = preparation_reference(index);
+                entry.replay_source = None;
+                entry.sources[0].id = format!("{index}:{}", "x".repeat(200 * 1024));
+                entry
+            })
+            .collect::<Vec<_>>();
+        let visits = PREPARATION_SOURCE_VISITS.sync_scope(std::cell::Cell::new(0), || {
+            for start in 0..references.len() {
+                let (entries, sources) = bounded_preparation_group(&references[start..]).unwrap();
+                assert_eq!(entries, 1);
+                assert_eq!(sources, references[start].sources);
+            }
+            PREPARATION_SOURCE_VISITS.with(std::cell::Cell::get)
+        });
+        // Each selection inspects its accepted entry and at most one rejected
+        // successor, rather than rescanning the complete remaining tail.
+        assert_eq!(visits, 2 * references.len() - 1);
+    }
+
+    #[test]
+    fn preparation_group_leaves_ineligible_entries_on_the_old_path() {
+        for scope in ["checkpoint:owner", "task-basis:run", "unknown:turn"] {
+            let mut entry = preparation_reference(0);
+            entry.sources[0].scope = scope.into();
+            assert_eq!(bounded_preparation_group(&[entry]).unwrap(), (0, vec![]));
+        }
+        for version in [
+            "item-revision:01",
+            "item-revision:+1",
+            "item-revision:9223372036854775808",
+            "revision:1",
+        ] {
+            let mut entry = preparation_reference(0);
+            entry.sources[0].version = version.into();
+            assert_eq!(bounded_preparation_group(&[entry]).unwrap(), (0, vec![]));
+        }
+        let mut entry = preparation_reference(0);
+        entry.replay_source.as_mut().unwrap().scope = "checkpoint:owner".into();
+        assert_eq!(bounded_preparation_group(&[entry]).unwrap(), (0, vec![]));
+
+        for kind in ["input", "context"] {
+            let mut entry = preparation_reference(0);
+            entry.sources[0].scope = format!("{kind}:turn");
+            entry.sources[0].version = if kind == "input" {
+                "input-revision:1".into()
+            } else {
+                "revision:1".into()
+            };
+            entry.replay_source = None;
+            assert!(frozen_payload_batchable(&entry));
+            assert_eq!(bounded_preparation_group(&[entry]).unwrap(), (0, vec![]));
+        }
+        let mut entry = preparation_reference(0);
+        entry.sources =
+            vec![entry.sources[0].clone(); pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize];
+        assert_eq!(bounded_preparation_group(&[entry]).unwrap(), (0, vec![]));
+        let mut entry = preparation_reference(0);
+        entry.sources.clear();
+        assert_eq!(bounded_preparation_group(&[entry]).unwrap(), (0, vec![]));
+    }
 
     #[test]
     fn legacy_frozen_command_hash_is_verified_before_model_upgrade() {
