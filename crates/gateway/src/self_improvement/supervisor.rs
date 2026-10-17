@@ -2102,6 +2102,14 @@ mod tests {
             "pinned-native"
         }
 
+        fn model_tool_support(&self, model: &str) -> pioneer_provider::ModelToolSupport {
+            if model == "pinned-model" {
+                pioneer_provider::ModelToolSupport::Supported
+            } else {
+                pioneer_provider::ModelToolSupport::Unknown
+            }
+        }
+
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {
                 streaming: false,
@@ -2121,7 +2129,7 @@ mod tests {
                 .push(request);
             if is_preflight {
                 return Ok(ChatResponse {
-                    text: r#"{"tools":{"visibleTools":[]}}"#.to_owned(),
+                    text: r#"{"tools":{"visibleTools":["read_skill"]}}"#.to_owned(),
                     usage: None,
                     reasoning_content: None,
                     provider_replay_state: None,
@@ -2200,6 +2208,14 @@ mod tests {
             "native"
         }
 
+        fn model_tool_support(&self, model: &str) -> pioneer_provider::ModelToolSupport {
+            if model == "native-model" {
+                pioneer_provider::ModelToolSupport::Supported
+            } else {
+                pioneer_provider::ModelToolSupport::Unknown
+            }
+        }
+
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {
                 streaming: false,
@@ -2219,7 +2235,7 @@ mod tests {
                 .push(request);
             if is_preflight {
                 return Ok(ChatResponse {
-                    text: r#"{"tools":{"visibleTools":[]}}"#.to_owned(),
+                    text: r#"{"tools":{"visibleTools":["read_skill"]}}"#.to_owned(),
                     usage: None,
                     reasoning_content: None,
                     provider_replay_state: None,
@@ -2513,6 +2529,7 @@ mod tests {
 
     fn agent_tool_loop_config() -> ToolLoopConfig {
         ToolLoopConfig {
+            no_progress_mode: pioneer_tools::ToolNoProgressMode::Enforce,
             provider: pioneer_provider::ProviderTimeoutPolicy::default(),
             preflight: PreflightLoopConfig::default(),
             web: WebToolsConfig::default(),

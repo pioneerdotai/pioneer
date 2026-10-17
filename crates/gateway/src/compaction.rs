@@ -43,6 +43,7 @@ pub(crate) fn legacy_event_message(
 }
 #[cfg(test)]
 pub(crate) use native::observe_prepared_transfers;
+pub(crate) use native::restore_native_history_roots;
 pub(crate) use native::{GatewayNativeContextController, native_owner};
 pub(crate) use tool_outcomes::{retained_shell_outcome, retained_tool_policy};
 

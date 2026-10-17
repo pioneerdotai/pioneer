@@ -339,12 +339,21 @@ fn durable_event_thread_id(event: &AgentDurableEvent) -> Option<&str> {
         | AgentDurableEvent::TurnFailed { thread_id, .. }
         | AgentDurableEvent::TurnBlocked { thread_id, .. }
         | AgentDurableEvent::TurnInterrupted { thread_id, .. } => Some(thread_id.as_str()),
+        AgentDurableEvent::NativeInitialPhaseAdvanced { preparation } => {
+            Some(preparation.thread_id.as_str())
+        }
+        AgentDurableEvent::NativeSemanticCheckpoint { checkpoint, .. } => {
+            Some(checkpoint.thread_id.as_str())
+        }
         AgentDurableEvent::NativeCancellationContextPrepared { preparation, .. }
         | AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => {
             Some(preparation.thread_id.as_str())
         }
         AgentDurableEvent::TurnPermissionAudit { event } => Some(event.thread_id.as_str()),
         AgentDurableEvent::ToolOutputRecorded { notification, .. } => {
+            Some(notification.thread_id.as_str())
+        }
+        AgentDurableEvent::ProviderUsageObserved { notification } => {
             Some(notification.thread_id.as_str())
         }
         AgentDurableEvent::ItemStarted { notification } => Some(notification.thread_id.as_str()),
@@ -399,12 +408,21 @@ fn durable_event_turn_id(event: &AgentDurableEvent) -> Option<&str> {
         | AgentDurableEvent::TurnFailed { turn_id, .. }
         | AgentDurableEvent::TurnBlocked { turn_id, .. }
         | AgentDurableEvent::TurnInterrupted { turn_id, .. } => Some(turn_id.as_str()),
+        AgentDurableEvent::NativeInitialPhaseAdvanced { preparation } => {
+            Some(preparation.turn_id.as_str())
+        }
+        AgentDurableEvent::NativeSemanticCheckpoint { checkpoint, .. } => {
+            Some(checkpoint.turn_id.as_str())
+        }
         AgentDurableEvent::NativeCancellationContextPrepared { preparation, .. }
         | AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => {
             Some(preparation.turn_id.as_str())
         }
         AgentDurableEvent::TurnPermissionAudit { event } => Some(event.turn_id.as_str()),
         AgentDurableEvent::ToolOutputRecorded { notification, .. } => {
+            Some(notification.turn_id.as_str())
+        }
+        AgentDurableEvent::ProviderUsageObserved { notification } => {
             Some(notification.turn_id.as_str())
         }
         AgentDurableEvent::ItemStarted { notification } => Some(notification.turn_id.as_str()),
@@ -671,6 +689,20 @@ impl TurnFailureRecoveryKind {
     }
 }
 
+fn recovery_resume_reason_class(class: pioneer_protocol::ProviderFailureClass) -> &'static str {
+    use pioneer_protocol::ProviderFailureClass::*;
+    match class {
+        AuthExpired | AuthOrPermission | PermissionDenied => "auth_or_config",
+        ModelNotFound => "model_unavailable",
+        UnsupportedImageInput
+        | UnsupportedToolCalling
+        | UnsupportedStreaming
+        | UnsupportedCapability
+        | UnsupportedParameter => "unsupported_capability",
+        _ => "recovery_blocked",
+    }
+}
+
 fn classify_legacy_turn_failure(_error_message: &str) -> TurnFailureRecoveryKind {
     TurnFailureRecoveryKind::RuntimeFailure
 }
@@ -697,43 +729,38 @@ impl MessageProcessor {
             .crud_store
             .count_turn_execution_window_terminal_items_since(turn_id, window.started_at.clone())
             .await?;
+        let (observed_attempts, observed_tokens, mut usage_available) = self
+            .crud_store
+            .summarize_execution_window_provider_usage(turn_id, window.window_index)
+            .await?;
+        let accounted_rounds = window.agent_round_count.max(if observed_attempts > 0 {
+            observed_attempts
+        } else {
+            counts.agent_round_count
+        });
+        usage_available &= observed_attempts > 0
+            && observed_attempts >= accounted_rounds
+            && observed_tokens == window.provider_token_count.max(observed_tokens);
+        let mut metadata = execution_window_terminal_metadata(
+            &window.metadata_json,
+            terminal_status,
+            terminal_reason,
+        );
+        metadata["accountingSchemaVersion"] = serde_json::json!(1);
+        metadata["providerUsageAvailable"] = serde_json::json!(usage_available);
         let now = now_db_timestamp();
         let stats = pioneer_crud::TurnExecutionWindowStatsRecord {
-            agent_round_count: window.agent_round_count.max(counts.agent_round_count),
+            agent_round_count: accounted_rounds,
             tool_call_count: window.tool_call_count.max(counts.tool_call_count),
-            provider_token_count: window.provider_token_count,
-            metadata_json: execution_window_terminal_metadata(
-                &window.metadata_json,
-                terminal_status,
-                terminal_reason,
-            ),
+            provider_token_count: window.provider_token_count.max(observed_tokens),
+            metadata_json: metadata,
             completed_at: now,
             updated_at: now,
         };
 
-        match terminal_status {
-            pioneer_protocol::ExecutionWindowStatus::Completed => {
-                self.crud_store
-                    .mark_turn_execution_window_completed(window.id.as_str(), stats)
-                    .await?;
-            }
-            pioneer_protocol::ExecutionWindowStatus::Failed => {
-                self.crud_store
-                    .mark_turn_execution_window_failed(window.id.as_str(), stats)
-                    .await?;
-            }
-            pioneer_protocol::ExecutionWindowStatus::Interrupted => {
-                self.crud_store
-                    .mark_turn_execution_window_interrupted(window.id.as_str(), stats)
-                    .await?;
-            }
-            pioneer_protocol::ExecutionWindowStatus::Blocked => {
-                self.crud_store
-                    .mark_turn_execution_window_blocked(window.id.as_str(), None, stats)
-                    .await?;
-            }
-            _ => {}
-        }
+        self.crud_store
+            .close_terminal_execution_window_with_usage(&window, terminal_status, stats)
+            .await?;
 
         Ok(())
     }
@@ -1393,15 +1420,16 @@ impl MessageProcessor {
         &self,
         preparation: pioneer_protocol::NativeTerminalEffectPreparation,
         initial_turn: bool,
+        prepare_artifact_obligations: bool,
+        execution_owner_generation: Option<u64>,
     ) -> Result<(), DurableCommitRejection> {
         if initial_turn {
             return self
-                .crud_store
-                .persist_native_cancellation_context(
+                .persist_native_execution_preparation(
                     preparation,
-                    self.turn_execution_owner_id.as_ref(),
-                    now_timestamp_secs(),
                     true,
+                    prepare_artifact_obligations,
+                    execution_owner_generation,
                 )
                 .await
                 .map_err(classify_native_preparation_error);
@@ -1609,6 +1637,7 @@ impl MessageProcessor {
                                 job.status,
                                 pioneer_protocol::RecoveryJobStatus::Pending
                                     | pioneer_protocol::RecoveryJobStatus::Exhausted
+                                    | pioneer_protocol::RecoveryJobStatus::Blocked
                             )
                     }) && !self
                         .replay_applied_recovery_provider_failure(
@@ -1913,9 +1942,16 @@ impl MessageProcessor {
                     AgentDurableEvent::NativeCancellationContextPrepared {
                         preparation,
                         initial_turn,
+                        prepare_artifact_obligations,
+                        execution_owner_generation,
                     } => Some(
-                        self.prepare_native_turn_control(preparation.clone(), *initial_turn)
-                            .await,
+                        self.prepare_native_turn_control(
+                            preparation.clone(),
+                            *initial_turn,
+                            *prepare_artifact_obligations,
+                            *execution_owner_generation,
+                        )
+                        .await,
                     ),
                     AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => Some(
                         match self
@@ -4391,6 +4427,29 @@ impl MessageProcessor {
                 );
                 true
             }),
+            AgentDurableEvent::ProviderUsageObserved { notification } => {
+                message_future(async move {
+                    if !matches!(&notification.item, TurnItem::SystemEvent {code: Some(code), details: Some(details), .. }
+                    if code == "provider_usage" && details["schema_version"].as_u64() == Some(1))
+                    {
+                        return false;
+                    }
+                    match self
+                        .materialize_native_agent_turn_event(
+                            pioneer_crud::CanonicalTurnEventPayload::ItemUpdated(notification),
+                            now_timestamp_secs(),
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(()) => true,
+                        Err(error) => {
+                            warn!(error = %error, "failed to persist provider usage observation");
+                            false
+                        }
+                    }
+                })
+            }
             AgentDurableEvent::ItemCompleted { notification } => message_future(async move {
                 let mut notification = notification;
                 self.enrich_item_completed_markdown(&mut notification).await;
@@ -4842,13 +4901,148 @@ impl MessageProcessor {
                     true
                 })
             }
+            AgentDurableEvent::NativeSemanticCheckpoint {
+                execution_owner_generation,
+                runtime_generation,
+                checkpoint,
+                control,
+            } => message_future(async move {
+                let commit = async {
+                    let snapshot = self
+                        .crud_store
+                        .get_turn_runtime_snapshot(&checkpoint.turn_id)
+                        .await?
+                        .context("semantic checkpoint startup unavailable")?;
+                    let phase = snapshot
+                        .initial_phase_json
+                        .as_deref()
+                        .context("semantic checkpoint phase unavailable")?;
+                    anyhow::ensure!(
+                        snapshot.workspace_id == checkpoint.workspace_id
+                            && snapshot.thread_id == checkpoint.thread_id,
+                        "semantic checkpoint scope differs"
+                    );
+                    let requirements =
+                        pioneer_agent::NativeInitialPreparation::completed_resume_requirements(
+                            phase,
+                            snapshot
+                                .remaining_storage_bytes()?
+                                .saturating_add(phase.len()),
+                        )?
+                        .context("semantic checkpoint initial preparation is not completed")?;
+                    anyhow::ensure!(
+                        pioneer_agent::native_semantic_checkpoint_compatible(
+                            &checkpoint,
+                            &requirements.tool_retry_budget,
+                            requirements.no_progress_mode,
+                        ),
+                        "semantic checkpoint is incompatible"
+                    );
+                    self.crud_store
+                        .commit_native_semantic_checkpoint(
+                            checkpoint,
+                            control,
+                            runtime_generation,
+                            self.turn_execution_owner_id.as_ref(),
+                            execution_owner_generation
+                                .context("semantic checkpoint owner epoch unavailable")?,
+                        )
+                        .await
+                }
+                .await;
+                if let Err(_error) = &commit {
+                    #[cfg(test)]
+                    eprintln!("native semantic checkpoint fixture rejection: {_error:#}");
+                    warn!("native semantic checkpoint commit rejected");
+                }
+                commit.is_ok()
+            }),
+            AgentDurableEvent::NativeInitialPhaseAdvanced { preparation } => {
+                message_future(async move {
+                    let commit = async {
+                        let current = self
+                            .crud_store
+                            .get_turn_runtime_snapshot(&preparation.turn_id)
+                            .await?
+                            .context("native initial snapshot unavailable")?;
+                        anyhow::ensure!(
+                            current.workspace_id == preparation.workspace_id
+                                && current.thread_id == preparation.thread_id,
+                            "native initial phase scope differs"
+                        );
+                        let previous = current
+                            .initial_phase_json
+                            .as_deref()
+                            .context("native initial phase unavailable")?;
+                        let budget = current
+                            .remaining_storage_bytes()?
+                            .checked_add(previous.len())
+                            .context("native initial phase byte allowance invalid")?;
+                        let _ = pioneer_agent::NativeInitialPreparation::restore(
+                            &preparation.initial_phase_json,
+                            &preparation.workspace_id,
+                            &preparation.thread_id,
+                            &preparation.turn_id,
+                            budget,
+                        )?;
+                        anyhow::ensure!(
+                            preparation.expected_sha256.len() == 64
+                                && preparation
+                                    .expected_sha256
+                                    .bytes()
+                                    .all(|b| b.is_ascii_hexdigit()),
+                            "native initial phase digest invalid"
+                        );
+                        if previous != preparation.initial_phase_json {
+                            use sha2::Digest;
+                            anyhow::ensure!(
+                                hex::encode(sha2::Sha256::digest(previous.as_bytes()))
+                                    == preparation.expected_sha256,
+                                "native initial phase predecessor changed"
+                            );
+                            pioneer_agent::NativeInitialPreparation::validate_transition(
+                                previous,
+                                &preparation.initial_phase_json,
+                                budget,
+                            )?;
+                        }
+                        self.crud_store
+                            .advance_native_initial_phase(
+                                &preparation.workspace_id,
+                                &preparation.thread_id,
+                                &preparation.turn_id,
+                                preparation.window_index,
+                                preparation.runtime_generation,
+                                self.turn_execution_owner_id.as_ref(),
+                                preparation
+                                    .execution_owner_generation
+                                    .context("initial phase producer owner epoch unavailable")?,
+                                previous,
+                                &preparation.initial_phase_json,
+                            )
+                            .await
+                    }
+                    .await;
+                    if commit.is_err() {
+                        warn!("native initial phase commit rejected");
+                    }
+                    commit.is_ok()
+                })
+            }
             AgentDurableEvent::NativeCancellationContextPrepared {
                 preparation,
                 initial_turn,
+                prepare_artifact_obligations,
+                execution_owner_generation,
             } => message_future(async move {
-                self.prepare_native_turn_control(preparation, initial_turn)
-                    .await
-                    .is_ok()
+                self.prepare_native_turn_control(
+                    preparation,
+                    initial_turn,
+                    prepare_artifact_obligations,
+                    execution_owner_generation,
+                )
+                .await
+                .is_ok()
             }),
             AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => {
                 message_future(async move {
@@ -4865,6 +5059,8 @@ impl MessageProcessor {
                             error = %format!("{error:#}"),
                             "failed to persist native terminal-effect preparation"
                         );
+                        #[cfg(test)]
+                        eprintln!("native terminal-effect fixture rejection: {error:#}");
                         return false;
                     }
                     true
@@ -4922,6 +5118,7 @@ impl MessageProcessor {
                 thread_id,
                 turn_id,
                 error,
+                failure,
                 recovery,
             } => message_future(async move {
                 if let Err(finalize_error) = self
@@ -4940,23 +5137,60 @@ impl MessageProcessor {
                     thread_id.as_str(),
                     turn_id.as_str(),
                 );
-                if recovery.is_some() {
-                    if !message_future(
-                        self.mark_turn_failed_with_recovery(thread_id, turn_id, error, recovery),
-                    )
-                    .await
+                let disposition =
+                    failure.map(pioneer_protocol::NativeFailureMetadata::effective_disposition);
+                if disposition == Some(pioneer_protocol::TurnFailureDisposition::Permanent) {
+                    if !self
+                        .mark_turn_failed_with_recovery(thread_id, turn_id, error, recovery)
+                        .await
                     {
                         return false;
                     }
-                } else if !message_future(self.report_turn_failure(
-                    thread_id,
-                    turn_id,
-                    TurnFailureRecoveryKind::RuntimeFailure,
-                    error,
-                ))
-                .await
-                {
-                    return false;
+                } else if disposition == Some(pioneer_protocol::TurnFailureDisposition::Transient) {
+                    let committed = if let Some(recovery) = recovery {
+                        self.handle_runtime_recovery_attempt_failure(
+                            turn_id, recovery, error, None, None,
+                        )
+                        .await
+                    } else {
+                        self.report_turn_failure(
+                            thread_id,
+                            turn_id,
+                            TurnFailureRecoveryKind::RuntimeFailure,
+                            error,
+                        )
+                        .await
+                    };
+                    if !committed {
+                        return false;
+                    }
+                } else {
+                    // Legacy CLI outcomes retain their existing projection. A
+                    // native event missing policy facts cannot authorize restart.
+                    let cli_binding =
+                        match self.crud_store.get_cli_runtime_turn_binding(&turn_id).await {
+                            Ok(binding) => binding,
+                            Err(_) => return false,
+                        };
+                    let committed = if cli_binding.is_some() {
+                        if recovery.is_some() {
+                            self.mark_turn_failed_with_recovery(thread_id, turn_id, error, recovery)
+                                .await
+                        } else {
+                            self.report_turn_failure(
+                                thread_id,
+                                turn_id,
+                                TurnFailureRecoveryKind::RuntimeFailure,
+                                error,
+                            )
+                            .await
+                        }
+                    } else {
+                        self.mark_turn_blocked_with_recovery(thread_id, turn_id, "native failure disposition is unknown; restoration requires explicit review".to_owned(), recovery, None, None).await
+                    };
+                    if !committed {
+                        return false;
+                    }
                 }
                 pioneer_tools::apply_patch::patch_telemetry().record_task_result(false);
                 true
@@ -5369,7 +5603,7 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn handle_cli_runtime_recovery_native_failure(
+    pub(super) async fn handle_runtime_recovery_attempt_failure(
         &self,
         turn_id: String,
         recovery: pioneer_protocol::RecoveryAttemptContext,
@@ -5380,7 +5614,7 @@ impl MessageProcessor {
         let now_unix = now_timestamp_secs();
         match self
             .recovery_coordinator
-            .record_cli_runtime_attempt_failure(
+            .record_runtime_attempt_failure(
                 recovery.job_id.as_str(),
                 recovery.attempt_id.as_str(),
                 failure_message,
@@ -5829,6 +6063,15 @@ impl MessageProcessor {
                     attempt_number: current_attempt.saturating_add(1),
                     next_run_at_unix: job.next_run_at_unix,
                     reason: job.last_error,
+                }
+            }
+            pioneer_protocol::RecoveryJobStatus::Blocked => {
+                crate::resilience::RecoveryCoordinatorEvent::RecoveryBlocked {
+                    job_id: job.id,
+                    turn_id: job.turn_id,
+                    reason: job.last_error.or(job.reason).unwrap_or_else(|| {
+                        "Automatic recovery requires compatible saved state.".to_owned()
+                    }),
                 }
             }
             pioneer_protocol::RecoveryJobStatus::Failed
@@ -8333,7 +8576,16 @@ impl MessageProcessor {
                     self.finalize_agent_execution_for_turn(&current_turn, "completed")
                         .await;
                 }
-                return committed;
+                return committed
+                    && self
+                        .reconcile_completed_turn(
+                            thread_id,
+                            turn_id,
+                            recovery,
+                            now_timestamp_secs(),
+                            terminal_actor_generation,
+                        )
+                        .await;
             }
             if current_turn.status != TurnStatus::InProgress {
                 self.retire_execution_progress_state(turn_id.as_str()).await;
@@ -8363,9 +8615,21 @@ impl MessageProcessor {
             }
         }
 
-        if self
-            .artifact_finalization_blocks_completion(thread_id.as_str(), turn_id.as_str())
-            .await
+        // A Composer source Turn owns its accepted message; its detached Task
+        // owns provider work and artifact obligations. UI mode is not ownership.
+        let owns_work = match self.crud_store.turn_work_owner(&thread_id, &turn_id).await {
+            Ok(Some(pioneer_crud::TurnWorkOwner::Turn)) => true,
+            Ok(Some(pioneer_crud::TurnWorkOwner::DetachedTask)) => false,
+            Ok(None) => return false,
+            Err(error) => {
+                warn!(thread_id, turn_id, error = %error, "Turn completion work owner unavailable");
+                return false;
+            }
+        };
+        if owns_work
+            && self
+                .artifact_finalization_blocks_completion(&thread_id, &turn_id)
+                .await
         {
             return false;
         }
@@ -8429,6 +8693,26 @@ impl MessageProcessor {
         self.finalize_agent_execution_for_turn(&turn_completed.turn, "completed")
             .await;
 
+        self.reconcile_completed_turn(
+            thread_id,
+            turn_id,
+            recovery,
+            event_timestamp,
+            terminal_actor_generation,
+        )
+        .await
+    }
+
+    // Both a newly committed terminal event and its exact replay must finish
+    // the existing Task aggregate and resource cleanup after the durable commit.
+    async fn reconcile_completed_turn(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
+        event_timestamp: i64,
+        terminal_actor_generation: Option<u64>,
+    ) -> bool {
         if let Err(error) = self
             .close_latest_active_execution_window_for_terminal_turn(
                 turn_id.as_str(),
@@ -8800,9 +9084,56 @@ impl MessageProcessor {
             }
         }
 
+        // Validate artifacts while this Turn still owns an active native fence.
+        // An exact committed retry is checked by the finalization transaction.
+        let (workspace_id, already_completed) = match self
+            .crud_store
+            .get_turn(&thread_id, &turn_id)
+            .await
+        {
+            Ok(Some((workspace, turn))) => (workspace, turn.status == TurnStatus::Completed),
+            Ok(None) => return false,
+            Err(error) => {
+                warn!(thread_id, turn_id, error = %error, "failed to load native finalization target");
+                return false;
+            }
+        };
+        if !already_completed {
+            let candidate = match self
+                .crud_store
+                .turn_finalization_notification(&turn_id)
+                .await
+            {
+                Ok(Some(candidate))
+                    if candidate.thread_id == thread_id && candidate.turn_id == turn_id =>
+                {
+                    candidate
+                }
+                Ok(_) => return false,
+                Err(error) => {
+                    warn!(thread_id, turn_id, error = %error, "native finalization candidate unavailable");
+                    return false;
+                }
+            };
+            if candidate.workspace_id != workspace_id {
+                return false;
+            }
+            self.record_final_assistant_text_for_item(&candidate).await;
+            if self
+                .artifact_finalization_blocks_completion(&thread_id, &turn_id)
+                .await
+            {
+                return false;
+            }
+        }
+        let terminal_actor_generation = self
+            .agent_manager
+            .turn_owner_generation(&thread_id, &turn_id)
+            .await;
+        let event_timestamp = now_timestamp_secs();
         let committed = match self
             .crud_store
-            .commit_prepared_turn_finalization(turn_id.as_str(), now_timestamp_secs())
+            .commit_prepared_turn_finalization(turn_id.as_str(), event_timestamp)
             .await
         {
             Ok(TurnFinalizationCommitOutcome::Committed(committed)) => committed,
@@ -8843,12 +9174,31 @@ impl MessageProcessor {
         }
         self.record_final_assistant_text_for_item(&committed.final_item)
             .await;
-        self.kick_native_turn_event_deliveries();
 
-        // Reuse terminal cleanup/recovery/task reconciliation. Its canonical
-        // TurnCompleted write is now an exact idempotent replay of the already
-        // committed terminal half of the finalization transaction.
-        self.complete_turn(thread_id, turn_id, recovery).await
+        // The atomic result owns the exact terminal payload. Re-running the
+        // pre-commit gate or reconstructing another terminal notification here
+        // can reject an already successful Turn and strand its Task aggregate.
+        if let Err(error) = self
+            .thread_manager
+            .commit_terminal_turn(&thread_id, &committed.turn_completed.turn)
+            .await
+        {
+            warn!(thread_id, turn_id, error = %error, "failed to synchronize committed native Turn");
+            return false;
+        }
+        self.kick_native_turn_event_deliveries();
+        self.kick_native_terminal_effects();
+        self.retire_execution_progress_state(&turn_id).await;
+        self.finalize_agent_execution_for_turn(&committed.turn_completed.turn, "completed")
+            .await;
+        self.reconcile_completed_turn(
+            thread_id,
+            turn_id,
+            recovery,
+            event_timestamp,
+            terminal_actor_generation,
+        )
+        .await
     }
 
     pub(super) async fn mark_turn_blocked(
@@ -8970,35 +9320,195 @@ impl MessageProcessor {
         recovery_job_id: &str,
         reason: &str,
     ) -> Result<pioneer_protocol::TurnBlockedResumeMetadata> {
-        let latest_checkpoint_id = self
+        let checkpoint = self
             .crud_store
             .latest_turn_execution_checkpoint_for_turn(turn_id)
-            .await?
-            .map(|checkpoint| checkpoint.id);
+            .await?;
+        let latest_checkpoint_id = checkpoint.as_ref().map(|checkpoint| checkpoint.id.clone());
         let recovery_job = self.crud_store.get_recovery_job(recovery_job_id).await?;
-        let has_runtime_snapshot = self
-            .crud_store
-            .get_turn_runtime_snapshot(turn_id)
-            .await?
-            .is_some();
-        let can_resume_same_turn = recovery_job
-            .as_ref()
-            .is_some_and(|job| !job.item_type.is_tool_item() || has_runtime_snapshot);
-
-        let normalized = reason.to_ascii_lowercase();
-        let reason_class = if normalized.contains("auth")
-            || normalized.contains("permission")
-            || normalized.contains("credential")
-            || normalized.contains("api key")
+        let snapshot = self.crud_store.get_turn_runtime_snapshot(turn_id).await?;
+        let mut snapshot_compatible = snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.turn_id == turn_id
+                && crate::turn_runtime_snapshot::validate_runtime_snapshot_for_resume(snapshot)
+                    .is_ok()
+                && snapshot.initial_phase_json.as_deref().is_some_and(|phase| {
+                    pioneer_agent::NativeInitialPreparation::completed_for_resume(
+                        phase,
+                        pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+                    )
+                    .unwrap_or(false)
+                })
+        });
+        let mut accepted_retry_budget = None;
+        let mut accepted_no_progress_mode = None;
+        if snapshot_compatible {
+            let snapshot = snapshot.as_ref().expect("validated snapshot");
+            let requirements =
+                pioneer_agent::NativeInitialPreparation::completed_resume_requirements(
+                    snapshot
+                        .initial_phase_json
+                        .as_deref()
+                        .expect("validated initial phase"),
+                    pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+                )?
+                .expect("validated completed phase");
+            accepted_retry_budget = Some(requirements.tool_retry_budget);
+            accepted_no_progress_mode = Some(requirements.no_progress_mode);
+            if let Some(contract) = requirements.native_agent_action_contract {
+                snapshot_compatible = crate::authorization::BoundAgentActionAdapter::native_launch_contract_can_restore(
+                    &self.crud_store, &snapshot.workspace_id, &snapshot.thread_id, turn_id, &contract,
+                ).await?;
+            }
+            if let Some((hash, count)) = requirements.mcp_projection {
+                snapshot_compatible &=
+                    count <= crate::turn_mcp::McpProjectionLimits::default().max_tools;
+                snapshot_compatible &= self
+                    .crud_store
+                    .get_turn_mcp_projection(turn_id)
+                    .await?
+                    .is_some_and(|projection| {
+                        projection.workspace_id == snapshot.workspace_id
+                            && projection.projection_version
+                                == crate::turn_mcp::MCP_TURN_PROJECTION_VERSION as i32
+                            && projection.manifest_hash == hash
+                            && projection.tool_count == count as i32
+                            && matches!(
+                                projection.resolution_status.as_str(),
+                                "resolved" | "resolved_degraded"
+                            )
+                    });
+            }
+        }
+        let mut checkpoint_compatible = checkpoint.as_ref().is_some_and(|checkpoint| {
+            serde_json::from_value::<pioneer_protocol::ExecutionCheckpointPayload>(
+                checkpoint.payload_json.clone(),
+            )
+            .is_ok_and(|payload| {
+                payload.turn_id == turn_id
+                    && snapshot.as_ref().is_some_and(|snapshot| {
+                        payload.workspace_id == snapshot.workspace_id
+                            && payload.thread_id == snapshot.thread_id
+                    })
+                    && accepted_retry_budget.as_ref().is_some_and(|budget| {
+                        accepted_no_progress_mode.is_some_and(|mode| {
+                            pioneer_agent::native_semantic_checkpoint_compatible(
+                                &payload, budget, mode,
+                            )
+                        })
+                    })
+            })
+        });
+        if checkpoint_compatible
+            && let Some(checkpoint) = checkpoint.as_ref()
+            && checkpoint.checkpoint_kind
+                == pioneer_crud::TurnExecutionCheckpointKind::SemanticState
         {
-            "auth_or_config"
-        } else if normalized.contains("model") {
-            "model_unavailable"
-        } else if normalized.contains("capability") || normalized.contains("unsupported") {
-            "unsupported_capability"
-        } else {
-            "recovery_blocked"
-        };
+            let payload = serde_json::from_value(checkpoint.payload_json.clone())?;
+            checkpoint_compatible = self
+                .crud_store
+                .native_semantic_checkpoint_frontier_is_current(&payload)
+                .await?
+                && self
+                    .crud_store
+                    .latest_turn_execution_window(turn_id)
+                    .await?
+                    .is_some_and(|window| {
+                        window.id == checkpoint.window_id
+                            && window.status == pioneer_protocol::ExecutionWindowStatus::Running
+                    });
+        }
+        if checkpoint_compatible && let Some(checkpoint) = checkpoint.as_ref() {
+            let references: Vec<pioneer_protocol::NativeControlRef> = serde_json::from_value(
+                checkpoint
+                    .payload_json
+                    .get("native_semantic_state")
+                    .and_then(|state| state.get("controls"))
+                    .and_then(|state| state.get("retained"))
+                    .context("compatible native checkpoint control refs unavailable")?
+                    .clone(),
+            )?;
+            match self
+                .crud_store
+                .load_native_controls(
+                    &checkpoint.workspace_id,
+                    &checkpoint.thread_id,
+                    &checkpoint.turn_id,
+                    &references,
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(error) if error.is::<pioneer_protocol::NativeControlSourceUnavailable>() => {
+                    checkpoint_compatible = false
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if snapshot_compatible {
+            // Resolve canonical history, propagating repository/read failures.
+            // A row's mere existence is not proof its referenced state exists.
+            crate::turn_runtime_snapshot::restored_conversation_scope_from_snapshot(
+                &self.crud_store,
+                snapshot.as_ref().expect("validated snapshot"),
+            )
+            .await?;
+            crate::turn_runtime_snapshot::restore_agent_skill_overlay_from_snapshot(
+                &self.crud_store,
+                &snapshot.as_ref().expect("validated snapshot").workspace_id,
+                snapshot.as_ref().expect("validated snapshot"),
+            )
+            .await?;
+        }
+        if checkpoint_compatible && let Some(checkpoint) = checkpoint.as_ref() {
+            checkpoint_compatible = self
+                .artifact_service
+                .native_artifact_state_compatible(
+                    &checkpoint.workspace_id,
+                    &checkpoint.thread_id,
+                    &checkpoint.turn_id,
+                )
+                .await?;
+        }
+        if checkpoint_compatible && let Some(checkpoint) = checkpoint.as_ref() {
+            let roots: Vec<pioneer_compaction::SourceRef> = serde_json::from_value(
+                checkpoint
+                    .payload_json
+                    .get("native_semantic_state")
+                    .and_then(|state| state.get("provider_history_roots"))
+                    .context("compatible native history roots unavailable")?
+                    .clone(),
+            )?;
+            match crate::compaction::restore_native_history_roots(
+                self,
+                &self.crud_store,
+                &checkpoint.workspace_id,
+                &checkpoint.thread_id,
+                &checkpoint.turn_id,
+                &roots,
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(error) if error.is::<pioneer_agent::NativeHistorySourceUnavailable>() => {
+                    checkpoint_compatible = false
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let can_resume_same_turn = recovery_job.as_ref().is_some_and(|job| {
+            job.turn_id == turn_id
+                && !matches!(
+                    job.action,
+                    pioneer_protocol::RecoveryAction::MarkFailed
+                        | pioneer_protocol::RecoveryAction::Fallback
+                )
+        }) && snapshot_compatible
+            && checkpoint_compatible;
+        let reason_class = recovery_job
+            .as_ref()
+            .and_then(|job| job.error_class)
+            .map(recovery_resume_reason_class)
+            .unwrap_or("recovery_blocked");
 
         let mut resume_requirements = Vec::new();
         match reason_class {
@@ -9015,7 +9525,7 @@ impl MessageProcessor {
             }
             "unsupported_capability" => {
                 resume_requirements.push(
-                    "Disable the unsupported capability or configure a provider/model that supports it."
+                    "Configure support for the accepted capability; resume must preserve the original input and tools."
                         .to_owned(),
                 );
             }
@@ -9025,12 +9535,14 @@ impl MessageProcessor {
                 );
             }
         }
-        resume_requirements
-            .push("Resume the same turn after the requirement is satisfied.".to_owned());
-        if !can_resume_same_turn {
-            if recovery_job
-                .as_ref()
-                .is_some_and(|job| job.item_type.is_tool_item())
+        if can_resume_same_turn {
+            resume_requirements
+                .push("Resume the same turn after the requirement is satisfied.".to_owned());
+        } else {
+            if snapshot.is_none()
+                && recovery_job
+                    .as_ref()
+                    .is_some_and(|job| job.item_type.is_tool_item())
             {
                 resume_requirements.push(
                     "This blocked tool recovery has no durable turn runtime snapshot; operator recovery is required."
@@ -11206,4 +11718,228 @@ mod user_message_attachment_tests {
 #[cfg(test)]
 pub(super) mod native_preparation_failure_tests {
     include!("native_preparation_failure_tests.rs");
+}
+
+#[cfg(test)]
+mod recovery_resume_reason_contract_tests {
+    use super::recovery_resume_reason_class;
+    use pioneer_protocol::ProviderFailureClass;
+
+    #[test]
+    fn resume_reason_uses_only_persisted_typed_class() {
+        for (class, expected) in [
+            (ProviderFailureClass::AuthOrPermission, "auth_or_config"),
+            (ProviderFailureClass::ModelNotFound, "model_unavailable"),
+            (
+                ProviderFailureClass::UnsupportedImageInput,
+                "unsupported_capability",
+            ),
+            (ProviderFailureClass::Unknown, "recovery_blocked"),
+        ] {
+            assert_eq!(recovery_resume_reason_class(class), expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod terminal_usage_close_contract_tests {
+    use super::*;
+    use migration::MigratorTrait;
+    use pioneer_protocol::{ExecutionWindowStatus, Thread, Turn};
+
+    #[tokio::test]
+    async fn actual_gateway_terminal_close_preserves_partial_zero_and_missing_usage_after_restart()
+    {
+        for (lower_bound, receipt, unknown) in [
+            (100, Some((40, 10)), true),
+            (0, Some((0, 0)), false),
+            (0, None, true),
+        ] {
+            let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+            migration::Migrator::up(&db, None).await.unwrap();
+            crate::bootstrap::bootstrap(&db).await.unwrap();
+            let workspace_manager = Arc::new(crate::workspace::WorkspaceManager::new(db.clone()));
+            let workspace = workspace_manager
+                .list_workspaces()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|w| w.is_current)
+                .unwrap()
+                .id;
+            let store = Arc::new(pioneer_crud::CrudStore::new(db));
+            let processor = MessageProcessor::new(
+                Arc::new(crate::thread::ThreadManager::new("test-model", "echo")),
+                Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+                    "echo",
+                    Arc::new(pioneer_provider::providers::EchoProvider::new()),
+                )),
+                Arc::new(crate::session::SessionManager::new()),
+                workspace_manager,
+                store.clone(),
+                Arc::new(crate::secrets::GatewaySecrets::new(Arc::new(
+                    pioneer_keystore::MemorySecretStore::new(),
+                ))),
+                crate::message::summary::SummaryConfig {
+                    summary_model: None,
+                    summary_model_provider: None,
+                    title_model: None,
+                    title_model_provider: None,
+                },
+                crate::message::tests::test_tool_loop_config(),
+            );
+            let now = chrono::Utc::now().fixed_offset();
+            let thread = Thread {
+                workspace_id: workspace.clone(),
+                id: "terminal_usage_thread".into(),
+                name: None,
+                preview: String::new(),
+                preview_author: None,
+                mode: pioneer_protocol::ThreadMode::Agent,
+                model: "test-model".into(),
+                model_provider: "echo".into(),
+                reasoning_effort: None,
+                created_at: now.timestamp(),
+                updated_at: now.timestamp(),
+                status: pioneer_protocol::ThreadStatus::Active,
+                origin_kind: pioneer_protocol::ThreadOriginKind::User,
+                sidebar_visibility: pioneer_protocol::ThreadSidebarVisibility::Visible,
+                agent_nickname: None,
+                agent_role: None,
+                visibility: None,
+                turns: vec![],
+            };
+            let turn = Turn {
+                id: "terminal_usage_turn".into(),
+                status: pioneer_protocol::TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: vec![],
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            };
+            store
+                .materialize_turn_start(
+                    &thread,
+                    pioneer_protocol::SandboxMode::FullAccess,
+                    &turn,
+                    &[],
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .unwrap();
+            let window = store.create_turn_execution_window(pioneer_crud::NewTurnExecutionWindowRecord {
+                workspace_id: workspace.clone(), thread_id: thread.id.clone(), turn_id: turn.id.clone(), window_index: 1,
+                status: ExecutionWindowStatus::Running, exhaustion_reason: None,
+                agent_round_count: 1, tool_call_count: 0, provider_token_count: lower_bound,
+                metadata_json: serde_json::json!({"runtimeWindowId":"original-owner", "accountingSchemaVersion":1,"providerUsageAvailable":false}), started_at: now,
+            }, now, now).await.unwrap();
+            if let Some((input, output)) = receipt {
+                let item = TurnItem::SystemEvent {
+                    id: "terminal_usage_receipt".into(),
+                    level: pioneer_protocol::SystemEventLevel::Info,
+                    message: "Provider usage observation".into(),
+                    code: Some("provider_usage".into()),
+                    details: Some(
+                        serde_json::json!({"schema_version":1,"window_index":1,"status":"completed","complete":true,"usage":{"input_tokens":input,"output_tokens":output}}),
+                    ),
+                };
+                store
+                    .materialize_item_started(
+                        pioneer_protocol::ItemStartedNotification {
+                            workspace_id: workspace.clone(),
+                            thread_id: thread.id.clone(),
+                            turn_id: turn.id.clone(),
+                            item: item.clone(),
+                        },
+                        now.timestamp(),
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .materialize_item_completed(
+                        pioneer_protocol::ItemCompletedNotification {
+                            workspace_id: workspace.clone(),
+                            thread_id: thread.id.clone(),
+                            turn_id: turn.id.clone(),
+                            item,
+                        },
+                        now.timestamp(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let before = store
+                .aggregate_turn_execution_window_usage(&turn.id)
+                .await
+                .unwrap();
+            store
+                .update_turn_status(
+                    &thread.id,
+                    &turn.id,
+                    pioneer_protocol::TurnStatus::Failed,
+                    Some("fixture failure"),
+                    now.timestamp(),
+                )
+                .await
+                .unwrap();
+            processor
+                .close_latest_active_execution_window_for_terminal_turn(
+                    &turn.id,
+                    ExecutionWindowStatus::Failed,
+                    Some("fixture failure"),
+                )
+                .await
+                .unwrap();
+            let closed = store
+                .latest_turn_execution_window(&turn.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(closed.id, window.id);
+            assert_eq!(closed.status, ExecutionWindowStatus::Failed);
+            assert_eq!(closed.provider_token_count, lower_bound);
+            assert_eq!(closed.agent_round_count, 1);
+            assert_eq!(closed.metadata_json["providerUsageAvailable"], !unknown);
+            assert_eq!(closed.metadata_json["runtimeWindowId"], "original-owner");
+            let fresh =
+                pioneer_crud::CrudStore::new(store.database_connection()).with_maintenance_access();
+            let after = fresh
+                .aggregate_turn_execution_window_usage(&turn.id)
+                .await
+                .unwrap();
+            assert_eq!(after.total_provider_tokens, before.total_provider_tokens);
+            assert_eq!(after.total_agent_rounds, before.total_agent_rounds);
+            assert_eq!(after.provider_token_usage_unknown, unknown);
+            processor
+                .close_latest_active_execution_window_for_terminal_turn(
+                    &turn.id,
+                    ExecutionWindowStatus::Failed,
+                    Some("duplicate"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .latest_turn_execution_window(&turn.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                closed
+            );
+            assert_eq!(
+                fresh
+                    .aggregate_turn_execution_window_usage(&turn.id)
+                    .await
+                    .unwrap(),
+                after
+            );
+        }
+    }
 }

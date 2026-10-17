@@ -5,6 +5,7 @@ pub mod ids;
 pub mod local_blob_store;
 pub mod mime;
 pub mod models;
+mod native_obligations;
 pub mod output_dir;
 pub mod projection;
 pub mod provider_resolver;

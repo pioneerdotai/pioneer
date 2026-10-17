@@ -9,6 +9,31 @@ use futures_util::stream::BoxStream;
 
 use pioneer_protocol::ProviderModelInfo;
 
+/// Model evidence, distinct from the adapter's protocol ceiling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelToolSupport {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+impl ModelToolSupport {
+    pub fn from_optional(supported: Option<bool>) -> Self {
+        match supported {
+            Some(true) => Self::Supported,
+            Some(false) => Self::Unsupported,
+            None => Self::Unknown,
+        }
+    }
+    pub fn as_optional(self) -> Option<bool> {
+        match self {
+            Self::Supported => Some(true),
+            Self::Unsupported => Some(false),
+            Self::Unknown => None,
+        }
+    }
+}
+
 /// Result of a safe, non-inference provider warm-up.
 ///
 /// `NotSupported` is intentionally distinct from success: adapters that do
@@ -47,16 +72,63 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// The exact non-secret Azure connection owned by this adapter instance.
+    fn resolved_azure_connection(&self) -> Option<crate::AzureResolvedConnection> {
+        None
+    }
+
     /// Declares what features this provider supports.
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()
     }
 
-    /// Adapter capability is a protocol ceiling; known catalog model support
-    /// can narrow it. Absence remains unknown, not evidence for every model.
+    /// Explicit adapter-owned model evidence. A brand-wide transport feature
+    /// does not establish support for an unknown model or deployment.
+    fn model_tool_support(&self, _model: &str) -> ModelToolSupport {
+        if self.capabilities().tool_calling {
+            ModelToolSupport::Unknown
+        } else {
+            ModelToolSupport::Unsupported
+        }
+    }
+
+    fn capture_model_contract(&self, model: &str) -> Result<crate::AcceptedProviderModelContract> {
+        self.capture_model_contract_with_limit(
+            model,
+            pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+        )
+    }
+    fn capture_model_contract_with_limit(
+        &self,
+        model: &str,
+        limit: usize,
+    ) -> Result<crate::AcceptedProviderModelContract> {
+        // Unbound adapters have no credential-scoped discovery owner. Public
+        // source evidence is not borrowed for an injected/private endpoint.
+        crate::model_contract::AcceptedProviderModelContract::capture(
+            self,
+            model,
+            false,
+            None,
+            None,
+            Default::default(),
+            self.model_tool_support(model),
+            limit,
+        )
+    }
+
+    /// Native budgeting uses the selected provider's accepted catalog even
+    /// when it runs outside the transport future. Ordinary unbound requests
+    /// retain the existing current-catalog contract.
+    fn model_catalog_for_request(
+        &self,
+        _model: &str,
+    ) -> Result<std::sync::Arc<crate::catalog::ModelCatalog>> {
+        crate::catalog::model_catalog()
+    }
+
     fn model_tool_calling(&self, model: &str) -> bool {
-        self.capabilities().tool_calling
-            && crate::tools::policy::model_tool_support(self.name(), model) != Some(false)
+        self.model_tool_support(model) == ModelToolSupport::Supported
     }
 
     /// Selects the native file-tool wire contract for this provider/model.
@@ -73,7 +145,8 @@ pub trait Provider: Send + Sync {
     /// retried, while transport/HTTP transient failures are classified by the
     /// shared provider-neutral fallback before endpoint errors are redacted.
     fn classify_failure(&self, error: &anyhow::Error) -> Option<ProviderFailureClassification> {
-        crate::failure::classify_stream_error(error)
+        crate::failure::classify_transport_error(error)
+            .or_else(|| crate::failure::classify_stream_error(error))
     }
 
     /// Materialize and locally budget the media that this request will send.
@@ -209,6 +282,44 @@ mod tests {
             ];
             Ok(stream::iter(chunks).boxed())
         }
+    }
+
+    #[test]
+    fn transport_ceiling_alone_does_not_prove_model_tool_support() {
+        struct CeilingOnly;
+        #[async_trait]
+        impl Provider for CeilingOnly {
+            fn name(&self) -> &str {
+                "ceiling-only"
+            }
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    tool_calling: true,
+                    ..Default::default()
+                }
+            }
+            async fn chat(&self, _: ChatRequest) -> Result<ChatResponse> {
+                unreachable!()
+            }
+            async fn stream_chat(
+                &self,
+                _: ChatRequest,
+            ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+                unreachable!()
+            }
+        }
+        // An enabled transport protocol alone establishes no model evidence.
+        assert!(CeilingOnly.capabilities().tool_calling);
+        assert_eq!(
+            CeilingOnly.model_tool_support("unlisted"),
+            ModelToolSupport::Unknown
+        );
+        assert!(!CeilingOnly.model_tool_calling("unlisted"));
+        assert_eq!(
+            MockProvider.model_tool_support("any"),
+            ModelToolSupport::Unsupported
+        );
+        assert!(!MockProvider.model_tool_calling("any"));
     }
 
     #[test]

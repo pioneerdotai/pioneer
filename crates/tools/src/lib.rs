@@ -17,6 +17,7 @@ mod output_policy;
 mod output_projection;
 mod permissions;
 mod process_policy;
+mod progress;
 mod registry;
 mod retry_controller;
 mod router;
@@ -81,7 +82,7 @@ pub use network_policy::{
     NetworkPolicyGrant, enforce_network_url,
 };
 pub use no_progress_guard::{
-    ToolNoProgressFeedback, ToolNoProgressGuard, ToolNoProgressGuardConfig,
+    ToolNoProgressFeedback, ToolNoProgressGuard, ToolNoProgressGuardConfig, ToolNoProgressMode,
     ToolNoProgressPreflightDecision,
 };
 pub use orchestrator::{ApprovalState, OrchestratorPolicy, SandboxTarget, ToolOrchestrator};
@@ -108,13 +109,17 @@ pub use permissions::{
     StaticPermissionApprovalBroker, ToolPermissionEvaluator, extract_permission_intent,
 };
 pub use process_policy::{ProcessSpawnPlan, build_process_spawn_plan, resolve_process_cwd};
+pub use progress::{
+    ToolCompletionEvidence, ToolProgressDisposition, ToolProgressEvidence, ToolProgressFrontier,
+    ToolSemanticEvidence, ToolStreamActivity,
+};
 pub use registry::{ToolHandler, ToolRegistry, ToolRegistryBuilder};
 pub use retry_controller::{
     ToolFailureSignature, ToolRetryBudgetConfig, ToolRetryBudgetKind, ToolRetryBudgetSnapshot,
-    ToolRetryBudgetUsage, ToolRetryClassBudget, ToolRetryController, ToolRetryDecision,
-    ToolRetryEpisodeState, ToolRetryEventDraft, ToolRetryExhaustionReason, ToolRetryObservation,
-    ToolRetryPrompt, ToolRetryPromptEntry, ToolRetryResolution, ToolRetryResolvedEntry,
-    default_tool_retry_class_budgets,
+    ToolRetryBudgetUsage, ToolRetryCheckpoint, ToolRetryCheckpointEpisode, ToolRetryClassBudget,
+    ToolRetryController, ToolRetryDecision, ToolRetryEpisodeState, ToolRetryEventDraft,
+    ToolRetryExhaustionReason, ToolRetryObservation, ToolRetryPrompt, ToolRetryPromptEntry,
+    ToolRetryResolution, ToolRetryResolvedEntry, default_tool_retry_class_budgets,
 };
 pub use router::{RawToolCall, ToolCall, ToolRouter};
 pub use runtime::ToolCallRuntime;
@@ -163,7 +168,8 @@ use std::fmt::{Display, Formatter};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebToolsConfig {
     pub default_timeout_ms: u64,
     pub hard_max_timeout_ms: u64,
@@ -245,7 +251,8 @@ impl WebToolsConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ComputerUseToolsConfig {
     pub runtime_home_dir: PathBuf,
     pub artifacts_subdir: String,

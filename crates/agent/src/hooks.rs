@@ -481,7 +481,8 @@ pub(super) fn build_post_turn_phase_request(
     )
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct EffectiveTurnPolicySet {
     policies: HookPolicySet,
 }
@@ -500,7 +501,8 @@ impl EffectiveTurnPolicySet {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct EffectiveTurnPromptContextSet {
     contexts: HookPromptContextSet,
     manifest: EffectiveTurnPromptManifestHookMetadata,
@@ -509,13 +511,6 @@ pub(super) struct EffectiveTurnPromptContextSet {
 impl EffectiveTurnPromptContextSet {
     pub(super) fn empty() -> Self {
         Self::default()
-    }
-
-    pub(super) fn from_hook_prompt_context_set(contexts: HookPromptContextSet) -> Self {
-        Self {
-            contexts,
-            manifest: EffectiveTurnPromptManifestHookMetadata::empty(),
-        }
     }
 
     pub(super) fn from_hook_prompt_context_set_and_manifest(
@@ -545,7 +540,8 @@ impl EffectiveTurnPromptContextSet {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct EffectiveTurnPromptSectionSet {
     sections: HookPromptSectionSet,
     manifest: EffectiveTurnPromptManifestHookMetadata,
@@ -572,7 +568,8 @@ impl EffectiveTurnPromptSectionSet {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct EffectiveTurnPromptManifestHookMetadata {
     pub(super) sources: Vec<EffectiveTurnPromptManifestHookSourceEntry>,
     pub(super) diagnostics: Vec<EffectiveTurnPromptManifestHookDiagnostic>,
@@ -596,7 +593,8 @@ impl EffectiveTurnPromptManifestHookMetadata {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct EffectiveTurnPromptManifestHookSourceEntry {
     pub(super) source: EffectiveTurnPromptManifestHookSource,
     pub(super) section_id: Option<HookSectionId>,
@@ -608,7 +606,8 @@ pub(super) struct EffectiveTurnPromptManifestHookSourceEntry {
     pub(super) hook_content_chars: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct EffectiveTurnPromptManifestHookSource {
     pub(super) hook_id: HookId,
     pub(super) subscription_id: HookSubscriptionId,
@@ -616,21 +615,22 @@ pub(super) struct EffectiveTurnPromptManifestHookSource {
     pub(super) contribution_hash: Option<HookContributionHash>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) enum EffectiveTurnPromptManifestHookContributionKind {
     PromptContext,
     ThreadContext,
     PromptSection,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct EffectiveTurnPromptManifestHookDiagnostic {
     pub(super) code: EffectiveTurnPromptManifestHookDiagnosticCode,
     pub(super) message: String,
     pub(super) source: Option<EffectiveTurnPromptManifestHookSource>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) enum EffectiveTurnPromptManifestHookDiagnosticCode {
     HookDiagnostic,
     HookBestEffortFailed,
@@ -721,6 +721,32 @@ impl EffectiveTurnToolBundleSet {
         &self.metadata.diagnostics
     }
 
+    pub(super) fn metadata(&self) -> &HookToolBundleSet {
+        &self.metadata
+    }
+
+    fn require_complete_artifacts(&self) -> Result<(), AgentTurnHookError> {
+        if self.metadata.entries.len() != self.bundles.len() {
+            return Err(AgentTurnHookError::ToolBundleUnavailable);
+        }
+        for (entry, bundle) in self.metadata.entries.iter().zip(&self.bundles) {
+            let advertised = entry
+                .tool_names
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            let actual = bundle
+                .specs
+                .iter()
+                .map(|spec| spec.spec.name.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            if advertised != actual {
+                return Err(AgentTurnHookError::ToolBundleUnavailable);
+            }
+        }
+        Ok(())
+    }
+
     fn from_local(local_contributions: Vec<AgentTurnToolBundleContribution>) -> Self {
         Self::from_local_and_hook_contributions(local_contributions, Vec::new(), None, "")
     }
@@ -766,6 +792,7 @@ impl EffectiveTurnToolBundleSet {
 pub(super) enum AgentTurnHookError {
     InvalidContext(HookIdError),
     Runtime(HookRuntimeError),
+    ToolBundleUnavailable,
 }
 
 impl AgentTurnHookError {
@@ -779,6 +806,7 @@ impl AgentTurnHookError {
                 let _ = error;
                 "runtime"
             }
+            Self::ToolBundleUnavailable => "tool_bundle_unavailable",
         }
     }
 
@@ -833,32 +861,23 @@ pub(super) async fn run_agent_turn_prompt_context_hook_phase(
     context: &AgentTurnHookContext,
     policy_set: &EffectiveTurnPolicySet,
     input: TurnPrePromptContextHookInput,
-) -> EffectiveTurnPromptContextSet {
+) -> Result<EffectiveTurnPromptContextSet, AgentTurnHookError> {
     let _startup_hooks = pioneer_observability::turn_startup::current_stage(
         pioneer_observability::turn_startup::Stage::HookContext,
     );
     let Some(runtime) = runtime else {
-        return EffectiveTurnPromptContextSet::empty();
+        return Ok(EffectiveTurnPromptContextSet::empty());
     };
 
     let empty_prompt_context_set = EffectiveTurnPromptContextSet::empty();
-    let request = match build_phase_request_with_input(
+    let request = build_phase_request_with_input(
         context,
         HookPhase::TurnPrePromptContext,
         policy_set,
         &empty_prompt_context_set,
         HookInput::turn_pre_prompt_context(input),
-    ) {
-        Ok(request) => request,
-        Err(error) => {
-            warn!(
-                phase = %HookPhase::TurnPrePromptContext,
-                error = %error,
-                "agent turn prompt context hook phase failed to build request; continuing with empty context"
-            );
-            return runtime_failed_prompt_context_set();
-        }
-    };
+    )
+    .map_err(AgentTurnHookError::InvalidContext)?;
 
     match runtime.run_phase(request).await {
         Ok(mut response) => {
@@ -878,14 +897,16 @@ pub(super) async fn run_agent_turn_prompt_context_hook_phase(
                 &response.runs,
                 &prompt_context_set,
             );
-            EffectiveTurnPromptContextSet::from_hook_prompt_context_set_and_manifest(
-                prompt_context_set,
-                manifest,
+            Ok(
+                EffectiveTurnPromptContextSet::from_hook_prompt_context_set_and_manifest(
+                    prompt_context_set,
+                    manifest,
+                ),
             )
         }
         Err(error) => {
             warn_hook_prompt_context_runtime_error(HookPhase::TurnPrePromptContext, &error);
-            runtime_failed_prompt_context_set()
+            Err(AgentTurnHookError::Runtime(error))
         }
     }
 }
@@ -896,31 +917,22 @@ pub(super) async fn run_agent_turn_post_preflight_prompt_context_hook_phase(
     policy_set: &EffectiveTurnPolicySet,
     prompt_context_set: &EffectiveTurnPromptContextSet,
     input: TurnPostPreflightPromptContextHookInput,
-) -> EffectiveTurnPromptContextSet {
+) -> Result<EffectiveTurnPromptContextSet, AgentTurnHookError> {
     let _startup_hooks = pioneer_observability::turn_startup::current_stage(
         pioneer_observability::turn_startup::Stage::HookPostPreflight,
     );
     let Some(runtime) = runtime else {
-        return prompt_context_set.clone();
+        return Ok(prompt_context_set.clone());
     };
 
-    let request = match build_phase_request_with_input(
+    let request = build_phase_request_with_input(
         context,
         HookPhase::TurnPostPreflightPromptContext,
         policy_set,
         prompt_context_set,
         HookInput::turn_post_preflight_prompt_context(input),
-    ) {
-        Ok(request) => request,
-        Err(error) => {
-            warn!(
-                phase = %HookPhase::TurnPostPreflightPromptContext,
-                error = %error,
-                "agent turn post-preflight prompt context hook phase failed to build request; preserving existing prompt context"
-            );
-            return prompt_context_set.clone();
-        }
-    };
+    )
+    .map_err(AgentTurnHookError::InvalidContext)?;
 
     match runtime.run_phase(request).await {
         Ok(mut response) => {
@@ -942,15 +954,15 @@ pub(super) async fn run_agent_turn_post_preflight_prompt_context_hook_phase(
                 &response.runs,
                 &post_preflight_context_set,
             );
-            prompt_context_set
-                .with_additional_prompt_context_phase(post_preflight_context_set, manifest)
+            Ok(prompt_context_set
+                .with_additional_prompt_context_phase(post_preflight_context_set, manifest))
         }
         Err(error) => {
             warn_hook_prompt_context_runtime_error(
                 HookPhase::TurnPostPreflightPromptContext,
                 &error,
             );
-            prompt_context_set.clone()
+            Err(AgentTurnHookError::Runtime(error))
         }
     }
 }
@@ -1031,7 +1043,9 @@ pub(super) async fn run_agent_turn_tool_materialization_hook_phase(
         pioneer_observability::turn_startup::Stage::HookTools,
     );
     let Some(runtime) = runtime else {
-        return Ok(EffectiveTurnToolBundleSet::from_local(local_contributions));
+        let set = EffectiveTurnToolBundleSet::from_local(local_contributions);
+        set.require_complete_artifacts()?;
+        return Ok(set);
     };
 
     let input = TurnPreToolMaterializationHookInput::from_parts(
@@ -1063,6 +1077,7 @@ pub(super) async fn run_agent_turn_tool_materialization_hook_phase(
             if let Some(store) = artifact_store {
                 store.clear_turn(context.turn_id.as_str());
             }
+            set.require_complete_artifacts()?;
             set.metadata.diagnostics.extend(phase_diagnostics);
             for diagnostic in set.diagnostics() {
                 warn_hook_diagnostic(HookPhase::TurnPreToolMaterialization, diagnostic);
@@ -1456,36 +1471,29 @@ fn prompt_manifest_hook_diagnostic_code_order(
     }
 }
 
-pub(super) async fn run_noop_agent_turn_hook_phase(
+pub(super) async fn run_agent_turn_notification_hook_phase(
     runtime: Option<&Arc<HookRuntime>>,
     context: &AgentTurnHookContext,
     phase: HookPhase,
     policy_set: &EffectiveTurnPolicySet,
     prompt_context_set: &EffectiveTurnPromptContextSet,
-) {
+) -> Result<(), AgentTurnHookError> {
     let Some(runtime) = runtime else {
-        return;
+        return Ok(());
     };
-
-    let request = match build_phase_request(context, phase, policy_set, prompt_context_set) {
-        Ok(request) => request,
-        Err(error) => {
-            warn!(
-                phase = %phase,
-                error = %error,
-                "skipping agent turn hook phase because context could not be built"
-            );
-            return;
-        }
-    };
-
+    let request = build_phase_request(context, phase, policy_set, prompt_context_set)
+        .map_err(AgentTurnHookError::InvalidContext)?;
     match runtime.run_phase(request).await {
         Ok(response) => {
             for diagnostic in response.diagnostics {
                 warn_hook_diagnostic(phase, &diagnostic);
             }
+            Ok(())
         }
-        Err(error) => warn_hook_runtime_error(phase, &error),
+        Err(error) => {
+            warn_hook_runtime_error(phase, &error);
+            Err(AgentTurnHookError::Runtime(error))
+        }
     }
 }
 
@@ -1748,12 +1756,6 @@ fn missing_tool_bundle_artifact_diagnostic(bundle_id: &str) -> HookDiagnostic {
     }
 }
 
-fn runtime_failed_prompt_context_set() -> EffectiveTurnPromptContextSet {
-    EffectiveTurnPromptContextSet::from_hook_prompt_context_set(
-        HookPromptContextSet::runtime_failed(),
-    )
-}
-
 fn current_unix_timestamp() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
@@ -1940,7 +1942,7 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
             warn!(
                 phase = %phase,
                 error_kind = "registry",
-                "agent turn prompt context hook phase failed; continuing with empty context"
+                "required prompt context phase failed; preparation stopped"
             );
         }
         HookRuntimeError::MissingHandler {
@@ -1954,7 +1956,7 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 subscription_id = %subscription_id,
                 hook_id = %hook_id,
                 error_kind = "missing_handler",
-                "agent turn prompt context hook phase failed; continuing with empty context"
+                "required prompt context phase failed; preparation stopped"
             );
         }
         HookRuntimeError::HookFailed {
@@ -1972,7 +1974,7 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 retryable = error.retryable,
                 safe_for_user = error.safe_for_user,
                 error_kind = "hook_failed",
-                "agent turn prompt context hook phase failed; continuing with empty context"
+                "required prompt context phase failed; preparation stopped"
             );
         }
         HookRuntimeError::HookTimedOut {
@@ -1988,7 +1990,7 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 hook_id = %hook_id,
                 timeout_ms = *timeout_ms,
                 error_kind = "hook_timed_out",
-                "agent turn prompt context hook phase failed; continuing with empty context"
+                "required prompt context phase failed; preparation stopped"
             );
         }
         HookRuntimeError::HookFailedClosed {
@@ -2006,7 +2008,7 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 retryable = error.retryable,
                 safe_for_user = error.safe_for_user,
                 error_kind = "hook_failed_closed",
-                "agent turn prompt context hook phase failed; continuing with empty context"
+                "required prompt context phase failed; preparation stopped"
             );
         }
         HookRuntimeError::MissingFallbackContribution {
@@ -2020,7 +2022,7 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 subscription_id = %subscription_id,
                 hook_id = %hook_id,
                 error_kind = "missing_fallback_contribution",
-                "agent turn prompt context hook phase failed; continuing with empty context"
+                "required prompt context phase failed; preparation stopped"
             );
         }
         HookRuntimeError::InvalidExecutionPolicy {
@@ -2036,7 +2038,7 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 hook_id = %hook_id,
                 reason = %reason,
                 error_kind = "invalid_execution_policy",
-                "agent turn prompt context hook phase failed; continuing with empty context"
+                "required prompt context phase failed; preparation stopped"
             );
         }
         HookRuntimeError::MissingDependency {
@@ -2050,7 +2052,7 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 subscription_id = %subscription_id,
                 dependency_id = %dependency_id,
                 error_kind = "missing_dependency",
-                "agent turn prompt context hook phase failed; continuing with empty context"
+                "required prompt context phase failed; preparation stopped"
             );
         }
         HookRuntimeError::DependencyCycle {
@@ -2062,7 +2064,7 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 error_phase = %error_phase,
                 subscription_count = subscription_ids.len(),
                 error_kind = "dependency_cycle",
-                "agent turn prompt context hook phase failed; continuing with empty context"
+                "required prompt context phase failed; preparation stopped"
             );
         }
         HookRuntimeError::DurablePersistenceUnavailable {
@@ -2074,7 +2076,7 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 error_phase = %error_phase,
                 operation = *operation,
                 error_kind = "durable_persistence_unavailable",
-                "agent turn prompt context hook phase failed; continuing with empty context"
+                "required prompt context phase failed; preparation stopped"
             );
         }
         HookRuntimeError::DurableExecutionIncomplete {
@@ -2091,7 +2093,7 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 timed_out_runs,
                 incomplete_runs,
                 error_kind = "durable_execution_incomplete",
-                "agent turn prompt context hook phase failed; continuing with empty context"
+                "required prompt context phase failed; preparation stopped"
             );
         }
     }
@@ -2432,6 +2434,150 @@ mod tests {
         HookSubscription, HookSubscriptionRegistry,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn accepted_test_tool_contribution() -> ToolBundleContribution {
+        ToolBundleContribution {
+            contribution_id: HookContributionId::new("test.accepted.tools").unwrap(),
+            bundle_id: HookToolBundleId::new("test.accepted.bundle").unwrap(),
+            domain: pioneer_hooks::HookDomain::new("test").unwrap(),
+            priority: 100,
+            tool_names: vec![HookToolName::new("test.accepted_tool").unwrap()],
+            diagnostics: Vec::new(),
+        }
+    }
+
+    struct AcceptedToolHook;
+
+    #[async_trait::async_trait]
+    impl HookHandler for AcceptedToolHook {
+        fn id(&self) -> HookId {
+            HookId::new("test.accepted_tool_hook").unwrap()
+        }
+
+        fn kind(&self) -> HookKind {
+            HookKind::new("test").unwrap()
+        }
+
+        fn supported_phases(&self) -> Vec<HookPhase> {
+            vec![HookPhase::TurnPreToolMaterialization]
+        }
+
+        fn capabilities(&self) -> HookCapabilities {
+            HookCapabilities::new([
+                pioneer_hooks::HookCapability::new("contribute_tool_bundle").unwrap()
+            ])
+        }
+
+        async fn execute(&self, _: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
+            Ok(HookHandlerResponse {
+                contributions: vec![HookContribution::ToolBundle(
+                    accepted_test_tool_contribution(),
+                )],
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_tool_hook_requires_its_exact_owned_artifact() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        handlers
+            .register_handler(Arc::new(AcceptedToolHook))
+            .unwrap();
+        subscriptions
+            .register_subscription(
+                &handlers,
+                HookSubscription::new(
+                    HookSubscriptionId::new("test.accepted_tool_subscription").unwrap(),
+                    HookId::new("test.accepted_tool_hook").unwrap(),
+                    HookPhase::TurnPreToolMaterialization,
+                ),
+            )
+            .unwrap();
+        let runtime = Arc::new(HookRuntime::new(handlers, subscriptions));
+        let context = AgentTurnHookContext::new("workspace", "thread", "turn");
+        let store = Arc::new(AgentToolBundleArtifactStore::new());
+        // A valid artifact for another Turn cannot satisfy this accepted bundle.
+        store.insert(
+            "other-turn",
+            accepted_test_tool_contribution().bundle_id,
+            ToolExtensionBundle::default(),
+        );
+        let result = run_agent_turn_tool_materialization_hook_phase(
+            Some(&runtime),
+            &context,
+            &EffectiveTurnPolicySet::empty(),
+            &EffectiveTurnPromptContextSet::empty(),
+            Vec::new(),
+            Some(&store),
+            true,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AgentTurnHookError::ToolBundleUnavailable)
+        ));
+        assert!(
+            store
+                .get("other-turn", &accepted_test_tool_contribution().bundle_id)
+                .is_some()
+        );
+
+        // An artifact with the accepted ID but different advertised tools is also unsafe.
+        store.insert(
+            "turn",
+            accepted_test_tool_contribution().bundle_id,
+            ToolExtensionBundle::default(),
+        );
+        let result = run_agent_turn_tool_materialization_hook_phase(
+            Some(&runtime),
+            &context,
+            &EffectiveTurnPolicySet::empty(),
+            &EffectiveTurnPromptContextSet::empty(),
+            Vec::new(),
+            Some(&store),
+            true,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AgentTurnHookError::ToolBundleUnavailable)
+        ));
+
+        // The same accepted contribution with its exact spec is retained.
+        let spec = pioneer_tools::ConfiguredToolSpec::new(
+            pioneer_tools::ToolSpec::new(
+                "test.accepted_tool",
+                "Test tool",
+                serde_json::json!({"type":"object"}),
+                pioneer_tools::PayloadKind::Function,
+            ),
+            pioneer_tools::ExecutionClass::Shared,
+            pioneer_tools::dynamic_unknown_output_policy(),
+        );
+        store.insert(
+            "turn",
+            accepted_test_tool_contribution().bundle_id,
+            ToolExtensionBundle {
+                specs: vec![spec],
+                handlers: Vec::new(),
+            },
+        );
+        let result = run_agent_turn_tool_materialization_hook_phase(
+            Some(&runtime),
+            &context,
+            &EffectiveTurnPolicySet::empty(),
+            &EffectiveTurnPromptContextSet::empty(),
+            Vec::new(),
+            Some(&store),
+            true,
+        )
+        .await;
+        let set = result.unwrap();
+        assert_eq!(set.bundles().len(), 1);
+        assert_eq!(set.bundles()[0].specs[0].spec.name, "test.accepted_tool");
+    }
 
     #[test]
     fn thread_context_prompt_contribution_has_distinct_manifest_kind() {

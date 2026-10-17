@@ -108,9 +108,17 @@ pub(crate) struct ExecutionAdmissionRequest {
     pub(crate) has_local_attachment_sources: bool,
     pub(crate) has_url_attachment_sources: bool,
     pub(crate) provider_authority_fingerprint: Option<String>,
+    pub(crate) provider_azure_connection: Option<pioneer_provider::AzureResolvedConnection>,
 }
 
 impl ExecutionAdmissionRequest {
+    pub(crate) fn bind_resolved_provider_authority(
+        &mut self,
+        authority: &pioneer_provider::ProviderAuthorityFingerprint,
+    ) {
+        self.provider_authority_fingerprint = Some(authority.as_str().to_owned());
+        self.provider_azure_connection = authority.azure_connection().cloned();
+    }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_turn(
         entry_point: ExecutionAdmissionEntryPoint,
@@ -139,6 +147,7 @@ impl ExecutionAdmissionRequest {
             has_local_attachment_sources: input_sources.has_local_paths,
             has_url_attachment_sources: input_sources.has_urls,
             provider_authority_fingerprint,
+            provider_azure_connection: None,
         })
     }
 
@@ -232,6 +241,7 @@ impl ExecutionAdmissionRequest {
             has_local_attachment_sources: input_sources.has_local_paths,
             has_url_attachment_sources: input_sources.has_urls,
             provider_authority_fingerprint,
+            provider_azure_connection: None,
         })
     }
 
@@ -315,6 +325,7 @@ impl ExecutionAdmissionRequest {
             has_local_attachment_sources: input_sources.has_local_paths,
             has_url_attachment_sources: input_sources.has_urls,
             provider_authority_fingerprint,
+            provider_azure_connection: None,
         })
     }
 }
@@ -464,6 +475,8 @@ struct ExecutionProviderGrant {
     provider: String,
     model: String,
     authority_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    azure_connection: Option<pioneer_provider::AzureResolvedConnection>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -536,6 +549,7 @@ impl ExecutionGrantManifest {
             _ => bail!("execution grant manifest has an invalid backend grant"),
         }
         if let Some(provider) = self.provider.as_ref() {
+            validate_provider_connection(&provider.provider, provider.azure_connection.as_ref())?;
             validate_non_empty_identity("provider", provider.provider.as_str())?;
             validate_non_empty_identity("model", provider.model.as_str())?;
             validate_sha256_identity(
@@ -598,6 +612,42 @@ fn validate_sha256_identity(kind: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn is_azure_provider(provider: &str) -> bool {
+    pioneer_provider::provider_definition(provider)
+        .is_some_and(|definition| definition.name == "azure-openai")
+}
+
+fn validate_provider_connection(
+    provider: &str,
+    connection: Option<&pioneer_provider::AzureResolvedConnection>,
+) -> Result<()> {
+    match (is_azure_provider(provider), connection) {
+        (true, Some(connection)) => connection.validate(true),
+        (true, None) => bail!("native Azure execution has no accepted resolved connection"),
+        (false, Some(_)) => bail!("accepted Azure connection belongs to another provider"),
+        (false, None) => Ok(()),
+    }
+}
+
+impl ExecutionProviderGrant {
+    fn current_authority(
+        &self,
+        workspace: &str,
+        registry: &pioneer_provider::ProviderRegistry,
+    ) -> Result<pioneer_provider::ProviderAuthorityFingerprint> {
+        validate_provider_connection(&self.provider, self.azure_connection.as_ref())?;
+        if let Some(connection) = &self.azure_connection {
+            registry.authority_fingerprint_for_workspace_with_frozen_azure(
+                workspace,
+                &self.provider,
+                connection,
+            )
+        } else {
+            registry.authority_fingerprint_for_workspace(workspace, &self.provider)
+        }
+    }
+}
+
 #[cfg(test)]
 fn test_execution_grant_manifest(
     execution_backend: Option<&AgentExecutionBackend>,
@@ -624,6 +674,7 @@ fn test_execution_grant_manifest(
                 provider: provider.to_owned(),
                 model: model.to_owned(),
                 authority_fingerprint: "a".repeat(64),
+                azure_connection: None,
             }),
             None,
         ),
@@ -756,12 +807,17 @@ impl ExecutionAdmissionService {
                     .as_deref()
                     .context("provider execution has no resolved authority fingerprint")?;
                 validate_sha256_identity("provider authority", authority_fingerprint)?;
+                validate_provider_connection(
+                    &request.provider,
+                    request.provider_azure_connection.as_ref(),
+                )?;
                 actions.insert(ResourceAction::ProviderUse.safe_name().to_owned());
                 (
                     Some(ExecutionProviderGrant {
                         provider: request.provider.clone(),
                         model: request.model.clone(),
                         authority_fingerprint: authority_fingerprint.to_owned(),
+                        azure_connection: request.provider_azure_connection.clone(),
                     }),
                     None,
                 )
@@ -1231,6 +1287,7 @@ impl ExecutionAuthorizationContext {
             provider: provider.to_owned(),
             model: model.to_owned(),
             authority_fingerprint: authority_fingerprint.to_owned(),
+            azure_connection: None,
         });
     }
 
@@ -1469,9 +1526,11 @@ impl ExecutionAuthorizationContext {
         let mut admitted = self.clone();
         admitted.mcp_projection = None;
         admitted.skill_projection = None;
-        let encoded = serde_json::to_vec(&admitted)
-            .context("failed to encode execution authorization identity")?;
-        Ok(hex::encode(Sha256::digest(encoded)))
+        let encoded = crate::turn_runtime_snapshot::to_snapshot_json(
+            &admitted,
+            "execution authorization identity",
+        )?;
+        Ok(hex::encode(Sha256::digest(encoded.as_bytes())))
     }
 
     /// Stable authority scope for a provider-owned CLI process shared by the
@@ -1552,6 +1611,84 @@ impl ExecutionAuthorizationContext {
         self.root_route_grants.as_slice()
     }
 
+    /// Same-provider continuations retain accepted Azure inputs while the
+    /// registry revalidates credentials and configured routes on every call.
+    pub(crate) fn resolve_continuation_provider_authority(
+        &self,
+        registry: &pioneer_provider::ProviderRegistry,
+        provider: &str,
+    ) -> Result<pioneer_provider::ProviderAuthorityFingerprint> {
+        if is_azure_provider(provider)
+            && self
+                .grant_manifest
+                .provider
+                .as_ref()
+                .is_some_and(|grant| is_azure_provider(&grant.provider))
+        {
+            let grant = self
+                .grant_manifest
+                .provider
+                .as_ref()
+                .expect("checked provider grant");
+            let current = grant.current_authority(&self.workspace_id, registry)?;
+            anyhow::ensure!(
+                current.as_str() == grant.authority_fingerprint,
+                "provider authority changed; continuation requires a fresh admission",
+            );
+            return Ok(current);
+        }
+        registry.authority_fingerprint_for_workspace(&self.workspace_id, provider)
+    }
+
+    pub(crate) fn provider_azure_connection(
+        &self,
+    ) -> Option<&pioneer_provider::AzureResolvedConnection> {
+        self.grant_manifest
+            .provider
+            .as_ref()
+            .and_then(|grant| grant.azure_connection.as_ref())
+    }
+
+    pub(crate) fn require_provider_binding(&self, provider: &str, model: &str) -> Result<()> {
+        let grant = self
+            .grant_manifest
+            .provider
+            .as_ref()
+            .context("native provider execution has no accepted provider grant")?;
+        let same_provider = match (
+            pioneer_provider::provider_definition(provider),
+            pioneer_provider::provider_definition(&grant.provider),
+        ) {
+            (Some(current), Some(accepted)) => current.name == accepted.name,
+            (None, None) => provider.trim().eq_ignore_ascii_case(grant.provider.trim()),
+            _ => false,
+        };
+        anyhow::ensure!(
+            same_provider && model == grant.model,
+            "native provider inputs differ from the accepted execution grant"
+        );
+        validate_provider_connection(provider, grant.azure_connection.as_ref())
+    }
+
+    pub(crate) fn require_provider_instance(
+        &self,
+        provider: &dyn pioneer_provider::Provider,
+        model: &str,
+    ) -> Result<()> {
+        self.require_provider_binding(provider.name(), model)?;
+        let grant = self
+            .grant_manifest
+            .provider
+            .as_ref()
+            .context("native provider grant is unavailable")?;
+        anyhow::ensure!(
+            provider.authority_fingerprint() == Some(grant.authority_fingerprint.as_str())
+                && provider.resolved_azure_connection().as_ref() == grant.azure_connection.as_ref(),
+            "provider instance differs from the accepted execution authority"
+        );
+        Ok(())
+    }
+
     pub(crate) fn verify_current_provider_authority(
         &self,
         registry: &pioneer_provider::ProviderRegistry,
@@ -1559,10 +1696,7 @@ impl ExecutionAuthorizationContext {
         let Some(provider) = self.grant_manifest.provider.as_ref() else {
             return Ok(());
         };
-        let current = registry.authority_fingerprint_for_workspace(
-            self.workspace_id.as_str(),
-            provider.provider.as_str(),
-        )?;
+        let current = provider.current_authority(self.workspace_id.as_str(), registry)?;
         if current.as_str() != provider.authority_fingerprint {
             bail!("provider authority changed; execution requires a fresh admission");
         }
@@ -1570,12 +1704,16 @@ impl ExecutionAuthorizationContext {
     }
 
     pub(crate) fn to_persisted_json(&self) -> Result<String> {
-        serde_json::to_string(self).context("failed to serialize execution authorization context")
+        crate::turn_runtime_snapshot::to_snapshot_json(self, "execution authorization context")
     }
 
     pub(crate) fn from_persisted_json(json: &str) -> Result<Self> {
+        anyhow::ensure!(
+            json.len() <= pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+            "execution authorization context exceeds byte limit",
+        );
         let context: Self = serde_json::from_str(json)
-            .context("failed to deserialize execution authorization context")?;
+            .map_err(|_| anyhow!("failed to deserialize execution authorization context"))?;
         if context.version != EXECUTION_AUTHORIZATION_CONTEXT_VERSION {
             bail!(
                 "unsupported execution authorization context version {}",
@@ -2728,6 +2866,7 @@ impl ExecutionAuthorizationContext {
         capabilities: &[TurnCapability],
         effective_permission_profile: &TurnPermissionProfileSnapshot,
         provider_authority_fingerprint: Option<&str>,
+        provider_azure_connection: Option<&pioneer_provider::AzureResolvedConnection>,
     ) -> Result<Self> {
         self.derive_continuation_with_grant_capabilities(
             provider,
@@ -2737,6 +2876,7 @@ impl ExecutionAuthorizationContext {
             capabilities,
             effective_permission_profile,
             provider_authority_fingerprint,
+            provider_azure_connection,
         )
     }
 
@@ -2750,6 +2890,7 @@ impl ExecutionAuthorizationContext {
         grant_capabilities: &[TurnCapability],
         effective_permission_profile: &TurnPermissionProfileSnapshot,
         provider_authority_fingerprint: Option<&str>,
+        provider_azure_connection: Option<&pioneer_provider::AzureResolvedConnection>,
     ) -> Result<Self> {
         let parent_cap =
             pioneer_protocol::task_permission_cap_snapshot(&self.permission_profile_cap);
@@ -2778,6 +2919,7 @@ impl ExecutionAuthorizationContext {
             execution_backend,
             grant_capabilities,
             provider_authority_fingerprint,
+            provider_azure_connection,
         )?;
         Ok(Self {
             version: EXECUTION_AUTHORIZATION_CONTEXT_VERSION,
@@ -2817,6 +2959,7 @@ impl ExecutionAuthorizationContext {
         capabilities: &[TurnCapability],
         effective_permission_profile: &TurnPermissionProfileSnapshot,
         provider_authority_fingerprint: Option<&str>,
+        provider_azure_connection: Option<&pioneer_provider::AzureResolvedConnection>,
     ) -> Result<Self> {
         if destination_root_thread_id.trim().is_empty() {
             bail!("agent continuation destination root is required");
@@ -2828,6 +2971,7 @@ impl ExecutionAuthorizationContext {
             capabilities,
             effective_permission_profile,
             provider_authority_fingerprint,
+            provider_azure_connection,
         )?;
         continuation.root_thread_id = destination_root_thread_id.to_owned();
         continuation.capability_projection_fingerprint = capability_projection_fingerprint(
@@ -2849,6 +2993,7 @@ impl ExecutionAuthorizationContext {
         execution_backend: Option<&AgentExecutionBackend>,
         capabilities: &[TurnCapability],
         provider_authority_fingerprint: Option<&str>,
+        provider_azure_connection: Option<&pioneer_provider::AzureResolvedConnection>,
     ) -> Result<ExecutionGrantManifest> {
         let policy = AuthorizationService::new();
         let (principal_kind, role_key) = self.registered_role_identity()?;
@@ -2892,11 +3037,13 @@ impl ExecutionAuthorizationContext {
                 let authority_fingerprint = provider_authority_fingerprint
                     .context("task continuation provider authority is unresolved")?;
                 validate_sha256_identity("provider authority", authority_fingerprint)?;
+                validate_provider_connection(provider, provider_azure_connection)?;
                 (
                     Some(ExecutionProviderGrant {
                         provider: provider.to_owned(),
                         model: model.to_owned(),
                         authority_fingerprint: authority_fingerprint.to_owned(),
+                        azure_connection: provider_azure_connection.cloned(),
                     }),
                     None,
                 )
@@ -3464,6 +3611,14 @@ impl RuntimeDraftMaterialization {
 }
 
 impl ExecutionAuthorizationAdmission {
+    pub(crate) fn provider_azure_connection(
+        &self,
+    ) -> Option<&pioneer_provider::AzureResolvedConnection> {
+        self.grant_manifest
+            .as_ref()
+            .and_then(|manifest| manifest.provider.as_ref())
+            .and_then(|grant| grant.azure_connection.as_ref())
+    }
     pub(crate) fn from_authorized_thread(
         request: &RequestContext,
         authorization: &AuthorizedThread,
@@ -3705,10 +3860,8 @@ impl ExecutionAuthorizationAdmission {
             .as_ref()
             .and_then(|manifest| manifest.provider.as_ref())
         {
-            let current = provider_registry.authority_fingerprint_for_workspace(
-                self.workspace_id.as_str(),
-                provider.provider.as_str(),
-            )?;
+            let current =
+                provider.current_authority(self.workspace_id.as_str(), provider_registry)?;
             if current.as_str() != provider.authority_fingerprint {
                 bail!("provider authority changed before durable execution start");
             }
@@ -3974,6 +4127,147 @@ mod tests {
         scoped_request(RoleKey::member())
     }
 
+    #[test]
+    fn azure_grant_roundtrip_uses_accepted_connection_and_fresh_credentials() {
+        let request = member_request();
+        let accepted = pioneer_provider::AzureResolvedConnection::from_values(
+            "resource-before".into(),
+            "deployment-before".into(),
+            "v1".into(),
+            None,
+        )
+        .unwrap();
+        let keys = Arc::new(std::sync::Mutex::new("key-before".to_owned()));
+        let resolver_keys = keys.clone();
+        let registry =
+            pioneer_provider::ProviderRegistry::new(move |_| resolver_keys.lock().unwrap().clone());
+        let authority = registry
+            .authority_fingerprint_for_workspace_with_frozen_azure(
+                "workspace-a",
+                "azure-openai",
+                &accepted,
+            )
+            .unwrap();
+        let mut context = ExecutionAuthorizationContext::for_test(
+            request.principal(),
+            "workspace-a",
+            "thread-a",
+            &pioneer_protocol::default_turn_permission_profile_snapshot(),
+            None,
+        );
+        context.bind_test_provider_authority("azure-openai", "model", authority.as_str());
+        context
+            .grant_manifest
+            .provider
+            .as_mut()
+            .unwrap()
+            .azure_connection = Some(accepted.clone());
+        let fingerprint = context.authorization_fingerprint().unwrap();
+        let encoded = context.to_persisted_json().unwrap();
+        let restored = ExecutionAuthorizationContext::from_persisted_json(&encoded).unwrap();
+        assert_eq!(restored.provider_azure_connection(), Some(&accepted));
+        assert_eq!(restored.authorization_fingerprint().unwrap(), fingerprint);
+        restored
+            .verify_current_provider_authority(&registry)
+            .unwrap();
+        let continuation = restored
+            .resolve_continuation_provider_authority(&registry, "Azure_OpenAI")
+            .unwrap();
+        assert_eq!(continuation.as_str(), authority.as_str());
+        assert_eq!(continuation.azure_connection(), Some(&accepted));
+        // Another resolved config cannot overwrite the persisted original.
+        let changed = pioneer_provider::AzureResolvedConnection::from_values(
+            "resource-after".into(),
+            "deployment-after".into(),
+            "2025-04-01-preview".into(),
+            None,
+        )
+        .unwrap();
+        let _ = registry
+            .authority_fingerprint_for_workspace_with_frozen_azure(
+                "workspace-a",
+                "azure-openai",
+                &changed,
+            )
+            .unwrap();
+        restored
+            .verify_current_provider_authority(&registry)
+            .unwrap();
+        *keys.lock().unwrap() = "key-after".into();
+        assert!(
+            restored
+                .verify_current_provider_authority(&registry)
+                .is_err()
+        );
+        assert!(
+            restored
+                .resolve_continuation_provider_authority(&registry, "azure-openai")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn azure_grant_missing_future_or_unbounded_connection_is_explicitly_unavailable() {
+        let request = member_request();
+        let mut context = ExecutionAuthorizationContext::for_test(
+            request.principal(),
+            "workspace-a",
+            "thread-a",
+            &pioneer_protocol::default_turn_permission_profile_snapshot(),
+            None,
+        );
+        context.bind_test_provider_authority("azure-openai", "model", &"a".repeat(64));
+        let legacy = context.to_persisted_json().unwrap();
+        assert!(!legacy.contains("azure_connection"));
+        assert!(ExecutionAuthorizationContext::from_persisted_json(&legacy).is_err());
+        let mut connection = pioneer_provider::AzureResolvedConnection::from_values(
+            "resource".into(),
+            "deployment".into(),
+            "v1".into(),
+            None,
+        )
+        .unwrap();
+        connection.schema_version = 2;
+        context
+            .grant_manifest
+            .provider
+            .as_mut()
+            .unwrap()
+            .azure_connection = Some(connection);
+        assert!(
+            ExecutionAuthorizationContext::from_persisted_json(
+                &context.to_persisted_json().unwrap()
+            )
+            .is_err()
+        );
+        // Raw input bytes fit the connection limit, but JSON escaping doesn't.
+        let connection = pioneer_provider::AzureResolvedConnection::from_values(
+            "\0".repeat(400_000),
+            "deployment".into(),
+            "v1".into(),
+            Some("https://gateway.invalid".into()),
+        )
+        .unwrap();
+        context
+            .grant_manifest
+            .provider
+            .as_mut()
+            .unwrap()
+            .azure_connection = Some(connection);
+        assert!(context.to_persisted_json().is_err());
+        assert!(context.authorization_fingerprint().is_err());
+        assert!(
+            ExecutionAuthorizationContext::from_persisted_json(
+                &"x".repeat(pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES + 1)
+            )
+            .is_err()
+        );
+        let mut non_azure = test_execution_grant_manifest(None, "openai", "model");
+        non_azure.provider.as_mut().unwrap().azure_connection =
+            context.provider_azure_connection().cloned();
+        assert!(non_azure.validate().is_err());
+    }
+
     fn scoped_request(role_key: RoleKey) -> RequestContext {
         let principal = Arc::new(AuthenticatedSessionPrincipal {
             gateway_id: GatewayId::new("G".repeat(21)).expect("gateway id"),
@@ -4091,6 +4385,7 @@ mod tests {
                 &[],
                 &effective,
                 Some("a".repeat(64).as_str()),
+                None,
             )
             .expect("derive exact continuation");
         assert_eq!(continuation.mcp_invocation_resource_limits(), limits);
@@ -4334,6 +4629,7 @@ mod tests {
                     &[],
                     &pioneer_protocol::default_turn_permission_profile_snapshot(),
                     None,
+                    None,
                 )
                 .is_err(),
             "a task continuation cannot restore a profile above the initiating cap"
@@ -4345,6 +4641,7 @@ mod tests {
                 Some(&backend),
                 &[],
                 &supervised,
+                None,
                 None,
             )
             .expect("narrow continuation");
@@ -4676,6 +4973,7 @@ mod tests {
             has_local_attachment_sources: true,
             has_url_attachment_sources: false,
             provider_authority_fingerprint: Some("a".repeat(64)),
+            provider_azure_connection: None,
         };
         assert!(native_api_provider_requires_artifacts(&request));
 

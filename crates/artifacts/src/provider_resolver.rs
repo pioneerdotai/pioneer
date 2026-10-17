@@ -17,6 +17,81 @@ pub struct ResolvedProviderArtifact {
 }
 
 impl ArtifactService {
+    /// Own exact immutable bytes through native preparation/provider reads.
+    /// No readable-copy lifetime or GC lease is involved.
+    pub async fn resolve_owned_provider_attachment(
+        &self,
+        workspace_id: &str,
+        artifact_id: &str,
+        version_id: &str,
+        max_bytes: usize,
+    ) -> ArtifactResult<ResolvedProviderArtifact> {
+        if version_id.is_empty() || max_bytes == 0 {
+            return Err(ArtifactError::InvalidRequest {
+                message: "exact bounded artifact version required".to_owned(),
+            });
+        }
+        let read = self
+            .read_bounded_artifact(
+                crate::service::ArtifactBoundedReadRequest {
+                    workspace_id: workspace_id.to_owned(),
+                    artifact_id: artifact_id.to_owned(),
+                    version_id: Some(version_id.to_owned()),
+                    projection_kind: None,
+                    offset: None,
+                    max_bytes: Some(max_bytes as u64),
+                },
+                max_bytes as u64,
+            )
+            .await
+            .map_err(|error| match error {
+                ArtifactError::NotFound { .. } => ArtifactError::NotFound {
+                    message: "exact native media version is unavailable".to_owned(),
+                },
+                _ => ArtifactError::InvalidRequest {
+                    message: "bounded native media read failed".to_owned(),
+                },
+            })?;
+        if read.truncated
+            || read.artifact.version_id.as_deref() != Some(version_id)
+            || read.len != read.total_size_bytes
+        {
+            return Err(ArtifactError::InvalidRequest {
+                message: "artifact input exceeds read limit or exact version is unavailable"
+                    .to_owned(),
+            });
+        }
+        use sha2::Digest;
+        let hash = hex::encode(sha2::Sha256::digest(&read.bytes));
+        if hash != read.sha256 || read.artifact.sha256.as_deref() != Some(hash.as_str()) {
+            return Err(ArtifactError::InvalidRequest {
+                message: "artifact input content hash mismatch".to_owned(),
+            });
+        }
+        let attachment = MessageAttachment {
+            mime_type: read
+                .artifact
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| OCTET_STREAM.to_owned()),
+            name: Some(read.artifact.display_name.clone()),
+            size_bytes: Some(read.len),
+            sha256: Some(hash),
+            source: pioneer_provider::attachments::owned_bytes_source(&read.bytes),
+            artifact: Some(AttachmentArtifactContext {
+                workspace_id: workspace_id.to_owned(),
+                artifact_id: artifact_id.to_owned(),
+                artifact_version_id: Some(version_id.to_owned()),
+            }),
+        };
+        Ok(ResolvedProviderArtifact {
+            artifact_id: artifact_id.to_owned(),
+            version_id: Some(version_id.to_owned()),
+            content_type: provider_content_type(read.artifact.kind),
+            attachment,
+        })
+    }
+
     pub async fn resolve_provider_attachment(
         &self,
         workspace_id: &str,

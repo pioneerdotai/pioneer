@@ -249,7 +249,7 @@ async fn repair_turns_completed_after_final_agent_message(
 async fn repair_terminal_turn_execution_windows(
     connection: impl Into<SqliteDatabase>,
 ) -> Result<u64> {
-    let store = pioneer_crud::CrudStore::new(connection);
+    let store = pioneer_crud::CrudStore::new(connection).with_maintenance_access();
     store
         .close_active_execution_windows_for_terminal_turns(chrono::Utc::now().fixed_offset())
         .await
@@ -630,6 +630,9 @@ mod tests {
                     provider_name: "provider-a".to_owned(),
                     reasoning_effort: None,
                     agent_skill_versions_json: None,
+                    provider_model_contract_json: None,
+                    initial_phase_json: None,
+                    ordinary_skill_catalog_json: Some(r#"{"schema_version":1,"catalog":{"version":0,"generated_at_unix":0,"skills":[]}}"#.into()),
                     hook_runtime_context_json: r#"{"mode":"agent","actor_kind":"agent"}"#
                         .to_owned(),
                     workspace_skill_policies_json: "[]".to_owned(),
@@ -783,7 +786,27 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_repair_closes_active_execution_windows_for_terminal_turns() {
         let connection = setup_workspace_database().await;
+        ensure_default_workspace_exists(&connection).await.unwrap();
         let now = chrono::Utc::now().fixed_offset();
+        thread::ActiveModel {
+            id: Set("thread_1".to_owned()),
+            workspace_id: Set(DEFAULT_WORKSPACE_ID.to_owned()),
+            name: Set(Some("window repair".to_owned())),
+            preview: Set(String::new()),
+            preview_author_json: Set(None),
+            mode: Set("agent".to_owned()),
+            model: Set("model-a".to_owned()),
+            model_provider: Set("provider-a".to_owned()),
+            status: Set("active".to_owned()),
+            origin_kind: Set("user".to_owned()),
+            sidebar_visibility: Set("visible".to_owned()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&connection)
+        .await
+        .unwrap();
         for (turn_id, status, error) in [
             (
                 "blocked_turn_with_running_window",

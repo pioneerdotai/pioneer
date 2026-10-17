@@ -8,6 +8,7 @@ pub mod diagnostics;
 pub mod fingerprint;
 pub mod hooks;
 pub mod instruction_delivery;
+mod native_continuation;
 pub mod profile;
 pub mod render;
 pub mod runtime_files;
@@ -32,6 +33,10 @@ pub use hooks::{
 pub use instruction_delivery::{
     CompiledInstructionDeliveryPlan, CompiledInstructionPayload, InstructionDeliveryChannel,
     InstructionScope, InstructionSectionPlan, InstructionTrust, compile_instruction_delivery_plan,
+};
+pub use native_continuation::{
+    reproject_native_control_plan, reproject_native_instruction_plan,
+    validate_native_instruction_plan,
 };
 pub use profile::PromptProfile;
 pub use render::{

@@ -678,6 +678,10 @@ struct SkillShellToolHandler {
 
 #[async_trait]
 impl ToolHandler for SkillShellToolHandler {
+    fn delegates_runtime_execution(&self) -> bool {
+        true
+    }
+
     async fn handle(
         &self,
         invocation: ToolInvocation,
@@ -781,11 +785,11 @@ impl ToolHandler for SkillShellToolHandler {
             "truncated": truncated
         });
 
-        Ok(Box::new(FunctionToolOutput::with_payload(
-            merged,
-            nested.success(),
-            payload,
-        )))
+        Ok(Box::new(
+            FunctionToolOutput::with_payload(merged, nested.success(), payload)
+                .with_progress(nested.progress_evidence())
+                .with_authoritative_outcome(nested.outcome.clone()),
+        ))
     }
 }
 
@@ -803,6 +807,10 @@ struct SkillFunctionProxyHandler {
 
 #[async_trait]
 impl ToolHandler for SkillFunctionProxyHandler {
+    fn delegates_runtime_execution(&self) -> bool {
+        true
+    }
+
     async fn handle(
         &self,
         invocation: ToolInvocation,
@@ -836,11 +844,11 @@ impl ToolHandler for SkillFunctionProxyHandler {
         .await?;
 
         let payload = nested.raw_output_json();
-        Ok(Box::new(FunctionToolOutput::with_payload(
-            nested.raw_output_text(),
-            nested.success(),
-            payload,
-        )))
+        Ok(Box::new(
+            FunctionToolOutput::with_payload(nested.raw_output_text(), nested.success(), payload)
+                .with_progress(nested.progress_evidence())
+                .with_authoritative_outcome(nested.outcome.clone()),
+        ))
     }
 }
 

@@ -76,9 +76,10 @@ use tokio::task::yield_now;
 use tokio::time::{Duration, Instant, advance, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
-fn test_tool_loop_config() -> ToolLoopConfig {
+pub(crate) fn test_tool_loop_config() -> ToolLoopConfig {
     crate::chat::preflight::load_test_catalog();
     ToolLoopConfig {
+        no_progress_mode: pioneer_tools::ToolNoProgressMode::Enforce,
         provider: pioneer_provider::ProviderTimeoutPolicy::default(),
         preflight: super::PreflightLoopConfig::default(),
         web: WebToolsConfig {
@@ -456,6 +457,19 @@ fn test_skill_tool_name(slug: &str, tool_slug: &str) -> String {
     )
 }
 
+// These doubles sit below the registry's native wire boundary. Responses and
+// captured wire requests use provider-safe names; timeline assertions keep the
+// canonical domain names. The codec has separate rejection/roundtrip tests.
+fn test_skill_tool_wire_name(slug: &str, tool_slug: &str) -> String {
+    use sha2::Digest;
+    format!(
+        "p1v1{}",
+        &hex::encode(sha2::Sha256::digest(
+            test_skill_tool_name(slug, tool_slug).as_bytes()
+        ))[..60]
+    )
+}
+
 fn mcp_tool_capability(server_name: &str, raw_tool_name: &str) -> TurnCapability {
     TurnCapability {
         id: format!("mcp-tool:workspace:{server_name}:{raw_tool_name}"),
@@ -488,6 +502,15 @@ struct PendingProvider;
 
 #[async_trait::async_trait]
 impl Provider for PendingProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "pending"
     }
@@ -841,10 +864,12 @@ fn explicit_mcp_tool_materialization(
         selection_reason: "explicit_composer_capability".to_owned(),
         capability_id: Some(capability_id.to_owned()),
     };
+    let descriptors = vec![descriptor];
     let materialized =
-        pioneer_tools::materialize_mcp_runtime_tools(&[descriptor], Arc::new(NoopMcpToolExecutor));
+        pioneer_tools::materialize_mcp_runtime_tools(&descriptors, Arc::new(NoopMcpToolExecutor));
 
     AgentMcpMaterialization {
+        descriptors,
         bundles: materialized.bundles,
         available_mcp: vec!["resend".to_owned(), "resend/send".to_owned()],
         blocked_mcp: Vec::new(),
@@ -1746,6 +1771,7 @@ fn visible_test_requests(requests: Vec<ChatRequest>) -> Vec<ChatRequest> {
 
 #[derive(Default)]
 struct CaptureStandardProvider {
+    fail_first_main: std::sync::atomic::AtomicBool,
     requests: std::sync::Mutex<Vec<ChatRequest>>,
 }
 
@@ -1868,6 +1894,90 @@ struct RetainingTraceHandler {
 struct BatchJournalHandler {
     slow_tool_name: String,
     slow_release: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Default)]
+struct OrderedBatchState {
+    active_reads: AtomicUsize,
+    max_reads: AtomicUsize,
+    revision: AtomicUsize,
+    completed_before: AtomicUsize,
+    completed_after: AtomicUsize,
+}
+
+struct OrderedBatchHandler {
+    state: Arc<OrderedBatchState>,
+    before_barrier: Arc<tokio::sync::Barrier>,
+    mutation: bool,
+    after: bool,
+}
+
+struct ConfirmedStalledReadHandler(Arc<AtomicUsize>);
+
+#[async_trait::async_trait]
+impl ToolHandler for ConfirmedStalledReadHandler {
+    fn supports_parallel_reads(&self) -> bool {
+        true
+    }
+
+    async fn handle(
+        &self,
+        _invocation: ToolInvocation,
+        _trace: ToolEventTrace,
+    ) -> Result<Box<dyn pioneer_tools::ToolOutput>, pioneer_tools::ToolError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        let mut progress = pioneer_tools::ToolProgressEvidence::resource_state([7; 32], [1; 32]);
+        progress.completion = pioneer_tools::ToolCompletionEvidence::TimedOut;
+        Ok(Box::new(
+            FunctionToolOutput::new("same observed job revision", false)
+                .with_progress(progress)
+                .with_authoritative_outcome(pioneer_tools::ToolOutcome::recoverable(
+                    pioneer_tools::ToolErrorClass::Timeout,
+                    "observation timed out",
+                    false,
+                    None,
+                )),
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolHandler for OrderedBatchHandler {
+    fn supports_parallel_reads(&self) -> bool {
+        !self.mutation
+    }
+
+    async fn handle(
+        &self,
+        _invocation: ToolInvocation,
+        _trace: ToolEventTrace,
+    ) -> Result<Box<dyn pioneer_tools::ToolOutput>, pioneer_tools::ToolError> {
+        if self.mutation {
+            assert_eq!(self.state.active_reads.load(Ordering::SeqCst), 0);
+            assert_eq!(self.state.completed_before.load(Ordering::SeqCst), 8);
+            assert_eq!(self.state.completed_after.load(Ordering::SeqCst), 0);
+            self.state.revision.store(1, Ordering::SeqCst);
+        } else {
+            let active = self.state.active_reads.fetch_add(1, Ordering::SeqCst) + 1;
+            self.state.max_reads.fetch_max(active, Ordering::SeqCst);
+            if !self.after {
+                // Each native read segment must start four real handlers.
+                self.before_barrier.wait().await;
+            }
+            assert_eq!(
+                self.state.revision.load(Ordering::SeqCst),
+                usize::from(self.after)
+            );
+            tokio::task::yield_now().await;
+            self.state.active_reads.fetch_sub(1, Ordering::SeqCst);
+            if self.after {
+                self.state.completed_after.fetch_add(1, Ordering::SeqCst);
+            } else {
+                self.state.completed_before.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        Ok(Box::new(FunctionToolOutput::new("observed", true)))
+    }
 }
 
 struct ReviewGuardProvider {
@@ -2386,6 +2496,7 @@ enum LoopBudgetProviderMode {
 }
 
 struct LoopBudgetProvider {
+    fail_first_main: std::sync::atomic::AtomicBool,
     requests: std::sync::Mutex<Vec<ChatRequest>>,
     next_index: AtomicUsize,
     mode: LoopBudgetProviderMode,
@@ -2396,6 +2507,7 @@ struct LoopBudgetProvider {
 impl LoopBudgetProvider {
     fn new(mode: LoopBudgetProviderMode, tool_calls_per_round: usize) -> Self {
         Self {
+            fail_first_main: std::sync::atomic::AtomicBool::new(false),
             requests: std::sync::Mutex::new(Vec::new()),
             next_index: AtomicUsize::new(0),
             mode,
@@ -2410,6 +2522,7 @@ impl LoopBudgetProvider {
         preflight_response_text: impl Into<String>,
     ) -> Self {
         Self {
+            fail_first_main: std::sync::atomic::AtomicBool::new(false),
             requests: std::sync::Mutex::new(Vec::new()),
             next_index: AtomicUsize::new(0),
             mode,
@@ -2552,6 +2665,25 @@ impl RecordingMemoryProvider {
 
 #[async_trait::async_trait]
 impl AgentMemoryProvider for RecordingMemoryProvider {
+    async fn restore_memory_tools(
+        &self,
+        _: MemoryTurnContext,
+        accepted_specs: &[Vec<ConfiguredToolSpec>],
+    ) -> Result<MemoryToolMaterialization, String> {
+        let materialized = self.tool_result.clone()?;
+        let actual = materialized
+            .bundles
+            .iter()
+            .map(|bundle| bundle.specs.clone())
+            .collect::<Vec<_>>();
+        if serde_json::to_value(&actual).map_err(|e| e.to_string())?
+            != serde_json::to_value(accepted_specs).map_err(|e| e.to_string())?
+        {
+            return Err("fixture memory tool contract changed".into());
+        }
+        Ok(materialized)
+    }
+
     async fn recall_memory(
         &self,
         context: MemoryTurnContext,
@@ -2724,6 +2856,11 @@ impl ToolHandler for RetainingTraceHandler {
 
 #[async_trait::async_trait]
 impl ToolHandler for BatchJournalHandler {
+    fn supports_parallel_reads(&self) -> bool {
+        // This fixture only waits and returns a fixed value.
+        true
+    }
+
     async fn handle(
         &self,
         invocation: ToolInvocation,
@@ -2804,6 +2941,7 @@ fn review_guard_observation(
         task_id: "task_review_guard".to_owned(),
         run_id: "run_review_guard".to_owned(),
         candidate_id: candidate_id.to_owned(),
+        candidate_revision: "a".repeat(64),
         title: "Review guard task".to_owned(),
         status: "waiting_review".to_owned(),
         candidate_status: "pending_review".to_owned(),
@@ -3037,6 +3175,15 @@ impl ToolHandler for StatefulMemoryToolHandler {
 
 #[async_trait::async_trait]
 impl Provider for CaptureStandardProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "capture-standard"
     }
@@ -3060,6 +3207,14 @@ impl Provider for CaptureStandardProvider {
             .push(request);
         if preflight {
             return Ok(test_preflight_response());
+        }
+        if self.fail_first_main.swap(false, Ordering::SeqCst) {
+            return Err(pioneer_provider::failure::ProviderTransportFailure {
+                classification: pioneer_provider::ProviderFailureClassification::new(
+                    ProviderFailureClass::Provider5xx,
+                ),
+            }
+            .into());
         }
         Ok(ChatResponse {
             text: "done".to_owned(),
@@ -3086,6 +3241,15 @@ impl Provider for CaptureStandardProvider {
 
 #[async_trait::async_trait]
 impl Provider for SequencedToolProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "sequenced-tools"
     }
@@ -3127,7 +3291,21 @@ impl Provider for SequencedToolProvider {
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
-                tool_calls: self.first_tool_calls.clone(),
+                tool_calls: self
+                    .first_tool_calls
+                    .iter()
+                    .cloned()
+                    .map(|mut call| {
+                        if call.name.starts_with("skill.") {
+                            use sha2::Digest;
+                            call.name = format!(
+                                "p1v1{}",
+                                &hex::encode(sha2::Sha256::digest(call.name.as_bytes()))[..60]
+                            );
+                        }
+                        call
+                    })
+                    .collect(),
                 provider_replay_state: self.first_provider_replay_state.clone(),
                 termination: pioneer_provider::ProviderTermination::ToolCalls,
             });
@@ -3162,6 +3340,15 @@ impl Provider for SequencedToolProvider {
 
 #[async_trait::async_trait]
 impl Provider for LoopBudgetProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "loop-budget"
     }
@@ -3195,6 +3382,14 @@ impl Provider for LoopBudgetProvider {
             });
         }
 
+        if self.fail_first_main.swap(false, Ordering::SeqCst) {
+            return Err(pioneer_provider::failure::ProviderTransportFailure {
+                classification: pioneer_provider::ProviderFailureClassification::new(
+                    ProviderFailureClass::Provider5xx,
+                ),
+            }
+            .into());
+        }
         let round_index = self.next_index.fetch_add(1, Ordering::SeqCst);
         let tool_calls = match self.mode {
             LoopBudgetProviderMode::ToolWhileAvailableThenFinal if tools_available => {
@@ -3271,6 +3466,15 @@ impl Provider for LoopBudgetProvider {
 
 #[async_trait::async_trait]
 impl Provider for AlwaysTaskCreateProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "always-task-create"
     }
@@ -3293,7 +3497,10 @@ impl Provider for AlwaysTaskCreateProvider {
             .expect("always task_create provider lock poisoned")
             .push(request);
         if preflight {
-            return Ok(test_preflight_response());
+            return Ok(ChatResponse {
+                text: preflight_response_with_visible_tools(&["task_create"]),
+                ..test_preflight_response()
+            });
         }
 
         let round_index = self.next_index.fetch_add(1, Ordering::SeqCst);
@@ -3331,6 +3538,15 @@ impl Provider for AlwaysTaskCreateProvider {
 
 #[async_trait::async_trait]
 impl Provider for ProviderRecoveryBoundaryProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "provider-recovery-boundary"
     }
@@ -3364,8 +3580,8 @@ impl Provider for ProviderRecoveryBoundaryProvider {
                 reasoning_content: None,
                 tool_calls: vec![ProviderToolCall {
                     id: "call_provider_boundary_1".to_owned(),
-                    name: "missing_tool_for_boundary".to_owned(),
-                    arguments: "{}".to_owned(),
+                    name: "list_dir".to_owned(),
+                    arguments: r#"{"path":".","depth":0,"limit":1}"#.to_owned(),
                 }],
                 provider_replay_state: None,
                 termination: pioneer_provider::ProviderTermination::ToolCalls,
@@ -3391,6 +3607,15 @@ impl Provider for ProviderRecoveryBoundaryProvider {
 
 #[async_trait::async_trait]
 impl Provider for CaptureAgentProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "capture"
     }
@@ -3402,7 +3627,9 @@ impl Provider for CaptureAgentProvider {
         // The capture double models a JSON-function provider. Keep its
         // externally visible name stable while opting into the native
         // filesystem capability contract used by apply-patch flows.
-        pioneer_provider::select_native_file_tool_capability("openai", model)
+        let mut capability = pioneer_provider::select_native_file_tool_capability("openai", model);
+        capability.provider = self.name().to_owned();
+        capability
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -3457,6 +3684,15 @@ impl Provider for CaptureAgentProvider {
 
 #[async_trait::async_trait]
 impl Provider for FirstCallBlockingProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "generation-blocking"
     }
@@ -3492,6 +3728,15 @@ impl Provider for FirstCallBlockingProvider {
 
 #[async_trait::async_trait]
 impl Provider for ReviewGuardProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "review-guard"
     }
@@ -3567,6 +3812,15 @@ impl Provider for ReviewGuardProvider {
 
 #[async_trait::async_trait]
 impl Provider for EmptyNoToolRoundProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "empty-no-tool-round"
     }
@@ -3643,6 +3897,15 @@ impl Provider for EmptyNoToolRoundProvider {
 
 #[async_trait::async_trait]
 impl Provider for SequencedTextProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "sequenced-text"
     }
@@ -3733,6 +3996,15 @@ impl TurnFinalizationProvider for FailFinalizationProvider {
 
 #[async_trait::async_trait]
 impl Provider for TextOnlyAgentProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "text-only"
     }
@@ -3762,6 +4034,15 @@ impl Provider for TextOnlyAgentProvider {
 
 #[async_trait::async_trait]
 impl Provider for NoToolCaptureProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "no-tool-capture"
     }
@@ -3801,6 +4082,7 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
 
 fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent> {
     match event {
+        AgentDurableEvent::ProviderUsageObserved { .. } => None,
         AgentDurableEvent::ToolOutputRecorded { notification, .. } => {
             Some(AgentEvent::ItemDelta(notification))
         }
@@ -3901,6 +4183,24 @@ fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent>
             },
             output_policy_snapshot,
         }),
+        AgentDurableEvent::NativeSemanticCheckpoint {
+            checkpoint,
+            control: Some(control),
+            ..
+        } => Some(AgentEvent::ItemCompleted(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: checkpoint.workspace_id,
+                thread_id: checkpoint.thread_id,
+                turn_id: checkpoint.turn_id,
+                item: pioneer_protocol::TurnItem::SystemEvent {
+                    id: control.id.clone(),
+                    level: pioneer_protocol::SystemEventLevel::Info,
+                    message: "Native runtime control recorded.".to_owned(),
+                    code: Some("native.control".to_owned()),
+                    details: Some(serde_json::json!({"nativeControl":control})),
+                },
+            },
+        )),
         AgentDurableEvent::ItemStarted { notification } => {
             Some(AgentEvent::ItemStarted(notification))
         }
@@ -3929,6 +4229,8 @@ fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent>
         | AgentDurableEvent::TurnExecutionWindowBlocked { .. }
         | AgentDurableEvent::TurnProviderHistoryAppended { .. }
         | AgentDurableEvent::TurnPermissionAudit { .. }
+        | AgentDurableEvent::NativeInitialPhaseAdvanced { .. }
+        | AgentDurableEvent::NativeSemanticCheckpoint { .. }
         | AgentDurableEvent::NativeCancellationContextPrepared { .. }
         | AgentDurableEvent::NativeTerminalEffectsPrepared { .. } => None,
         AgentDurableEvent::ProviderFailureDetected {
@@ -3969,6 +4271,7 @@ fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent>
             turn_id,
             error,
             recovery,
+            ..
         } => Some(AgentEvent::TurnFailed {
             thread_id,
             turn_id,
@@ -4003,10 +4306,128 @@ fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent>
     }
 }
 
+// Deterministic durable control source for manager-level fixtures. ACK only
+// follows recording, and reads revalidate scope plus the exact content hash.
+struct FixtureControlContext {
+    delegate: Option<Arc<dyn crate::compaction::controller::NativeContextController>>,
+    records: std::sync::Mutex<
+        std::collections::BTreeMap<
+            (String, String, String, String),
+            pioneer_protocol::NativeControlRecord,
+        >,
+    >,
+}
+#[async_trait::async_trait]
+impl crate::compaction::controller::NativeContextController for FixtureControlContext {
+    async fn load_native_controls(
+        &self,
+        context: &crate::compaction::controller::NativeContext,
+        references: &[pioneer_protocol::NativeControlRef],
+    ) -> anyhow::Result<Vec<pioneer_protocol::NativeControlRecord>> {
+        let records = self.records.lock().unwrap();
+        references
+            .iter()
+            .map(|reference| {
+                let record = records
+                    .get(&(
+                        context.workspace_id.clone(),
+                        context.thread_id.clone(),
+                        context.turn_id.clone(),
+                        reference.item_id.clone(),
+                    ))
+                    .ok_or_else(|| anyhow::anyhow!("fixture control source is unavailable"))?;
+                anyhow::ensure!(
+                    record.reference().map_err(anyhow::Error::msg)? == *reference,
+                    "fixture control source changed"
+                );
+                Ok(record.clone())
+            })
+            .collect()
+    }
+    async fn load_native_history_roots(
+        &self,
+        context: &crate::compaction::controller::NativeContext,
+        roots: &[pioneer_compaction::SourceRef],
+    ) -> anyhow::Result<Vec<ChatMessage>> {
+        if let Some(delegate) = &self.delegate {
+            return delegate.load_native_history_roots(context, roots).await;
+        }
+        anyhow::ensure!(roots.is_empty(), "fixture has no checkpoint history source");
+        Ok(Vec::new())
+    }
+    async fn stop(
+        &self,
+        context: &crate::compaction::controller::NativeContext,
+    ) -> anyhow::Result<()> {
+        if let Some(delegate) = &self.delegate {
+            return delegate.stop(context).await;
+        }
+        Ok(())
+    }
+    async fn prepare(
+        &self,
+        context: &crate::compaction::controller::NativeContext,
+        request: ChatRequest,
+        measurement: Option<crate::compaction::controller::NativeUsageMeasurement>,
+        recovery: bool,
+    ) -> anyhow::Result<crate::compaction::controller::NativePreparedRequest> {
+        if let Some(delegate) = &self.delegate {
+            return delegate
+                .prepare(context, request, measurement, recovery)
+                .await;
+        }
+        // This fixture supplies only the durable control source absent from a
+        // standalone Agent. It preserves the original no-controller request;
+        // media/context admission has separate concrete provider fixtures.
+        let receipt = crate::compaction::controller::NativeInputReceipt::for_request(
+            &request,
+            &context.provider_instance,
+            context.provider.usage_api(),
+            0,
+            None,
+        )?;
+        Ok(crate::compaction::controller::NativePreparedRequest {
+            history_check: crate::compaction::controller::NativeHistoryCheckMetadata {
+                target_output_cap: request.max_tokens.unwrap_or(4096),
+                fixed_input_tokens: 0,
+            },
+            request,
+            receipt,
+            covered_native_control_ids: Vec::new(),
+        })
+    }
+}
+
 async fn subscribe_agent_events(
     manager: &AgentManager,
     thread_id: &str,
 ) -> tokio::sync::mpsc::Receiver<AgentEvent> {
+    subscribe_agent_events_with_checkpoints(manager, thread_id)
+        .await
+        .0
+}
+
+type FixtureCheckpoints =
+    Arc<std::sync::Mutex<std::collections::BTreeMap<String, ExecutionCheckpointContext>>>;
+
+async fn subscribe_agent_events_with_checkpoints(
+    manager: &AgentManager,
+    thread_id: &str,
+) -> (tokio::sync::mpsc::Receiver<AgentEvent>, FixtureCheckpoints) {
+    let checkpoints: FixtureCheckpoints = Default::default();
+    let recorded_checkpoints = checkpoints.clone();
+    let controller = Arc::new(FixtureControlContext {
+        delegate: manager
+            .runtime_dependencies
+            .snapshot()
+            .await
+            .context_controller
+            .clone(),
+        records: Default::default(),
+    });
+    manager
+        .set_context_controller(Some(controller.clone()))
+        .await;
     let mut durable_rx = manager
         .take_durable_receiver(thread_id)
         .await
@@ -4014,6 +4435,76 @@ async fn subscribe_agent_events(
     let (tx, rx) = tokio::sync::mpsc::channel(256);
     tokio::spawn(async move {
         while let Some(event) = durable_rx.recv().await {
+            if let AgentDurableEvent::TurnExecutionWindowCheckpointed {
+                notification,
+                payload,
+            } = &event
+            {
+                let mut checkpoints = recorded_checkpoints.lock().unwrap();
+                assert!(checkpoints.len() < 128);
+                let usage = crate::ExecutionWindowUsageSnapshot {
+                    total_windows: notification.window_index,
+                    total_tool_calls: u64::from(payload.window.tool_call_count),
+                    total_provider_tokens: payload.window.provider_token_count.unwrap_or(0),
+                    provider_token_usage_unknown: !payload.provider_budget.provider_usage_available,
+                    ..Default::default()
+                };
+                checkpoints.insert(
+                    payload.turn_id.clone(),
+                    ExecutionCheckpointContext {
+                        window_id: notification.window_id.clone(),
+                        window_index: notification.window_index,
+                        checkpoint_id: notification.checkpoint_id.clone(),
+                        checkpoint_kind: notification.checkpoint_kind.clone(),
+                        payload: payload.clone(),
+                        usage,
+                    },
+                );
+            }
+            if let AgentDurableEvent::NativeSemanticCheckpoint {
+                checkpoint,
+                control: Some(record),
+                ..
+            } = &event
+            {
+                record.validate().unwrap();
+                let mut records = controller.records.lock().unwrap();
+                assert!(records.len() < 4096);
+                records.insert(
+                    (
+                        checkpoint.workspace_id.clone(),
+                        checkpoint.thread_id.clone(),
+                        checkpoint.turn_id.clone(),
+                        record.id.clone(),
+                    ),
+                    record.clone(),
+                );
+            }
+            if let AgentDurableEvent::ItemCompleted { notification } = &event {
+                if let TurnItem::SystemEvent {
+                    code,
+                    details: Some(details),
+                    ..
+                } = &notification.item
+                {
+                    if code.as_deref() == Some("native.control") {
+                        let record: pioneer_protocol::NativeControlRecord =
+                            serde_json::from_value(details["nativeControl"].clone()).unwrap();
+                        record.validate().unwrap();
+                        let mut records = controller.records.lock().unwrap();
+                        assert!(records.len() < 4096);
+                        records.insert(
+                            (
+                                notification.workspace_id.clone(),
+                                notification.thread_id.clone(),
+                                notification.turn_id.clone(),
+                                record.id.clone(),
+                            ),
+                            record,
+                        );
+                    }
+                }
+            }
             let event = test_agent_event_from_durable(event);
             durable_rx.acknowledge_last(Ok(()));
             let Some(event) = event else {
@@ -4024,7 +4515,63 @@ async fn subscribe_agent_events(
             }
         }
     });
-    rx
+    (rx, checkpoints)
+}
+
+async fn start_failed_native_fixture(
+    manager: &AgentManager,
+    thread: &str,
+    workspace: &str,
+    turn: &str,
+    provider: &str,
+    input: &str,
+) -> (Vec<AgentEvent>, ExecutionCheckpointContext) {
+    manager.ensure_thread(thread, workspace).await.unwrap();
+    let (mut events, checkpoints) = subscribe_agent_events_with_checkpoints(manager, thread).await;
+    manager
+        .start_test_turn_with_default_profile(
+            thread,
+            turn,
+            ThreadMode::Agent,
+            "test-model",
+            provider,
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: input.into(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let mut observed = Vec::new();
+    for _ in 0..160 {
+        let event = timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let failed = matches!(event, AgentEvent::ProviderFailureDetected { .. });
+        assert!(
+            !matches!(
+                event,
+                AgentEvent::TurnCompleted { .. }
+                    | AgentEvent::TurnFailed { .. }
+                    | AgentEvent::TurnBlocked { .. }
+            ),
+            "unexpected terminal before decoder failure: {event:?}"
+        );
+        observed.push(event);
+        if failed {
+            let checkpoint = checkpoints
+                .lock()
+                .unwrap()
+                .get(turn)
+                .cloned()
+                .expect("failed native attempt closes its actual window");
+            return (observed, checkpoint);
+        }
+    }
+    panic!("native failure fixture did not observe a provider failure")
 }
 
 async fn recv_events_until_terminal(
@@ -4038,7 +4585,10 @@ async fn recv_events_until_terminal(
             Ok(None) => {
                 panic!("agent event channel should stay open")
             }
-            Err(_) => panic!("timed out waiting for terminal agent event"),
+            Err(_) => panic!(
+                "timed out waiting for terminal agent event; last={:?}",
+                observed.last()
+            ),
         };
         let terminal = matches!(
             event,
@@ -4177,6 +4727,34 @@ fn completed_agent_message_text(observed: &[AgentEvent]) -> Option<String> {
         };
         Some(text.clone())
     })
+}
+
+fn completed_native_control_directives(
+    observed: &[AgentEvent],
+) -> Vec<pioneer_protocol::NativeHostDirective> {
+    observed
+        .iter()
+        .filter_map(|event| {
+            let AgentEvent::ItemCompleted(notification) = event else {
+                return None;
+            };
+            let TurnItem::SystemEvent {
+                code,
+                details: Some(details),
+                ..
+            } = &notification.item
+            else {
+                return None;
+            };
+            if code.as_deref() != Some("native.control") {
+                return None;
+            }
+            let record: pioneer_protocol::NativeControlRecord =
+                serde_json::from_value(details.get("nativeControl")?.clone()).ok()?;
+            record.validate().ok()?;
+            Some(record.host.directive)
+        })
+        .collect()
 }
 
 fn completed_system_event_codes(observed: &[AgentEvent]) -> Vec<String> {
@@ -4635,117 +5213,84 @@ async fn empty_no_tool_round_after_tool_result_preserves_context() {
 }
 
 #[tokio::test]
-async fn tool_schema_dump_no_tool_round_retries_without_schema_agent_message() {
+async fn exact_tool_schema_final_is_accepted() {
     let provider = Arc::new(SequencedTextProvider::new(vec![
         TOOL_SCHEMA_DUMP_RESPONSE,
-        "done after schema dump recovery",
+        "unexpected retry",
     ]));
     let registry = Arc::new(ProviderRegistry::with_provider(
         "sequenced-text",
         provider.clone(),
     ));
     let manager = AgentManager::new(registry, test_tool_loop_config());
-
     let observed = start_simple_turn(
         &manager,
-        "schema_dump_retry_thread",
+        "exact_tool_schema_final_is_accepted",
         "workspace",
-        "schema_dump_retry_turn",
+        "exact_format_turn",
         ThreadMode::Agent,
         "sequenced-text",
-        "hello",
+        "Выведи точный fixture без пояснений",
     )
     .await;
     assert_turn_completed(&observed);
-
-    let completed_messages = observed
+    let messages = observed
         .iter()
-        .filter_map(|event| {
-            let AgentEvent::ItemCompleted(notification) = event else {
-                return None;
-            };
-            let TurnItem::AgentMessage { text, .. } = &notification.item else {
-                return None;
-            };
-            Some(text.clone())
+        .filter_map(|event| match event {
+            AgentEvent::ItemCompleted(notification) => match &notification.item {
+                TurnItem::AgentMessage { text, .. } => Some(text.as_str()),
+                _ => None,
+            },
+            _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        completed_messages,
-        vec!["done after schema dump recovery".to_owned()],
-        "tool schema dumps must not create completed AgentMessage items"
-    );
-
-    let requests = provider.snapshot_requests();
-    assert_eq!(
-        requests.len(),
-        2,
-        "schema dump should be retried inside the same agent loop before final answer"
-    );
+    assert_eq!(messages, vec![TOOL_SCHEMA_DUMP_RESPONSE]);
+    assert_eq!(provider.snapshot_requests().len(), 1);
     assert!(
-        requests[1].messages.iter().any(|message| {
-            message
-                .content
-                .contains("reproduced tool schemas or tool definitions")
-        }),
-        "retry request should include the schema-dump recovery instruction"
+        !observed
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ProviderFailureDetected { .. }))
     );
 }
 
 #[tokio::test]
-async fn raw_tool_call_markup_no_tool_round_retries_without_raw_agent_message() {
+async fn exact_protocol_markup_final_is_accepted() {
     let provider = Arc::new(SequencedTextProvider::new(vec![
         RAW_TOOL_CALL_MARKUP_RESPONSE,
-        "done after raw tool-call recovery",
+        "unexpected retry",
     ]));
     let registry = Arc::new(ProviderRegistry::with_provider(
         "sequenced-text",
         provider.clone(),
     ));
     let manager = AgentManager::new(registry, test_tool_loop_config());
-
     let observed = start_simple_turn(
         &manager,
-        "raw_tool_markup_retry_thread",
+        "exact_protocol_markup_final_is_accepted",
         "workspace",
-        "raw_tool_markup_retry_turn",
+        "exact_format_turn",
         ThreadMode::Agent,
         "sequenced-text",
-        "hello",
+        "Выведи точный fixture без пояснений",
     )
     .await;
     assert_turn_completed(&observed);
-
-    let completed_messages = observed
+    let messages = observed
         .iter()
-        .filter_map(|event| {
-            let AgentEvent::ItemCompleted(notification) = event else {
-                return None;
-            };
-            let TurnItem::AgentMessage { text, .. } = &notification.item else {
-                return None;
-            };
-            Some(text.clone())
+        .filter_map(|event| match event {
+            AgentEvent::ItemCompleted(notification) => match &notification.item {
+                TurnItem::AgentMessage { text, .. } => Some(text.as_str()),
+                _ => None,
+            },
+            _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        completed_messages,
-        vec!["done after raw tool-call recovery".to_owned()],
-        "raw tool-call markup must not create completed AgentMessage items"
-    );
-
-    let requests = provider.snapshot_requests();
-    assert_eq!(
-        requests.len(),
-        2,
-        "raw tool-call markup should be retried inside the same agent loop before final answer"
-    );
+    assert_eq!(messages, vec![RAW_TOOL_CALL_MARKUP_RESPONSE]);
+    assert_eq!(provider.snapshot_requests().len(), 1);
     assert!(
-        requests[1]
-            .messages
+        !observed
             .iter()
-            .any(|message| message.content.contains("raw tool-call markup")),
-        "retry request should include the raw tool-call markup recovery instruction"
+            .any(|event| matches!(event, AgentEvent::ProviderFailureDetected { .. }))
     );
 }
 
@@ -5011,7 +5556,7 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
         "empty-no-tool-round",
         provider.clone(),
     ));
-    let manager = Arc::new(AgentManager::new(registry, test_tool_loop_config()));
+    let manager = Arc::new(AgentManager::new(registry.clone(), test_tool_loop_config()));
     manager
         .set_memory_provider(Some(Arc::new(RecordingMemoryProvider::new(
             Ok(MemoryRecallSnapshot::empty()),
@@ -5052,6 +5597,14 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
         .await
         .expect("turn should start");
 
+    let accepted_contract = registry
+        .get_or_create_for_workspace(workspace_id, "empty-no-tool-round")
+        .unwrap()
+        .capture_model_contract("test-model")
+        .unwrap();
+    let accepted_contract =
+        serde_json::from_slice(&serde_json::to_vec(&accepted_contract).unwrap()).unwrap();
+    let mut initial_phase_json = None;
     let mut exhausted_window_id = None;
     let mut checkpoint_context = None;
     let mut saw_provider_failure = false;
@@ -5060,6 +5613,9 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
             .await
             .expect("provider failure lifecycle event should arrive")
             .expect("durable receiver should stay open");
+        if let AgentDurableEvent::NativeInitialPhaseAdvanced { preparation } = &event {
+            initial_phase_json = Some(preparation.initial_phase_json.clone());
+        }
         durable_events.acknowledge_last(Ok(()));
         match event {
             AgentDurableEvent::TurnExecutionWindowExhausted { notification } => {
@@ -5182,14 +5738,10 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
                         .iter()
                         .any(|tool| tool.name == "memory_remember")
                 );
-                let restarted_provider = Arc::new(CaptureAgentProvider::default());
-                let restarted = AgentManager::new(
-                    Arc::new(ProviderRegistry::with_provider(
-                        "capture",
-                        restarted_provider.clone(),
-                    )),
-                    test_tool_loop_config(),
-                );
+                // Rebuild the Agent facade from accepted bytes while keeping the
+                // same provider authority, model and original semantic input.
+                let restarted_provider = provider.clone();
+                let restarted = AgentManager::new(registry.clone(), test_tool_loop_config());
                 restarted
                     .set_memory_provider(Some(Arc::new(RecordingMemoryProvider::new(
                         Ok(MemoryRecallSnapshot::empty()),
@@ -5205,13 +5757,48 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
                     .await
                     .unwrap();
                 let mut restarted_events = subscribe_agent_events(&restarted, thread_id).await;
-                restarted.start_turn_with_hook_context_and_execution_checkpoint_permission_profile_and_security_snapshot(
-                    thread_id, turn_id, ThreadMode::Agent, AgentTurnHookRuntimeContext::default(),
-                    "test-model", "capture", HashMap::new(), SkillCatalogSnapshot { version: 1, generated_at_unix: 0, skills: Vec::new() },
-                    vec![UserInput::Text { text: "ordinary question".to_owned(), text_elements: Vec::new() }],
-                    Vec::new(), Vec::new(), HashMap::new(), Vec::new(), restart_checkpoint,
-                    pioneer_protocol::default_turn_permission_profile_snapshot(), test_full_access_security_snapshot(),
-                ).await.unwrap();
+                restarted
+                    .start_turn_with_hook_context_and_execution_checkpoint_and_reasoning(
+                        thread_id,
+                        turn_id,
+                        ThreadMode::Agent,
+                        AgentTurnHookRuntimeContext::default(),
+                        "test-model",
+                        "empty-no-tool-round",
+                        None,
+                        Some(accepted_contract),
+                        Some(
+                            crate::NativeInitialPreparation::restore(
+                                initial_phase_json.as_deref().unwrap(),
+                                workspace_id,
+                                thread_id,
+                                turn_id,
+                                pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+                            )
+                            .unwrap(),
+                        ),
+                        HashMap::new(),
+                        SkillCatalogSnapshot {
+                            version: 1,
+                            generated_at_unix: 0,
+                            skills: Vec::new(),
+                        },
+                        Vec::new(),
+                        vec![UserInput::Text {
+                            text: "return a final answer".to_owned(),
+                            text_elements: Vec::new(),
+                        }],
+                        Vec::new(),
+                        Vec::new(),
+                        HashMap::new(),
+                        Vec::new(),
+                        restart_checkpoint,
+                        None,
+                        pioneer_protocol::default_turn_permission_profile_snapshot(),
+                        Some(test_full_access_security_snapshot()),
+                    )
+                    .await
+                    .unwrap();
                 assert_turn_completed(&recv_events_until_terminal(&mut restarted_events).await);
                 assert!(
                     restarted_provider
@@ -5234,7 +5821,7 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
 }
 
 #[tokio::test]
-async fn terminal_runtime_failure_checkpoints_window_before_turn_failure() {
+async fn permanent_finalization_rejection_is_not_a_recoverable_runtime_failure() {
     let provider = Arc::new(CaptureAgentProvider::default());
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider));
     let manager = AgentManager::new(registry, test_tool_loop_config());
@@ -5296,11 +5883,17 @@ async fn terminal_runtime_failure_checkpoints_window_before_turn_failure() {
                 );
                 saw_checkpoint = true;
             }
-            AgentDurableEvent::TurnFailed { error, .. } => {
+            AgentDurableEvent::TurnFailed { error, failure, .. } => {
                 assert_eq!(error, "finalization rejected the turn");
                 assert!(
-                    saw_checkpoint,
-                    "runtime failure must be published only after its checkpoint"
+                    !saw_checkpoint && !saw_exhausted,
+                    "an explicit permanent rejection must not create a resumable runtime checkpoint"
+                );
+                assert_eq!(
+                    failure,
+                    Some(pioneer_protocol::NativeFailureMetadata::execution(
+                        pioneer_protocol::TurnFailureDisposition::Permanent
+                    ))
                 );
                 return;
             }
@@ -5312,90 +5905,33 @@ async fn terminal_runtime_failure_checkpoints_window_before_turn_failure() {
 }
 
 #[tokio::test]
-async fn third_consecutive_tool_schema_dump_no_tool_round_surfaces_provider_failure() {
+async fn repeated_available_schema_answers_do_not_create_false_provider_failure() {
     let provider = Arc::new(SequencedTextProvider::new(vec![
-        TOOL_SCHEMA_DUMP_RESPONSE,
-        TOOL_SCHEMA_DUMP_RESPONSE,
-        TOOL_SCHEMA_DUMP_RESPONSE,
+        TOOL_SCHEMA_DUMP_RESPONSE;
+        3
     ]));
     let registry = Arc::new(ProviderRegistry::with_provider(
         "sequenced-text",
         provider.clone(),
     ));
     let manager = AgentManager::new(registry, test_tool_loop_config());
-    let thread_id = "schema_dump_failure_thread";
-    let turn_id = "schema_dump_failure_turn";
-
-    manager
-        .ensure_thread(thread_id, "workspace")
-        .await
-        .expect("thread should be created");
-    let mut events = subscribe_agent_events(&manager, thread_id).await;
-    manager
-        .start_test_turn_with_default_profile_and_capabilities(
-            thread_id,
-            turn_id,
-            ThreadMode::Agent,
-            "test-model",
-            "sequenced-text",
-            HashMap::new(),
-            vec![UserInput::Text {
-                text: "hello".to_owned(),
-                text_elements: Vec::new(),
-            }],
-            Vec::new(),
-            Vec::new(),
-        )
-        .await
-        .expect("turn should start");
-
-    let mut completed_agent_messages = Vec::new();
-    for _ in 0..40 {
-        let event = timeout(Duration::from_secs(2), events.recv())
-            .await
-            .expect("must receive agent event in time")
-            .expect("broadcast should remain open");
-        match event {
-            AgentEvent::ItemCompleted(notification) => {
-                if let TurnItem::AgentMessage { text, .. } = notification.item {
-                    completed_agent_messages.push(text);
-                }
-            }
-            AgentEvent::ProviderFailureDetected { failure, .. } => {
-                assert_eq!(failure.class, ProviderFailureClass::Unknown);
-                assert_eq!(
-                    failure.provider_code.as_deref(),
-                    Some("tool_schema_dump_response")
-                );
-                assert!(!failure.is_recoverable_hint);
-                assert_eq!(
-                    failure.message.as_deref(),
-                    Some("model returned tool schema definitions instead of a final answer")
-                );
-                assert!(
-                    completed_agent_messages.is_empty(),
-                    "tool schema dump provider failure must not create AgentMessage items"
-                );
-                assert_eq!(
-                    provider.snapshot_requests().len(),
-                    3,
-                    "provider failure should happen on the third consecutive schema dump no-tool round"
-                );
-                return;
-            }
-            AgentEvent::TurnCompleted { .. } => {
-                panic!("tool schema dump no-tool rounds must not complete the turn")
-            }
-            AgentEvent::TurnFailed { error, .. } => {
-                panic!(
-                    "tool schema dump no-tool rounds should surface provider failure, not TurnFailed: {error}"
-                )
-            }
-            _ => {}
-        }
-    }
-
-    panic!("provider failure was not emitted for repeated tool schema dump no-tool rounds")
+    let observed = start_simple_turn(
+        &manager,
+        "schema_exact_thread",
+        "workspace",
+        "schema_exact_turn",
+        ThreadMode::Agent,
+        "sequenced-text",
+        "Generate exact JSON schema",
+    )
+    .await;
+    assert_turn_completed(&observed);
+    assert_eq!(provider.snapshot_requests().len(), 1);
+    assert!(
+        !observed
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ProviderFailureDetected { .. }))
+    );
 }
 
 #[tokio::test]
@@ -7616,6 +8152,55 @@ async fn phase_12_post_turn_hook_does_not_create_task_anchor() {
 }
 
 #[tokio::test]
+async fn required_post_prompt_hook_failure_prevents_main_provider_dispatch() {
+    for failure_policy in [
+        HookFailurePolicy::Required,
+        HookFailurePolicy::FailClosed,
+        HookFailurePolicy::BestEffort,
+    ] {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(CaptureAgentProvider::default());
+        let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+        let manager = AgentManager::new(registry, test_tool_loop_config());
+        manager
+            .set_hook_runtime(Some(recording_hook_runtime_with_phase_failures(
+                calls.clone(),
+                Vec::new(),
+                failure_policy,
+                vec![HookPhase::TurnPostPromptCompile],
+            )))
+            .await;
+        let observed = start_simple_turn(
+            &manager,
+            "thread_post_prompt",
+            "workspace_post_prompt",
+            "turn_post_prompt",
+            ThreadMode::Agent,
+            "capture",
+            "ordinary answer",
+        )
+        .await;
+        if failure_policy == HookFailurePolicy::BestEffort {
+            assert!(matches!(
+                observed.last(),
+                Some(AgentEvent::TurnCompleted { .. })
+            ));
+            assert!(!visible_test_requests(provider.snapshot_requests()).is_empty());
+        } else {
+            assert_turn_failed(&observed, "required post-prompt hook failed");
+            assert!(visible_test_requests(provider.snapshot_requests()).is_empty());
+        }
+        assert_eq!(
+            snapshot_hook_calls(&calls)
+                .iter()
+                .filter(|call| call.phase == HookPhase::TurnPostPromptCompile)
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
 async fn phase_08_required_policy_hook_failure_fails_turn() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let provider = Arc::new(CaptureAgentProvider::default());
@@ -8115,7 +8700,7 @@ async fn phase_09_context_budget_truncates_predictably() {
 }
 
 #[tokio::test]
-async fn phase_09_failed_context_hook_yields_diagnostic_and_empty_context() {
+async fn phase_09_required_context_failure_aborts_before_compile_and_provider() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let provider = Arc::new(CaptureAgentProvider::default());
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
@@ -8139,6 +8724,86 @@ async fn phase_09_failed_context_hook_yields_diagnostic_and_empty_context() {
         "phase 09 context failure",
     )
     .await;
+    assert_turn_failed(&observed, "required prompt-context preparation failed");
+    assert!(provider.snapshot_requests().is_empty());
+    let calls = snapshot_hook_calls(&calls);
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.phase == HookPhase::TurnPrePromptContext)
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.phase == HookPhase::TurnPrePromptCompile)
+    );
+}
+
+#[tokio::test]
+async fn phase_09_fail_closed_context_failure_aborts_before_compile_and_provider() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime_with_phase_failures(
+            calls.clone(),
+            Vec::new(),
+            HookFailurePolicy::FailClosed,
+            vec![HookPhase::TurnPrePromptContext],
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase09_context_fail_closed",
+        "ws_phase09_context_fail_closed",
+        "turn_phase09_context_fail_closed",
+        ThreadMode::Agent,
+        "capture",
+        "phase 09 context failure",
+    )
+    .await;
+    assert_turn_failed(&observed, "required prompt-context preparation failed");
+    assert!(provider.snapshot_requests().is_empty());
+    let calls = snapshot_hook_calls(&calls);
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.phase == HookPhase::TurnPrePromptContext)
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.phase == HookPhase::TurnPrePromptCompile)
+    );
+}
+
+#[tokio::test]
+async fn phase_09_explicit_best_effort_context_failure_can_continue() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime_with_phase_failures(
+            calls.clone(),
+            Vec::new(),
+            HookFailurePolicy::BestEffort,
+            vec![HookPhase::TurnPrePromptContext],
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase09_context_best_effort",
+        "ws_phase09_context_best_effort",
+        "turn_phase09_context_best_effort",
+        ThreadMode::Agent,
+        "capture",
+        "phase 09 context failure",
+    )
+    .await;
     assert_turn_completed(&observed);
 
     let calls = snapshot_hook_calls(&calls);
@@ -8148,9 +8813,7 @@ async fn phase_09_failed_context_hook_yields_diagnostic_and_empty_context() {
         .expect("pre-prompt-compile hook called");
     let set = &pre_prompt_compile.prompt_context_set;
     assert!(set.entries.is_empty());
-    assert!(set.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code.as_str() == "prompt_context.runtime_failed" && diagnostic.safe_for_user
-    }));
+    assert!(!set.diagnostics.is_empty());
     let requests = provider.snapshot_requests();
     assert_eq!(requests.len(), 1);
     let prompt = requests[0]
@@ -8749,18 +9412,18 @@ async fn phase_11_review_guard_injects_after_final_answer_attempt_and_allows_acc
     );
     assert_eq!(task_provider_for_assert.call_counts(), (1, 0, 0));
 
-    let codes = completed_system_event_codes(&observed);
+    let codes = completed_native_control_directives(&observed);
     assert_eq!(
         codes
             .iter()
-            .filter(|code| code.as_str() == "task.review_required.observed")
+            .filter(|code| **code == pioneer_protocol::NativeHostDirective::ReviewTaskResults)
             .count(),
         1
     );
     assert!(
         !codes
             .iter()
-            .any(|code| code.as_str() == "task.terminal.observed"),
+            .any(|code| *code == pioneer_protocol::NativeHostDirective::ObserveTaskResults),
         "review-required observation must not be recorded as a terminal task observation"
     );
     let requests = provider.snapshot_requests();
@@ -8863,18 +9526,18 @@ async fn phase_11_review_guard_revise_waits_for_revision_candidate_then_accepts(
     );
     assert_eq!(task_provider_for_assert.call_counts(), (1, 1, 1));
 
-    let codes = completed_system_event_codes(&observed);
+    let codes = completed_native_control_directives(&observed);
     assert_eq!(
         codes
             .iter()
-            .filter(|code| code.as_str() == "task.review_required.observed")
+            .filter(|code| **code == pioneer_protocol::NativeHostDirective::ReviewTaskResults)
             .count(),
         2
     );
     assert!(
         !codes
             .iter()
-            .any(|code| code.as_str() == "task.terminal.observed"),
+            .any(|code| *code == pioneer_protocol::NativeHostDirective::ObserveTaskResults),
         "review-required observation must not be recorded as a terminal task observation"
     );
     let requests = provider.snapshot_requests();
@@ -8939,18 +9602,18 @@ async fn phase_11_repeated_review_observation_does_not_spam_or_complete() {
         "Attached task result review is still required. Call task_accept, task_revise, or task_cancel for each pending review candidate before providing the final answer.",
     );
 
-    let codes = completed_system_event_codes(&observed);
+    let codes = completed_native_control_directives(&observed);
     assert_eq!(
         codes
             .iter()
-            .filter(|code| code.as_str() == "task.review_required.observed")
+            .filter(|code| **code == pioneer_protocol::NativeHostDirective::ReviewTaskResults)
             .count(),
         1
     );
     assert!(
         !codes
             .iter()
-            .any(|code| code.as_str() == "task.terminal.observed"),
+            .any(|code| *code == pioneer_protocol::NativeHostDirective::ObserveTaskResults),
         "review-required observation must not be recorded as a terminal task observation"
     );
     assert!(completed_agent_message_text(&observed).is_none());
@@ -11694,12 +12357,39 @@ async fn remembered_memory_is_recalled_in_new_thread_and_forget_suppresses_it() 
     );
 }
 
-fn loop_budget_manager(
+struct MissingBudgetToolHandler;
+#[async_trait::async_trait]
+impl ToolHandler for MissingBudgetToolHandler {
+    async fn handle(
+        &self,
+        invocation: ToolInvocation,
+        _: ToolEventTrace,
+    ) -> Result<Box<dyn pioneer_tools::ToolOutput>, ToolError> {
+        Err(ToolError::NotFound(invocation.tool_name))
+    }
+}
+
+async fn loop_budget_manager(
     provider: Arc<LoopBudgetProvider>,
     tool_loop_config: ToolLoopConfig,
 ) -> AgentManager {
     let registry = Arc::new(ProviderRegistry::with_provider("loop-budget", provider));
-    AgentManager::new(registry, tool_loop_config)
+    let manager = AgentManager::new(registry, tool_loop_config);
+    let mut bundle = fake_task_tool_bundle_for_names(
+        &["missing_loop_budget_tool"],
+        Arc::new(MissingBudgetToolHandler),
+    );
+    bundle.specs[0].spec.recovery = ToolRecoveryMetadata {
+        retry_class: ToolRetryClass::Never,
+        idempotency_mode: ToolIdempotencyMode::None,
+        max_attempts: 1,
+        can_resume: false,
+        max_wall_clock_secs: None,
+    };
+    manager
+        .set_turn_tool_provider(Some(Arc::new(StaticTurnToolProvider { bundle })))
+        .await;
+    manager
 }
 
 fn tool_result_message_count(request: &ChatRequest) -> usize {
@@ -11750,7 +12440,7 @@ async fn tool_loop_provider_round_budget_requests_continuation_without_final_no_
     set_execution_window_budget(&mut config, 2, 16);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let mut events = start_loop_budget_turn(
         &manager,
         "thr_loop_budget_rounds",
@@ -11809,8 +12499,8 @@ async fn wall_clock_window_checkpoints_before_executing_the_next_tool_batch() {
         SequencedToolProvider::new(
             vec![ProviderToolCall {
                 id: "call_after_elapsed_window".to_owned(),
-                name: "must_not_execute_after_elapsed_window".to_owned(),
-                arguments: serde_json::json!({}).to_string(),
+                name: "list_dir".to_owned(),
+                arguments: serde_json::json!({"path":".","depth":0,"limit":1}).to_string(),
             }],
             "final after time checkpoint",
         )
@@ -11957,6 +12647,178 @@ async fn request_tools_selection_survives_execution_window_and_not_next_turn() {
 }
 
 #[tokio::test]
+async fn native_identical_read_batch_observes_exact_allowance_before_the_next_spawn() {
+    for mode in [
+        pioneer_tools::ToolNoProgressMode::Enforce,
+        pioneer_tools::ToolNoProgressMode::Observe,
+        pioneer_tools::ToolNoProgressMode::Disabled,
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler: Arc<dyn ToolHandler> = Arc::new(ConfirmedStalledReadHandler(calls.clone()));
+        let provider = Arc::new(SequencedToolProvider::new(
+            (0..5)
+                .map(|i| ProviderToolCall {
+                    id: format!("same_read_{i}"),
+                    name: "batch_wait".to_owned(),
+                    arguments: "{}".to_owned(),
+                })
+                .collect(),
+            "all observed results reported",
+        ));
+        let mut config = test_tool_loop_config();
+        config.no_progress_mode = mode;
+        let manager = AgentManager::new(
+            Arc::new(ProviderRegistry::with_provider(
+                "sequenced-tools",
+                provider.clone(),
+            )),
+            config,
+        );
+        manager
+            .set_turn_tool_provider(Some(Arc::new(StaticTurnToolProvider {
+                bundle: fake_task_tool_bundle_for_names(&["batch_wait"], handler),
+            })))
+            .await;
+        manager
+            .ensure_thread("duplicate_thread", "duplicate_workspace")
+            .await
+            .unwrap();
+        let mut events = subscribe_agent_events(&manager, "duplicate_thread").await;
+        manager
+            .start_test_turn_with_default_profile_and_capabilities(
+                "duplicate_thread",
+                "duplicate_turn",
+                ThreadMode::Agent,
+                "test-model",
+                "sequenced-tools",
+                HashMap::new(),
+                vec![UserInput::Text {
+                    text: "observe the same job revision".to_owned(),
+                    text_elements: Vec::new(),
+                }],
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let _terminal = recv_events_until_terminal(&mut events).await;
+        // The first result establishes the authoritative baseline; only the
+        // next two timeouts prove unchanged state. Later identical calls must
+        // see that updated parent state before they can execute.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            if mode == pioneer_tools::ToolNoProgressMode::Enforce {
+                3
+            } else {
+                5
+            }
+        );
+        let requests = provider.snapshot_requests();
+        let replay = requests
+            .get(1)
+            .expect("the complete batch reaches provider replay");
+        let ids = replay
+            .messages
+            .iter()
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            (0..5).map(|i| format!("same_read_{i}")).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_batch_drains_bounded_read_segments_around_an_unknown_shared_mutation() {
+    let state = Arc::new(OrderedBatchState::default());
+    let barrier = Arc::new(tokio::sync::Barrier::new(4));
+    let names = (0..8)
+        .map(|i| format!("batch_read_{i}"))
+        .chain([
+            "batch_unknown_mutation".to_owned(),
+            "batch_read_after".to_owned(),
+        ])
+        .collect::<Vec<_>>();
+    let bundle = ToolExtensionBundle {
+        specs: names.iter().map(|name| fake_task_tool_spec(name)).collect(),
+        handlers: names
+            .iter()
+            .map(|name| {
+                let handler: Arc<dyn ToolHandler> = Arc::new(OrderedBatchHandler {
+                    state: state.clone(),
+                    before_barrier: barrier.clone(),
+                    mutation: name == "batch_unknown_mutation",
+                    after: name == "batch_read_after",
+                });
+                (name.clone(), handler)
+            })
+            .collect(),
+    };
+    let provider = Arc::new(SequencedToolProvider::new(
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| ProviderToolCall {
+                id: format!("ordered_{i}"),
+                name: name.clone(),
+                arguments: "{}".to_owned(),
+            })
+            .collect(),
+        "ordered complete",
+    ));
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::with_provider(
+            "sequenced-tools",
+            provider.clone(),
+        )),
+        test_tool_loop_config(),
+    );
+    manager
+        .set_turn_tool_provider(Some(Arc::new(StaticTurnToolProvider { bundle })))
+        .await;
+    manager
+        .ensure_thread("ordered_thread", "ordered_workspace")
+        .await
+        .unwrap();
+    let mut events = subscribe_agent_events(&manager, "ordered_thread").await;
+    manager
+        .start_test_turn_with_default_profile_and_capabilities(
+            "ordered_thread",
+            "ordered_turn",
+            ThreadMode::Agent,
+            "test-model",
+            "sequenced-tools",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "observe, mutate, observe".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let observed = recv_events_until_terminal(&mut events).await;
+    assert_turn_completed(&observed);
+    assert_eq!(state.completed_before.load(Ordering::SeqCst), 8);
+    assert_eq!(state.completed_after.load(Ordering::SeqCst), 1);
+    assert_eq!(state.max_reads.load(Ordering::SeqCst), 4);
+    let requests = provider.snapshot_requests();
+    let results = requests
+        .last()
+        .unwrap()
+        .messages
+        .iter()
+        .filter_map(|message| message.tool_call_id.as_deref())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        (0..10).map(|i| format!("ordered_{i}")).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn completed_parallel_tool_result_is_journaled_before_the_batch_finishes() {
     let slow_release = Arc::new(tokio::sync::Semaphore::new(0));
     let handler: Arc<dyn ToolHandler> = Arc::new(BatchJournalHandler {
@@ -12095,7 +12957,7 @@ async fn production_regression_repeated_failed_tools_continue_without_final_no_t
     set_execution_window_budget(&mut config, 2, 16);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let mut events = start_loop_budget_turn(
         &manager,
         "thr_production_failed_tools_window_regression",
@@ -12177,7 +13039,16 @@ async fn execution_window_continuation_restarts_same_turn_and_completes_next_win
     set_execution_window_budget(&mut config, 2, 16);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
+    let initial_hook_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            initial_hook_calls.clone(),
+            Vec::new(),
+            HookFailurePolicy::FailClosed,
+            false,
+        )))
+        .await;
     let mut events = start_loop_budget_turn(
         &manager,
         "thr_loop_budget_multi_window",
@@ -12186,6 +13057,25 @@ async fn execution_window_continuation_restarts_same_turn_and_completes_next_win
     .await;
 
     let observed_events = recv_events_until_terminal(&mut events).await;
+    for phase in [
+        HookPhase::TurnPrePolicy,
+        HookPhase::TurnPrePromptContext,
+        HookPhase::TurnPreToolMaterialization,
+        HookPhase::TurnPostPreflightPromptContext,
+        HookPhase::TurnPrePromptCompile,
+        HookPhase::TurnPostPromptCompile,
+    ] {
+        assert_eq!(
+            initial_hook_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.phase == phase)
+                .count(),
+            1,
+            "completed initial phase must run once across windows: {phase}"
+        );
+    }
     assert!(matches!(
         observed_events.last(),
         Some(AgentEvent::TurnCompleted { turn_id, .. })
@@ -12349,23 +13239,54 @@ async fn provider_recovery_success_boundary_survives_execution_window_continuati
         LoopBudgetProviderMode::TwoToolRoundsThenFinal,
         1,
     ));
+    provider.fail_first_main.store(true, Ordering::SeqCst);
     let mut config = test_tool_loop_config();
     set_execution_window_budget(&mut config, 2, 16);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let thread_id = "thr_loop_budget_recovery_window";
     let turn_id = "turn_loop_budget_recovery_window";
     let recovery_job_id = "recovery_job_window_continuation";
     let recovery_attempt_id = "recovery_attempt_window_continuation";
 
-    let mut events = start_loop_budget_turn(&manager, thread_id, turn_id).await;
-    let initial_events = recv_events_until_terminal(&mut events).await;
-    assert!(matches!(
-        initial_events.last(),
-        Some(AgentEvent::TurnCompleted { .. })
-    ));
-
+    manager
+        .ensure_thread(thread_id, "ws_loop_budget")
+        .await
+        .unwrap();
+    let (mut events, checkpoints) =
+        subscribe_agent_events_with_checkpoints(&manager, thread_id).await;
+    manager
+        .start_test_turn_with_default_profile(
+            thread_id,
+            turn_id,
+            ThreadMode::Agent,
+            "test-model",
+            "loop-budget",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "run loop budget test".into(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    loop {
+        let event = timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(event, AgentEvent::ProviderFailureDetected { .. }) {
+            break;
+        }
+        assert!(!matches!(
+            event,
+            AgentEvent::TurnCompleted { .. }
+                | AgentEvent::TurnFailed { .. }
+                | AgentEvent::TurnBlocked { .. }
+        ));
+    }
     provider.next_index.store(0, Ordering::SeqCst);
     provider
         .requests
@@ -12374,6 +13295,7 @@ async fn provider_recovery_success_boundary_survives_execution_window_continuati
         .clear();
     while events.try_recv().is_ok() {}
 
+    let checkpoint = checkpoints.lock().unwrap().get(turn_id).cloned().unwrap();
     manager
         .start_recovery_attempt(
             thread_id,
@@ -12392,11 +13314,11 @@ async fn provider_recovery_success_boundary_survives_execution_window_continuati
                 continue_generation: true,
                 model_override: None,
                 retained_provider_history: Vec::new(),
-                execution_checkpoint_context: None,
+                execution_checkpoint_context: Some(checkpoint),
             },
         )
         .await
-        .expect("recovery request should restart completed turn");
+        .expect("recovery request should continue the failed semantic turn");
 
     let mut recovery_events = Vec::new();
     let mut saw_recovery_success = false;
@@ -12475,7 +13397,7 @@ async fn max_windows_cap_blocks_continuation_without_turn_failed() {
     config.execution_windows.total.max_windows_per_turn = Some(1);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let thread_id = "thr_loop_budget_max_windows";
     let turn_id = "turn_loop_budget_max_windows";
     manager
@@ -12592,7 +13514,7 @@ async fn total_tool_call_cap_blocks_continuation_without_turn_failed() {
     config.execution_windows.total.max_tool_calls_per_turn = Some(1);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let thread_id = "thr_loop_budget_total_tools";
     let turn_id = "turn_loop_budget_total_tools";
     manager
@@ -12664,7 +13586,7 @@ async fn total_tool_call_cap_blocks_continuation_without_turn_failed() {
 }
 
 #[tokio::test]
-async fn failed_tool_results_with_durable_progress_do_not_trip_no_progress_breaker() {
+async fn unknown_tool_results_preserve_general_window_cap_without_fabricating_progress() {
     let provider = Arc::new(LoopBudgetProvider::new(
         LoopBudgetProviderMode::ToolWhileAvailableThenFinal,
         1,
@@ -12678,7 +13600,15 @@ async fn failed_tool_results_with_durable_progress_do_not_trip_no_progress_break
     config.execution_windows.total.max_windows_per_turn = Some(3);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
+    manager
+        .set_turn_tool_provider(Some(Arc::new(StaticTurnToolProvider {
+            bundle: fake_task_tool_bundle_for_names(
+                &["missing_loop_budget_tool"],
+                Arc::new(MemoryFakeHandler),
+            ),
+        })))
+        .await;
     let thread_id = "thr_loop_budget_failed_windows";
     let turn_id = "turn_loop_budget_failed_windows";
     let mut events = start_loop_budget_turn(&manager, thread_id, turn_id).await;
@@ -12691,11 +13621,11 @@ async fn failed_tool_results_with_durable_progress_do_not_trip_no_progress_break
     };
     assert!(
         reason.contains("max execution windows per turn reached"),
-        "failed tool results are durable progress, so only the explicit administrative cap may block: {reason}"
+        "unknown results cannot prove semantic stall or advancement; the explicit administrative cap still applies: {reason}"
     );
     assert!(
         !reason.contains("max_consecutive_no_progress_windows"),
-        "durable progress must reset the recovery circuit breaker: {reason}"
+        "Unknown must not be reported as confirmed no-progress: {reason}"
     );
 }
 
@@ -12710,7 +13640,7 @@ async fn memory_recall_tools_remain_available_for_budget_continuation() {
     set_execution_window_budget(&mut config, 2, 16);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let memory_provider = Arc::new(RecordingMemoryProvider::new(
         Ok(MemoryRecallSnapshot {
             items: vec![memory_recall_item(
@@ -12775,7 +13705,7 @@ async fn memory_recall_tools_remain_available_for_budget_continuation() {
 }
 
 #[tokio::test]
-async fn provider_tools_after_tools_disabled_requests_continuation_without_turn_failed() {
+async fn provider_tools_after_tools_disabled_are_rejected_before_dispatch_and_checkpointed() {
     let provider = Arc::new(LoopBudgetProvider::new(
         LoopBudgetProviderMode::AlwaysTools,
         1,
@@ -12784,73 +13714,45 @@ async fn provider_tools_after_tools_disabled_requests_continuation_without_turn_
     set_execution_window_budget(&mut config, 8, 16);
     config.retry.max_recoverable_retry_rounds_per_episode = 1;
     config.retry.max_same_tool_error_retries_per_episode = 16;
-    let manager = loop_budget_manager(provider.clone(), config);
-    let mut events = start_loop_budget_turn(
+    let manager = loop_budget_manager(provider.clone(), config).await;
+    let (observed, checkpoint) = start_failed_native_fixture(
         &manager,
         "thr_loop_budget_disabled_tools",
+        "ws_loop_budget",
         "turn_loop_budget_disabled_tools",
+        "loop-budget",
+        "exercise no-tools native response",
     )
     .await;
-
-    let observed_events = recv_events_until_loop_budget_action(
-        &mut events,
-        ToolLoopBudgetLimitKind::ProviderReturnedToolsAfterToolsDisabled,
-        ToolLoopBudgetAction::ContinueInNextWindow,
-    )
-    .await;
-    let budget_index = observed_events
-        .iter()
-        .position(|event| {
-            matches!(
-                event,
-                AgentEvent::TurnToolLoopBudgetExceeded(notification)
-                    if notification.limit_kind
-                        == ToolLoopBudgetLimitKind::ProviderReturnedToolsAfterToolsDisabled
-                        && notification.action == ToolLoopBudgetAction::ContinueInNextWindow
-            )
-        })
-        .expect("provider tool-call leak should request continuation");
     assert!(
-        !observed_events[..=budget_index]
-            .iter()
-            .any(|event| matches!(event, AgentEvent::TurnFailed { .. })),
-        "provider tools after tools-disabled must not fail the turn"
+        matches!(observed.last(), Some(AgentEvent::ProviderFailureDetected { failure, .. }) if failure.class == ProviderFailureClass::ProviderRejected)
     );
-
-    timeout(Duration::from_secs(2), async {
-        while provider.snapshot_requests().len() < 4 {
-            yield_now().await;
-        }
-    })
-    .await
-    .expect("continuation should causally schedule the next provider round");
+    assert_eq!(
+        checkpoint.payload.window.exhaustion_reason,
+        Some(ExecutionWindowExhaustionReason::ProviderFailureContinuation)
+    );
     let requests = provider.snapshot_requests();
-    assert!(
-        requests.len() >= 4,
-        "continuation should schedule another provider request after the no-tools violation"
-    );
     let no_tools_index = requests
         .iter()
         .position(|request| request.tools.is_none())
-        .expect("fixture should enter one no-tools finalization round before continuation");
+        .expect("fixture reaches a no-tools request");
+    assert_eq!(no_tools_index, 2);
     assert_eq!(
-        tool_result_message_count(&requests[no_tools_index]),
-        2,
-        "only tool-capable retry rounds should execute tools before no-tools violation"
+        requests.len(),
+        3,
+        "an undeclared response does not cause an automatic provider retry"
     );
-    assert!(
-        requests
-            .iter()
-            .skip(no_tools_index + 1)
-            .any(|request| request.tools.is_some()),
-        "next execution window should restore tools after provider tools-disabled violation"
+    assert_eq!(tool_result_message_count(&requests[no_tools_index]), 2);
+    assert_eq!(
+        checkpoint.payload.tools.executed_count, 2,
+        "rejected no-tools calls never execute"
     );
 }
 
 #[tokio::test]
 async fn failed_task_create_cannot_finalize_as_success_claim() {
     let task_tools = Arc::new(FailingTaskMutationToolProvider::default());
-    let provider = Arc::new(SequencedToolProvider::new(
+    let provider = Arc::new(SequencedToolProvider::with_preflight_response(
         vec![ProviderToolCall {
             id: "call_task_create_failed_then_claim_success".to_owned(),
             name: "task_create".to_owned(),
@@ -12862,6 +13764,7 @@ async fn failed_task_create_cannot_finalize_as_success_claim() {
             .to_string(),
         }],
         "задача настроена",
+        preflight_response_with_visible_tools(&["task_create"]),
     ));
     let registry = Arc::new(ProviderRegistry::with_provider(
         "sequenced-tools",
@@ -12887,7 +13790,7 @@ async fn failed_task_create_cannot_finalize_as_success_claim() {
     let final_text =
         completed_agent_message_text(&observed).expect("final assistant text should be emitted");
     assert!(
-        final_text.contains("Task mutation failed"),
+        final_text.contains("unresolved postcondition"),
         "final text should report the primary failed mutation, got: {final_text}"
     );
     assert!(
@@ -12918,45 +13821,49 @@ async fn task_mutation_failure_preserves_root_cause_when_provider_returns_tools_
         .set_task_tool_provider(Some(task_tools.clone()))
         .await;
 
-    let observed = start_simple_turn(
+    let (observed, checkpoint) = start_failed_native_fixture(
         &manager,
         "thr_task_mutation_provider_tools_disabled",
         "ws_task_mutation_provider_tools_disabled",
         "turn_task_mutation_provider_tools_disabled",
-        ThreadMode::Agent,
         "always-task-create",
         "create a scheduled task",
     )
     .await;
-
-    assert_turn_completed(&observed);
     assert!(
-        !observed.iter().any(|event| match event {
-            AgentEvent::TurnFailed { .. } => true,
-            _ => false,
-        }),
-        "deterministic task mutation finalization must not surface a turn failure"
-    );
-    let final_text =
-        completed_agent_message_text(&observed).expect("final assistant text should be emitted");
-    assert!(final_text.contains("Task mutation failed"), "{final_text}");
-    assert!(final_text.contains("task_create"), "{final_text}");
-    assert!(
-        !final_text.contains("provider_returned_tools_after_tools_disabled"),
-        "root cause must stay the task mutation failure, got: {final_text}"
+        matches!(observed.last(), Some(AgentEvent::ProviderFailureDetected { failure, .. }) if failure.class == ProviderFailureClass::ProviderRejected)
     );
     assert_eq!(
         task_tools.handler.calls(),
         0,
-        "invalid task_create arguments and final no-tools tool calls must not execute mutations"
+        "invalid arguments and undeclared no-tools replies never mutate a task"
     );
-    let requests = provider.snapshot_requests();
+    let state = checkpoint.payload.native_semantic_state.as_ref().unwrap();
+    let failures = state["task_mutation_guard"]["failures_since_last_success"]
+        .as_array()
+        .unwrap();
     assert!(
-        requests
+        !failures.is_empty(),
+        "decoder failure cannot erase an unresolved task postcondition"
+    );
+    assert!(failures.iter().all(|failure| {
+        failure["tool_name"] == "task_create"
+            && failure["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("trigger"))
+    }));
+    assert!(
+        !observed
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnCompleted { .. })),
+        "no false final success is published"
+    );
+    assert!(
+        provider
+            .snapshot_requests()
             .iter()
             .skip(1)
-            .any(|request| request.tools.is_none()),
-        "task mutation finalization should still include a no-tools provider request"
+            .any(|request| request.tools.is_none())
     );
 }
 
@@ -12980,18 +13887,21 @@ async fn partial_task_tool_name_does_not_emit_visible_truncated_tool_row() {
         .set_task_tool_provider(Some(task_tools.clone()))
         .await;
 
-    let observed = start_simple_turn(
+    let (observed, checkpoint) = start_failed_native_fixture(
         &manager,
         "thr_partial_task_tool_name",
         "ws_partial_task_tool_name",
         "turn_partial_task_tool_name",
-        ThreadMode::Agent,
         "sequenced-tools",
         "create a scheduled task",
     )
     .await;
 
-    assert_turn_completed(&observed);
+    assert!(
+        matches!(observed.last(), Some(AgentEvent::ProviderFailureDetected { failure, .. }) if failure.class == ProviderFailureClass::ProviderRejected)
+    );
+    assert_eq!(checkpoint.payload.tools.executed_count, 0);
+    assert_eq!(provider.snapshot_requests().len(), 1);
     assert_eq!(
         task_tools.handler.calls(),
         0,
@@ -13022,7 +13932,7 @@ async fn tool_loop_total_tool_call_budget_prevents_execution() {
     set_execution_window_budget(&mut config, 8, 2);
     config.retry.max_recoverable_retry_rounds_per_episode = 8;
     config.retry.max_same_tool_error_retries_per_episode = 8;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let mut events = start_loop_budget_turn(
         &manager,
         "thr_loop_budget_tool_calls",
@@ -13073,7 +13983,7 @@ async fn tool_loop_recoverable_retry_rounds_are_bounded() {
     set_execution_window_budget(&mut config, 8, 8);
     config.retry.max_recoverable_retry_rounds_per_episode = 1;
     config.retry.max_same_tool_error_retries_per_episode = 8;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let mut events = start_loop_budget_turn(
         &manager,
         "thr_loop_budget_retries",
@@ -13142,7 +14052,7 @@ async fn empty_response_after_retry_exhaustion_retries_in_no_tools_mode() {
     set_execution_window_budget(&mut config, 8, 8);
     config.retry.max_recoverable_retry_rounds_per_episode = 1;
     config.retry.max_same_tool_error_retries_per_episode = 8;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let mut events = start_loop_budget_turn(
         &manager,
         "thr_empty_after_retry_exhaustion",
@@ -13193,7 +14103,7 @@ async fn tool_loop_same_failure_signature_is_bounded() {
     set_execution_window_budget(&mut config, 8, 8);
     config.retry.max_recoverable_retry_rounds_per_episode = 8;
     config.retry.max_same_tool_error_retries_per_episode = 1;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let mut events = start_loop_budget_turn(
         &manager,
         "thr_loop_budget_same_failure",
@@ -13234,7 +14144,7 @@ async fn tool_loop_distinct_failure_signatures_keep_tools_available() {
     config.retry.max_recoverable_retry_rounds_per_episode = 8;
     config.retry.max_same_tool_error_retries_per_episode = 3;
     config.retry.max_retries_per_tool_name_per_episode = 8;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let mut events = start_loop_budget_turn(
         &manager,
         "thr_distinct_tool_failures",
@@ -13276,7 +14186,7 @@ async fn tool_retry_budget_resets_after_successful_episode() {
     config.retry.max_recoverable_retry_rounds_per_episode = 1;
     config.retry.max_same_tool_error_retries_per_episode = 1;
     config.retry.max_retries_per_tool_name_per_episode = 1;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let mut events = start_loop_budget_turn(
         &manager,
         "thr_loop_budget_retry_episode_reset",
@@ -13475,7 +14385,7 @@ async fn start_turn_initializes_first_execution_window_index() {
     ));
     let mut config = test_tool_loop_config();
     set_execution_window_budget(&mut config, 2, 16);
-    let manager = loop_budget_manager(provider, config);
+    let manager = loop_budget_manager(provider, config).await;
     let thread_id = "thr_initial_window_index";
     let workspace_id = "ws_initial_window_index";
     let turn_id = "turn_initial_window_index";
@@ -13720,8 +14630,9 @@ async fn non_tool_recovery_request_restarts_turn_without_failing() {
 }
 
 #[tokio::test]
-async fn continue_generation_recovery_is_compiled_into_system_prompt() {
+async fn recovery_checkpoint_is_compiled_into_the_same_turn_system_prompt() {
     let provider = Arc::new(CaptureStandardProvider::default());
+    provider.fail_first_main.store(true, Ordering::SeqCst);
     let registry = Arc::new(ProviderRegistry::with_provider(
         "capture-standard",
         provider.clone(),
@@ -13735,7 +14646,8 @@ async fn continue_generation_recovery_is_compiled_into_system_prompt() {
         .await
         .expect("thread should be created");
 
-    let mut events = subscribe_agent_events(&manager, thread_id).await;
+    let (mut events, checkpoints) =
+        subscribe_agent_events_with_checkpoints(&manager, thread_id).await;
 
     manager
         .start_test_turn_with_default_profile_and_capabilities(
@@ -13761,13 +14673,19 @@ async fn continue_generation_recovery_is_compiled_into_system_prompt() {
             .expect("must receive agent event in time")
             .expect("broadcast should remain open");
 
-        if matches!(event, AgentEvent::TurnCompleted { .. }) {
+        if matches!(event, AgentEvent::ProviderFailureDetected { .. }) {
             break;
         }
     }
 
     let recovery_job_id = "recovery_job_2";
     let recovery_attempt_id = "recovery_attempt_2";
+    let checkpoint = checkpoints
+        .lock()
+        .unwrap()
+        .get(turn_id)
+        .cloned()
+        .expect("failed native attempt must close its checkpoint");
     manager
         .start_recovery_attempt(
             thread_id,
@@ -13786,11 +14704,11 @@ async fn continue_generation_recovery_is_compiled_into_system_prompt() {
                 continue_generation: true,
                 model_override: None,
                 retained_provider_history: Vec::new(),
-                execution_checkpoint_context: None,
+                execution_checkpoint_context: Some(checkpoint),
             },
         )
         .await
-        .expect("recovery request should restart completed turn");
+        .expect("recovery request should continue the failed semantic turn");
 
     let mut saw_recovery_success = false;
     for _ in 0..40 {
@@ -13828,12 +14746,12 @@ async fn continue_generation_recovery_is_compiled_into_system_prompt() {
     assert!(
         continuation_prompt
             .full_system_text
-            .contains("Continue from where it stopped without repeating prior text.")
+            .contains("Original request preview: hello")
     );
     assert!(
         continuation_prompt
             .full_system_text
-            .contains("Recovery Continuation")
+            .contains("Execution Continuation")
     );
     assert!(
         continuation_prompt
@@ -13860,7 +14778,8 @@ async fn provider_recovery_success_boundary_clears_recovery_before_later_provide
         .ensure_thread(thread_id, "ws_000000000000000004b")
         .await
         .expect("thread should be created");
-    let mut events = subscribe_agent_events(&manager, thread_id).await;
+    let (mut events, checkpoints) =
+        subscribe_agent_events_with_checkpoints(&manager, thread_id).await;
 
     manager
         .start_test_turn_with_default_profile_and_capabilities(
@@ -13900,6 +14819,7 @@ async fn provider_recovery_success_boundary_clears_recovery_before_later_provide
         "initial provider failure should be emitted before recovery starts"
     );
 
+    let checkpoint = checkpoints.lock().unwrap().get(turn_id).cloned().unwrap();
     manager
         .start_recovery_attempt(
             thread_id,
@@ -13918,7 +14838,7 @@ async fn provider_recovery_success_boundary_clears_recovery_before_later_provide
                 continue_generation: false,
                 model_override: None,
                 retained_provider_history: Vec::new(),
-                execution_checkpoint_context: None,
+                execution_checkpoint_context: Some(checkpoint),
             },
         )
         .await
@@ -13940,12 +14860,7 @@ async fn provider_recovery_success_boundary_clears_recovery_before_later_provide
             }
             AgentEvent::ProviderFailureDetected {
                 failure, recovery, ..
-            } if failure
-                .message
-                .as_deref()
-                .unwrap_or_default()
-                .contains("late provider failure") =>
-            {
+            } if failure.class == ProviderFailureClass::Unknown => {
                 assert!(
                     saw_recovery_success,
                     "recovery success must be emitted before the later provider failure"
@@ -14462,7 +15377,7 @@ async fn active_skill_contributes_dynamic_tool_definition_to_model_request() {
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    assert!(tool_names.contains(&test_skill_tool_name("my-skill", "fetch-data").as_str()));
+    assert!(tool_names.contains(&test_skill_tool_wire_name("my-skill", "fetch-data").as_str()));
     assert!(tool_names.contains(&"read_skill"));
 
     let _ = fs::remove_dir_all(skill_root);
@@ -15037,7 +15952,7 @@ async fn dynamic_skill_tool_executes_and_emits_dynamic_tool_call() {
         .expect("second round must include dynamic tool result");
     assert_eq!(
         dynamic_result.name.as_deref(),
-        Some(test_skill_tool_name("my-skill", "echo-shell").as_str())
+        Some(test_skill_tool_wire_name("my-skill", "echo-shell").as_str())
     );
     assert!(
         dynamic_result.content.contains("shell-ok"),
@@ -15317,7 +16232,7 @@ runtime:
         .expect("second round must include dynamic tool result");
     assert_eq!(
         dynamic_result.name.as_deref(),
-        Some(test_skill_tool_name("my-skill", "echo-shell").as_str())
+        Some(test_skill_tool_wire_name("my-skill", "echo-shell").as_str())
     );
     assert!(
         dynamic_result
@@ -15749,7 +16664,7 @@ async fn invalid_skill_runtime_config_fails_open_to_builtin_tools() {
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
     assert!(tool_names.contains(&"read_file"));
-    assert!(!tool_names.contains(&test_skill_tool_name("my-skill", "bad-proxy").as_str()));
+    assert!(!tool_names.contains(&test_skill_tool_wire_name("my-skill", "bad-proxy").as_str()));
 
     let _ = fs::remove_dir_all(skill_root);
 }
@@ -15839,8 +16754,8 @@ async fn invalid_skill_runtime_tool_is_excluded_per_tool() {
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    assert!(tool_names.contains(&test_skill_tool_name("my-skill", "fetch-data").as_str()));
-    assert!(!tool_names.contains(&test_skill_tool_name("my-skill", "bad-proxy").as_str()));
+    assert!(tool_names.contains(&test_skill_tool_wire_name("my-skill", "fetch-data").as_str()));
+    assert!(!tool_names.contains(&test_skill_tool_wire_name("my-skill", "bad-proxy").as_str()));
 
     let _ = fs::remove_dir_all(skill_root);
 }
@@ -15876,6 +16791,7 @@ impl crate::compaction::controller::NativeContextController for RecordingContext
             None,
         )?;
         Ok(crate::compaction::controller::NativePreparedRequest {
+            covered_native_control_ids: Vec::new(),
             request,
             receipt,
             history_check: crate::compaction::controller::NativeHistoryCheckMetadata {
@@ -15889,6 +16805,15 @@ impl crate::compaction::controller::NativeContextController for RecordingContext
 struct UsageToolProvider(SequencedToolProvider);
 #[async_trait::async_trait]
 impl Provider for UsageToolProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         self.0.name()
     }
@@ -16367,11 +17292,18 @@ async fn cancellation_context_freezes_interrupted_policy_request_handlers_and_cl
             )
             .await
             .unwrap();
-        let AgentDurableEvent::NativeCancellationContextPrepared { preparation, .. } =
-            receiver.recv().await.unwrap()
+        let AgentDurableEvent::NativeCancellationContextPrepared {
+            preparation,
+            prepare_artifact_obligations,
+            ..
+        } = receiver.recv().await.unwrap()
         else {
             panic!("provider work must begin with immutable cancellation registration");
         };
+        assert!(
+            prepare_artifact_obligations,
+            "normal start prepares obligations before dispatch"
+        );
         assert!(
             calls.lock().unwrap().is_empty(),
             "registration cannot run hooks"
@@ -16447,5 +17379,730 @@ async fn cancellation_context_freezes_interrupted_policy_request_handlers_and_cl
         assert_eq!(calls.lock().unwrap().len(), usize::from(enabled));
         receiver.acknowledge_last(Ok(()));
         manager.remove_thread(thread).await;
+    }
+}
+
+struct UnavailableRequiredTaskTools;
+#[async_trait::async_trait]
+impl TaskToolProvider for UnavailableRequiredTaskTools {
+    fn terminal_cleanup_runtime_contract(&self) -> &'static str {
+        "pioneer.test.required-task-preparation.v1"
+    }
+    async fn materialize_task_tools(
+        &self,
+        _: TaskTurnContext,
+    ) -> Result<TaskToolMaterialization, String> {
+        Err("fixture required task service SECRET unavailable".into())
+    }
+    async fn pending_attached_tasks(
+        &self,
+        _: TaskTurnContext,
+    ) -> Result<Vec<super::PendingAttachedTask>, String> {
+        Ok(Vec::new())
+    }
+    async fn review_required_attached_task_observations(
+        &self,
+        _: TaskTurnContext,
+    ) -> Result<Vec<ReviewRequiredTaskObservation>, String> {
+        Ok(Vec::new())
+    }
+    async fn terminal_attached_task_observations(
+        &self,
+        _: TaskTurnContext,
+    ) -> Result<Vec<super::TerminalTaskObservation>, String> {
+        Ok(Vec::new())
+    }
+    async fn cleanup_attached_tasks(&self, _: TaskTurnContext, _: String) -> Result<(), String> {
+        Ok(())
+    }
+    async fn cleanup_attached_tasks_idempotent(
+        &self,
+        _: &str,
+        _: TaskTurnContext,
+        _: String,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn required_task_materialization_failure_cannot_become_an_empty_accepted_manifest() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::with_provider("capture", provider.clone())),
+        test_tool_loop_config(),
+    );
+    manager
+        .set_task_tool_provider(Some(Arc::new(UnavailableRequiredTaskTools)))
+        .await;
+    let observed = start_simple_turn(
+        &manager,
+        "r05-required-task-thread",
+        "r05-workspace",
+        "r05-required-task-turn",
+        ThreadMode::Agent,
+        "capture",
+        "use required task tooling",
+    )
+    .await;
+    assert_turn_blocked(&observed, "required task tooling could not be materialized");
+    assert!(provider.snapshot_requests().is_empty());
+    assert!(
+        !observed
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnCapabilitiesResolved { .. }))
+    );
+    assert!(!format!("{observed:?}").contains("SECRET"));
+}
+
+#[tokio::test]
+async fn required_aggregate_tool_failure_never_dispatches_builtin_only_fallback() {
+    for tool_name in ["request_tools", "required_extension_missing_handler"] {
+        let provider = Arc::new(CaptureAgentProvider::default());
+        let manager = AgentManager::new(
+            Arc::new(ProviderRegistry::with_provider("capture", provider.clone())),
+            test_tool_loop_config(),
+        );
+        let bundle = ToolExtensionBundle {
+            specs: vec![ConfiguredToolSpec::new(
+                ToolSpec::new(
+                    tool_name,
+                    "required extension",
+                    json!({"type":"object", "properties":{}}),
+                    PayloadKind::Function,
+                ),
+                ExecutionClass::Shared,
+                dynamic_unknown_output_policy(),
+            )],
+            handlers: vec![],
+        };
+        manager
+            .set_task_tool_provider(Some(Arc::new(StaticTaskToolProvider {
+                bundle,
+                runtime_contract: "pioneer.test.required-aggregate.v1",
+            })))
+            .await;
+        let observed = start_simple_turn(
+            &manager,
+            "r05-aggregate-thread",
+            "r05-workspace",
+            "r05-aggregate-turn",
+            ThreadMode::Agent,
+            "capture",
+            "keep all required extensions",
+        )
+        .await;
+        assert_turn_blocked(&observed, "required tool runtime could not be constructed");
+        assert!(provider.snapshot_requests().is_empty());
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event, AgentEvent::TurnCapabilitiesResolved { .. }))
+        );
+    }
+}
+
+#[tokio::test]
+async fn required_context_helpers_preserve_runtime_policy_on_both_phases() {
+    use super::hooks::{
+        AgentTurnHookContext, EffectiveTurnPolicySet, EffectiveTurnPromptContextSet,
+        run_agent_turn_post_preflight_prompt_context_hook_phase,
+        run_agent_turn_prompt_context_hook_phase,
+    };
+    for phase in [
+        HookPhase::TurnPrePromptContext,
+        HookPhase::TurnPostPreflightPromptContext,
+    ] {
+        for policy in [
+            HookFailurePolicy::Required,
+            HookFailurePolicy::FailClosed,
+            HookFailurePolicy::BestEffort,
+            HookFailurePolicy::Skip,
+            HookFailurePolicy::Fallback,
+        ] {
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let runtime = recording_hook_runtime_with_phase_failures_and_fallback(
+                calls.clone(),
+                Vec::new(),
+                policy,
+                vec![phase],
+                vec![prompt_context_contribution(
+                    "r05.context.fallback",
+                    "r05",
+                    10,
+                    "required fallback",
+                )],
+            );
+            let context = AgentTurnHookContext::new("r05-ws", "r05-thread", "r05-turn");
+            let result = if phase == HookPhase::TurnPrePromptContext {
+                run_agent_turn_prompt_context_hook_phase(
+                    Some(&runtime),
+                    &context,
+                    &EffectiveTurnPolicySet::empty(),
+                    pioneer_hooks::TurnPrePromptContextHookInput::from_parts(
+                        "input",
+                        Some("model"),
+                        Some("fixture"),
+                    ),
+                )
+                .await
+            } else {
+                run_agent_turn_post_preflight_prompt_context_hook_phase(
+                    Some(&runtime),
+                    &context,
+                    &EffectiveTurnPolicySet::empty(),
+                    &EffectiveTurnPromptContextSet::empty(),
+                    pioneer_hooks::TurnPostPreflightPromptContextHookInput::from_parts(
+                        "input",
+                        Some("model"),
+                        Some("fixture"),
+                    ),
+                )
+                .await
+            };
+            assert_eq!(
+                result.is_ok(),
+                !matches!(
+                    policy,
+                    HookFailurePolicy::Required | HookFailurePolicy::FailClosed
+                ),
+                "{phase:?} {policy:?}"
+            );
+            if policy == HookFailurePolicy::Fallback {
+                assert_eq!(
+                    result.unwrap().clone_hook_prompt_context_set().entries[0]
+                        .content
+                        .as_str(),
+                    "required fallback"
+                );
+            }
+            assert_eq!(
+                snapshot_hook_calls(&calls).len(),
+                usize::from(policy != HookFailurePolicy::Skip)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn invalid_required_context_request_never_reaches_hook_runtime() {
+    use super::hooks::{
+        AgentTurnHookContext, EffectiveTurnPolicySet, EffectiveTurnPromptContextSet,
+        run_agent_turn_post_preflight_prompt_context_hook_phase,
+        run_agent_turn_prompt_context_hook_phase,
+    };
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let runtime = recording_hook_runtime(
+        calls.clone(),
+        Vec::new(),
+        HookFailurePolicy::BestEffort,
+        false,
+    );
+    let context = AgentTurnHookContext::with_runtime_context(
+        "r05-ws",
+        "r05-thread",
+        "r05-turn",
+        super::AgentTurnHookRuntimeContext {
+            actor_id: Some(String::new()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        run_agent_turn_prompt_context_hook_phase(
+            Some(&runtime),
+            &context,
+            &EffectiveTurnPolicySet::empty(),
+            pioneer_hooks::TurnPrePromptContextHookInput::from_parts(
+                "input",
+                Some("model"),
+                Some("fixture")
+            )
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        run_agent_turn_post_preflight_prompt_context_hook_phase(
+            Some(&runtime),
+            &context,
+            &EffectiveTurnPolicySet::empty(),
+            &EffectiveTurnPromptContextSet::empty(),
+            pioneer_hooks::TurnPostPreflightPromptContextHookInput::from_parts(
+                "input",
+                Some("model"),
+                Some("fixture")
+            )
+        )
+        .await
+        .is_err()
+    );
+    assert!(snapshot_hook_calls(&calls).is_empty());
+}
+
+// Intentionally supplies only a transport ceiling, with no model evidence.
+struct UnknownModelEvidenceProvider(Arc<CaptureAgentProvider>);
+#[async_trait::async_trait]
+impl Provider for UnknownModelEvidenceProvider {
+    fn name(&self) -> &str {
+        "unknown-model-evidence"
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.0.capabilities()
+    }
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        self.0.chat(request).await
+    }
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        self.0.stream_chat(request).await
+    }
+}
+
+#[tokio::test]
+async fn native_required_tools_unknown_stops_before_initial_hooks_or_dispatch() {
+    let capture = Arc::new(CaptureAgentProvider::default());
+    let provider = Arc::new(UnknownModelEvidenceProvider(capture.clone()));
+    assert_eq!(
+        provider.model_tool_support("test-model"),
+        pioneer_provider::ModelToolSupport::Unknown
+    );
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::with_provider(
+            "unknown-model-evidence",
+            provider,
+        )),
+        test_tool_loop_config(),
+    );
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls.clone(),
+            Vec::new(),
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+    let events = start_simple_turn(
+        &manager,
+        "r05-unknown-thread",
+        "r05-workspace",
+        "r05-unknown-turn",
+        ThreadMode::Agent,
+        "unknown-model-evidence",
+        "requires native tools",
+    )
+    .await;
+    assert_turn_blocked(
+        &events,
+        "native Agent requires verified model tool support; capability evidence is unknown",
+    );
+    assert!(capture.snapshot_requests().is_empty());
+    assert!(snapshot_hook_calls(&calls).is_empty());
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnCapabilitiesResolved { .. }))
+    );
+}
+
+#[tokio::test]
+async fn ordinary_chat_does_not_require_native_tool_model_evidence() {
+    let capture = Arc::new(CaptureAgentProvider::default());
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::with_provider(
+            "unknown-model-evidence",
+            Arc::new(UnknownModelEvidenceProvider(capture.clone())),
+        )),
+        test_tool_loop_config(),
+    );
+    let events = start_simple_turn(
+        &manager,
+        "r05-chat-unknown-thread",
+        "r05-workspace",
+        "r05-chat-unknown-turn",
+        ThreadMode::Chat,
+        "unknown-model-evidence",
+        "plain chat",
+    )
+    .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnCompleted { .. }))
+    );
+    let requests = capture.snapshot_requests();
+    assert!(!requests.is_empty());
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.tools.as_deref().unwrap_or_default().is_empty())
+    );
+}
+
+#[tokio::test]
+async fn applied_tool_retry_accepts_first_ordinary_final_with_optional_tools() {
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "retry_invalid_read".into(),
+            name: "list_dir".into(),
+            arguments: r#"{"path":42}"#.into(),
+        }],
+        TOOL_SCHEMA_DUMP_RESPONSE,
+    ));
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::with_provider(
+            "sequenced-tools",
+            provider.clone(),
+        )),
+        test_tool_loop_config(),
+    );
+    let events = start_simple_turn(
+        &manager,
+        "retry_final_thread",
+        "workspace",
+        "retry_final_turn",
+        ThreadMode::Agent,
+        "sequenced-tools",
+        "Explain the tool error as exact JSON schema",
+    )
+    .await;
+    assert_turn_completed(&events);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ItemToolRetryScheduled(_))),
+        "fixture must actually apply a retry instruction"
+    );
+    assert_eq!(
+        completed_agent_message_text(&events).as_deref(),
+        Some(TOOL_SCHEMA_DUMP_RESPONSE)
+    );
+    let requests = provider.snapshot_requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "valid optional-tool final must not be discarded for an extra provider round"
+    );
+    assert!(
+        requests[1]
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+    );
+    assert!(requests[1].tool_choice.is_none());
+}
+
+struct DecreasingUsageProvider(AtomicUsize);
+#[async_trait::async_trait]
+impl Provider for DecreasingUsageProvider {
+    fn name(&self) -> &str {
+        "decreasing-usage"
+    }
+    fn model_tool_support(&self, _: &str) -> pioneer_provider::ModelToolSupport {
+        pioneer_provider::ModelToolSupport::Supported
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: true,
+            tool_calling: true,
+            ..Default::default()
+        }
+    }
+    async fn chat(&self, _: ChatRequest) -> anyhow::Result<ChatResponse> {
+        anyhow::bail!("unexpected nonstream")
+    }
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        if is_turn_preflight_request(&request) {
+            return Ok(futures_util::stream::iter(vec![
+                Ok(StreamChunk::delta(TEST_PREFLIGHT_RESPONSE)),
+                Ok(StreamChunk::final_chunk_with(
+                    pioneer_provider::ProviderTermination::Complete,
+                )),
+            ])
+            .boxed());
+        }
+        if self.0.fetch_add(1, Ordering::SeqCst) > 0 {
+            return Ok(futures_util::stream::iter(vec![
+                Ok(StreamChunk::delta("done")),
+                Ok(StreamChunk::final_chunk_with(
+                    pioneer_provider::ProviderTermination::Complete,
+                )),
+            ])
+            .boxed());
+        }
+        let mut charged = StreamChunk::delta("charged intent");
+        charged.usage = Some(pioneer_provider::TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(0),
+            ..Default::default()
+        });
+        let mut correction = StreamChunk::delta("");
+        correction.usage = Some(pioneer_provider::TokenUsage {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            ..Default::default()
+        });
+        Ok(futures_util::stream::iter(vec![
+            Ok(charged),
+            Ok(correction),
+            Ok(StreamChunk::tool_calls(vec![ProviderToolCall {
+                id: "budget-effect".into(),
+                name: "budget_effect".into(),
+                arguments: "{}".into(),
+            }])),
+            Ok(StreamChunk::final_chunk_with(
+                pioneer_provider::ProviderTermination::ToolCalls,
+            )),
+        ])
+        .boxed())
+    }
+}
+struct BudgetEffectHandler(Arc<AtomicUsize>);
+#[async_trait::async_trait]
+impl ToolHandler for BudgetEffectHandler {
+    async fn handle(
+        &self,
+        _: ToolInvocation,
+        _: ToolEventTrace,
+    ) -> Result<Box<dyn pioneer_tools::ToolOutput>, pioneer_tools::ToolError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(FunctionToolOutput::new("effect", true)))
+    }
+}
+
+#[tokio::test]
+async fn warm_native_known_token_cap_prevents_effect_after_decreasing_provider_snapshot() {
+    let provider = Arc::new(DecreasingUsageProvider(AtomicUsize::new(0)));
+    let effects = Arc::new(AtomicUsize::new(0));
+    let mut config = test_tool_loop_config();
+    config
+        .execution_windows
+        .window
+        .max_provider_tokens_per_window = Some(100);
+    config.execution_windows.total.max_windows_per_turn = Some(1);
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::with_provider(
+            "decreasing-usage",
+            provider.clone(),
+        )),
+        config,
+    );
+    manager
+        .set_turn_tool_provider(Some(Arc::new(StaticTurnToolProvider {
+            bundle: fake_task_tool_bundle_for_names(
+                &["budget_effect"],
+                Arc::new(BudgetEffectHandler(effects.clone())),
+            ),
+        })))
+        .await;
+    let thread = "warm_budget_thread";
+    manager.ensure_thread(thread, "workspace").await.unwrap();
+    let mut receiver = manager.take_durable_receiver(thread).await.unwrap();
+    manager
+        .start_test_turn_with_default_profile_and_capabilities(
+            thread,
+            "warm_budget_turn",
+            ThreadMode::Agent,
+            "test-model",
+            "decreasing-usage",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "observe charged budget before effects".into(),
+                text_elements: vec![],
+            }],
+            vec![],
+            vec![],
+        )
+        .await
+        .unwrap();
+    let mut checkpoint = None;
+    let mut terminal = false;
+    for _ in 0..160 {
+        let event = timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        receiver.acknowledge_last(Ok(()));
+        match event {
+            AgentDurableEvent::TurnExecutionWindowCheckpointed { payload, .. } => {
+                checkpoint = Some(payload);
+            }
+            AgentDurableEvent::TurnCompleted { .. }
+            | AgentDurableEvent::TurnFailed { .. }
+            | AgentDurableEvent::TurnBlocked { .. }
+            | AgentDurableEvent::TurnInterrupted { .. } => {
+                terminal = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        terminal,
+        "actual warm admission must reach a terminal event"
+    );
+    assert_eq!(
+        effects.load(Ordering::SeqCst),
+        0,
+        "known spend must reach the real warm gate before tool dispatch"
+    );
+    assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+    let checkpoint = checkpoint.expect("actual warm token quota must checkpoint the original Turn");
+    assert_eq!(checkpoint.turn_id, "warm_budget_turn");
+    assert_eq!(checkpoint.window.provider_token_count, Some(100));
+    assert!(!checkpoint.provider_budget.provider_usage_available);
+    assert_eq!(
+        checkpoint.window.exhaustion_reason,
+        Some(ExecutionWindowExhaustionReason::MaxProviderTokensPerWindow)
+    );
+}
+
+struct ToollessTypedFailureProvider {
+    stream: bool,
+}
+#[async_trait::async_trait]
+impl Provider for ToollessTypedFailureProvider {
+    fn name(&self) -> &str {
+        "tool-less-rate-limit"
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: self.stream,
+            tool_calling: false,
+            ..Default::default()
+        }
+    }
+    fn model_tool_support(&self, _: &str) -> pioneer_provider::ModelToolSupport {
+        pioneer_provider::ModelToolSupport::Unsupported
+    }
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        assert!(request.tools.is_none());
+        Err(pioneer_provider::failure::ProviderTransportFailure {
+            classification: pioneer_provider::failure::classify_transport_status(Some(429), None),
+        }
+        .into())
+    }
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        assert!(request.tools.is_none());
+        Ok(futures_util::stream::iter(vec![
+            Ok(StreamChunk::delta("partial native response")),
+            Ok(StreamChunk::provider_replay_state(
+                pioneer_provider::ProviderReplayState::for_model(
+                    "tool-less-rate-limit",
+                    request.model,
+                    serde_json::json!({"opaque":"original signed failed accumulator"}),
+                ),
+            )),
+            Err(pioneer_provider::failure::ProviderTransportFailure {
+                classification: pioneer_provider::failure::classify_transport_status(
+                    Some(429),
+                    None,
+                ),
+            }
+            .into()),
+        ])
+        .boxed())
+    }
+}
+
+#[tokio::test]
+async fn native_toolless_failure_closes_charged_semantic_window_before_failure_on_both_transports()
+{
+    for stream in [false, true] {
+        let provider = Arc::new(ToollessTypedFailureProvider { stream });
+        let manager = AgentManager::new(
+            Arc::new(ProviderRegistry::with_provider(
+                "tool-less-rate-limit",
+                provider,
+            )),
+            test_tool_loop_config(),
+        );
+        let thread = if stream {
+            "native_toolless_failed_stream"
+        } else {
+            "native_toolless_failed_chat"
+        };
+        manager.ensure_thread(thread, "workspace").await.unwrap();
+        let mut receiver = manager.take_durable_receiver(thread).await.unwrap();
+        manager
+            .start_test_turn_with_default_profile(
+                thread,
+                "original_toolless_turn",
+                ThreadMode::Agent,
+                "fixture",
+                "tool-less-rate-limit",
+                HashMap::new(),
+                vec![UserInput::Text {
+                    text: "original goal".into(),
+                    text_elements: vec![],
+                }],
+                vec![],
+            )
+            .await
+            .unwrap();
+        let mut closing = None;
+        let mut failed_observation = false;
+        loop {
+            let event = timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            receiver.acknowledge_last(Ok(()));
+            match event {
+                AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } => {
+                    assert_eq!(payload["termination"]["kind"], "provider_error");
+                    assert_eq!(
+                        payload["message"]["provider_replay_state"]["payload"]["opaque"],
+                        "original signed failed accumulator"
+                    );
+                    failed_observation = true;
+                }
+                AgentDurableEvent::TurnExecutionWindowCheckpointed { payload, .. } => {
+                    assert_eq!(
+                        payload.window.agent_round_count, 2,
+                        "preflight and main are distinct charged attempts"
+                    );
+                    assert_eq!(
+                        payload.window.exhaustion_reason,
+                        Some(ExecutionWindowExhaustionReason::ProviderFailureContinuation)
+                    );
+                    assert_eq!(payload.turn_id, "original_toolless_turn");
+                    assert_eq!(
+                        payload.native_semantic_state.as_ref().unwrap()["schema_version"],
+                        pioneer_protocol::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION
+                    );
+                    assert_eq!(
+                        payload.native_semantic_state.as_ref().unwrap()["attached_task_wait"],
+                        serde_json::Value::Null
+                    );
+                    assert!(payload.window.progress.unwrap().valid());
+                    closing = Some(payload);
+                }
+                AgentDurableEvent::ProviderFailureDetected { failure, .. } => {
+                    assert_eq!(failure.class, ProviderFailureClass::RateLimit);
+                    assert!(
+                        closing.is_some(),
+                        "closing semantic state and real charged budget must precede failure/recovery"
+                    );
+                    assert_eq!(
+                        failed_observation, stream,
+                        "partial streaming opaque replay stays acknowledged and non-executable"
+                    );
+                    break;
+                }
+                AgentDurableEvent::TurnFinalizationPrepared { .. } => {
+                    panic!("failed response cannot publish final success")
+                }
+                _ => {}
+            }
+        }
     }
 }

@@ -29,6 +29,95 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use url::Url;
 
+// Work starts after approval and fresh authority revalidation. A timeout ends
+// this observation attempt; it does not cancel the semantic Turn or a child task.
+pub(crate) fn tool_attempt_work_budget(
+    invocation: &ToolInvocation,
+) -> Result<std::time::Duration, ToolError> {
+    use crate::context::LocalShellPayload;
+    let declared_ms = match &invocation.payload {
+        ToolPayload::LocalShell(LocalShellPayload::ExecCommand(args)) => args.timeout_ms,
+        ToolPayload::LocalShell(LocalShellPayload::WriteStdin(args)) => args.yield_time_ms,
+        ToolPayload::Function { arguments }
+            if matches!(
+                invocation.tool_name.as_str(),
+                "grep_files" | "web_fetch" | "download_url" | "task_wait"
+            ) =>
+        {
+            arguments
+                .get("timeout_ms")
+                .or_else(|| arguments.get("timeoutMs"))
+                .and_then(serde_json::Value::as_u64)
+        }
+        _ => None,
+    };
+    let default_ms = match invocation.tool_name.as_str() {
+        "exec_command" | "write_stdin" => 60_000,
+        "task_wait" => 3_600_000,
+        _ => 300_000,
+    };
+    let millis = declared_ms
+        .unwrap_or(default_ms)
+        .max(1)
+        .checked_add(5_000)
+        .ok_or_else(|| ToolError::invalid_arguments("tool timeout is out of range"))?;
+    let duration = std::time::Duration::from_millis(millis);
+    tokio::time::Instant::now()
+        .checked_add(duration)
+        .ok_or_else(|| ToolError::invalid_arguments("tool timeout is out of range"))?;
+    Ok(duration)
+}
+
+async fn await_owned_tool_attempt<T>(
+    work: impl std::future::Future<Output = Result<T, ToolError>>,
+    cancellation: tokio_util::sync::CancellationToken,
+    budget: Option<std::time::Duration>,
+) -> Result<T, ToolError> {
+    if cancellation.is_cancelled() {
+        return Err(ToolError::cancelled("tool dispatch cancelled"));
+    }
+    if budget.is_some_and(|budget| budget.is_zero()) {
+        cancellation.cancel();
+        return Err(ToolError::TimedOut);
+    }
+    tokio::pin!(work);
+    let deadline = budget
+        .map(|budget| {
+            tokio::time::Instant::now()
+                .checked_add(budget)
+                .ok_or_else(|| ToolError::invalid_arguments("tool timeout is out of range"))
+        })
+        .transpose()?;
+    let timeout = async {
+        match deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    let polled = std::sync::atomic::AtomicBool::new(false);
+    let poll_owned = std::future::poll_fn(|cx| {
+        polled.store(true, std::sync::atomic::Ordering::Relaxed);
+        work.as_mut().poll(cx)
+    });
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            if polled.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), &mut work).await;
+            }
+            Err(ToolError::cancelled("tool dispatch cancelled"))
+        }
+        _ = timeout => {
+            cancellation.cancel();
+            if polled.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), &mut work).await;
+            }
+            Err(ToolError::TimedOut)
+        }
+        result = poll_owned => result,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalState {
     Approved,
@@ -77,9 +166,10 @@ impl PostExecutionPolicy {
 
     fn apply(&self, invocation: &ToolInvocation, result: &mut AnyToolResult) {
         let raw_output_json = result.raw_output_json();
-        let outcome =
+        let outcome = result.output.authoritative_outcome().unwrap_or_else(|| {
             self.classifier
-                .classify_result(invocation, &raw_output_json, result.success());
+                .classify_result(invocation, &raw_output_json, result.success())
+        });
         result.set_outcome(outcome);
     }
 
@@ -1636,7 +1726,44 @@ impl ToolOrchestrator {
         );
         // Dispatch wrapper only. Concrete process, filesystem, and network handlers enforce
         // the immutable turn snapshot supplied with the invocation.
-        let dispatched = registry.dispatch(invocation.clone(), trace).await;
+        let work_budget = if registry.delegates_runtime_execution(&invocation.tool_name) {
+            None
+        } else {
+            Some(registry.attempt_work_budget(&invocation)?)
+        };
+        let work_started = tokio::time::Instant::now();
+        let policy = match work_budget {
+            Some(budget) => {
+                let budget_ms = i64::try_from(budget.as_millis())
+                    .map_err(|_| ToolError::invalid_arguments("tool timeout is out of range"))?;
+                let deadline_ms = chrono::Utc::now()
+                    .timestamp_millis()
+                    .checked_add(budget_ms)
+                    .and_then(|deadline| deadline.checked_add(2_000))
+                    .filter(|deadline| chrono::DateTime::from_timestamp_millis(*deadline).is_some())
+                    .ok_or_else(|| ToolError::invalid_arguments("tool timeout is out of range"))?;
+                serde_json::json!({"schemaVersion":1,"deadlineAtUnixMs":deadline_ms})
+            }
+            None => serde_json::json!({"schemaVersion":2,"kind":"delegated"}),
+        };
+        // Concrete work owns one monotonic allowance including its receipt ACK.
+        // Transparent wrappers retain Stop/lease ownership; each child starts
+        // its own finite work clock after that child's fresh approval.
+        await_owned_tool_attempt(
+            trace.emit_progress_delta(invocation.attempt_id, "attempt_work_started", Some(policy)),
+            invocation.cancellation.child_token(),
+            work_budget,
+        )
+        .await?;
+        let cancellation = invocation.cancellation.child_token();
+        let mut owned_invocation = invocation.clone();
+        owned_invocation.cancellation = cancellation.clone();
+        let dispatched = await_owned_tool_attempt(
+            registry.dispatch(owned_invocation, trace),
+            cancellation,
+            work_budget.map(|budget| budget.saturating_sub(work_started.elapsed())),
+        )
+        .await;
         match dispatched {
             Ok(result) => {
                 trace.emit_stage(
@@ -4560,5 +4687,158 @@ mod tests {
             Some(crate::context::ToolErrorClass::CommandNotFound)
         );
         assert!(outcome.should_retry);
+    }
+
+    #[test]
+    fn dynamic_wrapper_retains_actual_nested_timeout_before_model_projection() {
+        let invocation = invocation_for_tool(
+            "skill.dynamic.proxy",
+            ToolPayload::Function {
+                arguments: serde_json::json!({}),
+            },
+        );
+        let child_outcome = ToolOutcome::recoverable(
+            crate::ToolErrorClass::Timeout,
+            "actual child timeout",
+            false,
+            None,
+        );
+        let mut result = AnyToolResult {
+            call_id: invocation.call_id.clone(),
+            tool_name: invocation.tool_name.clone(),
+            payload: invocation.payload.clone(),
+            output: Box::new(
+                FunctionToolOutput::with_payload(
+                    "obscured",
+                    false,
+                    serde_json::json!({"stdout":"", "timed_out":true}),
+                )
+                .with_authoritative_outcome(child_outcome),
+            ),
+            outcome: ToolOutcome::ok(),
+            projection: None,
+        };
+        PostExecutionPolicy::default().apply(&invocation, &mut result);
+        assert_eq!(
+            result.outcome.error_class,
+            Some(crate::ToolErrorClass::Timeout)
+        );
+        assert_eq!(
+            result.outcome.status,
+            crate::ToolOutcomeStatus::RecoverableError
+        );
+        assert_eq!(
+            result.outcome.provider_outcome().status,
+            pioneer_provider::ToolResultStatus::RecoverableError
+        );
+    }
+}
+
+#[cfg(test)]
+mod attempt_deadline_tests {
+    use super::await_owned_tool_attempt;
+    use crate::ToolError;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test(start_paused = true)]
+    async fn hanging_tool_is_cancelled_and_joined_before_typed_timeout_returns() {
+        let cancellation = CancellationToken::new();
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let marker = observed.clone();
+        let token = cancellation.clone();
+        let work = async move {
+            token.cancelled().await;
+            marker.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        };
+        let result =
+            await_owned_tool_attempt(work, cancellation.clone(), Some(Duration::from_secs(10)))
+                .await;
+        assert!(matches!(result, Err(ToolError::TimedOut)));
+        assert!(cancellation.is_cancelled());
+        assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_work_finishes_within_its_declared_budget() {
+        let cancellation = CancellationToken::new();
+        let work = async {
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            Ok(42)
+        };
+        assert_eq!(
+            await_owned_tool_attempt(work, cancellation.clone(), Some(Duration::from_secs(180)))
+                .await
+                .unwrap(),
+            42
+        );
+        assert!(!cancellation.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_during_work_joins_cooperative_cleanup_before_return() {
+        let cancellation = CancellationToken::new();
+        let owner = cancellation.clone();
+        let cleaned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let marker = cleaned.clone();
+        let child = cancellation.child_token();
+        let work_token = child.clone();
+        let (result, ()) = tokio::join!(
+            await_owned_tool_attempt(
+                async move {
+                    work_token.cancelled().await;
+                    marker.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+                child,
+                Some(Duration::from_secs(180))
+            ),
+            async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                owner.cancel();
+            }
+        );
+        assert!(matches!(result, Err(ToolError::Cancelled(_))));
+        assert!(cleaned.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delegated_stop_cancels_and_drains_the_owned_child() {
+        let owner = CancellationToken::new();
+        let child = owner.child_token();
+        let child_work = child.clone();
+        let cleaned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let marker = cleaned.clone();
+        let (result, ()) = tokio::join!(
+            await_owned_tool_attempt(
+                async move {
+                    child_work.cancelled().await;
+                    marker.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+                child,
+                None
+            ),
+            async move {
+                tokio::time::sleep(Duration::from_secs(360)).await;
+                owner.cancel();
+            }
+        );
+        assert!(matches!(result, Err(ToolError::Cancelled(_))));
+        assert!(cleaned.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_cancels_owned_work_without_waiting_for_work_deadline() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let result: Result<(), ToolError> = await_owned_tool_attempt(
+            std::future::pending(),
+            cancellation,
+            Some(Duration::from_secs(180)),
+        )
+        .await;
+        assert!(matches!(result, Err(ToolError::Cancelled(_))));
     }
 }

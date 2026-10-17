@@ -295,6 +295,7 @@ mod tests {
                 attachment_kinds: Vec::new(),
             },
             pioneer_protocol::ExecutionCheckpointWindowSummary {
+                progress: None,
                 window_id: Some("window_1".to_owned()),
                 window_index: 1,
                 started_at_unix_ms: Some(1),
@@ -386,6 +387,7 @@ mod tests {
                 attachment_kinds: Vec::new(),
             },
             pioneer_protocol::ExecutionCheckpointWindowSummary {
+                progress: None,
                 window_id: Some("window_1".to_owned()),
                 window_index: 1,
                 started_at_unix_ms: None,
@@ -455,6 +457,7 @@ mod tests {
                 attachment_kinds: vec!["local_file".to_owned()],
             },
             pioneer_protocol::ExecutionCheckpointWindowSummary {
+                progress: None,
                 window_id: Some("window_snapshot_1".to_owned()),
                 window_index: 2,
                 started_at_unix_ms: Some(100),
@@ -519,7 +522,7 @@ mod tests {
         insta::assert_snapshot!(rendered, @r###"
 Initiating thread: initiating_thread_snapshot
 Execution thread: thr_snapshot (internal child)
-Checkpoint: schema_version=2, workspace_id=ws_snapshot, turn_id=turn_snapshot
+Checkpoint: schema_version=3, workspace_id=ws_snapshot, turn_id=turn_snapshot
 Original request preview: Create the proposal
 Original attachment kinds: local_file
 Completed window: index=2, agent_rounds=5, tool_calls=6, provider_tokens=unknown

@@ -21,6 +21,73 @@ thread_local! {
     };
 }
 
+thread_local! {
+    static BLOCKING_WORK_CONTEXT: std::cell::RefCell<Option<crate::ProviderAttemptContext>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn work_context() -> Option<crate::ProviderAttemptContext> {
+    crate::http::current_provider_attempt_context()
+        .or_else(|| BLOCKING_WORK_CONTEXT.with(|slot| slot.borrow().clone()))
+}
+
+pub(crate) fn check_work() -> Result<()> {
+    if work_context().is_some_and(|context| {
+        context.cancellation.is_cancelled() || tokio::time::Instant::now() >= context.deadline
+    }) {
+        return Err(crate::failure::transport_timeout_error());
+    }
+    Ok(())
+}
+
+pub(crate) fn with_blocking_work_context<T>(
+    context: crate::ProviderAttemptContext,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<crate::ProviderAttemptContext>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BLOCKING_WORK_CONTEXT.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+    let previous = BLOCKING_WORK_CONTEXT.with(|slot| slot.replace(Some(context)));
+    let _restore = Restore(previous);
+    operation()
+}
+
+pub(crate) fn bounded_work<T>(
+    future: impl Future<Output = Result<T>>,
+) -> impl Future<Output = Result<T>> {
+    // Materialization, accounting and retries nest this boundary. Keep their
+    // operation state on the heap instead of multiplying it in each wrapper.
+    let future = Box::pin(future);
+    async move {
+        if let Some(context) = work_context() {
+            check_work()?;
+            let result = tokio::select! { biased;
+                _ = context.cancellation.cancelled() => Err(crate::failure::transport_timeout_error()),
+                result = tokio::time::timeout_at(context.deadline, future) => result.map_err(|_| crate::failure::transport_timeout_error())?,
+            };
+            // A ready synchronous leaf can finish after the timeout was first polled.
+            check_work()?;
+            result
+        } else {
+            future.await
+        }
+    }
+}
+
+fn blocking_backoff(delay: Duration) -> Result<()> {
+    let end = Instant::now() + delay;
+    loop {
+        check_work()?;
+        let remaining = end.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AttachmentOperationAuthority {
     authority_fingerprint: String,
@@ -119,10 +186,11 @@ impl AttachmentOperationError {
         matches!(self, Self::Retryable(_))
     }
 
-    fn message(&self) -> String {
-        match self {
-            Self::Retryable(error) | Self::NonRetryable(error) => error.to_string(),
-        }
+    fn failure_class(&self) -> pioneer_protocol::ProviderFailureClass {
+        let (Self::Retryable(error) | Self::NonRetryable(error)) = self;
+        crate::failure::classify_transport_error(error)
+            .map(|failure| failure.class)
+            .unwrap_or(pioneer_protocol::ProviderFailureClass::Unknown)
     }
 }
 
@@ -197,8 +265,26 @@ fn evict_oldest_if_full(map: &mut HashMap<AttachmentOperationAuthority, CircuitS
     }
 }
 
+// A poisoned bookkeeping map is untrusted; discard it, retaining no stale
+// denial. This does not alter authority keys, TTL or cardinality limits.
+fn lock_breakers()
+-> std::sync::MutexGuard<'static, HashMap<AttachmentOperationAuthority, CircuitState>> {
+    lock_breaker_map(breakers())
+}
+
+fn lock_breaker_map(
+    breakers: &Mutex<HashMap<AttachmentOperationAuthority, CircuitState>>,
+) -> std::sync::MutexGuard<'_, HashMap<AttachmentOperationAuthority, CircuitState>> {
+    breakers.lock().unwrap_or_else(|poison| {
+        let mut map = poison.into_inner();
+        map.clear();
+        breakers.clear_poison();
+        map
+    })
+}
+
 fn circuit_open_for(operation_key: &AttachmentOperationAuthority) -> Option<Duration> {
-    let mut map = breakers().lock().expect("circuit breaker lock poisoned");
+    let mut map = lock_breakers();
     let now = Instant::now();
     prune_breakers(&mut map, now);
     let state = map.get_mut(operation_key)?;
@@ -214,12 +300,12 @@ fn circuit_open_for(operation_key: &AttachmentOperationAuthority) -> Option<Dura
 }
 
 fn record_success(operation_key: &AttachmentOperationAuthority) {
-    let mut map = breakers().lock().expect("circuit breaker lock poisoned");
+    let mut map = lock_breakers();
     map.remove(operation_key);
 }
 
 fn record_failure(operation_key: &AttachmentOperationAuthority, policy: &AttachmentRuntimePolicy) {
-    let mut map = breakers().lock().expect("circuit breaker lock poisoned");
+    let mut map = lock_breakers();
     let now = Instant::now();
     prune_breakers(&mut map, now);
     if !map.contains_key(operation_key) {
@@ -257,6 +343,7 @@ where
     let mut last_error: Option<anyhow::Error> = None;
 
     for attempt in 1..=max_attempts {
+        check_work()?;
         match attempt_fn(attempt) {
             Ok(result) => {
                 record_success(operation_key);
@@ -265,18 +352,20 @@ where
             Err(error) if error.is_retryable() && attempt < max_attempts => {
                 let delay = next_delay(policy, jitter_identity.as_str(), attempt);
                 observability::emit_upload_retry(provider, operation, attempt, delay);
-                std::thread::sleep(delay);
+                blocking_backoff(delay)?;
                 last_error = Some(error.into_error());
             }
             Err(error) => {
-                let reason = error.message();
-                record_failure(operation_key, policy);
+                let class = error.failure_class();
+                if error.is_retryable() {
+                    record_failure(operation_key, policy);
+                }
                 observability::emit_upload_fail(
                     provider,
                     operation,
                     attempt,
                     "ATTACHMENT_OPERATION_FAILED",
-                    reason.as_str(),
+                    class,
                 );
                 return Err(error.into_error());
             }
@@ -317,7 +406,8 @@ where
     let mut last_error: Option<anyhow::Error> = None;
 
     for attempt in 1..=max_attempts {
-        match attempt_fn(attempt).await {
+        check_work()?;
+        match bounded_work(async { Ok(attempt_fn(attempt).await) }).await? {
             Ok(result) => {
                 record_success(operation_key);
                 return Ok(result);
@@ -325,18 +415,24 @@ where
             Err(error) if error.is_retryable() && attempt < max_attempts => {
                 let delay = next_delay(policy, jitter_identity.as_str(), attempt);
                 observability::emit_upload_retry(provider, operation, attempt, delay);
-                tokio::time::sleep(delay).await;
+                bounded_work(async {
+                    tokio::time::sleep(delay).await;
+                    Ok(())
+                })
+                .await?;
                 last_error = Some(error.into_error());
             }
             Err(error) => {
-                let reason = error.message();
-                record_failure(operation_key, policy);
+                let class = error.failure_class();
+                if error.is_retryable() {
+                    record_failure(operation_key, policy);
+                }
                 observability::emit_upload_fail(
                     provider,
                     operation,
                     attempt,
                     "ATTACHMENT_OPERATION_FAILED",
-                    reason.as_str(),
+                    class,
                 );
                 return Err(error.into_error());
             }
@@ -441,10 +537,100 @@ mod tests {
             "opens-after-threshold",
         );
         let _ = execute_with_retry_blocking::<(), _>("test", "op", &key, &policy, |_| {
-            Err(AttachmentOperationError::non_retryable(anyhow!("boom")))
+            Err(AttachmentOperationError::retryable(anyhow!("boom")))
         });
         let err = execute_with_retry_blocking::<(), _>("test", "op", &key, &policy, |_| Ok(()))
             .expect_err("circuit breaker should block operation");
         assert!(err.to_string().contains("ATTACHMENT_CIRCUIT_BREAKER_OPEN"));
+    }
+    #[test]
+    fn permanent_rejections_never_open_transient_breaker() {
+        let mut policy = test_policy();
+        policy.circuit_breaker.failure_threshold = 1;
+        let key = AttachmentOperationAuthority::new("runtime-tests-permanent", "resolve", "input");
+        for _ in 0..8 {
+            let result = execute_with_retry_blocking::<(), _>("test", "op", &key, &policy, |_| {
+                Err(AttachmentOperationError::non_retryable(anyhow!(
+                    "invalid input"
+                )))
+            });
+            assert!(result.is_err());
+            assert!(circuit_open_for(&key).is_none());
+        }
+        assert!(execute_with_retry_blocking("test", "op", &key, &policy, |_| Ok(())).is_ok());
+    }
+
+    #[test]
+    fn poisoned_bookkeeping_recovers_without_repeated_panic() {
+        let map = Mutex::new(HashMap::new());
+        let _ = std::panic::catch_unwind(|| {
+            let _map = map.lock().unwrap_or_else(|error| error.into_inner());
+            panic!("inject bookkeeping poison");
+        });
+        assert!(lock_breaker_map(&map).is_empty());
+        assert!(lock_breaker_map(&map).is_empty());
+        assert!(!map.is_poisoned());
+    }
+}
+
+#[cfg(test)]
+mod r04_owned_work_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_during_retry_backoff_never_starts_another_attempt() {
+        let context =
+            crate::ProviderAttemptContext::new(crate::ProviderTimeoutPolicy::default(), false)
+                .unwrap();
+        let cancellation = context.cancellation.clone();
+        let attempts = AtomicUsize::new(0);
+        let mut policy = AttachmentRuntimePolicy::default();
+        policy.retry.initial_backoff_ms = 10_000;
+        policy.retry.max_backoff_ms = 10_000;
+        policy.retry.jitter_ms = 0;
+        let authority = AttachmentOperationAuthority::new("r04-stop", "url_fetch", "safe-endpoint");
+        let (result, _) = tokio::join!(
+            crate::with_provider_attempt_context(
+                context,
+                execute_with_retry_async("fixture", "url_fetch", &authority, &policy, |_| async {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Err::<(), _>(AttachmentOperationError::retryable(anyhow!(
+                        "fixed retryable failure"
+                    )))
+                })
+            ),
+            async {
+                tokio::task::yield_now().await;
+                cancellation.cancel();
+            }
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn blocking_retry_cancellation_is_observed_before_dispatch() {
+        let context =
+            crate::ProviderAttemptContext::new(crate::ProviderTimeoutPolicy::default(), false)
+                .unwrap();
+        context.cancellation.cancel();
+        let mut attempted = false;
+        let authority =
+            AttachmentOperationAuthority::new("r04-prestop", "url_fetch", "safe-endpoint");
+        let result = with_blocking_work_context(context, || {
+            execute_with_retry_blocking(
+                "fixture",
+                "url_fetch",
+                &authority,
+                &AttachmentRuntimePolicy::default(),
+                |_| {
+                    attempted = true;
+                    Ok(())
+                },
+            )
+        });
+        assert!(result.is_err());
+        assert!(!attempted);
     }
 }

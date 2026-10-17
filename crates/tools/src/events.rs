@@ -119,6 +119,7 @@ pub enum ToolEventKind {
 pub enum ToolEventPayload {
     CallStarted(ToolCallStartedEvent),
     Heartbeat,
+    OwnerHeartbeat,
     PermissionAudit(TurnPermissionAuditEvent),
     OutputDelta(ToolOutputDeltaEvent),
     CallCompleted(ToolCallCompletedEvent),
@@ -129,7 +130,7 @@ impl ToolEventPayload {
     pub fn kind(&self) -> ToolEventKind {
         match self {
             Self::CallStarted(_) => ToolEventKind::CallStarted,
-            Self::Heartbeat => ToolEventKind::Heartbeat,
+            Self::Heartbeat | Self::OwnerHeartbeat => ToolEventKind::Heartbeat,
             Self::PermissionAudit(_) => ToolEventKind::PermissionAudit,
             Self::OutputDelta(_) => ToolEventKind::OutputDelta,
             Self::CallCompleted(_) => ToolEventKind::CallCompleted,
@@ -139,7 +140,7 @@ impl ToolEventPayload {
 
     pub fn event_class(&self) -> ProtocolEventClass {
         match self {
-            Self::Heartbeat => ProtocolEventClass::Progress,
+            Self::Heartbeat | Self::OwnerHeartbeat => ProtocolEventClass::Progress,
             Self::OutputDelta(_) => ProtocolEventClass::Durable,
             Self::CallStarted(_)
             | Self::PermissionAudit(_)
@@ -411,6 +412,16 @@ impl ToolEventTrace {
             attempt_id,
             "runtime.call.heartbeat",
             ToolEventPayload::Heartbeat,
+        );
+    }
+
+    /// The actor is still polling this attempt. This renews its lease only.
+    pub fn emit_owner_heartbeat(&self, attempt_id: u32) {
+        self.event_bus.emit_progress(
+            self,
+            attempt_id,
+            "runtime.call.owner_heartbeat",
+            ToolEventPayload::OwnerHeartbeat,
         );
     }
 

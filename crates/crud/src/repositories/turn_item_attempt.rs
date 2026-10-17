@@ -21,6 +21,31 @@ use crate::convention::{
 };
 use crate::turn_item_terminal::{TurnItemTerminalState, terminalize_turn_item_payload};
 
+// Only the atomic native checkpoint writer admits this existing class/type
+// pairing. Read the accepted operation class in the actual deadline statement;
+// no checkpoint JSON parsing or stale pre-read is needed under DB capacity.
+pub(crate) fn native_attached_wait_predicate() -> &'static str {
+    "turn_item_attempt.execution_class='durable_wait' AND turn_item_attempt.item_type='reasoning'"
+}
+
+fn work_aware_deadline(
+    value: Option<DateTimeWithTimeZone>,
+    current_column: &'static str,
+) -> sea_orm::sea_query::SimpleExpr {
+    // The receipt and its work horizons commit together. A queued repair or
+    // heartbeat must inspect that exact current attempt at the physical write,
+    // rather than overwrite it using a policy read before the receipt existed.
+    let accepted_work = "EXISTS (SELECT 1 FROM tool_output_chunk p WHERE p.turn_id=turn_item_attempt.turn_id AND p.item_id=turn_item_attempt.item_id AND json_extract(p.metadata,'$.stage')='attempt_work_started' AND json_extract(p.metadata,'$.observation.attempt_id')=turn_item_attempt.attempt_number AND json_extract(p.metadata,'$.observation.trace_id')=json_extract(turn_item_attempt.payload,'$.observation.traceId'))";
+    Expr::cust_with_values(
+        format!(
+            "CASE WHEN {} THEN NULL WHEN {accepted_work} THEN {current_column} ELSE ? END",
+            native_attached_wait_predicate()
+        ),
+        [value],
+    )
+    .into()
+}
+
 const MAX_TERMINAL_TURN_RUNNING_ATTEMPTS: u64 = 64;
 
 #[derive(Debug, Clone)]
@@ -184,23 +209,28 @@ pub async fn heartbeat_running_attempt<C: ConnectionTrait>(
         return Ok(false);
     };
 
-    let mut update = turn_item_attempt::Entity::update_many()
-        .col_expr(
-            turn_item_attempt::Column::LastHeartbeatAt,
-            Expr::value(Some(heartbeat_at)),
-        )
-        .col_expr(
+    let mut update = turn_item_attempt::Entity::update_many().col_expr(
+        turn_item_attempt::Column::LastHeartbeatAt,
+        Expr::value(Some(heartbeat_at)),
+    );
+    // A heartbeat renews only supplied horizons. None preserves work policy;
+    // explicit initial configuration remains the owner of deadline clearing.
+    if let Some(lease) = next_lease_expires_at {
+        update = update.col_expr(
             turn_item_attempt::Column::LeaseExpiresAt,
-            Expr::value(next_lease_expires_at),
-        )
-        .col_expr(
-            turn_item_attempt::Column::IdleDeadlineAt,
-            Expr::value(next_idle_deadline_at),
+            Expr::value(Some(lease)),
         );
+    }
+    if let Some(idle) = next_idle_deadline_at {
+        update = update.col_expr(
+            turn_item_attempt::Column::IdleDeadlineAt,
+            work_aware_deadline(Some(idle), "idle_deadline_at"),
+        );
+    }
     if let Some(hard_deadline_at) = next_hard_deadline_at {
         update = update.col_expr(
             turn_item_attempt::Column::HardDeadlineAt,
-            Expr::value(Some(hard_deadline_at)),
+            work_aware_deadline(Some(hard_deadline_at), "hard_deadline_at"),
         );
     }
     let affected = update
@@ -224,15 +254,15 @@ pub async fn heartbeat_running_attempt<C: ConnectionTrait>(
         return Ok(false);
     }
 
-    turn_item::Entity::update_many()
-        .col_expr(
-            turn_item::Column::LastHeartbeatAt,
-            Expr::value(Some(heartbeat_at)),
-        )
-        .col_expr(
-            turn_item::Column::LeaseExpiresAt,
-            Expr::value(next_lease_expires_at),
-        )
+    let mut item_update = turn_item::Entity::update_many().col_expr(
+        turn_item::Column::LastHeartbeatAt,
+        Expr::value(Some(heartbeat_at)),
+    );
+    if let Some(lease) = next_lease_expires_at {
+        item_update =
+            item_update.col_expr(turn_item::Column::LeaseExpiresAt, Expr::value(Some(lease)));
+    }
+    item_update
         .col_expr(turn_item::Column::UpdatedAt, Expr::value(heartbeat_at))
         .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
         .filter(turn_item::Column::ItemId.eq(item_id.to_owned()))
@@ -267,11 +297,11 @@ pub async fn configure_running_attempt_deadlines<C: ConnectionTrait>(
         )
         .col_expr(
             turn_item_attempt::Column::IdleDeadlineAt,
-            Expr::value(idle_deadline_at),
+            work_aware_deadline(idle_deadline_at, "idle_deadline_at"),
         )
         .col_expr(
             turn_item_attempt::Column::HardDeadlineAt,
-            Expr::value(hard_deadline_at),
+            work_aware_deadline(hard_deadline_at, "hard_deadline_at"),
         )
         .col_expr(
             turn_item_attempt::Column::UpdatedAt,

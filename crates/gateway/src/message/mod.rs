@@ -1107,25 +1107,6 @@ impl MessageProcessor {
                 resilience_config.context_compaction_timeout,
             ),
         ));
-        let recovery_coordinator = Arc::new(
-            RecoveryCoordinator::new(
-                crud_store.clone(),
-                agent_manager.clone(),
-                provider_registry.clone(),
-                RecoveryPolicyRegistry::with_command_execution_timeout_config(
-                    resilience_config.command_execution_timeout,
-                ),
-                normalized_tool_loop_config.clone(),
-            )
-            .with_authorization_invalidation_hub(authorization_invalidation_hub.clone())
-            .with_execution_leases(execution_leases.clone())
-            .with_turn_execution_owner_id(turn_execution_owner_id.clone()),
-        );
-        let cli_runtime_command_heartbeats = CliRuntimeCommandHeartbeatTracker::new(
-            resilience_config
-                .cli_runtime_command_heartbeat
-                .interval_secs,
-        );
         let artifact_service = Arc::new(ArtifactService::new_with_policies(
             crud_store.clone(),
             Arc::new(LocalArtifactBlobStore::new(runtime_home.clone())),
@@ -1136,6 +1117,26 @@ impl MessageProcessor {
                 readable_copy_ttl_secs: artifacts_config.readable_copy_ttl_secs,
             },
         ));
+        let recovery_coordinator = Arc::new(
+            RecoveryCoordinator::new(
+                crud_store.clone(),
+                agent_manager.clone(),
+                provider_registry.clone(),
+                RecoveryPolicyRegistry::with_command_execution_timeout_config(
+                    resilience_config.command_execution_timeout,
+                ),
+                normalized_tool_loop_config.clone(),
+            )
+            .with_artifact_service(artifact_service.clone())
+            .with_authorization_invalidation_hub(authorization_invalidation_hub.clone())
+            .with_execution_leases(execution_leases.clone())
+            .with_turn_execution_owner_id(turn_execution_owner_id.clone()),
+        );
+        let cli_runtime_command_heartbeats = CliRuntimeCommandHeartbeatTracker::new(
+            resilience_config
+                .cli_runtime_command_heartbeat
+                .interval_secs,
+        );
         let artifact_uploads = Arc::new(artifacts::upload::ArtifactUploadSessionManager::new(
             runtime_home.join("artifacts").join("upload_sessions"),
         ));
@@ -2292,6 +2293,8 @@ impl MessageProcessor {
             self.workspace_manager
                 .with_database(crud_store.database_connection()),
         );
+        scoped.artifact_service =
+            Arc::new(self.artifact_service.with_crud_store(crud_store.clone()));
         scoped.timeout_supervisor =
             Arc::new(self.timeout_supervisor.with_crud_store(crud_store.clone()));
         scoped.recovery_coordinator = Arc::new(
@@ -3514,7 +3517,7 @@ impl MessageProcessor {
 
             if let Err(error) = self
                 .timeout_supervisor
-                .heartbeat_item_attempt(
+                .heartbeat_item_attempt_from_confirmed_external_activity(
                     key.turn_id.as_str(),
                     key.item_id.as_str(),
                     TurnItemType::CommandExecution,
@@ -4116,18 +4119,17 @@ impl MessageProcessor {
             }
             let summary = self
                 .artifact_service
-                .get_artifact(workspace_id, artifact_id, Some(version_id))
+                .get_exact_artifact_ref(workspace_id, artifact_id, version_id)
                 .await
                 .map_err(|_| anyhow::anyhow!("artifact reference is unavailable"))?;
-            if summary.workspace_id != workspace_id
-                || summary.artifact.artifact_id != *artifact_id
-                || summary.artifact.version_id.as_deref() != Some(version_id)
-                || summary.artifact.status != pioneer_protocol::ArtifactStatus::Ready
+            if summary.artifact_id != *artifact_id
+                || summary.version_id.as_deref() != Some(version_id)
+                || summary.status != pioneer_protocol::ArtifactStatus::Ready
             {
                 anyhow::bail!("artifact reference is unavailable");
             }
 
-            let durable_scope_matches = pioneer_crud::resolve_artifact_authorization_scope(
+            let durable_scope_matches = pioneer_crud::resolve_native_artifact_authorization_scope(
                 &database,
                 artifact_id,
                 Some(workspace_id),
@@ -4147,18 +4149,29 @@ impl MessageProcessor {
             // the generic resolver may not materialize that binding yet. Its
             // existing direct thread scope is still authoritative only when
             // every stored binding agrees with the exact target thread.
-            let direct_thread_scope_matches = summary.primary_thread_id.as_deref()
-                == Some(thread_id)
-                && summary.bindings.iter().all(|binding| {
-                    binding.workspace_id == workspace_id
-                        && binding.thread_id.as_deref() == Some(thread_id)
-                });
+            let direct_thread_scope_matches = self
+                .crud_store
+                .native_input_direct_scope_matches(workspace_id, artifact_id, thread_id)
+                .await?;
             if !durable_scope_matches && !direct_thread_scope_matches {
                 anyhow::bail!("artifact reference is unavailable");
             }
         }
 
         Ok(())
+    }
+
+    async fn resolve_owned_provider_artifact_inputs(
+        &self,
+        workspace_id: &str,
+        input: &[pioneer_protocol::UserInput],
+    ) -> anyhow::Result<Vec<ResolvedArtifactInput>> {
+        crate::turn_runtime_snapshot::resolve_owned_artifact_inputs(
+            self.artifact_service.as_ref(),
+            workspace_id,
+            input,
+        )
+        .await
     }
 
     async fn resolve_provider_artifact_inputs(
@@ -4215,6 +4228,7 @@ impl MessageProcessor {
         runtime_environment: &HashMap<String, String>,
         history: &[ChatMessage],
         agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
+        skill_catalog: &pioneer_skills::SkillCatalogSnapshot,
         accepted_history: Option<&crate::compaction::frozen::PreparedHistory>,
     ) -> anyhow::Result<()> {
         let canonical = history.iter().all(|message| message.provenance.is_some());
@@ -4234,6 +4248,7 @@ impl MessageProcessor {
             runtime_environment,
             if canonical { &[] } else { history },
             agent_skill_overlay,
+            skill_catalog,
         )?;
         let mut frozen_prepared = None;
         if let Some(prepared) = accepted_history {
@@ -4280,19 +4295,112 @@ impl MessageProcessor {
             snapshot.history_json = serde_json::to_string(&prepared.descriptor)?;
             frozen_prepared = Some(prepared);
         }
-        // The borrowed preparation retains its hold through this atomic root
-        // handoff; the writer rechecks the epochs read during preparation.
+        // Fresh authorization selects the same adapter/connection as dispatch;
+        // immutable retries reuse the original selected facts, never a refresh.
+        let context = crate::authorization::ExecutionAuthorizationContext::load_for_turn(
+            self.crud_store.as_ref(),
+            turn_id,
+        )
+        .await?;
+        context.require_provider_binding(provider_name, model)?;
+        anyhow::ensure!(
+            context.workspace_id() == workspace_id,
+            "native snapshot workspace differs from execution authority"
+        );
+        context.verify_current_provider_authority(self.provider_registry.as_ref())?;
+        let provider = match context.provider_azure_connection() {
+            Some(connection) => self
+                .provider_registry
+                .get_or_create_for_workspace_with_frozen_azure(
+                    workspace_id,
+                    provider_name,
+                    connection,
+                )?,
+            None => self
+                .provider_registry
+                .get_or_create_for_workspace(workspace_id, provider_name)?,
+        };
+        context.require_provider_instance(provider.as_ref(), model)?;
+        let profile_byte_budget = snapshot.remaining_storage_bytes()?;
+        let accepted = self.crud_store.get_turn_runtime_snapshot(turn_id).await?;
+        let contract = if let Some(accepted) = &accepted {
+            crate::turn_runtime_snapshot::restored_provider_model_contract(accepted)?
+        } else {
+            provider.capture_model_contract_with_limit(model, profile_byte_budget)?
+        };
+        contract.validate_identity(provider.name(), model, provider.authority_fingerprint())?;
+        let _ = contract.clone().bind(provider)?;
+        snapshot.provider_model_contract_json =
+            Some(contract.to_json_with_limit(profile_byte_budget)?);
+        snapshot.initial_phase_json = Some(match accepted {
+            Some(accepted) => accepted
+                .initial_phase_json
+                .context("accepted native initial preparation is unavailable")?,
+            None => pioneer_agent::NativeInitialPreparation::new_admission_json(
+                workspace_id,
+                thread_id,
+                turn_id,
+                snapshot.remaining_storage_bytes()?,
+            )?,
+        });
+        snapshot.validate_storage_size()?;
         self.crud_store
-            .upsert_turn_runtime_snapshot_with_source_epochs(
+            .insert_native_turn_runtime_snapshot_with_source_epochs(
                 snapshot,
                 accepted_history
-                    .map(|prepared| &prepared.source_epochs)
+                    .or(frozen_prepared.as_ref())
+                    .map(|p| &p.source_epochs)
                     .unwrap_or(&Default::default()),
             )
             .await
             .with_context(|| format!("failed to persist runtime snapshot for turn `{turn_id}`"))?;
         drop(frozen_prepared);
         Ok(())
+    }
+
+    /// Dispatch from the same immutable owner used by cold recovery. This keeps
+    /// provider configuration and the rest of admission inputs on one path.
+    pub(crate) async fn start_admitted_native_snapshot_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
+        security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
+        checkpoint: Option<pioneer_agent::ExecutionCheckpointContext>,
+    ) -> anyhow::Result<()> {
+        let context = self
+            .load_turn_execution_authorization_context(turn_id)
+            .await?;
+        context.verify_current_provider_authority(self.provider_registry.as_ref())?;
+        let snapshot = self
+            .crud_store
+            .get_turn_runtime_snapshot(turn_id)
+            .await?
+            .context("native admission is missing its runtime snapshot")?;
+        anyhow::ensure!(
+            snapshot.thread_id == thread_id && snapshot.workspace_id == context.workspace_id(),
+            "native snapshot differs from execution authority scope"
+        );
+        context.require_provider_binding(&snapshot.provider_name, &snapshot.model)?;
+        let overlay = crate::turn_runtime_snapshot::restore_agent_skill_overlay_from_snapshot(
+            self.crud_store.as_ref(),
+            &snapshot.workspace_id,
+            &snapshot,
+        )
+        .await?;
+        let request = crate::turn_runtime_snapshot::restored_recovery_turn_request_from_snapshot(
+            self.crud_store.as_ref(),
+            Some(self.artifact_service.as_ref()),
+            &snapshot,
+            permission_profile,
+            security_snapshot,
+            overlay,
+        )
+        .await?;
+        self.agent_manager
+            .start_admitted_native_turn(thread_id, request, checkpoint)
+            .await
+            .map_err(|_| anyhow::anyhow!("failed to dispatch exact native admission inputs"))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4315,72 +4423,51 @@ impl MessageProcessor {
         resolved_artifacts: &[ResolvedArtifactInput],
         runtime_environment: &HashMap<String, String>,
         history: &[ChatMessage],
-        agent_skill_overlay: &mut Vec<pioneer_skills::AgentSkillRuntimeEntry>,
+        agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
+        skill_catalog: &pioneer_skills::SkillCatalogSnapshot,
         accepted_history: Option<&crate::compaction::frozen::PreparedHistory>,
     ) -> anyhow::Result<()> {
-        match self
-            .persist_turn_runtime_snapshot(
-                thread_id,
-                workspace_id,
-                turn_id,
-                mode,
-                hook_runtime_context,
-                model,
-                provider_name,
-                reasoning_effort,
-                workspace_skill_policies,
-                input,
-                capabilities,
-                resolved_artifacts,
-                runtime_environment,
-                history,
-                agent_skill_overlay.as_slice(),
-                accepted_history,
-            )
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(error) if !agent_skill_overlay.is_empty() => {
-                warn!(
-                    workspace_id,
-                    turn_id,
-                    error = %format!("{error:#}"),
-                    "failed to persist Agent skill pins; retrying authoritative base-only snapshot"
-                );
-                agent_skill_overlay.clear();
-                self.persist_turn_runtime_snapshot(
-                    thread_id,
-                    workspace_id,
-                    turn_id,
-                    mode,
-                    hook_runtime_context,
-                    model,
-                    provider_name,
-                    reasoning_effort,
-                    workspace_skill_policies,
-                    input,
-                    capabilities,
-                    resolved_artifacts,
-                    runtime_environment,
-                    history,
-                    &[],
-                    accepted_history,
-                )
-                .await
-            }
-            Err(error) => Err(error),
-        }
+        self.persist_turn_runtime_snapshot(
+            thread_id,
+            workspace_id,
+            turn_id,
+            mode,
+            hook_runtime_context,
+            model,
+            provider_name,
+            reasoning_effort,
+            workspace_skill_policies,
+            input,
+            capabilities,
+            resolved_artifacts,
+            runtime_environment,
+            history,
+            agent_skill_overlay,
+            skill_catalog,
+            accepted_history,
+        )
+        .await
     }
 
     pub(crate) fn native_api_provider_supports_agent_skill_overlay(
         &self,
         workspace_id: &str,
         provider_name: &str,
+        azure_connection: Option<&pioneer_provider::AzureResolvedConnection>,
     ) -> bool {
-        match self
-            .provider_registry
-            .get_or_create_for_workspace(workspace_id, provider_name)
-        {
+        let provider = match azure_connection {
+            Some(connection) => self
+                .provider_registry
+                .get_or_create_for_workspace_with_frozen_azure(
+                    workspace_id,
+                    provider_name,
+                    connection,
+                ),
+            None => self
+                .provider_registry
+                .get_or_create_for_workspace(workspace_id, provider_name),
+        };
+        match provider {
             Ok(provider) => provider.capabilities().tool_calling,
             Err(error) => {
                 warn!(
@@ -4640,7 +4727,7 @@ impl MessageProcessor {
         ));
         let provider_registry = Arc::new(ProviderRegistry::with_provider(
             "openai",
-            Arc::new(pioneer_provider::providers::EchoProvider::new()),
+            Arc::new(tests::OpenAiEchoProvider),
         ));
         let now_snapshot = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         {
@@ -4680,6 +4767,7 @@ impl MessageProcessor {
                 .join("upload_sessions"),
         ));
         let normalized_tool_loop_config = ToolLoopConfig {
+            no_progress_mode: pioneer_tools::ToolNoProgressMode::Enforce,
             provider: pioneer_provider::ProviderTimeoutPolicy::default(),
             preflight: pioneer_agent::PreflightLoopConfig::default(),
             web: pioneer_tools::WebToolsConfig {
@@ -4772,6 +4860,7 @@ impl MessageProcessor {
                 RecoveryPolicyRegistry::default(),
                 normalized_tool_loop_config.clone(),
             )
+            .with_artifact_service(artifact_service.clone())
             .with_authorization_invalidation_hub(authorization_invalidation_hub.clone())
             .with_execution_leases(execution_leases.clone())
             .with_turn_execution_owner_id(turn_execution_owner_id.clone()),

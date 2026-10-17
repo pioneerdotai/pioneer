@@ -89,6 +89,7 @@ pub(crate) fn project_cli_runtime_event(
                 thread_id: context.thread_id.clone(),
                 turn_id: context.turn_id.clone(),
                 error: failed.message.clone(),
+                failure: None,
                 recovery: context.recovery.clone(),
             })
         }
@@ -140,6 +141,7 @@ fn project_runtime_error(
         thread_id: context.thread_id.clone(),
         turn_id: context.turn_id.clone(),
         error: error.message.clone(),
+        failure: None,
         recovery: context.recovery.clone(),
     })
 }
@@ -2887,6 +2889,7 @@ mod tests {
                 thread_id: "thread_1".to_owned(),
                 turn_id: "turn_1".to_owned(),
                 error: "native failure".to_owned(),
+                failure: None,
                 recovery: None
             }]
         );

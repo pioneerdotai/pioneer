@@ -350,6 +350,7 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
     let calls = Arc::new(AtomicU64::new(0));
     let provider = Arc::new(RecoveryProvider {
         barrier: CancellationBarrierProvider {
+            name: "delayed",
             entered: entered.clone(),
             release: Arc::new(Notify::new()),
         },
@@ -383,7 +384,7 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
     ensure_test_superuser_execution_turn(&processor, &workspace, thread, turn).await;
     let saved = store.get_turn(thread, turn).await.unwrap().unwrap().1;
     let now = chrono::Utc::now().fixed_offset();
-    let runtime = crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
+    let mut runtime = crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
         thread,
         &workspace,
         turn,
@@ -402,8 +403,30 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
         &HashMap::new(),
         &[],
         &[],
+        &pioneer_skills::SkillCatalogSnapshot {
+            version: 1,
+            generated_at_unix: now.timestamp(),
+            skills: vec![],
+        },
     )
     .unwrap();
+    runtime.initial_phase_json = Some(crate::native_recovery_test_support::completed_native_phase(
+        &workspace,
+        thread,
+        turn,
+        &test_tool_loop_config().normalized(),
+        serde_json::json!({"attempts":0,"known_tokens":0,"unknown":false}),
+    ));
+    runtime.provider_model_contract_json = Some(
+        processor
+            .provider_registry
+            .get_or_create_for_workspace(&workspace, "openai")
+            .unwrap()
+            .capture_model_contract("test-model")
+            .unwrap()
+            .to_json()
+            .unwrap(),
+    );
     store.upsert_turn_runtime_snapshot(runtime).await.unwrap();
     let security = pioneer_protocol::TurnExecutionSecuritySnapshot::workspace_write(
         saved.permission_profile.clone(),
@@ -457,6 +480,81 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
             now.timestamp(),
             true,
         )
+        .await
+        .unwrap();
+    // The old native producer must have durably committed its semantic
+    // predecessor. Scalar rows alone cannot authorize a fresh recovery budget.
+    let window = store
+        .create_turn_execution_window(
+            pioneer_crud::NewTurnExecutionWindowRecord {
+                workspace_id: workspace.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                window_index: 1,
+                status: pioneer_protocol::ExecutionWindowStatus::Running,
+                exhaustion_reason: None,
+                agent_round_count: 0,
+                tool_call_count: 0,
+                provider_token_count: 0,
+                metadata_json: serde_json::json!({"runtimeWindowId":format!("{turn}:window:1")}),
+                started_at: now,
+            },
+            now,
+            now,
+        )
+        .await
+        .unwrap();
+    let mut checkpoint = pioneer_protocol::build_execution_checkpoint_payload(
+        &workspace,
+        thread,
+        turn,
+        pioneer_protocol::build_execution_checkpoint_original_request_summary(&[UserInput::Text {
+            text: "continue original work".into(),
+            text_elements: vec![],
+        }]),
+        pioneer_protocol::ExecutionCheckpointWindowSummary {
+            progress: Some(pioneer_protocol::ExecutionProgressSummary {
+                schema_version: 1,
+                baseline: [0, 0, 0],
+                frontier: [0, 0, 0],
+            }),
+            window_id: Some(format!("{turn}:window:1")),
+            window_index: window.window_index,
+            started_at_unix_ms: Some(now.timestamp_millis()),
+            completed_at_unix_ms: None,
+            agent_round_count: 0,
+            tool_call_count: 0,
+            provider_token_count: None,
+            exhaustion_reason: None,
+        },
+        pioneer_protocol::build_execution_checkpoint_provider_budget_summary(
+            pioneer_protocol::ExecutionCheckpointProviderBudgetInput {
+                model: Some("test-model".into()),
+                model_provider: Some("openai".into()),
+                agent_round_count: 0,
+                tool_call_count: 0,
+                provider_token_count: None,
+                exhaustion_reason: None,
+                exhausted_limit: None,
+                exhausted_observed: None,
+            },
+        ),
+        pioneer_protocol::build_execution_checkpoint_tool_summary(&[], 32),
+        vec![],
+    );
+    checkpoint.native_semantic_state = Some(
+        crate::native_recovery_test_support::native_semantic_fixture_state(
+            &test_tool_loop_config().normalized(),
+            [0, 0, 0],
+        ),
+    );
+    assert!(pioneer_agent::native_semantic_checkpoint_compatible(
+        &checkpoint,
+        &test_tool_loop_config().normalized().retry,
+        test_tool_loop_config().normalized().no_progress_mode
+    ));
+    store
+        .commit_native_semantic_checkpoint(checkpoint, None, 1, old_owner, 1)
         .await
         .unwrap();
     processor.thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
@@ -537,6 +635,8 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
                 .commit_durable_agent_event(AgentDurableEvent::NativeCancellationContextPrepared {
                     preparation: original_context.clone(),
                     initial_turn: false,
+                    prepare_artifact_obligations: false,
+                    execution_owner_generation: None,
                 })
                 .await
                 .is_err()
@@ -853,6 +953,8 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
                             AgentDurableEvent::NativeCancellationContextPrepared {
                                 preparation: original_context.clone(),
                                 initial_turn: false,
+                                prepare_artifact_obligations: false,
+                                execution_owner_generation: None,
                             }
                         )
                         .await
@@ -1405,15 +1507,32 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
                 })
                 .await
         );
-        assert!(
-            processor
-                .handle_durable_agent_event(AgentDurableEvent::TurnCompleted {
+        // Commit an actual fenced canonical completion while the restored
+        // actor is still awaiting its pre-start acknowledgement. A bare legacy
+        // TurnCompleted event cannot prove a completion of a loaded Blocked turn.
+        let mut completed = saved.clone();
+        completed.status = TurnStatus::Completed;
+        store
+            .with_critical_writes()
+            .accept_native_turn_event_without_projection_for_test(
+                pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
+                    workspace_id: workspace.clone(),
                     thread_id: thread.into(),
-                    turn_id: turn.into(),
-                    recovery: None
-                })
-                .await
-        );
+                    turn: completed,
+                }),
+                now_timestamp_secs(),
+                processor.turn_execution_owner_id.as_ref(),
+            )
+            .await
+            .unwrap();
+        let projection = store
+            .with_maintenance_access()
+            .replay_due_turn_event_projections(now_timestamp_secs(), 64)
+            .await
+            .unwrap();
+        assert_eq!(projection.projected, 1);
+        assert_eq!(projection.failed, 0);
+        assert!(store.native_turn_has_accepted_terminal(turn).await.unwrap());
     }
     processor.release_completed_history_preparation_barrier();
     if matches!(
@@ -1456,6 +1575,8 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
                 .handle_durable_agent_event(AgentDurableEvent::NativeCancellationContextPrepared {
                     preparation: original_context.clone(),
                     initial_turn: false,
+                    prepare_artifact_obligations: false,
+                    execution_owner_generation: None,
                 })
                 .await
         );

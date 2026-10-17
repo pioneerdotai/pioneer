@@ -190,6 +190,7 @@ pub enum PromptSectionId {
     ExecutionContinuation,
     SkillsRuntimePrompt,
     RetryRuntimeInstruction,
+    NativeRuntimeControls,
     DynamicContext,
     ExtraSystem,
     Dynamic(PromptDynamicSectionId),
@@ -221,6 +222,7 @@ impl PromptSectionId {
             Self::ExecutionContinuation => "execution_continuation",
             Self::SkillsRuntimePrompt => "skills_runtime_prompt",
             Self::RetryRuntimeInstruction => "retry_runtime_instruction",
+            Self::NativeRuntimeControls => "native_runtime_controls",
             Self::DynamicContext => "dynamic_context",
             Self::ExtraSystem => "extra_system",
             Self::Dynamic(id) => return id.as_str().to_owned(),
@@ -254,6 +256,7 @@ impl PromptSectionId {
                 | "execution_continuation"
                 | "skills_runtime_prompt"
                 | "retry_runtime_instruction"
+                | "native_runtime_controls"
                 | "dynamic_context"
                 | "extra_system"
         )

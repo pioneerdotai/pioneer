@@ -180,6 +180,10 @@ impl NativeRequestProjection {
             .budget
             .output_reserve(request.max_tokens.map(u64::from))?;
         request.max_tokens = Some(u32::try_from(reserve)?);
+        let mut budget_request = request.clone();
+        budget_request.messages = budget_messages;
+        let wire_budget = budget_request.tool_wire_budget_view()?;
+        let budget_messages = &wire_budget.messages;
         let message_input_tokens = budget_messages
             .iter()
             .zip(&per_message_media)
@@ -196,8 +200,8 @@ impl NativeRequestProjection {
             .filter_map(|message| message.provider_replay_state.as_ref())
             .find_map(|state| state.payload.get("prefix_context"));
         let mut input = serde_json::json!({
-            "model":request.model,"messages":budget_messages,"tools":request.tools,
-            "tool_choice":request.tool_choice,"parallel_tool_calls":request.parallel_tool_calls,
+            "model":request.model,"messages":budget_messages,"tools":wire_budget.tools,
+            "tool_choice":wire_budget.tool_choice,"parallel_tool_calls":request.parallel_tool_calls,
             "temperature":request.temperature,"max_tokens":request.max_tokens,
             "reasoning":request.reasoning.map(|value|format!("{value:?}")),
             "system_sections":request.compiled_prompt.as_ref().map(|value|value.system_sections()),
@@ -217,8 +221,8 @@ impl NativeRequestProjection {
             .filter(|message| message.role == Role::System)
             .collect::<Vec<_>>();
         let fixed_input = serde_json::json!({
-            "model":request.model,"messages":fixed_messages,"tools":request.tools,
-            "tool_choice":request.tool_choice,"parallel_tool_calls":request.parallel_tool_calls,
+            "model":request.model,"messages":fixed_messages,"tools":wire_budget.tools,
+            "tool_choice":wire_budget.tool_choice,"parallel_tool_calls":request.parallel_tool_calls,
             "temperature":request.temperature,"max_tokens":request.max_tokens,
             "reasoning":request.reasoning.map(|value|format!("{value:?}")),
             "system_sections":request.compiled_prompt.as_ref().map(|value|value.system_sections()),

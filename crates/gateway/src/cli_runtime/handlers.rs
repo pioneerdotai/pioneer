@@ -5969,7 +5969,7 @@ impl MessageProcessor {
                     return false;
                 }
                 if let Some(recovery) = recovery.as_ref() {
-                    self.handle_cli_runtime_recovery_native_failure(
+                    self.handle_runtime_recovery_attempt_failure(
                         turn_binding.turn_id.clone(),
                         recovery.clone(),
                         failure,
@@ -6087,7 +6087,7 @@ impl MessageProcessor {
             self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
                 .await;
             if !self
-                .handle_cli_runtime_recovery_native_failure(
+                .handle_runtime_recovery_attempt_failure(
                     turn_binding.turn_id.clone(),
                     recovery.clone(),
                     failure_message.clone(),

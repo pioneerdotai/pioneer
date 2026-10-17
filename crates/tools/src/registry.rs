@@ -8,6 +8,29 @@ use std::sync::Arc;
 
 #[async_trait]
 pub trait ToolHandler: Send + Sync {
+    /// The concrete handler performs only reads. Class names and remote hints
+    /// are not sufficient proof for native batch concurrency.
+    fn supports_parallel_reads(&self) -> bool {
+        false
+    }
+
+    /// A transparent composition performs bounded local preparation/projection
+    /// and delegates all work to exactly one owned nested dispatch. Its child
+    /// owns locks and the finite attempt budget after fresh authorization.
+    /// Never enable this for a handler that also performs external work.
+    fn delegates_runtime_execution(&self) -> bool {
+        false
+    }
+
+    /// One execution attempt, after authorization. Concrete handlers may use
+    /// their frozen workload policy instead of the native default.
+    fn attempt_work_budget(
+        &self,
+        invocation: &ToolInvocation,
+    ) -> Result<std::time::Duration, ToolError> {
+        crate::orchestrator::tool_attempt_work_budget(invocation)
+    }
+
     async fn handle(
         &self,
         invocation: ToolInvocation,
@@ -26,6 +49,28 @@ impl ToolRegistry {
 
     pub fn has_handler(&self, tool_name: &str) -> bool {
         self.handlers.contains_key(tool_name)
+    }
+
+    pub(crate) fn supports_parallel_reads(&self, tool_name: &str) -> bool {
+        self.handlers.get(tool_name).is_some_and(|handler| {
+            handler.supports_parallel_reads() && !handler.delegates_runtime_execution()
+        })
+    }
+
+    pub(crate) fn delegates_runtime_execution(&self, tool_name: &str) -> bool {
+        self.handlers
+            .get(tool_name)
+            .is_some_and(|handler| handler.delegates_runtime_execution())
+    }
+
+    pub(crate) fn attempt_work_budget(
+        &self,
+        invocation: &ToolInvocation,
+    ) -> Result<std::time::Duration, ToolError> {
+        self.handlers
+            .get(invocation.tool_name.as_str())
+            .ok_or_else(|| ToolError::NotFound(invocation.tool_name.clone()))?
+            .attempt_work_budget(invocation)
     }
 
     pub async fn dispatch(

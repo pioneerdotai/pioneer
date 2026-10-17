@@ -86,9 +86,12 @@ async fn check_composer_runtime_can_switch_cli_native_cli_without_blocking_histo
     sessions
         .set_connection_workspace(connection, Some(workspace.clone()))
         .await;
-    let provider = Arc::new(CaptureSummaryProvider::new(
-        r#"<task_result>{"summary":"native runtime completed"}</task_result>"#,
-    ));
+    let provider = Arc::new(
+        CaptureSummaryProvider::new(
+            r#"<task_result>{"summary":"native runtime completed"}</task_result>"#,
+        )
+        .named("openai"),
+    );
     let cli = Arc::new(RecordingCliRuntimeSession::default());
     cli.enable_projected_mcp_metadata(store.clone()).await;
     let cli_manager = test_cli_runtime_manager(cli.clone());

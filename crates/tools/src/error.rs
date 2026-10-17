@@ -7,6 +7,8 @@ pub enum ToolError {
     NotVisible(String),
     Rejected(String),
     Cancelled(String),
+    TimedOut,
+    ResponseLimitExceeded,
     ExecutionFailed(String),
     Internal(String),
 }
@@ -41,6 +43,8 @@ impl Display for ToolError {
             Self::NotVisible(message) => write!(f, "tool not visible: {message}"),
             Self::Rejected(message) => write!(f, "tool call rejected: {message}"),
             Self::Cancelled(message) => write!(f, "tool call cancelled: {message}"),
+            Self::ResponseLimitExceeded => write!(f, "response exceeds bounded read limits"),
+            Self::TimedOut => write!(f, "tool attempt deadline exceeded"),
             Self::ExecutionFailed(message) => write!(f, "tool execution failed: {message}"),
             Self::Internal(message) => write!(f, "tool internal error: {message}"),
         }

@@ -564,8 +564,110 @@ fn catalog_store() -> &'static CatalogStore {
     STORE.get_or_init(CatalogStore::default)
 }
 
+// The selected entry preserves provenance and an independent supplement's
+// presence even when this particular model has no tool evidence.
+#[derive(Serialize, Deserialize)]
+struct SelectedModel {
+    model: Option<CatalogModel>,
+    origins: Option<ModelOrigins>,
+    supplement_present: bool,
+    tool_source: Option<bool>,
+}
+pub(crate) fn selected_model_json(
+    catalog: Option<&ModelCatalog>,
+    provider: &str,
+    model: &str,
+    limit: usize,
+) -> anyhow::Result<String> {
+    #[derive(Serialize)]
+    struct Borrowed<'a> {
+        model: Option<&'a CatalogModel>,
+        origins: Option<&'a ModelOrigins>,
+        supplement_present: bool,
+        tool_source: Option<bool>,
+    }
+    let owner = catalog_provider(provider);
+    crate::model_contract::bounded_json_with_limit(
+        &Borrowed {
+            model: catalog.and_then(|c| c.models.get(&owner)?.get(model)),
+            origins: catalog.and_then(|c| c.origins.get(&owner)?.get(model)),
+            supplement_present: catalog.is_some_and(|c| c.tool_capabilities.is_some()),
+            tool_source: catalog.and_then(|c| {
+                c.tool_capabilities
+                    .as_ref()?
+                    .get(&owner)?
+                    .get(model)
+                    .copied()
+            }),
+        },
+        limit,
+    )
+}
+pub(crate) fn restore_selected_model(
+    encoded: &str,
+    provider: &str,
+    id: &str,
+) -> anyhow::Result<ModelCatalog> {
+    anyhow::ensure!(
+        encoded.len() <= pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+        "accepted catalog entry exceeds byte limit"
+    );
+    crate::model_contract::validate_json_shape(encoded)?;
+    let value: SelectedModel = serde_json::from_str(encoded)
+        .map_err(|_| anyhow::anyhow!("accepted catalog entry is invalid"))?;
+    let owner = catalog_provider(provider);
+    anyhow::ensure!(
+        value
+            .model
+            .as_ref()
+            .is_none_or(|m| m.id == id && m.provider == owner),
+        "accepted catalog entry identity differs"
+    );
+    anyhow::ensure!(
+        value.model.is_none() || value.origins.is_some(),
+        "accepted catalog provenance is missing"
+    );
+    anyhow::ensure!(
+        value
+            .origins
+            .as_ref()
+            .and_then(|o| o.input_limit.as_ref())
+            .is_none_or(|l| l.value > 0),
+        "accepted catalog input limit is invalid"
+    );
+    let models = value
+        .model
+        .map(|m| BTreeMap::from([(owner.clone(), BTreeMap::from([(id.to_owned(), m)]))]))
+        .unwrap_or_default();
+    let origins = value
+        .origins
+        .map(|o| BTreeMap::from([(owner.clone(), BTreeMap::from([(id.to_owned(), o)]))]))
+        .unwrap_or_default();
+    let tool_capabilities = value.supplement_present.then(|| {
+        value
+            .tool_source
+            .map(|v| BTreeMap::from([(owner, BTreeMap::from([(id.to_owned(), v)]))]))
+            .unwrap_or_default()
+    });
+    use sha2::{Digest, Sha256};
+    Ok(ModelCatalog {
+        models,
+        origins,
+        tool_capabilities,
+        snapshot_id: hex::encode(Sha256::digest(encoded.as_bytes())),
+    })
+}
+
 /// A validated, downloaded catalog is required; absence never supplies synthetic limits.
 pub fn model_catalog() -> anyhow::Result<Arc<ModelCatalog>> {
+    if let Some(contract) = crate::model_contract::current() {
+        return Ok(contract.catalog.clone());
+    }
+    if let Some(catalog) =
+        crate::attachments::admission::current().and_then(|state| state.accepted_catalog())
+    {
+        return Ok(catalog);
+    }
     catalog_store().snapshot()
 }
 

@@ -1,5 +1,7 @@
+mod native_control;
 pub(crate) mod preflight;
 mod provider;
+pub(crate) mod semantic_state;
 mod skill_tools;
 mod skills;
 mod tool_recovery_policy;
@@ -24,11 +26,10 @@ use crate::hooks::{
     AgentTurnPostTurnSummary, EffectiveTurnPolicySet, EffectiveTurnPromptContextSet,
     EffectiveTurnPromptManifestHookContributionKind, EffectiveTurnPromptManifestHookDiagnosticCode,
     EffectiveTurnPromptManifestHookMetadata, EffectiveTurnPromptManifestHookSource,
-    EffectiveTurnPromptSectionSet, run_agent_turn_policy_hook_phase,
-    run_agent_turn_post_preflight_prompt_context_hook_phase,
+    EffectiveTurnPromptSectionSet, run_agent_turn_notification_hook_phase,
+    run_agent_turn_policy_hook_phase, run_agent_turn_post_preflight_prompt_context_hook_phase,
     run_agent_turn_prompt_compile_hook_phase, run_agent_turn_prompt_context_hook_phase,
-    run_agent_turn_tool_materialization_hook_phase, run_noop_agent_turn_hook_phase,
-    tool_bundle_contributions_from_bundles,
+    run_agent_turn_tool_materialization_hook_phase, tool_bundle_contributions_from_bundles,
 };
 use crate::{
     AgentEventHub, AgentEventHubError, AgentMcpAvailability, AgentMcpMaterialization,
@@ -85,11 +86,10 @@ use pioneer_protocol::{
     generate_id,
 };
 use pioneer_provider::{
-    AttachmentDataSource, CanonicalProviderRoundEnvelope, ChatMessage, ChatRequest,
-    CompiledPromptPayload, InputContentType, MessageAttachment, MessageContentPart,
-    NativeFileToolCapability, NativePatchWireShape, Provider, ProviderCallIdentity,
-    ProviderRegistry, ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig, ToolDefinition,
-    infer_mime_from_reference,
+    CanonicalProviderRoundEnvelope, ChatMessage, ChatRequest, CompiledPromptPayload,
+    InputContentType, MessageAttachment, MessageContentPart, NativeFileToolCapability,
+    NativePatchWireShape, Provider, ProviderCallIdentity, ProviderRegistry, ProviderTimeoutPolicy,
+    ProviderToolCall, ReasoningConfig, ToolDefinition, infer_mime_from_reference,
 };
 use pioneer_skills::{
     ExcludedSkill, ResolvedSkill, SkillExcludedReason, SkillExplicitRef, SkillPolicyKey,
@@ -102,8 +102,7 @@ use pioneer_tools::{
     ToolLoopBudgetReason, ToolLoopGuard, ToolLoopGuardDecision, ToolLoopRoundAction,
     ToolNoProgressGuard, ToolNoProgressGuardConfig, ToolNoProgressPreflightDecision, ToolOutcome,
     ToolRecoveryView, ToolResultEnvelope, ToolResultView, ToolRetryController, ToolRetryDecision,
-    ToolRetryObservation, build_builtin_tools_with_security_snapshot,
-    build_tools_with_environment_and_security_snapshot, classify_tool_error,
+    ToolRetryObservation, build_tools_with_environment_and_security_snapshot, classify_tool_error,
 };
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
@@ -112,7 +111,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
@@ -167,9 +165,9 @@ fn agent_skill_cards_have_read_path(
 }
 
 async fn finish_tool_event_forwarder(
-    forwarder: JoinHandle<Result<(), AgentEventHubError>>,
+    forwarder: AbortOnDropJoinHandle<Result<(), AgentEventHubError>>,
 ) -> Result<(), ChatTurnError> {
-    match forwarder.await {
+    match forwarder.join().await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(agent_event_error(error)),
         Err(error) => Err(ChatTurnError::Terminal(format!(
@@ -221,6 +219,7 @@ struct AgentRoundResponse {
 
 #[derive(Debug)]
 struct ExecutedToolResult {
+    progress: pioneer_tools::ToolProgressEvidence,
     item_id: String,
     provider_call_id: String,
     ordinal: u32,
@@ -248,6 +247,28 @@ struct SpawnedToolTask {
     handle: AbortOnDropJoinHandle<Result<ExecutedToolResult, ChatTurnError>>,
 }
 
+const NATIVE_PARALLEL_READ_LIMIT: usize = 4;
+
+fn native_tool_batch_segment_len<'a>(
+    calls: impl Iterator<Item = (&'a str, &'a str)>,
+    supports_parallel_reads: impl Fn(&str) -> bool,
+) -> usize {
+    let mut identities = HashSet::new();
+    let mut count = 0;
+    for (name, arguments) in calls.take(NATIVE_PARALLEL_READ_LIMIT) {
+        if !supports_parallel_reads(name) {
+            return count.max(1);
+        }
+        if !identities.insert(ToolNoProgressGuard::exact_strategy_identity(
+            name, arguments,
+        )) {
+            break;
+        }
+        count += 1;
+    }
+    count
+}
+
 fn unknown_tool_task_result(
     item_id: String,
     provider_call_id: String,
@@ -258,6 +279,7 @@ fn unknown_tool_task_result(
 ) -> ExecutedToolResult {
     let outcome = ToolOutcome::fatal(ToolErrorClass::Internal, Some(message.clone()));
     ExecutedToolResult {
+        progress: Default::default(),
         item_id,
         provider_call_id: provider_call_id.clone(),
         ordinal,
@@ -288,6 +310,12 @@ impl<T> AbortOnDropJoinHandle<T> {
         }
     }
 
+    fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+
     async fn join(mut self) -> Result<T, tokio::task::JoinError> {
         // Keep ownership of the JoinHandle while awaiting it.  Taking it out
         // before the await makes Drop unable to abort a task when the join
@@ -312,13 +340,128 @@ impl<T> Drop for AbortOnDropJoinHandle<T> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TaskMutationFailure {
     tool_name: String,
+    identity: TaskMutationIdentity,
+    expected_revision: Option<i64>,
     error: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskMutationIdentity {
+    task_id: Option<String>,
+    operation: TaskMutationOperation,
+    postcondition_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TaskMutationOperation {
+    Create,
+    Update,
+    Reschedule,
+}
+
+impl TaskMutationIdentity {
+    fn from_result(result: &ExecutedToolResult) -> (Self, Option<i64>) {
+        let operation = match result.tool_name.as_str() {
+            "task_create" => TaskMutationOperation::Create,
+            "task_update" => TaskMutationOperation::Update,
+            _ => TaskMutationOperation::Reschedule,
+        };
+        // Canonical arguments, never the error/display text, identify the
+        // intended postcondition. A concurrency revision is a precondition.
+        let mut value =
+            serde_json::from_str::<JsonValue>(&result.arguments).unwrap_or(JsonValue::Null);
+        let task_id = value
+            .get("taskId")
+            .and_then(JsonValue::as_str)
+            .filter(|_| operation != TaskMutationOperation::Create)
+            .map(str::to_owned);
+        let expected_revision = value.get("expectedRevision").and_then(JsonValue::as_i64);
+        // Create has no target yet. The Task owner derives a creation key from
+        // the actual item when no explicit key was accepted; equal arguments
+        // on another item are an independent creation, never its receipt.
+        let explicit_key = value
+            .as_object()
+            .and_then(|object| {
+                match (object.get("idempotencyKey"), object.get("idempotency_key")) {
+                    (Some(key), None) | (None, Some(key)) => key.as_str(),
+                    _ => None,
+                }
+            })
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned);
+        if let Some(object) = value.as_object_mut() {
+            object.remove("expectedRevision");
+            object.remove("idempotencyKey");
+            object.remove("idempotency_key");
+        }
+        let fingerprint = if value.is_object() {
+            let creation = if operation == TaskMutationOperation::Create {
+                Some(match explicit_key {
+                    Some(key) => serde_json::json!(["explicit_key", key]),
+                    None => serde_json::json!(["item", result.item_id]),
+                })
+            } else {
+                None
+            };
+            let signature = pioneer_tools::ToolFailureSignature::from_arguments(
+                &result.tool_name,
+                &serde_json::json!([value, creation]).to_string(),
+                ToolErrorClass::Unknown,
+            );
+            hex::encode(Sha256::digest(signature.arguments_fingerprint.as_bytes()))
+        } else {
+            // An invalid invocation has no proven shared mutation identity.
+            hex::encode(Sha256::digest(result.item_id.as_bytes()))
+        };
+        (
+            Self {
+                task_id,
+                operation,
+                postcondition_sha256: fingerprint,
+            },
+            expected_revision,
+        )
+    }
+
+    fn confirmed(&self, result: &ExecutedToolResult, expected_revision: Option<i64>) -> bool {
+        if !result.success || result.outcome.status != pioneer_tools::ToolOutcomeStatus::Ok {
+            return false;
+        }
+        let Ok(output) = serde_json::from_str::<JsonValue>(&result.model_visible_text) else {
+            return false;
+        };
+        let output_task = output
+            .get("taskId")
+            .and_then(JsonValue::as_str)
+            .or_else(|| output.pointer("/task/id").and_then(JsonValue::as_str));
+        let Some(output_task) = output_task.filter(|id| id.len() == 21) else {
+            return false;
+        };
+        let revision = output
+            .get("revision")
+            .and_then(JsonValue::as_i64)
+            .or_else(|| output.pointer("/task/revision").and_then(JsonValue::as_i64));
+        if !revision.is_some_and(|revision| {
+            revision > 0 && expected_revision.is_none_or(|expected| revision > expected)
+        }) {
+            return false;
+        }
+        if let Some(expected_task) = &self.task_id {
+            return expected_task == output_task;
+        }
+        self.operation == TaskMutationOperation::Create
+    }
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TaskMutationFinalizationGuard {
     failures_since_last_success: Vec<TaskMutationFailure>,
 }
@@ -326,7 +469,6 @@ struct TaskMutationFinalizationGuard {
 #[derive(Debug)]
 struct RenderedTaskObservation {
     task_ids: Vec<String>,
-    message: String,
     details: JsonValue,
 }
 
@@ -334,7 +476,6 @@ struct RenderedTaskObservation {
 struct RenderedReviewRequiredObservation {
     signatures: Vec<String>,
     observations: Vec<ReviewRequiredTaskObservation>,
-    message: String,
     details: JsonValue,
 }
 
@@ -351,6 +492,7 @@ impl ExecutedToolResult {
         )
         .with_recovery_view(self.recovery_view.clone())
         .with_model_visible_text(self.model_visible_text.clone())
+        .with_progress(self.progress)
     }
 }
 
@@ -494,24 +636,81 @@ fn sync_review_action_tools_to_observations(
 }
 
 impl TaskMutationFinalizationGuard {
-    fn observe(&mut self, result: &ExecutedToolResult) {
+    fn checkpoint_valid(&self) -> bool {
+        self.failures_since_last_success.len() <= 256
+            && self
+                .failures_since_last_success
+                .iter()
+                .enumerate()
+                .all(|(index, failure)| {
+                    let operation_name = match failure.identity.operation {
+                        TaskMutationOperation::Create => "task_create",
+                        TaskMutationOperation::Update => "task_update",
+                        TaskMutationOperation::Reschedule => "task_reschedule",
+                    };
+                    failure.tool_name == operation_name
+                        && failure
+                            .identity
+                            .task_id
+                            .as_ref()
+                            .is_none_or(|id| !id.is_empty() && id.len() <= 256)
+                        && failure.identity.postcondition_sha256.len() == 64
+                        && failure
+                            .identity
+                            .postcondition_sha256
+                            .bytes()
+                            .all(|b| b.is_ascii_hexdigit())
+                        && failure.error.len() <= 4096
+                        && self.failures_since_last_success[..index]
+                            .iter()
+                            .all(|other| other.identity != failure.identity)
+                })
+    }
+
+    fn observe(&mut self, result: &ExecutedToolResult) -> Result<(), ChatTurnError> {
         if !is_guarded_task_mutation_tool(result.tool_name.as_str()) {
-            return;
+            return Ok(());
         }
+        let (identity, expected_revision) = TaskMutationIdentity::from_result(result);
         if result.success {
-            self.failures_since_last_success.clear();
-            return;
+            self.failures_since_last_success.retain(|failure| {
+                let precondition = match (failure.expected_revision, expected_revision) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                };
+                failure.identity != identity || !identity.confirmed(result, precondition)
+            });
+            return Ok(());
+        }
+        if let Some(failure) = self
+            .failures_since_last_success
+            .iter_mut()
+            .find(|failure| failure.identity == identity)
+        {
+            failure.expected_revision = match (failure.expected_revision, expected_revision) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            return Ok(());
+        }
+        if self.failures_since_last_success.len() >= 256 {
+            return Err(ChatTurnError::Blocked(
+                "unresolved task mutation limit exceeded".to_owned(),
+            ));
         }
         self.failures_since_last_success.push(TaskMutationFailure {
             tool_name: result.tool_name.clone(),
-            error: result.model_visible_text.clone(),
+            identity,
+            expected_revision,
+            error: bounded_utf8_suffix(&result.model_visible_text, 4096).to_owned(),
         });
+        Ok(())
     }
 
     fn deterministic_failure_message(&self) -> Option<String> {
         let failure = self.failures_since_last_success.last()?;
         Some(format!(
-            "Task mutation failed and no later task mutation succeeded. Do not report the task as created, updated, or rescheduled. Failed tool: {}. Primary error: {}",
+            "Task mutation has an unresolved postcondition. Do not report this task as created, updated, or rescheduled. Failed tool: {}. Primary error: {}",
             failure.tool_name, failure.error
         ))
     }
@@ -528,7 +727,21 @@ fn append_text_fragment(target: &mut String, fragment: &str) {
     if !target.is_empty() {
         target.push('\n');
     }
-    target.push_str(fragment);
+    target.push_str(bounded_utf8_suffix(
+        fragment,
+        semantic_state::MAX_SUMMARY_TEXT_BYTES,
+    ));
+    if target.len() > semantic_state::MAX_SUMMARY_TEXT_BYTES {
+        *target = bounded_utf8_suffix(target, semantic_state::MAX_SUMMARY_TEXT_BYTES).to_owned();
+    }
+}
+
+fn bounded_utf8_suffix(text: &str, max_bytes: usize) -> &str {
+    let mut start = text.len().saturating_sub(max_bytes);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
 }
 
 fn post_turn_tool_event_summary(result: &ExecutedToolResult) -> TurnPostTurnToolEventSummary {
@@ -568,6 +781,7 @@ use crate::post_turn::{post_turn_tool_error_class, post_turn_tool_outcome_status
 #[derive(Debug, Clone)]
 pub(super) enum ChatTurnError {
     Terminal(String),
+    Transient(String),
     Blocked(String),
     ProviderFailure {
         item_id: String,
@@ -598,6 +812,7 @@ impl Default for ChatTurnOutcome {
 
 #[derive(Debug, Clone)]
 struct ChatExecutionWindowStats {
+    progress_baseline: [u64; 3],
     window_index: u32,
     started_at_unix_ms: i64,
     agent_round_count: u32,
@@ -605,18 +820,21 @@ struct ChatExecutionWindowStats {
     executed_tool_success_count: u32,
     executed_tool_failed_count: u32,
     provider_token_count: Option<u64>,
+    provider_token_usage_unknown: bool,
 }
 
 impl ChatExecutionWindowStats {
     fn new(window_index: u32) -> Self {
         Self {
             window_index,
+            progress_baseline: [0; 3],
             started_at_unix_ms: Local::now().timestamp_millis(),
             agent_round_count: 0,
             requested_tool_call_count: 0,
             executed_tool_success_count: 0,
             executed_tool_failed_count: 0,
             provider_token_count: None,
+            provider_token_usage_unknown: false,
         }
     }
 
@@ -635,7 +853,21 @@ impl ChatExecutionWindowStats {
                     .unwrap_or_default()
                     .saturating_add(provider_token_count),
             );
+        } else {
+            self.provider_token_usage_unknown = true;
         }
+    }
+
+    fn record_preflight(&mut self, usage: preflight::PreflightBudgetUsage) {
+        self.agent_round_count = self.agent_round_count.saturating_add(usage.attempts);
+        if usage.attempts > 0 {
+            self.provider_token_count = Some(
+                self.provider_token_count
+                    .unwrap_or_default()
+                    .saturating_add(usage.known_tokens),
+            );
+        }
+        self.provider_token_usage_unknown |= usage.unknown;
     }
 
     fn record_executed_tools(&mut self, results: &[ExecutedToolResult]) {
@@ -659,6 +891,7 @@ impl ChatExecutionWindowStats {
         reason: ExecutionWindowExhaustionReason,
     ) -> ExecutionCheckpointWindowSummary {
         ExecutionCheckpointWindowSummary {
+            progress: None,
             window_id: None,
             window_index: self.window_index,
             started_at_unix_ms: Some(self.started_at_unix_ms),
@@ -678,16 +911,20 @@ impl ChatExecutionWindowStats {
         exhausted_limit: Option<u64>,
         exhausted_observed: Option<u64>,
     ) -> ExecutionCheckpointProviderBudgetSummary {
-        build_execution_checkpoint_provider_budget_summary(ExecutionCheckpointProviderBudgetInput {
-            model: Some(model.to_owned()),
-            model_provider: Some(model_provider.to_owned()),
-            agent_round_count: self.agent_round_count,
-            tool_call_count: self.requested_tool_call_count,
-            provider_token_count: self.provider_token_count,
-            exhaustion_reason: Some(reason),
-            exhausted_limit,
-            exhausted_observed,
-        })
+        let mut summary = build_execution_checkpoint_provider_budget_summary(
+            ExecutionCheckpointProviderBudgetInput {
+                model: Some(model.to_owned()),
+                model_provider: Some(model_provider.to_owned()),
+                agent_round_count: self.agent_round_count,
+                tool_call_count: self.requested_tool_call_count,
+                provider_token_count: self.provider_token_count,
+                exhaustion_reason: Some(reason),
+                exhausted_limit,
+                exhausted_observed,
+            },
+        );
+        summary.provider_usage_available &= !self.provider_token_usage_unknown;
+        summary
     }
 
     fn checkpoint_tool_summary(&self) -> ExecutionCheckpointToolSummary {
@@ -834,7 +1071,8 @@ fn build_failure_execution_window_continuation(
             ExecutionWindowExhaustionReason::ProviderFailureContinuation,
             "provider_failure_continuation",
         ),
-        ChatTurnError::Terminal(_) => (
+        ChatTurnError::Terminal(_) => return None,
+        ChatTurnError::Transient(_) => (
             ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
             "runtime_shutdown_continuation",
         ),
@@ -978,22 +1216,46 @@ impl ChatTurnError {
 }
 
 fn agent_event_error(error: AgentEventHubError) -> ChatTurnError {
-    ChatTurnError::Terminal(format!("failed to publish agent event: {error}"))
+    let message = format!("failed to publish agent event: {error}");
+    match error {
+        AgentEventHubError::CommitRejected(rejection) if !rejection.is_retryable() => {
+            ChatTurnError::Terminal(message)
+        }
+        _ => ChatTurnError::Transient(message),
+    }
+}
+
+fn ensure_preflight_usage_committed(
+    failure: Option<pioneer_protocol::TurnFailureDisposition>,
+) -> Result<(), ChatTurnError> {
+    use pioneer_protocol::TurnFailureDisposition;
+    match failure {
+        None => Ok(()),
+        Some(TurnFailureDisposition::Permanent) => Err(ChatTurnError::Terminal(
+            "preflight durable usage was rejected".to_owned(),
+        )),
+        Some(TurnFailureDisposition::Transient) => Err(ChatTurnError::Transient(
+            "preflight durable usage is unavailable".to_owned(),
+        )),
+        Some(TurnFailureDisposition::Unknown) => Err(ChatTurnError::Blocked(
+            "preflight durable usage outcome is unknown".to_owned(),
+        )),
+    }
 }
 
 fn chat_error_post_turn_status(error: &ChatTurnError) -> pioneer_hooks::TurnPostTurnStatus {
     match error {
         ChatTurnError::ProviderFailure { .. } => pioneer_hooks::TurnPostTurnStatus::ProviderFailure,
         ChatTurnError::Blocked(_) => pioneer_hooks::TurnPostTurnStatus::Blocked,
-        ChatTurnError::Terminal(_) | ChatTurnError::WithPostTurnDispatch { .. } => {
-            pioneer_hooks::TurnPostTurnStatus::Failed
-        }
+        ChatTurnError::Terminal(_)
+        | ChatTurnError::Transient(_)
+        | ChatTurnError::WithPostTurnDispatch { .. } => pioneer_hooks::TurnPostTurnStatus::Failed,
     }
 }
 
 fn chat_error_preview(error: &ChatTurnError) -> String {
     match error {
-        ChatTurnError::Terminal(message) => message.clone(),
+        ChatTurnError::Terminal(message) | ChatTurnError::Transient(message) => message.clone(),
         ChatTurnError::Blocked(message) => message.clone(),
         ChatTurnError::ProviderFailure { failure, .. } => {
             failure.message.clone().unwrap_or_else(|| {
@@ -1046,6 +1308,100 @@ async fn emit_durable_event(
         .publish_durable_and_wait(event)
         .await
         .map_err(agent_event_error)
+}
+
+fn attach_native_semantic_state(
+    payload: &mut pioneer_protocol::ExecutionCheckpointPayload,
+    state: serde_json::Value,
+    baseline: [u64; 3],
+) -> Result<(), ChatTurnError> {
+    let frontier = &state["progress_frontier"];
+    let read = |field: &str| {
+        frontier[field]
+            .as_u64()
+            .ok_or_else(|| ChatTurnError::Blocked("native progress source unavailable".to_owned()))
+    };
+    let progress = pioneer_protocol::ExecutionProgressSummary {
+        schema_version: 1,
+        baseline,
+        frontier: [
+            read("advanced_observations")?,
+            read("unchanged_observations")?,
+            read("unknown_observations")?,
+        ],
+    };
+    if !progress.valid() {
+        return Err(ChatTurnError::Blocked(
+            "native progress baseline is incompatible".to_owned(),
+        ));
+    }
+    payload.window.progress = Some(progress);
+    payload.native_semantic_state = Some(state);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_native_semantic_checkpoint(
+    event_tx: &AgentEventHub,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    input: &[UserInput],
+    model: &str,
+    model_provider: &str,
+    stats: &ChatExecutionWindowStats,
+    no_progress: pioneer_protocol::ExecutionCheckpointToolNoProgressState,
+    requested_tools: &[String],
+    state: serde_json::Value,
+    control: Option<pioneer_protocol::NativeControlRecord>,
+    execution_owner_generation: Option<u64>,
+    runtime_generation: u64,
+) -> Result<(), ChatTurnError> {
+    let mut payload = pioneer_protocol::build_execution_checkpoint_payload(
+        workspace_id,
+        thread_id,
+        turn_id,
+        build_execution_checkpoint_original_request_summary(input),
+        ExecutionCheckpointWindowSummary {
+            progress: None,
+            window_id: Some(execution_window_runtime_id(turn_id, stats.window_index)),
+            window_index: stats.window_index,
+            started_at_unix_ms: Some(stats.started_at_unix_ms),
+            completed_at_unix_ms: None,
+            agent_round_count: stats.agent_round_count,
+            tool_call_count: stats.requested_tool_call_count,
+            provider_token_count: stats.provider_token_count,
+            exhaustion_reason: None,
+        },
+        build_execution_checkpoint_provider_budget_summary(
+            ExecutionCheckpointProviderBudgetInput {
+                model: Some(model.to_owned()),
+                model_provider: Some(model_provider.to_owned()),
+                agent_round_count: stats.agent_round_count,
+                tool_call_count: stats.requested_tool_call_count,
+                provider_token_count: stats.provider_token_count,
+                exhaustion_reason: None,
+                exhausted_limit: None,
+                exhausted_observed: None,
+            },
+        ),
+        stats.checkpoint_tool_summary(),
+        Vec::new(),
+    );
+    payload.provider_budget.provider_usage_available &= !stats.provider_token_usage_unknown;
+    payload.tool_no_progress = no_progress;
+    payload.requested_tool_names = requested_tools.to_vec();
+    attach_native_semantic_state(&mut payload, state, stats.progress_baseline)?;
+    emit_durable_event(
+        event_tx,
+        AgentDurableEvent::NativeSemanticCheckpoint {
+            execution_owner_generation,
+            runtime_generation,
+            checkpoint: payload,
+            control,
+        },
+    )
+    .await
 }
 
 async fn persist_provider_history_message(
@@ -2083,6 +2439,7 @@ async fn run_agent_turn_preflight_stage(
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
+    window_index: u32,
     hook_runtime_context: &AgentTurnHookRuntimeContext,
     input_text: &str,
 ) -> TurnPreflightOrchestratorResult {
@@ -2168,6 +2525,7 @@ async fn run_agent_turn_preflight_stage(
             workspace: workspace_id.into(),
             thread: thread_id.into(),
             turn: turn_id.into(),
+            window_index,
         }),
         provider_registry,
         workspace_id: workspace_id.to_owned(),
@@ -2250,6 +2608,7 @@ fn preflight_active_recall_prompt_context_input(
     )
 }
 
+#[cfg(test)]
 fn compile_agent_instruction_delivery_plan_with_prompt_root(
     prompt_root: &std::path::Path,
     skills_prompt: Option<String>,
@@ -2263,8 +2622,36 @@ fn compile_agent_instruction_delivery_plan_with_prompt_root(
     thread_id: &str,
     turn_id: &str,
 ) -> Result<CompiledInstructionDeliveryPlan, ChatTurnError> {
-    let now = Local::now();
+    compile_agent_instruction_delivery_plan_with_captured_clock(
+        prompt_root,
+        skills_prompt,
+        retry_instruction,
+        runtime_sections,
+        permission_profile,
+        include_task_orchestration_policy,
+        include_request_tools_catalog,
+        continue_generation_hint,
+        initiating_thread_id,
+        thread_id,
+        turn_id,
+        &Local::now().fixed_offset(),
+    )
+}
 
+fn compile_agent_instruction_delivery_plan_with_captured_clock(
+    prompt_root: &std::path::Path,
+    skills_prompt: Option<String>,
+    retry_instruction: Option<String>,
+    runtime_sections: &[PromptRuntimeSectionInput],
+    permission_profile: &TurnPermissionProfileSnapshot,
+    include_task_orchestration_policy: bool,
+    include_request_tools_catalog: bool,
+    continue_generation_hint: bool,
+    initiating_thread_id: Option<&str>,
+    thread_id: &str,
+    turn_id: &str,
+    now: &chrono::DateTime<chrono::FixedOffset>,
+) -> Result<CompiledInstructionDeliveryPlan, ChatTurnError> {
     let extra_system = format!(
         "## Runtime\n{}\nCurrent date/time: {} ({})\nOS: {}",
         pioneer_promt::render_thread_ids(initiating_thread_id, thread_id),
@@ -2331,6 +2718,15 @@ fn runtime_sections_with_current_permissions(
     sections
 }
 
+fn reproject_agent_instruction_plan(
+    base: &CompiledInstructionDeliveryPlan,
+    retry: Option<&str>,
+    tools_enabled: bool,
+) -> Result<CompiledInstructionDeliveryPlan, ChatTurnError> {
+    pioneer_promt::reproject_native_instruction_plan(base, retry, tools_enabled, None)
+        .map_err(|_| ChatTurnError::Blocked("accepted prompt reprojection failed".to_owned()))
+}
+
 fn compiled_prompt_payload_from_delivery_plan(
     plan: &CompiledInstructionDeliveryPlan,
 ) -> CompiledPromptPayload {
@@ -2361,16 +2757,170 @@ fn next_retained_provider_history_sequence(
         .map_or(0, |sequence| sequence.saturating_add(1))
 }
 
+const MAX_RETAINED_PROVIDER_MESSAGES: usize = 8192;
+const MAX_RETAINED_PROVIDER_BYTES: usize = 256 * 1024 * 1024;
+
+struct RetainedProviderByteCounter(usize);
+impl std::io::Write for RetainedProviderByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .filter(|value| *value <= MAX_RETAINED_PROVIDER_BYTES)
+            .ok_or_else(|| std::io::Error::other("retained native history byte limit"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Count actual message and provenance wire bytes without another transcript allocation.
+fn retained_provider_message_bytes(message: &ChatMessage) -> Result<usize, ChatTurnError> {
+    let mut counter = RetainedProviderByteCounter(0);
+    serde_json::to_writer(&mut counter, &(message, &message.provenance)).map_err(|_| {
+        ChatTurnError::Blocked("retained native history exceeds its byte bound".into())
+    })?;
+    Ok(counter.0)
+}
+
+/// Called only after successful context preparation. The exact acknowledged
+/// checkpoint roots replace their old prefix; current native tool units stay whole.
+fn synchronize_retained_provider_history(
+    retained: &mut Vec<RetainedProviderHistoryMessage>,
+    next_sequence: &mut i64,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    accepted: &[ChatMessage],
+) -> Result<usize, ChatTurnError> {
+    let unavailable =
+        || ChatTurnError::Blocked("retained native history projection unavailable".into());
+    let mut units = std::collections::BTreeMap::new();
+    let mut selected = Vec::new();
+    let mut bytes = 0usize;
+    for message in accepted {
+        let Some(origin) = &message.provenance else {
+            if matches!(
+                message.role,
+                pioneer_provider::Role::Assistant | pioneer_provider::Role::Tool
+            ) {
+                return Err(unavailable());
+            }
+            continue;
+        };
+        let root = origin
+            .sources
+            .iter()
+            .any(|source| source.scope.starts_with("checkpoint:"));
+        let current = origin.thread_id == thread
+            && origin.sources.iter().any(|source| {
+                source.scope.split_once(':').is_some_and(|(kind, owner)| {
+                    owner == turn
+                        && matches!(
+                            kind,
+                            "context"
+                                | "event"
+                                | "item"
+                                | "pending-assistant"
+                                | "pending-tool"
+                                | "pending-item"
+                        )
+                })
+            });
+        let keep = root
+            || (current
+                && matches!(
+                    message.role,
+                    pioneer_provider::Role::Assistant | pioneer_provider::Role::Tool
+                ));
+        let key = (origin.thread_id.as_str(), origin.unit_id.as_str());
+        if units
+            .insert(key, keep)
+            .is_some_and(|previous| previous != keep)
+        {
+            return Err(unavailable());
+        }
+        if !keep {
+            continue;
+        }
+        if origin.workspace_id != workspace || origin.sources.is_empty() {
+            return Err(unavailable());
+        }
+        if current
+            && !root
+            && !origin.sources.iter().all(|source| {
+                source.scope.split_once(':').is_some_and(|(kind, owner)| {
+                    owner == turn
+                        && matches!(
+                            kind,
+                            "context"
+                                | "event"
+                                | "item"
+                                | "pending-assistant"
+                                | "pending-tool"
+                                | "pending-item"
+                        )
+                })
+            })
+        {
+            return Err(unavailable());
+        }
+        if selected.len() >= MAX_RETAINED_PROVIDER_MESSAGES {
+            return Err(unavailable());
+        }
+        bytes = bytes
+            .checked_add(retained_provider_message_bytes(message)?)
+            .filter(|value| *value <= MAX_RETAINED_PROVIDER_BYTES)
+            .ok_or_else(unavailable)?;
+        selected.push(message);
+    }
+    // All validation precedes replacement. A failed preparation or bound leaves
+    // the old agreed projection intact, including opaque native replay state.
+    let next = selected
+        .into_iter()
+        .enumerate()
+        .map(|(sequence, message)| RetainedProviderHistoryMessage {
+            sequence: sequence as i64,
+            message: message.clone(),
+        })
+        .collect::<Vec<_>>();
+    *next_sequence = next.len() as i64;
+    *retained = next;
+    Ok(bytes)
+}
+
 fn retain_provider_history_message(
     retained_context: &mut Vec<RetainedProviderHistoryMessage>,
     next_sequence: &mut i64,
+    retained_bytes: &mut Option<usize>,
     message: &ChatMessage,
-) {
+) -> Result<(), ChatTurnError> {
+    let unavailable = || ChatTurnError::Blocked("retained native history capacity exceeded".into());
+    if retained_context.len() >= MAX_RETAINED_PROVIDER_MESSAGES {
+        return Err(unavailable());
+    }
+    let previous_bytes = match *retained_bytes {
+        Some(bytes) => bytes,
+        None => retained_context.iter().try_fold(0usize, |bytes, entry| {
+            bytes
+                .checked_add(retained_provider_message_bytes(&entry.message)?)
+                .filter(|bytes| *bytes <= MAX_RETAINED_PROVIDER_BYTES)
+                .ok_or_else(unavailable)
+        })?,
+    };
+    let bytes = previous_bytes
+        .checked_add(retained_provider_message_bytes(message)?)
+        .filter(|bytes| *bytes <= MAX_RETAINED_PROVIDER_BYTES)
+        .ok_or_else(unavailable)?;
+    let following_sequence = next_sequence.checked_add(1).ok_or_else(unavailable)?;
     retained_context.push(RetainedProviderHistoryMessage {
         sequence: *next_sequence,
         message: message.clone(),
     });
-    *next_sequence = next_sequence.saturating_add(1);
+    *next_sequence = following_sequence;
+    *retained_bytes = Some(bytes);
+    Ok(())
 }
 
 fn prompt_manifest_profile(profile: PromptProfile) -> PromptManifestProfile {
@@ -2666,10 +3216,13 @@ pub(super) async fn execute_chat_turn_flow(
     disable_tool_calling: bool,
     continue_generation_hint: bool,
     tool_loop_config: ToolLoopConfig,
+    initial_preparation: Option<crate::NativeInitialPreparation>,
+    runtime_generation: u64,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
     turn_tool_provider: Option<Arc<dyn TurnToolProvider>>,
     turn_finalization_provider: Option<Arc<dyn TurnFinalizationProvider>>,
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
+    memory_provider: Option<Arc<dyn crate::AgentMemoryProvider>>,
     hook_runtime: Option<Arc<HookRuntime>>,
     tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
     permission_approval_broker: Arc<dyn PermissionApprovalBroker>,
@@ -2677,6 +3230,8 @@ pub(super) async fn execute_chat_turn_flow(
     recovery: Option<RecoveryAttemptContext>,
     event_tx: Arc<AgentEventHub>,
 ) -> Result<ChatTurnOutcome, ChatTurnError> {
+    let preparation_started = Instant::now();
+    let preparation_started_at_unix_ms = Local::now().timestamp_millis();
     if mode == ThreadMode::Message {
         return Err(ChatTurnError::Terminal(
             "message turns must complete in gateway admission without provider execution"
@@ -2751,6 +3306,8 @@ pub(super) async fn execute_chat_turn_flow(
                 runtime_environment,
                 retained_provider_history,
                 execution_window_index,
+                preparation_started,
+                preparation_started_at_unix_ms,
                 execution_checkpoint_context,
                 permission_profile,
                 execution_security_snapshot,
@@ -2758,10 +3315,13 @@ pub(super) async fn execute_chat_turn_flow(
                 disable_tool_calling,
                 continue_generation_hint,
                 tool_loop_config,
+                initial_preparation,
+                runtime_generation,
                 mcp_tool_provider,
                 turn_tool_provider,
                 turn_finalization_provider,
                 task_tool_provider,
+                memory_provider,
                 hook_runtime,
                 tool_bundle_artifacts,
                 permission_approval_broker,
@@ -2793,7 +3353,13 @@ pub(super) async fn execute_chat_turn_flow(
                 &thinking_item_id,
                 &message_item_id,
                 tool_loop_config.provider,
+                None,
                 event_tx.clone(),
+                StandardFinalization {
+                    task: task_tool_provider.as_ref(),
+                    finalization: turn_finalization_provider.as_ref(),
+                    context: None,
+                },
             )
             .await;
 
@@ -2852,6 +3418,153 @@ async fn await_context_request<T>(
     }
 }
 
+pub(super) struct StandardFinalization<'a> {
+    task: Option<&'a Arc<dyn TaskToolProvider>>,
+    finalization: Option<&'a Arc<dyn TurnFinalizationProvider>>,
+    context: Option<(
+        &'a crate::compaction::controller::NativeContextSession,
+        crate::compaction::controller::NativeInputReceipt,
+    )>,
+}
+
+impl StandardFinalization<'_> {
+    async fn check(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        text: &str,
+        usage: Option<&pioneer_provider::TokenUsage>,
+    ) -> Result<Option<String>, ChatTurnError> {
+        if let Some((session, receipt)) = &self.context {
+            session
+                .record_usage(receipt.clone(), usage)
+                .map_err(|error| {
+                    ChatTurnError::Blocked(format!("context usage unavailable: {error}"))
+                })?;
+        }
+        let mut revision = None;
+        if let Some(snapshot) =
+            attached_task_finalization_snapshot(self.task, workspace, thread, turn)
+                .await
+                .map_err(|error| {
+                    ChatTurnError::Blocked(format!("task finalization unavailable: {error}"))
+                })?
+        {
+            revision = Some(snapshot.revision.clone());
+            if !snapshot.pending.is_empty() || !snapshot.review_required.is_empty() {
+                return Err(ChatTurnError::Blocked(
+                    "attached task obligations remain unresolved".into(),
+                ));
+            }
+        }
+        if let Some(provider) = self.finalization {
+            match provider
+                .check_turn_finalization(TurnFinalizationContext {
+                    workspace_id: workspace.into(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    final_text: text.into(),
+                })
+                .await
+                .map_err(|error| {
+                    ChatTurnError::Blocked(format!("turn finalization unavailable: {error}"))
+                })? {
+                TurnFinalizationDecision::Allow => {}
+                TurnFinalizationDecision::Retry { .. } => {
+                    return Err(ChatTurnError::Blocked(
+                        "finalization requires work unavailable in the tool-less response path"
+                            .into(),
+                    ));
+                }
+                TurnFinalizationDecision::Fail { message } => {
+                    return Err(ChatTurnError::Terminal(message));
+                }
+            }
+        }
+        Ok(revision)
+    }
+}
+
+async fn publish_standard_final_response(
+    hub: &AgentEventHub,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    thinking: &str,
+    message: &str,
+    round: &AgentRoundResponse,
+    revision: Option<String>,
+) -> Result<(), ChatTurnError> {
+    provider::persist_completed_response(
+        hub,
+        thread,
+        turn,
+        message,
+        thinking,
+        &round.text,
+        &round.reasoning,
+        round.provider_replay_state.as_ref(),
+    )
+    .await?;
+    send_reasoning_completed(workspace, thread, turn, thinking, &round.reasoning, hub).await?;
+    emit_durable_event(
+        hub,
+        AgentDurableEvent::ItemStarted {
+            notification: ItemStartedNotification {
+                workspace_id: workspace.into(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: TurnItem::AgentMessage {
+                    id: message.into(),
+                    text: String::new(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+        },
+    )
+    .await?;
+    emit_progress_event(
+        hub,
+        AgentProgressEvent::ItemDelta {
+            notification: ItemDeltaNotification {
+                workspace_id: workspace.into(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item_id: message.into(),
+                delta: round.text.clone(),
+                stream: Some(pioneer_protocol::ItemDeltaStream::AgentMessage),
+                payload: None,
+                markdown: None,
+                markdown_version: None,
+            },
+        },
+    )
+    .await?;
+    emit_durable_event(
+        hub,
+        AgentDurableEvent::TurnFinalizationPrepared {
+            notification: ItemCompletedNotification {
+                workspace_id: workspace.into(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: TurnItem::AgentMessage {
+                    id: message.into(),
+                    text: round.text.clone(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            generation: TURN_FINALIZATION_GENERATION,
+            task_finalization_revision: revision,
+        },
+    )
+    .await
+}
+
 async fn execute_standard_provider_response(
     context_session: Option<&crate::compaction::controller::NativeContextSession>,
     provider: &Arc<dyn Provider>,
@@ -2868,7 +3581,9 @@ async fn execute_standard_provider_response(
     thinking_item_id: &str,
     message_item_id: &str,
     provider_timeout_policy: ProviderTimeoutPolicy,
+    accounting: Option<&mut ChatExecutionWindowStats>,
     event_tx: Arc<AgentEventHub>,
+    finalization: StandardFinalization<'_>,
 ) -> Result<String, ChatTurnError> {
     let mut messages = history;
 
@@ -2899,9 +3614,13 @@ async fn execute_standard_provider_response(
     } else {
         (request, None)
     };
+    let finalization = StandardFinalization {
+        context: context_session.zip(receipt),
+        ..finalization
+    };
     let work = async {
         if provider.capabilities().streaming && !force_non_stream {
-            provider::stream_provider_response(
+            provider::stream_provider_response_accounted(
                 provider,
                 request,
                 workspace_id,
@@ -2911,10 +3630,12 @@ async fn execute_standard_provider_response(
                 message_item_id,
                 provider_timeout_policy,
                 event_tx.as_ref(),
+                accounting,
+                Some(&finalization),
             )
             .await
         } else {
-            provider::non_stream_provider_response(
+            provider::non_stream_provider_response_with_policy(
                 provider,
                 request,
                 workspace_id,
@@ -2922,17 +3643,15 @@ async fn execute_standard_provider_response(
                 turn_id,
                 thinking_item_id,
                 message_item_id,
+                provider_timeout_policy,
                 event_tx.as_ref(),
+                accounting,
+                Some(&finalization),
             )
             .await
         }
     };
-    let (text, usage) = await_context_request(context_session, work).await?;
-    if let (Some(session), Some(receipt)) = (context_session, receipt) {
-        session
-            .record_usage(receipt, usage.as_ref())
-            .map_err(|e| ChatTurnError::Blocked(format!("context usage unavailable: {e}")))?;
-    }
+    let (text, _) = await_context_request(context_session, work).await?;
     Ok(text)
 }
 
@@ -2974,29 +3693,17 @@ async fn materialize_task_tooling(
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
-) -> TaskToolMaterialization {
+) -> Result<TaskToolMaterialization, String> {
     let Some(provider) = provider else {
-        return TaskToolMaterialization::default();
+        return Ok(TaskToolMaterialization::default());
     };
-    match provider
+    provider
         .materialize_task_tools(TaskTurnContext {
             workspace_id: workspace_id.to_owned(),
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
         })
         .await
-    {
-        Ok(materialization) => materialization,
-        Err(error) => {
-            warn!(
-                thread_id,
-                turn_id,
-                error = error.as_str(),
-                "failed to materialize task orchestration tools"
-            );
-            TaskToolMaterialization::default()
-        }
-    }
 }
 
 async fn materialize_turn_tooling(
@@ -3045,57 +3752,52 @@ async fn review_required_attached_task_observation(
         }
     };
 
-    let mut observations = observations
-        .into_iter()
-        .take(MAX_REVIEW_REQUIRED_TASK_OBSERVATIONS)
-        .collect::<Vec<_>>();
-    if observations.is_empty() {
-        return None;
-    }
-    observations.sort_by(|left, right| {
-        left.task_id
-            .cmp(&right.task_id)
-            .then_with(|| left.run_id.cmp(&right.run_id))
-            .then_with(|| left.candidate_id.cmp(&right.candidate_id))
-    });
-
-    let signatures = observations
-        .iter()
-        .map(review_required_observation_signature)
-        .collect::<Vec<_>>();
-    let payload = observations
-        .iter()
-        .map(review_required_observation_payload)
-        .collect::<Vec<_>>();
-    let payload_text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".to_owned());
-    let message = format!(
-        "Attached task result candidates require review before this turn can finish:\n{payload_text}\nFor each candidate, call one of its allowedActions (`task_accept`, `task_revise`, or `task_cancel`). Do not provide the final answer until every review-required candidate is accepted, revised, cancelled, or otherwise no longer waiting for review."
-    );
-    let details = json!({
-        "taskIds": observations.iter().map(|observation| observation.task_id.clone()).collect::<Vec<_>>(),
-        "observations": payload,
-    });
-
-    Some(RenderedReviewRequiredObservation {
-        signatures,
-        observations,
-        message,
-        details,
-    })
+    render_review_required_snapshot(&observations, &BTreeSet::new())
 }
 
 fn review_required_observation_signature(observation: &ReviewRequiredTaskObservation) -> String {
-    format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}",
-        observation.task_id,
-        observation.run_id,
-        observation.candidate_id,
-        observation.candidate_status,
-        observation.round,
-        observation.remaining_revision_rounds,
-        observation.allowed_actions.join(","),
-        observation.revision_blocked_reason.as_deref().unwrap_or("")
-    )
+    use sha2::Digest;
+    // Exact bytes presented in the control, including candidate identity/revision.
+    hex::encode(sha2::Sha256::digest(
+        review_required_observation_payload(observation)
+            .to_string()
+            .as_bytes(),
+    ))
+}
+
+fn retain_current_review_delivery(
+    observations: &[ReviewRequiredTaskObservation],
+    delivered: &mut BTreeSet<String>,
+) -> Result<(), ChatTurnError> {
+    if observations.iter().any(|record| {
+        record.candidate_revision.len() != 64
+            || !record
+                .candidate_revision
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        return Err(ChatTurnError::Blocked(
+            "authoritative review candidate revision unavailable".into(),
+        ));
+    }
+    let current = observations
+        .iter()
+        .map(review_required_observation_signature)
+        .collect::<BTreeSet<_>>();
+    if current.len() > 256 {
+        return Err(ChatTurnError::Blocked(
+            "active review delivery cursor exceeds its accepted bound".into(),
+        ));
+    }
+    let retained = observations
+        .iter()
+        .filter_map(|record| {
+            let signature = review_required_observation_signature(record);
+            delivered.contains(&signature).then_some(signature)
+        })
+        .collect();
+    *delivered = retained;
+    Ok(())
 }
 
 fn review_required_observation_payload(observation: &ReviewRequiredTaskObservation) -> JsonValue {
@@ -3103,6 +3805,7 @@ fn review_required_observation_payload(observation: &ReviewRequiredTaskObservati
         "taskId": observation.task_id,
         "runId": observation.run_id,
         "candidateId": observation.candidate_id,
+        "candidateRevision": observation.candidate_revision,
         "title": observation.title,
         "status": observation.status,
         "candidateStatus": observation.candidate_status,
@@ -3169,11 +3872,131 @@ async fn wait_for_attached_task_finalization_snapshot(
         .map(Some)
 }
 
+fn attached_wait_owner(generation: Option<u64>) -> Result<u64, ChatTurnError> {
+    generation.filter(|value| *value > 0).ok_or_else(|| {
+        ChatTurnError::Blocked("durable attached task wait owner unavailable".into())
+    })
+}
+
+fn attached_task_semantic_revision(
+    snapshot: &TaskFinalizationSnapshot,
+) -> Result<[u8; 32], ChatTurnError> {
+    use sha2::Digest;
+    if snapshot
+        .pending
+        .len()
+        .saturating_add(snapshot.review_required.len())
+        .saturating_add(snapshot.terminal.len())
+        > 256
+    {
+        return Err(ChatTurnError::Blocked(
+            "attached task waiting snapshot exceeds bounded checkpoint contract".into(),
+        ));
+    }
+    let mut records = snapshot
+        .pending
+        .iter()
+        .map(|task| {
+            (
+                "pending",
+                task.task_id.as_str(),
+                task.run_id.as_deref().unwrap_or(""),
+                task.status.as_str(),
+            )
+        })
+        .chain(snapshot.terminal.iter().map(|task| {
+            (
+                "terminal",
+                task.task_id.as_str(),
+                task.run_id.as_deref().unwrap_or(""),
+                task.status.as_str(),
+            )
+        }))
+        .collect::<Vec<_>>();
+    records.sort_unstable();
+    let mut hash = sha2::Sha256::new();
+    for record in records {
+        for field in [record.0, record.1, record.2, record.3] {
+            hash.update((field.len() as u64).to_le_bytes());
+            hash.update(field.as_bytes());
+        }
+    }
+    let reviews = snapshot
+        .review_required
+        .iter()
+        .map(review_required_observation_signature)
+        .collect::<BTreeSet<_>>();
+    for review in reviews {
+        hash.update(review.as_bytes());
+    }
+    Ok(hash.finalize().into())
+}
+
+async fn await_attached_task_change(
+    provider: Option<&Arc<dyn TaskToolProvider>>,
+    wait: &pioneer_protocol::NativeAttachedTaskWait,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    control: &TurnExecutionControl,
+    hub: &AgentEventHub,
+) -> Result<TaskFinalizationSnapshot, ChatTurnError> {
+    let provider = provider
+        .ok_or_else(|| ChatTurnError::Blocked("attached task wait owner unavailable".into()))?;
+    let context = TaskTurnContext {
+        workspace_id: workspace.into(),
+        thread_id: thread.into(),
+        turn_id: turn.into(),
+    };
+    let cancellation = control.cancellation_token();
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut failures = 0u8;
+    loop {
+        let observation = provider.wait_for_attached_task_finalization_snapshot(
+            context.clone(),
+            ATTACHED_TASK_FINALIZATION_WAIT_MS,
+        );
+        tokio::pin!(observation);
+        let result = loop {
+            tokio::select! { biased;
+                _ = cancellation.cancelled() => return Err(ChatTurnError::Blocked("attached task wait cancelled".into())),
+                _ = heartbeat.tick() => hub.publish_heartbeat(workspace.into(), thread.into(), turn.into(), wait.item_id.clone(), TurnItemType::Reasoning),
+                result = &mut observation => break result,
+            }
+        };
+        let snapshot = match result {
+            Ok(snapshot) => {
+                failures = 0;
+                snapshot
+            }
+            Err(error) => {
+                failures += 1;
+                if failures >= 3 {
+                    return Err(ChatTurnError::Blocked(format!(
+                        "attached task wait unavailable: {error}"
+                    )));
+                }
+                tokio::select! { biased; _ = cancellation.cancelled() => return Err(ChatTurnError::Blocked("attached task wait cancelled".into())), _ = tokio::time::sleep(Duration::from_millis(100)) => {} }
+                continue;
+            }
+        };
+        if attached_task_semantic_revision(&snapshot)? != wait.baseline {
+            return Ok(snapshot);
+        }
+        // A no-change bounded timeout stays in this owned host wait, without a provider round.
+    }
+}
+
 fn render_review_required_snapshot(
     observations: &[ReviewRequiredTaskObservation],
+    delivered: &BTreeSet<String>,
 ) -> Option<RenderedReviewRequiredObservation> {
-    let mut observations = observations.to_vec();
-    observations.truncate(MAX_REVIEW_REQUIRED_TASK_OBSERVATIONS);
+    let mut observations = observations
+        .iter()
+        .filter(|record| !delivered.contains(&review_required_observation_signature(record)))
+        .cloned()
+        .collect::<Vec<_>>();
     if observations.is_empty() {
         return None;
     }
@@ -3183,6 +4006,7 @@ fn render_review_required_snapshot(
             .then_with(|| left.run_id.cmp(&right.run_id))
             .then_with(|| left.candidate_id.cmp(&right.candidate_id))
     });
+    observations.truncate(MAX_REVIEW_REQUIRED_TASK_OBSERVATIONS);
     let signatures = observations
         .iter()
         .map(review_required_observation_signature)
@@ -3191,14 +4015,9 @@ fn render_review_required_snapshot(
         .iter()
         .map(review_required_observation_payload)
         .collect::<Vec<_>>();
-    let payload_text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".to_owned());
-    let message = format!(
-        "Attached task result candidates require review before this turn can finish:\n{payload_text}\nFor each candidate, call one of its allowedActions (`task_accept`, `task_revise`, or `task_cancel`). Do not provide the final answer until every review-required candidate is accepted, revised, cancelled, or otherwise no longer waiting for review."
-    );
     Some(RenderedReviewRequiredObservation {
         signatures,
         observations,
-        message,
         details: json!({
             "taskIds": payload.iter().filter_map(|value| value.get("taskId").and_then(JsonValue::as_str)).collect::<Vec<_>>(),
             "observations": payload,
@@ -3206,28 +4025,18 @@ fn render_review_required_snapshot(
     })
 }
 
-fn render_pending_snapshot(pending: &[PendingAttachedTask]) -> Option<String> {
+fn render_pending_snapshot(pending: &[PendingAttachedTask]) -> Option<JsonValue> {
     if pending.is_empty() {
         return None;
     }
-    let task_lines = pending
-        .iter()
-        .map(|task| {
-            let run = task
-                .run_id
-                .as_ref()
-                .map(|run_id| format!(", run {run_id}"))
-                .unwrap_or_default();
-            format!(
-                "- {} ({}, status {}{})",
-                task.title, task.task_id, task.status, run
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    Some(format!(
-        "Attached tasks created by this turn are still active, so the turn cannot finish yet.\n{task_lines}\nCall task_wait for active runs, or task_cancel/task_detach when abandoning or backgrounding the work before giving the final answer."
-    ))
+    Some(json!({
+        "pendingCount": pending.len(),
+        "tasks": pending.iter().take(20).map(|task| json!({
+            "taskId": task.task_id, "runId": task.run_id,
+            "title": bounded_task_text(&task.title, 400), "status": task.status,
+        })).collect::<Vec<_>>(),
+        "additionalTasksRequireAuthoritativeRead": pending.len() > 20,
+    }))
 }
 
 fn render_terminal_snapshot(
@@ -3252,12 +4061,8 @@ fn render_terminal_snapshot(
         .iter()
         .map(task_observation_payload)
         .collect::<Vec<_>>();
-    let payload_text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".to_owned());
     Some(RenderedTaskObservation {
         task_ids,
-        message: format!(
-            "Attached task results are available:\n{payload_text}\nUse these TaskRun results/errors in the next response. Full details are available with task_get."
-        ),
         details: json!({
             "taskIds": observations.iter().map(|observation| observation.task_id.clone()).collect::<Vec<_>>(),
             "observations": payload,
@@ -3363,14 +4168,9 @@ async fn terminal_attached_task_observation(
         .iter()
         .map(task_observation_payload)
         .collect::<Vec<_>>();
-    let payload_text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".to_owned());
-    let message = format!(
-        "Attached task results are available:\n{payload_text}\nUse these TaskRun results/errors in the next response. Full details are available with task_get."
-    );
 
     Some(RenderedTaskObservation {
         task_ids,
-        message,
         details: json!({
             "taskIds": observations.iter().map(|observation| observation.task_id.clone()).collect::<Vec<_>>(),
             "observations": payload,
@@ -3466,77 +4266,65 @@ fn workdir_from_execution_security_snapshot(
         })
 }
 
-async fn execute_agent_provider_response(
-    context_session: Option<&crate::compaction::controller::NativeContextSession>,
+/// Completed initial outputs are distinct from per-window runtime handles.
+/// Initial phases end at this boundary before provider rounds begin; durable
+/// restoration binds their outputs separately from the ephemeral event receiver.
+#[derive(Clone)]
+pub(crate) struct WarmNativeInitialTools {
+    bundles: Vec<pioneer_tools::ToolExtensionBundle>,
+    skills: Option<Arc<skill_tools::SkillToolMaterialization>>,
+}
+
+struct PreparedNativeInitialTurn {
+    outputs: crate::native_initial::AcceptedNativeInitialOutputs,
+    extension_bundles: Vec<pioneer_tools::ToolExtensionBundle>,
+    skill_tool_materialization: Option<Arc<skill_tools::SkillToolMaterialization>>,
+    tools: Option<pioneer_tools::BuiltinTools>,
+}
+
+async fn prepare_native_initial_turn(
     provider_registry: Arc<ProviderRegistry>,
     provider: &Arc<dyn Provider>,
-    model: String,
-    hook_runtime_context: AgentTurnHookRuntimeContext,
-    reasoning: Option<ReasoningConfig>,
-    history: Vec<ChatMessage>,
-    user_message: ChatMessage,
+    model: &str,
+    hook_context: &AgentTurnHookContext,
+    hook_runtime_context: &AgentTurnHookRuntimeContext,
+    user_input_text: String,
     input: &[UserInput],
     capabilities: &[TurnCapability],
     workspace_skill_policies: &HashMap<SkillPolicyKey, crate::WorkspaceSkillPolicy>,
     skill_catalog: &pioneer_skills::SkillCatalogSnapshot,
     agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
     runtime_environment: HashMap<String, String>,
-    retained_provider_history: Vec<RetainedProviderHistoryMessage>,
+    history: &[ChatMessage],
     execution_window_index: u32,
-    execution_checkpoint_context: Option<ExecutionCheckpointContext>,
-    permission_profile: TurnPermissionProfileSnapshot,
-    execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
-    force_non_stream: bool,
-    disable_tool_calling: bool,
+    execution_checkpoint_context: Option<&ExecutionCheckpointContext>,
+    permission_profile: &TurnPermissionProfileSnapshot,
+    execution_security_snapshot: Option<&TurnExecutionSecuritySnapshot>,
     continue_generation_hint: bool,
-    tool_loop_config: ToolLoopConfig,
-    mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
-    turn_tool_provider: Option<Arc<dyn TurnToolProvider>>,
-    turn_finalization_provider: Option<Arc<dyn TurnFinalizationProvider>>,
-    task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
-    hook_runtime: Option<Arc<HookRuntime>>,
-    tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
+    tool_loop_config: &ToolLoopConfig,
+    provider_tool_calling: bool,
+    native_file_tool_capability: NativeFileToolCapability,
+    mcp_tool_provider: Option<&Arc<dyn AgentMcpToolProvider>>,
+    turn_tool_provider: Option<&Arc<dyn TurnToolProvider>>,
+    task_tool_provider: Option<&Arc<dyn TaskToolProvider>>,
+    hook_runtime: Option<&Arc<HookRuntime>>,
+    tool_bundle_artifacts: Option<&Arc<AgentToolBundleArtifactStore>>,
     permission_approval_broker: Arc<dyn PermissionApprovalBroker>,
-    turn_control: TurnExecutionControl,
-    mut recovery: Option<RecoveryAttemptContext>,
+    recovering: bool,
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
-    initial_thinking_item_id: String,
-    message_item_id: &str,
-    event_tx: Arc<AgentEventHub>,
-) -> Result<ChatTurnOutcome, ChatTurnError> {
-    let workdir = workdir_from_execution_security_snapshot(execution_security_snapshot.as_ref())?;
-    let filesystem_prompt_snapshot = execution_security_snapshot.clone();
-
-    let tool_loop_config = tool_loop_config.normalized();
-    let provider_tool_calling =
-        provider.model_tool_calling(model.as_str()) && !disable_tool_calling;
-    let native_file_tool_capability = if provider_tool_calling {
-        provider.native_file_tool_capability(model.as_str())
-    } else {
-        NativeFileToolCapability::unavailable(
-            provider.name(),
-            model.as_str(),
-            "provider tool calling is disabled for this turn",
-        )
-    };
-    let post_turn_model = model.clone();
-    let post_turn_model_provider = provider.name().to_owned();
-    let hook_context = AgentTurnHookContext::with_runtime_context(
-        workspace_id,
-        thread_id,
-        turn_id,
-        hook_runtime_context.clone(),
-    );
-    let user_input_text = user_message.text_content_lossy();
-
+    event_tx: &Arc<AgentEventHub>,
+    admission_clock: &chrono::DateTime<chrono::FixedOffset>,
+) -> Result<PreparedNativeInitialTurn, ChatTurnError> {
+    let workdir = workdir_from_execution_security_snapshot(execution_security_snapshot)?;
+    let filesystem_prompt_snapshot = execution_security_snapshot.cloned();
     let effective_policy_set = run_agent_turn_policy_hook_phase(
-        hook_runtime.as_ref(),
-        &hook_context,
+        hook_runtime,
+        hook_context,
         TurnPrePolicyHookInput::from_parts(
             user_input_text.clone(),
-            Some(model.clone()),
+            Some(model.to_owned()),
             Some(provider.name().to_owned()),
         ),
     )
@@ -3552,22 +4340,25 @@ async fn execute_agent_provider_response(
     })?;
 
     let mut effective_prompt_context_set = run_agent_turn_prompt_context_hook_phase(
-        hook_runtime.as_ref(),
-        &hook_context,
+        hook_runtime,
+        hook_context,
         &effective_policy_set,
         TurnPrePromptContextHookInput::from_parts(
             user_input_text.clone(),
-            Some(model.clone()),
+            Some(model.to_owned()),
             Some(provider.name().to_owned()),
         ),
     )
-    .await;
+    .await
+    .map_err(|_| {
+        ChatTurnError::Terminal("required prompt-context preparation failed".to_owned())
+    })?;
 
     let normalized_capabilities = normalize_turn_capabilities(capabilities);
 
     let mcp_materialization = if provider_tool_calling {
         match materialize_mcp_tooling(
-            mcp_tool_provider.as_ref(),
+            mcp_tool_provider,
             workspace_id,
             turn_id,
             normalized_capabilities.mcp_server_refs.as_slice(),
@@ -3743,7 +4534,7 @@ async fn execute_agent_provider_response(
     }
 
     if let Some(persistence_request) = mcp_materialization.persistence.clone() {
-        let Some(mcp_tool_provider) = mcp_tool_provider.as_ref() else {
+        let Some(mcp_tool_provider) = mcp_tool_provider else {
             return Err(ChatTurnError::Blocked(
                 "resolved MCP projection has no persistence owner".to_owned(),
             ));
@@ -3775,36 +4566,36 @@ async fn execute_agent_provider_response(
         }
     }
 
-    emit_capability_resolution_events(
-        event_tx.as_ref(),
-        workspace_id,
-        thread_id,
-        turn_id,
-        accepted_capabilities.as_slice(),
-        rejected_capabilities.as_slice(),
-        mcp_materialization.mcp_bindings.as_slice(),
-    )
-    .await?;
-    emit_mcp_resolution_diagnostics(
-        event_tx.as_ref(),
-        workspace_id,
-        thread_id,
-        turn_id,
-        mcp_materialization.diagnostics.as_slice(),
-    )
-    .await?;
+    if !provider_tool_calling {
+        emit_capability_resolution_events(
+            event_tx.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            accepted_capabilities.as_slice(),
+            rejected_capabilities.as_slice(),
+            mcp_materialization.mcp_bindings.as_slice(),
+        )
+        .await?;
+        emit_mcp_resolution_diagnostics(
+            event_tx.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            mcp_materialization.diagnostics.as_slice(),
+        )
+        .await?;
+    }
     let capability_diagnostics = capability_manifest_diagnostics(rejected_capabilities.as_slice());
 
     let mut skills_prompt = normalize_optional_prompt(Some(skills_resolution.prompt.clone()));
 
     let task_materialization = if provider_tool_calling {
-        materialize_task_tooling(
-            task_tool_provider.as_ref(),
-            workspace_id,
-            thread_id,
-            turn_id,
-        )
-        .await
+        materialize_task_tooling(task_tool_provider, workspace_id, thread_id, turn_id)
+            .await
+            .map_err(|_| {
+                ChatTurnError::Blocked("required task tooling could not be materialized".to_owned())
+            })?
     } else {
         TaskToolMaterialization::default()
     };
@@ -3823,18 +4614,14 @@ async fn execute_agent_provider_response(
     // provider materializes the durable responding execution here even for a
     // model/backend that cannot receive tools, and any admission failure must
     // stop before the first external provider request.
-    let turn_tool_materialization = materialize_turn_tooling(
-        turn_tool_provider.as_ref(),
-        workspace_id,
-        thread_id,
-        turn_id,
-    )
-    .await
-    .map_err(|error| {
-        ChatTurnError::Terminal(format!(
-            "failed to admit durable Agent execution before provider start: {error}"
-        ))
-    })?;
+    let turn_tool_materialization =
+        materialize_turn_tooling(turn_tool_provider, workspace_id, thread_id, turn_id)
+            .await
+            .map_err(|error| {
+                ChatTurnError::Terminal(format!(
+                    "failed to admit durable Agent execution before provider start: {error}"
+                ))
+            })?;
     for diagnostic in &turn_tool_materialization.diagnostics {
         warn!(
             thread_id,
@@ -3846,7 +4633,7 @@ async fn execute_agent_provider_response(
 
     if !provider_tool_calling {
         if !agent_skill_overlay.is_empty() {
-            if recovery.is_some() {
+            if recovering {
                 return Err(ChatTurnError::Terminal(
                     "pinned Agent skills cannot be recovered without native tool calling"
                         .to_owned(),
@@ -3862,13 +4649,13 @@ async fn execute_agent_provider_response(
             .await?;
         }
 
-        let _effective_tool_bundle_set = run_agent_turn_tool_materialization_hook_phase(
-            hook_runtime.as_ref(),
-            &hook_context,
+        let effective_tool_bundle_set = run_agent_turn_tool_materialization_hook_phase(
+            hook_runtime,
+            hook_context,
             &effective_policy_set,
             &effective_prompt_context_set,
             Vec::new(),
-            tool_bundle_artifacts.as_ref(),
+            tool_bundle_artifacts,
             provider_tool_calling,
         )
         .await
@@ -3882,11 +4669,17 @@ async fn execute_agent_provider_response(
             ChatTurnError::Terminal("turn tool materialization hook failed".to_owned())
         })?;
 
+        if !effective_tool_bundle_set.bundles().is_empty() {
+            return Err(ChatTurnError::Blocked(
+                "accepted hook tools require native tool calling".to_owned(),
+            ));
+        }
+
         let turn_preflight = run_agent_turn_preflight_stage(
             event_tx.clone(),
             provider_registry.clone(),
             provider.clone(),
-            model.as_str(),
+            model,
             provider_tool_calling,
             &tool_loop_config,
             &effective_policy_set,
@@ -3898,32 +4691,39 @@ async fn execute_agent_provider_response(
             workspace_id,
             thread_id,
             turn_id,
-            &hook_runtime_context,
+            execution_window_index,
+            hook_runtime_context,
             user_input_text.as_str(),
         )
         .await;
 
+        ensure_preflight_usage_committed(turn_preflight.publication_failure)?;
         trace_agent_turn_preflight(thread_id, turn_id, &turn_preflight, &[]);
 
         if let Some(active_recall_input) = preflight_active_recall_prompt_context_input(
             user_input_text.as_str(),
-            model.as_str(),
+            model,
             provider.name(),
             &turn_preflight,
         ) {
             effective_prompt_context_set = run_agent_turn_post_preflight_prompt_context_hook_phase(
-                hook_runtime.as_ref(),
-                &hook_context,
+                hook_runtime,
+                hook_context,
                 &effective_policy_set,
                 &effective_prompt_context_set,
                 active_recall_input,
             )
-            .await;
+            .await
+            .map_err(|_| {
+                ChatTurnError::Terminal(
+                    "required post-preflight context preparation failed".to_owned(),
+                )
+            })?;
         }
 
         let effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
-            hook_runtime.as_ref(),
-            &hook_context,
+            hook_runtime,
+            hook_context,
             &effective_policy_set,
             &effective_prompt_context_set,
             Vec::new(),
@@ -3942,20 +4742,17 @@ async fn execute_agent_provider_response(
         let prompt_sections =
             prompt_sections_for_compile_from_hook_sections(&effective_prompt_section_set)?;
         let prior_visible_assistant_text =
-            prior_visible_assistant_text_for_execution_continuation(history.as_slice());
+            prior_visible_assistant_text_for_execution_continuation(history);
         let prompt_runtime_sections = runtime_sections_with_execution_continuation_context(
             prompt_sections.runtime_sections.as_slice(),
             execution_window_index,
-            execution_checkpoint_context.as_ref(),
+            execution_checkpoint_context,
             prior_visible_assistant_text.as_deref(),
             turn_tool_materialization.initiating_thread_id.as_deref(),
         );
         let prompt_runtime_sections = runtime_sections_with_artifact_reference_policy(
             prompt_runtime_sections,
-            history_or_prompt_context_has_artifact_refs(
-                history.as_slice(),
-                &effective_prompt_context_set,
-            ),
+            history_or_prompt_context_has_artifact_refs(history, &effective_prompt_context_set),
         )?;
         let prompt_runtime_sections = append_native_filesystem_capability_section(
             prompt_runtime_sections,
@@ -3963,28 +4760,30 @@ async fn execute_agent_provider_response(
             filesystem_prompt_snapshot.as_ref(),
         )?;
 
-        let initial_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
+        let initial_instruction_plan = compile_agent_instruction_delivery_plan_with_captured_clock(
             tool_loop_config.computer_use.runtime_home_dir.as_path(),
             skills_prompt.clone(),
             None,
             prompt_runtime_sections.as_slice(),
-            &permission_profile,
+            permission_profile,
             include_task_orchestration_policy,
             false,
             continue_generation_hint,
             turn_tool_materialization.initiating_thread_id.as_deref(),
             thread_id,
             turn_id,
+            admission_clock,
         )?;
 
-        run_noop_agent_turn_hook_phase(
-            hook_runtime.as_ref(),
-            &hook_context,
+        run_agent_turn_notification_hook_phase(
+            hook_runtime,
+            hook_context,
             HookPhase::TurnPostPromptCompile,
             &effective_policy_set,
             &effective_prompt_context_set,
         )
-        .await;
+        .await
+        .map_err(|_| ChatTurnError::Terminal("required post-prompt hook failed".to_owned()))?;
 
         emit_durable_event(
             event_tx.as_ref(),
@@ -4003,66 +4802,44 @@ async fn execute_agent_provider_response(
         )
         .await?;
 
-        let result = execute_standard_provider_response(
-            context_session,
-            provider,
-            model,
-            history,
-            user_message.clone(),
-            reasoning,
-            Some(compiled_prompt_payload_from_delivery_plan(
-                &initial_instruction_plan,
-            )),
-            false,
-            force_non_stream,
-            workspace_id,
-            thread_id,
-            turn_id,
-            initial_thinking_item_id.as_str(),
-            message_item_id,
-            tool_loop_config.provider,
-            event_tx.clone(),
-        )
-        .await;
-
-        match result {
-            Ok(assistant_text) => {
-                let summary = AgentTurnPostTurnSummary::succeeded_with_model(
-                    Some(post_turn_model.clone()),
-                    Some(post_turn_model_provider.clone()),
-                    extract_user_text(input),
-                    assistant_text,
-                    Vec::new(),
-                    Vec::new(),
-                );
-                return Ok(ChatTurnOutcome::Completed {
-                    post_turn_dispatch: Some(AgentTurnPostTurnHookDispatch::new(
-                        hook_context,
-                        effective_policy_set,
-                        effective_prompt_context_set,
-                        summary,
-                    )),
-                });
-            }
-            Err(error) => {
-                return Err(with_post_turn_failure_dispatch(
-                    error,
-                    hook_context,
-                    effective_policy_set,
-                    effective_prompt_context_set,
-                    extract_user_text(input),
-                    String::new(),
-                    Vec::new(),
-                    Vec::new(),
-                ));
-            }
-        }
+        return Ok(PreparedNativeInitialTurn {
+            outputs: crate::native_initial::AcceptedNativeInitialOutputs {
+                native_agent_action_contract: None,
+                mcp_descriptors: Vec::new(),
+                mcp_manifest_hash: None,
+                policy: effective_policy_set,
+                prompt_context: effective_prompt_context_set,
+                prompt_sections: effective_prompt_section_set,
+                instructions: initial_instruction_plan,
+                capability_diagnostics,
+                skill_plan: skills_resolution.runtime_plan,
+                tool_metadata: effective_tool_bundle_set.metadata().clone(),
+                extension_specs: Vec::new(),
+                provider_tool_calling,
+                initiating_thread_id: turn_tool_materialization.initiating_thread_id,
+                visible_tools: Vec::new(),
+                core_tools: Vec::new(),
+                selected_optional_tools: Vec::new(),
+                requested_tools: Vec::new(),
+                preflight_usage: turn_preflight.usage,
+                config: crate::native_initial::checked_config_clone(&tool_loop_config).map_err(
+                    |_| {
+                        ChatTurnError::Blocked(
+                            "accepted initial configuration exceeds execution allowance".to_owned(),
+                        )
+                    },
+                )?,
+            },
+            extension_bundles: Vec::new(),
+            skill_tool_materialization: None,
+            tools: None,
+        });
     }
 
-    let skill_tool_materialization = skill_tools::materialize_skill_tooling(
+    let skill_tool_materialization = Arc::new(skill_tools::materialize_skill_tooling(
         &skills_resolution.runtime_plan,
         &tool_loop_config.skills,
-    );
+    ));
 
     for excluded in &skill_tool_materialization.excluded_tools {
         warn!(
@@ -4109,12 +4886,12 @@ async fn execute_agent_provider_response(
         task_materialization.bundles.clone(),
     ));
     let effective_tool_bundle_set = run_agent_turn_tool_materialization_hook_phase(
-        hook_runtime.as_ref(),
-        &hook_context,
+        hook_runtime,
+        hook_context,
         &effective_policy_set,
         &effective_prompt_context_set,
         tool_bundle_contributions,
-        tool_bundle_artifacts.as_ref(),
+        tool_bundle_artifacts,
         provider_tool_calling,
     )
     .await
@@ -4128,6 +4905,13 @@ async fn execute_agent_provider_response(
         ChatTurnError::Terminal("turn tool materialization hook failed".to_owned())
     })?;
 
+    let extension_specs =
+        crate::native_initial::checked_extension_specs(effective_tool_bundle_set.bundles())
+            .map_err(|_| {
+                ChatTurnError::Blocked(
+                    "accepted initial tool catalog exceeds execution allowance".to_owned(),
+                )
+            })?;
     let extension_bundles = effective_tool_bundle_set.bundles().to_vec();
 
     let permission_context = PermissionEvaluationContext::for_turn(
@@ -4137,47 +4921,39 @@ async fn execute_agent_provider_response(
         permission_profile.clone(),
     );
     let runtime_environment = runtime_environment.into_iter().collect::<BTreeMap<_, _>>();
-    let tools = match build_tools_with_environment_and_security_snapshot(
+    let tools = build_tools_with_environment_and_security_snapshot(
         workdir.clone(),
         turn_id.to_owned(),
         permission_context.clone(),
         tool_loop_config.web.clone(),
         tool_loop_config.computer_use.clone(),
-        extension_bundles,
-        runtime_environment.clone(),
-        execution_security_snapshot.clone(),
-    ) {
-        Ok(tools) => tools,
-        Err(error) => {
-            warn!(
-                thread_id,
-                turn_id,
-                error = %error,
-                "failed to build tool runtime with extensions; continuing with built-ins only"
-            );
-            build_tools_with_environment_and_security_snapshot(
-                workdir.clone(),
-                turn_id.to_owned(),
-                permission_context.clone(),
-                tool_loop_config.web.clone(),
-                tool_loop_config.computer_use.clone(),
-                Vec::new(),
-                runtime_environment,
-                execution_security_snapshot.clone(),
-            )
-            .unwrap_or_else(|_| {
-                build_builtin_tools_with_security_snapshot(
-                    workdir.clone(),
-                    turn_id.to_owned(),
-                    permission_context.clone(),
-                    tool_loop_config.web.clone(),
-                    tool_loop_config.computer_use.clone(),
-                    execution_security_snapshot,
-                )
-            })
-        }
-    }
+        extension_bundles.clone(),
+        runtime_environment,
+        execution_security_snapshot.cloned(),
+    )
+    .map_err(|_| {
+        ChatTurnError::Blocked("required tool runtime could not be constructed".to_owned())
+    })?
     .with_permission_approval_broker(permission_approval_broker);
+
+    emit_capability_resolution_events(
+        event_tx.as_ref(),
+        workspace_id,
+        thread_id,
+        turn_id,
+        accepted_capabilities.as_slice(),
+        rejected_capabilities.as_slice(),
+        mcp_materialization.mcp_bindings.as_slice(),
+    )
+    .await?;
+    emit_mcp_resolution_diagnostics(
+        event_tx.as_ref(),
+        workspace_id,
+        thread_id,
+        turn_id,
+        mcp_materialization.diagnostics.as_slice(),
+    )
+    .await?;
 
     // One trusted provider capability decision owns native filesystem-tool
     // visibility for this turn.  Apply it before preflight so the core index,
@@ -4193,50 +4969,13 @@ async fn execute_agent_provider_response(
         .bind_function_proxy_runtime(tools.router.clone(), tools.runtime.clone())
         .await;
 
-    let runtime = tools.runtime.clone();
     let router = tools.router.clone();
-
-    let runtime_tool_index = Arc::new(
-        skills_resolution
-            .runtime_plan
-            .tools
-            .iter()
-            .map(|descriptor| (descriptor.canonical_tool_name.clone(), descriptor.clone()))
-            .collect::<HashMap<_, _>>(),
-    );
-
-    let runtime_recheck_policy = pioneer_skills::RuntimeExecutionRecheckPolicy {
-        runtime_recheck_on_tool_call: tool_loop_config
-            .skills
-            .dependencies
-            .runtime_recheck_on_tool_call,
-        security: pioneer_skills::SkillSecurityPolicy {
-            allow_untrusted_install: tool_loop_config.skills.security.allow_untrusted_install,
-            min_trust_for_shell_tools: tool_loop_config
-                .skills
-                .security
-                .min_trust_for_shell_tools
-                .clone(),
-            min_trust_for_http_tools: tool_loop_config
-                .skills
-                .security
-                .min_trust_for_http_tools
-                .clone(),
-            min_trust_for_function_proxy_tools: tool_loop_config
-                .skills
-                .security
-                .min_trust_for_function_proxy_tools
-                .clone(),
-            max_install_archive_bytes: tool_loop_config.skills.security.max_install_archive_bytes,
-            max_install_file_bytes: tool_loop_config.skills.security.max_install_file_bytes,
-        },
-    };
 
     let turn_preflight = run_agent_turn_preflight_stage(
         event_tx.clone(),
         provider_registry,
         provider.clone(),
-        model.as_str(),
+        model,
         provider_tool_calling,
         &tool_loop_config,
         &effective_policy_set,
@@ -4245,13 +4984,15 @@ async fn execute_agent_provider_response(
         workspace_id,
         thread_id,
         turn_id,
-        &hook_runtime_context,
+        execution_window_index,
+        hook_runtime_context,
         user_input_text.as_str(),
     )
     .await;
 
+    ensure_preflight_usage_committed(turn_preflight.publication_failure)?;
     let mut requested_tool_names = restored_requested_tool_names(
-        execution_checkpoint_context.as_ref(),
+        execution_checkpoint_context,
         workspace_id,
         thread_id,
         turn_id,
@@ -4305,7 +5046,7 @@ async fn execute_agent_provider_response(
         &[]
     };
 
-    if recovery.is_some() && !agent_skill_overlay.is_empty() && exposed_agent_overlay.is_empty() {
+    if recovering && !agent_skill_overlay.is_empty() && exposed_agent_overlay.is_empty() {
         return Err(ChatTurnError::Terminal(
             "pinned Agent skills are unavailable in the recovered turn's final tool plan"
                 .to_owned(),
@@ -4333,23 +5074,26 @@ async fn execute_agent_provider_response(
 
     if let Some(active_recall_input) = preflight_active_recall_prompt_context_input(
         user_input_text.as_str(),
-        model.as_str(),
+        model,
         provider.name(),
         &turn_preflight,
     ) {
         effective_prompt_context_set = run_agent_turn_post_preflight_prompt_context_hook_phase(
-            hook_runtime.as_ref(),
-            &hook_context,
+            hook_runtime,
+            hook_context,
             &effective_policy_set,
             &effective_prompt_context_set,
             active_recall_input,
         )
-        .await;
+        .await
+        .map_err(|_| {
+            ChatTurnError::Terminal("required post-preflight context preparation failed".to_owned())
+        })?;
     }
 
     let effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
-        hook_runtime.as_ref(),
-        &hook_context,
+        hook_runtime,
+        hook_context,
         &effective_policy_set,
         &effective_prompt_context_set,
         Vec::new(),
@@ -4372,20 +5116,17 @@ async fn execute_agent_provider_response(
     let prompt_sections =
         prompt_sections_for_compile_from_hook_sections(&effective_prompt_section_set)?;
     let prior_visible_assistant_text =
-        prior_visible_assistant_text_for_execution_continuation(history.as_slice());
+        prior_visible_assistant_text_for_execution_continuation(history);
     let prompt_runtime_sections = runtime_sections_with_execution_continuation_context(
         prompt_sections.runtime_sections.as_slice(),
         execution_window_index,
-        execution_checkpoint_context.as_ref(),
+        execution_checkpoint_context,
         prior_visible_assistant_text.as_deref(),
         turn_tool_materialization.initiating_thread_id.as_deref(),
     );
     let prompt_runtime_sections = runtime_sections_with_artifact_reference_policy(
         prompt_runtime_sections,
-        history_or_prompt_context_has_artifact_refs(
-            history.as_slice(),
-            &effective_prompt_context_set,
-        ),
+        history_or_prompt_context_has_artifact_refs(history, &effective_prompt_context_set),
     )?;
     let prompt_runtime_sections = append_native_filesystem_capability_section(
         prompt_runtime_sections,
@@ -4393,28 +5134,30 @@ async fn execute_agent_provider_response(
         filesystem_prompt_snapshot.as_ref(),
     )?;
 
-    let initial_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
+    let initial_instruction_plan = compile_agent_instruction_delivery_plan_with_captured_clock(
         tool_loop_config.computer_use.runtime_home_dir.as_path(),
         skills_prompt.clone(),
         None,
         prompt_runtime_sections.as_slice(),
-        &permission_profile,
+        permission_profile,
         include_task_orchestration_policy,
         true,
         continue_generation_hint,
         turn_tool_materialization.initiating_thread_id.as_deref(),
         thread_id,
         turn_id,
+        admission_clock,
     )?;
 
-    run_noop_agent_turn_hook_phase(
-        hook_runtime.as_ref(),
-        &hook_context,
+    run_agent_turn_notification_hook_phase(
+        hook_runtime,
+        hook_context,
         HookPhase::TurnPostPromptCompile,
         &effective_policy_set,
         &effective_prompt_context_set,
     )
-    .await;
+    .await
+    .map_err(|_| ChatTurnError::Terminal("required post-prompt hook failed".to_owned()))?;
 
     emit_durable_event(
         event_tx.as_ref(),
@@ -4433,7 +5176,1117 @@ async fn execute_agent_provider_response(
     )
     .await?;
 
-    let mut visible_tool_names = initial_visibility.visible_tools;
+    Ok(PreparedNativeInitialTurn {
+        outputs: crate::native_initial::AcceptedNativeInitialOutputs {
+            native_agent_action_contract: turn_tool_materialization.native_agent_action_contract,
+            mcp_manifest_hash: mcp_materialization
+                .persistence
+                .as_ref()
+                .map(|p| p.manifest_hash.clone()),
+            mcp_descriptors: mcp_materialization.descriptors,
+            policy: effective_policy_set,
+            prompt_context: effective_prompt_context_set,
+            prompt_sections: effective_prompt_section_set,
+            instructions: initial_instruction_plan,
+            capability_diagnostics,
+            skill_plan: skills_resolution.runtime_plan,
+            tool_metadata: effective_tool_bundle_set.metadata().clone(),
+            extension_specs,
+            provider_tool_calling,
+            initiating_thread_id: turn_tool_materialization.initiating_thread_id,
+            visible_tools: initial_visibility.visible_tools,
+            core_tools: turn_preflight.local_modules.tools.input.core_tools.clone(),
+            selected_optional_tools: turn_preflight.plan.tools.visible_tools.clone(),
+            requested_tools: requested_tool_names,
+            preflight_usage: turn_preflight.usage,
+            config: crate::native_initial::checked_config_clone(&tool_loop_config).map_err(
+                |_| {
+                    ChatTurnError::Blocked(
+                        "accepted initial configuration exceeds execution allowance".to_owned(),
+                    )
+                },
+            )?,
+        },
+        extension_bundles,
+        skill_tool_materialization: Some(skill_tool_materialization),
+        tools: Some(tools),
+    })
+}
+
+/// Fixed concrete owners only. Initial hooks, catalog discovery, preflight
+/// and root admission never execute while restoring an accepted phase.
+async fn restore_native_initial_tool_owners(
+    outputs: &crate::native_initial::AcceptedNativeInitialOutputs,
+    mcp_provider: Option<&Arc<dyn AgentMcpToolProvider>>,
+    turn_provider: Option<&Arc<dyn TurnToolProvider>>,
+    task_provider: Option<&Arc<dyn TaskToolProvider>>,
+    memory_provider: Option<&Arc<dyn crate::AgentMemoryProvider>>,
+    hook_runtime_context: &AgentTurnHookRuntimeContext,
+    original_input_text: &str,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<WarmNativeInitialTools, ChatTurnError> {
+    let unavailable =
+        || ChatTurnError::Blocked("accepted initial tool owner cannot be restored".to_owned());
+    let mut mcp_specs = Vec::new();
+    let mut memory_specs = Vec::new();
+    let mut turn_specs = Vec::new();
+    let mut task_specs = Vec::new();
+    for (entry, specs) in outputs
+        .tool_metadata
+        .entries
+        .iter()
+        .zip(&outputs.extension_specs)
+    {
+        match (entry.domain.as_str(), entry.bundle_id.as_str()) {
+            ("skill", id) if id.starts_with("skill.runtime.bundle.") => (),
+            ("turn", id) if id.starts_with("turn.runtime.bundle.") => {
+                turn_specs.push(specs.clone())
+            }
+            ("task", id) if id.starts_with("task.runtime.bundle.") => {
+                task_specs.push(specs.clone())
+            }
+            ("memory", id) if id.starts_with("memory.tool_bundle.bundle.") => {
+                memory_specs.push(specs.clone())
+            }
+            ("mcp", id) if id.starts_with("mcp.runtime.bundle.") => mcp_specs.push(specs.clone()),
+            // Unsupported external hook owners never become builtins.
+            _ => return Err(unavailable()),
+        }
+    }
+    let skills = Some(Arc::new(skill_tools::materialize_skill_tooling(
+        &outputs.skill_plan,
+        &outputs.config.skills,
+    )));
+    let turns = if turn_specs.is_empty() {
+        Vec::new()
+    } else {
+        turn_provider
+            .ok_or_else(unavailable)?
+            .restore_turn_tools(
+                TurnToolContext {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                },
+                outputs.native_agent_action_contract.as_deref(),
+                &turn_specs,
+            )
+            .await
+            .map_err(|_| unavailable())?
+            .bundles
+    };
+    let tasks = if task_specs.is_empty() {
+        Vec::new()
+    } else {
+        task_provider
+            .ok_or_else(unavailable)?
+            .restore_task_tools(
+                TaskTurnContext {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                },
+                &task_specs,
+            )
+            .await
+            .map_err(|_| unavailable())?
+            .bundles
+    };
+    let memory = if memory_specs.is_empty() {
+        Vec::new()
+    } else {
+        memory_provider
+            .ok_or_else(unavailable)?
+            .restore_memory_tools(
+                pioneer_memory::hooks::MemoryTurnContext {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    mode: ThreadMode::Agent,
+                    conversation_thread_id: hook_runtime_context.conversation_thread_id.clone(),
+                    input_text: original_input_text.to_owned(),
+                    task_id: hook_runtime_context.task_id.clone(),
+                    agent_id: hook_runtime_context.agent_id.clone(),
+                    principal_id: (hook_runtime_context.actor_kind
+                        == pioneer_hooks::HookActorKind::User)
+                        .then(|| hook_runtime_context.actor_id.clone())
+                        .flatten(),
+                },
+                &memory_specs,
+            )
+            .await
+            .map_err(|_| unavailable())?
+            .bundles
+    };
+    let mcp = if mcp_specs.is_empty() {
+        Vec::new()
+    } else {
+        mcp_provider
+            .ok_or_else(unavailable)?
+            .restore_mcp_tools(
+                workspace_id,
+                turn_id,
+                outputs
+                    .mcp_manifest_hash
+                    .as_deref()
+                    .ok_or_else(unavailable)?,
+                &outputs.mcp_descriptors,
+            )
+            .await
+            .map_err(|_| unavailable())?
+    };
+    let mut bundles = Vec::new();
+    for (entry, original) in outputs
+        .tool_metadata
+        .entries
+        .iter()
+        .zip(&outputs.extension_specs)
+    {
+        let (prefix, owned) = match entry.domain.as_str() {
+            "skill" => (
+                "skill.runtime.bundle.",
+                skills.as_ref().ok_or_else(unavailable)?.bundles.as_slice(),
+            ),
+            "turn" => ("turn.runtime.bundle.", turns.as_slice()),
+            "task" => ("task.runtime.bundle.", tasks.as_slice()),
+            "memory" => ("memory.tool_bundle.bundle.", memory.as_slice()),
+            "mcp" => ("mcp.runtime.bundle.", mcp.as_slice()),
+            _ => return Err(unavailable()),
+        };
+        let index: usize = entry
+            .bundle_id
+            .as_str()
+            .strip_prefix(prefix)
+            .and_then(|n| n.parse().ok())
+            .ok_or_else(unavailable)?;
+        let bundle = owned.get(index).ok_or_else(unavailable)?;
+        let actual = crate::native_initial::checked_extension_specs(std::slice::from_ref(bundle))
+            .map_err(|_| unavailable())?;
+        // Objects retain their semantic JSON key order independence; arrays
+        // and every configured policy/binding remain exact.
+        if serde_json::to_value(&actual[0]).map_err(|_| unavailable())?
+            != serde_json::to_value(original).map_err(|_| unavailable())?
+        {
+            return Err(unavailable());
+        }
+        bundles.push(bundle.clone());
+    }
+    Ok(WarmNativeInitialTools { bundles, skills })
+}
+
+async fn restore_prepared_native_initial_turn(
+    outputs: &crate::native_initial::AcceptedNativeInitialOutputs,
+    warm: Option<&WarmNativeInitialTools>,
+    mcp_provider: Option<&Arc<dyn AgentMcpToolProvider>>,
+    turn_provider: Option<&Arc<dyn TurnToolProvider>>,
+    task_provider: Option<&Arc<dyn TaskToolProvider>>,
+    memory_provider: Option<&Arc<dyn crate::AgentMemoryProvider>>,
+    hook_runtime_context: &AgentTurnHookRuntimeContext,
+    original_input_text: &str,
+    runtime_environment: &HashMap<String, String>,
+    permission_profile: &TurnPermissionProfileSnapshot,
+    security_snapshot: Option<&TurnExecutionSecuritySnapshot>,
+    approval_broker: Arc<dyn PermissionApprovalBroker>,
+    native_files: &NativeFileToolCapability,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<PreparedNativeInitialTurn, ChatTurnError> {
+    if !outputs.provider_tool_calling {
+        return Ok(PreparedNativeInitialTurn {
+            outputs: outputs.clone(),
+            extension_bundles: Vec::new(),
+            skill_tool_materialization: None,
+            tools: None,
+        });
+    }
+    let cold;
+    let warm = if let Some(warm) = warm {
+        warm
+    } else {
+        cold = restore_native_initial_tool_owners(
+            outputs,
+            mcp_provider,
+            turn_provider,
+            task_provider,
+            memory_provider,
+            hook_runtime_context,
+            original_input_text,
+            workspace_id,
+            thread_id,
+            turn_id,
+        )
+        .await?;
+        &cold
+    };
+    let workdir = workdir_from_execution_security_snapshot(security_snapshot)?;
+    let tools = build_tools_with_environment_and_security_snapshot(
+        workdir,
+        turn_id.to_owned(),
+        PermissionEvaluationContext::for_turn(
+            workspace_id,
+            thread_id,
+            turn_id,
+            permission_profile.clone(),
+        ),
+        outputs.config.web.clone(),
+        outputs.config.computer_use.clone(),
+        warm.bundles.clone(),
+        runtime_environment
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<BTreeMap<_, _>>(),
+        security_snapshot.cloned(),
+    )
+    .map_err(|_| ChatTurnError::Blocked("accepted tool runtime cannot be restored".to_owned()))?
+    .with_permission_approval_broker(approval_broker);
+    tools
+        .router
+        .set_blocked_tool_names(native_file_tool_blocked_names(native_files));
+    tools
+        .router
+        .set_native_patch_wire_shape(native_files.patch_shape);
+    if let Some(skills) = &warm.skills {
+        skills
+            .bind_function_proxy_runtime(tools.router.clone(), tools.runtime.clone())
+            .await;
+    }
+    Ok(PreparedNativeInitialTurn {
+        outputs: outputs.clone(),
+        extension_bundles: warm.bundles.clone(),
+        skill_tool_materialization: warm.skills.clone(),
+        tools: Some(tools),
+    })
+}
+
+async fn execute_agent_provider_response(
+    context_session: Option<&crate::compaction::controller::NativeContextSession>,
+    provider_registry: Arc<ProviderRegistry>,
+    provider: &Arc<dyn Provider>,
+    model: String,
+    hook_runtime_context: AgentTurnHookRuntimeContext,
+    reasoning: Option<ReasoningConfig>,
+    history: Vec<ChatMessage>,
+    user_message: ChatMessage,
+    input: &[UserInput],
+    capabilities: &[TurnCapability],
+    workspace_skill_policies: &HashMap<SkillPolicyKey, crate::WorkspaceSkillPolicy>,
+    skill_catalog: &pioneer_skills::SkillCatalogSnapshot,
+    agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
+    runtime_environment: HashMap<String, String>,
+    retained_provider_history: Vec<RetainedProviderHistoryMessage>,
+    execution_window_index: u32,
+    preparation_started: Instant,
+    preparation_started_at_unix_ms: i64,
+    execution_checkpoint_context: Option<ExecutionCheckpointContext>,
+    permission_profile: TurnPermissionProfileSnapshot,
+    execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
+    force_non_stream: bool,
+    disable_tool_calling: bool,
+    continue_generation_hint: bool,
+    tool_loop_config: ToolLoopConfig,
+    initial_preparation: Option<crate::NativeInitialPreparation>,
+    runtime_generation: u64,
+    mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
+    turn_tool_provider: Option<Arc<dyn TurnToolProvider>>,
+    turn_finalization_provider: Option<Arc<dyn TurnFinalizationProvider>>,
+    task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
+    memory_provider: Option<Arc<dyn crate::AgentMemoryProvider>>,
+    hook_runtime: Option<Arc<HookRuntime>>,
+    tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
+    permission_approval_broker: Arc<dyn PermissionApprovalBroker>,
+    turn_control: TurnExecutionControl,
+    mut recovery: Option<RecoveryAttemptContext>,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    initial_thinking_item_id: String,
+    message_item_id: &str,
+    event_tx: Arc<AgentEventHub>,
+) -> Result<ChatTurnOutcome, ChatTurnError> {
+    let runtime_generation = initial_preparation
+        .as_ref()
+        .and_then(crate::NativeInitialPreparation::cancellation_runtime_generation)
+        .unwrap_or(runtime_generation);
+    let mut window_stats = ChatExecutionWindowStats::new(execution_window_index);
+    window_stats.started_at_unix_ms = preparation_started_at_unix_ms;
+    emit_execution_window_started(
+        workspace_id,
+        thread_id,
+        turn_id,
+        &window_stats,
+        event_tx.as_ref(),
+    )
+    .await?;
+    let tool_loop_config = tool_loop_config.normalized();
+    let model_tool_support = provider.model_tool_support(model.as_str());
+    if !disable_tool_calling && model_tool_support == pioneer_provider::ModelToolSupport::Unknown {
+        return Err(ChatTurnError::Blocked(
+            "native Agent requires verified model tool support; capability evidence is unknown"
+                .to_owned(),
+        ));
+    }
+    let provider_tool_calling = model_tool_support == pioneer_provider::ModelToolSupport::Supported
+        && !disable_tool_calling;
+    let native_file_tool_capability = if provider_tool_calling {
+        provider.native_file_tool_capability(model.as_str())
+    } else {
+        NativeFileToolCapability::unavailable(
+            provider.name(),
+            model.as_str(),
+            "provider tool calling is disabled for this turn",
+        )
+    };
+    let post_turn_model = model.clone();
+    let post_turn_model_provider = provider.name().to_owned();
+    let hook_context = AgentTurnHookContext::with_runtime_context(
+        workspace_id,
+        thread_id,
+        turn_id,
+        hook_runtime_context.clone(),
+    );
+    let user_input_text = user_message.text_content_lossy();
+
+    use crate::native_initial::{AcceptedNativeInitialOutputs, InitialPhase};
+    let initial_preparation = initial_preparation.ok_or_else(|| {
+        ChatTurnError::Blocked("native initial preparation owner unavailable".to_owned())
+    })?;
+    let mut initial = initial_preparation.inner.lock().await;
+    let reused_initial = matches!(initial.snapshot.state, InitialPhase::Completed { .. });
+    let prepared = match &initial.snapshot.state {
+        InitialPhase::Preparing => {
+            return Err(ChatTurnError::Blocked(
+                "initial preparation was interrupted before committed outputs; outcome is unknown"
+                    .to_owned(),
+            ));
+        }
+        InitialPhase::Completed { outputs } => {
+            if outputs.provider_tool_calling != provider_tool_calling {
+                return Err(ChatTurnError::Blocked(
+                    "accepted initial tool contract differs".to_owned(),
+                ));
+            }
+            restore_prepared_native_initial_turn(
+                outputs,
+                initial.warm_tools.as_ref(),
+                mcp_tool_provider.as_ref(),
+                turn_tool_provider.as_ref(),
+                task_tool_provider.as_ref(),
+                memory_provider.as_ref(),
+                &hook_runtime_context,
+                user_input_text.as_str(),
+                &runtime_environment,
+                &permission_profile,
+                execution_security_snapshot.as_ref(),
+                permission_approval_broker.clone(),
+                &native_file_tool_capability,
+                workspace_id,
+                thread_id,
+                turn_id,
+            )
+            .await?
+        }
+        InitialPhase::NotStarted => {
+            if execution_window_index != 1 || execution_checkpoint_context.is_some() {
+                return Err(ChatTurnError::Blocked(
+                    "native continuation initial outputs were not committed".to_owned(),
+                ));
+            }
+            let previous_digest = crate::native_initial::digest(&initial.encoded);
+            initial.snapshot.state = InitialPhase::Preparing;
+            let preparing = crate::native_initial::encode(&initial.snapshot, initial.byte_budget)
+                .map_err(|_| {
+                ChatTurnError::Blocked(
+                    "native initial preparation exceeds snapshot allowance".to_owned(),
+                )
+            })?;
+            initial.encoded = preparing.clone();
+            emit_durable_event(
+                event_tx.as_ref(),
+                AgentDurableEvent::NativeInitialPhaseAdvanced {
+                    preparation: pioneer_protocol::NativeInitialPhaseAdvance {
+                        execution_owner_generation: initial_preparation
+                            .execution_owner_generation(),
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        window_index: execution_window_index,
+                        runtime_generation,
+                        expected_sha256: previous_digest,
+                        initial_phase_json: preparing,
+                    },
+                },
+            )
+            .await?;
+            let prepared = prepare_native_initial_turn(
+                provider_registry,
+                provider,
+                model.as_str(),
+                &hook_context,
+                &hook_runtime_context,
+                user_input_text,
+                input,
+                capabilities,
+                workspace_skill_policies,
+                skill_catalog,
+                agent_skill_overlay,
+                runtime_environment.clone(),
+                history.as_slice(),
+                execution_window_index,
+                execution_checkpoint_context.as_ref(),
+                &permission_profile,
+                execution_security_snapshot.as_ref(),
+                continue_generation_hint,
+                &tool_loop_config,
+                provider_tool_calling,
+                native_file_tool_capability.clone(),
+                mcp_tool_provider.as_ref(),
+                turn_tool_provider.as_ref(),
+                task_tool_provider.as_ref(),
+                hook_runtime.as_ref(),
+                tool_bundle_artifacts.as_ref(),
+                permission_approval_broker.clone(),
+                recovery.is_some(),
+                workspace_id,
+                thread_id,
+                turn_id,
+                &event_tx,
+                &initial.snapshot.admission_clock,
+            )
+            .await?;
+
+            let PreparedNativeInitialTurn {
+                outputs,
+                extension_bundles,
+                skill_tool_materialization,
+                tools,
+            } = prepared;
+            let mut completed = initial.snapshot.clone();
+            completed.state = InitialPhase::Completed {
+                outputs: Box::new(outputs),
+            };
+            let encoded =
+                crate::native_initial::encode(&completed, initial.byte_budget).map_err(|_| {
+                    ChatTurnError::Blocked(
+                        "native initial outputs exceed snapshot allowance".to_owned(),
+                    )
+                })?;
+            emit_durable_event(
+                event_tx.as_ref(),
+                AgentDurableEvent::NativeInitialPhaseAdvanced {
+                    preparation: pioneer_protocol::NativeInitialPhaseAdvance {
+                        execution_owner_generation: initial_preparation
+                            .execution_owner_generation(),
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        window_index: execution_window_index,
+                        runtime_generation,
+                        expected_sha256: crate::native_initial::digest(&initial.encoded),
+                        initial_phase_json: encoded.clone(),
+                    },
+                },
+            )
+            .await?;
+            initial.snapshot = completed;
+            initial.encoded = encoded;
+            initial.warm_tools = Some(WarmNativeInitialTools {
+                bundles: extension_bundles.clone(),
+                skills: skill_tool_materialization.clone(),
+            });
+            let InitialPhase::Completed { outputs } = &initial.snapshot.state else {
+                unreachable!()
+            };
+            PreparedNativeInitialTurn {
+                outputs: outputs.as_ref().clone(),
+                extension_bundles,
+                skill_tool_materialization,
+                tools,
+            }
+        }
+    };
+    if initial.warm_tools.is_none() {
+        initial.warm_tools = Some(WarmNativeInitialTools {
+            bundles: prepared.extension_bundles.clone(),
+            skills: prepared.skill_tool_materialization.clone(),
+        });
+    }
+    drop(initial);
+    let PreparedNativeInitialTurn {
+        outputs,
+        tools,
+        skill_tool_materialization,
+        ..
+    } = prepared;
+    let AcceptedNativeInitialOutputs {
+        policy: effective_policy_set,
+        prompt_context: effective_prompt_context_set,
+        prompt_sections: effective_prompt_section_set,
+        instructions: initial_instruction_plan,
+        capability_diagnostics,
+        skill_plan: skill_runtime_plan,
+        visible_tools: mut visible_tool_names,
+        core_tools,
+        selected_optional_tools,
+        requested_tools: mut requested_tool_names,
+        initiating_thread_id,
+        preflight_usage,
+        config: tool_loop_config,
+        ..
+    } = outputs;
+    // Durable provider-usage receipts already own completed preflight. A new
+    // window must not charge those attempts/tokens again.
+    let preflight_usage = if reused_initial && execution_window_index > 1 {
+        Default::default()
+    } else {
+        preflight_usage
+    };
+    let mut semantic = semantic_state::NativeSemanticState::restore(
+        execution_checkpoint_context.as_ref(),
+        workspace_id,
+        thread_id,
+        turn_id,
+        execution_window_index,
+        &tool_loop_config.retry,
+        !reused_initial,
+        tool_loop_config.no_progress_mode,
+    )?;
+    window_stats.progress_baseline = execution_checkpoint_context
+        .as_ref()
+        .filter(|context| context.payload.window.window_index == execution_window_index)
+        .and_then(|context| context.payload.window.progress)
+        .map_or_else(
+            || semantic.progress_frontier.observation_counts(),
+            |progress| progress.baseline,
+        );
+    let mut native_controls =
+        native_control::NativeControlRuntime::restore(semantic.controls.clone(), context_session)
+            .await?;
+    window_stats.record_preflight(preflight_usage);
+    let continuation_sections = runtime_sections_with_execution_continuation_context(
+        &[],
+        execution_window_index,
+        execution_checkpoint_context.as_ref(),
+        prior_visible_assistant_text_for_execution_continuation(&history).as_deref(),
+        initiating_thread_id.as_deref(),
+    );
+    let initial_instruction_plan = pioneer_promt::reproject_native_instruction_plan(
+        &initial_instruction_plan,
+        semantic.applied_retry_instruction.as_deref(),
+        provider_tool_calling,
+        continuation_sections.first(),
+    )
+    .map_err(|_| {
+        ChatTurnError::Blocked("native continuation instruction projection unavailable".to_owned())
+    })?;
+
+    if !provider_tool_calling {
+        if !native_controls.state.retained.is_empty() {
+            return Err(ChatTurnError::Blocked(
+                "non-tool native continuation has incompatible controls".to_owned(),
+            ));
+        }
+        let mut guard = ToolLoopGuard::new_execution_window_with_started_at(
+            tool_loop_config.execution_windows.window.clone(),
+            "",
+            preparation_started,
+        );
+        guard.record_preflight_provider_usage(
+            preflight_usage.attempts,
+            preflight_usage.known_tokens,
+            preflight_usage.unknown,
+        );
+        let round_plan = guard
+            .begin_provider_round()
+            .map_err(ChatTurnError::Terminal)?;
+        if let Some(budget_exceeded) = round_plan.budget_exceeded {
+            let mut continuation = build_budget_execution_window_continuation(
+                workspace_id,
+                thread_id,
+                turn_id,
+                input,
+                &post_turn_model,
+                &post_turn_model_provider,
+                &window_stats,
+                &budget_exceeded,
+                Default::default(),
+                &[],
+            );
+            attach_native_semantic_state(
+                &mut continuation.checkpoint_payload,
+                semantic.to_value()?,
+                window_stats.progress_baseline,
+            )?;
+            emit_execution_window_exhausted_and_checkpointed(
+                workspace_id,
+                thread_id,
+                turn_id,
+                &window_stats,
+                &continuation,
+                event_tx.as_ref(),
+            )
+            .await?;
+            return Ok(ChatTurnOutcome::NeedsContinuation(continuation));
+        }
+
+        let mut standard_thinking_id = initial_thinking_item_id.clone();
+        if let Some(wait) = semantic.attached_task_wait.as_mut() {
+            wait.item_id = standard_thinking_id.clone();
+            wait.owner_generation =
+                attached_wait_owner(initial_preparation.execution_owner_generation())?;
+            wait.runtime_generation = runtime_generation;
+        }
+        semantic.checkpoint_revision = semantic
+            .checkpoint_revision
+            .checked_add(1)
+            .ok_or_else(|| ChatTurnError::Blocked("semantic revision exhausted".to_owned()))?;
+        persist_native_semantic_checkpoint(
+            event_tx.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            input,
+            &post_turn_model,
+            &post_turn_model_provider,
+            &window_stats,
+            Default::default(),
+            &requested_tool_names,
+            semantic.to_value()?,
+            None,
+            initial_preparation.execution_owner_generation(),
+            runtime_generation,
+        )
+        .await?;
+        let result: Result<String, ChatTurnError> = async {
+            if let Some(wait) = &semantic.attached_task_wait {
+                await_attached_task_change(
+                    task_tool_provider.as_ref(),
+                    wait,
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    &turn_control,
+                    event_tx.as_ref(),
+                )
+                .await?;
+                send_reasoning_completed(
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    &standard_thinking_id,
+                    "",
+                    event_tx.as_ref(),
+                )
+                .await?;
+                standard_thinking_id =
+                    start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
+                        .await?;
+                semantic.attached_task_wait = None;
+                semantic.checkpoint_revision = semantic
+                    .checkpoint_revision
+                    .checked_add(1)
+                    .ok_or_else(|| ChatTurnError::Blocked("semantic revision exhausted".into()))?;
+                persist_native_semantic_checkpoint(
+                    event_tx.as_ref(),
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    input,
+                    &post_turn_model,
+                    &post_turn_model_provider,
+                    &window_stats,
+                    Default::default(),
+                    &requested_tool_names,
+                    semantic.to_value()?,
+                    None,
+                    initial_preparation.execution_owner_generation(),
+                    runtime_generation,
+                )
+                .await?;
+            }
+            let restored_roots = if semantic.provider_history_roots.is_empty() {
+                Vec::new()
+            } else {
+                let session = context_session.ok_or_else(|| {
+                    ChatTurnError::Blocked("native history root owner unavailable".into())
+                })?;
+                session
+                    .load_native_history_roots(&semantic.provider_history_roots)
+                    .await
+                    .map_err(|_| {
+                        ChatTurnError::Blocked("native history roots unavailable".into())
+                    })?
+            };
+            let mut messages = history;
+            messages.push(user_message.clone());
+            let mut continuation_provider_history = retained_provider_history;
+            if !restored_roots.is_empty() {
+                continuation_provider_history.retain(|entry| {
+                    !entry.message.provenance.as_ref().is_some_and(|origin| {
+                        origin
+                            .sources
+                            .iter()
+                            .any(|source| source.scope.starts_with("checkpoint:"))
+                    })
+                });
+                continuation_provider_history.extend(restored_roots.into_iter().enumerate().map(
+                    |(index, message)| RetainedProviderHistoryMessage {
+                        sequence: i64::MIN + index as i64,
+                        message,
+                    },
+                ));
+            }
+            append_recovered_provider_history(&mut messages, continuation_provider_history);
+            let request = ChatRequest {
+                model: model.clone(),
+                messages,
+                temperature: Some(0.7),
+                max_tokens: None,
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning,
+                compiled_prompt: Some(compiled_prompt_payload_from_delivery_plan(
+                    &initial_instruction_plan,
+                )),
+            };
+            let (request, receipt) = if let Some(session) = context_session {
+                let prepared = session.prepare(request, false).await.map_err(|error| {
+                    ChatTurnError::Blocked(format!("context preparation failed: {error}"))
+                })?;
+                semantic.provider_history_roots =
+                    semantic_state::history_roots_from_request(&prepared.request.messages)?;
+                (prepared.request, Some(prepared.receipt))
+            } else {
+                (request, None)
+            };
+            semantic.checkpoint_revision = semantic
+                .checkpoint_revision
+                .checked_add(1)
+                .ok_or_else(|| ChatTurnError::Blocked("semantic revision exhausted".into()))?;
+            persist_native_semantic_checkpoint(
+                event_tx.as_ref(),
+                workspace_id,
+                thread_id,
+                turn_id,
+                input,
+                &post_turn_model,
+                &post_turn_model_provider,
+                &window_stats,
+                Default::default(),
+                &requested_tool_names,
+                semantic.to_value()?,
+                None,
+                initial_preparation.execution_owner_generation(),
+                runtime_generation,
+            )
+            .await?;
+            let round = await_context_request(
+                context_session,
+                provider::request_agent_round_accounted(
+                    provider,
+                    request,
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    &standard_thinking_id,
+                    force_non_stream,
+                    tool_loop_config.provider,
+                    event_tx.as_ref(),
+                    Some(&mut window_stats),
+                ),
+            )
+            .await?;
+            if let (Some(session), Some(receipt)) = (context_session, receipt) {
+                session
+                    .record_usage(receipt, round.usage.as_ref())
+                    .map_err(|error| {
+                        ChatTurnError::Blocked(format!("context usage unavailable: {error}"))
+                    })?;
+            }
+            if let Err(error) = provider::validate_standard_final_answer(
+                &round.text,
+                &round.tool_calls,
+                &standard_thinking_id,
+                provider.name(),
+                &model,
+                if provider.capabilities().streaming && !force_non_stream {
+                    ProviderTransportKind::Stream
+                } else {
+                    ProviderTransportKind::NonStream
+                },
+            ) {
+                provider::persist_failed_provider_observation(
+                    event_tx.as_ref(),
+                    thread_id,
+                    turn_id,
+                    &standard_thinking_id,
+                    &round.text,
+                    &round.reasoning,
+                    &round.tool_calls,
+                    round.provider_replay_state.as_ref(),
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
+            loop {
+                let snapshot = attached_task_finalization_snapshot(
+                    task_tool_provider.as_ref(),
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                )
+                .await
+                .map_err(|error| {
+                    ChatTurnError::Blocked(format!("task finalization unavailable: {error}"))
+                })?;
+                let Some(snapshot) = snapshot.filter(|snapshot| !snapshot.pending.is_empty())
+                else {
+                    break;
+                };
+                if !snapshot.review_required.is_empty() {
+                    return Err(ChatTurnError::Blocked(
+                        review_required_final_answer_block_message(),
+                    ));
+                }
+                semantic.attached_task_wait = Some(pioneer_protocol::NativeAttachedTaskWait {
+                    schema_version: 1,
+                    baseline: attached_task_semantic_revision(&snapshot)?,
+                    item_id: standard_thinking_id.clone(),
+                    checkpoint_id: pioneer_protocol::native_semantic_checkpoint_id(turn_id),
+                    owner_generation: attached_wait_owner(
+                        initial_preparation.execution_owner_generation(),
+                    )?,
+                    runtime_generation,
+                });
+                semantic.checkpoint_revision = semantic
+                    .checkpoint_revision
+                    .checked_add(1)
+                    .ok_or_else(|| ChatTurnError::Blocked("semantic revision exhausted".into()))?;
+                persist_native_semantic_checkpoint(
+                    event_tx.as_ref(),
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    input,
+                    &post_turn_model,
+                    &post_turn_model_provider,
+                    &window_stats,
+                    Default::default(),
+                    &requested_tool_names,
+                    semantic.to_value()?,
+                    None,
+                    initial_preparation.execution_owner_generation(),
+                    runtime_generation,
+                )
+                .await?;
+                await_attached_task_change(
+                    task_tool_provider.as_ref(),
+                    semantic.attached_task_wait.as_ref().unwrap(),
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    &turn_control,
+                    event_tx.as_ref(),
+                )
+                .await?;
+                send_reasoning_completed(
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    &standard_thinking_id,
+                    &round.reasoning,
+                    event_tx.as_ref(),
+                )
+                .await?;
+                standard_thinking_id =
+                    start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
+                        .await?;
+                semantic.attached_task_wait = None;
+                semantic.checkpoint_revision = semantic
+                    .checkpoint_revision
+                    .checked_add(1)
+                    .ok_or_else(|| ChatTurnError::Blocked("semantic revision exhausted".into()))?;
+                persist_native_semantic_checkpoint(
+                    event_tx.as_ref(),
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    input,
+                    &post_turn_model,
+                    &post_turn_model_provider,
+                    &window_stats,
+                    Default::default(),
+                    &requested_tool_names,
+                    semantic.to_value()?,
+                    None,
+                    initial_preparation.execution_owner_generation(),
+                    runtime_generation,
+                )
+                .await?;
+            }
+            let revision = StandardFinalization {
+                task: task_tool_provider.as_ref(),
+                finalization: turn_finalization_provider.as_ref(),
+                context: None,
+            }
+            .check(
+                workspace_id,
+                thread_id,
+                turn_id,
+                &round.text,
+                round.usage.as_ref(),
+            )
+            .await?;
+            publish_standard_final_response(
+                event_tx.as_ref(),
+                workspace_id,
+                thread_id,
+                turn_id,
+                &standard_thinking_id,
+                message_item_id,
+                &round,
+                revision,
+            )
+            .await?;
+            Ok(round.text)
+        }
+        .await;
+
+        match result {
+            Ok(assistant_text) => {
+                let summary = AgentTurnPostTurnSummary::succeeded_with_model(
+                    Some(post_turn_model.clone()),
+                    Some(post_turn_model_provider.clone()),
+                    extract_user_text(input),
+                    assistant_text,
+                    Vec::new(),
+                    Vec::new(),
+                );
+                return Ok(ChatTurnOutcome::Completed {
+                    post_turn_dispatch: Some(AgentTurnPostTurnHookDispatch::new(
+                        hook_context,
+                        effective_policy_set,
+                        effective_prompt_context_set,
+                        summary,
+                    )),
+                });
+            }
+            Err(error) => {
+                if let Some(mut continuation) = build_failure_execution_window_continuation(
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    input,
+                    &post_turn_model,
+                    &post_turn_model_provider,
+                    &window_stats,
+                    &error,
+                    Default::default(),
+                    &requested_tool_names,
+                ) {
+                    send_reasoning_completed(
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        &standard_thinking_id,
+                        "",
+                        event_tx.as_ref(),
+                    )
+                    .await?;
+                    semantic.checkpoint_revision =
+                        semantic.checkpoint_revision.checked_add(1).ok_or_else(|| {
+                            ChatTurnError::Blocked("semantic revision exhausted".into())
+                        })?;
+                    attach_native_semantic_state(
+                        &mut continuation.checkpoint_payload,
+                        semantic.to_value()?,
+                        window_stats.progress_baseline,
+                    )?;
+                    emit_execution_window_exhausted_and_checkpointed(
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        &window_stats,
+                        &continuation,
+                        event_tx.as_ref(),
+                    )
+                    .await?;
+                }
+                return Err(with_post_turn_failure_dispatch(
+                    error,
+                    hook_context,
+                    effective_policy_set,
+                    effective_prompt_context_set,
+                    extract_user_text(input),
+                    String::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ));
+            }
+        }
+    }
+
+    let tools = tools.ok_or_else(|| {
+        ChatTurnError::Blocked("prepared native tool runtime is unavailable".to_owned())
+    })?;
+    let skill_tool_materialization = skill_tool_materialization.ok_or_else(|| {
+        ChatTurnError::Blocked("prepared skill runtime is unavailable".to_owned())
+    })?;
+    let runtime = tools.runtime.clone();
+    let router = tools.router.clone();
+    if reused_initial {
+        requested_tool_names = restored_requested_tool_names(
+            execution_checkpoint_context.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+        );
+        visible_tool_names = router
+            .compute_final_visible_tools(
+                &core_tools,
+                &selected_optional_tools,
+                &requested_tool_names,
+            )
+            .visible_tools;
+    }
+    let runtime_tool_index = Arc::new(
+        skill_runtime_plan
+            .tools
+            .iter()
+            .map(|descriptor| (descriptor.canonical_tool_name.clone(), descriptor.clone()))
+            .collect::<HashMap<_, _>>(),
+    );
+
+    let runtime_recheck_policy = pioneer_skills::RuntimeExecutionRecheckPolicy {
+        runtime_recheck_on_tool_call: tool_loop_config
+            .skills
+            .dependencies
+            .runtime_recheck_on_tool_call,
+        security: pioneer_skills::SkillSecurityPolicy {
+            allow_untrusted_install: tool_loop_config.skills.security.allow_untrusted_install,
+            min_trust_for_shell_tools: tool_loop_config
+                .skills
+                .security
+                .min_trust_for_shell_tools
+                .clone(),
+            min_trust_for_http_tools: tool_loop_config
+                .skills
+                .security
+                .min_trust_for_http_tools
+                .clone(),
+            min_trust_for_function_proxy_tools: tool_loop_config
+                .skills
+                .security
+                .min_trust_for_function_proxy_tools
+                .clone(),
+            max_install_archive_bytes: tool_loop_config.skills.security.max_install_archive_bytes,
+            max_install_file_bytes: tool_loop_config.skills.security.max_install_file_bytes,
+        },
+    };
 
     let pending_tool_ui = Arc::new(Mutex::new(HashMap::<String, PendingToolUiState>::new()));
 
@@ -4450,7 +6303,7 @@ async fn execute_agent_provider_response(
     let thread_id_for_tools = thread_id.to_owned();
     let turn_id_for_tools = turn_id.to_owned();
 
-    let tool_event_forwarder = tokio::spawn(async move {
+    let tool_event_forwarder = AbortOnDropJoinHandle::new(tokio::spawn(async move {
         let mut durable_open = true;
         while durable_open {
             tokio::select! {
@@ -4483,7 +6336,7 @@ async fn execute_agent_provider_response(
                         Ok(event)
                             if matches!(
                                 &event.payload,
-                                ToolEventPayload::Heartbeat
+                                ToolEventPayload::Heartbeat | ToolEventPayload::OwnerHeartbeat
                             ) =>
                         {
                             tooling::forward_tool_event_to_agent(
@@ -4503,59 +6356,160 @@ async fn execute_agent_provider_response(
             }
         }
         Ok::<(), AgentEventHubError>(())
-    });
+    }));
 
-    let include_artifact_reference_policy = history_or_prompt_context_has_artifact_refs(
-        history.as_slice(),
-        &effective_prompt_context_set,
-    );
-
+    let mut provider_history_roots = semantic.provider_history_roots;
+    let restored_roots = if provider_history_roots.is_empty() {
+        Vec::new()
+    } else if let Some(session) = context_session {
+        session
+            .load_native_history_roots(&provider_history_roots)
+            .await
+            .map_err(|_| ChatTurnError::Blocked("native history roots unavailable".into()))?
+    } else {
+        return Err(ChatTurnError::Blocked(
+            "native history root owner unavailable".into(),
+        ));
+    };
     let mut messages = history
         .into_iter()
         .filter(|message| message.role != pioneer_provider::Role::System)
         .collect::<Vec<_>>();
-    let mut active_compiled_prompt = Some(compiled_prompt_payload_from_delivery_plan(
-        &initial_instruction_plan,
-    ));
 
     messages.push(user_message);
     let mut continuation_provider_history = retained_provider_history;
+    if !restored_roots.is_empty() {
+        continuation_provider_history.retain(|entry| {
+            !entry.message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.scope.starts_with("checkpoint:"))
+            })
+        });
+        continuation_provider_history.extend(restored_roots.into_iter().enumerate().map(
+            |(index, message)| RetainedProviderHistoryMessage {
+                sequence: i64::MIN + index as i64,
+                message,
+            },
+        ));
+    }
+    let mut continuation_provider_history_bytes = None;
     let mut next_provider_history_sequence =
         next_retained_provider_history_sequence(&continuation_provider_history);
     append_recovered_provider_history(&mut messages, continuation_provider_history.clone());
 
-    let mut pending_retry_instruction: Option<String> = None;
-    let mut applied_retry_instruction: Option<String> = None;
-    let mut observed_review_required_signatures = BTreeSet::<String>::new();
-    let mut observed_terminal_task_ids = BTreeSet::<String>::new();
+    let mut semantic_checkpoint_revision = semantic.checkpoint_revision;
+    let mut attached_task_wait = semantic.attached_task_wait;
+    let mut pending_retry_instruction = semantic.pending_retry_instruction;
+    let mut applied_retry_instruction = semantic.applied_retry_instruction;
+    let mut observed_review_required_signatures = semantic.observed_review_required_signatures;
+    let mut observed_terminal_task_ids = semantic.observed_terminal_task_ids;
     let window_budget = &tool_loop_config.execution_windows.window;
-    let mut tool_loop_guard = ToolLoopGuard::new_execution_window(
+    let mut tool_loop_guard = ToolLoopGuard::new_execution_window_with_started_at(
         window_budget.clone(),
         tool_loop_final_answer_instruction(),
+        preparation_started,
     );
-    let mut tool_retry_controller = ToolRetryController::new(tool_loop_config.retry.clone());
+    tool_loop_guard.record_preflight_provider_usage(
+        preflight_usage.attempts,
+        preflight_usage.known_tokens,
+        preflight_usage.unknown,
+    );
+    let mut tool_retry_controller =
+        ToolRetryController::from_checkpoint(tool_loop_config.retry.clone(), semantic.retry)
+            .map_err(|_| {
+                ChatTurnError::Blocked("native retry checkpoint is incompatible".to_owned())
+            })?;
+    if tool_retry_controller.is_exhausted() {
+        tool_loop_guard
+            .request_final_answer_with_instruction(
+                pioneer_protocol::NativeHostDirective::ExhaustedTools.instruction(),
+            )
+            .map_err(ChatTurnError::Blocked)?;
+    }
     let restored_no_progress_state = execution_checkpoint_context
         .as_ref()
         .map(|context| context.payload.tool_no_progress.clone())
         .unwrap_or_default();
-    let mut tool_no_progress_guard = ToolNoProgressGuard::from_checkpoint(
+    let mut tool_no_progress_guard = ToolNoProgressGuard::from_checkpoint_with_mode(
         ToolNoProgressGuardConfig::default(),
         restored_no_progress_state,
+        semantic.no_progress_mode,
     );
-    let mut tool_retry_lifecycle = ToolRetryLifecycleTracker::default();
-    let mut task_mutation_finalization_guard = TaskMutationFinalizationGuard::default();
-    let mut post_turn_assistant_text = String::new();
-    let mut post_turn_tool_events = Vec::new();
-    let mut post_turn_domain_events = Vec::new();
-    let mut window_stats = ChatExecutionWindowStats::new(execution_window_index);
-    emit_execution_window_started(
-        workspace_id,
-        thread_id,
+    tool_no_progress_guard
+        .restore_progress_frontier(semantic.progress_frontier)
+        .map_err(|message| ChatTurnError::Blocked(message.to_owned()))?;
+    let mut tool_retry_lifecycle = ToolRetryLifecycleTracker::from_checkpoint(
         turn_id,
-        &window_stats,
-        event_tx.as_ref(),
+        semantic.retry_lifecycle,
+        tool_retry_controller
+            .state_snapshot()
+            .active_episode
+            .is_some(),
     )
-    .await?;
+    .map_err(|_| ChatTurnError::Blocked("native retry lifecycle is incompatible".to_owned()))?;
+    let mut task_mutation_finalization_guard = semantic.task_mutation_guard;
+    let mut post_turn_assistant_text = semantic.post_turn_assistant_text;
+    let mut post_turn_tool_events = semantic.post_turn_tool_events;
+    let mut post_turn_domain_events = semantic.post_turn_domain_events;
+
+    macro_rules! capture_semantic_state {
+        () => {
+            (|| -> Result<serde_json::Value, ChatTurnError> {
+                semantic_checkpoint_revision =
+                    semantic_checkpoint_revision.checked_add(1).ok_or_else(|| {
+                        ChatTurnError::Blocked("semantic revision exhausted".to_owned())
+                    })?;
+                semantic_state::capture(
+                    semantic_checkpoint_revision,
+                    &attached_task_wait,
+                    turn_id,
+                    &tool_loop_config.retry,
+                    &native_controls.state,
+                    &provider_history_roots,
+                    tool_loop_config.no_progress_mode,
+                    tool_no_progress_guard.progress_frontier(),
+                    &tool_retry_controller,
+                    &tool_retry_lifecycle,
+                    &pending_retry_instruction,
+                    &applied_retry_instruction,
+                    &observed_review_required_signatures,
+                    &observed_terminal_task_ids,
+                    &task_mutation_finalization_guard,
+                    &post_turn_assistant_text,
+                    &post_turn_tool_events,
+                    &post_turn_domain_events,
+                )
+            })()
+        };
+    }
+
+    macro_rules! persist_control {
+        ($thinking:expr, $directive:expr, $data:expr) => {{
+            let control = native_controls
+                .enqueue($directive, $data)
+                .map_err(|error| (error, $thinking.clone()))?;
+            persist_native_semantic_checkpoint(
+                event_tx.as_ref(),
+                workspace_id,
+                thread_id,
+                turn_id,
+                input,
+                &post_turn_model,
+                &post_turn_model_provider,
+                &window_stats,
+                tool_no_progress_guard.checkpoint_state(),
+                &requested_tool_names,
+                capture_semantic_state!().map_err(|error| (error, $thinking.clone()))?,
+                control,
+                initial_preparation.execution_owner_generation(),
+                runtime_generation,
+            )
+            .await
+            .map_err(|error| (error, $thinking.clone()))?;
+        }};
+    }
 
     let turn_result: Result<AgentProviderLoopOutcome, (ChatTurnError, String)> = async {
         let mut current_thinking_id = initial_thinking_item_id;
@@ -4563,8 +6517,34 @@ async fn execute_agent_provider_response(
         let mut task_gate_query_failures = 0usize;
 
         loop {
+            if let Some(wait) = attached_task_wait.as_mut() {
+                wait.item_id = current_thinking_id.clone();
+                wait.owner_generation = attached_wait_owner(initial_preparation.execution_owner_generation()).map_err(|error| (error, current_thinking_id.clone()))?;
+                wait.runtime_generation = runtime_generation;
+            }
+            persist_native_semantic_checkpoint(
+                event_tx.as_ref(), workspace_id, thread_id, turn_id, input,
+                &post_turn_model, &post_turn_model_provider, &window_stats,
+                tool_no_progress_guard.checkpoint_state(), &requested_tool_names,
+                capture_semantic_state!().map_err(|e| (e, current_thinking_id.clone()))?,
+                None, initial_preparation.execution_owner_generation(), runtime_generation,
+            ).await.map_err(|e| (e, current_thinking_id.clone()))?;
             retain_agent_attachment_messages(&mut messages);
 
+            if let Some(wait) = &attached_task_wait {
+                await_attached_task_change(task_tool_provider.as_ref(), wait, workspace_id, thread_id, turn_id, &turn_control, event_tx.as_ref())
+                    .await.map_err(|error| (error, current_thinking_id.clone()))?;
+                send_reasoning_completed(workspace_id, thread_id, turn_id, &current_thinking_id, "", event_tx.as_ref())
+                    .await.map_err(|error| (error, current_thinking_id.clone()))?;
+                current_thinking_id = start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
+                    .await.map_err(|error| (error, current_thinking_id.clone()))?;
+                attached_task_wait = None;
+                persist_native_semantic_checkpoint(event_tx.as_ref(), workspace_id, thread_id, turn_id, input,
+                    &post_turn_model, &post_turn_model_provider, &window_stats, tool_no_progress_guard.checkpoint_state(),
+                    &requested_tool_names, capture_semantic_state!().map_err(|error| (error, current_thinking_id.clone()))?,
+                    None, initial_preparation.execution_owner_generation(), runtime_generation)
+                    .await.map_err(|error| (error, current_thinking_id.clone()))?;
+            }
             let task_gate_snapshot = match attached_task_finalization_snapshot(
                 task_tool_provider.as_ref(),
                 workspace_id,
@@ -4587,9 +6567,6 @@ async fn execute_agent_provider_response(
                             current_thinking_id.clone(),
                         ));
                     }
-                    let message = format!(
-                        "Attached task state could not be read safely ({task_gate_query_failures}/3); retrying before finalization: {error}"
-                    );
                     send_reasoning_completed(
                         workspace_id,
                         thread_id,
@@ -4600,7 +6577,8 @@ async fn execute_agent_provider_response(
                     )
                     .await
                     .map_err(|error| (error, current_thinking_id.clone()))?;
-                    messages.push(ChatMessage::user(message));
+                    persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::RetryTaskStateRead,
+                        Some((pioneer_protocol::NativeControlOrigin::RuntimeDiagnostic, json!({"state": "unavailable", "attempt": task_gate_query_failures}))));
                     current_thinking_id = start_reasoning_item(
                         workspace_id,
                         thread_id,
@@ -4613,14 +6591,15 @@ async fn execute_agent_provider_response(
                 }
             };
 
+            if let Some(snapshot) = &task_gate_snapshot {
+                retain_current_review_delivery(&snapshot.review_required, &mut observed_review_required_signatures)
+                    .map_err(|error| (error, current_thinking_id.clone()))?;
+                sync_review_action_tools_to_observations(&mut visible_tool_names, &snapshot.review_required);
+            }
             let review_observation = task_gate_snapshot
                 .as_ref()
-                .and_then(|snapshot| render_review_required_snapshot(snapshot.review_required.as_slice()));
+                .and_then(|snapshot| render_review_required_snapshot(snapshot.review_required.as_slice(), &observed_review_required_signatures));
             if let Some(observation) = review_observation {
-                sync_review_action_tools_to_observations(
-                    &mut visible_tool_names,
-                    observation.observations.as_slice(),
-                );
                 let has_new_signature = observation
                     .signatures
                     .iter()
@@ -4632,30 +6611,9 @@ async fn execute_agent_provider_response(
                         observation.observations.as_slice(),
                         router.as_ref(),
                     );
-                    let event_item_id = generate_id(TURN_ITEM_ID_LEN);
-                    emit_durable_event(
-                        event_tx.as_ref(),
-                        AgentDurableEvent::ItemCompleted {
-                            notification: ItemCompletedNotification {
-                                workspace_id: workspace_id.to_owned(),
-                                thread_id: thread_id.to_owned(),
-                                turn_id: turn_id.to_owned(),
-                                item: TurnItem::SystemEvent {
-                                    id: event_item_id,
-                                    level: pioneer_protocol::SystemEventLevel::Info,
-                                    message: observation.message.clone(),
-                                    code: Some("task.review_required.observed".to_owned()),
-                                    details: Some(observation.details),
-                                },
-                            },
-                        },
-                    )
-                    .await
-                    .map_err(|error| (error, current_thinking_id.clone()))?;
-                    messages.push(ChatMessage::user(observation.message));
+                    persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::ReviewTaskResults,
+                        Some((pioneer_protocol::NativeControlOrigin::TaskService, observation.details)));
                 }
-            } else {
-                sync_review_action_tools_to_observations(&mut visible_tool_names, &[]);
             }
 
             if let Some(observation) = task_gate_snapshot.as_ref().and_then(|snapshot| {
@@ -4665,27 +6623,8 @@ async fn execute_agent_provider_response(
                 for task_id in &observation.task_ids {
                     observed_terminal_task_ids.insert(task_id.clone());
                 }
-                let event_item_id = generate_id(TURN_ITEM_ID_LEN);
-                emit_durable_event(
-                    event_tx.as_ref(),
-                    AgentDurableEvent::ItemCompleted {
-                        notification: ItemCompletedNotification {
-                            workspace_id: workspace_id.to_owned(),
-                            thread_id: thread_id.to_owned(),
-                            turn_id: turn_id.to_owned(),
-                            item: TurnItem::SystemEvent {
-                                id: event_item_id,
-                                level: pioneer_protocol::SystemEventLevel::Info,
-                                message: observation.message.clone(),
-                                code: Some("task.terminal.observed".to_owned()),
-                                details: Some(observation.details),
-                            },
-                        },
-                    },
-                )
-                .await
-                .map_err(|error| (error, current_thinking_id.clone()))?;
-                messages.push(ChatMessage::user(observation.message));
+                persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::ObserveTaskResults,
+                    Some((pioneer_protocol::NativeControlOrigin::TaskService, observation.details)));
             }
 
             let round_plan = tool_loop_guard.begin_provider_round().map_err(|message| {
@@ -4723,7 +6662,7 @@ async fn execute_agent_provider_response(
                 )
                 .await
                 .map_err(|error| (error, current_thinking_id.clone()))?;
-                let continuation = build_budget_execution_window_continuation(
+                let mut continuation = build_budget_execution_window_continuation(
                     workspace_id,
                     thread_id,
                     turn_id,
@@ -4735,6 +6674,9 @@ async fn execute_agent_provider_response(
                     tool_no_progress_guard.checkpoint_state(),
                     &requested_tool_names,
                 );
+                attach_native_semantic_state(&mut continuation.checkpoint_payload, capture_semantic_state!()
+                    .map_err(|error| (error, current_thinking_id.clone()))?, window_stats.progress_baseline)
+                    .map_err(|error| (error, current_thinking_id.clone()))?;
                 emit_execution_window_exhausted_and_checkpointed(
                     workspace_id,
                     thread_id,
@@ -4761,45 +6703,6 @@ async fn execute_agent_provider_response(
                     .map_err(|error| (agent_event_error(error), current_thinking_id.clone()))?;
                 }
                 let next_retry_instruction = normalize_optional_prompt(Some(instruction));
-                if next_retry_instruction != applied_retry_instruction {
-                    let refreshed_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
-            tool_loop_config.computer_use.runtime_home_dir.as_path(),
-                        skills_prompt.clone(),
-                        next_retry_instruction.clone(),
-                        prompt_runtime_sections.as_slice(),
-                        &permission_profile,
-                        include_task_orchestration_policy,
-                        round_plan.tools_enabled,
-                        continue_generation_hint,
-                        turn_tool_materialization.initiating_thread_id.as_deref(),
-                        thread_id,
-                        turn_id,
-                    )
-                    .map_err(|error| (error, current_thinking_id.clone()))?;
-                    active_compiled_prompt = Some(compiled_prompt_payload_from_delivery_plan(
-                        &refreshed_instruction_plan,
-                    ));
-
-                    emit_durable_event(
-                        event_tx.as_ref(),
-                        AgentDurableEvent::PromptManifestCompiled {
-                            thread_id: thread_id.to_owned(),
-                            turn_id: turn_id.to_owned(),
-                            manifest: prompt_manifest_from_bundle(
-                                &refreshed_instruction_plan.bundle,
-                                &EffectiveTurnPromptManifestHookMetadata::combined(
-                                    effective_prompt_context_set.manifest_metadata(),
-                                    effective_prompt_section_set.manifest_metadata(),
-                                ),
-                                capability_diagnostics.as_slice(),
-                            ),
-                        },
-                    )
-                    .await
-                    .map_err(|error| (error, current_thinking_id.clone()))?;
-
-                    applied_retry_instruction = next_retry_instruction.clone();
-                }
                 pending_retry_instruction = next_retry_instruction;
             }
 
@@ -4819,78 +6722,26 @@ async fn execute_agent_provider_response(
                 None
             };
 
-            let round_compiled_prompt = if round_plan.tools_enabled {
-                active_compiled_prompt.clone()
-            } else {
-                let no_tool_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
-                    hook_runtime.as_ref(),
-                    &hook_context,
-                    &effective_policy_set,
-                    &effective_prompt_context_set,
-                    Vec::new(),
-                    TurnPrePromptCompileHookInput::from_parts(false, Vec::new()),
-                )
-                .await
-                .map_err(|error| {
-                    (
-                        ChatTurnError::Terminal(format!(
-                            "turn prompt section hook failed before no-tool provider round: {}",
-                            error.kind()
-                        )),
-                        current_thinking_id.clone(),
-                    )
-                })?;
-                let no_tool_prompt_sections =
-                    prompt_sections_for_compile_from_hook_sections(&no_tool_prompt_section_set)
-                        .map_err(|error| (error, current_thinking_id.clone()))?;
-                let no_tool_runtime_sections =
-                    runtime_sections_with_execution_continuation_context(
-                        no_tool_prompt_sections.runtime_sections.as_slice(),
-                        execution_window_index,
-                        execution_checkpoint_context.as_ref(),
-                        prior_visible_assistant_text.as_deref(),
-                        turn_tool_materialization.initiating_thread_id.as_deref(),
-                    );
-                let no_tool_runtime_sections = runtime_sections_with_artifact_reference_policy(
-                    no_tool_runtime_sections,
-                    include_artifact_reference_policy,
-                )
+            let control_projection = native_controls.projection(workspace_id, thread_id, turn_id)
                 .map_err(|error| (error, current_thinking_id.clone()))?;
-                let no_tool_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
-            tool_loop_config.computer_use.runtime_home_dir.as_path(),
-                    skills_prompt.clone(),
-                    applied_retry_instruction.clone(),
-                    no_tool_runtime_sections.as_slice(),
-                    &permission_profile,
-                    include_task_orchestration_policy,
-                    false,
-                    continue_generation_hint,
-                    turn_tool_materialization.initiating_thread_id.as_deref(),
-                    thread_id,
-                    turn_id,
-                )
+            control_projection.append_observations(&mut messages)
                 .map_err(|error| (error, current_thinking_id.clone()))?;
-                emit_durable_event(
-                    event_tx.as_ref(),
-                    AgentDurableEvent::PromptManifestCompiled {
-                        thread_id: thread_id.to_owned(),
-                        turn_id: turn_id.to_owned(),
-                        manifest: prompt_manifest_from_bundle(
-                            &no_tool_instruction_plan.bundle,
-                            &EffectiveTurnPromptManifestHookMetadata::combined(
-                                effective_prompt_context_set.manifest_metadata(),
-                                no_tool_prompt_section_set.manifest_metadata(),
-                            ),
-                            capability_diagnostics.as_slice(),
-                        ),
-                    },
-                )
-                .await
+            let round_plan_with_controls = reproject_agent_instruction_plan(
+                &initial_instruction_plan,
+                pending_retry_instruction.as_deref(),
+                round_plan.tools_enabled,
+            ).and_then(|plan| pioneer_promt::reproject_native_control_plan(&plan, &control_projection.instructions)
+                .map_err(|_| ChatTurnError::Blocked("native control instruction projection unavailable".to_owned())))
                 .map_err(|error| (error, current_thinking_id.clone()))?;
-                Some(compiled_prompt_payload_from_delivery_plan(&no_tool_instruction_plan))
-            };
-
-            let post_turn_assistant_text_len_before_round = post_turn_assistant_text.len();
+            let round_compiled_prompt = Some(compiled_prompt_payload_from_delivery_plan(&round_plan_with_controls));
+            emit_durable_event(event_tx.as_ref(), AgentDurableEvent::PromptManifestCompiled {
+                thread_id: thread_id.to_owned(), turn_id: turn_id.to_owned(),
+                manifest: prompt_manifest_from_bundle(&round_plan_with_controls.bundle,
+                    &EffectiveTurnPromptManifestHookMetadata::combined(
+                        effective_prompt_context_set.manifest_metadata(), effective_prompt_section_set.manifest_metadata(),
+                    ), capability_diagnostics.as_slice()),
+            }).await.map_err(|error| (error, current_thinking_id.clone()))?;
+            let post_turn_assistant_text_before_round = post_turn_assistant_text.clone();
             let request = ChatRequest {
                     model: model.clone(),
                     messages: messages.clone(),
@@ -4900,17 +6751,37 @@ async fn execute_agent_provider_response(
                     tool_choice: None,
                     parallel_tool_calls: round_plan.tools_enabled.then_some(true),
                     reasoning,
-                    compiled_prompt: round_compiled_prompt,
+                    compiled_prompt: round_compiled_prompt.clone(),
                             };
-            let (request, receipt) = if let Some(session) = context_session {
+            let (request, receipt, covered_controls) = if let Some(session) = context_session {
                 let prepared = session.prepare(request, false).await.map_err(|e| (
                     ChatTurnError::Blocked(format!("context preparation failed: {e}")),
                     current_thinking_id.clone(),
                 ))?;
-                (prepared.request, Some(prepared.receipt))
-            } else { (request, None) };
+                (prepared.request, Some(prepared.receipt), prepared.covered_native_control_ids)
+            } else { (request, None, Vec::new()) };
+            control_projection.validate_inclusion(&request, &round_compiled_prompt)
+                .map_err(|error| (error, current_thinking_id.clone()))?;
+            native_controls.sync_after_compaction(&covered_controls)
+                .map_err(|error| (error, current_thinking_id.clone()))?;
+            if context_session.is_some() {
+                provider_history_roots = semantic_state::history_roots_from_request(&request.messages)
+                    .map_err(|error| (error, current_thinking_id.clone()))?;
+                continuation_provider_history_bytes = Some(synchronize_retained_provider_history(
+                    &mut continuation_provider_history, &mut next_provider_history_sequence,
+                    workspace_id, thread_id, turn_id, &request.messages,
+                ).map_err(|error| (error, current_thinking_id.clone()))?);
+            }
             messages = request.messages.clone();
-            let round = await_context_request(context_session, provider::request_agent_round(
+            persist_native_semantic_checkpoint(
+                event_tx.as_ref(), workspace_id, thread_id, turn_id, input,
+                &post_turn_model, &post_turn_model_provider, &window_stats,
+                tool_no_progress_guard.checkpoint_state(), &requested_tool_names,
+                capture_semantic_state!().map_err(|e| (e, current_thinking_id.clone()))?,
+                None, initial_preparation.execution_owner_generation(), runtime_generation,
+            ).await.map_err(|e| (e, current_thinking_id.clone()))?;
+            let tokens_before_round = window_stats.provider_token_count.unwrap_or(0);
+            let round = await_context_request(context_session, provider::request_agent_round_accounted(
                 provider,
                 request,
                 workspace_id,
@@ -4920,6 +6791,7 @@ async fn execute_agent_provider_response(
                 force_non_stream,
                 tool_loop_config.provider,
                 event_tx.as_ref(),
+                Some(&mut window_stats),
             ))
             .await
             .map_err(|e| (e, current_thinking_id.clone()))?;
@@ -4931,11 +6803,19 @@ async fn execute_agent_provider_response(
                 ))?;
             }
 
+            applied_retry_instruction = pending_retry_instruction.take();
+            native_controls.mark_applied(&control_projection);
+            persist_native_semantic_checkpoint(
+                event_tx.as_ref(), workspace_id, thread_id, turn_id, input,
+                &post_turn_model, &post_turn_model_provider, &window_stats,
+                tool_no_progress_guard.checkpoint_state(), &requested_tool_names,
+                capture_semantic_state!().map_err(|error| (error, current_thinking_id.clone()))?,
+                None, initial_preparation.execution_owner_generation(), runtime_generation,
+            ).await.map_err(|error| (error, current_thinking_id.clone()))?;
             if !round.text.trim().is_empty() {
                 append_text_fragment(&mut post_turn_assistant_text, round.text.as_str());
             }
 
-            window_stats.record_provider_round(round.tool_calls.len(), round.provider_token_count);
 
             if !round_plan.tools_enabled
                 && !round.tool_calls.is_empty()
@@ -4971,9 +6851,8 @@ async fn execute_agent_provider_response(
                         )
                         .await
                         .map_err(|error| (error, current_thinking_id.clone()))?;
-                        messages.push(ChatMessage::user(format!(
-                            "Attached task state could not be read safely ({task_gate_query_failures}/3); retrying before deterministic finalization: {error}"
-                        )));
+                        persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::RetryTaskStateRead,
+                            Some((pioneer_protocol::NativeControlOrigin::RuntimeDiagnostic, json!({"state": "unavailable", "attempt": task_gate_query_failures}))));
                         current_thinking_id = start_reasoning_item(
                             workspace_id,
                             thread_id,
@@ -5005,7 +6884,7 @@ async fn execute_agent_provider_response(
                     }
                 }
 
-                post_turn_assistant_text = final_text.clone();
+                post_turn_assistant_text = bounded_utf8_suffix(&final_text, semantic_state::MAX_SUMMARY_TEXT_BYTES).to_owned();
                 send_reasoning_completed(
                     workspace_id,
                     thread_id,
@@ -5109,7 +6988,7 @@ async fn execute_agent_provider_response(
             match tool_loop_guard.after_provider_round_with_usage(
                 round_plan.tools_enabled,
                 round.tool_calls.len(),
-                round.provider_token_count,
+                Some(round.provider_token_count.unwrap_or(0).max(window_stats.provider_token_count.unwrap_or(0).saturating_sub(tokens_before_round))),
             ) {
                 ToolLoopGuardDecision::Continue => {}
                 ToolLoopGuardDecision::RequestContinuation { budget_exceeded } => {
@@ -5132,7 +7011,7 @@ async fn execute_agent_provider_response(
                     )
                     .await
                     .map_err(|error| (error, current_thinking_id.clone()))?;
-                    let continuation = build_budget_execution_window_continuation(
+                    let mut continuation = build_budget_execution_window_continuation(
                         workspace_id,
                         thread_id,
                         turn_id,
@@ -5144,7 +7023,10 @@ async fn execute_agent_provider_response(
                         tool_no_progress_guard.checkpoint_state(),
                         &requested_tool_names,
                     );
-                    emit_execution_window_exhausted_and_checkpointed(
+                    attach_native_semantic_state(&mut continuation.checkpoint_payload, capture_semantic_state!()
+                    .map_err(|error| (error, current_thinking_id.clone()))?, window_stats.progress_baseline)
+                    .map_err(|error| (error, current_thinking_id.clone()))?;
+                emit_execution_window_exhausted_and_checkpointed(
                         workspace_id,
                         thread_id,
                         turn_id,
@@ -5182,45 +7064,6 @@ async fn execute_agent_provider_response(
 
                     pending_retry_instruction =
                         normalize_optional_prompt(Some(instruction.clone()));
-                    if pending_retry_instruction != applied_retry_instruction {
-                        let refreshed_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
-            tool_loop_config.computer_use.runtime_home_dir.as_path(),
-                            skills_prompt.clone(),
-                            pending_retry_instruction.clone(),
-                            prompt_runtime_sections.as_slice(),
-                            &permission_profile,
-                            include_task_orchestration_policy,
-                            false,
-                            continue_generation_hint,
-                            turn_tool_materialization.initiating_thread_id.as_deref(),
-                            thread_id,
-                            turn_id,
-                        )
-                        .map_err(|error| (error, current_thinking_id.clone()))?;
-                        active_compiled_prompt = Some(compiled_prompt_payload_from_delivery_plan(
-                            &refreshed_instruction_plan,
-                        ));
-
-                        emit_durable_event(
-                            event_tx.as_ref(),
-                            AgentDurableEvent::PromptManifestCompiled {
-                                thread_id: thread_id.to_owned(),
-                                turn_id: turn_id.to_owned(),
-                                manifest: prompt_manifest_from_bundle(
-                                    &refreshed_instruction_plan.bundle,
-                                    &EffectiveTurnPromptManifestHookMetadata::combined(
-                                        effective_prompt_context_set.manifest_metadata(),
-                                        effective_prompt_section_set.manifest_metadata(),
-                                    ),
-                                    capability_diagnostics.as_slice(),
-                                ),
-                            },
-                        )
-                        .await
-                        .map_err(|error| (error, current_thinking_id.clone()))?;
-
-                        applied_retry_instruction = pending_retry_instruction.clone();
-                    }
 
                     current_thinking_id =
                         start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
@@ -5233,11 +7076,6 @@ async fn execute_agent_provider_response(
             }
 
             if round.tool_calls.is_empty() {
-                if round_plan.tools_enabled && pending_retry_instruction.take().is_some() {
-                    consecutive_rejected_no_tool_rounds = 0;
-                    continue;
-                }
-
                 // The snapshot used to render observations at the start of
                 // the round is not sufficient as a terminal gate: a child
                 // can transition while the provider is generating its final
@@ -5266,9 +7104,6 @@ async fn execute_agent_provider_response(
                                 current_thinking_id.clone(),
                             ));
                         }
-                        let message = format!(
-                            "Attached task state could not be read safely ({task_gate_query_failures}/3); retrying before finalization: {error}"
-                        );
                         send_reasoning_completed(
                             workspace_id,
                             thread_id,
@@ -5279,7 +7114,8 @@ async fn execute_agent_provider_response(
                         )
                         .await
                         .map_err(|error| (error, current_thinking_id.clone()))?;
-                        messages.push(ChatMessage::user(message));
+                        persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::RetryTaskStateRead,
+                        Some((pioneer_protocol::NativeControlOrigin::RuntimeDiagnostic, json!({"state": "unavailable", "attempt": task_gate_query_failures}))));
                         current_thinking_id = start_reasoning_item(
                             workspace_id,
                             thread_id,
@@ -5293,9 +7129,13 @@ async fn execute_agent_provider_response(
                     }
                 };
 
+                if let Some(snapshot) = &final_task_gate_snapshot {
+                    retain_current_review_delivery(&snapshot.review_required, &mut observed_review_required_signatures)
+                        .map_err(|error| (error, current_thinking_id.clone()))?;
+                }
                 if let Some(observation) = final_task_gate_snapshot
                     .as_ref()
-                    .and_then(|snapshot| render_review_required_snapshot(snapshot.review_required.as_slice()))
+                    .and_then(|snapshot| render_review_required_snapshot(snapshot.review_required.as_slice(), &observed_review_required_signatures))
                 {
                     let has_new_signature = observation
                         .signatures
@@ -5311,7 +7151,7 @@ async fn execute_agent_provider_response(
                     observed_review_required_signatures.extend(observation.signatures.clone());
                     sync_review_action_tools_to_observations(
                         &mut visible_tool_names,
-                        observation.observations.as_slice(),
+                        &final_task_gate_snapshot.as_ref().unwrap().review_required,
                     );
                     apply_review_required_tools_to_visible_tools(
                         &mut visible_tool_names,
@@ -5328,27 +7168,8 @@ async fn execute_agent_provider_response(
                     )
                     .await
                     .map_err(|error| (error, current_thinking_id.clone()))?;
-                    let event_item_id = generate_id(TURN_ITEM_ID_LEN);
-                    emit_durable_event(
-                        event_tx.as_ref(),
-                        AgentDurableEvent::ItemCompleted {
-                            notification: ItemCompletedNotification {
-                                workspace_id: workspace_id.to_owned(),
-                                thread_id: thread_id.to_owned(),
-                                turn_id: turn_id.to_owned(),
-                                item: TurnItem::SystemEvent {
-                                    id: event_item_id,
-                                    level: pioneer_protocol::SystemEventLevel::Info,
-                                    message: observation.message.clone(),
-                                    code: Some("task.review_required.observed".to_owned()),
-                                    details: Some(observation.details),
-                                },
-                            },
-                        },
-                    )
-                    .await
-                    .map_err(|error| (error, current_thinking_id.clone()))?;
-                    messages.push(ChatMessage::user(observation.message));
+                    persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::ReviewTaskResults,
+                        Some((pioneer_protocol::NativeControlOrigin::TaskService, observation.details)));
                     current_thinking_id =
                         start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
                             .await
@@ -5357,45 +7178,17 @@ async fn execute_agent_provider_response(
                     continue;
                 }
 
-                if let Some(observation) = final_task_gate_snapshot
-                    .as_ref()
-                    .and_then(|snapshot| render_pending_snapshot(snapshot.pending.as_slice()))
-                {
-                    send_reasoning_completed(
-                        workspace_id,
-                        thread_id,
-                        turn_id,
-                        current_thinking_id.as_str(),
-                        round.reasoning.as_str(),
-                        event_tx.as_ref(),
-                    )
-                    .await
-                    .map_err(|error| (error, current_thinking_id.clone()))?;
-                    let event_item_id = generate_id(TURN_ITEM_ID_LEN);
-                    emit_durable_event(
-                        event_tx.as_ref(),
-                        AgentDurableEvent::ItemCompleted {
-                            notification: ItemCompletedNotification {
-                                workspace_id: workspace_id.to_owned(),
-                                thread_id: thread_id.to_owned(),
-                                turn_id: turn_id.to_owned(),
-                                item: TurnItem::SystemEvent {
-                                    id: event_item_id,
-                                    level: pioneer_protocol::SystemEventLevel::Info,
-                                    message: observation.clone(),
-                                    code: Some("task.attached.pending".to_owned()),
-                                    details: None,
-                                },
-                            },
-                        },
-                    )
-                    .await
-                    .map_err(|error| (error, current_thinking_id.clone()))?;
-                    messages.push(ChatMessage::user(observation));
-                    current_thinking_id =
-                        start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
-                            .await
-                            .map_err(|error| (error, current_thinking_id.clone()))?;
+                if final_task_gate_snapshot.as_ref().is_some_and(|snapshot| !snapshot.review_required.is_empty()) {
+                    return Err((ChatTurnError::Blocked(review_required_final_answer_block_message()), current_thinking_id.clone()));
+                }
+
+                if let Some(snapshot) = final_task_gate_snapshot.as_ref().filter(|snapshot| !snapshot.pending.is_empty()) {
+                    attached_task_wait = Some(pioneer_protocol::NativeAttachedTaskWait {
+                        schema_version: 1, checkpoint_id: pioneer_protocol::native_semantic_checkpoint_id(turn_id), baseline: attached_task_semantic_revision(snapshot).map_err(|error| (error, current_thinking_id.clone()))?,
+                        item_id: current_thinking_id.clone(), owner_generation: attached_wait_owner(initial_preparation.execution_owner_generation()).map_err(|error| (error, current_thinking_id.clone()))?, runtime_generation,
+                    });
+                    persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::AwaitAttachedTasks,
+                        Some((pioneer_protocol::NativeControlOrigin::TaskService, render_pending_snapshot(&snapshot.pending).unwrap())));
                     consecutive_rejected_no_tool_rounds = 0;
                     continue;
                 }
@@ -5417,27 +7210,8 @@ async fn execute_agent_provider_response(
                     )
                     .await
                     .map_err(|error| (error, current_thinking_id.clone()))?;
-                    let event_item_id = generate_id(TURN_ITEM_ID_LEN);
-                    emit_durable_event(
-                        event_tx.as_ref(),
-                        AgentDurableEvent::ItemCompleted {
-                            notification: ItemCompletedNotification {
-                                workspace_id: workspace_id.to_owned(),
-                                thread_id: thread_id.to_owned(),
-                                turn_id: turn_id.to_owned(),
-                                item: TurnItem::SystemEvent {
-                                    id: event_item_id,
-                                    level: pioneer_protocol::SystemEventLevel::Info,
-                                    message: observation.message.clone(),
-                                    code: Some("task.terminal.observed".to_owned()),
-                                    details: Some(observation.details),
-                                },
-                            },
-                        },
-                    )
-                    .await
-                    .map_err(|error| (error, current_thinking_id.clone()))?;
-                    messages.push(ChatMessage::user(observation.message));
+                    persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::ObserveTaskResults,
+                        Some((pioneer_protocol::NativeControlOrigin::TaskService, observation.details)));
                     current_thinking_id =
                         start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
                             .await
@@ -5484,7 +7258,7 @@ async fn execute_agent_provider_response(
                     .then(|| no_tool_final_answer_rejection(final_text.as_str()))
                     .flatten();
                 if let Some(rejection) = final_answer_rejection {
-                    post_turn_assistant_text.truncate(post_turn_assistant_text_len_before_round);
+                    post_turn_assistant_text = post_turn_assistant_text_before_round.clone();
                     consecutive_rejected_no_tool_rounds += 1;
 
                     if consecutive_rejected_no_tool_rounds
@@ -5541,7 +7315,8 @@ async fn execute_agent_provider_response(
                                 .map_err(|error| (error, current_thinking_id.clone()))?;
                     }
 
-                    messages.push(ChatMessage::user(rejection.recovery_instruction()));
+                    persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::RepairFinalAnswer,
+                        Some((pioneer_protocol::NativeControlOrigin::RuntimeDiagnostic, json!({"requirement": rejection.recovery_instruction()}))));
                     continue;
                 }
 
@@ -5557,8 +7332,7 @@ async fn execute_agent_provider_response(
                     {
                         Ok(TurnFinalizationDecision::Allow) => {}
                         Ok(TurnFinalizationDecision::Retry { instruction }) => {
-                            post_turn_assistant_text
-                                .truncate(post_turn_assistant_text_len_before_round);
+                            post_turn_assistant_text = post_turn_assistant_text_before_round.clone();
                             if !round.reasoning.trim().is_empty() {
                                 send_reasoning_completed(
                                     workspace_id,
@@ -5581,20 +7355,19 @@ async fn execute_agent_provider_response(
                                 .map_err(|error| (error, current_thinking_id.clone()))?;
                             }
                             consecutive_rejected_no_tool_rounds = 0;
-                            messages.push(ChatMessage::user(instruction));
+                            persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::FinalizationRetry,
+                                Some((pioneer_protocol::NativeControlOrigin::ArtifactService, json!({"requirement": instruction}))));
                             continue;
                         }
                         Ok(TurnFinalizationDecision::Fail { message }) => {
-                            post_turn_assistant_text
-                                .truncate(post_turn_assistant_text_len_before_round);
+                            post_turn_assistant_text = post_turn_assistant_text_before_round.clone();
                             return Err((ChatTurnError::Terminal(message), current_thinking_id.clone()));
                         }
                         Err(error) => {
-                            post_turn_assistant_text
-                                .truncate(post_turn_assistant_text_len_before_round);
+                            post_turn_assistant_text = post_turn_assistant_text_before_round.clone();
                             return Err((
-                                ChatTurnError::Terminal(format!(
-                                    "turn finalization check failed: {error}"
+                                ChatTurnError::Blocked(format!(
+                                    "turn finalization outcome is unavailable: {error}"
                                 )),
                                 current_thinking_id.clone(),
                             ));
@@ -5602,7 +7375,7 @@ async fn execute_agent_provider_response(
                     }
                 }
                 if final_text != round.text {
-                    post_turn_assistant_text = final_text.clone();
+                    post_turn_assistant_text = bounded_utf8_suffix(&final_text, semantic_state::MAX_SUMMARY_TEXT_BYTES).to_owned();
                 }
 
                 send_reasoning_completed(
@@ -5759,12 +7532,25 @@ async fn execute_agent_provider_response(
             retain_provider_history_message(
                 &mut continuation_provider_history,
                 &mut next_provider_history_sequence,
+                &mut continuation_provider_history_bytes,
                 &assistant_round,
-            );
+            ).map_err(|error| (error, current_thinking_id.clone()))?;
             messages.push(assistant_round);
 
-            let guarded_tool_calls = resolved_tool_calls
-                .into_iter()
+            let mut pending_tool_calls = std::collections::VecDeque::from(resolved_tool_calls);
+            let mut executed_results = Vec::new();
+            let mut no_progress_feedback = pioneer_tools::ToolNoProgressFeedback::default();
+            while !pending_tool_calls.is_empty() {
+                let segment_len = native_tool_batch_segment_len(
+                    pending_tool_calls.iter().map(|(call, _, _)| {
+                        (call.name.as_str(), call.arguments.as_str())
+                    }),
+                    |name| router.supports_parallel_reads(name),
+                );
+                // Admission is computed by the parent after the preceding
+                // segment has completed and updated the exact guard state.
+                let guarded_tool_calls = pending_tool_calls
+                .drain(..segment_len)
                 .map(|(model_tool_call, item_id, ordinal)| {
                     let decision = tool_no_progress_guard.preflight(
                         model_tool_call.name.as_str(),
@@ -5889,6 +7675,7 @@ async fn execute_agent_provider_response(
                             )
                             .await?;
                             return Ok(ExecutedToolResult {
+                                progress: Default::default(),
                                 item_id: item_id.clone(),
                                 provider_call_id: provider_call_id.clone(),
                                 ordinal,
@@ -6050,6 +7837,7 @@ async fn execute_agent_provider_response(
                                 .await?;
 
                                 return Ok(ExecutedToolResult {
+                                    progress: Default::default(),
                                     item_id: item_id.clone(),
                                     provider_call_id: provider_call_id.clone(),
                                     ordinal,
@@ -6139,6 +7927,7 @@ async fn execute_agent_provider_response(
                                     .await?;
                                 }
                                 return Ok(ExecutedToolResult {
+                                    progress: Default::default(),
                                     item_id: item_id.clone(),
                                     provider_call_id: provider_call_id.clone(),
                                     ordinal,
@@ -6209,6 +7998,7 @@ async fn execute_agent_provider_response(
                             .complete_attempt(turn_id.as_str(), item_id.as_str())
                             .await;
 
+                        let progress = dispatch_result.as_ref().ok().map(|result| result.progress_evidence()).unwrap_or_default();
                         let full_source_in_item = dispatch_result.as_ref().ok().and_then(|r| r.projection()).is_some_and(|p| matches!(p.storage, pioneer_protocol::ToolStoragePayload::Shell { .. }) && matches!(p.output_policy.storage, pioneer_protocol::StorageOutputPolicy::Full { .. }));
                         let full_message = dispatch_result.as_ref().ok().map(|result| {
                             let mut message = result.to_history_message();
@@ -6282,6 +8072,7 @@ async fn execute_agent_provider_response(
                         );
 
                         Ok(ExecutedToolResult {
+                            progress,
                             item_id: item_id.clone(),
                             provider_call_id,
                             ordinal,
@@ -6313,7 +8104,7 @@ async fn execute_agent_provider_response(
                 .collect::<Vec<_>>();
 
             let parallel_tool_calls = tool_tasks.len().max(1);
-            let mut executed_results = stream::iter(tool_tasks)
+            let segment_results = stream::iter(tool_tasks)
                 .map(|task| {
                     let event_tx = event_tx.clone();
                     let workspace_id = workspace_id.to_owned();
@@ -6379,6 +8170,11 @@ async fn execute_agent_provider_response(
                         }
                     };
                     let mut result = result;
+                    let typed_outcome = result.outcome.provider_outcome();
+                    result.message.tool_outcome = Some(typed_outcome);
+                    if let Some(full_message) = &mut result.full_message {
+                        full_message.tool_outcome = Some(typed_outcome);
+                    }
                     let reference = serde_json::json!({"workspace_id": workspace_id, "thread_id": thread_id,
                         "turn_id": turn_id, "item_id": result.item_id}).to_string();
                     if !result.full_source_in_item {
@@ -6405,6 +8201,14 @@ async fn execute_agent_provider_response(
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| (error, current_thinking_id.clone()))?;
+                let observations = segment_results.iter()
+                    .map(ExecutedToolResult::retry_observation).collect::<Vec<_>>();
+                no_progress_feedback.fact_lines.extend(
+                    tool_no_progress_guard.observe(&observations).fact_lines,
+                );
+                no_progress_feedback.fact_lines.truncate(semantic_state::MAX_SUMMARY_EVENTS);
+                executed_results.extend(segment_results);
+            }
             executed_results.sort_by_key(|result| result.ordinal);
             if tool_event_forwarder.is_finished() {
                 return Err((
@@ -6435,7 +8239,8 @@ async fn execute_agent_provider_response(
 
             for result in &executed_results {
                 record_observed_terminal_task_ids(&mut observed_terminal_task_ids, result);
-                task_mutation_finalization_guard.observe(result);
+                task_mutation_finalization_guard.observe(result)
+                    .map_err(|error| (error, current_thinking_id.clone()))?;
             }
             post_turn_tool_events.extend(
                 executed_results
@@ -6448,12 +8253,17 @@ async fn execute_agent_provider_response(
                     .map(post_turn_domain_event_summary_from_tool),
             );
 
+            // A bounded post-turn summary is independent of unresolved guards.
+            if post_turn_tool_events.len() > semantic_state::MAX_SUMMARY_EVENTS {
+                post_turn_tool_events.drain(..post_turn_tool_events.len() - semantic_state::MAX_SUMMARY_EVENTS);
+            }
+            if post_turn_domain_events.len() > semantic_state::MAX_SUMMARY_EVENTS {
+                post_turn_domain_events.drain(..post_turn_domain_events.len() - semantic_state::MAX_SUMMARY_EVENTS);
+            }
             let retry_observations = executed_results
                 .iter()
                 .map(ExecutedToolResult::retry_observation)
                 .collect::<Vec<_>>();
-            let no_progress_feedback = tool_no_progress_guard.observe(&retry_observations);
-            let mut next_round_tools_enabled = true;
             pending_retry_instruction = match tool_retry_controller.decide(&retry_observations) {
                 ToolRetryDecision::None { drafts } => {
                     emit_tool_retry_drafts(
@@ -6479,9 +8289,11 @@ async fn execute_agent_provider_response(
                     )
                     .await
                     .map_err(|error| (agent_event_error(error), current_thinking_id.clone()))?;
+                    persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::RetryTools,
+                        Some((pioneer_protocol::NativeControlOrigin::ToolService, json!({"facts": prompt.fact_lines()}))));
                     render_tool_retry_instruction(
                         ToolRetryInstructionKind::Retry,
-                        &prompt.fact_lines(),
+                        &["Inspect the untrusted native tool retry observations.".to_owned()],
                     )
                 }
                 ToolRetryDecision::Exhausted { prompt, drafts, .. } => {
@@ -6495,12 +8307,13 @@ async fn execute_agent_provider_response(
                     )
                     .await
                     .map_err(|error| (agent_event_error(error), current_thinking_id.clone()))?;
+                    persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::ExhaustedTools,
+                        Some((pioneer_protocol::NativeControlOrigin::ToolService, json!({"facts": prompt.fact_lines()}))));
                     let exhausted_instruction = render_tool_retry_instruction(
                         ToolRetryInstructionKind::Exhausted,
-                        &prompt.fact_lines(),
+                        &["Inspect the untrusted native tool retry observations.".to_owned()],
                     );
                     if let Some(instruction) = exhausted_instruction.clone() {
-                        next_round_tools_enabled = false;
                         // Explicit retry exhaustion still uses a final no-tools round. Window
                         // budget exhaustion is handled earlier as durable continuation.
                         match tool_loop_guard.request_final_answer_with_instruction(instruction) {
@@ -6519,9 +8332,11 @@ async fn execute_agent_provider_response(
             };
 
             if !no_progress_feedback.is_empty() {
+                persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::ChangeToolStrategy,
+                    Some((pioneer_protocol::NativeControlOrigin::ToolService, json!({"facts": no_progress_feedback.fact_lines}))));
                 let guard_instruction = render_tool_retry_instruction(
                     ToolRetryInstructionKind::Retry,
-                    no_progress_feedback.fact_lines.as_slice(),
+                    &["Inspect the untrusted native tool progress observations.".to_owned()],
                 );
                 pending_retry_instruction = match (
                     pending_retry_instruction.take(),
@@ -6534,48 +8349,6 @@ async fn execute_agent_provider_response(
                 };
             }
 
-            let next_retry_instruction =
-                normalize_optional_prompt(pending_retry_instruction.clone());
-
-            if next_retry_instruction != applied_retry_instruction {
-                let refreshed_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
-            tool_loop_config.computer_use.runtime_home_dir.as_path(),
-                    skills_prompt.clone(),
-                    next_retry_instruction.clone(),
-                    prompt_runtime_sections.as_slice(),
-                    &permission_profile,
-                    include_task_orchestration_policy,
-                    next_round_tools_enabled,
-                    continue_generation_hint,
-                    turn_tool_materialization.initiating_thread_id.as_deref(),
-                    thread_id,
-                    turn_id,
-                )
-                .map_err(|error| (error, current_thinking_id.clone()))?;
-                active_compiled_prompt = Some(compiled_prompt_payload_from_delivery_plan(
-                    &refreshed_instruction_plan,
-                ));
-
-                emit_durable_event(
-                    event_tx.as_ref(),
-                    AgentDurableEvent::PromptManifestCompiled {
-                        thread_id: thread_id.to_owned(),
-                        turn_id: turn_id.to_owned(),
-                        manifest: prompt_manifest_from_bundle(
-                            &refreshed_instruction_plan.bundle,
-                            &EffectiveTurnPromptManifestHookMetadata::combined(
-                                effective_prompt_context_set.manifest_metadata(),
-                                effective_prompt_section_set.manifest_metadata(),
-                            ),
-                            capability_diagnostics.as_slice(),
-                        ),
-                    },
-                )
-                .await
-                .map_err(|error| (error, current_thinking_id.clone()))?;
-
-                applied_retry_instruction = next_retry_instruction;
-            }
 
             for result in &mut executed_results {
                 result.message.provenance = Some(crate::compaction::history::pending_origin(
@@ -6586,8 +8359,9 @@ async fn execute_agent_provider_response(
                 retain_provider_history_message(
                     &mut continuation_provider_history,
                     &mut next_provider_history_sequence,
+                    &mut continuation_provider_history_bytes,
                     &result.message,
-                );
+                ).map_err(|error| (error, current_thinking_id.clone()))?;
             }
             messages.extend(executed_results.into_iter().map(|result| result.message));
 
@@ -6663,7 +8437,7 @@ async fn execute_agent_provider_response(
                 },
                 other => other,
             };
-            if let Some(continuation) = build_failure_execution_window_continuation(
+            if let Some(mut continuation) = build_failure_execution_window_continuation(
                 workspace_id,
                 thread_id,
                 turn_id,
@@ -6675,6 +8449,11 @@ async fn execute_agent_provider_response(
                 tool_no_progress_guard.checkpoint_state(),
                 &requested_tool_names,
             ) {
+                attach_native_semantic_state(
+                    &mut continuation.checkpoint_payload,
+                    capture_semantic_state!()?,
+                    window_stats.progress_baseline,
+                )?;
                 emit_execution_window_exhausted_and_checkpointed(
                     workspace_id,
                     thread_id,
@@ -6826,98 +8605,41 @@ fn content_part_for_resolved_artifact(resolved: &ResolvedArtifactInput) -> Messa
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum ComputerUseSnapshotScope {
-    Session(u64),
-    UnknownSnapshot,
-}
-
-fn computer_use_snapshot_scope(message: &ChatMessage) -> Option<ComputerUseSnapshotScope> {
+// A frame can supersede another only with an authoritative successful outcome
+// and the same explicit session. Legacy/unknown results remain semantic input.
+fn computer_use_snapshot_scope(message: &ChatMessage) -> Option<u64> {
     if message.role != pioneer_provider::Role::Tool
         || message.name.as_deref() != Some("computer_use")
         || !message.has_attachments()
+        || message.tool_outcome.and_then(|outcome| outcome.is_error()) != Some(false)
     {
         return None;
     }
-
-    let payload = match serde_json::from_str::<JsonValue>(message.content.as_str()) {
-        Ok(payload) => payload,
-        Err(_) => return Some(ComputerUseSnapshotScope::UnknownSnapshot),
-    };
-
-    match payload.get("action").and_then(JsonValue::as_str) {
-        Some("snapshot") | None => {
-            let session_id = payload.get("session_id").and_then(JsonValue::as_u64);
-            Some(
-                session_id
-                    .map(ComputerUseSnapshotScope::Session)
-                    .unwrap_or(ComputerUseSnapshotScope::UnknownSnapshot),
-            )
-        }
-        _ => None,
+    let payload = serde_json::from_str::<JsonValue>(&message.content).ok()?;
+    if payload.get("action").and_then(JsonValue::as_str) != Some("snapshot") {
+        return None;
     }
+    payload.get("session_id").and_then(JsonValue::as_u64)
 }
 
 fn retain_agent_attachment_messages(messages: &mut [ChatMessage]) {
-    let attachment_budget_bytes = pioneer_provider::default_attachment_pipeline_config()
-        .max_total_bytes_per_request
-        .max(1);
-    retain_agent_attachment_messages_with_budget(messages, attachment_budget_bytes);
-}
-
-fn retain_agent_attachment_messages_with_budget(
-    messages: &mut [ChatMessage],
-    attachment_budget_bytes: usize,
-) {
-    let mut latest_snapshot_index: HashMap<ComputerUseSnapshotScope, usize> = HashMap::new();
-
+    let mut latest_snapshot_index = HashMap::new();
     for (index, message) in messages.iter().enumerate().rev() {
-        if let Some(scope) = computer_use_snapshot_scope(message) {
-            latest_snapshot_index.entry(scope).or_insert(index);
+        if let Some(session) = computer_use_snapshot_scope(message) {
+            latest_snapshot_index.entry(session).or_insert(index);
         }
     }
-
     for (index, message) in messages.iter_mut().enumerate() {
-        if !message.has_attachments() {
-            continue;
-        }
-
-        if let Some(scope) = computer_use_snapshot_scope(message)
-            && latest_snapshot_index.get(&scope).copied() != Some(index)
+        if let Some(session) = computer_use_snapshot_scope(message)
+            && latest_snapshot_index.get(&session).copied() != Some(index)
         {
+            // This mutates the request projection, not full tool_result_v2 history.
             message.content_parts.clear();
+            message.content.push_str("\n[Earlier screenshot omitted: a later successful snapshot of this session follows.]");
         }
     }
-
-    let mut total_attachment_bytes = estimated_total_attachment_bytes(messages);
-    if total_attachment_bytes <= attachment_budget_bytes {
-        return;
-    }
-
-    let snapshot_indices = messages
-        .iter()
-        .enumerate()
-        .filter_map(|(index, message)| {
-            (message.has_attachments() && computer_use_snapshot_scope(message).is_some())
-                .then_some(index)
-        })
-        .collect::<Vec<_>>();
-
-    for index in snapshot_indices {
-        if total_attachment_bytes <= attachment_budget_bytes {
-            break;
-        }
-        if messages[index].content_parts.is_empty() {
-            continue;
-        }
-        let removed_bytes = estimated_message_attachment_bytes(&messages[index]);
-        messages[index].content_parts.clear();
-        if removed_bytes > 0 {
-            total_attachment_bytes = total_attachment_bytes.saturating_sub(removed_bytes);
-        } else {
-            total_attachment_bytes = estimated_total_attachment_bytes(messages);
-        }
-    }
+    // Never drop current state to meet guessed bytes. The existing provider's
+    // actual prepared-request admission must explicitly reject excess input.
 }
 
 fn retain_chat_mode_attachment_messages(messages: &mut [ChatMessage]) {
@@ -6941,43 +8663,8 @@ fn retain_chat_mode_attachment_messages(messages: &mut [ChatMessage]) {
     }
 }
 
-fn estimated_total_attachment_bytes(messages: &[ChatMessage]) -> usize {
-    messages
-        .iter()
-        .map(estimated_message_attachment_bytes)
-        .sum::<usize>()
-}
-
-fn estimated_message_attachment_bytes(message: &ChatMessage) -> usize {
-    message
-        .content_parts
-        .iter()
-        .map(estimated_attachment_part_bytes)
-        .sum::<usize>()
-}
-
-fn estimated_attachment_part_bytes(part: &MessageContentPart) -> usize {
-    let attachment = match part {
-        MessageContentPart::Text { .. } => return 0,
-        MessageContentPart::File { file } => file,
-        MessageContentPart::Image { image } => image,
-        MessageContentPart::Audio { audio } => audio,
-        MessageContentPart::Video { video } => video,
-    };
-
-    if let Some(size_bytes) = attachment.size_bytes {
-        return usize::try_from(size_bytes).unwrap_or(usize::MAX);
-    }
-
-    match &attachment.source {
-        AttachmentDataSource::Path { path } => std::fs::metadata(path.as_str())
-            .ok()
-            .and_then(|meta| usize::try_from(meta.len()).ok())
-            .unwrap_or(0),
-        AttachmentDataSource::Bytes { base64_data } => base64_data.len().saturating_mul(3) / 4,
-        AttachmentDataSource::Url { .. } | AttachmentDataSource::Reference { .. } => 0,
-    }
-}
+#[cfg(test)]
+mod final_acceptance_tests;
 
 #[cfg(test)]
 mod tests {
@@ -6992,11 +8679,15 @@ mod tests {
         deterministic_tool_item_id, materialize_mcp_tooling, native_filesystem_scope,
         native_provider_tool_definition, normalize_turn_capabilities, readable_agent_skill_overlay,
         resolve_skill_capability_summary, retain_agent_attachment_messages,
-        retain_agent_attachment_messages_with_budget, retain_chat_mode_attachment_messages,
-        review_required_observation_payload, review_required_observation_signature,
-        runtime_sections_with_artifact_reference_policy,
+        retain_chat_mode_attachment_messages, review_required_observation_payload,
+        review_required_observation_signature, runtime_sections_with_artifact_reference_policy,
         runtime_sections_with_execution_continuation_context,
         sync_review_action_tools_to_observations, workdir_from_execution_security_snapshot,
+    };
+    use super::{
+        MAX_RETAINED_PROVIDER_BYTES, MAX_RETAINED_PROVIDER_MESSAGES, RetainedProviderByteCounter,
+        retain_provider_history_message, retained_provider_message_bytes,
+        synchronize_retained_provider_history,
     };
     use crate::{
         AgentMcpAvailability, AgentMcpMaterialization, AgentMcpMaterializationError,
@@ -7361,6 +9052,51 @@ mod tests {
     #[derive(Default)]
     struct NoopToolHandler;
 
+    #[test]
+    fn native_batch_segments_bound_reads_and_separate_unknown_mutations_and_exact_duplicates() {
+        let calls = [
+            ("read", r#"{"path":"a"}"#),
+            ("read", r#"{"path":"b"}"#),
+            ("mutation", "{}"),
+            ("read", r#"{"path":"c"}"#),
+        ];
+        let reads = |name: &str| name == "read";
+        assert_eq!(
+            super::native_tool_batch_segment_len(calls.iter().copied(), reads),
+            2
+        );
+        assert_eq!(
+            super::native_tool_batch_segment_len(calls[2..].iter().copied(), reads),
+            1
+        );
+        assert_eq!(
+            super::native_tool_batch_segment_len(calls[3..].iter().copied(), reads),
+            1
+        );
+        assert_eq!(
+            super::native_tool_batch_segment_len(calls.iter().copied(), |_| false),
+            1
+        );
+        let duplicate = [
+            ("read", r#"{"path":"a","start_line":1}"#),
+            ("read", r#"{"start_line":1,"path":"a"}"#),
+        ];
+        assert_eq!(
+            super::native_tool_batch_segment_len(duplicate.into_iter(), reads),
+            1
+        );
+        let distinct = (0..9)
+            .map(|index| ("read", format!(r#"{{"path":"{index}"}}"#)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            super::native_tool_batch_segment_len(
+                distinct.iter().map(|(name, args)| (*name, args.as_str())),
+                reads
+            ),
+            4
+        );
+    }
+
     #[async_trait::async_trait]
     impl ToolHandler for NoopToolHandler {
         async fn handle(
@@ -7547,7 +9283,46 @@ mod tests {
         assert!(!lowered.contains("if-match"));
     }
 
-    fn execution_checkpoint_context_fixture() -> ExecutionCheckpointContext {
+    #[tokio::test]
+    async fn tool_forwarder_stays_owned_on_early_exit_and_cancelled_drain() {
+        struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        for cancel_drain in [false, true] {
+            let (started, start) = tokio::sync::oneshot::channel();
+            let (dropped, drop_observed) = tokio::sync::oneshot::channel();
+            let owned = super::AbortOnDropJoinHandle::new(tokio::spawn(async move {
+                let _witness = Dropped(Some(dropped));
+                let _ = started.send(());
+                std::future::pending::<Result<(), super::AgentEventHubError>>().await
+            }));
+            start.await.unwrap();
+            if cancel_drain {
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::ZERO,
+                        super::finish_tool_event_forwarder(owned)
+                    )
+                    .await
+                    .is_err()
+                );
+            } else {
+                // A restore failure returns before reaching the drain helper.
+                drop(owned);
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(1), drop_observed)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    pub(super) fn execution_checkpoint_context_fixture() -> ExecutionCheckpointContext {
         ExecutionCheckpointContext {
             window_id: "turn_1:window:1".to_owned(),
             window_index: 1,
@@ -7567,6 +9342,7 @@ mod tests {
                     attachment_kinds: Vec::new(),
                 },
                 window: ExecutionCheckpointWindowSummary {
+                    progress: None,
                     window_id: Some("turn_1:window:1".to_owned()),
                     window_index: 1,
                     started_at_unix_ms: Some(1_000),
@@ -7605,6 +9381,8 @@ mod tests {
                 },
                 tool_no_progress: Default::default(),
                 requested_tool_names: Vec::new(),
+                native_semantic_state: None,
+                native_event_frontier: None,
                 strict_obligations: Vec::new(),
             },
         }
@@ -7741,6 +9519,7 @@ mod tests {
             task_id: "task_review_payload".to_owned(),
             run_id: "run_review_payload".to_owned(),
             candidate_id: "candidate_review_payload".to_owned(),
+            candidate_revision: "a".repeat(64),
             title: "Review payload".to_owned(),
             status: "waiting_review".to_owned(),
             candidate_status: "pending_review".to_owned(),
@@ -7803,10 +9582,17 @@ mod tests {
         );
 
         let signature = review_required_observation_signature(&observation);
-        assert!(signature.contains("task_review_payload"));
-        assert!(signature.contains("candidate_review_payload"));
-        assert!(signature.contains("task_accept,task_cancel"));
-        assert!(signature.contains("max_revision_rounds_reached"));
+        assert_eq!(signature.len(), 64);
+        assert_eq!(
+            signature,
+            review_required_observation_signature(&observation)
+        );
+        let mut revised = observation.clone();
+        revised.candidate_id = "different_candidate".into();
+        assert_ne!(signature, review_required_observation_signature(&revised));
+        revised = observation.clone();
+        revised.allowed_actions.push("task_revise".into());
+        assert_ne!(signature, review_required_observation_signature(&revised));
     }
 
     fn test_skill_id(seed: &str) -> pioneer_protocol::SkillId {
@@ -8135,6 +9921,7 @@ mod tests {
 
     fn task_result(tool_name: &str, success: bool, text: &str) -> ExecutedToolResult {
         ExecutedToolResult {
+            progress: Default::default(),
             item_id: "item_1234567890123456".to_owned(),
             provider_call_id: "provider_call_1".to_owned(),
             ordinal: 0,
@@ -8536,6 +10323,7 @@ mod tests {
             task_id: "task_review_visibility".to_owned(),
             run_id: "run_review_visibility".to_owned(),
             candidate_id: "candidate_review_visibility".to_owned(),
+            candidate_revision: "a".repeat(64),
             title: "Review visibility".to_owned(),
             status: "waiting_review".to_owned(),
             candidate_status: "pending_review".to_owned(),
@@ -9323,19 +11111,600 @@ mod tests {
         assert!(!phase03_names.contains(&"task_cancel".to_owned()));
     }
 
+    fn task_guard_checkpoint_context(
+        guard: &TaskMutationFinalizationGuard,
+    ) -> ExecutionCheckpointContext {
+        let budget = pioneer_tools::ToolRetryBudgetConfig::default();
+        let mut context = execution_checkpoint_context_fixture();
+        context.payload.native_semantic_state = Some(
+            super::semantic_state::capture(
+                1,
+                &None,
+                "turn_1",
+                &budget,
+                &super::native_control::NativeControlState::default(),
+                &[],
+                pioneer_tools::ToolNoProgressMode::Enforce,
+                &pioneer_tools::ToolProgressFrontier::default(),
+                &super::ToolRetryController::new(budget.clone()),
+                &super::ToolRetryLifecycleTracker::default(),
+                &None,
+                &None,
+                &Default::default(),
+                &Default::default(),
+                guard,
+                "",
+                &[],
+                &[],
+            )
+            .unwrap(),
+        );
+        context.payload.window.progress = Some(pioneer_protocol::ExecutionProgressSummary {
+            schema_version: 1,
+            baseline: [0; 3],
+            frontier: [0; 3],
+        });
+        // Exercise the persisted checkpoint codec, not just guard serialization.
+        context.payload =
+            serde_json::from_slice(&serde_json::to_vec(&context.payload).unwrap()).unwrap();
+        context
+    }
+
+    fn restore_task_guard(
+        context: &ExecutionCheckpointContext,
+    ) -> Result<TaskMutationFinalizationGuard, super::ChatTurnError> {
+        super::semantic_state::NativeSemanticState::restore(
+            Some(context),
+            "workspace_1",
+            "thread_1",
+            "turn_1",
+            context.window_index + 1,
+            &pioneer_tools::ToolRetryBudgetConfig::default(),
+            false,
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        )
+        .map(|state| state.task_mutation_guard)
+    }
+
     #[test]
     fn task_mutation_finalization_guard_reports_failed_mutation_until_success() {
         let mut guard = TaskMutationFinalizationGuard::default();
-        guard.observe(&task_result("task_create", false, "trigger must be object"));
-
-        let message = guard
-            .deterministic_failure_message()
-            .expect("failed task mutation should block success finalization");
+        let mut failed = task_result("task_create", false, "task service temporarily unavailable");
+        failed.arguments =
+            r#"{"title":"report","goal":"write report","idempotencyKey":" creation-1 "}"#
+                .to_owned();
+        guard.observe(&failed).unwrap();
+        let message = guard.deterministic_failure_message().unwrap();
         assert!(message.contains("task_create"));
-        assert!(message.contains("trigger must be object"));
+        assert!(message.contains("task service temporarily unavailable"));
+        let mut restored = restore_task_guard(&task_guard_checkpoint_context(&guard)).unwrap();
+        let mut success = task_result("task_create", true, r#"{"taskId":"abc"}"#);
+        success.arguments =
+            r#"{"title":"report","goal":"write report","idempotency_key":"creation-1"}"#.to_owned();
+        success.item_id = "another-delivery".to_owned();
+        restored.observe(&success).unwrap();
+        assert!(
+            restored.deterministic_failure_message().is_some(),
+            "arbitrary text without a real creation receipt is not acceptance"
+        );
+        success.model_visible_text =
+            r#"{"taskId":"AAAAAAAAAAAAAAAAAAAAA","revision":1}"#.to_owned();
+        restored.observe(&success).unwrap();
+        assert!(restored.deterministic_failure_message().is_none());
+    }
 
-        guard.observe(&task_result("task_create", true, "{\"taskId\":\"abc\"}"));
-        assert!(guard.deterministic_failure_message().is_none());
+    #[test]
+    fn independent_same_arguments_creations_do_not_clear_cold_failure() {
+        let mut failed = task_result("task_create", false, "temporary failure");
+        failed.arguments = r#"{"title":"report","goal":"write report"}"#.to_owned();
+        failed.item_id = "creation-call-A".to_owned();
+        let mut guard = TaskMutationFinalizationGuard::default();
+        guard.observe(&failed).unwrap();
+        let context = task_guard_checkpoint_context(&guard);
+        let mut restored = restore_task_guard(&context).unwrap();
+        let mut success = task_result(
+            "task_create",
+            true,
+            r#"{"taskId":"BBBBBBBBBBBBBBBBBBBBB","revision":1}"#,
+        );
+        success.arguments = failed.arguments.clone();
+        success.item_id = "creation-call-B".to_owned();
+        success.provider_call_id = "provider-call-B".to_owned();
+        restored.observe(&success).unwrap();
+        assert!(restored.deterministic_failure_message().is_some());
+        assert_eq!(restored.failures_since_last_success.len(), 1);
+        // A proven receipt on the original item can resolve that creation.
+        success.item_id = failed.item_id.clone();
+        success.model_visible_text =
+            r#"{"taskId":"AAAAAAAAAAAAAAAAAAAAA","revision":1}"#.to_owned();
+        restored.observe(&success).unwrap();
+        assert!(restored.deterministic_failure_message().is_none());
+
+        failed.arguments =
+            r#"{"title":"report","goal":"write report","idempotencyKey":"key-A"}"#.to_owned();
+        guard = TaskMutationFinalizationGuard::default();
+        guard.observe(&failed).unwrap();
+        let mut restored = restore_task_guard(&task_guard_checkpoint_context(&guard)).unwrap();
+        for args in [
+            r#"{"title":"report","goal":"write report","idempotencyKey":"key-B"}"#,
+            r#"{"title":"another report","goal":"write report","idempotencyKey":"key-A"}"#,
+        ] {
+            success.arguments = args.to_owned();
+            restored.observe(&success).unwrap();
+            assert!(restored.deterministic_failure_message().is_some());
+        }
+    }
+
+    #[test]
+    fn task_mutation_success_requires_same_task_postcondition_and_newer_revision() {
+        let mut failed = task_result("task_update", false, "revision conflict");
+        failed.arguments = r#"{"taskId":"AAAAAAAAAAAAAAAAAAAAA","title":"accepted title","expectedRevision":7,"idempotencyKey":"k1"}"#.to_owned();
+        let mut guard = TaskMutationFinalizationGuard::default();
+        guard.observe(&failed).unwrap();
+        let mut restored = restore_task_guard(&task_guard_checkpoint_context(&guard)).unwrap();
+        let mut success = task_result(
+            "task_update",
+            true,
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA"},"revision":10}"#,
+        );
+        success.item_id = "new-delivery".to_owned();
+        for args in [
+            r#"{"taskId":"BBBBBBBBBBBBBBBBBBBBB","title":"accepted title","expectedRevision":9,"idempotencyKey":"k2"}"#,
+            r#"{"taskId":"AAAAAAAAAAAAAAAAAAAAA","title":"another title","expectedRevision":9,"idempotencyKey":"k2"}"#,
+        ] {
+            success.arguments = args.to_owned();
+            restored.observe(&success).unwrap();
+            assert!(restored.deterministic_failure_message().is_some());
+        }
+        success.arguments = r#"{"taskId":"AAAAAAAAAAAAAAAAAAAAA","title":"accepted title","expectedRevision":9,"idempotency_key":"k2"}"#.to_owned();
+        success.tool_name = "task_reschedule".to_owned();
+        restored.observe(&success).unwrap();
+        assert!(restored.deterministic_failure_message().is_some());
+        success.tool_name = "task_update".to_owned();
+        for output in [
+            r#"{"task":{"id":"BBBBBBBBBBBBBBBBBBBBB"},"revision":10}"#,
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA"}}"#,
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA"},"revision":7}"#,
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA"},"revision":8}"#,
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA"},"revision":9}"#,
+        ] {
+            success.model_visible_text = output.to_owned();
+            restored.observe(&success).unwrap();
+            assert!(restored.deterministic_failure_message().is_some());
+        }
+        success.model_visible_text =
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA"},"revision":10}"#.to_owned();
+        success.outcome = ToolOutcome::fatal(ToolErrorClass::Unknown, None);
+        restored.observe(&success).unwrap();
+        assert!(restored.deterministic_failure_message().is_some());
+        success.outcome = ToolOutcome::ok();
+        restored.observe(&success).unwrap();
+        assert!(restored.deterministic_failure_message().is_none());
+    }
+
+    #[test]
+    fn reschedule_postcondition_survives_cold_restore_and_new_delivery_key() {
+        // Reschedule has no expectedRevision input; require an actual positive receipt revision.
+        let mut failed = task_result("task_reschedule", false, "temporary failure");
+        failed.arguments = r#"{"taskId":"AAAAAAAAAAAAAAAAAAAAA","trigger":{"kind":"interval","intervalSeconds":60},"idempotencyKey":"k1"}"#.to_owned();
+        let mut guard = TaskMutationFinalizationGuard::default();
+        guard.observe(&failed).unwrap();
+        let mut restored = restore_task_guard(&task_guard_checkpoint_context(&guard)).unwrap();
+        let mut success = task_result(
+            "task_reschedule",
+            true,
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA","revision":10}}"#,
+        );
+        success.item_id = "reschedule-new-delivery".to_owned();
+        for args in [
+            r#"{"taskId":"BBBBBBBBBBBBBBBBBBBBB","trigger":{"kind":"interval","intervalSeconds":60},"idempotencyKey":"k2"}"#,
+            r#"{"taskId":"AAAAAAAAAAAAAAAAAAAAA","trigger":{"kind":"interval","intervalSeconds":90},"idempotencyKey":"k2"}"#,
+        ] {
+            success.arguments = args.to_owned();
+            restored.observe(&success).unwrap();
+            assert!(restored.deterministic_failure_message().is_some());
+        }
+        success.arguments = r#"{"taskId":"AAAAAAAAAAAAAAAAAAAAA","trigger":{"kind":"interval","intervalSeconds":60},"idempotency_key":"k2"}"#.to_owned();
+        for output in [
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA"}}"#,
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA","revision":0}}"#,
+        ] {
+            success.model_visible_text = output.to_owned();
+            restored.observe(&success).unwrap();
+            assert!(restored.deterministic_failure_message().is_some());
+        }
+        success.model_visible_text =
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA","revision":10}}"#.to_owned();
+        restored.observe(&success).unwrap();
+        assert!(restored.deterministic_failure_message().is_none());
+    }
+
+    #[test]
+    fn incompatible_task_guard_identity_codec_never_restores_an_empty_guard() {
+        let mut guard = TaskMutationFinalizationGuard::default();
+        let mut failed = task_result("task_create", false, "unresolved creation");
+        failed.arguments = r#"{"title":"report","goal":"write report"}"#.to_owned();
+        guard.observe(&failed).unwrap();
+        let context = task_guard_checkpoint_context(&guard);
+        assert!(
+            restore_task_guard(&context)
+                .unwrap()
+                .deterministic_failure_message()
+                .is_some()
+        );
+        for version in [8, 99] {
+            let mut incompatible = context.clone();
+            incompatible.payload.native_semantic_state.as_mut().unwrap()["schema_version"] =
+                version.into();
+            assert!(!super::semantic_state::checkpoint_compatible(
+                &incompatible.payload,
+                &pioneer_tools::ToolRetryBudgetConfig::default(),
+                pioneer_tools::ToolNoProgressMode::Enforce,
+            ));
+            assert!(restore_task_guard(&incompatible).is_err());
+        }
+    }
+
+    #[test]
+    fn restored_retry_exhaustion_keeps_native_next_round_without_tools() {
+        let budget = pioneer_tools::ToolRetryBudgetConfig {
+            max_recoverable_retry_rounds_per_episode: 1,
+            max_same_tool_error_retries_per_episode: 1,
+            max_retries_per_tool_name_per_episode: 1,
+        };
+        let mut controller = pioneer_tools::ToolRetryController::new(budget.clone());
+        let failure = pioneer_tools::ToolRetryObservation::from_tool_outcome(
+            "item",
+            "command_execution",
+            1,
+            "exec_command",
+            "{}",
+            false,
+            pioneer_tools::ToolOutcome::recoverable(
+                pioneer_tools::ToolErrorClass::NotFound,
+                "correct the call",
+                false,
+                None,
+            ),
+        );
+        assert!(matches!(
+            controller.decide(&[failure.clone()]),
+            pioneer_tools::ToolRetryDecision::Retry { .. }
+        ));
+        assert!(matches!(
+            controller.decide(&[failure]),
+            pioneer_tools::ToolRetryDecision::Exhausted { .. }
+        ));
+        let restored = pioneer_tools::ToolRetryController::from_checkpoint(
+            budget,
+            controller.checkpoint().unwrap(),
+        )
+        .unwrap();
+        let mut guard = pioneer_tools::ToolLoopGuard::new_execution_window(
+            Default::default(),
+            "ordinary finalization",
+        );
+        if restored.is_exhausted() {
+            guard
+                .request_final_answer_with_instruction(
+                    pioneer_protocol::NativeHostDirective::ExhaustedTools.instruction(),
+                )
+                .unwrap();
+        }
+        let round = guard.begin_provider_round().unwrap();
+        assert!(
+            !round.tools_enabled,
+            "window/restart must not renew an exhausted tool allowance"
+        );
+        assert_eq!(
+            round.final_instruction.as_deref(),
+            Some(pioneer_protocol::NativeHostDirective::ExhaustedTools.instruction())
+        );
+    }
+
+    #[test]
+    fn semantic_checkpoint_restores_guidance_guards_and_rejects_legacy_foreign_or_oversized_state()
+    {
+        let budget = pioneer_tools::ToolRetryBudgetConfig::default();
+        let controller = super::ToolRetryController::new(budget.clone());
+        let lifecycle = super::ToolRetryLifecycleTracker::default();
+        let mut guard = TaskMutationFinalizationGuard::default();
+        guard
+            .observe(&task_result("task_create", false, "invalid trigger"))
+            .unwrap();
+        let pending = Some("Retry only the unresolved mutation".to_owned());
+        let applied = Some("Original accepted guidance".to_owned());
+        let reviews = std::collections::BTreeSet::from([hex::encode(
+            <sha2::Sha256 as sha2::Digest>::digest(b"original review record"),
+        )]);
+        let terminal = std::collections::BTreeSet::from(["terminal-original".to_owned()]);
+        let roots = vec![pioneer_compaction::SourceRef {
+            scope: "checkpoint:native-owner".into(),
+            id: "acknowledged-root".into(),
+            version: "exact-version".into(),
+        }];
+        let mut progress_guard = super::ToolNoProgressGuard::default();
+        progress_guard.observe(&[pioneer_tools::ToolRetryObservation::from_tool_outcome(
+            "snapshot",
+            "dynamic_tool_call",
+            1,
+            "read_file",
+            "{}",
+            true,
+            pioneer_tools::ToolOutcome::ok(),
+        )
+        .with_progress(pioneer_tools::ToolProgressEvidence::resource_state(
+            [1; 32], [2; 32],
+        ))]);
+        let mut context = execution_checkpoint_context_fixture();
+        context.window_index = context.payload.window.window_index;
+        context.payload.native_semantic_state = Some(
+            super::semantic_state::capture(
+                1,
+                &None,
+                "turn_1",
+                &budget,
+                &super::native_control::NativeControlState::default(),
+                &roots,
+                pioneer_tools::ToolNoProgressMode::Enforce,
+                progress_guard.progress_frontier(),
+                &controller,
+                &lifecycle,
+                &pending,
+                &applied,
+                &reviews,
+                &terminal,
+                &guard,
+                "Original post-turn summary",
+                &[],
+                &[],
+            )
+            .unwrap(),
+        );
+        context.payload.window.progress = Some(pioneer_protocol::ExecutionProgressSummary {
+            schema_version: 1,
+            baseline: [0; 3],
+            frontier: progress_guard.progress_frontier().observation_counts(),
+        });
+        let mut missing_window_progress = context.clone();
+        missing_window_progress.payload.window.progress = None;
+        assert!(!super::semantic_state::checkpoint_compatible(
+            &missing_window_progress.payload,
+            &budget,
+            pioneer_tools::ToolNoProgressMode::Enforce
+        ));
+        let mut inconsistent_window_progress = context.clone();
+        inconsistent_window_progress
+            .payload
+            .window
+            .progress
+            .as_mut()
+            .unwrap()
+            .frontier[0] += 1;
+        assert!(!super::semantic_state::checkpoint_compatible(
+            &inconsistent_window_progress.payload,
+            &budget,
+            pioneer_tools::ToolNoProgressMode::Enforce
+        ));
+        let state = super::semantic_state::NativeSemanticState::restore(
+            Some(&context),
+            "workspace_1",
+            "thread_1",
+            "turn_1",
+            context.window_index + 1,
+            &budget,
+            false,
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        )
+        .unwrap();
+        assert_eq!(state.provider_history_roots, roots);
+        assert_eq!(
+            state.no_progress_mode,
+            pioneer_tools::ToolNoProgressMode::Enforce
+        );
+        assert!(!crate::native_semantic_checkpoint_compatible(
+            &context.payload,
+            &budget,
+            pioneer_tools::ToolNoProgressMode::Observe
+        ));
+        assert!(
+            super::semantic_state::NativeSemanticState::restore(
+                Some(&context),
+                "workspace_1",
+                "thread_1",
+                "turn_1",
+                context.window_index + 1,
+                &budget,
+                false,
+                pioneer_tools::ToolNoProgressMode::Observe
+            )
+            .is_err()
+        );
+        assert_eq!(state.progress_frontier.advanced_observations, 1);
+        let mut cold_progress = super::ToolNoProgressGuard::default();
+        cold_progress
+            .restore_progress_frontier(state.progress_frontier.clone())
+            .unwrap();
+        cold_progress.observe(&[pioneer_tools::ToolRetryObservation::from_tool_outcome(
+            "same-snapshot",
+            "dynamic_tool_call",
+            1,
+            "read_file",
+            "{}",
+            true,
+            pioneer_tools::ToolOutcome::ok(),
+        )
+        .with_progress(pioneer_tools::ToolProgressEvidence::resource_state(
+            [1; 32], [2; 32],
+        ))]);
+        assert_eq!(cold_progress.progress_frontier().advanced_observations, 1);
+        assert_eq!(cold_progress.progress_frontier().unchanged_observations, 1);
+        let mut legacy_progress = context.clone();
+        legacy_progress
+            .payload
+            .native_semantic_state
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("progress_frontier");
+        assert!(!crate::native_semantic_checkpoint_compatible(
+            &legacy_progress.payload,
+            &budget,
+            pioneer_tools::ToolNoProgressMode::Enforce
+        ));
+        let mut future_progress = context.clone();
+        future_progress
+            .payload
+            .native_semantic_state
+            .as_mut()
+            .unwrap()["progress_frontier"]["schema_version"] = serde_json::json!(99);
+        assert!(!crate::native_semantic_checkpoint_compatible(
+            &future_progress.payload,
+            &budget,
+            pioneer_tools::ToolNoProgressMode::Enforce
+        ));
+        let mut inconsistent_progress = context.clone();
+        inconsistent_progress
+            .payload
+            .native_semantic_state
+            .as_mut()
+            .unwrap()["progress_frontier"]["advanced_observations"] = serde_json::json!(0);
+        assert!(!crate::native_semantic_checkpoint_compatible(
+            &inconsistent_progress.payload,
+            &budget,
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        ));
+        let mut legacy_mode = context.clone();
+        legacy_mode
+            .payload
+            .native_semantic_state
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("no_progress_mode");
+        assert!(!crate::native_semantic_checkpoint_compatible(
+            &legacy_mode.payload,
+            &budget,
+            pioneer_tools::ToolNoProgressMode::Enforce
+        ));
+
+        let mut legacy_roots = context.clone();
+        legacy_roots
+            .payload
+            .native_semantic_state
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_history_roots");
+        assert!(!crate::native_semantic_checkpoint_compatible(
+            &legacy_roots.payload,
+            &budget,
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        ));
+        let mut bad_roots = context.clone();
+        bad_roots.payload.native_semantic_state.as_mut().unwrap()["provider_history_roots"][0]["version"] =
+            serde_json::json!("v".repeat(257));
+        assert!(!crate::native_semantic_checkpoint_compatible(
+            &bad_roots.payload,
+            &budget,
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        ));
+        assert_eq!(state.checkpoint_revision, 1);
+        assert_eq!(state.pending_retry_instruction, pending);
+        assert_eq!(state.applied_retry_instruction, applied);
+        assert_eq!(state.observed_review_required_signatures, reviews);
+        assert_eq!(state.observed_terminal_task_ids, terminal);
+        assert!(
+            state
+                .task_mutation_guard
+                .deterministic_failure_message()
+                .is_some()
+        );
+        assert_eq!(state.post_turn_assistant_text, "Original post-turn summary");
+        context.payload.workspace_id = "foreign".to_owned();
+        assert!(
+            super::semantic_state::NativeSemanticState::restore(
+                Some(&context),
+                "workspace_1",
+                "thread_1",
+                "turn_1",
+                2,
+                &budget,
+                false,
+                pioneer_tools::ToolNoProgressMode::Enforce,
+            )
+            .is_err()
+        );
+        context.payload.workspace_id = "workspace_1".to_owned();
+        context.payload.native_semantic_state.as_mut().unwrap()["schema_version"] =
+            serde_json::json!(crate::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION + 1);
+        assert!(
+            super::semantic_state::NativeSemanticState::restore(
+                Some(&context),
+                "workspace_1",
+                "thread_1",
+                "turn_1",
+                2,
+                &budget,
+                false,
+                pioneer_tools::ToolNoProgressMode::Enforce,
+            )
+            .is_err()
+        );
+        context.payload.native_semantic_state = None;
+        assert!(
+            super::semantic_state::NativeSemanticState::restore(
+                Some(&context),
+                "workspace_1",
+                "thread_1",
+                "turn_1",
+                2,
+                &budget,
+                false,
+                pioneer_tools::ToolNoProgressMode::Enforce,
+            )
+            .is_err()
+        );
+        assert!(
+            super::semantic_state::NativeSemanticState::restore(
+                None,
+                "workspace_1",
+                "thread_1",
+                "turn_1",
+                1,
+                &budget,
+                false,
+                pioneer_tools::ToolNoProgressMode::Enforce,
+            )
+            .is_err()
+        );
+        let oversized = Some("界".repeat(32 * 1024));
+        assert!(
+            super::semantic_state::capture(
+                1,
+                &None,
+                "turn_1",
+                &budget,
+                &super::native_control::NativeControlState::default(),
+                &[],
+                pioneer_tools::ToolNoProgressMode::Enforce,
+                &pioneer_tools::ToolProgressFrontier::default(),
+                &controller,
+                &lifecycle,
+                &oversized,
+                &None,
+                &reviews,
+                &terminal,
+                &guard,
+                "",
+                &[],
+                &[]
+            )
+            .is_err()
+        );
     }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -9395,6 +11764,9 @@ mod tests {
             name: Some("computer_use".to_owned()),
             tool_calls: None,
             provider_replay_state: None,
+            tool_outcome: Some(pioneer_provider::ToolResultOutcome::new(
+                pioneer_provider::ToolResultStatus::Ok,
+            )),
         }
     }
 
@@ -9626,6 +11998,199 @@ mod tests {
     }
 
     #[test]
+    fn retained_history_replaces_compacted_prefix_and_preserves_signed_atomic_tool_group() {
+        use crate::compaction::history::{PendingOriginKind, pending_origin};
+        let mut assistant = ChatMessage::assistant_tool_calls_with_provider_state(
+            Some("working"),
+            Some("opaque reasoning"),
+            vec![ProviderToolCall {
+                id: "native-call".into(),
+                name: "read_file".into(),
+                arguments: "{\"path\":\"/original\"}".into(),
+            }],
+            Some(pioneer_provider::ProviderReplayState::new(
+                "test",
+                serde_json::json!({"signature":"SIGNED_SENTINEL"}),
+            )),
+        );
+        assistant.provenance = Some(pending_origin(
+            "workspace",
+            "thread",
+            "turn",
+            "round",
+            PendingOriginKind::Assistant,
+            "round",
+        ));
+        let mut result = ChatMessage::tool_result("native-call", "read_file", "result");
+        result.provenance = Some(pending_origin(
+            "workspace",
+            "thread",
+            "turn",
+            "round",
+            PendingOriginKind::ToolResult,
+            "item",
+        ));
+        result.tool_outcome = Some(pioneer_provider::ToolResultOutcome::new(
+            pioneer_provider::ToolResultStatus::Ok,
+        ));
+        // Pending metadata must remain pending, rather than becoming a reason
+        // to discard native state or to declare a domain success.
+        assistant.provenance.as_mut().unwrap().complete = false;
+        result.provenance.as_mut().unwrap().complete = false;
+        let mut retained = vec![];
+        let mut sequence = 0;
+        for generation in 0..256 {
+            let mut root = ChatMessage::user(format!("acknowledged summary {generation}"));
+            let mut origin = pending_origin(
+                "workspace",
+                "thread",
+                "turn",
+                "summary",
+                PendingOriginKind::Assistant,
+                "summary",
+            );
+            origin.unit_id = format!("checkpoint:owner:root-{generation}");
+            origin.sources[0].scope = "checkpoint:owner".into();
+            origin.sources[0].id = format!("root-{generation}");
+            origin.sources[0].version = "exact-version".into();
+            root.provenance = Some(origin);
+            let accepted = vec![
+                ChatMessage::system("instructions"),
+                ChatMessage::user("original input"),
+                root.clone(),
+                assistant.clone(),
+                result.clone(),
+            ];
+            let bytes = synchronize_retained_provider_history(
+                &mut retained,
+                &mut sequence,
+                "workspace",
+                "thread",
+                "turn",
+                &accepted,
+            )
+            .unwrap();
+            assert!(bytes < 4096);
+            assert_eq!(retained.len(), 3);
+            assert_eq!(sequence, 3);
+            assert_eq!(retained[0].message, root);
+            assert_eq!(retained[1].message, assistant);
+            assert_eq!(retained[2].message, result);
+            let mut replay = vec![];
+            append_recovered_provider_history(&mut replay, retained.clone());
+            assert_eq!(
+                replay,
+                accepted[2..],
+                "next window uses the accepted root and exact native suffix"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_history_rejects_split_units_missing_proof_and_capacity_without_replacement() {
+        use crate::compaction::history::{PendingOriginKind, pending_origin};
+        let mut assistant = ChatMessage::assistant("unchanged");
+        assistant.provenance = Some(pending_origin(
+            "workspace",
+            "thread",
+            "turn",
+            "round",
+            PendingOriginKind::Assistant,
+            "round",
+        ));
+        let mut retained = vec![RetainedProviderHistoryMessage {
+            sequence: 7,
+            message: assistant.clone(),
+        }];
+        let original = retained.clone();
+        let mut sequence = 8;
+        let mut unrelated = ChatMessage::user("belongs to same indivisible unit");
+        unrelated.provenance = assistant.provenance.clone();
+        assert!(
+            synchronize_retained_provider_history(
+                &mut retained,
+                &mut sequence,
+                "workspace",
+                "thread",
+                "turn",
+                &[assistant.clone(), unrelated]
+            )
+            .is_err()
+        );
+        assert_eq!(retained, original);
+        assert_eq!(sequence, 8);
+        assert!(
+            synchronize_retained_provider_history(
+                &mut retained,
+                &mut sequence,
+                "workspace",
+                "thread",
+                "turn",
+                &[ChatMessage::assistant("unproven")]
+            )
+            .is_err()
+        );
+        assert_eq!(retained, original);
+        let mut bytes = Some(MAX_RETAINED_PROVIDER_BYTES);
+        assert!(
+            retain_provider_history_message(&mut retained, &mut sequence, &mut bytes, &assistant)
+                .is_err()
+        );
+        assert_eq!(retained, original);
+        assert_eq!(sequence, 8);
+        let mut bytes = None;
+        sequence = i64::MAX;
+        assert!(
+            retain_provider_history_message(&mut retained, &mut sequence, &mut bytes, &assistant)
+                .is_err()
+        );
+        assert_eq!(retained, original);
+        let mut crowded = vec![assistant; MAX_RETAINED_PROVIDER_MESSAGES + 1];
+        for (index, message) in crowded.iter_mut().enumerate() {
+            message.provenance.as_mut().unwrap().unit_id = format!("turn:round-{index}");
+        }
+        assert!(
+            synchronize_retained_provider_history(
+                &mut retained,
+                &mut sequence,
+                "workspace",
+                "thread",
+                "turn",
+                &crowded
+            )
+            .is_err()
+        );
+        assert_eq!(retained, original);
+    }
+
+    #[test]
+    fn retained_history_counts_physical_wire_and_provenance_bytes_with_a_real_ceiling() {
+        use std::io::Write;
+        let mut message = ChatMessage::assistant("界\n\"immutable");
+        message.provenance = Some(crate::compaction::history::pending_origin(
+            "workspace",
+            "thread",
+            "turn",
+            "round",
+            crate::compaction::history::PendingOriginKind::Assistant,
+            "round",
+        ));
+        assert_eq!(
+            retained_provider_message_bytes(&message).unwrap(),
+            serde_json::to_vec(&(&message, &message.provenance))
+                .unwrap()
+                .len()
+        );
+        let mut counter = RetainedProviderByteCounter(0);
+        for _ in 0..MAX_RETAINED_PROVIDER_BYTES / 8192 {
+            counter.write_all(&[b'a'; 8192]).unwrap();
+        }
+        assert_eq!(counter.0, MAX_RETAINED_PROVIDER_BYTES);
+        assert!(counter.write_all(b"x").is_err());
+        assert_eq!(counter.0, MAX_RETAINED_PROVIDER_BYTES);
+    }
+
+    #[test]
     fn recovery_context_replays_exact_provider_messages_in_sequence_order() {
         let mut messages = vec![ChatMessage::user("retry the turn")];
         let assistant_round = ChatMessage::assistant_tool_calls_with_provider_state(
@@ -9688,6 +12253,7 @@ mod tests {
                 name: None,
                 tool_calls: None,
                 provider_replay_state: None,
+                tool_outcome: None,
             },
             computer_use_snapshot_message("call_1", 1, "/tmp/s1-1.png"),
             computer_use_snapshot_message("call_2", 2, "/tmp/s2-1.png"),
@@ -9703,7 +12269,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_policy_prunes_snapshots_before_pinned_files_when_budget_exceeded() {
+    fn agent_policy_preserves_current_snapshots_even_when_they_exceed_byte_budget() {
         let mut messages = vec![
             ChatMessage {
                 provenance: None,
@@ -9715,18 +12281,96 @@ mod tests {
                 name: None,
                 tool_calls: None,
                 provider_replay_state: None,
+                tool_outcome: None,
             },
             computer_use_snapshot_message("call_1", 1, "/tmp/s1-1.png"),
             computer_use_snapshot_message("call_2", 2, "/tmp/s2-1.png"),
             computer_use_snapshot_message("call_3", 1, "/tmp/s1-2.png"),
         ];
 
-        retain_agent_attachment_messages_with_budget(&mut messages, 700_000);
+        retain_agent_attachment_messages(&mut messages);
 
         assert_eq!(messages[0].content_parts.len(), 1);
         assert!(messages[1].content_parts.is_empty());
-        assert!(messages[2].content_parts.is_empty());
+        assert_eq!(messages[2].content_parts.len(), 1);
         assert_eq!(messages[3].content_parts.len(), 1);
+        assert!(messages[1].content.contains("Earlier screenshot omitted"));
+    }
+
+    #[test]
+    fn current_visual_over_budget_is_explicitly_rejected_by_actual_admission() {
+        let bytes = [
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+            8, 4, 0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 252, 255, 31,
+            0, 3, 3, 2, 0, 239, 191, 151, 219, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+        ];
+        let mut frame = computer_use_snapshot_message("current", 1, "/current.png");
+        if let MessageContentPart::Image { image } = &mut frame.content_parts[0] {
+            image.source = pioneer_provider::attachments::owned_bytes_source(&bytes);
+            image.size_bytes = Some(bytes.len() as u64);
+        }
+        let call = pioneer_provider::ProviderToolCall {
+            id: "current".into(),
+            name: "computer_use".into(),
+            arguments: "{}".into(),
+        };
+        let mut messages = vec![
+            ChatMessage::assistant_tool_calls(None::<String>, vec![call]),
+            frame,
+        ];
+        retain_agent_attachment_messages(&mut messages);
+        assert!(messages[1].has_attachments());
+        let config = pioneer_provider::attachments::AttachmentPipelineConfig {
+            max_total_bytes_per_request: 32,
+            ..Default::default()
+        };
+        let mut capabilities = pioneer_provider::ProviderCapabilities::default();
+        capabilities.vision = true;
+        capabilities.input_types.image = pioneer_provider::InputTypeSupport::data_url_inline_only();
+        let error = pioneer_provider::attachments::prepare_messages_for_provider_with_config(
+            "openai",
+            &capabilities,
+            &messages,
+            &config,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("ATTACHMENT_TOO_LARGE")
+                || error
+                    .to_string()
+                    .contains("ATTACHMENT_TOTAL_BUDGET_EXCEEDED"),
+            "{error:#}"
+        );
+        assert!(messages[1].has_attachments());
+    }
+
+    #[test]
+    fn unknown_failed_and_unscoped_frames_cannot_prove_supersession() {
+        for outcome in [
+            None,
+            Some(pioneer_provider::ToolResultOutcome::new(
+                pioneer_provider::ToolResultStatus::RecoverableError,
+            )),
+            Some(pioneer_provider::ToolResultOutcome {
+                schema_version: 2,
+                status: pioneer_provider::ToolResultStatus::Ok,
+            }),
+        ] {
+            let mut messages = vec![
+                computer_use_snapshot_message("old", 1, "/old.png"),
+                computer_use_snapshot_message("new", 1, "/new.png"),
+            ];
+            messages[1].tool_outcome = outcome;
+            retain_agent_attachment_messages(&mut messages);
+            assert!(messages.iter().all(ChatMessage::has_attachments));
+        }
+        let mut messages = vec![
+            computer_use_snapshot_message("old", 1, "/old.png"),
+            computer_use_snapshot_message("new", 1, "/new.png"),
+        ];
+        messages[1].content = r#"{"action":"snapshot"}"#.to_owned();
+        retain_agent_attachment_messages(&mut messages);
+        assert!(messages.iter().all(ChatMessage::has_attachments));
     }
 
     #[test]
@@ -9742,6 +12386,7 @@ mod tests {
                 name: None,
                 tool_calls: None,
                 provider_replay_state: None,
+                tool_outcome: None,
             },
             ChatMessage {
                 provenance: None,
@@ -9753,6 +12398,7 @@ mod tests {
                 name: Some("computer_use".to_owned()),
                 tool_calls: None,
                 provider_replay_state: None,
+                tool_outcome: None,
             },
             ChatMessage {
                 provenance: None,
@@ -9764,6 +12410,7 @@ mod tests {
                 name: None,
                 tool_calls: None,
                 provider_replay_state: None,
+                tool_outcome: None,
             },
         ];
 
@@ -10048,5 +12695,59 @@ mod compaction_result_budget_tests {
         assert!(page.content_parts.is_empty());
         assert!(page.content.contains("fixture-ref"));
         assert!(source.content_parts.len() == 1);
+    }
+}
+
+#[cfg(test)]
+mod cold_initial_owner_tests {
+    #[tokio::test]
+    async fn cold_restore_keeps_skill_bridge_without_initial_hooks_and_rejects_unknown_owner() {
+        let mut outputs = crate::native_initial::tests::outputs();
+        outputs.provider_tool_calling = true;
+        let restored = super::restore_native_initial_tool_owners(
+            &outputs,
+            None,
+            None,
+            None,
+            None,
+            &crate::AgentTurnHookRuntimeContext::default(),
+            "original input",
+            "workspace",
+            "thread",
+            "turn",
+        )
+        .await
+        .unwrap();
+        assert!(restored.skills.is_some());
+        assert!(restored.bundles.is_empty());
+        outputs
+            .tool_metadata
+            .entries
+            .push(pioneer_hooks::HookToolBundleEntry {
+                contribution_id: pioneer_hooks::HookContributionId::new("custom.contribution.0")
+                    .unwrap(),
+                bundle_id: pioneer_hooks::HookToolBundleId::new("custom.bundle.0").unwrap(),
+                domain: pioneer_hooks::HookDomain::new("custom").unwrap(),
+                priority: 1,
+                tool_names: Vec::new(),
+                diagnostics: Vec::new(),
+            });
+        outputs.extension_specs.push(Vec::new());
+        assert!(
+            super::restore_native_initial_tool_owners(
+                &outputs,
+                None,
+                None,
+                None,
+                None,
+                &crate::AgentTurnHookRuntimeContext::default(),
+                "original input",
+                "workspace",
+                "thread",
+                "turn"
+            )
+            .await
+            .is_err()
+        );
     }
 }

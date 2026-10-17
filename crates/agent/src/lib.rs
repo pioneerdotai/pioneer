@@ -9,6 +9,29 @@ mod chat;
 pub mod compaction;
 mod hooks;
 mod manager_recovery;
+mod native_initial;
+pub use native_initial::{NativeInitialPreparation, NativeInitialResumeRequirements};
+
+/// Agent owns this bounded semantic codec; readers must reject other versions.
+pub use pioneer_protocol::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION;
+
+#[derive(Debug)]
+pub struct NativeHistorySourceUnavailable;
+impl std::fmt::Display for NativeHistorySourceUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("required native history checkpoint source unavailable")
+    }
+}
+impl std::error::Error for NativeHistorySourceUnavailable {}
+
+/// Read-only structural proof; actual restore still revalidates all authority.
+pub fn native_semantic_checkpoint_compatible(
+    payload: &pioneer_protocol::ExecutionCheckpointPayload,
+    accepted_budget: &pioneer_tools::ToolRetryBudgetConfig,
+    mode: pioneer_tools::ToolNoProgressMode,
+) -> bool {
+    chat::semantic_state::checkpoint_compatible(payload, accepted_budget, mode)
+}
 #[cfg(test)]
 mod manager_tests;
 pub mod post_turn;
@@ -95,8 +118,11 @@ const DEFAULT_CONTROL_OUTCOME_CAPACITY: usize = 512;
 const MAX_CONTROL_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(120);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolLoopConfig {
+    #[serde(default)]
+    pub no_progress_mode: pioneer_tools::ToolNoProgressMode,
     pub provider: ProviderTimeoutPolicy,
     pub preflight: PreflightLoopConfig,
     pub web: WebToolsConfig,
@@ -108,7 +134,8 @@ pub struct ToolLoopConfig {
     pub retry: ToolRetryBudgetConfig,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreflightLoopConfig {
     pub provider_name: Option<String>,
     pub model: Option<String>,
@@ -127,7 +154,8 @@ impl PreflightLoopConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillsLoopConfig {
     pub enabled: bool,
     pub max_skills_per_source: usize,
@@ -146,7 +174,8 @@ pub struct SkillsLoopConfig {
     pub runtime: SkillsRuntimeLoopConfig,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillsRuntimeLoopConfig {
     pub enable_dynamic_tools: bool,
     pub enable_read_skill: bool,
@@ -158,13 +187,15 @@ pub struct SkillsRuntimeLoopConfig {
     pub allow_function_proxy_tools: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillsValidationLoopConfig {
     pub strict_agentskills: bool,
     pub accept_openclaw_profile: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillsSecurityLoopConfig {
     pub allow_untrusted_install: bool,
     pub min_trust_for_shell_tools: SkillTrustLevel,
@@ -180,7 +211,8 @@ pub struct SkillsSecurityLoopConfig {
     pub upload_max_chunk_size_bytes: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillsDependenciesLoopConfig {
     pub preflight_on_resolve: bool,
     pub runtime_recheck_on_tool_call: bool,
@@ -276,6 +308,7 @@ pub struct AgentMcpAvailability {
 
 #[derive(Clone, Default)]
 pub struct AgentMcpMaterialization {
+    pub descriptors: Vec<pioneer_tools::McpDynamicToolDescriptor>,
     pub bundles: Vec<pioneer_tools::ToolExtensionBundle>,
     pub available_mcp: Vec<String>,
     pub blocked_mcp: Vec<String>,
@@ -403,6 +436,16 @@ pub trait AgentMcpToolProvider: Send + Sync {
         request: AgentMcpMaterializationRequest,
     ) -> Result<AgentMcpMaterialization, AgentMcpMaterializationError>;
 
+    async fn restore_mcp_tools(
+        &self,
+        _workspace_id: &str,
+        _turn_id: &str,
+        _manifest_hash: &str,
+        _descriptors: &[pioneer_tools::McpDynamicToolDescriptor],
+    ) -> Result<Vec<pioneer_tools::ToolExtensionBundle>, String> {
+        Err("accepted MCP tool owner does not support cold restoration".to_owned())
+    }
+
     async fn persist_mcp_projection(
         &self,
         request: AgentMcpProjectionPersistenceRequest,
@@ -429,6 +472,8 @@ pub struct ReviewRequiredTaskObservation {
     pub task_id: String,
     pub run_id: String,
     pub candidate_id: String,
+    /// Full authoritative candidate projection revision; empty means unavailable.
+    pub candidate_revision: String,
     pub title: String,
     pub status: String,
     pub candidate_status: String,
@@ -484,6 +529,9 @@ pub struct TurnToolContext {
 
 #[derive(Clone, Default)]
 pub struct TurnToolMaterialization {
+    /// Original concrete Agent action launch catalog; no adapter or authority
+    /// lease is serialized. Its owner validates/rebinds it on cold restore.
+    pub native_agent_action_contract: Option<String>,
     pub bundles: Vec<pioneer_tools::ToolExtensionBundle>,
     pub diagnostics: Vec<String>,
     pub initiating_thread_id: Option<String>,
@@ -504,6 +552,15 @@ pub trait TurnToolProvider: Send + Sync {
         &self,
         context: TurnToolContext,
     ) -> Result<TurnToolMaterialization, String>;
+
+    async fn restore_turn_tools(
+        &self,
+        _context: TurnToolContext,
+        _native_agent_action_contract: Option<&str>,
+        _accepted_specs: &[Vec<pioneer_tools::ConfiguredToolSpec>],
+    ) -> Result<TurnToolMaterialization, String> {
+        Err("accepted Turn tool owner does not support cold restoration".to_owned())
+    }
 
     async fn authorize_skill_continuation(
         &self,
@@ -548,6 +605,14 @@ pub trait TaskToolProvider: Send + Sync {
         &self,
         context: TaskTurnContext,
     ) -> Result<TaskToolMaterialization, String>;
+
+    async fn restore_task_tools(
+        &self,
+        _context: TaskTurnContext,
+        _accepted_specs: &[Vec<pioneer_tools::ConfiguredToolSpec>],
+    ) -> Result<TaskToolMaterialization, String> {
+        Err("accepted Task tool owner does not support cold restoration".to_owned())
+    }
 
     /// Read the parent task gate as one logical snapshot.  The default is
     /// retained for lightweight providers and test doubles; the Gateway
@@ -625,6 +690,7 @@ pub trait TaskToolProvider: Send + Sync {
 impl ToolLoopConfig {
     pub fn normalized(&self) -> Self {
         Self {
+            no_progress_mode: self.no_progress_mode,
             provider: self.provider,
             preflight: self.preflight.normalized(),
             web: self.web.normalized(),
@@ -1210,6 +1276,7 @@ pub struct ExecutionWindowUsageSnapshot {
     pub total_provider_tokens: u64,
     pub provider_token_usage_unknown: bool,
     pub consecutive_no_progress_windows: u32,
+    pub consecutive_unconfirmed_progress_windows: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1220,6 +1287,7 @@ struct TurnExecutionUsageCounters {
     total_provider_tokens: u64,
     provider_token_usage_unknown: bool,
     consecutive_no_progress_windows: u32,
+    consecutive_unconfirmed_progress_windows: u32,
 }
 
 impl TurnExecutionUsageCounters {
@@ -1231,6 +1299,8 @@ impl TurnExecutionUsageCounters {
             total_provider_tokens: snapshot.total_provider_tokens,
             provider_token_usage_unknown: snapshot.provider_token_usage_unknown,
             consecutive_no_progress_windows: snapshot.consecutive_no_progress_windows,
+            consecutive_unconfirmed_progress_windows: snapshot
+                .consecutive_unconfirmed_progress_windows,
         }
     }
 
@@ -1242,6 +1312,7 @@ impl TurnExecutionUsageCounters {
             total_provider_tokens: self.total_provider_tokens,
             provider_token_usage_unknown: self.provider_token_usage_unknown,
             consecutive_no_progress_windows: self.consecutive_no_progress_windows,
+            consecutive_unconfirmed_progress_windows: self.consecutive_unconfirmed_progress_windows,
         }
     }
 
@@ -1267,6 +1338,7 @@ impl TurnExecutionUsageCounters {
             }
         }
 
+        self.provider_token_usage_unknown |= !payload.provider_budget.provider_usage_available;
         match payload
             .window
             .provider_token_count
@@ -1280,27 +1352,29 @@ impl TurnExecutionUsageCounters {
             }
         }
 
-        if execution_checkpoint_payload_is_no_progress_recovery(payload) {
-            self.consecutive_no_progress_windows =
-                self.consecutive_no_progress_windows.saturating_add(1);
-        } else {
-            self.consecutive_no_progress_windows = 0;
+        match payload.window.progress.map_or(
+            pioneer_protocol::ExecutionProgressKind::Unknown,
+            |progress| progress.kind(),
+        ) {
+            pioneer_protocol::ExecutionProgressKind::Advanced => {
+                self.consecutive_no_progress_windows = 0;
+                self.consecutive_unconfirmed_progress_windows = 0;
+            }
+            pioneer_protocol::ExecutionProgressKind::Unchanged => {
+                self.consecutive_no_progress_windows =
+                    self.consecutive_no_progress_windows.saturating_add(1);
+                self.consecutive_unconfirmed_progress_windows = self
+                    .consecutive_unconfirmed_progress_windows
+                    .saturating_add(1);
+            }
+            pioneer_protocol::ExecutionProgressKind::Unknown => {
+                // Unknown neither confirms another stall nor clears known stall.
+                self.consecutive_unconfirmed_progress_windows = self
+                    .consecutive_unconfirmed_progress_windows
+                    .saturating_add(1);
+            }
         }
     }
-}
-
-fn execution_checkpoint_payload_is_no_progress_recovery(
-    payload: &ExecutionCheckpointPayload,
-) -> bool {
-    payload.window.agent_round_count == 0
-        && payload.tools.executed_count == 0
-        && matches!(
-            payload.window.exhaustion_reason,
-            Some(
-                ExecutionWindowExhaustionReason::ProviderFailureContinuation
-                    | ExecutionWindowExhaustionReason::RuntimeShutdownContinuation
-            )
-        )
 }
 
 #[derive(Debug, Clone)]
@@ -1311,6 +1385,9 @@ pub struct RestoredRecoveryTurnRequest {
     pub hook_runtime_context: AgentTurnHookRuntimeContext,
     pub model: String,
     pub provider_name: String,
+    pub azure_connection: Option<pioneer_provider::AzureResolvedConnection>,
+    pub provider_model_contract: Option<pioneer_provider::AcceptedProviderModelContract>,
+    pub initial_preparation: Option<NativeInitialPreparation>,
     pub reasoning: Option<ReasoningConfig>,
     pub workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
     pub skill_catalog: SkillCatalogSnapshot,
@@ -1355,6 +1432,9 @@ struct ActiveTurnRequest {
     hook_runtime_context: AgentTurnHookRuntimeContext,
     model: String,
     provider_name: String,
+    azure_connection: Option<pioneer_provider::AzureResolvedConnection>,
+    provider_model_contract: Option<pioneer_provider::AcceptedProviderModelContract>,
+    initial_preparation: Option<NativeInitialPreparation>,
     reasoning: Option<ReasoningConfig>,
     workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
     skill_catalog: SkillCatalogSnapshot,
@@ -1375,6 +1455,7 @@ struct ActiveTurnRequest {
 #[derive(Debug, Clone)]
 enum TurnTaskFailure {
     Terminal(String),
+    Transient(String),
     Blocked(String),
     ProviderFailure {
         item_id: String,
@@ -1886,6 +1967,9 @@ enum AgentCommand {
         hook_runtime_context: AgentTurnHookRuntimeContext,
         model: String,
         provider_name: String,
+        azure_connection: Option<pioneer_provider::AzureResolvedConnection>,
+        provider_model_contract: Option<pioneer_provider::AcceptedProviderModelContract>,
+        initial_preparation: Option<NativeInitialPreparation>,
         reasoning: Option<ReasoningConfig>,
         workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
         skill_catalog: SkillCatalogSnapshot,
@@ -2524,6 +2608,7 @@ pub(crate) struct NativeTurnRuntimeSnapshot {
     pub(crate) mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
     pub(crate) turn_tool_provider: Option<Arc<dyn TurnToolProvider>>,
     pub(crate) turn_finalization_provider: Option<Arc<dyn TurnFinalizationProvider>>,
+    pub(crate) memory_provider: Option<Arc<dyn AgentMemoryProvider>>,
     pub(crate) task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     pub(crate) task_cleanup_runtime_contract: Option<String>,
     pub(crate) hook_runtime: Option<Arc<HookRuntime>>,
@@ -2709,6 +2794,7 @@ impl NativeRuntimeDependencies {
             turn_tool_provider: state.turn_tool_provider.clone(),
             turn_finalization_provider: state.turn_finalization_provider.clone(),
             task_tool_provider: state.task_tool_provider.clone(),
+            memory_provider: state.memory_provider.clone(),
             task_cleanup_runtime_contract: state
                 .task_tool_provider
                 .as_ref()
@@ -3285,6 +3371,9 @@ impl AgentManager {
             AgentTurnHookRuntimeContext::default(),
             model,
             provider_name,
+            None,
+            None,
+            None,
             workspace_skill_policies,
             skill_catalog,
             agent_skill_overlay,
@@ -3454,6 +3543,9 @@ impl AgentManager {
             hook_runtime_context,
             model,
             provider_name,
+            None,
+            None,
+            None,
             workspace_skill_policies,
             skill_catalog,
             agent_skill_overlay,
@@ -3540,6 +3632,9 @@ impl AgentManager {
             hook_runtime_context,
             model,
             provider_name,
+            None,
+            None,
+            None,
             workspace_skill_policies,
             skill_catalog,
             agent_skill_overlay,
@@ -3556,6 +3651,52 @@ impl AgentManager {
         .await
     }
 
+    /// Dispatch the exact owned native admission inputs restored by the Gateway.
+    pub async fn start_admitted_native_turn(
+        &self,
+        thread_id: &str,
+        request: RestoredRecoveryTurnRequest,
+        execution_checkpoint_context: Option<ExecutionCheckpointContext>,
+    ) -> Result<(), AgentStartError> {
+        if request.provider_model_contract.is_none() {
+            return Err(AgentStartError::Internal(
+                "native admission is missing its accepted model contract".to_owned(),
+            ));
+        }
+        if pioneer_provider::provider_definition(&request.provider_name)
+            .is_some_and(|definition| definition.name == "azure-openai")
+            && request.azure_connection.is_none()
+        {
+            return Err(AgentStartError::Internal(
+                "native Azure admission is missing its accepted connection".to_owned(),
+            ));
+        }
+        self.start_turn_with_hook_context_and_execution_checkpoint_and_reasoning(
+            thread_id,
+            &request.turn_id,
+            request.mode,
+            request.hook_runtime_context,
+            &request.model,
+            &request.provider_name,
+            request.azure_connection,
+            request.provider_model_contract,
+            request.initial_preparation,
+            request.workspace_skill_policies,
+            request.skill_catalog,
+            request.agent_skill_overlay,
+            request.input,
+            request.capabilities,
+            request.resolved_artifacts,
+            request.runtime_environment,
+            request.history,
+            execution_checkpoint_context,
+            request.reasoning,
+            request.permission_profile,
+            request.execution_security_snapshot,
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn start_turn_with_hook_context_and_execution_checkpoint_and_reasoning(
         &self,
@@ -3565,6 +3706,9 @@ impl AgentManager {
         hook_runtime_context: AgentTurnHookRuntimeContext,
         model: &str,
         provider_name: &str,
+        azure_connection: Option<pioneer_provider::AzureResolvedConnection>,
+        provider_model_contract: Option<pioneer_provider::AcceptedProviderModelContract>,
+        initial_preparation: Option<NativeInitialPreparation>,
         workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
         skill_catalog: SkillCatalogSnapshot,
         agent_skill_overlay: Vec<AgentSkillRuntimeEntry>,
@@ -3609,6 +3753,9 @@ impl AgentManager {
             hook_runtime_context,
             model: model.to_owned(),
             provider_name: provider_name.to_owned(),
+            azure_connection,
+            provider_model_contract,
+            initial_preparation,
             reasoning,
             workspace_skill_policies,
             skill_catalog,

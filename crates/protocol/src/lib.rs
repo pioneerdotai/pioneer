@@ -27,9 +27,16 @@ mod markdown;
 mod mcp;
 mod member;
 mod memory;
+mod native_control;
 mod notification;
 mod patch_history;
 mod provider;
+pub use native_control::{
+    NATIVE_CONTROL_MAX_PENDING, NATIVE_CONTROL_RECORD_MAX_BYTES, NATIVE_CONTROL_STORAGE_MAX_BYTES,
+    NativeControlCheckpointState, NativeControlObservation, NativeControlOrigin,
+    NativeControlRecord, NativeControlRef, NativeControlSourceUnavailable, NativeControlTrust,
+    NativeHostControl, NativeHostDirective, encode_native_control,
+};
 mod public_error;
 mod recovery_diagnostic;
 pub use recovery_diagnostic::{
@@ -69,13 +76,15 @@ pub use agent_authorship::{
 };
 pub use agent_event::{
     AgentDurableEvent, AgentProgressEvent, DurableEventCausalityKey, ItemHeartbeatSource,
-    NativeDurableCancellationReceipt, NativeTerminalEffectGate, NativeTerminalEffectKind,
-    NativeTerminalEffectPayload, NativeTerminalEffectPreparation,
+    NativeDurableCancellationReceipt, NativeFailureMetadata, NativeFailureReason,
+    NativeFailureStage, NativeInitialPhaseAdvance, NativeTerminalEffectGate,
+    NativeTerminalEffectKind, NativeTerminalEffectPayload, NativeTerminalEffectPreparation,
     NativeTerminalEffectPreparationFailure, NativeTerminalEffectSpec, ProgressCoalescingKey,
     ProtocolEventClass, RecoveryAttemptContext, SkillAuditEvent, ToolResultView,
     TurnAcceptedCapability, TurnCapabilityAcceptedReason, TurnCapabilityRejectedReason,
-    TurnPermissionAuditDecision, TurnPermissionAuditEvent, TurnPermissionAuditEventKind,
-    TurnPermissionAuditRequestKey, TurnRejectedCapability, TurnSkillBinding,
+    TurnFailureDisposition, TurnPermissionAuditDecision, TurnPermissionAuditEvent,
+    TurnPermissionAuditEventKind, TurnPermissionAuditRequestKey, TurnRejectedCapability,
+    TurnSkillBinding,
 };
 pub use agent_launch::{
     AgentAuthoredInput, AgentAuthoredInputError, AgentExecutionProfileBackend,
@@ -456,12 +465,13 @@ pub use turn::{
     CLIAgentRuntimeKind, CLIAgentRuntimeSandboxPolicy, ContextCompressedNotification,
     ContextCompressingNotification, DeltaOutputPolicy, DiagnosticExcerptPolicy,
     EXECUTION_CHECKPOINT_DEFAULT_TOOL_DETAIL_LIMIT, EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
-    EmptyStrictObligationCollector, ExecutionCheckpointOriginalRequestSummary,
-    ExecutionCheckpointPayload, ExecutionCheckpointProviderBudgetInput,
-    ExecutionCheckpointProviderBudgetSummary, ExecutionCheckpointStrictObligation,
-    ExecutionCheckpointToolCallSummary, ExecutionCheckpointToolNoProgressExactVariant,
-    ExecutionCheckpointToolNoProgressState, ExecutionCheckpointToolNoProgressStrategy,
-    ExecutionCheckpointToolSummary, ExecutionCheckpointWindowSummary,
+    EmptyStrictObligationCollector, ExecutionCheckpointNativeFrontier,
+    ExecutionCheckpointOriginalRequestSummary, ExecutionCheckpointPayload,
+    ExecutionCheckpointProviderBudgetInput, ExecutionCheckpointProviderBudgetSummary,
+    ExecutionCheckpointStrictObligation, ExecutionCheckpointToolCallSummary,
+    ExecutionCheckpointToolNoProgressExactVariant, ExecutionCheckpointToolNoProgressState,
+    ExecutionCheckpointToolNoProgressStrategy, ExecutionCheckpointToolSummary,
+    ExecutionCheckpointWindowSummary, ExecutionProgressKind, ExecutionProgressSummary,
     ExecutionWindowExhaustionReason, ExecutionWindowStatus,
     HISTORICAL_COMMAND_LLM_PROJECTION_VERSION, HistoricalCommandLlmProjection,
     HistoricalCommandOutput, HistoricalCommandOutputSource, HistoricalCommandRepresentation,
@@ -515,9 +525,9 @@ pub use turn::{
     TurnPermissionProfileCap, TurnPermissionProfileSelection, TurnPermissionProfileSnapshot,
     TurnPermissionProfileSource, TurnPermissionRequestOpenedNotification,
     TurnPermissionRequestResolvedNotification, TurnPermissionRequestRespondParams,
-    TurnPermissionRequestRespondResponse, TurnProcessPolicySnapshot, TurnProcessTimeoutPolicy,
-    TurnReasoningSelection, TurnResumeParams, TurnResumeResponse, TurnSandboxMode,
-    TurnSandboxSnapshot, TurnSecurityBackendSnapshot, TurnSecurityCapabilityKind,
+    TurnPermissionRequestRespondResponse, TurnProcessExecutionProfile, TurnProcessPolicySnapshot,
+    TurnProcessTimeoutPolicy, TurnReasoningSelection, TurnResumeParams, TurnResumeResponse,
+    TurnSandboxMode, TurnSandboxSnapshot, TurnSecurityBackendSnapshot, TurnSecurityCapabilityKind,
     TurnSecurityDegradation, TurnSecurityEnforcementStatus, TurnSecurityExecutionBackendKind,
     TurnSecurityParentCapSnapshot, TurnSecurityRuleProvenance, TurnSecuritySnapshotSource,
     TurnShellPolicy, TurnSkillCapabilitySummary, TurnSkillPackCapabilitySummary,
@@ -567,4 +577,42 @@ pub use schema::{protocol_schema_documents, write_protocol_schemas};
 mod model_selection;
 pub use model_selection::{GatewayModelSelection, ModelSelectionTransport};
 
+/// Agent-owned semantic checkpoint codec shared with persistence readers.
+/// Agent remains the serializer and full restore authority.
+pub const NATIVE_SEMANTIC_STATE_SCHEMA_VERSION: u32 = 9;
+
+/// Agent-owned host wait in the existing semantic checkpoint; never work progress.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeAttachedTaskWait {
+    pub schema_version: u32,
+    pub baseline: [u8; 32],
+    pub item_id: String,
+    pub checkpoint_id: String,
+    pub owner_generation: u64,
+    pub runtime_generation: u64,
+}
+impl NativeAttachedTaskWait {
+    pub fn valid(&self) -> bool {
+        self.schema_version == 1
+            && !self.item_id.is_empty()
+            && self.item_id.len() <= 21
+            && self.checkpoint_id.len() == 21
+            && self
+                .checkpoint_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            && self.owner_generation > 0
+            && self.runtime_generation > 0
+    }
+}
+
+/// Existing durable semantic checkpoint identity; shared by its producer and readers.
+pub fn native_semantic_checkpoint_id(turn: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(
+        format!("native-semantic-v1:{turn}").as_bytes(),
+    ))[..21]
+        .to_owned()
+}
 pub use artifact::{HtmlPublication, compact_html_timeline_item, compact_html_timeline_value};

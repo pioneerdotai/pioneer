@@ -1061,6 +1061,48 @@ pub async fn load_agent_execution<C: ConnectionTrait>(
         .context("failed to load agent execution")
 }
 
+/// Read-only eligibility proof for the original native initial Agent owner.
+/// Return a scalar rather than materializing unrelated execution/grant TEXT.
+pub async fn native_initial_agent_owner_exists<C: ConnectionTrait>(
+    db: &C,
+    execution_id: &str,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    identity_fingerprint: &str,
+    profile_fingerprint: &str,
+) -> Result<bool> {
+    let row = db.query_one_raw(Statement::from_sql_and_values(db.get_database_backend(),
+        "SELECT EXISTS(SELECT 1 FROM agent_execution e \
+         JOIN agent_identity i ON i.id=e.agent_identity_id \
+         JOIN agent_presentation_snapshot p ON p.id=e.presentation_snapshot_id \
+         JOIN turn t ON t.id=? AND t.thread_id=e.parent_thread_id \
+         JOIN thread th ON th.id=t.thread_id AND th.workspace_id=e.workspace_id \
+         WHERE e.id=? AND e.workspace_id=? AND e.parent_thread_id=? \
+           AND e.identity_source_fingerprint=? AND e.resolved_profile_fingerprint=? \
+           AND e.finished_at IS NULL AND e.status IN ('created','queued','running','recovering') \
+           AND t.message_deleted_at IS NULL \
+           AND i.workspace_id=e.workspace_id AND i.status='active' AND i.retired_at IS NULL \
+           AND (i.source_kind='ephemeral' OR (i.source_kind='native_agent' AND EXISTS( \
+               SELECT 1 FROM native_agent_config n WHERE n.id=i.source_id AND n.workspace_id=e.workspace_id \
+               AND n.enabled=1 AND n.config_revision=i.source_revision))) \
+           AND i.source_revision=e.identity_source_revision \
+           AND i.source_fingerprint=e.identity_source_fingerprint \
+           AND p.agent_identity_id=i.id AND p.source_revision=e.identity_source_revision \
+           AND p.source_fingerprint=e.identity_source_fingerprint \
+           AND EXISTS(SELECT 1 FROM agent_execution_grant g WHERE g.execution_id=e.id \
+               AND length(cast(g.grant_json as blob))<=?) \
+           AND (EXISTS(SELECT 1 FROM agent_turn_response_execution r WHERE r.turn_id=t.id AND r.execution_id=e.id) \
+               OR (t.initiated_by_actor_kind='agent_execution' AND t.initiated_by_actor_id=e.id))) AS available",
+        [turn_id.into(), execution_id.into(), workspace_id.into(), thread_id.into(), identity_fingerprint.into(), profile_fingerprint.into(),
+         (pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES as i64).into()]))
+        .await.context("failed to check native initial Agent owner")?;
+    Ok(row
+        .context("native initial Agent owner proof is unavailable")?
+        .try_get::<i64>("", "available")?
+        != 0)
+}
+
 pub async fn load_agent_execution_resource_state<C: ConnectionTrait>(
     db: &C,
     execution_id: &str,
@@ -7191,6 +7233,180 @@ mod tests {
             "maxReasoning": { "allowed": [{ "effort": "medium" }] },
             "fingerprint": "fc747ed91c91bd27b7ed9378961fedb2c57de5eba831ae5bfd5e3745e29e0af3"
         })
+    }
+
+    #[tokio::test]
+    async fn native_initial_owner_proof_requires_original_scope_source_profile_and_references() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let store = crate::CrudStore::new(db).with_maintenance_access();
+        let db = store.database_connection();
+        assert_eq!(
+            db.read_class(),
+            pioneer_sqlite::SqliteReadClass::Maintenance
+        );
+        db.execute_unprepared("INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','Owner',1,1); INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status) VALUES('thread','ws','','agent','model','fixture','idle'); INSERT INTO turn(id,thread_id,status,prompt_manifest_json) VALUES('turn','thread','in_progress','{}')").await.unwrap();
+        let now = utc_now();
+        ensure_native_agent_config(
+            &db,
+            &NativeAgentConfigInput {
+                id: "N00000000000000000001".into(),
+                workspace_id: "ws".into(),
+                system_key: None,
+                display_name: "Pioneer".into(),
+                nickname: "pioneer".into(),
+                enabled: true,
+                avatar_revision: None,
+                config_revision: 3,
+                now,
+            },
+        )
+        .await
+        .unwrap();
+        ensure_agent_identity(
+            &db,
+            &AgentIdentityInput {
+                id: "A00000000000000000001".into(),
+                workspace_id: "ws".into(),
+                source_kind: SOURCE_NATIVE_AGENT.into(),
+                source_id: "N00000000000000000001".into(),
+                source_revision: 3,
+                source_fingerprint: "generation-a".into(),
+                now,
+            },
+        )
+        .await
+        .unwrap();
+        insert_presentation_snapshot(
+            &db,
+            &PresentationSnapshotInput {
+                id: "S00000000000000000001".into(),
+                agent_identity_id: "A00000000000000000001".into(),
+                source_revision: 3,
+                source_fingerprint: "generation-a".into(),
+                display_name: "Pioneer".into(),
+                nickname: "pioneer".into(),
+                avatar_revision: None,
+                role_label: None,
+                now,
+            },
+        )
+        .await
+        .unwrap();
+        let execution = "E00000000000000000001";
+        insert_agent_execution(
+            &db,
+            &AgentExecutionInput {
+                id: execution.into(),
+                workspace_id: "ws".into(),
+                agent_identity_id: "A00000000000000000001".into(),
+                identity_source_revision: 3,
+                identity_source_fingerprint: "generation-a".into(),
+                parent_execution_id: None,
+                parent_task_id: None,
+                parent_thread_id: Some("thread".into()),
+                home_root_thread_id: "thread".into(),
+                work_graph_root_execution_id: execution.into(),
+                requested_identity_selection_json: "{}".into(),
+                requested_profile_selection_json: "{}".into(),
+                resolved_profile_id: Some("P00000000000000000003".into()),
+                resolved_profile_fingerprint: Some("profile-fingerprint".into()),
+                presentation_snapshot_id: Some("S00000000000000000001".into()),
+                authorization_context_fingerprint: "authorization".into(),
+                execution_generation: 1,
+                status: "running".into(),
+                now,
+            },
+        )
+        .await
+        .unwrap();
+        let child = version_one_child_launch_grant();
+        let grant = serde_json::json!({"identity": child["identities"][0], "profile": child["profiles"][0], "child_launch_grant": child,
+            "role_key":"member", "agent_authorization_fingerprint":"authorization", "allowed_action_names":[]}).to_string();
+        let grant =
+            pioneer_protocol::migrate_embedded_child_launch_grant_json_to_current(&grant).unwrap();
+        insert_agent_execution_grant(
+            &db,
+            &AgentExecutionGrantInput {
+                id: "G00000000000000000001".into(),
+                execution_id: execution.into(),
+                parent_execution_id: None,
+                child_identity_id: "A00000000000000000001".into(),
+                grant_fingerprint: agent_execution_grant_fingerprint(&grant).unwrap(),
+                grant_json: grant,
+                now,
+            },
+        )
+        .await
+        .unwrap();
+        insert_agent_turn_response(
+            &db,
+            &AgentTurnResponseInput {
+                turn_id: "turn".into(),
+                execution_id: execution.into(),
+                presentation_snapshot_id: "S00000000000000000001".into(),
+                now,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            native_initial_agent_owner_exists(
+                &db,
+                execution,
+                "ws",
+                "thread",
+                "turn",
+                "generation-a",
+                "profile-fingerprint"
+            )
+            .await
+            .unwrap()
+        );
+        for (workspace, thread, source, profile) in [
+            ("foreign", "thread", "generation-a", "profile-fingerprint"),
+            ("ws", "foreign", "generation-a", "profile-fingerprint"),
+            ("ws", "thread", "changed", "profile-fingerprint"),
+            ("ws", "thread", "generation-a", "changed"),
+        ] {
+            assert!(
+                !native_initial_agent_owner_exists(
+                    &db, execution, workspace, thread, "turn", source, profile
+                )
+                .await
+                .unwrap()
+            );
+        }
+        db.execute_unprepared("UPDATE native_agent_config SET enabled=0")
+            .await
+            .unwrap();
+        assert!(
+            !native_initial_agent_owner_exists(
+                &db,
+                execution,
+                "ws",
+                "thread",
+                "turn",
+                "generation-a",
+                "profile-fingerprint"
+            )
+            .await
+            .unwrap()
+        );
+        db.execute_unprepared("UPDATE native_agent_config SET enabled=1; DELETE FROM agent_turn_response_execution WHERE turn_id='turn'").await.unwrap();
+        assert!(
+            !native_initial_agent_owner_exists(
+                &db,
+                execution,
+                "ws",
+                "thread",
+                "turn",
+                "generation-a",
+                "profile-fingerprint"
+            )
+            .await
+            .unwrap()
+        );
     }
 
     #[test]

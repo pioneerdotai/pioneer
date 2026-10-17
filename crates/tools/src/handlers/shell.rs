@@ -14,6 +14,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use pioneer_protocol::{SandboxBackendKind, TurnExecutionSecuritySnapshot};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::future::pending;
 use std::io;
@@ -145,12 +146,16 @@ impl SessionBuffer {
 }
 
 struct ExecToolOutput {
+    progress: crate::ToolProgressEvidence,
     success: bool,
     ui_text: String,
     payload: ExecModelPayload,
 }
 
 impl ToolOutput for ExecToolOutput {
+    fn progress_evidence(&self) -> crate::ToolProgressEvidence {
+        self.progress
+    }
     fn success(&self) -> bool {
         self.success
     }
@@ -191,6 +196,10 @@ impl ToolHandler for UnifiedExecHandler {
                 self.handle_exec_command(args, invocation, trace).await
             }
             LocalShellPayload::WriteStdin(args) => {
+                let snapshot = invocation.execution_security_snapshot.as_ref().ok_or_else(|| {
+                    ToolError::Rejected("missing turn execution security snapshot; refusing interactive process input".into())
+                })?;
+                crate::process_policy::require_supported_process_execution(snapshot)?;
                 self.handle_write_stdin(args, invocation.cancellation, trace)
                     .await
             }
@@ -337,6 +346,23 @@ impl UnifiedExecHandler {
             self.sessions.lock().await.remove(&session_id);
         }
 
+        let progress = crate::ToolProgressEvidence {
+            completion: if state.finished {
+                crate::ToolCompletionEvidence::Completed
+            } else {
+                crate::ToolCompletionEvidence::Running
+            },
+            stdout: crate::ToolStreamActivity::from_bytes(
+                initial.stdout.as_bytes(),
+                !initial.stdout_lost_output,
+            ),
+            stderr: crate::ToolStreamActivity::from_bytes(
+                initial.stderr.as_bytes(),
+                !initial.stderr_lost_output,
+            ),
+            duration_ms: Some(session_started_at.elapsed().as_millis() as u64),
+            ..Default::default()
+        };
         let payload = build_exec_model_payload(ExecPayloadInput {
             exit_code: state.exit_code,
             timed_out: false,
@@ -351,6 +377,7 @@ impl UnifiedExecHandler {
         });
 
         Ok(Box::new(ExecToolOutput {
+            progress,
             success: state.success,
             ui_text: render_exec_ui_text(&payload),
             payload,
@@ -438,6 +465,23 @@ impl UnifiedExecHandler {
             self.sessions.lock().await.remove(&args.session_id);
         }
 
+        let progress = crate::ToolProgressEvidence {
+            completion: if state.finished {
+                crate::ToolCompletionEvidence::Completed
+            } else {
+                crate::ToolCompletionEvidence::Running
+            },
+            stdout: crate::ToolStreamActivity::from_bytes(
+                chunk.stdout.as_bytes(),
+                !chunk.stdout_lost_output,
+            ),
+            stderr: crate::ToolStreamActivity::from_bytes(
+                chunk.stderr.as_bytes(),
+                !chunk.stderr_lost_output,
+            ),
+            duration_ms: Some(started_at.elapsed().as_millis() as u64),
+            ..Default::default()
+        };
         let payload = build_exec_model_payload(ExecPayloadInput {
             exit_code: state.exit_code,
             timed_out: false,
@@ -452,6 +496,7 @@ impl UnifiedExecHandler {
         });
 
         Ok(Box::new(ExecToolOutput {
+            progress,
             success: state.success,
             ui_text: render_exec_ui_text(&payload),
             payload,
@@ -529,6 +574,7 @@ fn parse_local_shell_payload(
 }
 
 struct OneShotCommandResult {
+    progress: crate::ToolProgressEvidence,
     success: bool,
     ui_text: String,
     payload: ExecModelPayload,
@@ -537,6 +583,7 @@ struct OneShotCommandResult {
 impl OneShotCommandResult {
     fn into_tool_output(self) -> ExecToolOutput {
         ExecToolOutput {
+            progress: self.progress,
             success: self.success,
             ui_text: self.ui_text,
             payload: self.payload,
@@ -810,6 +857,25 @@ async fn run_one_shot(
         truncation_method: "bounded_head_then_drain".to_owned(),
         full_output_available: false,
     };
+    let progress = crate::ToolProgressEvidence {
+        completion: if timed_out {
+            crate::ToolCompletionEvidence::TimedOut
+        } else {
+            crate::ToolCompletionEvidence::Completed
+        },
+        stdout: crate::ToolStreamActivity {
+            bytes_observed: stdout_summary.bytes_seen as u64,
+            digest: stdout_summary.digest,
+            complete: stdout_summary.complete,
+        },
+        stderr: crate::ToolStreamActivity {
+            bytes_observed: stderr_summary.bytes_seen as u64,
+            digest: stderr_summary.digest,
+            complete: stderr_summary.complete,
+        },
+        duration_ms: Some(started_at.elapsed().as_millis() as u64),
+        ..Default::default()
+    };
     let payload = build_exec_model_payload_with_stats(
         ExecPayloadInput {
             exit_code: status.code(),
@@ -830,6 +896,7 @@ async fn run_one_shot(
     let ui_text = render_exec_ui_text(&payload);
 
     Ok(OneShotCommandResult {
+        progress,
         success,
         ui_text,
         payload,
@@ -847,6 +914,8 @@ struct StreamReadSummary {
     bytes_seen: usize,
     bytes_retained: usize,
     truncated: bool,
+    digest: [u8; 32],
+    complete: bool,
 }
 
 struct OneShotOutputBudget {
@@ -900,6 +969,7 @@ where
     R: AsyncRead + Unpin,
 {
     let mut summary = StreamReadSummary::default();
+    let mut digest = Sha256::new();
     let mut chunk = [0u8; 4096];
     loop {
         let read = tokio::select! {
@@ -911,10 +981,12 @@ where
             read = reader.read(&mut chunk) => read?,
         };
         if read == 0 {
+            summary.complete = true;
             let _ = send_shell_chunk(&tx, ShellChunkEvent::Closed { stream }, &shutdown).await;
             break;
         }
         summary.bytes_seen = summary.bytes_seen.saturating_add(read);
+        digest.update(&chunk[..read]);
         let (retained, exceeded) = budget.claim(summary.bytes_seen.saturating_sub(read), read);
         if retained > 0 {
             if !send_shell_chunk(
@@ -939,6 +1011,7 @@ where
             }
         }
     }
+    summary.digest = digest.finalize().into();
     Ok(summary)
 }
 
@@ -1370,6 +1443,69 @@ mod tests {
             apply_patch_preflight: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn recursive_policy_denies_tty_one_shot_and_interactive_payload_without_retry() {
+        let handler = UnifiedExecHandler::default();
+        for tty in [false, true] {
+            let mut call = invocation(
+                "exec_command",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({
+                        "command": ["/bin/sh", "-c", "exit 0"], "tty": tty,
+                    }),
+                },
+            );
+            call.execution_security_snapshot
+                .as_mut()
+                .unwrap()
+                .process
+                .command_risk
+                .denied_commands = vec!["rm".into()];
+            let error = match handler.handle(call.clone(), trace("exec_command")).await {
+                Ok(_) => {
+                    panic!("unsupported recursive policy must reject before spawning a session")
+                }
+                Err(error) => error,
+            };
+            assert!(matches!(error, ToolError::Rejected(_)));
+            let outcome = crate::classifier::ErrorClassifier::classify_error(
+                &crate::classifier::DefaultErrorClassifier,
+                &call,
+                &error,
+            );
+            assert_eq!(
+                outcome.status,
+                crate::context::ToolOutcomeStatus::FatalError
+            );
+            assert_eq!(
+                outcome.error_class,
+                Some(crate::context::ToolErrorClass::PermissionDenied)
+            );
+            assert!(!outcome.should_retry);
+            assert!(handler.sessions.lock().await.is_empty());
+        }
+        let mut call = invocation(
+            "write_stdin",
+            ToolPayload::Function {
+                arguments: serde_json::json!({"session_id": 999, "chars": "rm nonexistent-fixture\n"}),
+            },
+        );
+        call.execution_security_snapshot
+            .as_mut()
+            .unwrap()
+            .process
+            .command_risk
+            .allowed_command_families = vec!["sh".into()];
+        let error = match handler.handle(call, trace("write_stdin")).await {
+            Ok(_) => panic!("interactive input must not bypass recursive policy"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, ToolError::Rejected(_)),
+            "policy denial precedes even session lookup"
+        );
     }
 
     fn parse_session_id(output: &str) -> u64 {
@@ -2009,6 +2145,18 @@ mod tests {
             .get("stdout")
             .and_then(serde_json::Value::as_str)
             .expect("stdout should be present");
+        let evidence = output.progress_evidence();
+        assert_eq!(evidence.semantic, crate::ToolSemanticEvidence::Unknown);
+        assert_eq!(
+            Some(evidence.stdout.bytes_observed),
+            payload
+                .pointer("/output_stats/stdout/bytes_seen")
+                .and_then(serde_json::Value::as_u64)
+        );
+        assert!(
+            evidence.stdout.bytes_observed > stdout.len() as u64,
+            "runtime activity counts the physical stream before model truncation"
+        );
         assert!(stdout.len() <= ONE_SHOT_MAX_STREAM_BYTES);
         assert_eq!(
             payload
@@ -2048,6 +2196,46 @@ mod tests {
             one_shot_output_limits(Some(100_000), configured),
             (2_000, 3_000)
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stderr_activity_is_typed_before_the_model_payload_and_remains_semantically_unknown() {
+        let handler = UnifiedExecHandler::default();
+        let output = handler
+            .handle(
+                invocation(
+                    "exec_command",
+                    ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                        command: Some(vec![
+                            "sh".to_owned(),
+                            "-c".to_owned(),
+                            "printf 'owned stderr' >&2".to_owned(),
+                        ]),
+                        workdir: None,
+                        timeout_ms: Some(5_000),
+                        max_output_tokens: None,
+                        yield_time_ms: None,
+                        tty: Some(false),
+                    })),
+                ),
+                trace("exec_command"),
+            )
+            .await
+            .unwrap();
+        let evidence = output.progress_evidence();
+        assert_eq!(evidence.stdout.bytes_observed, 0);
+        assert_eq!(evidence.stderr.bytes_observed, b"owned stderr".len() as u64);
+        assert_eq!(
+            evidence.stderr.digest,
+            <[u8; 32]>::from(Sha256::digest(b"owned stderr"))
+        );
+        assert!(evidence.stderr.complete);
+        assert_eq!(
+            evidence.completion,
+            crate::ToolCompletionEvidence::Completed
+        );
+        assert_eq!(evidence.semantic, crate::ToolSemanticEvidence::Unknown);
     }
 
     #[cfg(unix)]

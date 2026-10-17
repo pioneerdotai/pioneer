@@ -5,7 +5,7 @@ use pioneer_crud::{
     AcceptedAgentSkillCreate, AcceptedAgentSkillRollback, AcceptedAgentSkillUpdate,
     SelfImprovementFinalOutcome, SelfImprovementFrozenSourceRange, SelfImprovementNoChangeReason,
 };
-use pioneer_protocol::{ProviderFailureClass, ProviderFailureStage, SkillId};
+use pioneer_protocol::{ProviderFailureClass, SkillId};
 use pioneer_provider::{
     ChatMessage, ChatRequest, ProviderRegistry, ProviderTermination, ReasoningConfig, TokenUsage,
 };
@@ -91,10 +91,12 @@ impl ModelContractError {
             stage,
             kind: ModelContractErrorKind::Transport,
             reason_code: "provider_transport_failed",
-            provider_failure_class: Some(pioneer_agent::classify_provider_failure_message(
-                format!("{error:#}").as_str(),
-                ProviderFailureStage::Finalize,
-            )),
+            provider_failure_class: Some(
+                pioneer_provider::failure::classify_transport_error(error)
+                    .or_else(|| pioneer_provider::failure::classify_stream_error(error))
+                    .map(|classification| classification.class)
+                    .unwrap_or(ProviderFailureClass::Unknown),
+            ),
             usage: ModelCallUsage {
                 provider_calls: 1,
                 ..ModelCallUsage::default()

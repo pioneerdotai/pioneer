@@ -307,6 +307,7 @@ impl StreamDelta {
 #[derive(Debug, Deserialize)]
 struct StreamError {
     #[serde(default)]
+    #[cfg_attr(not(test), allow(dead_code))] // parsed only; never diagnostic or policy input
     message: Option<String>,
     #[serde(default)]
     code: Option<serde_json::Value>,
@@ -315,6 +316,7 @@ struct StreamError {
 }
 
 impl StreamError {
+    #[cfg(test)]
     fn description(self) -> String {
         let mut parts = Vec::new();
         if let Some(message) = self.message.filter(|message| !message.is_empty()) {
@@ -627,10 +629,10 @@ impl OpenAiCompatibleProvider {
                 .attachments_for_message(message_index)
                 .collect::<Vec<_>>();
             if message.role == Role::Tool && !attachments.is_empty() {
-                let tool_text = if message.content.is_empty() {
+                let tool_text = if message.wire_content_is_empty() {
                     "{}".to_owned()
                 } else {
-                    message.content.clone()
+                    message.wire_content()
                 };
                 rendered.push(Self::build_api_message(
                     "tool",
@@ -742,14 +744,14 @@ impl OpenAiCompatibleProvider {
         provider_name: &str,
     ) -> Result<Option<ApiMessageContent>> {
         if attachments.is_empty() {
-            let text = override_text.unwrap_or_else(|| message.content.clone());
+            let text = override_text.unwrap_or_else(|| message.wire_content());
             if text.is_empty() && message.tool_calls.is_some() {
                 return Ok(None);
             }
             return Ok(Some(ApiMessageContent::Text(text)));
         }
 
-        let text = override_text.unwrap_or_else(|| message.content.clone());
+        let text = override_text.unwrap_or_else(|| message.wire_content());
         let parts = Self::build_parts(text.as_str(), attachments, true, provider_name)?;
         Ok(Some(ApiMessageContent::Parts(parts)))
     }
@@ -818,10 +820,10 @@ impl OpenAiCompatibleProvider {
                 .attachments_for_message(message_index)
                 .collect::<Vec<_>>();
             if msg.role == Role::Tool && !attachments.is_empty() {
-                let tool_text = if msg.content.is_empty() {
+                let tool_text = if msg.wire_content_is_empty() {
                     "{}".to_owned()
                 } else {
-                    msg.content.clone()
+                    msg.wire_content()
                 };
                 result.push(Self::build_api_message(
                     "tool",
@@ -839,7 +841,7 @@ impl OpenAiCompatibleProvider {
             }
 
             if !system_prepended && msg.role == Role::User && !system_prefix.is_empty() {
-                let merged_text = if msg.content.is_empty() {
+                let merged_text = if msg.wire_content_is_empty() {
                     system_prefix.clone()
                 } else {
                     format!("{system_prefix}\n\n{}", msg.content)
@@ -1109,18 +1111,7 @@ impl OpenAiCompatibleProvider {
     }
 
     async fn api_error(&self, response: reqwest::Response) -> anyhow::Error {
-        let status = response.status();
-        let body = match crate::http::read_response_text_bounded(
-            response,
-            16 * 1024,
-            "provider_error_body",
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(error) => return error,
-        };
-        anyhow!("{} API error ({status}): {body}", self.name)
+        crate::failure::http_error(response).await
     }
 }
 
@@ -1238,7 +1229,12 @@ impl OpenAiCompatibleProvider {
                                     .and_then(serde_json::Value::as_u64)
                                     .and_then(|code| u16::try_from(code).ok());
                                 let outcome = crate::failure::native_chat_stream_error(
-                                    &error.description(),
+                                    error
+                                        .code
+                                        .as_ref()
+                                        .and_then(serde_json::Value::as_str)
+                                        .or(error.error_type.as_deref())
+                                        .unwrap_or_default(),
                                     status,
                                 );
                                 let _ = tx.send(Err(outcome)).await;
@@ -1388,7 +1384,8 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
             .json(&api_request);
         let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
-            .await?;
+            .await
+            .map_err(crate::failure::safe_transport_error)?;
 
         if !response.status().is_success() {
             return Err(self.api_error(response).await);
@@ -1499,7 +1496,8 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
         let request_builder = self.authorized_get(&self.models_url());
         let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
-            .await?;
+            .await
+            .map_err(crate::failure::safe_transport_error)?;
 
         if !response.status().is_success() {
             return Err(self.api_error(response).await);

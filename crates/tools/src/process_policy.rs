@@ -64,6 +64,7 @@ pub struct ProcessSpawnPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(not(feature = "computer-use"), allow(dead_code))]
 pub(crate) struct ProcessEnvironmentPlan {
+    execution_profile: pioneer_protocol::TurnProcessExecutionProfile,
     inherit_environment: bool,
     environment: BTreeMap<String, String>,
     removed_environment: Vec<String>,
@@ -79,16 +80,19 @@ impl ProcessEnvironmentPlan {
             // Direct handler/unit tests predate execution snapshots. Product
             // dispatch attaches and validates one before invoking a tool.
             return Self {
+                execution_profile: pioneer_protocol::TurnProcessExecutionProfile::Unrestricted,
                 inherit_environment: true,
                 environment: BTreeMap::new(),
                 removed_environment: Vec::new(),
             };
         };
-        Self::from_policy_with_host_environment(
+        let mut plan = Self::from_policy_with_host_environment(
             &snapshot.process.environment,
             invocation_environment,
             std::env::vars(),
-        )
+        );
+        plan.execution_profile = snapshot.process.execution_profile();
+        plan
     }
 
     fn from_policy_with_host_environment<I>(
@@ -102,10 +106,15 @@ impl ProcessEnvironmentPlan {
         let (inherit_environment, environment, removed_environment) =
             sanitize_environment(policy, invocation_environment, host_environment);
         Self {
+            execution_profile: pioneer_protocol::TurnProcessExecutionProfile::Unrestricted,
             inherit_environment,
             environment,
             removed_environment,
         }
+    }
+
+    pub(crate) fn require_supported_spawn(&self) -> Result<(), ToolError> {
+        require_supported_execution_profile(self.execution_profile)
     }
 
     pub(crate) fn apply_to_std_command(&self, command: &mut std::process::Command) {
@@ -121,6 +130,7 @@ impl ProcessEnvironmentPlan {
     #[cfg(test)]
     pub(crate) fn inherited_for_test() -> Self {
         Self {
+            execution_profile: pioneer_protocol::TurnProcessExecutionProfile::Unrestricted,
             inherit_environment: true,
             environment: BTreeMap::new(),
             removed_environment: Vec::new(),
@@ -256,45 +266,41 @@ fn configure_macos_developer_environment(environment: &mut BTreeMap<String, Stri
     }
 }
 
+// No current native backend restricts descendant executable identities.
+// Reject the capability, not a finite list of interpreter names or syntax.
+const RECURSIVE_COMMAND_POLICY_UNSUPPORTED: &str = "process policy denied command: required recursive command restrictions are unsupported by native process backends";
+
+fn require_supported_execution_profile(
+    profile: pioneer_protocol::TurnProcessExecutionProfile,
+) -> Result<(), ToolError> {
+    use pioneer_protocol::TurnProcessExecutionProfile;
+    match profile {
+        TurnProcessExecutionProfile::Unrestricted => Ok(()),
+        TurnProcessExecutionProfile::Disabled => Err(ToolError::Rejected(
+            "process policy denied shell command: shell execution is disabled".into(),
+        )),
+        TurnProcessExecutionProfile::RequiredRecursive => Err(ToolError::Rejected(
+            RECURSIVE_COMMAND_POLICY_UNSUPPORTED.into(),
+        )),
+    }
+}
+
+pub(crate) fn require_supported_process_execution(
+    snapshot: &TurnExecutionSecuritySnapshot,
+) -> Result<(), ToolError> {
+    require_supported_execution_profile(snapshot.process.execution_profile())
+}
+
 fn enforce_process_policy(
     snapshot: &TurnExecutionSecuritySnapshot,
-    command: &[String],
+    _command: &[String],
 ) -> Result<(), ToolError> {
-    if !snapshot.process.shell.enabled {
-        return Err(ToolError::Rejected(
-            "process policy denied shell command: shell execution is disabled".to_owned(),
-        ));
-    }
+    require_supported_process_execution(snapshot)?;
     if snapshot.permission_profile.effective_policy.shell_command == PermissionBehavior::Deny {
         return Err(ToolError::Rejected(
             "process policy denied shell command by turn permission profile".to_owned(),
         ));
     }
-
-    let executable = command
-        .first()
-        .map(|value| value.as_str())
-        .unwrap_or_default();
-    if command_matches_any(executable, &snapshot.process.command_risk.denied_commands) {
-        return Err(ToolError::Rejected(format!(
-            "process policy denied command `{executable}`"
-        )));
-    }
-    if !snapshot
-        .process
-        .command_risk
-        .allowed_command_families
-        .is_empty()
-        && !command_matches_any(
-            executable,
-            &snapshot.process.command_risk.allowed_command_families,
-        )
-    {
-        return Err(ToolError::Rejected(format!(
-            "process policy denied command `{executable}` outside allowed command families"
-        )));
-    }
-
     Ok(())
 }
 
@@ -368,20 +374,6 @@ fn env_denied(policy: &TurnEnvironmentPolicy, name: &str) -> bool {
         .denied_patterns
         .iter()
         .any(|pattern| policy_pattern_matches(pattern, name))
-}
-
-fn command_matches_any(command: &str, patterns: &[String]) -> bool {
-    patterns
-        .iter()
-        .any(|pattern| command_matches(pattern.as_str(), command))
-}
-
-fn command_matches(pattern: &str, command: &str) -> bool {
-    let command_name = Path::new(command)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or(command);
-    policy_pattern_matches(pattern, command) || policy_pattern_matches(pattern, command_name)
 }
 
 fn policy_pattern_matches(pattern: &str, value: &str) -> bool {
@@ -489,6 +481,107 @@ mod tests {
             )],
             1,
         )
+    }
+
+    #[test]
+    fn recursive_restrictions_reject_every_arbitrary_launcher_before_filesystem_or_spawn() {
+        let root = Path::new("/pioneer-recursive-policy-fixture-must-not-exist");
+        for risk in [
+            TurnCommandRiskPolicy {
+                denied_commands: vec!["rm".into()],
+                allowed_command_families: vec![],
+            },
+            TurnCommandRiskPolicy {
+                denied_commands: vec![],
+                allowed_command_families: vec!["sh".into(), "python".into(), "make".into()],
+            },
+            TurnCommandRiskPolicy {
+                denied_commands: vec![" ".into()],
+                allowed_command_families: vec![],
+            },
+        ] {
+            let mut snapshot = workspace_write_snapshot(root);
+            snapshot.process.command_risk = risk;
+            snapshot.sandbox.tmp.writable_roots = vec![root.to_string_lossy().into_owned()];
+            let cold: TurnExecutionSecuritySnapshot =
+                serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+            assert_eq!(
+                cold.process.execution_profile(),
+                pioneer_protocol::TurnProcessExecutionProfile::RequiredRecursive
+            );
+            for command in [
+                vec!["/bin/rm", "nonexistent-policy-fixture"],
+                vec!["/bin/sh", "-c", "rm nonexistent-policy-fixture"],
+                vec![
+                    "python",
+                    "-c",
+                    "import subprocess; subprocess.run(['rm','nonexistent-policy-fixture'])",
+                ],
+                vec![
+                    "node",
+                    "-e",
+                    "require('child_process').spawn('rm',['nonexistent-policy-fixture'])",
+                ],
+                vec!["env", "rm", "nonexistent-policy-fixture"],
+                vec!["make", "arbitrary_build_target"],
+                vec!["./script_with_shebang"],
+                vec!["./renamed_interpreter", "arbitrary payload"],
+                vec!["./custom_binary_capable_of_spawning_children"],
+                vec!["/symlink/to/allowed_binary"],
+                vec!["sh_basename_collision"],
+            ] {
+                let error = build_process_spawn_plan_with_host_environment(
+                    Some(&cold),
+                    root,
+                    &exec_args(&command),
+                    &BTreeMap::new(),
+                    BTreeMap::<String, String>::new(),
+                    60_000,
+                )
+                .unwrap_err();
+                assert!(
+                    matches!(error, ToolError::Rejected(ref message) if message == RECURSIVE_COMMAND_POLICY_UNSUPPORTED),
+                    "no argv spelling, script or wrapper establishes recursive proof: {command:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn accepted_process_profile_survives_cold_restore_without_reinterpreting_default_policy() {
+        let mut original = workspace_write_snapshot(Path::new("/tmp/accepted-process-profile"));
+        assert_eq!(
+            original.process.execution_profile(),
+            pioneer_protocol::TurnProcessExecutionProfile::Unrestricted
+        );
+        original.process.command_risk.denied_commands = vec!["rm".into()];
+        let frozen = serde_json::to_vec(&original).unwrap();
+        original.process.command_risk = Default::default();
+        let cold: TurnExecutionSecuritySnapshot = serde_json::from_slice(&frozen).unwrap();
+        assert_eq!(
+            cold.process.execution_profile(),
+            pioneer_protocol::TurnProcessExecutionProfile::RequiredRecursive
+        );
+        assert!(matches!(
+            require_supported_process_execution(&cold),
+            Err(ToolError::Rejected(_))
+        ));
+        let mut disabled = cold;
+        disabled.process.shell.enabled = false;
+        assert_eq!(
+            disabled.process.execution_profile(),
+            pioneer_protocol::TurnProcessExecutionProfile::Disabled
+        );
+        assert!(matches!(
+            require_supported_process_execution(&disabled),
+            Err(ToolError::Rejected(_))
+        ));
+        let legacy_empty: TurnCommandRiskPolicy = serde_json::from_str("{}").unwrap();
+        original.process.command_risk = legacy_empty;
+        assert_eq!(
+            original.process.execution_profile(),
+            pioneer_protocol::TurnProcessExecutionProfile::Unrestricted
+        );
     }
 
     #[test]

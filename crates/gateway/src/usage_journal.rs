@@ -112,8 +112,27 @@ impl Provider for JournalProvider {
     fn authority_fingerprint(&self) -> Option<&str> {
         self.inner.authority_fingerprint()
     }
+    fn resolved_azure_connection(&self) -> Option<pioneer_provider::AzureResolvedConnection> {
+        self.inner.resolved_azure_connection()
+    }
     fn capabilities(&self) -> ProviderCapabilities {
         self.inner.capabilities()
+    }
+    fn capture_model_contract_with_limit(
+        &self,
+        model: &str,
+        limit: usize,
+    ) -> anyhow::Result<pioneer_provider::AcceptedProviderModelContract> {
+        self.inner.capture_model_contract_with_limit(model, limit)
+    }
+    fn model_catalog_for_request(
+        &self,
+        model: &str,
+    ) -> anyhow::Result<Arc<pioneer_provider::catalog::ModelCatalog>> {
+        self.inner.model_catalog_for_request(model)
+    }
+    fn model_tool_support(&self, model: &str) -> pioneer_provider::ModelToolSupport {
+        self.inner.model_tool_support(model)
     }
     fn model_tool_calling(&self, model: &str) -> bool {
         self.inner.model_tool_calling(model)

@@ -25,6 +25,11 @@ impl crate::traits::Provider for EchoProvider {
         "echo"
     }
 
+    fn model_tool_support(&self, _model: &str) -> crate::ModelToolSupport {
+        // This deterministic adapter owns its entire simulated model protocol.
+        crate::ModelToolSupport::Supported
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             streaming: true,

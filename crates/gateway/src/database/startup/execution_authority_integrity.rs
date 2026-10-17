@@ -3,7 +3,7 @@ use pioneer_crud::CrudStore;
 use pioneer_protocol::{PrincipalId, TurnStatus};
 use tracing::{info, warn};
 
-const SCAN_BATCH: u64 = 10_000;
+const SCAN_BATCH: u64 = pioneer_crud::MAX_EXECUTION_AUTHORITY_PAGE_ROWS;
 const QUARANTINE_REASON: &str =
     "execution quarantined: mandatory authority envelope is missing or invalid";
 
@@ -24,6 +24,7 @@ async fn run_with_batch_size(store: &CrudStore, batch_size: u64) -> Result<Integ
     if batch_size == 0 {
         bail!("execution authority integrity scan requires a non-zero batch size");
     }
+    let batch_size = batch_size.min(pioneer_crud::MAX_EXECUTION_AUTHORITY_PAGE_ROWS);
     let mut quarantined = 0_u64;
     let mut scanned = 0_u64;
     let mut after_turn_id = None;
@@ -148,7 +149,7 @@ async fn validate_record(
     record
         .authority_envelope_json
         .as_deref()
-        .context("active execution has no authority envelope")?;
+        .context("active execution authority envelope is unavailable")?;
     crate::authorization::ExecutionAuthorizationContext::load_for_turn(
         store,
         record.turn_id.as_str(),
@@ -177,7 +178,7 @@ fn validate_task_record(record: &pioneer_crud::ActiveTaskExecutionAuthorityRecor
     let encoded = record
         .authority_envelope_json
         .as_deref()
-        .context("active Agent Task has no authority envelope")?;
+        .context("active Agent Task authority envelope is unavailable")?;
     let context = crate::authorization::ExecutionAuthorizationContext::from_persisted_json(encoded)
         .context("active Agent Task authority envelope is invalid")?;
 
@@ -289,6 +290,7 @@ mod tests {
             "turn-authority-f",
             "turn-authority-g",
             "turn-authority-h",
+            "turn-authority-i",
         ] {
             store
                 .materialize_turn_start(
@@ -477,13 +479,28 @@ mod tests {
             .expect("Task execution admission fixture should persist");
         }
 
-        // A batch size of two forces the test to cross the same keyset boundary
-        // that the production 10k-page scan uses.
-        let summary = run_with_batch_size(&store, 2)
+        // An oversized legacy row after the first bounded page must be
+        // quarantined without transferring its payload or hiding later rows.
+        store
+            .database_connection()
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "UPDATE \"turn\" SET execution_authorization_context_json=? WHERE id=?",
+                [
+                    "é".repeat(pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES / 2 + 1)
+                        .into(),
+                    "turn-authority-i".into(),
+                ],
+            ))
+            .await
+            .expect("legacy oversized authority fixture");
+        // A wider request is clamped to the same reader quantum. The scan
+        // must still process the second page and all Task records.
+        let summary = run_with_batch_size(&store, u64::MAX)
             .await
             .expect("integrity gate should complete");
-        assert_eq!(summary.scanned, 12);
-        assert_eq!(summary.quarantined, 10);
+        assert_eq!(summary.scanned, 13);
+        assert_eq!(summary.quarantined, 11);
 
         let valid = store
             .get_turn(thread_id, "turn-authority-a")
@@ -501,6 +518,7 @@ mod tests {
             "turn-authority-f",
             "turn-authority-g",
             "turn-authority-h",
+            "turn-authority-i",
         ] {
             let quarantined = store
                 .get_turn(thread_id, turn_id)

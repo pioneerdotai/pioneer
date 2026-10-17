@@ -3523,14 +3523,45 @@ impl pioneer_tasks::TaskExecutor for FailingSystemExecutor {
     }
 }
 
+// These admission fixtures select OpenAI while using deterministic Echo work.
+// Keep the adapter identity aligned with the selected registry authority.
+pub(super) struct OpenAiEchoProvider;
+
+#[async_trait]
+impl Provider for OpenAiEchoProvider {
+    fn name(&self) -> &str {
+        "openai"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        EchoProvider::new().capabilities()
+    }
+
+    fn model_tool_support(&self, model: &str) -> pioneer_provider::ModelToolSupport {
+        EchoProvider::new().model_tool_support(model)
+    }
+
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        EchoProvider::new().chat(request).await
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        EchoProvider::new().stream_chat(request).await
+    }
+}
+
 fn test_provider() -> Arc<pioneer_provider::ProviderRegistry> {
     Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
-        Arc::new(EchoProvider::new()),
+        Arc::new(OpenAiEchoProvider),
     ))
 }
 
 struct SequencedToolProvider {
+    name: &'static str,
     requests: std::sync::Mutex<Vec<ChatRequest>>,
     first_tool_calls: Vec<ProviderToolCall>,
     tool_call_rounds: Option<Vec<Vec<ProviderToolCall>>>,
@@ -3585,19 +3616,30 @@ struct MemoryAgentE2eProvider {
 }
 
 struct DelayedProvider {
+    name: &'static str,
     delay: Duration,
     text: String,
 }
 
 struct CancellationBarrierProvider {
+    name: &'static str,
     entered: Arc<Notify>,
     release: Arc<Notify>,
 }
 
 #[async_trait::async_trait]
 impl Provider for CancellationBarrierProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
-        "delayed"
+        self.name
     }
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
@@ -3609,7 +3651,10 @@ impl Provider for CancellationBarrierProvider {
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
-    async fn chat(&self, _request: ChatRequest) -> anyhow::Result<ChatResponse> {
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        if is_turn_preflight_request(&request) {
+            return Ok(test_turn_preflight_response_with_visible_tools(&[]));
+        }
         self.entered.notify_one();
         self.release.notified().await;
         Ok(ChatResponse {
@@ -3684,6 +3729,7 @@ impl pioneer_sqlite::SqliteWriteObserver for NativeSchedulingObserver {
 }
 
 struct PreflightCaptureProvider {
+    name: &'static str,
     text: String,
     requests: std::sync::Mutex<Vec<ChatRequest>>,
 }
@@ -3722,6 +3768,8 @@ struct FlakyTitleProvider {
 struct GuardAwareProvider {
     requests: std::sync::Mutex<Vec<ChatRequest>>,
     next_index: AtomicUsize,
+    child_entered: Notify,
+    release_premature_final: Notify,
 }
 
 struct CreateThenHangProvider {
@@ -3731,8 +3779,17 @@ struct CreateThenHangProvider {
 
 #[async_trait::async_trait]
 impl Provider for DelayedProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
-        "delayed"
+        self.name
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -3775,8 +3832,17 @@ impl Provider for DelayedProvider {
 
 #[async_trait::async_trait]
 impl Provider for RevisionProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
-        "revision"
+        "openai"
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -3850,8 +3916,17 @@ impl RevisionProvider {
 
 #[async_trait::async_trait]
 impl Provider for RevisionHangingProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
-        "revision-hanging"
+        "openai"
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -3942,8 +4017,17 @@ impl RevisionHangingProvider {
 
 #[async_trait::async_trait]
 impl Provider for CountingDelayedProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
-        "counting-delayed"
+        "openai"
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -4002,7 +4086,7 @@ impl CountingDelayedProvider {
 impl CaptureSummaryProvider {
     fn new(text: impl Into<String>) -> Self {
         Self {
-            name: "capture-summary".into(),
+            name: "openai".into(),
             pause_first: std::sync::atomic::AtomicBool::new(false),
             first_delay_ms: std::sync::atomic::AtomicUsize::new(0),
             release_first: Notify::new(),
@@ -4062,9 +4146,15 @@ impl CaptureSummaryProvider {
 impl PreflightCaptureProvider {
     fn new(text: impl Into<String>) -> Self {
         Self {
+            name: "openai",
             text: text.into(),
             requests: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    fn named(mut self, name: &'static str) -> Self {
+        self.name = name;
+        self
     }
 
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
@@ -4130,6 +4220,15 @@ impl ConcurrentComposerHistoryProvider {
 
 #[async_trait::async_trait]
 impl Provider for CaptureSummaryProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -4275,8 +4374,17 @@ impl Provider for CaptureSummaryProvider {
 
 #[async_trait::async_trait]
 impl Provider for PreflightCaptureProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
-        "preflight-capture"
+        self.name
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -4319,6 +4427,15 @@ impl Provider for PreflightCaptureProvider {
 
 #[async_trait::async_trait]
 impl Provider for PromptParityCaptureProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "openai"
     }
@@ -4409,8 +4526,17 @@ impl Provider for PromptParityCaptureProvider {
 
 #[async_trait::async_trait]
 impl Provider for HangingChildProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
-        "hanging-child"
+        "openai"
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -4454,8 +4580,17 @@ impl Provider for HangingChildProvider {
 
 #[async_trait::async_trait]
 impl Provider for ConcurrentComposerHistoryProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
-        "concurrent-composer-history"
+        "openai"
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -4521,8 +4656,17 @@ impl Provider for ConcurrentComposerHistoryProvider {
 
 #[async_trait::async_trait]
 impl Provider for FlakyTitleProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
-        "flaky-title"
+        "openai"
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -4583,8 +4727,17 @@ impl FlakyTitleProvider {
 
 #[async_trait::async_trait]
 impl Provider for GuardAwareProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
-        "guard-aware"
+        "parent"
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -4617,15 +4770,8 @@ impl Provider for GuardAwareProvider {
             });
         }
         if is_child_task_request(&request) {
-            sleep(Duration::from_secs(10)).await;
-            return Ok(ChatResponse {
-                text: "slow child".to_owned(),
-                usage: None,
-                reasoning_content: None,
-                provider_replay_state: None,
-                termination: pioneer_provider::ProviderTermination::Complete,
-                tool_calls: Vec::new(),
-            });
+            self.child_entered.notify_one();
+            return futures_util::future::pending::<anyhow::Result<ChatResponse>>().await;
         }
 
         self.requests
@@ -4650,14 +4796,10 @@ impl Provider for GuardAwareProvider {
                     .to_string(),
                 }],
             },
-            1 => ChatResponse {
-                text: "premature final".to_owned(),
-                usage: None,
-                reasoning_content: None,
-                provider_replay_state: None,
-                termination: pioneer_provider::ProviderTermination::Complete,
-                tool_calls: Vec::new(),
-            },
+            1 => {
+                self.release_premature_final.notified().await;
+                text_response("premature final")
+            }
             2 => {
                 let task_id = extract_task_id_from_messages(&request.messages)
                     .unwrap_or_else(|| "missing_task_id".to_owned());
@@ -4708,6 +4850,8 @@ impl GuardAwareProvider {
         Self {
             requests: std::sync::Mutex::new(Vec::new()),
             next_index: AtomicUsize::new(0),
+            child_entered: Notify::new(),
+            release_premature_final: Notify::new(),
         }
     }
 
@@ -4721,8 +4865,17 @@ impl GuardAwareProvider {
 
 #[async_trait::async_trait]
 impl Provider for CreateThenHangProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
-        "create-then-hang"
+        "parent"
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -5528,6 +5681,7 @@ async fn assert_memory_hook_subscription(
 impl SequencedToolProvider {
     fn new(first_tool_calls: Vec<ProviderToolCall>, second_text: impl Into<String>) -> Self {
         Self {
+            name: "openai",
             requests: std::sync::Mutex::new(Vec::new()),
             first_tool_calls,
             tool_call_rounds: None,
@@ -5535,6 +5689,16 @@ impl SequencedToolProvider {
             next_index: AtomicUsize::new(0),
             native_file_provider: None,
         }
+    }
+
+    fn new_named(
+        name: &'static str,
+        first_tool_calls: Vec<ProviderToolCall>,
+        second_text: impl Into<String>,
+    ) -> Self {
+        let mut provider = Self::new(first_tool_calls, second_text);
+        provider.name = name;
+        provider
     }
 
     fn with_tool_call_rounds(mut self, rounds: Vec<Vec<ProviderToolCall>>) -> Self {
@@ -5655,6 +5819,15 @@ impl VerticalSelfImprovementProvider {
 
 #[async_trait::async_trait]
 impl Provider for VerticalSelfImprovementProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "learning"
     }
@@ -5746,8 +5919,17 @@ impl VerticalUnfinishedSiblingProvider {
 
 #[async_trait::async_trait]
 impl Provider for VerticalUnfinishedSiblingProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
-        "vertical-unfinished-sibling"
+        "vertical-sibling"
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -5800,6 +5982,15 @@ impl Provider for VerticalUnfinishedSiblingProvider {
 
 #[async_trait::async_trait]
 impl Provider for VerticalCollaborativeSourceProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "source"
     }
@@ -5906,6 +6097,15 @@ impl VerticalReadSkillProvider {
 
 #[async_trait::async_trait]
 impl Provider for VerticalReadSkillProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "native"
     }
@@ -6004,6 +6204,15 @@ impl MemoryAgentE2eProvider {
 
 #[async_trait::async_trait]
 impl Provider for MemoryAgentE2eProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         self.name
     }
@@ -6131,15 +6340,20 @@ fn canonical_provider_messages_for_artifact_parity(
             let Some(_artifact) = attachment.artifact.as_ref() else {
                 continue;
             };
-            let pioneer_provider::AttachmentDataSource::Path { path } = &attachment.source else {
-                continue;
+            // Native ownership uses immutable bytes; CLI keeps its readable copy.
+            // Across roots parity remains the exact hash, not artifact handles.
+            let bytes = match &attachment.source {
+                pioneer_provider::AttachmentDataSource::Path { path } => {
+                    std::fs::read(path).expect("CLI parity copy")
+                }
+                pioneer_provider::AttachmentDataSource::Bytes { base64_data } => {
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD
+                        .decode(base64_data)
+                        .expect("native owned parity bytes")
+                }
+                _ => continue,
             };
-
-            // Artifact resolution deliberately creates a fresh per-turn staging path. Exact
-            // root isolation also requires distinct handles when equivalent bytes are attached
-            // from independent roots, so provider parity is defined by verified content here.
-            let bytes =
-                std::fs::read(path).expect("materialized parity artifact should be readable");
             let sha256 = hex::encode(Sha256::digest(bytes.as_slice()));
             if let Some(expected_sha256) = attachment.sha256.as_deref() {
                 assert_eq!(
@@ -6554,10 +6768,42 @@ fn is_child_task_main_request(request: &ChatRequest) -> bool {
     request.compiled_prompt.is_some() && is_child_task_request(request)
 }
 
+fn fixture_skill_wire_name(name: &str) -> String {
+    if name.starts_with("skill.") {
+        use sha2::Digest;
+        format!(
+            "p1v1{}",
+            &hex::encode(sha2::Sha256::digest(name.as_bytes()))[..60]
+        )
+    } else {
+        name.to_owned()
+    }
+}
+
+fn fixture_wire_tool_calls(calls: &[ProviderToolCall]) -> Vec<ProviderToolCall> {
+    calls
+        .iter()
+        .cloned()
+        .map(|mut call| {
+            call.name = fixture_skill_wire_name(&call.name);
+            call
+        })
+        .collect()
+}
+
 #[async_trait::async_trait]
 impl Provider for SequencedToolProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
-        "sequenced-tools"
+        self.name
     }
 
     fn native_file_tool_capability(
@@ -6608,7 +6854,7 @@ impl Provider for SequencedToolProvider {
                 reasoning_content: None,
                 provider_replay_state: None,
                 termination: pioneer_provider::ProviderTermination::ToolCalls,
-                tool_calls: tool_calls.clone(),
+                tool_calls: fixture_wire_tool_calls(tool_calls),
             });
         }
         if index == 0 {
@@ -6618,12 +6864,16 @@ impl Provider for SequencedToolProvider {
                 pioneer_provider::ProviderTermination::ToolCalls
             };
             return Ok(ChatResponse {
-                text: String::new(),
+                text: if self.first_tool_calls.is_empty() {
+                    self.second_text.clone()
+                } else {
+                    String::new()
+                },
                 usage: None,
                 reasoning_content: None,
                 provider_replay_state: None,
                 termination,
-                tool_calls: self.first_tool_calls.clone(),
+                tool_calls: fixture_wire_tool_calls(&self.first_tool_calls),
             });
         }
 
@@ -6654,6 +6904,15 @@ impl Provider for SequencedToolProvider {
 
 #[async_trait::async_trait]
 impl Provider for DirectAgentSandboxProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "direct-agent-sandbox"
     }
@@ -9034,6 +9293,7 @@ fn test_summary_config() -> super::summary::SummaryConfig {
 pub(super) fn test_tool_loop_config() -> ToolLoopConfig {
     let web = GatewayWebToolsConfig::default();
     ToolLoopConfig {
+        no_progress_mode: pioneer_tools::ToolNoProgressMode::Enforce,
         provider: pioneer_provider::ProviderTimeoutPolicy::default(),
         preflight: pioneer_agent::PreflightLoopConfig::default(),
         web: WebToolsConfig {
@@ -11384,6 +11644,27 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             timeout(Duration::from_secs(5), provider.first_started.notified())
                 .await
                 .expect("Task A provider request should start");
+            assert_eq!(
+                wait_for_turn_status(
+                    crud_store.clone(),
+                    parent_thread_id,
+                    turn_id,
+                    TurnStatus::Completed
+                )
+                .await,
+                TurnStatus::Completed,
+                "the Composer message must complete while its child owns the pending work"
+            );
+            assert!(
+                crud_store
+                    .get_turn(parent_thread_id, turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .error
+                    .is_none()
+            );
         } else {
             timeout(Duration::from_secs(5), provider.second_started.notified())
                 .await
@@ -12741,6 +13022,7 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "delayed",
         Arc::new(CancellationBarrierProvider {
+            name: "delayed",
             entered: provider_entered.clone(),
             release: provider_release,
         }),
@@ -13659,11 +13941,13 @@ async fn turn_start_with_artifact_input_materializes_user_message_attachment_and
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let capture_provider = Arc::new(CaptureSummaryProvider::new("artifact answer"));
+    let capture_provider =
+        Arc::new(CaptureSummaryProvider::new("artifact answer").with_native_attachments());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         capture_provider.clone(),
     ));
+    discover_native_capture_models(&provider_registry, workspace_id.as_str()).await;
     let processor = MessageProcessor::new(
         thread_manager,
         provider_registry,
@@ -13743,6 +14027,25 @@ async fn turn_start_with_artifact_input_materializes_user_message_attachment_and
                 && resolved.display_name == "report.txt"
     ));
 
+    let original_bindings = crud_store
+        .get_artifact_summary(&workspace_id, &artifact.artifact_id, None)
+        .await
+        .unwrap()
+        .bindings;
+    assert_eq!(original_bindings.len(), 1);
+    let repeated = processor
+        .user_message_payload_from_input_resolved(
+            workspace_id.as_str(),
+            &thread.thread.id,
+            turn_id,
+            &super::user_message_item_id(turn_id),
+            &serde_json::from_value::<Vec<UserInput>>(request["params"]["input"].clone()).unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repeated.0, text);
+    assert_eq!(repeated.1, attachments);
     let summary = crud_store
         .get_artifact_summary(&workspace_id, &artifact.artifact_id, None)
         .await
@@ -13753,6 +14056,7 @@ async fn turn_start_with_artifact_input_materializes_user_message_attachment_and
         .filter(|binding| binding.binding_kind == pioneer_protocol::ArtifactBindingKind::UserInput)
         .collect::<Vec<_>>();
     assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].binding_id, original_bindings[0].binding_id);
     assert_eq!(
         bindings[0].thread_id.as_deref(),
         Some(thread.thread.id.as_str())
@@ -13777,7 +14081,12 @@ async fn turn_start_with_artifact_input_materializes_user_message_attachment_and
             if file.name.as_deref() == Some("report.txt")
                 && file.mime_type == "text/plain"
                 && file.size_bytes == Some(14)
-                && matches!(file.source, pioneer_provider::AttachmentDataSource::Path { .. })
+                && matches!(&file.source, pioneer_provider::AttachmentDataSource::Bytes { base64_data }
+                    if base64_data == "aGVsbG8gYXJ0aWZhY3Q=")
+                && file.artifact.as_ref().is_some_and(|accepted| {
+                    accepted.artifact_id == artifact.artifact_id
+                        && accepted.artifact_version_id == artifact.version_id
+                })
     ));
 }
 
@@ -14106,6 +14415,25 @@ async fn followup_history_rejects_unavailable_accepted_artifact_before_provider(
         .expect("blocked artifact follow-up should remain queryable")
         .expect("blocked artifact follow-up should be persisted")
         .1;
+    if second_status != TurnStatus::Blocked {
+        eprintln!(
+            "missing historical artifact diagnostic: actor={:?}; owner={:?}; cancellation_generation={:?}",
+            processor
+                .agent_manager
+                .observe_turn(&thread.thread.id, second_turn_id)
+                .await,
+            processor
+                .crud_store
+                .get_turn_execution(second_turn_id)
+                .await,
+            processor
+                .crud_store
+                .native_cancellation_context(second_turn_id)
+                .await
+                .unwrap()
+                .map(|c| c.preparation.runtime_generation)
+        );
+    }
     assert_eq!(
         second_status,
         TurnStatus::Blocked,
@@ -14127,6 +14455,35 @@ async fn followup_history_rejects_unavailable_accepted_artifact_before_provider(
         )
     );
     assert!(error.contains("context preparation failed"));
+    assert_eq!(
+        processor
+            .crud_store
+            .get_turn_execution(second_turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        pioneer_crud::TurnExecutionStatus::Blocked,
+        "pre-start unavailability must close the same execution aggregate"
+    );
+    assert!(
+        processor
+            .crud_store
+            .find_unresolved_recovery_job_for_turn(second_turn_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "unavailable accepted history must not leave an unstartable retry job"
+    );
+    assert!(
+        processor
+            .crud_store
+            .native_cancellation_context(second_turn_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a pre-dispatch failure must not manufacture an executed native context"
+    );
     assert_eq!(
         capture_provider.snapshot_requests().len(),
         1,
@@ -20550,6 +20907,7 @@ fn review_enabled_child_completion_creates_pending_candidate_without_finalizing_
 
 async fn review_enabled_child_completion_creates_pending_candidate_without_finalizing_run_impl() {
     let provider = Arc::new(DelayedProvider {
+        name: "openai",
         delay: Duration::from_millis(0),
         text: r#"<task_result>{"summary":"ready for parent review","data":{"answer":"ok"}}</task_result>"#
             .to_owned(),
@@ -20942,6 +21300,7 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
     inject_queue_failure: bool,
 ) {
     let provider = Arc::new(DelayedProvider {
+        name: "openai",
         delay: Duration::from_millis(0),
         text: r#"<task_result>{"summary":"ready for user approval","data":{"answer":"ok"}}</task_result>"#
             .to_owned(),
@@ -21692,6 +22051,7 @@ async fn task_revise_dispatch_failure_blocks_revision_turn_and_run_impl() {
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         Arc::new(DelayedProvider {
+            name: "openai",
             delay: Duration::from_millis(0),
             text: r#"<task_result>{"summary":"needs revision","data":{"ok":false}}</task_result>"#
                 .to_owned(),
@@ -21970,6 +22330,7 @@ fn review_enabled_invalid_result_creates_extraction_failed_candidate() {
 
 async fn review_enabled_invalid_result_creates_extraction_failed_candidate_impl() {
     let provider = Arc::new(DelayedProvider {
+        name: "openai",
         delay: Duration::from_millis(0),
         text: "plain text that does not satisfy required json".to_owned(),
     });
@@ -22076,6 +22437,7 @@ fn waiting_review_cancel_cancels_candidate_locks_and_no_delivery() {
 
 async fn waiting_review_cancel_cancels_candidate_locks_and_no_delivery_impl() {
     let provider = Arc::new(DelayedProvider {
+        name: "openai",
         delay: Duration::from_millis(0),
         text: r#"<task_result>{"summary":"cancel me","data":{"answer":"ok"}}</task_result>"#
             .to_owned(),
@@ -22241,6 +22603,7 @@ fn parent_cancel_attached_subtree_cancels_waiting_review_candidate() {
 
 async fn parent_cancel_attached_subtree_cancels_waiting_review_candidate_body() {
     let provider = Arc::new(DelayedProvider {
+        name: "openai",
         delay: Duration::from_millis(0),
         text: r#"<task_result>{"summary":"child waits for review"}</task_result>"#.to_owned(),
     });
@@ -22350,6 +22713,7 @@ fn waiting_review_detach_is_blocked_and_candidate_stays_active() {
 
 async fn waiting_review_detach_is_blocked_and_candidate_stays_active_impl() {
     let provider = Arc::new(DelayedProvider {
+        name: "openai",
         delay: Duration::from_millis(0),
         text: r#"<task_result>{"summary":"do not detach yet"}</task_result>"#.to_owned(),
     });
@@ -22890,106 +23254,37 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
     let running_window = running_window
         .expect("running child window should load")
         .expect("hanging child should have an active execution window");
-    let runtime_window_id = running_window.metadata_json["runtimeWindowId"]
-        .as_str()
-        .expect("active child window should preserve its runtime id")
-        .to_owned();
-    let runtime_window_index = running_window.window_index;
-    initial_processor
-        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowExhausted {
-            notification: pioneer_protocol::TurnExecutionWindowExhaustedNotification {
-                workspace_id: workspace_id.clone(),
-                thread_id: lineage.child_thread_id.clone(),
-                turn_id: lineage.child_turn_id.clone(),
-                window_id: runtime_window_id.clone(),
-                window_index: runtime_window_index,
-                status: ExecutionWindowStatus::Exhausted,
-                exhaustion_reason: ExecutionWindowExhaustionReason::MaxToolCallsPerWindow,
-                limit: 3,
-                observed: 3,
-                agent_round_count: 2,
-                tool_call_count: 3,
-                provider_token_count: None,
-                started_at_unix_ms: 1_000,
-                exhausted_at_unix_ms: 2_000,
-                reason: "max_tool_calls_per_window".to_owned(),
-            },
-        })
-        .await;
-    let checkpoint_payload = pioneer_protocol::build_execution_checkpoint_payload(
-        workspace_id.clone(),
-        lineage.child_thread_id.clone(),
-        lineage.child_turn_id.clone(),
-        pioneer_protocol::ExecutionCheckpointOriginalRequestSummary {
-            input_count: 1,
-            text_preview: Some("Recovered hidden preflight child".to_owned()),
-            text_truncated: false,
-            attachment_count: 0,
-            attachment_kinds: Vec::new(),
-        },
-        pioneer_protocol::ExecutionCheckpointWindowSummary {
-            window_id: Some(runtime_window_id.clone()),
-            window_index: runtime_window_index,
-            started_at_unix_ms: Some(1_000),
-            completed_at_unix_ms: Some(2_000),
-            agent_round_count: 2,
-            tool_call_count: 3,
-            provider_token_count: None,
-            exhaustion_reason: Some(ExecutionWindowExhaustionReason::MaxToolCallsPerWindow),
-        },
-        pioneer_protocol::ExecutionCheckpointProviderBudgetSummary {
-            model: Some("test-model".to_owned()),
-            model_provider: Some("openai".to_owned()),
-            agent_round_count: 2,
-            tool_call_count: 3,
-            provider_token_count: None,
-            provider_usage_available: false,
-            exhaustion_reason: Some(ExecutionWindowExhaustionReason::MaxToolCallsPerWindow),
-            exhausted_limit: Some(3),
-            exhausted_observed: Some(3),
-        },
-        pioneer_protocol::ExecutionCheckpointToolSummary {
-            requested_count: 3,
-            executed_count: 2,
-            unexecuted_count: 1,
-            total_count: 3,
-            succeeded_count: 1,
-            failed_count: 1,
-            in_progress_count: 0,
-            detail_limit: 0,
-            details_truncated: false,
-            details: Vec::new(),
-        },
-        Vec::new(),
-    );
-    let checkpoint_payload_bytes = serde_json::to_vec(&checkpoint_payload)
-        .expect("checkpoint payload should serialize")
-        .len() as u64;
-    initial_processor
-        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowCheckpointed {
-            notification: pioneer_protocol::TurnExecutionWindowCheckpointedNotification {
-                workspace_id: workspace_id.clone(),
-                thread_id: lineage.child_thread_id.clone(),
-                turn_id: lineage.child_turn_id.clone(),
-                window_id: runtime_window_id,
-                window_index: runtime_window_index,
-                status: ExecutionWindowStatus::Checkpointed,
-                checkpoint_id: "task_recovery_checkpoint_1".to_owned(),
-                checkpoint_kind: "window_exhausted".to_owned(),
-                payload_bytes: checkpoint_payload_bytes,
-                created_at_unix_ms: 2_050,
-            },
-            payload: checkpoint_payload,
-        })
-        .await;
+    assert_eq!(running_window.status, ExecutionWindowStatus::Running);
+    let accepted_checkpoint = crud_store
+        .native_semantic_checkpoint_for_turn(&lineage.child_turn_id)
+        .await
+        .unwrap()
+        .expect("the live child must persist its semantic state before dispatch");
+    let accepted_payload: pioneer_protocol::ExecutionCheckpointPayload =
+        serde_json::from_value(accepted_checkpoint.payload_json).unwrap();
+    assert!(accepted_payload.native_semantic_state.is_some());
+    assert!(accepted_payload.window.progress.is_some());
+    assert_eq!(accepted_payload.tools.executed_count, 0);
+    let accepted_input: Vec<UserInput> = serde_json::from_str(&child_snapshot.input_json).unwrap();
     assert!(
-        crud_store
-            .latest_turn_execution_checkpoint_for_turn(lineage.child_turn_id.as_str())
-            .await
-            .expect("latest checkpoint should load")
-            .is_some(),
-        "startup recovery fixture should persist a child execution checkpoint"
+        accepted_input
+            .iter()
+            .any(|input| matches!(input, UserInput::Text { text, .. }
+        if text.contains("Recovered hidden preflight child")))
     );
+    let expected_original =
+        pioneer_protocol::build_execution_checkpoint_original_request_summary(&accepted_input);
+    assert_eq!(accepted_payload.original_request, expected_original);
+    let initial_phase = child_snapshot.initial_phase_json.clone();
+    assert!(initial_phase.is_some());
+    // Close the controlled pause from its real accepted state and receipts.
+    // Startup consumes that closed boundary, preserving mutable state and the
+    // completed initial phase instead of replacing them with legacy defaults.
+    initial_processor
+        .agent_manager
+        .remove_thread(&lineage.child_thread_id)
+        .await;
+    close_paused_native_fixture_window(&initial_processor, &lineage.child_turn_id).await;
     let stale_at = super::now_timestamp_secs().saturating_sub(120);
     crud_store
         .mark_execution_running(execution.id.as_str(), stale_at, Some(stale_at))
@@ -23006,13 +23301,6 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
             .await
             .expect("child Turn execution lease should be made stale")
     );
-    // Model an actual process restart. Leaving the original hanging agent loop
-    // alive would create two in-memory owners for the same durable Turn and
-    // turn this recovery test into an unsupported split-brain race.
-    initial_processor
-        .agent_manager
-        .remove_thread(lineage.child_thread_id.as_str())
-        .await;
     let recovery_provider = Arc::new(PreflightCaptureProvider::new(
         "recovered hidden child completed",
     ));
@@ -23031,6 +23319,15 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         test_tool_loop_config(),
     ));
     recovery_processor.bind_task_bridge().await;
+    // A fresh facade's local service revision is not the original durable
+    // cancellation generation. Continuing the Turn must preserve the latter.
+    for _ in 0..32 {
+        recovery_processor
+            .agent_manager
+            .set_memory_provider(None)
+            .await;
+    }
+
     recovery_processor
         .task_runtime
         .start()
@@ -23068,6 +23365,24 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         .load_execution_for_run(run.id.as_str())
         .await
         .expect("diagnostic execution lookup should succeed");
+    if recovered_task_status != TaskStatus::Completed {
+        eprintln!(
+            "cold child restore diagnostic: actor={:?}; window={:?}; owner={:?}; cancellation_generation={:?}",
+            recovery_processor
+                .agent_manager
+                .observe_turn(&lineage.child_thread_id, &lineage.child_turn_id)
+                .await,
+            crud_store
+                .latest_turn_execution_window(&lineage.child_turn_id)
+                .await,
+            crud_store.get_turn_execution(&lineage.child_turn_id).await,
+            crud_store
+                .native_cancellation_context(&lineage.child_turn_id)
+                .await
+                .unwrap()
+                .map(|c| c.preparation.runtime_generation)
+        );
+    }
     assert_eq!(
         recovered_task_status,
         pioneer_protocol::TaskStatus::Completed,
@@ -23102,19 +23417,26 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
     assert_eq!(recovered_execution.id, execution.id);
 
     let requests = recovery_provider.snapshot_requests();
-    let preflight_pos = requests
-        .iter()
-        .position(is_turn_preflight_request)
-        .expect("recovered hidden child task should call preflight");
+    assert!(
+        requests
+            .iter()
+            .all(|request| !is_turn_preflight_request(request)),
+        "restoring the same semantic Turn must not repeat completed preflight"
+    );
+    if let Some(snapshot) = crud_store
+        .get_turn_runtime_snapshot(&lineage.child_turn_id)
+        .await
+        .unwrap()
+    {
+        assert_eq!(
+            snapshot.initial_phase_json, initial_phase,
+            "recovery must preserve accepted initial preparation until terminal cleanup"
+        );
+    }
     let child_main_pos = requests
         .iter()
         .position(is_child_task_main_request)
-        .expect("recovered hidden child task should call main provider after prompt compile");
-    assert!(
-        preflight_pos < child_main_pos,
-        "recovered hidden child task preflight must run before the restored main child provider request"
-    );
-    assert!(requests[preflight_pos].compiled_prompt.is_none());
+        .expect("recovered hidden child must call main with its restored prompt");
     assert!(requests[child_main_pos].compiled_prompt.is_some());
     let restored_prompt = requests[child_main_pos]
         .compiled_prompt
@@ -23132,11 +23454,22 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
             .contains("Completed window: index=1"),
         "restored child prompt should include checkpoint window facts"
     );
+    let preview_suffix = if expected_original.text_truncated {
+        " (truncated)"
+    } else {
+        ""
+    };
+    let expected_preview = format!(
+        "Original request preview{preview_suffix}: {}",
+        expected_original
+            .text_preview
+            .as_deref()
+            .expect("actual child input has text")
+            .trim()
+    );
     assert!(
-        restored_prompt
-            .full_system_text
-            .contains("Original request preview: Recovered hidden preflight child"),
-        "restored child prompt should include checkpoint original request facts"
+        restored_prompt.full_system_text.contains(&expected_preview),
+        "restored child prompt should include the exact accepted child request preview"
     );
     let recovered_main_request = &requests[child_main_pos];
     assert!(
@@ -25232,6 +25565,29 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
         [pioneer_provider::MessageContentPart::File { file }]
             if file.name.as_deref() == Some("launch-context.txt")
     ));
+    let [pioneer_provider::MessageContentPart::File { file }] =
+        user_message.content_parts.as_slice()
+    else {
+        panic!("exact composer File required");
+    };
+    let pioneer_provider::AttachmentDataSource::Bytes { base64_data } = &file.source else {
+        panic!("Task provider input must own accepted bytes, never a mutable Path");
+    };
+    use base64::Engine as _;
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(base64_data)
+            .unwrap(),
+        b"hello artifact"
+    );
+    assert_eq!(
+        file.artifact.as_ref().unwrap().artifact_id,
+        artifact.artifact_id
+    );
+    assert_eq!(
+        file.artifact.as_ref().unwrap().artifact_version_id,
+        artifact.version_id
+    );
     let compiled_prompt = main_request
         .compiled_prompt
         .as_ref()
@@ -29005,10 +29361,26 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
         ));
         processor.release_completed_history_preparation_barrier();
         let starts = wait_for_cli_runtime_turn_starts(&cli_session, 1).await;
+        let admission_failure = if starts.len() != 1 {
+            Some((
+                crud_store
+                    .get_task_run(&run.id)
+                    .await
+                    .unwrap()
+                    .map(|run| (run.status, run.error)),
+                crud_store
+                    .get_turn(&lineage.child_thread_id, &lineage.child_turn_id)
+                    .await
+                    .unwrap()
+                    .map(|(_, turn)| (turn.status, turn.error)),
+            ))
+        } else {
+            None
+        };
         assert_eq!(
             starts.len(),
             1,
-            "{runtime_id} Task must dispatch exactly one native turn"
+            "{runtime_id} Task must dispatch exactly one native turn; admission={admission_failure:?}"
         );
         assert_eq!(
             cli_session.mcp_preparations.lock().await.as_slice(),
@@ -31460,6 +31832,12 @@ async fn legacy_cli_input_mapping_cannot_prove_a_later_message_edit_impl() {
             provider_name: "cli_runtime:codex".to_owned(),
             reasoning_effort: None,
             agent_skill_versions_json: None,
+            provider_model_contract_json: None,
+            initial_phase_json: None,
+            ordinary_skill_catalog_json: Some(
+                r#"{"schema_version":1,"catalog":{"version":0,"generated_at_unix":0,"skills":[]}}"#
+                    .into(),
+            ),
             hook_runtime_context_json: "{}".to_owned(),
             workspace_skill_policies_json: "[]".to_owned(),
             input_json: r#"[{"type":"text","text":"ORIGINAL LEGACY INPUT","textElements":[]}]"#
@@ -32858,10 +33236,14 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
     // Independently indexed live recall can differ between the two executions.
     harness
         .processor
-        .apply_thread_episodic_runtime_config(crate::thread_episodic::ThreadEpisodicRuntimeConfig {
-            recall_enabled: false,
-            ..Default::default()
-        })
+        .apply_thread_episodic_runtime_config(
+            crate::thread_episodic_runtime_config_from_gateway_config(
+                &pioneer_config::GatewayThreadEpisodicConfig {
+                    recall_enabled: false,
+                    ..Default::default()
+                },
+            ),
+        )
         .await;
     harness.processor.bind_task_bridge().await;
     harness.processor.start_task_event_listener().await;
@@ -33047,6 +33429,17 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
 
     let direct_main = single_prompt_parity_request(&direct_requests, PromptParityRequestKind::Main);
     let child_main = single_prompt_parity_request(&child_requests, PromptParityRequestKind::Main);
+    for request in [direct_main, child_main] {
+        assert!(
+            !request
+                .compiled_prompt
+                .as_ref()
+                .expect("parity main request must have a compiled prompt")
+                .full_system_text
+                .contains("Relevant thread context:"),
+            "fixed-history parity must disable live episodic recall on both routes"
+        );
+    }
     let lineage = wait_for_child_lineage_for_run(
         harness.crud_store.clone(),
         task.run
@@ -33143,10 +33536,14 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
     // can index a current user message for one route before the other starts.
     harness
         .processor
-        .apply_thread_episodic_runtime_config(crate::thread_episodic::ThreadEpisodicRuntimeConfig {
-            recall_enabled: false,
-            ..Default::default()
-        })
+        .apply_thread_episodic_runtime_config(
+            crate::thread_episodic_runtime_config_from_gateway_config(
+                &pioneer_config::GatewayThreadEpisodicConfig {
+                    recall_enabled: false,
+                    ..Default::default()
+                },
+            ),
+        )
         .await;
     harness.processor.bind_task_bridge().await;
     harness.processor.start_task_event_listener().await;
@@ -33578,6 +33975,17 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
 
     let direct_main = single_prompt_parity_request(&direct_requests, PromptParityRequestKind::Main);
     let child_main = single_prompt_parity_request(&child_requests, PromptParityRequestKind::Main);
+    for request in [direct_main, child_main] {
+        assert!(
+            !request
+                .compiled_prompt
+                .as_ref()
+                .expect("parity main request must have a compiled prompt")
+                .full_system_text
+                .contains("Relevant thread context:"),
+            "fixed-history parity must disable live episodic recall on both routes"
+        );
+    }
     let direct_main = canonical_main_request_execution_thread_for_parity(
         direct_main,
         direct_parent_thread_id,
@@ -33630,7 +34038,7 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
     for expected_tool in [
         "task_create",
         "read_skill",
-        dynamic_skill_tool_name.as_str(),
+        fixture_skill_wire_name(&dynamic_skill_tool_name).as_str(),
         "mcp_resend_send",
     ] {
         assert!(
@@ -33933,7 +34341,7 @@ async fn task_agent_without_explicit_model_or_provider_is_rejected() {
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
-        Arc::new(EchoProvider::new()),
+        Arc::new(OpenAiEchoProvider),
     ));
     let processor = Arc::new(MessageProcessor::new(
         thread_manager,
@@ -34043,7 +34451,8 @@ fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissions() {
 }
 
 async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissions_body() {
-    let provider = Arc::new(SequencedToolProvider::new(
+    let provider = Arc::new(SequencedToolProvider::new_named(
+        "nested",
         vec![
             ProviderToolCall {
                 id: "call_create_nested_subagent".to_owned(),
@@ -34276,7 +34685,8 @@ async fn supervised_native_task_grant_reaches_the_real_child_sandbox_side_effect
     std::fs::write(source.as_path(), "approved Task child\n")
         .expect("Task source fixture should write");
 
-    let provider = Arc::new(SequencedToolProvider::new(
+    let provider = Arc::new(SequencedToolProvider::new_named(
+        "supervised-task-native",
         vec![ProviderToolCall {
             id: "call_supervised_task_shell".to_owned(),
             name: "exec_command".to_owned(),
@@ -35073,7 +35483,8 @@ fn task_list_inside_child_turn_hides_its_execution_wrapper() {
 }
 
 async fn task_list_inside_child_turn_hides_its_execution_wrapper_impl() {
-    let provider = Arc::new(SequencedToolProvider::new(
+    let provider = Arc::new(SequencedToolProvider::new_named(
+        "task-list-child",
         vec![ProviderToolCall {
             id: "call_list_from_task_execution".to_owned(),
             name: "task_list".to_owned(),
@@ -35158,6 +35569,7 @@ async fn task_detach_updates_lifecycle_policy_impl() {
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         Arc::new(DelayedProvider {
+            name: "openai",
             delay: Duration::from_secs(10),
             text: "delayed result".to_owned(),
         }),
@@ -35240,7 +35652,11 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let provider = Arc::new(SequencedToolProvider::new(Vec::new(), "done"));
+    let provider = Arc::new(SequencedToolProvider::new_named(
+        "parent",
+        Vec::new(),
+        "done",
+    ));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "parent",
         provider.clone(),
@@ -35336,7 +35752,11 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         "review-disabled Phase 3 must not expose review/approval tools"
     );
 
-    let chat_provider = Arc::new(SequencedToolProvider::new(Vec::new(), "done"));
+    let chat_provider = Arc::new(SequencedToolProvider::new_named(
+        "parent",
+        Vec::new(),
+        "done",
+    ));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "parent",
         chat_provider.clone(),
@@ -35716,7 +36136,8 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
         "idempotencyKey": "same-task-create-key"
     })
     .to_string();
-    let provider = Arc::new(SequencedToolProvider::new(
+    let provider = Arc::new(SequencedToolProvider::new_named(
+        "parent",
         vec![
             ProviderToolCall {
                 id: "call_task_create_idem_1".to_owned(),
@@ -36910,21 +37331,13 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
         let thread_manager = Arc::new(ThreadManager::new("test-model", "parent"));
-        let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+        let (_database_directory, workspace_manager, crud_store, workspace_id) =
+            setup_pooled_file_workspace_manager().await;
         let provider = Arc::new(GuardAwareProvider::new());
         let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
             "parent",
             provider.clone(),
         ));
-        provider_registry
-            .insert(
-                "delayed",
-                Arc::new(DelayedProvider {
-                    delay: Duration::from_secs(10),
-                    text: "slow child".to_owned(),
-                }),
-            )
-            .expect("delayed provider should fit the bounded test registry");
         let processor = Arc::new(MessageProcessor::new(
             thread_manager,
             provider_registry,
@@ -36948,6 +37361,85 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
             "parent",
         )
         .await;
+        // A stable running child cannot finish on its own. The parent must
+        // durably wait, then resume only after a real domain control changes
+        // that same Task; elapsed fixture time is not progress.
+        let control_processor = processor.clone();
+        let control_provider = provider.clone();
+        let detach_control = tokio::spawn(async move {
+            timeout(Duration::from_secs(20), async {
+                control_provider.child_entered.notified().await;
+                let task_id = loop {
+                    let requests = control_provider.snapshot_requests();
+                    if let Some(task_id) = requests
+                        .get(1)
+                        .and_then(|request| extract_task_id_from_messages(&request.messages))
+                    {
+                        break task_id;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                };
+                assert_eq!(
+                    wait_for_task_status(
+                        control_processor.crud_store.clone(),
+                        &task_id,
+                        TaskStatus::Running
+                    )
+                    .await,
+                    TaskStatus::Running
+                );
+                control_provider.release_premature_final.notify_one();
+                loop {
+                    let checkpoint = control_processor
+                        .crud_store
+                        .native_semantic_checkpoint_for_turn("turn_task_guard_parent")
+                        .await
+                        .unwrap();
+                    if let Some(checkpoint) = checkpoint {
+                        let payload: pioneer_protocol::ExecutionCheckpointPayload =
+                            serde_json::from_value(checkpoint.payload_json).unwrap();
+                        if payload
+                            .native_semantic_state
+                            .as_ref()
+                            .and_then(|state| state.get("attached_task_wait"))
+                            .is_some_and(|wait| !wait.is_null())
+                        {
+                            break;
+                        }
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(
+                    control_provider.snapshot_requests().len(),
+                    2,
+                    "an unchanged pending Task must not cause a provider busy loop"
+                );
+                assert_eq!(
+                    control_processor
+                        .crud_store
+                        .get_turn("thr_task_guard_parent", "turn_task_guard_parent")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .1
+                        .status,
+                    TurnStatus::InProgress,
+                    "the guard must reject the premature final answer"
+                );
+                let detached = detach_task_for_test(
+                    &control_processor,
+                    pioneer_protocol::TaskDetachParams { task_id },
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    detached.task.lifecycle_policy.unwrap().attachment,
+                    TaskAttachmentMode::Detached
+                );
+            })
+            .await
+            .expect("real Task detach must wake the durable parent wait");
+        });
         let mut observed_notifications = Vec::new();
         let parent_completed = timeout(Duration::from_secs(30), async {
             loop {
@@ -37064,6 +37556,9 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
             }
         };
         assert_eq!(completed.turn.status, TurnStatus::Completed);
+        detach_control
+            .await
+            .expect("Task control driver should finish");
 
         let requests = provider.snapshot_requests();
         assert!(
@@ -37077,15 +37572,27 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
                 .any(|message| { message.tool_call_id.as_deref() == Some("call_guard_create") }),
             "the task_create tool result must reach the premature final round"
         );
+        let created_task_id = extract_task_id_from_messages(&requests[1].messages)
+            .expect("the real task_create result should identify its task");
         assert!(
             requests[2..].iter().any(|request| {
-                request.messages.iter().any(|message| {
-                    message
-                        .content
-                        .contains("Attached tasks created by this turn")
+                request.compiled_prompt.as_ref().is_some_and(|prompt| {
+                    prompt.full_system_text.contains(
+                        pioneer_protocol::NativeHostDirective::AwaitAttachedTasks.instruction(),
+                    )
+                }) && request.messages.iter().any(|message| {
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
+                    else {
+                        return false;
+                    };
+                    value.pointer("/observation/origin") == Some(&json!("task_service"))
+                        && value.pointer("/observation/trust") == Some(&json!("untrusted"))
+                        && value.pointer("/observation/value/pendingCount") == Some(&json!(1))
+                        && value.pointer("/observation/value/tasks/0/taskId")
+                            == Some(&json!(&created_task_id))
                 })
             }),
-            "guard observation should be model-visible"
+            "the fixed guard directive and exact untrusted pending Task observation should be model-visible"
         );
         assert!(
             requests[3]
@@ -37141,6 +37648,11 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
         assert!(
             !task.runs.is_empty(),
             "the detached child Task must retain its run"
+        );
+        assert_eq!(
+            task.task.status,
+            TaskStatus::Running,
+            "parent completion must follow real detachment while the same child remains active"
         );
         cancel_task_for_test(
             &processor,
@@ -37278,6 +37790,7 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() 
         .insert(
             "delayed",
             Arc::new(DelayedProvider {
+                name: "delayed",
                 delay: Duration::from_secs(10),
                 text: "slow child".to_owned(),
             }),
@@ -40211,6 +40724,7 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
             attachment_kinds: Vec::new(),
         },
         pioneer_protocol::ExecutionCheckpointWindowSummary {
+            progress: None,
             window_id: Some("runtime_win_1".to_owned()),
             window_index: 1,
             started_at_unix_ms: Some(1_000),
@@ -40798,6 +41312,7 @@ async fn terminal_turn_completion_closes_running_execution_window() {
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
             error: "stale failure".to_owned(),
+            failure: None,
             recovery: None,
         })
         .await
@@ -40895,6 +41410,7 @@ async fn agent_turn_failed_without_recovery_opens_runtime_recovery() {
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
             error: "provider failed".to_owned(),
+            failure: Some(pioneer_protocol::NativeFailureMetadata::runtime()),
             recovery: None,
         })
         .await;
@@ -40926,6 +41442,67 @@ async fn agent_turn_failed_without_recovery_opens_runtime_recovery() {
             .as_deref()
             .unwrap_or("")
             .contains("provider failed")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn permanent_native_failure_commits_terminal_without_runtime_recovery() {
+    let thread_id = "thr_native_permanent";
+    let turn_id = "turn_native_permanent";
+    let (processor, crud_store, _) = setup_execution_window_terminal_turn(thread_id, turn_id).await;
+    let event = AgentDurableEvent::TurnFailed {
+        thread_id: thread_id.into(),
+        turn_id: turn_id.into(),
+        error: "execution contract rejected".into(),
+        failure: Some(pioneer_protocol::NativeFailureMetadata::execution(
+            pioneer_protocol::TurnFailureDisposition::Permanent,
+        )),
+        recovery: None,
+    };
+    let restored: AgentDurableEvent =
+        serde_json::from_value(serde_json::to_value(event).unwrap()).unwrap();
+    processor.handle_durable_agent_event(restored).await;
+    let (_, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(turn.status, TurnStatus::Failed);
+    assert!(
+        crud_store
+            .find_recovery_jobs_by_turn_and_status(turn_id, RecoveryJobStatus::Pending)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_failure_without_disposition_blocks_without_inferred_retry() {
+    let thread_id = "thr_native_unknown";
+    let turn_id = "turn_native_unknown";
+    let (processor, crud_store, _) = setup_execution_window_terminal_turn(thread_id, turn_id).await;
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnFailed {
+            thread_id: thread_id.into(),
+            turn_id: turn_id.into(),
+            error: "503 connection reset retry-after: 2".into(),
+            failure: None,
+            recovery: None,
+        })
+        .await;
+    let (_, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(turn.status, TurnStatus::Blocked);
+    assert!(
+        crud_store
+            .find_recovery_jobs_by_turn_and_status(turn_id, RecoveryJobStatus::Pending)
+            .await
+            .unwrap()
+            .is_empty()
     );
 }
 
@@ -46993,6 +47570,7 @@ async fn cli_runtime_turn_start_blocker_rejects_active_cli_binding() {
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         Arc::new(DelayedProvider {
+            name: "openai",
             delay: Duration::from_secs(30),
             text: "late".to_owned(),
         }),
@@ -47321,6 +47899,7 @@ async fn cli_runtime_stale_silent_running_binding_schedules_recovery_impl() {
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         Arc::new(DelayedProvider {
+            name: "openai",
             delay: Duration::from_secs(30),
             text: "late".to_owned(),
         }),
@@ -47637,6 +48216,7 @@ fn cli_runtime_reconciliation_preserves_active_turn_and_repairs_missed_terminal_
         let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
             "openai",
             Arc::new(DelayedProvider {
+                name: "openai",
                 delay: Duration::from_secs(30),
                 text: "late".to_owned(),
             }),
@@ -48490,6 +49070,7 @@ async fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl() {
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         Arc::new(DelayedProvider {
+            name: "openai",
             delay: Duration::from_secs(30),
             text: "late".to_owned(),
         }),
@@ -48863,6 +49444,7 @@ async fn turn_cancel_clears_codex_goal_and_interrupts_latest_execution_segment()
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "delayed",
         Arc::new(DelayedProvider {
+            name: "delayed",
             delay: Duration::from_secs(30),
             text: "late".to_owned(),
         }),
@@ -54585,9 +55167,38 @@ async fn command_heartbeats_keep_default_policy_alive_for_four_hours() {
         heartbeat_at = started_at
             .saturating_add(hour.saturating_mul(60 * 60))
             .saturating_sub(hour);
+        let before = turn_item_attempt::Entity::find()
+            .filter(turn_item_attempt::Column::TurnId.eq("codex-turn-command"))
+            .filter(turn_item_attempt::Column::ItemId.eq("codex-item-four-hour-command"))
+            .one(&crud_store.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
         processor
             .timeout_supervisor
             .heartbeat_item_attempt(
+                "codex-turn-command",
+                "codex-item-four-hour-command",
+                TurnItemType::CommandExecution,
+                heartbeat_at,
+            )
+            .await
+            .unwrap();
+        let owner_only = turn_item_attempt::Entity::find()
+            .filter(turn_item_attempt::Column::TurnId.eq("codex-turn-command"))
+            .filter(turn_item_attempt::Column::ItemId.eq("codex-item-four-hour-command"))
+            .one(&crud_store.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            owner_only.hard_deadline_at, before.hard_deadline_at,
+            "hour {hour}: an owner lease cannot advance a command work horizon"
+        );
+        assert_eq!(owner_only.idle_deadline_at, before.idle_deadline_at);
+        processor
+            .timeout_supervisor
+            .heartbeat_item_attempt_from_confirmed_external_activity(
                 "codex-turn-command",
                 "codex-item-four-hour-command",
                 TurnItemType::CommandExecution,
@@ -55628,7 +56239,7 @@ fn agents_doc_turn_without_doc_omits_agents_md_prompt_section() {
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
         let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
         let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-        let capture_provider = Arc::new(CaptureSummaryProvider::new("ok"));
+        let capture_provider = Arc::new(CaptureSummaryProvider::new("ok").named("capture-summary"));
         let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
             "capture-summary",
             capture_provider.clone(),
@@ -55718,7 +56329,7 @@ fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
         let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
         let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-        let capture_provider = Arc::new(CaptureSummaryProvider::new("ok"));
+        let capture_provider = Arc::new(CaptureSummaryProvider::new("ok").named("capture-summary"));
         let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
             "capture-summary",
             capture_provider.clone(),
@@ -55925,8 +56536,141 @@ fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
     });
 }
 
+// Only for the two controlled restart fixtures: callers have removed the actor
+// while their provider barrier prevents any response/tool execution. Acknowledge
+// its charged dispatch receipt without inventing semantic state or a fresh guard.
+async fn close_paused_native_fixture_window(processor: &MessageProcessor, turn: &str) {
+    let store = &processor.crud_store;
+    let window = store
+        .latest_turn_execution_window(turn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(window.status, ExecutionWindowStatus::Running);
+    let checkpoint = store
+        .native_semantic_checkpoint_for_turn(turn)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut payload: pioneer_protocol::ExecutionCheckpointPayload =
+        serde_json::from_value(checkpoint.payload_json).unwrap();
+    assert_eq!(payload.tools.executed_count, 0);
+    let state = payload
+        .native_semantic_state
+        .as_mut()
+        .expect("real accepted semantic state");
+    assert_eq!(state["post_turn_tool_events"].as_array().unwrap().len(), 0);
+    assert_eq!(state["controls"]["retained"].as_array().unwrap().len(), 0);
+    let revision = state["checkpoint_revision"].as_u64().unwrap();
+    state["checkpoint_revision"] = json!(revision.checked_add(1).unwrap());
+    let (rounds, tokens, available) = store
+        .summarize_execution_window_provider_usage(turn, window.window_index)
+        .await
+        .unwrap();
+    payload.window.agent_round_count = std::cmp::max(payload.window.agent_round_count, rounds);
+    payload.provider_budget.agent_round_count = payload.window.agent_round_count;
+    payload.window.provider_token_count = Some(std::cmp::max(
+        payload.window.provider_token_count.unwrap_or(0),
+        tokens,
+    ));
+    payload.provider_budget.provider_token_count = payload.window.provider_token_count;
+    payload.provider_budget.provider_usage_available = available;
+    payload.native_event_frontier = None;
+    let owner = store.get_turn_execution(turn).await.unwrap().unwrap();
+    let cancellation = store
+        .native_cancellation_context(turn)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .commit_native_semantic_checkpoint(
+            payload.clone(),
+            None,
+            cancellation.preparation.runtime_generation,
+            processor.turn_execution_owner_id.as_ref(),
+            owner.owner_generation,
+        )
+        .await
+        .unwrap();
+    let accepted = store
+        .native_semantic_checkpoint_for_turn(turn)
+        .await
+        .unwrap()
+        .unwrap();
+    let completed_at = chrono::Utc::now().fixed_offset();
+    payload.window.completed_at_unix_ms = Some(completed_at.timestamp_millis());
+    payload.window.exhaustion_reason =
+        Some(ExecutionWindowExhaustionReason::RuntimeShutdownContinuation);
+    store
+        .checkpoint_native_running_window_for_recovery(
+            &window,
+            &accepted,
+            pioneer_crud::NewTurnExecutionCheckpointRecord {
+                id: None,
+                window_id: window.id.clone(),
+                workspace_id: window.workspace_id.clone(),
+                thread_id: window.thread_id.clone(),
+                turn_id: turn.to_owned(),
+                checkpoint_kind: pioneer_crud::TurnExecutionCheckpointKind::StartupRecovery,
+                payload_json: serde_json::to_value(&payload).unwrap(),
+                created_at: completed_at,
+            },
+            pioneer_crud::TurnExecutionWindowStatsRecord {
+                agent_round_count: payload.window.agent_round_count,
+                tool_call_count: 0,
+                provider_token_count: payload.window.provider_token_count.unwrap_or(0),
+                metadata_json: window.metadata_json.clone(),
+                completed_at,
+                updated_at: completed_at,
+            },
+            ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
+            processor.turn_execution_owner_id.as_ref(),
+            owner.owner_generation,
+        )
+        .await
+        .unwrap();
+}
+
+pub(super) async fn ensure_test_native_snapshot_owner(
+    processor: &MessageProcessor,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+) {
+    use sea_orm::{ActiveModelTrait, Set};
+    if processor
+        .crud_store
+        .get_turn_execution(turn)
+        .await
+        .unwrap()
+        .is_some()
+    {
+        return;
+    }
+    let now = chrono::Utc::now().fixed_offset();
+    pioneer_entity::turn_execution::ActiveModel {
+        turn_id: Set(turn.into()),
+        thread_id: Set(thread.into()),
+        workspace_id: Set(workspace.into()),
+        executor_kind: Set("native_agent".into()),
+        executor_key: Set(None),
+        status: Set("starting".into()),
+        owner_id: Set(processor.turn_execution_owner_id.to_string()),
+        owner_generation: Set(1),
+        lease_until: Set(now + chrono::Duration::minutes(1)),
+        heartbeat_at: Set(now),
+        started_at: Set(None),
+        completed_at: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&processor.crud_store.database_connection())
+    .await
+    .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn agent_skill_snapshot_failure_retries_the_gateway_path_without_overlay() {
+async fn agent_skill_snapshot_failure_preserves_overlay_and_retries_identical_payload() {
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let session_manager = Arc::new(SessionManager::new());
@@ -55952,11 +56696,18 @@ async fn agent_skill_snapshot_failure_retries_the_gateway_path_without_overlay()
         .await
         .expect("conditional Agent pin failure trigger must install");
 
-    let turn_id = "turn_agent_pin_fail_soft";
+    let turn_id = "turn_agent_pin_fail_closed";
     ensure_test_superuser_execution_turn(
         &processor,
         workspace_id.as_str(),
-        "thread_agent_pin_fail_soft",
+        "thread_agent_pin_fail_closed",
+        turn_id,
+    )
+    .await;
+    ensure_test_native_snapshot_owner(
+        &processor,
+        &workspace_id,
+        "thread_agent_pin_fail_closed",
         turn_id,
     )
     .await;
@@ -55978,9 +56729,32 @@ async fn agent_skill_snapshot_failure_retries_the_gateway_path_without_overlay()
         text_elements: Vec::new(),
     }];
 
+    // This storage-fault scenario admits o4-mini; the generic execution
+    // fixture's test-model grant must be rebound before testing that write.
+    let encoded = crud_store
+        .get_turn_execution_authorization_context(turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut authority =
+        crate::authorization::ExecutionAuthorizationContext::from_persisted_json(&encoded).unwrap();
+    authority.bind_test_provider_authority(
+        "openai",
+        "o4-mini",
+        processor
+            .provider_registry
+            .authority_fingerprint_for_workspace(&workspace_id, "openai")
+            .unwrap()
+            .as_str(),
+    );
+    crud_store
+        .set_turn_execution_authorization_context(turn_id, &authority.to_persisted_json().unwrap())
+        .await
+        .unwrap();
+    let accepted_overlay = overlay.clone();
     processor
         .persist_turn_runtime_snapshot_with_optional_agent_overlay(
-            "thread_agent_pin_fail_soft",
+            "thread_agent_pin_fail_closed",
             workspace_id.as_str(),
             turn_id,
             ThreadMode::Agent,
@@ -55995,24 +56769,70 @@ async fn agent_skill_snapshot_failure_retries_the_gateway_path_without_overlay()
             &runtime_environment,
             &[],
             &mut overlay,
+            &pioneer_skills::SkillCatalogSnapshot {
+                version: 0,
+                generated_at_unix: 0,
+                skills: Vec::new(),
+            },
             None,
         )
         .await
-        .expect("optional Agent pin failure must preserve the base Gateway turn path");
+        .expect_err("required Agent pin persistence failure must abort preparation");
 
-    assert!(
-        overlay.is_empty(),
-        "the caller must receive the same base-only overlay used by the persisted snapshot"
+    assert_eq!(
+        overlay, accepted_overlay,
+        "persistence failure cannot weaken accepted skills"
     );
+    assert!(
+        crud_store
+            .get_turn_runtime_snapshot(turn_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    crud_store
+        .database_connection()
+        .execute_unprepared("DROP TRIGGER reject_gateway_agent_pin_snapshot")
+        .await
+        .unwrap();
+    processor
+        .persist_turn_runtime_snapshot_with_optional_agent_overlay(
+            "thread_agent_pin_fail_closed",
+            workspace_id.as_str(),
+            turn_id,
+            ThreadMode::Agent,
+            &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+            "o4-mini",
+            "openai",
+            None,
+            &workspace_skill_policies,
+            input.as_slice(),
+            &[],
+            &[],
+            &runtime_environment,
+            &[],
+            &mut overlay,
+            &pioneer_skills::SkillCatalogSnapshot {
+                version: 0,
+                generated_at_unix: 0,
+                skills: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .expect("same payload may be retried after the transient storage fault clears");
+
+    assert_eq!(overlay, accepted_overlay);
     let snapshot = crud_store
         .get_turn_runtime_snapshot(turn_id)
         .await
-        .expect("base-only runtime snapshot lookup must succeed")
-        .expect("base-only runtime snapshot must be authoritative");
-    assert!(
-        snapshot.agent_skill_versions_json.is_none(),
-        "the fail-soft retry must not retain a partial Agent pin"
-    );
+        .unwrap()
+        .unwrap();
+    let restored =
+        crate::turn_runtime_snapshot::agent_skill_version_pins_from_snapshot(&snapshot).unwrap();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].version_id, overlay[0].version_id);
+    assert_eq!(restored[0].fingerprint, overlay[0].fingerprint);
 }
 
 async fn persist_agent_skill_snapshot_for_resolution_test(
@@ -56040,6 +56860,7 @@ async fn persist_agent_skill_snapshot_for_resolution_tests(
     entries: &[AgentSkillRuntimeEntry],
 ) {
     ensure_test_superuser_execution_turn(processor, workspace_id, thread_id, turn_id).await;
+    ensure_test_native_snapshot_owner(processor, workspace_id, thread_id, turn_id).await;
     bind_test_execution_skill_grants(
         processor,
         turn_id,
@@ -56061,7 +56882,7 @@ async fn persist_agent_skill_snapshot_for_resolution_tests(
             turn_id,
             ThreadMode::Agent,
             &pioneer_agent::AgentTurnHookRuntimeContext::default(),
-            "o4-mini",
+            "test-model",
             "openai",
             None,
             &workspace_skill_policies,
@@ -56071,6 +56892,11 @@ async fn persist_agent_skill_snapshot_for_resolution_tests(
             &runtime_environment,
             &[],
             &mut overlay,
+            &pioneer_skills::SkillCatalogSnapshot {
+                version: 0,
+                generated_at_unix: 0,
+                skills: Vec::new(),
+            },
             None,
         )
         .await
@@ -56485,6 +57311,7 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
         let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
             "openai",
             Arc::new(CancellationBarrierProvider {
+                name: "openai",
                 entered: provider_entered.clone(),
                 release: provider_release,
             }),
@@ -56492,7 +57319,9 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
         // Preflight runs before manifest compilation and window registration.
         // Let it finish through its own provider so the barrier gates only the
         // main response, after the actor's durable startup events have ACKed.
-        let preflight_provider = Arc::new(PreflightCaptureProvider::new("unexpected main request"));
+        let preflight_provider = Arc::new(
+            PreflightCaptureProvider::new("unexpected main request").named("preflight-capture"),
+        );
         provider_registry
             .insert("preflight-capture", preflight_provider.clone())
             .expect("preflight provider should fit the bounded test registry");
@@ -56994,11 +57823,13 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
     let release = Arc::new(Notify::new());
     let provider: Arc<dyn Provider> = if busy_native {
         Arc::new(CancellationBarrierProvider {
+            name: "delayed",
             entered: entered.clone(),
             release: release.clone(),
         })
     } else {
         Arc::new(DelayedProvider {
+            name: "delayed",
             delay: Duration::from_secs(30),
             text: "too late".to_owned(),
         })
@@ -57151,6 +57982,44 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                 .await
                 .unwrap()
         );
+        ensure_test_native_snapshot_owner(&processor, &workspace_id, thread_id, turn_id).await;
+        let security = test_full_access_execution_security_snapshot();
+        assert!(
+            crud_store_for_assert
+                .set_turn_execution_security_snapshot(turn_id, &security)
+                .await
+                .unwrap()
+        );
+        processor
+            .persist_turn_runtime_snapshot(
+                thread_id,
+                &workspace_id,
+                turn_id,
+                if with_effects {
+                    ThreadMode::Agent
+                } else {
+                    ThreadMode::Chat
+                },
+                &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+                "test-model",
+                "delayed",
+                None,
+                &HashMap::new(),
+                &turn_outcome.materialization.input,
+                &[],
+                &[],
+                &HashMap::new(),
+                &[],
+                &[],
+                &pioneer_skills::SkillCatalogSnapshot {
+                    version: 1,
+                    generated_at_unix: 0,
+                    skills: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
         for cycle in 0..if resume_direct { 2 } else { 1 } {
             processor
                 .agent_manager
@@ -57162,38 +58031,44 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                 .ensure_agent_listener_task(thread_id)
                 .await
                 .unwrap();
-            processor
-                .agent_manager
-                .start_turn_with_hook_context_permission_profile_and_security_snapshot(
-                    thread_id,
-                    turn_id,
-                    if with_effects {
-                        ThreadMode::Agent
-                    } else {
-                        ThreadMode::Chat
-                    },
-                    pioneer_agent::AgentTurnHookRuntimeContext::default(),
-                    "test-model",
-                    "delayed",
-                    HashMap::new(),
-                    pioneer_skills::SkillCatalogSnapshot {
-                        version: 1,
-                        generated_at_unix: 0,
-                        skills: Vec::new(),
-                    },
-                    vec![UserInput::Text {
-                        text: "hello".to_owned(),
-                        text_elements: Vec::new(),
-                    }],
-                    Vec::new(),
-                    Vec::new(),
-                    HashMap::new(),
-                    Vec::new(),
-                    default_test_permission_profile(),
-                    test_full_access_execution_security_snapshot(),
-                )
-                .await
-                .unwrap();
+            if cycle == 0 {
+                processor
+                    .start_admitted_native_snapshot_turn(
+                        thread_id,
+                        turn_id,
+                        default_test_permission_profile(),
+                        security.clone(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                // Resume the real recovery-closed predecessor after Blocked.
+                // Its original semantic state and cancellation plan are retained.
+                let weak = Arc::downgrade(&processor);
+                processor
+                    .recovery_coordinator
+                    .set_listener_starter(Arc::new(move |thread| {
+                        let weak = weak.clone();
+                        Box::pin(async move {
+                            weak.upgrade()
+                                .expect("cancellation fixture stays alive")
+                                .ensure_agent_listener_task(&thread)
+                                .await
+                                .map_err(|e| e.to_string())
+                        })
+                    }))
+                    .await;
+                let now = now_timestamp_secs();
+                let events = processor
+                    .recovery_coordinator
+                    .run_ready_jobs(now, 8)
+                    .await
+                    .unwrap();
+                for event in events {
+                    processor.handle_recovery_event(event, now).await;
+                }
+            }
             tokio::time::timeout(Duration::from_secs(5), entered.notified())
                 .await
                 .unwrap();
@@ -57208,6 +58083,7 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
 
             if resume_direct && cycle == 0 {
                 processor.agent_manager.remove_thread(thread_id).await;
+                close_paused_native_fixture_window(&processor, turn_id).await;
                 let context = crud_store_for_assert
                     .native_cancellation_context(turn_id)
                     .await
@@ -57642,6 +58518,7 @@ async fn turn_cancel_cli_runtime_without_active_session_does_not_start_runtime()
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "delayed",
         Arc::new(DelayedProvider {
+            name: "delayed",
             delay: Duration::from_secs(30),
             text: "too late".to_owned(),
         }),
@@ -57887,6 +58764,7 @@ async fn turn_cancel_allows_authorized_non_subscribed_collaborator_user() {
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "delayed",
         Arc::new(CancellationBarrierProvider {
+            name: "delayed",
             entered: provider_entered.clone(),
             release: provider_release.clone(),
         }),
@@ -63230,6 +64108,7 @@ async fn cli_runtime_request_respond_rejects_pending_for_blocked_turn_without_na
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         Arc::new(DelayedProvider {
+            name: "openai",
             delay: Duration::from_secs(30),
             text: "late".to_owned(),
         }),
@@ -65455,8 +66334,8 @@ async fn tool_retry_notification_is_persisted_for_history_replay_before_live() {
     let provider = Arc::new(SequencedToolProvider::new(
         vec![ProviderToolCall {
             id: "call_tool_retry_gateway".to_owned(),
-            name: "missing_gateway_tool".to_owned(),
-            arguments: "{}".to_owned(),
+            name: "exec_command".to_owned(),
+            arguments: json!({"command":["/pioneer-fixture-command-that-does-not-exist"], "workdir":std::env::temp_dir().display().to_string(), "timeout_ms":1000, "max_output_tokens":1000, "tty":false}).to_string(),
         }],
         "done after retry event",
     ));
@@ -65500,7 +66379,7 @@ async fn tool_retry_notification_is_persisted_for_history_replay_before_live() {
             "input": [
                 {
                     "type": "text",
-                    "text": "trigger a missing tool"
+                    "text": "run the admitted command and recover its execution failure"
                 }
             ]
         }
@@ -65528,7 +66407,7 @@ async fn tool_retry_notification_is_persisted_for_history_replay_before_live() {
             .expect("tool retry scheduled params should exist"),
     )
     .expect("tool retry scheduled notification should decode");
-    assert_eq!(scheduled.tool_name, "missing_gateway_tool");
+    assert_eq!(scheduled.tool_name, "exec_command");
 
     let history = crud_store
         .get_thread_history("thr_000000000000000199", Some(32))
@@ -65541,7 +66420,7 @@ async fn tool_retry_notification_is_persisted_for_history_replay_before_live() {
             tool_name,
             tool_retry_episode_id,
             ..
-        } if tool_name == "missing_gateway_tool"
+        } if tool_name == "exec_command"
             && tool_retry_episode_id == &scheduled.tool_retry_episode_id
     )));
 
@@ -65873,7 +66752,7 @@ Gateway skill body"#,
         .expect("second round must include dynamic tool result");
     assert_eq!(
         dynamic_result.name.as_deref(),
-        Some(dynamic_tool_name.as_str())
+        Some(fixture_skill_wire_name(&dynamic_tool_name).as_str())
     );
     assert!(dynamic_result.content.contains("gw-shell-ok"));
 
@@ -66206,7 +67085,7 @@ Gateway HTTP skill body"#
         .expect("second round must include dynamic http tool result");
     assert_eq!(
         dynamic_result.name.as_deref(),
-        Some(dynamic_tool_name.as_str())
+        Some(fixture_skill_wire_name(&dynamic_tool_name).as_str())
     );
     assert!(dynamic_result.content.contains(SECRET));
 
@@ -73397,6 +74276,85 @@ async fn memory_methods_fail_when_runtime_disabled() {
 }
 
 #[tokio::test]
+async fn cold_memory_and_task_owners_restore_accepted_subset_and_reject_revocation() {
+    let harness = setup_memory_gateway_harness("cold_initial_owners", true).await;
+    let context = memory_tool_context(&harness, "cold_initial");
+    let initial = materialize_memory_tools_for_context(&harness, context.clone()).await;
+    let memory =
+        crate::memory_tools::GatewayMemoryProvider::new(Arc::downgrade(&harness.processor));
+    let saved_memory = vec![vec![initial.bundles[0].specs[0].clone()]];
+    let restored = memory
+        .restore_memory_tools(context.clone(), &saved_memory)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&restored.bundles[0].specs).unwrap(),
+        serde_json::to_value(&saved_memory[0]).unwrap()
+    );
+    let task_context = TaskTurnContext {
+        workspace_id: context.workspace_id.clone(),
+        thread_id: context.thread_id.clone(),
+        turn_id: context.turn_id.clone(),
+    };
+    let task = crate::task_tools::GatewayTaskToolProvider::new(Arc::downgrade(&harness.processor));
+    let initial_task = task
+        .materialize_task_tools(task_context.clone())
+        .await
+        .unwrap();
+    assert!(!initial_task.bundles[0].specs.is_empty());
+    let saved_task = vec![vec![initial_task.bundles[0].specs[0].clone()]];
+    let restored_task = task
+        .restore_task_tools(task_context.clone(), &saved_task)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&restored_task.bundles[0].specs).unwrap(),
+        serde_json::to_value(&saved_task[0]).unwrap()
+    );
+    let mut changed = saved_task.clone();
+    changed[0][0]
+        .spec
+        .description
+        .push_str(" changed schema owner");
+    assert!(
+        task.restore_task_tools(task_context.clone(), &changed)
+            .await
+            .is_err()
+    );
+    let mut changed = saved_memory.clone();
+    changed[0][0].spec.description.push_str(" changed scope");
+    assert!(
+        memory
+            .restore_memory_tools(context.clone(), &changed)
+            .await
+            .is_err()
+    );
+    // Remove the existing authority after admission. Saved tool schemas are
+    // input contracts, never a replacement authorization grant.
+    harness
+        .crud_store
+        .database_connection()
+        .execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "UPDATE turn SET execution_authorization_context_json = NULL WHERE id = ?",
+            [context.turn_id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        memory
+            .restore_memory_tools(context, &saved_memory)
+            .await
+            .is_err()
+    );
+    assert!(
+        task.restore_task_tools(task_context, &saved_task)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn memory_provider_materializes_five_memory_tools_when_runtime_enabled() {
     let harness = setup_memory_gateway_harness("tools_materialize", true).await;
     let materialization =
@@ -75233,13 +76191,22 @@ async fn wait_for_task_status(
         }
         sleep(Duration::from_millis(25)).await;
     }
-    crud_store
+    let response = crud_store
         .get_task(task_id)
         .await
         .expect("task query should succeed")
-        .expect("task should exist")
-        .task
-        .status
+        .expect("task should exist");
+    for child in &response.task_run_turns {
+        let canonical = crud_store.get_turn(&child.thread_id, &child.turn_id).await;
+        let execution = crud_store.get_turn_execution(&child.turn_id).await;
+        let checkpoint = crud_store
+            .native_semantic_checkpoint_for_turn(&child.turn_id)
+            .await;
+        eprintln!(
+            "Task completion timeout: canonical={canonical:?}; execution={execution:?}; checkpoint={checkpoint:?}"
+        );
+    }
+    response.task.status
 }
 
 async fn wait_for_run_status(
@@ -75562,7 +76529,7 @@ async fn recv_notification_by_method(
     rx: &mut mpsc::Receiver<Message>,
     method: &str,
 ) -> JsonRpcNotification {
-    recv_notification_by_method_timeout(rx, method, Duration::from_secs(2)).await
+    recv_notification_by_method_timeout(rx, method, Duration::from_secs(30)).await
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -75599,11 +76566,19 @@ async fn recv_notification_by_method_timeout(
     method: &str,
     wait_for: Duration,
 ) -> JsonRpcNotification {
-    let context = format!("notification method `{method}`");
+    let deadline = tokio::time::Instant::now() + wait_for;
+    let mut observed = std::collections::VecDeque::new();
     for _ in 0..200 {
-        let payload = recv_text_timeout_context(rx, wait_for, context.as_str()).await;
+        let context = format!("notification method `{method}`; recent={observed:?}");
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let payload = recv_text_timeout_context(rx, remaining, context.as_str()).await;
         let value: serde_json::Value =
             serde_json::from_str(&payload).expect("json-rpc payload should decode");
+        if observed.len() == 8 {
+            observed.pop_front();
+        }
+        let summary = json!({"method":value.get("method"),"turn":value.pointer("/params/turn"),"error":value.get("error")}).to_string();
+        observed.push_back(summary.chars().take(2048).collect::<String>());
         if value.get("id").is_none()
             && value.get("method").and_then(serde_json::Value::as_str) == Some(method)
         {
@@ -75911,6 +76886,29 @@ async fn compaction_failed_partial_writer_preserves_event_but_excludes_observati
         .await
         .unwrap();
     assert_eq!(restored, history);
+    let mut authority = crate::authorization::ExecutionAuthorizationContext::for_test(
+        authenticated_test_superuser().as_ref(),
+        &workspace,
+        thread,
+        &default_test_permission_profile(),
+        None,
+    );
+    authority.bind_test_provider_authority(
+        "openai",
+        "o4-mini",
+        processor
+            .provider_registry
+            .authority_fingerprint_for_workspace(&workspace, "openai")
+            .unwrap()
+            .as_str(),
+    );
+    assert!(
+        store
+            .set_turn_execution_authorization_context(turn, &authority.to_persisted_json().unwrap())
+            .await
+            .unwrap()
+    );
+    ensure_test_native_snapshot_owner(&processor, &workspace, thread, turn).await;
     processor
         .persist_turn_runtime_snapshot(
             thread,
@@ -75918,8 +76916,8 @@ async fn compaction_failed_partial_writer_preserves_event_but_excludes_observati
             turn,
             pioneer_protocol::ThreadMode::Agent,
             &pioneer_agent::AgentTurnHookRuntimeContext::default(),
-            "fixture-model",
-            "fixture-provider",
+            "o4-mini",
+            "openai",
             None,
             &std::collections::HashMap::new(),
             &[],
@@ -75928,6 +76926,11 @@ async fn compaction_failed_partial_writer_preserves_event_but_excludes_observati
             &std::collections::HashMap::new(),
             &history,
             &[],
+            &pioneer_skills::SkillCatalogSnapshot {
+                version: 0,
+                generated_at_unix: 0,
+                skills: Vec::new(),
+            },
             None,
         )
         .await
@@ -76103,8 +77106,17 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
     struct OverflowProvider(std::sync::Mutex<Vec<ChatRequest>>, Vec<ProviderToolCall>);
     #[async_trait::async_trait]
     impl Provider for OverflowProvider {
+        fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+            // The fixture implements this simulated protocol for its model labels.
+            if self.capabilities().tool_calling {
+                pioneer_provider::ModelToolSupport::Supported
+            } else {
+                pioneer_provider::ModelToolSupport::Unsupported
+            }
+        }
+
         fn name(&self) -> &str {
-            "overflow-fixture"
+            "openai"
         }
         fn capabilities(&self) -> ProviderCapabilities {
             let mut capabilities = CaptureSummaryProvider::new("").capabilities();
@@ -76132,7 +77144,12 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
                     tool_calls: self.1.clone(),
                 });
             }
-            anyhow::bail!("provider error: maximum context length exceeded")
+            Err(pioneer_provider::failure::ProviderTransportFailure {
+                classification: pioneer_provider::ProviderFailureClassification::new(
+                    ProviderFailureClass::ContextTooLarge,
+                ),
+            }
+            .into())
         }
         async fn stream_chat(
             &self,
@@ -76155,15 +77172,18 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
         Vec::new()
     };
     let provider = Arc::new(OverflowProvider(std::sync::Mutex::new(Vec::new()), calls));
-    let summary = Arc::new(CaptureSummaryProvider::new(
-        pioneer_compaction::summary::HEADINGS
-            .iter()
-            .map(|heading| {
-                format!("{heading}\nПользователь ожидает ответ; продолжить текущую задачу.")
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    ));
+    let summary = Arc::new(
+        CaptureSummaryProvider::new(
+            pioneer_compaction::summary::HEADINGS
+                .iter()
+                .map(|heading| {
+                    format!("{heading}\nПользователь ожидает ответ; продолжить текущую задачу.")
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .named("summary-capture"),
+    );
     let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         provider.clone(),
@@ -76294,11 +77314,29 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
     })
     .await
     .expect("second overflow must terminate bounded recovery");
+    let terminal = store
+        .get_turn("native-controller", "native-controller-turn")
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    let window = store
+        .latest_turn_execution_window("native-controller-turn")
+        .await
+        .unwrap();
+    let checkpoints = if let Some(window) = &window {
+        store
+            .list_turn_execution_checkpoints_for_window(&window.id)
+            .await
+            .unwrap()
+    } else {
+        Vec::new()
+    };
     let requests = provider.0.lock().unwrap();
     assert_eq!(
         requests.len(),
         2 + usize::from(with_tool),
-        "one original request and exactly one main retry, plus the initial tool round"
+        "one original request and exactly one main retry, plus the initial tool round; terminal={terminal:?}; window={window:?}; checkpoints={checkpoints:?}"
     );
     assert!(requests.iter().all(|request| request.max_tokens.is_some()));
     drop(requests);
@@ -76640,7 +77678,7 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
         .set_connection_workspace(connection, Some(workspace.clone()))
         .await;
     let threads = Arc::new(ThreadManager::new("test-model", "openai"));
-    let provider = Arc::new(CaptureSummaryProvider::new("foreground answer"));
+    let provider = Arc::new(CaptureSummaryProvider::new("foreground answer").named("openai"));
     let processor = Arc::new(MessageProcessor::new(
         threads.clone(),
         Arc::new(pioneer_provider::ProviderRegistry::with_provider(
@@ -77015,6 +78053,18 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
     })
     .await
     .unwrap();
+    assert!(
+        processor
+            .artifact_service
+            .native_artifact_state_compatible(
+                &workspace,
+                "native-foreground",
+                "native-foreground-turn",
+            )
+            .await
+            .unwrap(),
+        "ordinary native Chat must initialize durable obligations before provider use without binding Agent tools"
+    );
     let row = store
         .database_connection()
         .query_one_raw(sea_orm::Statement::from_string(
@@ -77068,6 +78118,7 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
         compiled_prompt: None,
     };
     let prepared = pioneer_agent::compaction::controller::NativePreparedRequest {
+        covered_native_control_ids: Vec::new(),
         receipt: pioneer_agent::compaction::controller::NativeInputReceipt::for_request(
             &registration_request,
             &registration_context.provider_instance,
@@ -77174,7 +78225,7 @@ async fn compaction_native_controller_runs_on_real_turn_and_checks_short_complet
     sessions
         .set_connection_workspace(connection, Some(workspace.clone()))
         .await;
-    let provider = Arc::new(CaptureSummaryProvider::new("controller answer"));
+    let provider = Arc::new(CaptureSummaryProvider::new("controller answer").named("openai"));
     let processor = Arc::new(MessageProcessor::new(
         threads.clone(),
         Arc::new(pioneer_provider::ProviderRegistry::with_provider(
@@ -77395,6 +78446,7 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
         compiled_prompt: None,
     };
     let first_prepared = pioneer_agent::compaction::controller::NativePreparedRequest {
+        covered_native_control_ids: Vec::new(),
         receipt: pioneer_agent::compaction::controller::NativeInputReceipt::for_request(
             &request,
             &context.provider_instance,
@@ -77434,6 +78486,7 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
             "latest compact system metadata",
         ));
     let latest_prepared = pioneer_agent::compaction::controller::NativePreparedRequest {
+        covered_native_control_ids: Vec::new(),
         receipt: pioneer_agent::compaction::controller::NativeInputReceipt::for_request(
             &latest_request,
             &context.provider_instance,
@@ -79454,6 +80507,7 @@ async fn check_completed_history(
             )
             .unwrap();
             let prepared = pioneer_agent::compaction::controller::NativePreparedRequest {
+                covered_native_control_ids: Vec::new(),
                 request,
                 receipt,
                 history_check: pioneer_agent::compaction::controller::NativeHistoryCheckMetadata {
@@ -82876,11 +83930,13 @@ fn native_cancellation_race_fallback_preserves_materialization_error_and_require
             let release = Arc::new(Notify::new());
             let provider: Arc<dyn Provider> = if busy_native {
                 Arc::new(CancellationBarrierProvider {
+                    name: "delayed",
                     entered: entered.clone(),
                     release: release.clone(),
                 })
             } else {
                 Arc::new(DelayedProvider {
+                    name: "delayed",
                     delay: Duration::from_secs(30),
                     text: "too late".to_owned(),
                 })

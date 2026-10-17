@@ -53,13 +53,14 @@ pub struct PromptSourceManifestEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompiledPromptBundle {
-    pub compiler_version: &'static str,
+    pub compiler_version: String,
     pub profile: PromptProfile,
     pub full_system_text: String,
     pub stable_system_text: String,
     pub dynamic_system_text: String,
-    pub boundary_marker: &'static str,
+    pub boundary_marker: String,
     pub fingerprint_stable: String,
     pub fingerprint_dynamic: String,
     pub fingerprint_full: String,

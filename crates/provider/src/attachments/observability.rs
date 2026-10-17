@@ -61,9 +61,7 @@ pub fn emit_transport_selected(
         target: "pioneer_provider::attachments",
         event = "attachment.transport.selected",
         provider,
-        attachment_name = attachment.name,
         attachment_kind = ?attachment.kind,
-        attachment_mime = attachment.mime_type,
         attachment_size_bytes = attachment.size_bytes,
         transport,
         selection_reason = reason,
@@ -88,7 +86,7 @@ pub fn emit_upload_fail(
     operation: &str,
     attempt: usize,
     error_code: &str,
-    error_message: &str,
+    error_class: pioneer_protocol::ProviderFailureClass,
 ) {
     warn!(
         target: "pioneer_provider::attachments",
@@ -97,7 +95,7 @@ pub fn emit_upload_fail(
         operation,
         attempt,
         error_code,
-        error_message,
+        error_class = ?error_class,
         "attachment operation failed"
     );
 }

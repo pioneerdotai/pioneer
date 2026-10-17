@@ -45,6 +45,7 @@ enum ExecutionWindowTotalBudgetBlockKind {
     MaxWallClockMs,
     MaxProviderTokens,
     MaxConsecutiveNoProgressWindows,
+    MaxUnconfirmedProgressWindows,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +65,7 @@ enum ExecutionWindowTotalBudgetDecision {
 fn decide_execution_window_total_budget(
     usage: &TurnExecutionUsageCounters,
     total_budget: &pioneer_tools::ExecutionWindowTotalBudgetConfig,
+    mode: pioneer_tools::ToolNoProgressMode,
 ) -> ExecutionWindowTotalBudgetDecision {
     let next_window_index = match decide_execution_window_admission(
         Some(usage.total_windows.max(1)),
@@ -115,7 +117,6 @@ fn decide_execution_window_total_budget(
     }
 
     if let Some(max_provider_tokens) = total_budget.max_provider_tokens_per_turn
-        && !usage.provider_token_usage_unknown
         && usage.total_provider_tokens >= max_provider_tokens
     {
         return ExecutionWindowTotalBudgetDecision::Block(ExecutionWindowTotalBudgetBlock {
@@ -131,7 +132,9 @@ fn decide_execution_window_total_budget(
 
     let max_consecutive_no_progress_windows =
         total_budget.max_consecutive_no_progress_windows.max(1);
-    if usage.consecutive_no_progress_windows >= max_consecutive_no_progress_windows {
+    if mode == pioneer_tools::ToolNoProgressMode::Enforce
+        && usage.consecutive_no_progress_windows >= max_consecutive_no_progress_windows
+    {
         return ExecutionWindowTotalBudgetDecision::Block(ExecutionWindowTotalBudgetBlock {
             kind: ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveNoProgressWindows,
             total_windows: usage.total_windows,
@@ -143,6 +146,20 @@ fn decide_execution_window_total_budget(
         });
     }
 
+    let limit = total_budget
+        .max_consecutive_unconfirmed_progress_windows
+        .clamp(1, 4096);
+    if usage.consecutive_unconfirmed_progress_windows >= limit {
+        return ExecutionWindowTotalBudgetDecision::Block(ExecutionWindowTotalBudgetBlock {
+            kind: ExecutionWindowTotalBudgetBlockKind::MaxUnconfirmedProgressWindows,
+            total_windows: usage.total_windows,
+            total_tool_calls: saturating_u32_from_u64(usage.total_tool_calls),
+            reason: format!(
+                "max_consecutive_unconfirmed_progress_windows reached: limit={limit}, observed={}; domain progress remains unconfirmed",
+                usage.consecutive_unconfirmed_progress_windows
+            ),
+        });
+    }
     ExecutionWindowTotalBudgetDecision::Continue { next_window_index }
 }
 
@@ -161,7 +178,8 @@ fn total_budget_block_exhaustion_reason(
         ExecutionWindowTotalBudgetBlockKind::MaxProviderTokens => {
             pioneer_protocol::ExecutionWindowExhaustionReason::MaxProviderTokensPerWindow
         }
-        ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveNoProgressWindows => fallback,
+        ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveNoProgressWindows
+        | ExecutionWindowTotalBudgetBlockKind::MaxUnconfirmedProgressWindows => fallback,
     }
 }
 
@@ -177,13 +195,20 @@ fn recovery_execution_window_admission_error(
     match decide_execution_window_total_budget(
         &turn_request.execution_usage,
         &tool_loop_config.execution_windows.total.normalized(),
+        tool_loop_config.no_progress_mode,
     ) {
         ExecutionWindowTotalBudgetDecision::Continue { .. } => None,
         ExecutionWindowTotalBudgetDecision::Block(block) => Some(
             super::AgentControlError::ExecutionWindowContinuationBlocked {
-                stop_reason: (block.kind
-                    == ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveNoProgressWindows)
-                    .then_some(pioneer_protocol::RecoveryStopReason::NoProgress),
+                stop_reason: match block.kind {
+                    ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveNoProgressWindows => {
+                        Some(pioneer_protocol::RecoveryStopReason::NoProgress)
+                    }
+                    ExecutionWindowTotalBudgetBlockKind::MaxUnconfirmedProgressWindows => {
+                        Some(pioneer_protocol::RecoveryStopReason::AttemptsExhausted)
+                    }
+                    _ => None,
+                },
                 reason: block.reason,
             },
         ),
@@ -369,6 +394,9 @@ pub(super) async fn run_agent_loop(
                 hook_runtime_context,
                 model,
                 provider_name,
+                azure_connection,
+                provider_model_contract,
+                initial_preparation,
                 reasoning,
                 workspace_skill_policies,
                 skill_catalog,
@@ -392,7 +420,7 @@ pub(super) async fn run_agent_loop(
                     continue;
                 }
 
-                let runtime_snapshot = runtime_dependencies.snapshot().await;
+                let mut runtime_snapshot = runtime_dependencies.snapshot().await;
 
                 let execution_window_index = execution_checkpoint_context
                     .as_ref()
@@ -403,13 +431,16 @@ pub(super) async fn run_agent_loop(
                     .map(|context| super::TurnExecutionUsageCounters::from_snapshot(context.usage))
                     .unwrap_or_default();
 
-                let turn_request = ActiveTurnRequest {
+                let mut turn_request = ActiveTurnRequest {
                     turn_id: turn_id.clone(),
                     execution_window_index,
                     mode,
                     hook_runtime_context,
                     model,
                     provider_name: provider_name.clone(),
+                    azure_connection,
+                    provider_model_contract,
+                    initial_preparation,
                     reasoning,
                     workspace_skill_policies,
                     skill_catalog,
@@ -427,9 +458,15 @@ pub(super) async fn run_agent_loop(
                     execution_security_snapshot,
                 };
 
-                let provider = match provider_registry
-                    .get_or_create_for_workspace(workspace_id.as_str(), &provider_name)
-                {
+                let provider = match resolve_accepted_provider(
+                    &provider_registry,
+                    &workspace_id,
+                    &provider_name,
+                    turn_request.azure_connection.as_ref(),
+                    &turn_request.model,
+                    turn_request.provider_model_contract.as_ref(),
+                    turn_request.execution_checkpoint_context.is_none(),
+                ) {
                     Ok(p) => p,
                     Err(e) => {
                         let _ = ack.send(Err(AgentStartError::Internal(format!(
@@ -439,6 +476,67 @@ pub(super) async fn run_agent_loop(
                     }
                 };
 
+                if let Some(initial) = &turn_request.initial_preparation
+                    && let Some(config) = initial.frozen_config().await
+                {
+                    runtime_snapshot.tool_loop_config = config;
+                }
+                if turn_request.provider_model_contract.is_none() {
+                    turn_request.provider_model_contract =
+                        match provider.capture_model_contract(&turn_request.model) {
+                            Ok(contract) => Some(contract),
+                            Err(_) => {
+                                let _ = ack.send(Err(AgentStartError::Internal(
+                                    "native model contract cannot be captured".to_owned(),
+                                )));
+                                continue;
+                            }
+                        };
+                }
+                if turn_request.initial_preparation.is_none() {
+                    if turn_request.execution_checkpoint_context.is_some() {
+                        let _ = ack.send(Err(AgentStartError::Internal(
+                            "native continuation initial preparation is unavailable".to_owned(),
+                        )));
+                        continue;
+                    }
+                    turn_request.initial_preparation =
+                        match super::NativeInitialPreparation::new_admission_json(
+                            &workspace_id,
+                            &thread_id,
+                            &turn_id,
+                            pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+                        )
+                        .and_then(|json| {
+                            super::NativeInitialPreparation::restore(
+                                &json,
+                                &workspace_id,
+                                &thread_id,
+                                &turn_id,
+                                pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+                            )
+                        }) {
+                            Ok(initial) => Some(initial),
+                            Err(_) => {
+                                let _ = ack.send(Err(AgentStartError::Internal(
+                                    "native initial preparation cannot be captured".to_owned(),
+                                )));
+                                continue;
+                            }
+                        };
+                }
+                if turn_request.azure_connection.is_none() {
+                    turn_request.azure_connection = provider.resolved_azure_connection();
+                }
+                if pioneer_provider::provider_definition(&provider_name)
+                    .is_some_and(|definition| definition.name == "azure-openai")
+                    && turn_request.azure_connection.is_none()
+                {
+                    let _ = ack.send(Err(AgentStartError::Internal(
+                        "native Azure start is missing its accepted connection".to_owned(),
+                    )));
+                    continue;
+                }
                 // A direct start carrying an execution checkpoint is a native
                 // recovery start (task recovery uses this path instead of the
                 // explicit recovery command).  The durable state machine must
@@ -639,6 +737,9 @@ pub(super) async fn run_agent_loop(
                         let next_window_index = match decide_execution_window_total_budget(
                             &next_turn_request.execution_usage,
                             &total_budget,
+                            runtime_snapshot_for_continuation
+                                .tool_loop_config
+                                .no_progress_mode,
                         ) {
                             ExecutionWindowTotalBudgetDecision::Continue { next_window_index } => {
                                 next_window_index
@@ -717,9 +818,14 @@ pub(super) async fn run_agent_loop(
                                 usage: next_turn_request.execution_usage.snapshot(),
                             });
 
-                        let provider = match provider_registry.get_or_create_for_workspace(
-                            workspace_id.as_str(),
-                            next_turn_request.provider_name.as_str(),
+                        let provider = match resolve_accepted_provider(
+                            &provider_registry,
+                            &workspace_id,
+                            &next_turn_request.provider_name,
+                            next_turn_request.azure_connection.as_ref(),
+                            &next_turn_request.model,
+                            next_turn_request.provider_model_contract.as_ref(),
+                            false,
                         ) {
                             Ok(provider) => provider,
                             Err(error) => {
@@ -746,6 +852,11 @@ pub(super) async fn run_agent_loop(
                                     thread_id: thread_id.clone(),
                                     turn_id: turn_id.clone(),
                                     error: failure_message.clone(),
+                                    failure: Some(
+                                        pioneer_protocol::NativeFailureMetadata::execution(
+                                            pioneer_protocol::TurnFailureDisposition::Permanent
+                                        )
+                                    ),
                                     recovery,
                                 },);
                                 record_turn_observation!(
@@ -831,7 +942,18 @@ pub(super) async fn run_agent_loop(
                             run_id,
                         )));
                     }
-                    Err(TurnTaskFailure::Terminal(error)) => {
+                    Err(
+                        failure @ (TurnTaskFailure::Terminal(_) | TurnTaskFailure::Transient(_)),
+                    ) => {
+                        let (error, disposition) = match failure {
+                            TurnTaskFailure::Terminal(error) => {
+                                (error, pioneer_protocol::TurnFailureDisposition::Permanent)
+                            }
+                            TurnTaskFailure::Transient(error) => {
+                                (error, pioneer_protocol::TurnFailureDisposition::Transient)
+                            }
+                            _ => unreachable!(),
+                        };
                         let error_for_dispatch = error.clone();
                         let failure_dispatch = post_turn_dispatch.or_else(|| {
                             synthesize_post_turn_failure_dispatch(
@@ -843,17 +965,28 @@ pub(super) async fn run_agent_loop(
                                 error_for_dispatch.clone(),
                             )
                         });
-                        prepare_terminal_effects_or_stop!(
-                            turn_id,
-                            run_id,
-                            runtime_snapshot.as_ref(),
-                            failure_dispatch,
-                            Some(format!("parent turn failed: {error_for_dispatch}")),
-                        );
+                        if disposition == pioneer_protocol::TurnFailureDisposition::Permanent {
+                            prepare_terminal_effects_or_stop!(
+                                turn_id,
+                                run_id,
+                                runtime_snapshot.as_ref(),
+                                failure_dispatch,
+                                Some(format!("parent turn failed: {error_for_dispatch}")),
+                            );
+                        }
                         commit_terminal_or_stop!(AgentDurableEvent::TurnFailed {
                             thread_id: thread_id.clone(),
                             turn_id: turn_id.clone(),
                             error,
+                            failure: Some(
+                                if disposition
+                                    == pioneer_protocol::TurnFailureDisposition::Transient
+                                {
+                                    pioneer_protocol::NativeFailureMetadata::runtime()
+                                } else {
+                                    pioneer_protocol::NativeFailureMetadata::execution(disposition)
+                                }
+                            ),
                             recovery,
                         },);
                         record_turn_observation!(
@@ -1081,6 +1214,8 @@ pub(super) async fn run_agent_loop(
                     commit_terminal_or_stop!(
                         AgentDurableEvent::NativeCancellationContextPrepared {
                             preparation,
+                            prepare_artifact_obligations: false,
+                            execution_owner_generation: None,
                             initial_turn: recovery.is_none()
                                 && turn_request_snapshot
                                     .as_ref()
@@ -1151,9 +1286,14 @@ pub(super) async fn run_agent_loop(
                         );
                     }
 
-                    let provider = match provider_registry.get_or_create_for_workspace(
-                        workspace_id.as_str(),
-                        turn_request.provider_name.as_str(),
+                    let provider = match resolve_accepted_provider(
+                        &provider_registry,
+                        &workspace_id,
+                        &turn_request.provider_name,
+                        turn_request.azure_connection.as_ref(),
+                        &turn_request.model,
+                        turn_request.provider_model_contract.as_ref(),
+                        false,
                     ) {
                         Ok(provider) => provider,
                         Err(error) => {
@@ -1172,7 +1312,9 @@ pub(super) async fn run_agent_loop(
                     )
                     .await
                     {
-                        let _ = ack.send(Err(error));
+                        let _ = ack.send(Err(super::AgentControlError::Internal(format!(
+                            "failed to publish recovery continuation: {error}"
+                        ))));
                         continue;
                     }
 
@@ -1269,9 +1411,14 @@ pub(super) async fn run_agent_loop(
                     );
                 }
 
-                let provider = match provider_registry.get_or_create_for_workspace(
-                    workspace_id.as_str(),
-                    turn_request.provider_name.as_str(),
+                let provider = match resolve_accepted_provider(
+                    &provider_registry,
+                    &workspace_id,
+                    &turn_request.provider_name,
+                    turn_request.azure_connection.as_ref(),
+                    &turn_request.model,
+                    turn_request.provider_model_contract.as_ref(),
+                    false,
                 ) {
                     Ok(provider) => provider,
                     Err(error) => {
@@ -1319,17 +1466,27 @@ pub(super) async fn run_agent_loop(
                         TurnPostTurnStatus::Failed,
                         failure_message.clone(),
                     );
-                    prepare_terminal_effects_or_stop!(
-                        request.turn_id,
-                        active_turn_run_id.unwrap_or(0),
-                        Some(&runtime_snapshot),
-                        failure_dispatch,
-                        Some(format!("parent turn failed: {failure_message}")),
-                    );
+                    let permanent = matches!(&error, super::AgentEventHubError::CommitRejected(rejection) if !rejection.is_retryable());
+                    if permanent {
+                        prepare_terminal_effects_or_stop!(
+                            request.turn_id,
+                            active_turn_run_id.unwrap_or(0),
+                            Some(&runtime_snapshot),
+                            failure_dispatch,
+                            Some(format!("parent turn failed: {failure_message}")),
+                        );
+                    }
                     commit_terminal_or_stop!(AgentDurableEvent::TurnFailed {
                         thread_id: thread_id.clone(),
                         turn_id: request.turn_id.clone(),
                         error: failure_message.clone(),
+                        failure: Some(if permanent {
+                            pioneer_protocol::NativeFailureMetadata::execution(
+                                pioneer_protocol::TurnFailureDisposition::Permanent,
+                            )
+                        } else {
+                            pioneer_protocol::NativeFailureMetadata::runtime()
+                        }),
                         recovery,
                     },);
                     record_turn_observation!(
@@ -1392,7 +1549,7 @@ pub(super) async fn run_agent_loop(
                     continue;
                 }
 
-                let runtime_snapshot = runtime_dependencies.snapshot().await;
+                let mut runtime_snapshot = runtime_dependencies.snapshot().await;
 
                 let mut active_request = ActiveTurnRequest {
                     turn_id: turn_request.turn_id.clone(),
@@ -1401,6 +1558,9 @@ pub(super) async fn run_agent_loop(
                     hook_runtime_context: turn_request.hook_runtime_context,
                     model: turn_request.model,
                     provider_name: turn_request.provider_name,
+                    azure_connection: turn_request.azure_connection,
+                    provider_model_contract: turn_request.provider_model_contract,
+                    initial_preparation: turn_request.initial_preparation,
                     reasoning: turn_request.reasoning,
                     workspace_skill_policies: turn_request.workspace_skill_policies,
                     skill_catalog: turn_request.skill_catalog,
@@ -1418,6 +1578,11 @@ pub(super) async fn run_agent_loop(
                     execution_security_snapshot: turn_request.execution_security_snapshot,
                 };
 
+                if let Some(initial) = &active_request.initial_preparation
+                    && let Some(config) = initial.frozen_config().await
+                {
+                    runtime_snapshot.tool_loop_config = config;
+                }
                 super::apply_recovery_adjustments(&mut active_request, &recovery_request);
                 if let Some(error) = recovery_execution_window_admission_error(
                     &active_request,
@@ -1434,9 +1599,14 @@ pub(super) async fn run_agent_loop(
                     );
                 }
 
-                let provider = match provider_registry.get_or_create_for_workspace(
-                    workspace_id.as_str(),
-                    active_request.provider_name.as_str(),
+                let provider = match resolve_accepted_provider(
+                    &provider_registry,
+                    &workspace_id,
+                    &active_request.provider_name,
+                    active_request.azure_connection.as_ref(),
+                    &active_request.model,
+                    active_request.provider_model_contract.as_ref(),
+                    false,
                 ) {
                     Ok(provider) => provider,
                     Err(error) => {
@@ -1455,7 +1625,9 @@ pub(super) async fn run_agent_loop(
                 )
                 .await
                 {
-                    let _ = ack.send(Err(error));
+                    let _ = ack.send(Err(super::AgentControlError::Internal(format!(
+                        "failed to publish recovery continuation: {error}"
+                    ))));
                     continue;
                 }
 
@@ -1521,6 +1693,37 @@ pub(super) async fn run_agent_loop(
     }
 }
 
+fn resolve_accepted_provider(
+    registry: &ProviderRegistry,
+    workspace: &str,
+    provider: &str,
+    connection: Option<&pioneer_provider::AzureResolvedConnection>,
+    model: &str,
+    contract: Option<&pioneer_provider::AcceptedProviderModelContract>,
+    initial_direct_start: bool,
+) -> anyhow::Result<Arc<dyn Provider>> {
+    let azure = pioneer_provider::provider_definition(provider)
+        .is_some_and(|definition| definition.name == "azure-openai");
+    let resolved = match (azure, connection) {
+        (true, Some(connection)) => {
+            registry.get_or_create_for_workspace_with_frozen_azure(workspace, provider, connection)
+        }
+        (true, None) if !initial_direct_start => {
+            anyhow::bail!("native Azure continuation is missing its accepted connection")
+        }
+        (false, Some(_)) => anyhow::bail!("accepted Azure connection belongs to another provider"),
+        _ => registry.get_or_create_for_workspace(workspace, provider),
+    }?;
+    match contract {
+        Some(contract) => {
+            contract.require_selection(resolved.name(), model)?;
+            contract.clone().bind(resolved)
+        }
+        None if initial_direct_start => resolved.capture_model_contract(model)?.bind(resolved),
+        None => anyhow::bail!("native continuation is missing its accepted model contract"),
+    }
+}
+
 fn spawn_turn_task(
     command_tx: mpsc::Sender<AgentCommand>,
     event_hub: Arc<AgentEventHub>,
@@ -1573,6 +1776,11 @@ fn spawn_turn_task(
             AgentDurableEvent::NativeCancellationContextPrepared {
                 preparation: cancellation_context,
                 initial_turn,
+                prepare_artifact_obligations: true,
+                execution_owner_generation: turn_request
+                    .initial_preparation
+                    .as_ref()
+                    .and_then(|initial| initial.execution_owner_generation()),
             },
             Some(turn_control.cancellation_token()),
         )
@@ -1593,12 +1801,13 @@ fn spawn_turn_task(
 
         let NativeTurnRuntimeSnapshot {
             context_controller,
-            generation: _,
+            generation,
             tool_loop_config,
             mcp_tool_provider,
             turn_tool_provider,
             turn_finalization_provider,
             task_tool_provider,
+            memory_provider,
             task_cleanup_runtime_contract: _,
             hook_runtime,
             tool_bundle_artifacts,
@@ -1659,10 +1868,13 @@ fn spawn_turn_task(
             turn_request.execution_options.disable_tool_calling,
             turn_request.execution_options.continue_generation_hint,
             tool_loop_config,
+            turn_request.initial_preparation,
+            generation,
             mcp_tool_provider,
             turn_tool_provider,
             turn_finalization_provider,
             task_tool_provider,
+            memory_provider,
             hook_runtime,
             tool_bundle_artifacts,
             permission_approval_broker,
@@ -1673,17 +1885,16 @@ fn spawn_turn_task(
         .catch_unwind()
         .await
         .unwrap_or_else(|panic| {
-            let message = panic_payload_message(panic.as_ref());
+            let _ = panic;
             error!(
                 thread_id = %thread_id,
                 turn_id = %turn_request.turn_id,
-                message,
                 "agent turn task panicked"
             );
             TurnTaskCompletion {
-                result: Err(TurnTaskFailure::Terminal(format!(
-                    "agent turn task panicked: {message}"
-                ))),
+                result: Err(TurnTaskFailure::Transient(
+                    "agent turn task panicked".to_owned(),
+                )),
                 post_turn_dispatch: None,
             }
         });
@@ -1776,16 +1987,6 @@ async fn wait_for_turn_task_shutdown(mut task: JoinHandle<()>) {
     }
 }
 
-fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        return (*message).to_owned();
-    }
-    if let Some(message) = payload.downcast_ref::<String>() {
-        return message.clone();
-    }
-    "non-string panic payload".to_owned()
-}
-
 fn recovery_context(request: &super::RecoveryAttemptRequest) -> RecoveryAttemptContext {
     RecoveryAttemptContext {
         job_id: request.recovery_job_id.clone(),
@@ -1825,10 +2026,13 @@ async fn execute_turn_flow(
     disable_tool_calling: bool,
     continue_generation_hint: bool,
     tool_loop_config: ToolLoopConfig,
+    initial_preparation: Option<super::NativeInitialPreparation>,
+    runtime_generation: u64,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
     turn_tool_provider: Option<Arc<dyn TurnToolProvider>>,
     turn_finalization_provider: Option<Arc<dyn TurnFinalizationProvider>>,
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
+    memory_provider: Option<Arc<dyn super::AgentMemoryProvider>>,
     hook_runtime: Option<Arc<HookRuntime>>,
     tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
     permission_approval_broker: Arc<dyn pioneer_tools::PermissionApprovalBroker>,
@@ -1883,10 +2087,13 @@ async fn execute_turn_flow(
                     disable_tool_calling,
                     continue_generation_hint,
                     tool_loop_config,
+                    initial_preparation,
+                    runtime_generation,
                     mcp_tool_provider,
                     turn_tool_provider,
                     turn_finalization_provider,
                     task_tool_provider,
+                    memory_provider,
                     hook_runtime,
                     tool_bundle_artifacts,
                     permission_approval_broker,
@@ -1912,6 +2119,7 @@ async fn execute_turn_flow(
             TurnTaskCompletion {
                 result: Err(match error {
                     chat::ChatTurnError::Terminal(message) => TurnTaskFailure::Terminal(message),
+                    chat::ChatTurnError::Transient(message) => TurnTaskFailure::Transient(message),
                     chat::ChatTurnError::Blocked(message) => TurnTaskFailure::Blocked(message),
                     chat::ChatTurnError::ProviderFailure {
                         item_id,
@@ -1943,6 +2151,8 @@ enum LoopDurableCommitOutcome {
 fn loop_durable_event_kind(event: &AgentDurableEvent) -> &'static str {
     match event {
         AgentDurableEvent::ToolOutputRecorded { .. } => "tool_output_recorded",
+        AgentDurableEvent::NativeSemanticCheckpoint { .. } => "native_semantic_checkpoint",
+        AgentDurableEvent::NativeInitialPhaseAdvanced { .. } => "native_initial_phase_advanced",
         AgentDurableEvent::PromptManifestCompiled { .. } => "prompt_manifest_compiled",
         AgentDurableEvent::TurnSkillsResolved { .. } => "turn_skills_resolved",
         AgentDurableEvent::TurnCapabilitiesResolved { .. } => "turn_capabilities_resolved",
@@ -1952,6 +2162,7 @@ fn loop_durable_event_kind(event: &AgentDurableEvent) -> &'static str {
         AgentDurableEvent::TurnProviderHistoryAppended { .. } => "turn_provider_history_appended",
         AgentDurableEvent::ItemStarted { .. } => "item_started",
         AgentDurableEvent::ItemCompleted { .. } => "item_completed",
+        AgentDurableEvent::ProviderUsageObserved { .. } => "provider_usage_observed",
         AgentDurableEvent::TurnFinalizationPrepared { .. } => "turn_finalization_prepared",
         AgentDurableEvent::ItemToolRetryScheduled { .. } => "item_tool_retry_scheduled",
         AgentDurableEvent::ItemToolRetryResolved { .. } => "item_tool_retry_resolved",
@@ -2082,7 +2293,7 @@ async fn publish_recovery_execution_window_continued(
     workspace_id: &str,
     thread_id: &str,
     turn_request: &ActiveTurnRequest,
-) -> Result<(), super::AgentControlError> {
+) -> Result<(), super::AgentEventHubError> {
     let Some(context) = turn_request.execution_checkpoint_context.as_ref() else {
         return Ok(());
     };
@@ -2106,11 +2317,6 @@ async fn publish_recovery_execution_window_continued(
             },
         })
         .await
-        .map_err(|error| {
-            super::AgentControlError::Internal(format!(
-                "failed to publish execution window continuation for recovery: {error}"
-            ))
-        })
 }
 
 fn terminal_effect_preparation(
@@ -2240,6 +2446,74 @@ mod tests {
     use pioneer_runtime_events::{DurableCommitRejection, ExecutionEventHub};
     use std::sync::Arc;
     use tokio::time::{Duration, timeout};
+
+    #[test]
+    fn native_recovery_provider_requires_and_retains_the_accepted_azure_connection() {
+        let registry = pioneer_provider::ProviderRegistry::new(|_| "key".into());
+        let accepted = pioneer_provider::AzureResolvedConnection::from_values(
+            "resource-before".into(),
+            "deployment-before".into(),
+            "v1".into(),
+            None,
+        )
+        .unwrap();
+        let accepted_contract = registry
+            .get_or_create_for_workspace_with_frozen_azure("workspace", "azure-openai", &accepted)
+            .unwrap()
+            .capture_model_contract("deployment-before")
+            .unwrap();
+        for initial_direct_start in [false, true] {
+            let provider = super::resolve_accepted_provider(
+                &registry,
+                "workspace",
+                "azure-openai",
+                Some(&accepted),
+                "deployment-before",
+                Some(&accepted_contract),
+                initial_direct_start,
+            )
+            .unwrap();
+            assert_eq!(provider.resolved_azure_connection(), Some(accepted.clone()));
+        }
+        assert!(
+            super::resolve_accepted_provider(
+                &registry,
+                "workspace",
+                "azure-openai",
+                None,
+                "deployment-before",
+                Some(&accepted_contract),
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            super::resolve_accepted_provider(
+                &registry,
+                "workspace",
+                "openai",
+                Some(&accepted),
+                "deployment-before",
+                Some(&accepted_contract),
+                false
+            )
+            .is_err()
+        );
+        let mut future = accepted;
+        future.schema_version = 2;
+        assert!(
+            super::resolve_accepted_provider(
+                &registry,
+                "workspace",
+                "azure-openai",
+                Some(&future),
+                "deployment-before",
+                Some(&accepted_contract),
+                false
+            )
+            .is_err()
+        );
+    }
 
     fn completed_event(turn_id: &str) -> AgentDurableEvent {
         AgentDurableEvent::TurnCompleted {
@@ -2429,6 +2703,7 @@ mod tests {
             max_wall_clock_ms_per_turn,
             max_provider_tokens_per_turn,
             max_consecutive_no_progress_windows: 3,
+            max_consecutive_unconfirmed_progress_windows: 128,
         }
     }
 
@@ -2452,6 +2727,7 @@ mod tests {
                 attachment_kinds: Vec::new(),
             },
             pioneer_protocol::ExecutionCheckpointWindowSummary {
+                progress: None,
                 window_id: Some(format!("window_{window_index}")),
                 window_index,
                 started_at_unix_ms: Some(i64::from(window_index) * 1_000),
@@ -2497,10 +2773,14 @@ mod tests {
             total_provider_tokens: 0,
             provider_token_usage_unknown: false,
             consecutive_no_progress_windows: 0,
+            consecutive_unconfirmed_progress_windows: 0,
         };
 
-        let decision =
-            decide_execution_window_total_budget(&usage, &total_budget(3, 12, Some(10_000), None));
+        let decision = decide_execution_window_total_budget(
+            &usage,
+            &total_budget(3, 12, Some(10_000), None),
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        );
 
         let ExecutionWindowTotalBudgetDecision::Block(block) = decision else {
             panic!("total window budget should block continuation");
@@ -2519,10 +2799,14 @@ mod tests {
             total_provider_tokens: 0,
             provider_token_usage_unknown: false,
             consecutive_no_progress_windows: 0,
+            consecutive_unconfirmed_progress_windows: 0,
         };
 
-        let decision =
-            decide_execution_window_total_budget(&usage, &total_budget(4, 12, Some(10_000), None));
+        let decision = decide_execution_window_total_budget(
+            &usage,
+            &total_budget(4, 12, Some(10_000), None),
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        );
 
         let ExecutionWindowTotalBudgetDecision::Block(block) = decision else {
             panic!("total tool-call budget should block continuation");
@@ -2545,10 +2829,14 @@ mod tests {
             total_provider_tokens: 0,
             provider_token_usage_unknown: false,
             consecutive_no_progress_windows: 0,
+            consecutive_unconfirmed_progress_windows: 0,
         };
 
-        let decision =
-            decide_execution_window_total_budget(&usage, &total_budget(4, 100, Some(5_000), None));
+        let decision = decide_execution_window_total_budget(
+            &usage,
+            &total_budget(4, 100, Some(5_000), None),
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        );
 
         let ExecutionWindowTotalBudgetDecision::Block(block) = decision else {
             panic!("total wall-clock budget should block continuation");
@@ -2571,11 +2859,13 @@ mod tests {
             total_provider_tokens: 10_000,
             provider_token_usage_unknown: false,
             consecutive_no_progress_windows: 0,
+            consecutive_unconfirmed_progress_windows: 0,
         };
 
         let decision = decide_execution_window_total_budget(
             &usage,
             &total_budget(4, 100, Some(50_000), Some(10_000)),
+            pioneer_tools::ToolNoProgressMode::Enforce,
         );
 
         let ExecutionWindowTotalBudgetDecision::Block(block) = decision else {
@@ -2591,7 +2881,31 @@ mod tests {
     }
 
     #[test]
-    fn total_budget_decision_does_not_block_on_unknown_provider_tokens() {
+    fn total_budget_decision_preserves_unknown_below_known_token_cap() {
+        let usage = TurnExecutionUsageCounters {
+            total_windows: 1,
+            total_tool_calls: 4,
+            total_wall_clock_ms: 500,
+            total_provider_tokens: 9,
+            provider_token_usage_unknown: true,
+            consecutive_no_progress_windows: 0,
+            consecutive_unconfirmed_progress_windows: 0,
+        };
+
+        assert_eq!(
+            decide_execution_window_total_budget(
+                &usage,
+                &total_budget(4, 100, Some(50_000), Some(10)),
+                pioneer_tools::ToolNoProgressMode::Enforce
+            ),
+            ExecutionWindowTotalBudgetDecision::Continue {
+                next_window_index: 2
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_usage_cannot_hide_exhausted_known_token_budget_in_any_mode() {
         let usage = TurnExecutionUsageCounters {
             total_windows: 1,
             total_tool_calls: 4,
@@ -2599,17 +2913,28 @@ mod tests {
             total_provider_tokens: 10_000,
             provider_token_usage_unknown: true,
             consecutive_no_progress_windows: 0,
+            consecutive_unconfirmed_progress_windows: 0,
         };
-
-        assert_eq!(
-            decide_execution_window_total_budget(
-                &usage,
-                &total_budget(4, 100, Some(50_000), Some(10))
-            ),
-            ExecutionWindowTotalBudgetDecision::Continue {
-                next_window_index: 2
-            }
-        );
+        for mode in [
+            pioneer_tools::ToolNoProgressMode::Disabled,
+            pioneer_tools::ToolNoProgressMode::Observe,
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        ] {
+            let ExecutionWindowTotalBudgetDecision::Block(block) =
+                decide_execution_window_total_budget(
+                    &usage,
+                    &total_budget(4, 100, Some(50_000), Some(10)),
+                    mode,
+                )
+            else {
+                panic!("unknown usage must not erase the exhausted known lower bound");
+            };
+            assert_eq!(
+                block.kind,
+                ExecutionWindowTotalBudgetBlockKind::MaxProviderTokens
+            );
+            assert!(usage.provider_token_usage_unknown);
+        }
     }
 
     #[test]
@@ -2621,12 +2946,14 @@ mod tests {
             total_provider_tokens: 2_000_000,
             provider_token_usage_unknown: false,
             consecutive_no_progress_windows: 0,
+            consecutive_unconfirmed_progress_windows: 0,
         };
 
         assert_eq!(
             decide_execution_window_total_budget(
                 &usage,
-                &pioneer_tools::ExecutionWindowTotalBudgetConfig::default()
+                &pioneer_tools::ExecutionWindowTotalBudgetConfig::default(),
+                pioneer_tools::ToolNoProgressMode::Enforce
             ),
             ExecutionWindowTotalBudgetDecision::Continue {
                 next_window_index: 97
@@ -2635,42 +2962,89 @@ mod tests {
     }
 
     #[test]
-    fn no_progress_accounting_increments_only_for_empty_recovery_windows() {
+    fn unknown_windows_do_not_invent_or_reset_confirmed_semantic_stall() {
+        use pioneer_protocol::{
+            ExecutionProgressSummary, ExecutionWindowExhaustionReason as Reason,
+        };
         let mut usage = TurnExecutionUsageCounters::default();
-
-        usage.observe_checkpoint_payload(&checkpoint_payload(
-            1,
-            0,
-            0,
-            0,
-            pioneer_protocol::ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
-        ));
-
-        assert_eq!(usage.total_windows, 1);
+        let mut first = checkpoint_payload(1, 100, 20, 0, Reason::ProviderFailureContinuation);
+        first.window.progress = Some(ExecutionProgressSummary {
+            schema_version: 1,
+            baseline: [1, 0, 0],
+            frontier: [1, 1, 0],
+        });
+        usage.observe_checkpoint_payload(&first);
         assert_eq!(usage.consecutive_no_progress_windows, 1);
+        assert_eq!(usage.consecutive_unconfirmed_progress_windows, 1);
+        let mut noisy = checkpoint_payload(2, 40, 0, 3, Reason::RuntimeShutdownContinuation);
+        noisy.window.progress = Some(ExecutionProgressSummary {
+            schema_version: 1,
+            baseline: [1, 1, 0],
+            frontier: [1, 1, 3],
+        });
+        usage.observe_checkpoint_payload(&noisy);
+        assert_eq!(usage.consecutive_no_progress_windows, 1);
+        assert_eq!(usage.consecutive_unconfirmed_progress_windows, 2);
+        usage.observe_checkpoint_payload(&noisy);
+        assert_eq!(
+            usage.consecutive_unconfirmed_progress_windows, 2,
+            "duplicate window cannot spend twice"
+        );
+        let mut advanced = checkpoint_payload(3, 1, 0, 1, Reason::ProviderFailureContinuation);
+        advanced.window.progress = Some(ExecutionProgressSummary {
+            schema_version: 1,
+            baseline: [1, 1, 3],
+            frontier: [2, 1, 4],
+        });
+        usage.observe_checkpoint_payload(&advanced);
+        assert_eq!(usage.consecutive_no_progress_windows, 0);
+        assert_eq!(usage.consecutive_unconfirmed_progress_windows, 0);
+        assert_eq!(usage.total_windows, 3);
+        let restored = TurnExecutionUsageCounters::from_snapshot(usage.snapshot());
+        assert_eq!(restored, usage);
+        let mut unknown = checkpoint_payload(4, 0, 0, 0, Reason::RuntimeShutdownContinuation);
+        unknown.window.progress = None;
+        usage.observe_checkpoint_payload(&unknown);
+        assert_eq!(usage.consecutive_no_progress_windows, 0);
+        assert_eq!(usage.consecutive_unconfirmed_progress_windows, 1);
     }
 
     #[test]
-    fn durable_progress_resets_no_progress_accounting_even_when_tools_fail() {
-        let mut usage = TurnExecutionUsageCounters::default();
-
-        usage.observe_checkpoint_payload(&checkpoint_payload(
-            1,
-            0,
-            0,
-            0,
-            pioneer_protocol::ExecutionWindowExhaustionReason::ProviderFailureContinuation,
-        ));
-        usage.observe_checkpoint_payload(&checkpoint_payload(
-            2,
-            1,
-            0,
-            3,
-            pioneer_protocol::ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
-        ));
-
-        assert_eq!(usage.total_windows, 2);
-        assert_eq!(usage.consecutive_no_progress_windows, 0);
+    fn progress_safety_budget_remains_finite_in_all_heuristic_modes() {
+        let mut budget = pioneer_tools::ExecutionWindowTotalBudgetConfig::default();
+        budget.max_consecutive_no_progress_windows = 1;
+        budget.max_consecutive_unconfirmed_progress_windows = 2;
+        let mut usage = TurnExecutionUsageCounters {
+            total_windows: 1,
+            consecutive_no_progress_windows: 1,
+            consecutive_unconfirmed_progress_windows: 1,
+            ..Default::default()
+        };
+        for mode in [
+            pioneer_tools::ToolNoProgressMode::Disabled,
+            pioneer_tools::ToolNoProgressMode::Observe,
+        ] {
+            assert!(matches!(
+                decide_execution_window_total_budget(&usage, &budget, mode),
+                ExecutionWindowTotalBudgetDecision::Continue { .. }
+            ));
+        }
+        assert!(
+            matches!(decide_execution_window_total_budget(&usage, &budget, pioneer_tools::ToolNoProgressMode::Enforce),
+            ExecutionWindowTotalBudgetDecision::Block(block) if block.kind == ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveNoProgressWindows)
+        );
+        usage.consecutive_no_progress_windows = 0;
+        usage.consecutive_unconfirmed_progress_windows = 2;
+        for mode in [
+            pioneer_tools::ToolNoProgressMode::Disabled,
+            pioneer_tools::ToolNoProgressMode::Observe,
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        ] {
+            assert!(
+                matches!(decide_execution_window_total_budget(&usage, &budget, mode),
+                ExecutionWindowTotalBudgetDecision::Block(block) if block.kind == ExecutionWindowTotalBudgetBlockKind::MaxUnconfirmedProgressWindows)
+            );
+        }
     }
 
     #[test]
@@ -2682,11 +3056,16 @@ mod tests {
             total_provider_tokens: 0,
             provider_token_usage_unknown: true,
             consecutive_no_progress_windows: 3,
+            consecutive_unconfirmed_progress_windows: 3,
         };
 
         let mut budget = total_budget(8, 100, Some(10_000), None);
         budget.max_consecutive_no_progress_windows = 3;
-        let decision = decide_execution_window_total_budget(&usage, &budget);
+        let decision = decide_execution_window_total_budget(
+            &usage,
+            &budget,
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        );
 
         let ExecutionWindowTotalBudgetDecision::Block(block) = decision else {
             panic!("consecutive no-progress budget should block continuation");

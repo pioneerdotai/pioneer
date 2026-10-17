@@ -425,6 +425,112 @@ async fn raw_filtered_empty_projection_publishes_with_original_membership() {
 }
 
 #[tokio::test]
+async fn native_cold_history_restores_exact_own_working_root_without_global_head() {
+    let f = fixture("original current-turn observation", vec![], true, false).await;
+    let leaf = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    let checkpoint = publish_projection_checkpoint(
+        &f,
+        "thread",
+        "native-cold-root",
+        &[("thread".into(), leaf)],
+        pioneer_compaction::CoverageDomain::WorkingContext,
+        None,
+    )
+    .await;
+    let root = f
+        .store
+        .compaction_checkpoint_source("ws", "thread", &checkpoint.id)
+        .await
+        .unwrap()
+        .unwrap();
+    // The semantic checkpoint owns this exact ref; restoration must not select
+    // a global head or materialize a completed-history basis instead.
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_context SET head=NULL WHERE owner=?",
+            [checkpoint.owner.clone().into()],
+        ))
+        .await
+        .unwrap();
+    let store = f.store.with_maintenance_access();
+    let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+    let restored = super::native::restore_native_history_roots_with_scope(
+        &store,
+        "ws",
+        "thread",
+        &[root.clone()],
+        &allowed,
+        &mut super::coverage::CheckpointGraphResolver::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(
+        restored[0].content,
+        format!(
+            "Summary of completed work (historical data):\n{}",
+            checkpoint.summary
+        )
+    );
+    let origin = restored[0].provenance.as_ref().unwrap();
+    assert!(
+        origin.inherited,
+        "working-context provenance must survive cold materialization"
+    );
+    assert_eq!(origin.sources[0].id, root.id);
+    assert_eq!(origin.sources[0].version, root.version);
+    assert_eq!(
+        store.database_connection().read_class(),
+        pioneer_sqlite::SqliteReadClass::Maintenance
+    );
+    let mut changed = root.clone();
+    changed.version = "changed-version".into();
+    let error = super::native::restore_native_history_roots_with_scope(
+        &store,
+        "ws",
+        "thread",
+        &[changed],
+        &allowed,
+        &mut super::coverage::CheckpointGraphResolver::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.is::<pioneer_agent::NativeHistorySourceUnavailable>());
+    let error = super::native::restore_native_history_roots_with_scope(
+        &store,
+        "other",
+        "thread",
+        &[root.clone()],
+        &allowed,
+        &mut super::coverage::CheckpointGraphResolver::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.is::<pioneer_agent::NativeHistorySourceUnavailable>());
+    assert!(
+        super::native::restore_native_history_roots_with_scope(
+            &store,
+            "ws",
+            "thread",
+            &[root],
+            &std::collections::BTreeSet::new(),
+            &mut super::coverage::CheckpointGraphResolver::default()
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
 async fn source_creation_order_keeps_child_tool_work_before_later_parent_input() {
     use pioneer_agent::compaction::composition::{AcceptedContextBranch, compose_context};
     use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef, ProviderToolCall};
@@ -11022,6 +11128,11 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
         &std::collections::HashMap::new(),
         &[],
         &[],
+        &pioneer_skills::SkillCatalogSnapshot {
+            version: 0,
+            generated_at_unix: 0,
+            skills: Vec::new(),
+        },
     )
     .unwrap();
     runtime.history_json = descriptor_json;
@@ -19776,6 +19887,11 @@ async fn history_capture_inherits_read_class_and_cancellation_releases_admission
         &std::collections::HashMap::new(),
         &[],
         &[],
+        &pioneer_skills::SkillCatalogSnapshot {
+            version: 0,
+            generated_at_unix: 0,
+            skills: Vec::new(),
+        },
     )
     .unwrap();
     runtime.history_json = history_json;

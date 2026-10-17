@@ -496,6 +496,7 @@ pub struct RuntimeFailureCandidate {
 
 #[derive(Clone)]
 pub struct RecoveryCoordinator {
+    artifact_service: Option<Arc<pioneer_artifacts::ArtifactService>>,
     crud_store: Arc<CrudStore>,
     agent_manager: Arc<AgentManager>,
     policy_registry: RecoveryPolicyRegistry,
@@ -675,6 +676,18 @@ enum RestoredRecoveryTurnUnavailable {
     },
 }
 
+/// Source incompatibility is separate from a transient repository/read error.
+#[derive(Debug)]
+struct NativeSemanticCheckpointUnavailable;
+
+impl std::fmt::Display for NativeSemanticCheckpointUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native semantic checkpoint is unavailable or has unconsumed sources")
+    }
+}
+
+impl std::error::Error for NativeSemanticCheckpointUnavailable {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ExecutionWindowContinuationAdmission {
     Open {
@@ -719,7 +732,7 @@ fn execution_window_limit_reason(total_windows: u32, max_windows_per_turn: u32) 
 
 fn execution_window_no_progress_reason(limit: u32, observed: u32) -> String {
     format!(
-        "max_consecutive_no_progress_windows reached: limit={limit}, observed={observed}; automatic recovery stopped because consecutive execution windows produced no durable agent round or tool result"
+        "max_consecutive_no_progress_windows reached: limit={limit}, observed={observed}; automatic recovery stopped after confirmed unchanged domain observations"
     )
 }
 
@@ -735,6 +748,7 @@ impl RecoveryCoordinator {
             crate::authorization::AuthorizationInvalidationHub::durable(crud_store.clone()),
         );
         Self {
+            artifact_service: None,
             crud_store,
             agent_manager,
             policy_registry,
@@ -750,8 +764,20 @@ impl RecoveryCoordinator {
         }
     }
 
+    pub(crate) fn with_artifact_service(
+        mut self,
+        service: Arc<pioneer_artifacts::ArtifactService>,
+    ) -> Self {
+        self.artifact_service = Some(service);
+        self
+    }
+
     pub(crate) fn with_crud_store(&self, crud_store: Arc<CrudStore>) -> Self {
         let mut scoped = self.clone();
+        scoped.artifact_service = self
+            .artifact_service
+            .as_ref()
+            .map(|service| Arc::new(service.with_crud_store(crud_store.clone())));
         scoped.crud_store = crud_store;
         scoped
     }
@@ -1052,7 +1078,7 @@ impl RecoveryCoordinator {
         )])
     }
 
-    pub async fn record_cli_runtime_attempt_failure(
+    pub async fn record_runtime_attempt_failure(
         &self,
         recovery_job_id: &str,
         recovery_attempt_id: &str,
@@ -1241,17 +1267,67 @@ impl RecoveryCoordinator {
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
         let policy = self.policy_for_recovery_job(&job).await?;
         let attempt_number = attempt_number_for_job(&job);
+        let progress = match self
+            .crud_store
+            .prepare_recovery_progress_outcome(&job.id, active_attempt_id)
+            .await
+        {
+            Ok(Some(progress)) => progress,
+            Ok(None) => return Ok(Vec::new()),
+            Err(error) if error.is::<pioneer_crud::RecoveryProgressUnavailable>() => {
+                return self
+                    .block_active_recovery_with_native_source(
+                        job,
+                        active_attempt_id.to_owned(),
+                        error.to_string(),
+                        None,
+                        now_unix,
+                        diagnostic.clone(),
+                        accepted_cli_outcome,
+                        native_source,
+                        None,
+                    )
+                    .await;
+            }
+            Err(error) => return Err(error),
+        };
+        let mode = match self.accepted_execution_window_policy(&job.turn_id).await {
+            Ok((_, mode)) => mode,
+            Err(error) if error.is::<NativeSemanticCheckpointUnavailable>() => {
+                return self
+                    .block_active_recovery_with_native_source(
+                        job,
+                        active_attempt_id.to_owned(),
+                        error.to_string(),
+                        None,
+                        now_unix,
+                        diagnostic.clone(),
+                        accepted_cli_outcome,
+                        native_source,
+                        Some(&progress),
+                    )
+                    .await;
+            }
+            Err(error) => return Err(error),
+        };
         let consumed_run_count = job.run_count.saturating_add(1);
         let wall_clock_exceeded = i64::try_from(policy.max_wall_clock_secs)
             .ok()
             .is_some_and(|limit| now_unix.saturating_sub(job.scheduled_at_unix) > limit);
-        let no_progress_exceeded =
-            policy.no_progress_limit >= 0 && consumed_run_count >= policy.no_progress_limit;
+        let no_progress_exceeded = mode == pioneer_tools::ToolNoProgressMode::Enforce
+            && policy.no_progress_limit >= 0
+            && progress.state().consecutive_no_progress > 0
+            && i64::from(progress.state().consecutive_no_progress) >= policy.no_progress_limit;
+        let unconfirmed_exceeded = progress.state().consecutive_unconfirmed >= 128;
         let attempts_exhausted =
             policy.max_attempts >= 0 && consumed_run_count >= policy.max_attempts;
 
-        if wall_clock_exceeded || no_progress_exceeded || attempts_exhausted {
-            let stop_reason = budget_stop_reason(wall_clock_exceeded, attempts_exhausted);
+        if wall_clock_exceeded || no_progress_exceeded || attempts_exhausted || unconfirmed_exceeded
+        {
+            let stop_reason = budget_stop_reason(
+                wall_clock_exceeded,
+                attempts_exhausted || unconfirmed_exceeded,
+            );
             let mut diagnostic = diagnostic
                 .or_else(|| job.diagnostic.clone())
                 .unwrap_or_default();
@@ -1265,7 +1341,7 @@ impl RecoveryCoordinator {
 
             let applied = if let Some(execution) = native_source {
                 self.crud_store
-                    .record_native_recovery_start_failure_owned(
+                    .record_native_recovery_start_failure_owned_and_progress(
                         execution,
                         &RecoveryAttemptContext {
                             job_id: job.id.clone(),
@@ -1276,11 +1352,13 @@ impl RecoveryCoordinator {
                         Some(last_error),
                         Some(diagnostic),
                         now_unix,
+                        None,
+                        Some(&progress),
                     )
                     .await?
             } else {
                 self.crud_store
-                    .mark_recovery_job_terminal_after_attempt_with_diagnostic(
+                    .mark_recovery_job_terminal_after_attempt_with_diagnostic_and_progress(
                         job.id.as_str(),
                         active_attempt_id,
                         RecoveryJobStatus::Exhausted,
@@ -1288,6 +1366,7 @@ impl RecoveryCoordinator {
                         Some(diagnostic),
                         now_unix,
                         accepted_cli_outcome,
+                        Some(&progress),
                     )
                     .await?
             };
@@ -1328,7 +1407,7 @@ impl RecoveryCoordinator {
         let reason = failure_message;
         let applied = if let Some(execution) = native_source {
             self.crud_store
-                .record_native_recovery_start_failure_owned(
+                .record_native_recovery_start_failure_owned_and_progress(
                     execution,
                     &RecoveryAttemptContext {
                         job_id: job.id.clone(),
@@ -1339,11 +1418,13 @@ impl RecoveryCoordinator {
                     reason.clone(),
                     diagnostic,
                     now_unix,
+                    budget_origin_after_cooldown_unix,
+                    Some(&progress),
                 )
                 .await?
         } else {
             self.crud_store
-                .mark_recovery_job_retrying_with_diagnostic(
+                .mark_recovery_job_retrying_with_diagnostic_and_progress(
                     job.id.as_str(),
                     active_attempt_id,
                     next_run_at_unix,
@@ -1352,6 +1433,7 @@ impl RecoveryCoordinator {
                     diagnostic,
                     now_unix,
                     accepted_cli_outcome,
+                    Some(&progress),
                 )
                 .await?
         };
@@ -2243,15 +2325,56 @@ impl RecoveryCoordinator {
             .ok()
             .is_some_and(|limit| now_unix.saturating_sub(job.scheduled_at_unix) > limit);
 
-        let no_progress_exceeded =
-            policy.no_progress_limit >= 0 && run_index > policy.no_progress_limit;
+        if job.progress == pioneer_crud::RecoveryProgressLoad::Unavailable {
+            return self
+                .block_claimed_recovery_for_unavailable_progress(
+                    job,
+                    &claim_token,
+                    pioneer_crud::RecoveryProgressUnavailable.to_string(),
+                    now_unix,
+                )
+                .await;
+        }
+        let mode = match self.accepted_execution_window_policy(&job.turn_id).await {
+            Ok((_, mode)) => mode,
+            Err(error) if error.is::<NativeSemanticCheckpointUnavailable>() => {
+                return self
+                    .block_claimed_recovery_for_unavailable_progress(
+                        job,
+                        &claim_token,
+                        error.to_string(),
+                        now_unix,
+                    )
+                    .await;
+            }
+            Err(error) => return Err(error),
+        };
+        let progress = match &job.progress {
+            pioneer_crud::RecoveryProgressLoad::Available(state) => Some(state),
+            pioneer_crud::RecoveryProgressLoad::LegacyUnknown => None,
+            pioneer_crud::RecoveryProgressLoad::Unavailable => {
+                unreachable!("unavailable progress blocked before policy");
+            }
+        };
+        let no_progress_exceeded = mode == pioneer_tools::ToolNoProgressMode::Enforce
+            && policy.no_progress_limit >= 0
+            && progress.is_some_and(|state| {
+                state.consecutive_no_progress > 0
+                    && i64::from(state.consecutive_no_progress) >= policy.no_progress_limit
+            });
+        let unconfirmed_exceeded =
+            progress.is_some_and(|state| state.consecutive_unconfirmed >= 128);
 
         let attempts_exhausted = policy.max_attempts >= 0 && run_index > policy.max_attempts;
 
-        if wall_clock_exceeded || no_progress_exceeded || attempts_exhausted {
+        if wall_clock_exceeded || no_progress_exceeded || attempts_exhausted || unconfirmed_exceeded
+        {
             let diagnostic = terminal_diagnostic(
                 &job,
-                budget_stop_reason(wall_clock_exceeded, attempts_exhausted),
+                budget_stop_reason(
+                    wall_clock_exceeded,
+                    attempts_exhausted || unconfirmed_exceeded,
+                ),
             );
             let message = diagnostic.public_message();
 
@@ -2302,7 +2425,7 @@ impl RecoveryCoordinator {
                 None,
             );
             let reason = Some("turn location missing".to_owned());
-            if self
+            if match self
                 .crud_store
                 .mark_claimed_recovery_job_retrying(
                     job.id.as_str(),
@@ -2311,8 +2434,21 @@ impl RecoveryCoordinator {
                     reason.clone(),
                     now_unix,
                 )
-                .await?
+                .await
             {
+                Ok(scheduled) => scheduled,
+                Err(error) if error.is::<pioneer_crud::RecoveryProgressUnavailable>() => {
+                    return self
+                        .block_claimed_recovery_for_unavailable_progress(
+                            job,
+                            &claim_token,
+                            error.to_string(),
+                            now_unix,
+                        )
+                        .await;
+                }
+                Err(error) => return Err(error),
+            } {
                 events.push(RecoveryCoordinatorEvent::RetryScheduled {
                     job_id: job.id,
                     turn_id: job.turn_id,
@@ -2404,10 +2540,10 @@ impl RecoveryCoordinator {
                     active_attempt_id.as_str(),
                     now_unix,
                 )
-                .await?
+                .await
             {
-                ClaimedRecoveryActivation::Activated => {}
-                ClaimedRecoveryActivation::BlockedByActiveRecovery => {
+                Ok(ClaimedRecoveryActivation::Activated) => {}
+                Ok(ClaimedRecoveryActivation::BlockedByActiveRecovery) => {
                     let _ = self
                         .crud_store
                         .release_claimed_recovery_job(
@@ -2420,7 +2556,18 @@ impl RecoveryCoordinator {
                         .await?;
                     return Ok(events);
                 }
-                ClaimedRecoveryActivation::ClaimNotFound => return Ok(events),
+                Ok(ClaimedRecoveryActivation::ClaimNotFound) => return Ok(events),
+                Err(error) if error.is::<pioneer_crud::RecoveryProgressUnavailable>() => {
+                    return self
+                        .block_claimed_recovery_for_unavailable_progress(
+                            job,
+                            &claim_token,
+                            error.to_string(),
+                            now_unix,
+                        )
+                        .await;
+                }
+                Err(error) => return Err(error),
             }
             events.push(
                 RecoveryCoordinatorEvent::CliRuntimeTerminalReconciliationRequested(Box::new(
@@ -2490,10 +2637,10 @@ impl RecoveryCoordinator {
                 active_attempt_id.as_str(),
                 now_unix,
             )
-            .await?
+            .await
         {
-            ClaimedRecoveryActivation::Activated => {}
-            ClaimedRecoveryActivation::BlockedByActiveRecovery => {
+            Ok(ClaimedRecoveryActivation::Activated) => {}
+            Ok(ClaimedRecoveryActivation::BlockedByActiveRecovery) => {
                 let _ = self
                     .crud_store
                     .release_claimed_recovery_job(
@@ -2506,7 +2653,18 @@ impl RecoveryCoordinator {
                     .await?;
                 return Ok(events);
             }
-            ClaimedRecoveryActivation::ClaimNotFound => return Ok(events),
+            Ok(ClaimedRecoveryActivation::ClaimNotFound) => return Ok(events),
+            Err(error) if error.is::<pioneer_crud::RecoveryProgressUnavailable>() => {
+                return self
+                    .block_claimed_recovery_for_unavailable_progress(
+                        job,
+                        &claim_token,
+                        error.to_string(),
+                        now_unix,
+                    )
+                    .await;
+            }
+            Err(error) => return Err(error),
         }
 
         if let Some(binding) = cli_runtime_binding {
@@ -2589,14 +2747,29 @@ impl RecoveryCoordinator {
                     .await;
             }
         };
-        let execution_checkpoint_context = self
+        let execution_checkpoint_context = match self
             .prepare_execution_checkpoint_for_recovery(
                 workspace_id.as_str(),
                 thread_id.as_str(),
                 &job,
                 now_unix,
             )
-            .await?;
+            .await
+        {
+            Ok(context) => context,
+            Err(error) if error.is::<NativeSemanticCheckpointUnavailable>() => {
+                return self
+                    .block_active_recovery(
+                        job,
+                        active_attempt_id,
+                        NativeSemanticCheckpointUnavailable.to_string(),
+                        None,
+                        now_unix,
+                    )
+                    .await;
+            }
+            Err(error) => return Err(error),
+        };
         if let Some(context) = execution_checkpoint_context.as_ref()
             && let ExecutionWindowContinuationAdmission::Block {
                 reason,
@@ -2894,6 +3067,37 @@ impl RecoveryCoordinator {
         Ok(())
     }
 
+    async fn block_claimed_recovery_for_unavailable_progress(
+        &self,
+        job: RecoveryJobRecord,
+        claim_token: &str,
+        reason: String,
+        now_unix: i64,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        if self
+            .crud_store
+            .mark_claimed_recovery_job_terminal_with_diagnostic(
+                &job.id,
+                claim_token,
+                RecoveryJobStatus::Blocked,
+                Some(reason.clone()),
+                None,
+                now_unix,
+            )
+            .await?
+        {
+            self.cancel_other_open_jobs_after_terminal_recovery(&job.turn_id, &job.id, now_unix)
+                .await?;
+            Ok(vec![RecoveryCoordinatorEvent::RecoveryBlocked {
+                job_id: job.id,
+                turn_id: job.turn_id,
+                reason,
+            }])
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
     async fn block_active_recovery(
         &self,
         job: RecoveryJobRecord,
@@ -2902,7 +3106,56 @@ impl RecoveryCoordinator {
         stop_reason: Option<pioneer_protocol::RecoveryStopReason>,
         now_unix: i64,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
-        let diagnostic = stop_reason.map(|stop_reason| terminal_diagnostic(&job, stop_reason));
+        self.block_active_recovery_with_source(
+            job,
+            active_attempt_id,
+            reason,
+            stop_reason,
+            now_unix,
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn block_active_recovery_with_source(
+        &self,
+        job: RecoveryJobRecord,
+        active_attempt_id: String,
+        reason: String,
+        stop_reason: Option<pioneer_protocol::RecoveryStopReason>,
+        now_unix: i64,
+        source_diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
+        accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        self.block_active_recovery_with_native_source(
+            job,
+            active_attempt_id,
+            reason,
+            stop_reason,
+            now_unix,
+            source_diagnostic,
+            accepted_cli_outcome,
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn block_active_recovery_with_native_source(
+        &self,
+        job: RecoveryJobRecord,
+        active_attempt_id: String,
+        reason: String,
+        stop_reason: Option<pioneer_protocol::RecoveryStopReason>,
+        now_unix: i64,
+        source_diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
+        accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+        native_source: Option<&TurnExecutionRecord>,
+        progress: Option<&pioneer_crud::PreparedRecoveryProgress>,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        let diagnostic = source_diagnostic
+            .or_else(|| stop_reason.map(|stop_reason| terminal_diagnostic(&job, stop_reason)));
         // Keep the last provider failure separate from the reason retries stopped.
         let last_error = if diagnostic.is_some() {
             job.last_error.clone().or_else(|| job.reason.clone())
@@ -2910,19 +3163,40 @@ impl RecoveryCoordinator {
             Some(reason.clone())
         };
         let mut events = Vec::new();
-        if self
-            .crud_store
-            .mark_recovery_job_terminal_after_attempt_with_diagnostic(
-                job.id.as_str(),
-                active_attempt_id.as_str(),
-                RecoveryJobStatus::Blocked,
-                last_error,
-                diagnostic,
-                now_unix,
-                None,
-            )
-            .await?
-        {
+        let applied = if let Some(execution) = native_source {
+            // Unknown progress cannot authorize a reset of the private accounting
+            // state. Preserve its existing diagnostic unless an exact prepared
+            // predecessor can carry that state into the same native transition.
+            self.crud_store
+                .record_native_recovery_start_failure_owned_and_progress(
+                    execution,
+                    &RecoveryAttemptContext {
+                        job_id: job.id.clone(),
+                        attempt_id: active_attempt_id.clone(),
+                    },
+                    RecoveryJobStatus::Blocked,
+                    None,
+                    last_error,
+                    if progress.is_some() { diagnostic } else { None },
+                    now_unix,
+                    None,
+                    progress,
+                )
+                .await?
+        } else {
+            self.crud_store
+                .mark_recovery_job_terminal_after_attempt_with_diagnostic(
+                    job.id.as_str(),
+                    active_attempt_id.as_str(),
+                    RecoveryJobStatus::Blocked,
+                    last_error,
+                    diagnostic,
+                    now_unix,
+                    accepted_cli_outcome,
+                )
+                .await?
+        };
+        if applied {
             self.cancel_other_open_jobs_after_terminal_recovery(
                 job.turn_id.as_str(),
                 job.id.as_str(),
@@ -3285,6 +3559,7 @@ impl RecoveryCoordinator {
         let mut request =
             match crate::turn_runtime_snapshot::restored_recovery_turn_request_from_snapshot(
                 self.crud_store.as_ref(),
+                self.artifact_service.as_deref(),
                 &snapshot,
                 turn.permission_profile,
                 match self
@@ -3319,51 +3594,34 @@ impl RecoveryCoordinator {
                     ));
                 }
             };
-        let skills_context =
-            match crate::message::skills::workspace::skills_runtime_context_from_config(
-                &self.tool_loop_config,
+        // Ordinary skills are the exact catalog accepted in the runtime snapshot.
+        // Current authorization is revalidated by the existing continuation/tool
+        // owners; it cannot replace accepted content with the latest catalog.
+        if let Err(error) = self
+            .checkpoint_running_execution_window(
                 workspace_id.as_str(),
-            ) {
-                Ok(context) => context,
-                Err(error) => {
-                    return Ok(RestoredRecoveryTurnRequestLookup::Unavailable(
-                        RestoredRecoveryTurnUnavailable::SnapshotInvalid {
-                            error: format!("failed to resolve recovery skills context: {error:#}"),
-                        },
-                    ));
-                }
-            };
-        request.skill_catalog =
-            match crate::message::skills::workspace::load_skills_catalog_from_store(
-                self.crud_store.as_ref(),
-                workspace_id.as_str(),
-                &skills_context,
+                thread_id,
+                request.turn_id.as_str(),
+                request.input.as_slice(),
+                request.model.as_str(),
+                request.provider_name.as_str(),
+                now_unix,
+                ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
+                TurnExecutionCheckpointKind::StartupRecovery,
+                "startup_recovery",
+                "agent loop was restored after process loss",
             )
             .await
-            {
-                Ok(catalog) => catalog,
-                Err(error) => {
-                    return Ok(RestoredRecoveryTurnRequestLookup::Unavailable(
-                        RestoredRecoveryTurnUnavailable::SnapshotInvalid {
-                            error: format!("failed to load recovery skill catalog: {error:#}"),
-                        },
-                    ));
-                }
-            };
-        self.checkpoint_running_execution_window(
-            workspace_id.as_str(),
-            thread_id,
-            request.turn_id.as_str(),
-            request.input.as_slice(),
-            request.model.as_str(),
-            request.provider_name.as_str(),
-            now_unix,
-            ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
-            TurnExecutionCheckpointKind::StartupRecovery,
-            "startup_recovery",
-            "agent loop was restored after process loss",
-        )
-        .await?;
+        {
+            if error.is::<NativeSemanticCheckpointUnavailable>() {
+                return Ok(RestoredRecoveryTurnRequestLookup::Unavailable(
+                    RestoredRecoveryTurnUnavailable::SnapshotInvalid {
+                        error: NativeSemanticCheckpointUnavailable.to_string(),
+                    },
+                ));
+            }
+            return Err(error);
+        }
         match self
             .execution_window_continuation_admission_for_turn(
                 request.turn_id.as_str(),
@@ -3497,6 +3755,22 @@ impl RecoveryCoordinator {
         Ok(())
     }
 
+    // Chat has no Agent initial phase, mutable tool obligations or retry guard.
+    // Require both durable producers to agree before selecting its stateless path.
+    async fn is_stateless_chat_turn(&self, thread_id: &str, turn_id: &str) -> Result<bool> {
+        let Some((workspace, turn)) = self.crud_store.get_turn(thread_id, turn_id).await? else {
+            return Ok(false);
+        };
+        let Some(snapshot) = self.crud_store.get_turn_runtime_snapshot(turn_id).await? else {
+            return Ok(false);
+        };
+        Ok(snapshot.workspace_id == workspace
+            && snapshot.thread_id == thread_id
+            && turn.mode == pioneer_protocol::ThreadMode::Chat
+            && serde_json::from_str::<pioneer_protocol::ThreadMode>(&snapshot.mode_json)?
+                == pioneer_protocol::ThreadMode::Chat)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn checkpoint_running_execution_window(
         &self,
@@ -3515,6 +3789,28 @@ impl RecoveryCoordinator {
         let completed_at = chrono::DateTime::<chrono::Utc>::from_timestamp(now_unix, 0)
             .map(|timestamp| timestamp.fixed_offset())
             .unwrap_or_else(|| chrono::Utc::now().fixed_offset());
+        let execution = self.crud_store.get_turn_execution(turn_id).await?;
+        let requires_semantic = match execution.as_ref().map(|execution| execution.executor_kind) {
+            Some(
+                pioneer_crud::TurnExecutorKind::NativeAgent
+                | pioneer_crud::TurnExecutorKind::ApiProvider,
+            ) => !self.is_stateless_chat_turn(thread_id, turn_id).await?,
+            Some(
+                pioneer_crud::TurnExecutorKind::CliRuntime
+                | pioneer_crud::TurnExecutorKind::AcpRuntime,
+            ) => false,
+            None => {
+                if self
+                    .crud_store
+                    .get_cli_runtime_turn_binding(turn_id)
+                    .await?
+                    .is_none()
+                {
+                    return Err(NativeSemanticCheckpointUnavailable.into());
+                }
+                false
+            }
+        };
         let window = match self
             .crud_store
             .latest_turn_execution_window(turn_id)
@@ -3522,6 +3818,9 @@ impl RecoveryCoordinator {
         {
             Some(window) => window,
             None => {
+                if requires_semantic {
+                    return Err(NativeSemanticCheckpointUnavailable.into());
+                }
                 self.crud_store
                     .create_turn_execution_window(
                         NewTurnExecutionWindowRecord {
@@ -3550,6 +3849,38 @@ impl RecoveryCoordinator {
         if window.status != ExecutionWindowStatus::Running {
             return Ok(());
         }
+
+        let semantic_checkpoint = if requires_semantic {
+            Some(
+                self.crud_store
+                    .native_semantic_checkpoint_for_turn(turn_id)
+                    .await?
+                    .ok_or(NativeSemanticCheckpointUnavailable)?,
+            )
+        } else {
+            None
+        };
+        let semantic_payload = if let Some(checkpoint) = &semantic_checkpoint {
+            let payload: ExecutionCheckpointPayload =
+                serde_json::from_value(checkpoint.payload_json.clone())
+                    .map_err(|_| NativeSemanticCheckpointUnavailable)?;
+            if !(checkpoint.window_id == window.id
+                && payload.workspace_id == workspace_id
+                && payload.thread_id == thread_id
+                && payload.turn_id == turn_id
+                && payload.window.window_index == window.window_index
+                && payload.native_semantic_state.is_some()
+                && self
+                    .crud_store
+                    .native_semantic_checkpoint_frontier_is_current(&payload)
+                    .await?)
+            {
+                return Err(NativeSemanticCheckpointUnavailable.into());
+            }
+            Some(payload)
+        } else {
+            None
+        };
 
         let window_items = self
             .crud_store
@@ -3584,12 +3915,13 @@ impl RecoveryCoordinator {
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
             .unwrap_or_else(|| format!("{turn_id}:window:{}", window.window_index));
-        let payload = build_execution_checkpoint_payload(
+        let mut payload = build_execution_checkpoint_payload(
             workspace_id,
             thread_id,
             turn_id,
             build_execution_checkpoint_original_request_summary(input),
             ExecutionCheckpointWindowSummary {
+                progress: None,
                 window_id: Some(runtime_window_id),
                 window_index: window.window_index,
                 started_at_unix_ms: Some(window.started_at.timestamp_millis()),
@@ -3614,6 +3946,16 @@ impl RecoveryCoordinator {
             tool_summary,
             Vec::new(),
         );
+        if let Some(semantic_payload) = semantic_payload {
+            payload.window.progress = semantic_payload.window.progress;
+            payload.original_request = semantic_payload.original_request;
+            payload.native_semantic_state = semantic_payload.native_semantic_state;
+            payload.tool_no_progress = semantic_payload.tool_no_progress;
+            payload.requested_tool_names = semantic_payload.requested_tool_names;
+            payload.strict_obligations = semantic_payload.strict_obligations;
+            payload.provider_budget.provider_usage_available &=
+                semantic_payload.provider_budget.provider_usage_available;
+        }
         let mut metadata_json = window.metadata_json.clone();
         match metadata_json.as_object_mut() {
             Some(metadata) => {
@@ -3632,6 +3974,42 @@ impl RecoveryCoordinator {
                     "terminalReason": terminal_reason,
                 });
             }
+        }
+
+        metadata_json["semanticProgress"] = serde_json::to_value(payload.window.progress)?;
+        if let Some(semantic_checkpoint) = semantic_checkpoint {
+            let execution = execution
+                .as_ref()
+                .context("native recovery owner unavailable")?;
+            return self
+                .crud_store
+                .checkpoint_native_running_window_for_recovery(
+                    &window,
+                    &semantic_checkpoint,
+                    NewTurnExecutionCheckpointRecord {
+                        id: None,
+                        window_id: window.id.clone(),
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        checkpoint_kind,
+                        payload_json: serde_json::to_value(payload)?,
+                        created_at: completed_at,
+                    },
+                    pioneer_crud::TurnExecutionWindowStatsRecord {
+                        agent_round_count,
+                        tool_call_count,
+                        provider_token_count: window.provider_token_count,
+                        metadata_json,
+                        completed_at,
+                        updated_at: completed_at,
+                    },
+                    reason,
+                    self.turn_execution_owner_id.as_ref(),
+                    execution.owner_generation,
+                )
+                .await
+                .map(|_| ());
         }
 
         let checkpoint_exists = self
@@ -3675,6 +4053,71 @@ impl RecoveryCoordinator {
         Ok(())
     }
 
+    async fn accepted_execution_window_policy(
+        &self,
+        turn_id: &str,
+    ) -> Result<(
+        pioneer_tools::ExecutionWindowsConfig,
+        pioneer_tools::ToolNoProgressMode,
+    )> {
+        let execution = self.crud_store.get_turn_execution(turn_id).await?;
+        if let Some(execution) = execution.as_ref().filter(|execution| {
+            matches!(
+                execution.executor_kind,
+                TurnExecutorKind::NativeAgent | TurnExecutorKind::ApiProvider
+            )
+        }) {
+            let snapshot = self
+                .crud_store
+                .get_turn_runtime_snapshot(turn_id)
+                .await?
+                .ok_or(NativeSemanticCheckpointUnavailable)?;
+            if snapshot.workspace_id != execution.workspace_id
+                || snapshot.thread_id != execution.thread_id
+            {
+                return Err(NativeSemanticCheckpointUnavailable.into());
+            }
+            if self
+                .is_stateless_chat_turn(&execution.thread_id, turn_id)
+                .await?
+            {
+                return Ok((
+                    self.tool_loop_config.execution_windows.normalized(),
+                    self.tool_loop_config.no_progress_mode,
+                ));
+            }
+            let phase = snapshot
+                .initial_phase_json
+                .as_deref()
+                .ok_or(NativeSemanticCheckpointUnavailable)?;
+            // Reuse the original scoped restore proof. No handlers/services or
+            // database resources are held while decoding this bounded phase.
+            pioneer_agent::NativeInitialPreparation::restore(
+                phase,
+                &execution.workspace_id,
+                &execution.thread_id,
+                turn_id,
+                pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+            )
+            .map_err(|_| NativeSemanticCheckpointUnavailable)?;
+            let requirements =
+                pioneer_agent::NativeInitialPreparation::completed_resume_requirements(
+                    phase,
+                    pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+                )
+                .map_err(|_| NativeSemanticCheckpointUnavailable)?
+                .ok_or(NativeSemanticCheckpointUnavailable)?;
+            return Ok((
+                requirements.execution_windows.normalized(),
+                requirements.no_progress_mode,
+            ));
+        }
+        Ok((
+            self.tool_loop_config.execution_windows.normalized(),
+            self.tool_loop_config.no_progress_mode,
+        ))
+    }
+
     async fn execution_window_admission_for_turn(
         &self,
         turn_id: &str,
@@ -3711,12 +4154,10 @@ impl RecoveryCoordinator {
         .filter(|index| *index > 0)
         .max();
 
+        let (windows, _) = self.accepted_execution_window_policy(turn_id).await?;
         Ok(decide_execution_window_admission(
             latest_window_index,
-            self.tool_loop_config
-                .execution_windows
-                .total
-                .max_windows_per_turn,
+            windows.total.max_windows_per_turn,
         ))
     }
 
@@ -3735,7 +4176,9 @@ impl RecoveryCoordinator {
                     turn_id,
                 )
                 .await?;
-                let total_budget = &self.tool_loop_config.execution_windows.total;
+                let (accepted_windows, mode) =
+                    self.accepted_execution_window_policy(turn_id).await?;
+                let total_budget = &accepted_windows.total;
                 if let Some(limit) = total_budget.max_tool_calls_per_turn
                     && usage.total_tool_calls >= u64::from(limit)
                 {
@@ -3761,7 +4204,6 @@ impl RecoveryCoordinator {
                     });
                 }
                 if let Some(limit) = total_budget.max_provider_tokens_per_turn
-                    && !usage.provider_token_usage_unknown
                     && usage.total_provider_tokens >= limit
                 {
                     return Ok(ExecutionWindowContinuationAdmission::Block {
@@ -3773,19 +4215,29 @@ impl RecoveryCoordinator {
                         ),
                     });
                 }
-                let limit = self
-                    .tool_loop_config
-                    .execution_windows
-                    .total
-                    .max_consecutive_no_progress_windows
-                    .max(1);
-                if usage.consecutive_no_progress_windows >= limit {
+                let limit = total_budget.max_consecutive_no_progress_windows.max(1);
+                if mode == pioneer_tools::ToolNoProgressMode::Enforce
+                    && usage.consecutive_no_progress_windows >= limit
+                {
                     return Ok(ExecutionWindowContinuationAdmission::Block {
                         stop_reason: Some(pioneer_protocol::RecoveryStopReason::NoProgress),
                         total_windows: usage.total_windows,
                         reason: execution_window_no_progress_reason(
                             limit,
                             usage.consecutive_no_progress_windows,
+                        ),
+                    });
+                }
+                let limit = total_budget
+                    .max_consecutive_unconfirmed_progress_windows
+                    .clamp(1, 4096);
+                if usage.consecutive_unconfirmed_progress_windows >= limit {
+                    return Ok(ExecutionWindowContinuationAdmission::Block {
+                        stop_reason: Some(pioneer_protocol::RecoveryStopReason::AttemptsExhausted),
+                        total_windows: usage.total_windows,
+                        reason: format!(
+                            "max_consecutive_unconfirmed_progress_windows reached: limit={limit}, observed={}; domain progress remains unconfirmed",
+                            usage.consecutive_unconfirmed_progress_windows
                         ),
                     });
                 }
@@ -4487,17 +4939,9 @@ impl RecoveryCoordinator {
                         .to_owned(),
                 );
             }
-            ProviderFailureClass::UnsupportedToolCalling => {
-                if provider_snapshot_field(job, "transport") == Some("stream") {
-                    plan.force_non_stream = true;
-                }
-                plan.disable_tool_calling = true;
-            }
-            ProviderFailureClass::UnsupportedImageInput => {
-                if provider_snapshot_field(job, "transport") == Some("stream") {
-                    plan.force_non_stream = true;
-                }
-                plan.disable_image_input = true;
+            ProviderFailureClass::UnsupportedToolCalling
+            | ProviderFailureClass::UnsupportedImageInput => {
+                plan.terminal_reason = Some("accepted input or required tools are unsupported; recovery cannot weaken the turn contract".to_owned());
             }
             ProviderFailureClass::Unknown => {
                 plan.terminal_reason = Some(
@@ -5228,9 +5672,10 @@ fn deterministic_jitter_secs(seed: &str, base_delay_secs: u64) -> u64 {
 mod tests {
     use super::{
         ProviderFailureCandidate, RecoveryCoordinator, RecoveryCoordinatorEvent,
-        RecoveryJobEnqueueOutcome, RecoveryPolicyRegistry, RetainedProviderHistoryRow,
-        RuntimeFailureCandidate, TURN_RECOVERY_MAX_WALL_CLOCK_SECS,
-        assemble_retained_provider_history, is_causal_recovery_progress, terminal_diagnostic,
+        RecoveryJobEnqueueOutcome, RecoveryPolicyRegistry, RestoredRecoveryTurnRequestLookup,
+        RestoredRecoveryTurnUnavailable, RetainedProviderHistoryRow, RuntimeFailureCandidate,
+        TURN_RECOVERY_MAX_WALL_CLOCK_SECS, assemble_retained_provider_history,
+        is_causal_recovery_progress, terminal_diagnostic,
     };
     use migration::{Migrator, MigratorTrait};
     use pioneer_agent::{
@@ -5261,9 +5706,8 @@ mod tests {
         build_execution_checkpoint_payload,
     };
     use pioneer_provider::{
-        CanonicalProviderRoundEnvelope, ChatMessage, InputContentType, MessageAttachment,
-        ProviderCallIdentity, ProviderRegistry, ProviderReplayState, ProviderTermination,
-        ProviderToolCall, providers::EchoProvider,
+        CanonicalProviderRoundEnvelope, ChatMessage, ProviderCallIdentity, ProviderRegistry,
+        ProviderReplayState, ProviderTermination, ProviderToolCall, providers::EchoProvider,
     };
     use pioneer_skills::{SkillPolicyKey, SkillTrustLevel};
     use pioneer_tools::{
@@ -6127,6 +6571,7 @@ mod tests {
 
     fn test_tool_loop_config() -> ToolLoopConfig {
         ToolLoopConfig {
+            no_progress_mode: pioneer_tools::ToolNoProgressMode::Enforce,
             provider: pioneer_provider::ProviderTimeoutPolicy::default(),
             preflight: pioneer_agent::PreflightLoopConfig::default(),
             web: WebToolsConfig {
@@ -6491,7 +6936,9 @@ mod tests {
                 None,
             )
             .await;
-            persist_test_runtime_snapshot(&crud_store, &workspace_id, &thread_id, &turn_id).await;
+            persist_test_runtime_snapshot_only(&crud_store, &workspace_id, &thread_id, &turn_id)
+                .await;
+            persist_test_execution_security_snapshot(&crud_store, &thread_id, &turn_id).await;
             insert_test_turn_execution(
                 &crud_store,
                 &workspace_id,
@@ -6722,6 +7169,7 @@ mod tests {
 
     fn provider_plan_job(class: ProviderFailureClass, transport: &str) -> RecoveryJobRecord {
         RecoveryJobRecord {
+            progress: pioneer_crud::RecoveryProgressLoad::LegacyUnknown,
             last_failure_attempt_id: None,
             diagnostic: None,
             id: format!("job_plan_{}", super::provider_failure_class_name(class)),
@@ -6935,9 +7383,191 @@ mod tests {
         workspace_id: &str,
         thread_id: &str,
         turn_id: &str,
+        coordinator: &RecoveryCoordinator,
     ) {
         persist_test_runtime_snapshot_only(crud_store, workspace_id, thread_id, turn_id).await;
         persist_test_execution_security_snapshot(crud_store, thread_id, turn_id).await;
+        if crud_store
+            .get_turn_execution(turn_id)
+            .await
+            .unwrap()
+            .is_none()
+        {
+            insert_test_turn_execution(
+                crud_store,
+                workspace_id,
+                thread_id,
+                turn_id,
+                coordinator.turn_execution_owner_id.as_ref(),
+                TurnExecutorKind::NativeAgent,
+                chrono::Utc::now().timestamp() + 120,
+            )
+            .await;
+        }
+        let snapshot = crud_store
+            .get_turn_runtime_snapshot(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let phase = crate::native_recovery_test_support::completed_native_phase(
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator.tool_loop_config,
+            serde_json::json!({"attempts":0,"known_tokens":0,"unknown":false}),
+        );
+        crud_store
+            .upsert_turn_runtime_snapshot(NewTurnRuntimeSnapshot {
+                turn_id: snapshot.turn_id,
+                thread_id: snapshot.thread_id,
+                workspace_id: snapshot.workspace_id,
+                mode_json: snapshot.mode_json,
+                model: snapshot.model,
+                provider_name: snapshot.provider_name,
+                reasoning_effort: snapshot.reasoning_effort,
+                agent_skill_versions_json: snapshot.agent_skill_versions_json,
+                ordinary_skill_catalog_json: snapshot.ordinary_skill_catalog_json,
+                provider_model_contract_json: snapshot.provider_model_contract_json,
+                hook_runtime_context_json: snapshot.hook_runtime_context_json,
+                workspace_skill_policies_json: snapshot.workspace_skill_policies_json,
+                input_json: snapshot.input_json,
+                capabilities_json: snapshot.capabilities_json,
+                resolved_artifacts_json: snapshot.resolved_artifacts_json,
+                runtime_environment_json: snapshot.runtime_environment_json,
+                history_json: snapshot.history_json,
+                created_at: snapshot.created_at,
+                updated_at: snapshot.updated_at,
+                initial_phase_json: Some(phase),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Positive cold restore needs the actual semantic predecessor, not just a scalar row.
+    async fn seed_test_native_semantic_checkpoint(
+        crud_store: &CrudStore,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        coordinator: &RecoveryCoordinator,
+    ) {
+        let now = chrono::Utc::now().fixed_offset();
+        let owner = crud_store
+            .get_turn_execution(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner.owner_id, coordinator.turn_execution_owner_id.as_ref());
+        crud_store
+            .persist_native_cancellation_context(
+                pioneer_protocol::NativeTerminalEffectPreparation {
+                    batch_id: format!("{turn_id}:cancel"),
+                    workspace_id: workspace_id.into(),
+                    thread_id: thread_id.into(),
+                    turn_id: turn_id.into(),
+                    runtime_generation: 1,
+                    effects: vec![],
+                },
+                &owner.owner_id,
+                now.timestamp(),
+                true,
+            )
+            .await
+            .unwrap();
+        let window = match crud_store.latest_turn_execution_window(turn_id).await.unwrap() {
+            Some(window) => window,
+            None => crud_store.create_turn_execution_window(NewTurnExecutionWindowRecord {
+                workspace_id: workspace_id.into(), thread_id: thread_id.into(), turn_id: turn_id.into(),
+                window_index: 1, status: ExecutionWindowStatus::Running, exhaustion_reason: None,
+                agent_round_count: 0, tool_call_count: 0, provider_token_count: 0,
+                metadata_json: serde_json::json!({"runtimeWindowId":format!("{turn_id}:window:1")}),
+                started_at: now,
+            }, now, now).await.unwrap(),
+        };
+        assert_eq!(window.status, ExecutionWindowStatus::Running);
+        let snapshot = crud_store
+            .get_turn_runtime_snapshot(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let input: Vec<UserInput> = serde_json::from_str(&snapshot.input_json).unwrap();
+        let mut payload = build_execution_checkpoint_payload(
+            workspace_id,
+            thread_id,
+            turn_id,
+            pioneer_protocol::build_execution_checkpoint_original_request_summary(&input),
+            pioneer_protocol::ExecutionCheckpointWindowSummary {
+                progress: Some(pioneer_protocol::ExecutionProgressSummary {
+                    schema_version: 1,
+                    baseline: [0, 0, 0],
+                    frontier: [0, 0, 0],
+                }),
+                window_id: Some(
+                    window
+                        .metadata_json
+                        .get("runtimeWindowId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("{turn_id}:window:{}", window.window_index)),
+                ),
+                window_index: window.window_index,
+                started_at_unix_ms: Some(window.started_at.timestamp_millis()),
+                completed_at_unix_ms: None,
+                agent_round_count: window.agent_round_count,
+                tool_call_count: window.tool_call_count,
+                provider_token_count: (window.provider_token_count > 0)
+                    .then_some(window.provider_token_count),
+                exhaustion_reason: None,
+            },
+            pioneer_protocol::build_execution_checkpoint_provider_budget_summary(
+                pioneer_protocol::ExecutionCheckpointProviderBudgetInput {
+                    model: Some(snapshot.model),
+                    model_provider: Some(snapshot.provider_name),
+                    agent_round_count: window.agent_round_count,
+                    tool_call_count: window.tool_call_count,
+                    provider_token_count: (window.provider_token_count > 0)
+                        .then_some(window.provider_token_count),
+                    exhaustion_reason: None,
+                    exhausted_limit: None,
+                    exhausted_observed: None,
+                },
+            ),
+            pioneer_protocol::build_execution_checkpoint_tool_summary(&[], 32),
+            vec![],
+        );
+        payload.provider_budget.provider_usage_available = false;
+        let revision = crud_store
+            .native_semantic_checkpoint_for_turn(turn_id)
+            .await
+            .unwrap()
+            .map(|cp| {
+                cp.payload_json["native_semantic_state"]["checkpoint_revision"]
+                    .as_u64()
+                    .unwrap()
+                    + 1
+            })
+            .unwrap_or(1);
+        let mut state = crate::native_recovery_test_support::native_semantic_fixture_state(
+            &coordinator.tool_loop_config,
+            [0, 0, 0],
+        );
+        state["checkpoint_revision"] = serde_json::json!(revision);
+        payload.native_semantic_state = Some(state);
+        assert!(pioneer_agent::native_semantic_checkpoint_compatible(
+            &payload,
+            &coordinator.tool_loop_config.retry,
+            coordinator.tool_loop_config.no_progress_mode
+        ));
+        crud_store
+            .commit_native_semantic_checkpoint(
+                payload,
+                None,
+                1,
+                &owner.owner_id,
+                owner.owner_generation,
+            )
+            .await
+            .unwrap();
     }
 
     async fn persist_test_runtime_snapshot_only(
@@ -6956,20 +7586,36 @@ mod tests {
                 allow_implicit_invocation: Some(false),
             },
         );
-        let capabilities = vec![TurnCapability {
-            id: format!("skill:{writer_skill_id}"),
-            kind: TurnCapabilityKind::Skill {
-                skill_id: writer_skill_id,
-                pack_id: None,
-            },
-            label: Some("Writer".to_owned()),
-        }];
-        let resolved_artifacts = vec![ResolvedArtifactInput {
-            artifact_id: "artifact_snapshot".to_owned(),
-            version_id: Some("version_snapshot".to_owned()),
-            content_type: InputContentType::File,
-            attachment: MessageAttachment::from_path("/tmp/snapshot.txt", "text/plain"),
-        }];
+        let capabilities = if crud_store
+            .find_skill_installation(&writer_skill_id)
+            .await
+            .unwrap()
+            .is_some()
+        {
+            vec![TurnCapability {
+                id: format!("skill:{writer_skill_id}"),
+                kind: TurnCapabilityKind::Skill {
+                    skill_id: writer_skill_id,
+                    pack_id: None,
+                },
+                label: Some("Writer".to_owned()),
+            }]
+        } else {
+            Vec::new()
+        };
+        let resolved_artifacts: Vec<ResolvedArtifactInput> = Vec::new();
+        let skills_context = crate::message::skills::workspace::skills_runtime_context_from_config(
+            &test_tool_loop_config(),
+            workspace_id,
+        )
+        .unwrap();
+        let accepted_catalog = crate::message::skills::workspace::load_skills_catalog_from_store(
+            crud_store,
+            workspace_id,
+            &skills_context,
+        )
+        .await
+        .unwrap();
         let runtime_environment = HashMap::from([(
             "PIONEER_ARTIFACT_OUTPUT_DIR".to_owned(),
             "/tmp/pioneer-snapshot-output".to_owned(),
@@ -6984,7 +7630,7 @@ mod tests {
         }];
         let hook_runtime_context = AgentTurnHookRuntimeContext::task("task_snapshot");
 
-        let snapshot = crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
+        let mut snapshot = crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
             thread_id,
             workspace_id,
             turn_id,
@@ -7000,8 +7646,22 @@ mod tests {
             &runtime_environment,
             history.as_slice(),
             &[],
+            &accepted_catalog,
         )
         .expect("runtime snapshot should serialize");
+        let providers = pioneer_provider::ProviderRegistry::with_provider(
+            "echo",
+            Arc::new(EchoProvider::new()),
+        );
+        snapshot.provider_model_contract_json = Some(
+            providers
+                .get_or_create_for_workspace(workspace_id, "echo")
+                .unwrap()
+                .capture_model_contract("test-model")
+                .unwrap()
+                .to_json()
+                .unwrap(),
+        );
         crud_store
             .upsert_turn_runtime_snapshot(snapshot)
             .await
@@ -7099,7 +7759,22 @@ mod tests {
             )
             .await
             .expect("recovery skill installation should persist");
-        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        persist_test_runtime_snapshot(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
+        seed_test_native_semantic_checkpoint(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
         let stored_snapshot = crud_store
             .get_turn_runtime_snapshot(turn_id)
             .await
@@ -7197,11 +7872,8 @@ mod tests {
             .expect("frozen SkillId should resolve without its former parent");
         assert_eq!(restored_skill.identity.owner.as_deref(), Some("tests"));
         assert_eq!(restored_skill.identity.slug, "writer");
-        assert_eq!(
-            restored_skill.instructions.body.trim(),
-            "Write with current content."
-        );
-        assert_eq!(restored.resolved_artifacts.len(), 1);
+        assert_eq!(restored_skill.instructions.body.trim(), "Write carefully.");
+        assert!(restored.resolved_artifacts.is_empty());
         assert_eq!(
             restored
                 .runtime_environment
@@ -7219,6 +7891,36 @@ mod tests {
             security_snapshot.sandbox.mode,
             TurnSandboxMode::WorkspaceWrite
         );
+        crud_store
+            .upsert_workspace_skill_policy(
+                &pioneer_crud::WorkspaceSkillPolicyRecord {
+                    id: "snapshot-skill-disabled".into(),
+                    workspace_id: workspace_id.into(),
+                    skill_id: restored_skill_id.clone(),
+                    enabled: Some(false),
+                    allow_implicit_invocation: None,
+                },
+                4,
+            )
+            .await
+            .unwrap();
+        let disabled = coordinator
+            .restored_recovery_turn_request(thread_id, turn_id, 1_700_000_001)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                disabled,
+                RestoredRecoveryTurnRequestLookup::Unavailable(
+                    RestoredRecoveryTurnUnavailable::SnapshotInvalid { .. }
+                )
+            ),
+            "frozen content cannot override fresh disabling"
+        );
+        crud_store
+            .delete_workspace_skill_policy(workspace_id, &restored_skill_id)
+            .await
+            .unwrap();
         assert!(
             crud_store
                 .delete_skill_installation(&restored_skill_id)
@@ -7228,20 +7930,15 @@ mod tests {
         let restored_missing = coordinator
             .restored_recovery_turn_request(thread_id, turn_id, 1_700_000_001)
             .await
-            .expect("missing-skill recovery request should load")
-            .into_available()
-            .expect("runtime snapshot remains the authoritative identity set");
-        assert!(matches!(
-            &restored_missing.capabilities[0].kind,
-            TurnCapabilityKind::Skill { skill_id, .. } if skill_id == &restored_skill_id
-        ));
+            .expect("missing-skill lookup is explicit");
         assert!(
-            restored_missing
-                .skill_catalog
-                .skills
-                .iter()
-                .all(|skill| skill.identity.skill_id != restored_skill_id),
-            "removed frozen child must remain missing instead of being replaced"
+            matches!(
+                restored_missing,
+                RestoredRecoveryTurnRequestLookup::Unavailable(
+                    RestoredRecoveryTurnUnavailable::SnapshotInvalid { .. }
+                )
+            ),
+            "removed selected skill must stop recovery, never become an empty/latest catalog"
         );
         let _ = std::fs::remove_dir_all(skill_dir);
     }
@@ -7384,7 +8081,7 @@ mod tests {
         );
 
         let failure_events = coordinator
-            .record_cli_runtime_attempt_failure(
+            .record_runtime_attempt_failure(
                 request.job_id.as_str(),
                 request.recovery_attempt_id.as_str(),
                 "replacement native turn disconnected".to_owned(),
@@ -7593,7 +8290,11 @@ mod tests {
             .expect("window usage should aggregate");
         assert_eq!(usage.total_agent_rounds, 5);
         assert_eq!(usage.total_tool_calls, 7);
-        assert_eq!(usage.consecutive_no_progress_windows, 1);
+        assert_eq!(
+            usage.consecutive_no_progress_windows, 0,
+            "legacy/missing evidence must remain Unknown"
+        );
+        assert_eq!(usage.consecutive_unconfirmed_progress_windows, 2);
     }
 
     #[tokio::test]
@@ -7622,6 +8323,10 @@ mod tests {
                         provider_token_count: 10,
                         metadata_json: serde_json::json!({
                             "runtimeWindowId": format!("{turn_id}:window:{window_index}"),
+                            "semanticProgress": pioneer_protocol::ExecutionProgressSummary {
+                                schema_version: 1, baseline: [u64::from(window_index - 1),0,0],
+                                frontier: [u64::from(window_index),0,0],
+                            },
                         }),
                         started_at: window_started_at,
                     },
@@ -7656,6 +8361,338 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn original_native_policy_missing_phase_is_typed_unavailable_without_global_fallback() {
+        let (store, coordinator) = setup_coordinator().await;
+        let (ws, thread, turn) = (
+            "ws_native_window_policy",
+            "thread_native_window_policy",
+            "turn_native_window_policy",
+        );
+        materialize_turn_with_tool_item(
+            store.as_ref(),
+            ws,
+            thread,
+            turn,
+            "tool_native_policy",
+            None,
+        )
+        .await;
+        insert_test_turn_execution(
+            &store,
+            ws,
+            thread,
+            turn,
+            "original_owner",
+            TurnExecutorKind::NativeAgent,
+            1_700_000_120,
+        )
+        .await;
+        let error = coordinator
+            .accepted_execution_window_policy(turn)
+            .await
+            .unwrap_err();
+        assert!(error.is::<super::NativeSemanticCheckpointUnavailable>());
+        persist_test_runtime_snapshot_only(&store, ws, thread, turn).await;
+        let error = coordinator
+            .accepted_execution_window_policy(turn)
+            .await
+            .unwrap_err();
+        assert!(error.is::<super::NativeSemanticCheckpointUnavailable>());
+    }
+
+    #[tokio::test]
+    async fn native_recovery_close_preserves_preflight_and_main_charges_across_restart() {
+        for (receipts, known, available) in [
+            ([(Some(40), Some(10)), (Some(45), Some(5))], 100, true),
+            ([(Some(40), Some(10)), (Some(50), None)], 100, false),
+            ([(Some(0), Some(0)), (Some(0), Some(0))], 0, true),
+            ([(None, None), (None, None)], 0, false),
+        ] {
+            let mut config = test_tool_loop_config();
+            config.execution_windows.total.max_provider_tokens_per_turn = Some(100);
+            let (store, manager, coordinator) =
+                setup_coordinator_with_tool_loop_config(config.clone()).await;
+            let (workspace, thread, turn) = (
+                "ws_cold_charges",
+                "thread_cold_charges",
+                "turn_cold_charges",
+            );
+            materialize_turn_with_tool_item(&store, workspace, thread, turn, "before_window", None)
+                .await;
+            let (window, original) = crate::native_recovery_test_support::charged_native_window(
+                &store,
+                workspace,
+                thread,
+                turn,
+                coordinator.turn_execution_owner_id.as_ref(),
+                1,
+                &config,
+                receipts,
+                pioneer_protocol::ExecutionProgressSummary {
+                    schema_version: 1,
+                    baseline: [0; 3],
+                    frontier: [1, 0, 0],
+                },
+            )
+            .await;
+            assert_eq!(
+                window.provider_token_count, 0,
+                "charged semantic state does not update the Running scalar row"
+            );
+            let before = store
+                .aggregate_turn_execution_window_usage(turn)
+                .await
+                .unwrap();
+            assert_eq!(before.total_agent_rounds, 2);
+            assert_eq!(before.total_provider_tokens, known);
+            assert_eq!(before.provider_token_usage_unknown, !available);
+            let phase = store
+                .get_turn_runtime_snapshot(turn)
+                .await
+                .unwrap()
+                .unwrap()
+                .initial_phase_json;
+            let decision = coordinator
+                .prepare_recovery_execution_window(
+                    turn,
+                    chrono::Utc::now().timestamp() + 1,
+                    "native_fixture",
+                    "transport interruption",
+                )
+                .await
+                .unwrap();
+            if known >= 100 {
+                assert!(
+                    matches!(decision,super::ExecutionWindowContinuationAdmission::Block {reason,..}
+                    if reason.contains("max_total_provider_tokens_per_turn"))
+                );
+            } else {
+                assert_eq!(
+                    decision,
+                    super::ExecutionWindowContinuationAdmission::Open { window_index: 2 }
+                );
+            }
+            let closed = store
+                .get_turn_execution_window(&window.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(closed.status, ExecutionWindowStatus::Checkpointed);
+            assert_eq!(closed.agent_round_count, 2);
+            assert_eq!(closed.provider_token_count, known);
+            assert_eq!(closed.metadata_json["accountingSchemaVersion"], 1);
+            assert_eq!(closed.metadata_json["providerUsageAvailable"], available);
+            assert_eq!(closed.metadata_json["acceptedOwnerMarker"], "keep");
+            let checkpoint = store
+                .latest_turn_execution_checkpoint_for_turn(turn)
+                .await
+                .unwrap()
+                .unwrap();
+            let recovered: pioneer_protocol::ExecutionCheckpointPayload =
+                serde_json::from_value(checkpoint.payload_json).unwrap();
+            assert_eq!(recovered.window.agent_round_count, 2);
+            assert_eq!(recovered.window.provider_token_count, Some(known));
+            assert_eq!(recovered.provider_budget.provider_token_count, Some(known));
+            assert_eq!(
+                recovered.provider_budget.provider_usage_available,
+                available
+            );
+            assert_eq!(
+                recovered.native_semantic_state,
+                original.native_semantic_state
+            );
+            assert_eq!(recovered.original_request, original.original_request);
+            let after = store
+                .aggregate_turn_execution_window_usage(turn)
+                .await
+                .unwrap();
+            assert_eq!(after.total_agent_rounds, before.total_agent_rounds);
+            assert_eq!(after.total_provider_tokens, before.total_provider_tokens);
+            assert_eq!(
+                after.provider_token_usage_unknown,
+                before.provider_token_usage_unknown
+            );
+            let checkpoints = store
+                .list_turn_execution_checkpoints_for_window(&window.id)
+                .await
+                .unwrap();
+            let fresh_store = Arc::new(store.with_maintenance_access());
+            let restarted = RecoveryCoordinator::new(
+                fresh_store.clone(),
+                manager,
+                Arc::new(ProviderRegistry::with_provider(
+                    "echo",
+                    Arc::new(EchoProvider::new()),
+                )),
+                RecoveryPolicyRegistry::default(),
+                config.normalized(),
+            );
+            let repeated = restarted
+                .prepare_recovery_execution_window(
+                    turn,
+                    chrono::Utc::now().timestamp() + 2,
+                    "duplicate_close",
+                    "same outcome",
+                )
+                .await
+                .unwrap();
+            if known >= 100 {
+                assert!(matches!(
+                    repeated,
+                    super::ExecutionWindowContinuationAdmission::Block { .. }
+                ));
+            } else {
+                assert_eq!(
+                    repeated,
+                    super::ExecutionWindowContinuationAdmission::Open { window_index: 2 }
+                );
+            }
+            assert_eq!(
+                fresh_store
+                    .aggregate_turn_execution_window_usage(turn)
+                    .await
+                    .unwrap(),
+                after
+            );
+            assert_eq!(
+                fresh_store
+                    .list_turn_execution_checkpoints_for_window(&window.id)
+                    .await
+                    .unwrap(),
+                checkpoints
+            );
+            assert_eq!(
+                fresh_store
+                    .get_turn_runtime_snapshot(turn)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .initial_phase_json,
+                phase,
+                "cold reconciliation does not repeat or replace accepted preflight"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn continuation_token_cap_uses_known_lower_bound_with_unknown_usage_in_all_modes() {
+        for mode in [
+            pioneer_tools::ToolNoProgressMode::Disabled,
+            pioneer_tools::ToolNoProgressMode::Observe,
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        ] {
+            let mut config = test_tool_loop_config();
+            config.no_progress_mode = mode;
+            config.execution_windows.total.max_provider_tokens_per_turn = Some(10);
+            let (store, _, coordinator) = setup_coordinator_with_tool_loop_config(config).await;
+            let now = chrono::Utc::now().fixed_offset();
+            for (turn, tokens, available) in [
+                ("known_below_cap", 9, true),
+                ("unknown_below_cap", 9, false),
+                ("known_at_cap", 10, true),
+                ("unknown_at_cap", 10, false),
+            ] {
+                store
+                    .create_turn_execution_window(
+                        NewTurnExecutionWindowRecord {
+                            workspace_id: "token_budget_workspace".into(),
+                            thread_id: "token_budget_thread".into(),
+                            turn_id: turn.into(),
+                            window_index: 1,
+                            status: ExecutionWindowStatus::Checkpointed,
+                            exhaustion_reason: None,
+                            agent_round_count: 2,
+                            tool_call_count: 0,
+                            provider_token_count: tokens,
+                            metadata_json: serde_json::json!({
+                                "accountingSchemaVersion":1,"providerUsageAvailable":available
+                            }),
+                            started_at: now,
+                        },
+                        now,
+                        now,
+                    )
+                    .await
+                    .unwrap();
+                let usage = store
+                    .aggregate_turn_execution_window_usage(turn)
+                    .await
+                    .unwrap();
+                assert_eq!(usage.provider_token_usage_unknown, !available);
+                let admission = coordinator
+                    .execution_window_continuation_admission_for_turn(turn, None)
+                    .await
+                    .unwrap();
+                if tokens < 10 {
+                    assert_eq!(
+                        admission,
+                        super::ExecutionWindowContinuationAdmission::Open { window_index: 2 }
+                    );
+                } else {
+                    assert!(
+                        matches!(admission, super::ExecutionWindowContinuationAdmission::Block {
+                        stop_reason:None, reason, ..
+                    } if reason.contains("max_total_provider_tokens_per_turn"))
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_automatic_window_budget_is_separate_from_all_heuristic_modes() {
+        for mode in [
+            pioneer_tools::ToolNoProgressMode::Disabled,
+            pioneer_tools::ToolNoProgressMode::Observe,
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        ] {
+            let mut config = test_tool_loop_config();
+            config.no_progress_mode = mode;
+            config
+                .execution_windows
+                .total
+                .max_consecutive_no_progress_windows = 1;
+            config
+                .execution_windows
+                .total
+                .max_consecutive_unconfirmed_progress_windows = 2;
+            let (store, _, coordinator) = setup_coordinator_with_tool_loop_config(config).await;
+            let now = chrono::Utc::now().fixed_offset();
+            for index in 1..=2 {
+                store
+                    .create_turn_execution_window(
+                        NewTurnExecutionWindowRecord {
+                            workspace_id: "ws_unknown_window".into(),
+                            thread_id: "thread_unknown_window".into(),
+                            turn_id: "turn_unknown_window".into(),
+                            window_index: index,
+                            status: ExecutionWindowStatus::Checkpointed,
+                            exhaustion_reason: None,
+                            agent_round_count: 20,
+                            tool_call_count: 40,
+                            provider_token_count: 30,
+                            metadata_json: serde_json::json!({}),
+                            started_at: now,
+                        },
+                        now,
+                        now,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let admission = coordinator
+                .execution_window_continuation_admission_for_turn("turn_unknown_window", None)
+                .await
+                .unwrap();
+            assert!(
+                matches!(admission, super::ExecutionWindowContinuationAdmission::Block {
+                stop_reason: Some(pioneer_protocol::RecoveryStopReason::AttemptsExhausted), reason, ..
+            } if reason.contains("max_consecutive_unconfirmed_progress_windows") && !reason.contains("max_consecutive_no_progress_windows"))
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn persisted_no_progress_windows_trip_recovery_circuit_breaker_after_coordinator_restart()
     {
         let (crud_store, agent_manager, coordinator) = setup_coordinator_with_agent().await;
@@ -7673,12 +8710,16 @@ mod tests {
                         exhaustion_reason: Some(
                             ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
                         ),
-                        agent_round_count: 0,
-                        tool_call_count: 0,
+                        agent_round_count: 10,
+                        tool_call_count: 20,
                         provider_token_count: 0,
                         metadata_json: serde_json::json!({
                             "interruptedBy": "cli_runtime_recovery",
-                            "terminalReason": "native runtime exited before producing output",
+                            "terminalReason": "repeated known observations without domain revision",
+                            "semanticProgress": pioneer_protocol::ExecutionProgressSummary {
+                                schema_version: 1, baseline: [1,u64::from(window_index - 1),0],
+                                frontier: [1,u64::from(window_index),0],
+                            },
                         }),
                         started_at: timestamp,
                     },
@@ -7735,7 +8776,10 @@ mod tests {
                         agent_round_count: 0,
                         tool_call_count: 0,
                         provider_token_count: 0,
-                        metadata_json: serde_json::json!({}),
+                        metadata_json: serde_json::json!({"semanticProgress": pioneer_protocol::ExecutionProgressSummary {
+                            schema_version: 1, baseline: [1,u64::from(window_index - 1),0],
+                            frontier: [1,u64::from(window_index),0],
+                        }}),
                         started_at: timestamp,
                     },
                     timestamp,
@@ -7758,7 +8802,9 @@ mod tests {
                     agent_round_count: 1,
                     tool_call_count: 0,
                     provider_token_count: 10,
-                    metadata_json: serde_json::json!({}),
+                    metadata_json: serde_json::json!({"semanticProgress": pioneer_protocol::ExecutionProgressSummary {
+                        schema_version: 1, baseline: [1,2,0], frontier: [2,2,0],
+                    }}),
                     started_at: timestamp,
                 },
                 timestamp,
@@ -7923,7 +8969,14 @@ mod tests {
             None,
         )
         .await;
-        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        persist_test_runtime_snapshot(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
         let timestamp = chrono::Utc::now().fixed_offset();
         let first_window = crud_store
             .create_turn_execution_window(
@@ -7945,6 +8998,14 @@ mod tests {
             )
             .await
             .expect("initial native execution window should persist");
+        seed_test_native_semantic_checkpoint(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
         let job = coordinator
             .enqueue_runtime_failure_job(
                 &RuntimeFailureCandidate {
@@ -8015,7 +9076,14 @@ mod tests {
             None,
         )
         .await;
-        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        persist_test_runtime_snapshot(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
 
         let timestamp = chrono::Utc::now().fixed_offset();
         let window = crud_store
@@ -8039,6 +9107,14 @@ mod tests {
             .await
             .expect("running window should persist");
 
+        seed_test_native_semantic_checkpoint(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
         let restored = coordinator
             .restored_recovery_turn_request(thread_id, turn_id, 1_700_000_010)
             .await
@@ -8068,7 +9144,18 @@ mod tests {
             .list_turn_execution_checkpoints_for_window(window.id.as_str())
             .await
             .expect("startup checkpoint should load");
-        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(
+            checkpoints
+                .iter()
+                .filter(|cp| cp.checkpoint_kind == TurnExecutionCheckpointKind::SemanticState)
+                .count(),
+            1
+        );
+        let checkpoints: Vec<_> = checkpoints
+            .into_iter()
+            .filter(|cp| cp.checkpoint_kind != TurnExecutionCheckpointKind::SemanticState)
+            .collect();
         assert_eq!(
             checkpoints[0].checkpoint_kind,
             TurnExecutionCheckpointKind::StartupRecovery
@@ -8105,7 +9192,14 @@ mod tests {
             None,
         )
         .await;
-        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        persist_test_runtime_snapshot(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
         let timestamp = chrono::Utc::now().fixed_offset();
         crud_store
             .create_turn_execution_window(
@@ -8128,6 +9222,14 @@ mod tests {
             .await
             .expect("initial startup execution window should persist");
 
+        seed_test_native_semantic_checkpoint(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
         let restored = coordinator
             .restored_recovery_turn_request(thread_id, turn_id, 1_700_000_010)
             .await
@@ -8167,7 +9269,14 @@ mod tests {
             None,
         )
         .await;
-        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        persist_test_runtime_snapshot(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
 
         let timestamp = chrono::Utc::now().fixed_offset();
         let window = crud_store
@@ -8190,6 +9299,14 @@ mod tests {
             )
             .await
             .expect("running window should persist");
+        seed_test_native_semantic_checkpoint(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
         let job = coordinator
             .enqueue_runtime_failure_job(
                 &RuntimeFailureCandidate {
@@ -8247,7 +9364,18 @@ mod tests {
             .list_turn_execution_checkpoints_for_window(window.id.as_str())
             .await
             .expect("runtime checkpoint should load");
-        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(
+            checkpoints
+                .iter()
+                .filter(|cp| cp.checkpoint_kind == TurnExecutionCheckpointKind::SemanticState)
+                .count(),
+            1
+        );
+        let checkpoints: Vec<_> = checkpoints
+            .into_iter()
+            .filter(|cp| cp.checkpoint_kind != TurnExecutionCheckpointKind::SemanticState)
+            .collect();
         assert_eq!(
             checkpoints[0].checkpoint_kind,
             TurnExecutionCheckpointKind::WindowExhausted
@@ -8274,6 +9402,14 @@ mod tests {
             )
             .await
             .expect("second running window should persist");
+        seed_test_native_semantic_checkpoint(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
         let second_context = coordinator
             .prepare_execution_checkpoint_for_recovery(
                 workspace_id,
@@ -8325,6 +9461,9 @@ mod tests {
                 provider_name: "echo".to_owned(),
                 reasoning_effort: None,
                 agent_skill_versions_json: None,
+                provider_model_contract_json: None,
+                initial_phase_json: None,
+                ordinary_skill_catalog_json: Some(r#"{"schema_version":1,"catalog":{"version":0,"generated_at_unix":0,"skills":[]}}"#.into()),
                 hook_runtime_context_json: "{}".to_owned(),
                 workspace_skill_policies_json: "[]".to_owned(),
                 input_json: "[]".to_owned(),
@@ -8453,7 +9592,22 @@ mod tests {
             None,
         )
         .await;
-        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        persist_test_runtime_snapshot(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
+        seed_test_native_semantic_checkpoint(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
         let job = crud_store
             .enqueue_recovery_job(
                 turn_id.to_owned(),
@@ -8522,8 +9676,23 @@ mod tests {
             None,
         )
         .await;
-        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        persist_test_runtime_snapshot(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
 
+        seed_test_native_semantic_checkpoint(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
         let assistant_round = ChatMessage::assistant_tool_calls_with_provider_state(
             None::<String>,
             Some("reasoning that produced the side effect"),
@@ -8762,6 +9931,7 @@ mod tests {
                 attachment_kinds: Vec::new(),
             },
             pioneer_protocol::ExecutionCheckpointWindowSummary {
+                progress: None,
                 window_id: Some("runtime_window_1".to_owned()),
                 window_index: 1,
                 started_at_unix_ms: Some(1_000),
@@ -8902,7 +10072,35 @@ mod tests {
             None,
         )
         .await;
-        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        persist_test_runtime_snapshot(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
+
+        // The completed initial phase belongs to this immutable cancellation
+        // identity. A cold continuation must not invent a new runtime generation.
+        crud_store
+            .persist_native_cancellation_context(
+                pioneer_protocol::NativeTerminalEffectPreparation {
+                    batch_id: format!("{turn_id}:cancel"),
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    runtime_generation: 1,
+                    effects: Vec::new(),
+                },
+                coordinator.turn_execution_owner_id.as_ref(),
+                chrono::Utc::now().timestamp(),
+                true,
+            )
+            .await
+            .expect(
+                "the accepted native initial phase requires its original cancellation identity",
+            );
 
         let timestamp = chrono::Utc::now().fixed_offset();
         let window = crud_store
@@ -8940,7 +10138,7 @@ mod tests {
             )
             .await
             .expect("window should mark exhausted");
-        let payload = build_execution_checkpoint_payload(
+        let mut payload = build_execution_checkpoint_payload(
             workspace_id.to_owned(),
             thread_id.to_owned(),
             turn_id.to_owned(),
@@ -8952,6 +10150,7 @@ mod tests {
                 attachment_kinds: Vec::new(),
             },
             pioneer_protocol::ExecutionCheckpointWindowSummary {
+                progress: None,
                 window_id: Some("restore_window_1".to_owned()),
                 window_index: 1,
                 started_at_unix_ms: Some(1),
@@ -8986,6 +10185,22 @@ mod tests {
             },
             Vec::new(),
         );
+        payload.window.progress = Some(pioneer_protocol::ExecutionProgressSummary {
+            schema_version: 1,
+            baseline: [0, 0, 0],
+            frontier: [0, 0, 0],
+        });
+        payload.native_semantic_state = Some(
+            crate::native_recovery_test_support::native_semantic_fixture_state(
+                &coordinator.tool_loop_config,
+                [0, 0, 0],
+            ),
+        );
+        assert!(pioneer_agent::native_semantic_checkpoint_compatible(
+            &payload,
+            &coordinator.tool_loop_config.retry,
+            coordinator.tool_loop_config.no_progress_mode
+        ));
         crud_store
             .save_turn_execution_checkpoint(NewTurnExecutionCheckpointRecord {
                 id: None,
@@ -9027,14 +10242,17 @@ mod tests {
             .await
             .expect("startup recovery job should run");
 
-        assert!(events.iter().any(|event| matches!(
-            event,
-            RecoveryCoordinatorEvent::RetryAttemptStarted {
-                turn_id: started_turn_id,
-                item_type: TurnItemType::Reasoning,
-                ..
-            } if started_turn_id == turn_id
-        )));
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                RecoveryCoordinatorEvent::RetryAttemptStarted {
+                    turn_id: started_turn_id,
+                    item_type: TurnItemType::Reasoning,
+                    ..
+                } if started_turn_id == turn_id
+            )),
+            "the valid native checkpoint must start recovery: {events:#?}"
+        );
         assert!(
             agent_manager.has_thread(thread_id).await,
             "restored recovery should create the agent thread after restart"
@@ -9076,14 +10294,393 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn time_and_no_progress_stops_preserve_last_provider_fact() {
-        for (max_wall_clock_secs, no_progress_limit, stop_reason) in [
+    async fn recovery_progress_policy_uses_committed_domain_outcomes_in_all_modes() {
+        use sha2::Digest;
+        for mode in [
+            pioneer_tools::ToolNoProgressMode::Disabled,
+            pioneer_tools::ToolNoProgressMode::Observe,
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        ] {
+            let mut config = test_tool_loop_config();
+            config.no_progress_mode = mode;
+            let (store, _agent, coordinator) =
+                setup_coordinator_with_tool_loop_config(config).await;
+            let (workspace, thread, turn) = (
+                "ws_episode_progress",
+                "thread_episode_progress",
+                "turn_episode_progress",
+            );
+            materialize_turn_with_tool_item(&store, workspace, thread, turn, "item_episode", None)
+                .await;
+            let now = chrono::DateTime::from_timestamp(1_700_000_000, 0)
+                .unwrap()
+                .fixed_offset();
+            let window = store
+                .create_turn_execution_window(
+                    NewTurnExecutionWindowRecord {
+                        workspace_id: workspace.into(),
+                        thread_id: thread.into(),
+                        turn_id: turn.into(),
+                        window_index: 1,
+                        status: ExecutionWindowStatus::Running,
+                        exhaustion_reason: None,
+                        agent_round_count: 0,
+                        tool_call_count: 0,
+                        provider_token_count: 0,
+                        metadata_json: serde_json::json!({}),
+                        started_at: now,
+                    },
+                    now,
+                    now,
+                )
+                .await
+                .unwrap();
+            let checkpoint_id = hex::encode(sha2::Sha256::digest(
+                format!("native-semantic-v1:{turn}").as_bytes(),
+            ))[..21]
+                .to_owned();
+            let payload = |counts: [u64; 3]| {
+                serde_json::json!({
+                    "schema_version":pioneer_protocol::EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
+                    "workspace_id":workspace,"thread_id":thread,"turn_id":turn,
+                    "original_request":{"input_count":0,"text_truncated":false,"attachment_count":0},
+                "provider_budget":{"agent_round_count":0,"tool_call_count":0,"provider_usage_available":false},
+                "tools":{"requested_count":0,"executed_count":0,"unexecuted_count":0,"total_count":0,"succeeded_count":0,"failed_count":0,"in_progress_count":0,"detail_limit":1,"details_truncated":false},
+                "window":{"window_index":1,"agent_round_count":0,"tool_call_count":0,"progress":pioneer_protocol::ExecutionProgressSummary {
+                        schema_version:1,baseline:[0;3],frontier:counts }},
+                    "native_semantic_state":{"schema_version":pioneer_protocol::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION,"attached_task_wait":null,"progress_frontier":{"schema_version":1,
+                        "advanced_observations":counts[0],"unchanged_observations":counts[1],"unknown_observations":counts[2]}}
+                })
+            };
+            store
+                .save_turn_execution_checkpoint(pioneer_crud::NewTurnExecutionCheckpointRecord {
+                    id: Some(checkpoint_id.clone()),
+                    window_id: window.id,
+                    workspace_id: workspace.into(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    checkpoint_kind: TurnExecutionCheckpointKind::SemanticState,
+                    payload_json: payload([1, 0, 0]),
+                    created_at: now,
+                })
+                .await
+                .unwrap();
+            let job = coordinator
+                .enqueue_runtime_failure_job(
+                    &RuntimeFailureCandidate {
+                        turn_id: turn.into(),
+                        item_id: "reasoning_episode".into(),
+                        item_type: TurnItemType::Reasoning,
+                        trigger: RecoveryTrigger::RuntimeFailure,
+                        action: RecoveryAction::RestartTurn,
+                        reason: "fixture runtime failure".into(),
+                        base_backoff_secs: 1,
+                        max_attempts: 10,
+                        max_wall_clock_secs: 900,
+                        no_progress_limit: 2,
+                        metadata: Default::default(),
+                    },
+                    now.timestamp(),
+                )
+                .await
+                .unwrap()
+                .into_job();
+            for (ordinal, counts, stalls) in [
+                (1, [2, 0, 0], 0),
+                (2, [2, 1, 0], 1),
+                (3, [3, 1, 0], 0),
+                (4, [3, 2, 0], 1),
+                (5, [3, 3, 0], 2),
+            ] {
+                let current = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+                let timestamp = current.next_run_at_unix.max(now.timestamp() + 1);
+                let claim = store
+                    .claim_due_recovery_jobs(timestamp, 45, 1)
+                    .await
+                    .unwrap()
+                    .remove(0);
+                let attempt = format!("episode_attempt_{ordinal}");
+                assert_eq!(
+                    store
+                        .mark_claimed_recovery_job_active(
+                            &job.id,
+                            claim.claim_token.as_deref().unwrap(),
+                            &attempt,
+                            timestamp
+                        )
+                        .await
+                        .unwrap(),
+                    ClaimedRecoveryActivation::Activated
+                );
+                let wire = payload(counts).to_string();
+                store
+                    .database_connection()
+                    .execute_raw(sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Sqlite,
+                        "UPDATE turn_execution_checkpoint SET payload_json=? WHERE id=?",
+                        [wire.into(), checkpoint_id.clone().into()],
+                    ))
+                    .await
+                    .unwrap();
+                let failure =
+                    provider_failure(ProviderFailureClass::StreamTruncated, "fixture transient");
+                let events = coordinator
+                    .record_recovery_provider_failure(
+                        &job.id,
+                        &attempt,
+                        failure.clone(),
+                        timestamp,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                if ordinal == 5 && mode == pioneer_tools::ToolNoProgressMode::Enforce {
+                    assert!(matches!(
+                        events.as_slice(),
+                        [RecoveryCoordinatorEvent::RecoveryExhausted(_)]
+                    ));
+                } else {
+                    assert!(matches!(
+                        events.as_slice(),
+                        [RecoveryCoordinatorEvent::RetryScheduled { .. }]
+                    ));
+                }
+                let restored = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+                assert_eq!(restored.run_count, ordinal);
+                let pioneer_crud::RecoveryProgressLoad::Available(progress) = restored.progress
+                else {
+                    panic!("progress");
+                };
+                assert_eq!(progress.consecutive_no_progress, stalls);
+                if ordinal == 5 && mode == pioneer_tools::ToolNoProgressMode::Enforce {
+                    assert_eq!(
+                        restored.diagnostic.unwrap().stop_reason,
+                        Some(pioneer_protocol::RecoveryStopReason::NoProgress)
+                    );
+                }
+                assert!(
+                    coordinator
+                        .record_recovery_provider_failure(
+                            &job.id, &attempt, failure, timestamp, None
+                        )
+                        .await
+                        .unwrap()
+                        .is_empty(),
+                    "duplicate outcome must not charge again"
+                );
+                assert_eq!(
+                    store
+                        .get_recovery_job(&job.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .run_count,
+                    ordinal
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn incompatible_checkpoint_at_activation_blocks_before_starting_attempt() {
+        use sha2::Digest;
+        let (store, coordinator) = setup_coordinator().await;
+        let (workspace, thread, turn) = (
+            "ws_bad_progress_cp",
+            "thread_bad_progress_cp",
+            "turn_bad_progress_cp",
+        );
+        materialize_turn_with_tool_item(
+            &store,
+            workspace,
+            thread,
+            turn,
+            "item_bad_progress_cp",
+            None,
+        )
+        .await;
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0)
+            .unwrap()
+            .fixed_offset();
+        let window = store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: workspace.into(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 0,
+                    tool_call_count: 0,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({}),
+                    started_at: now,
+                },
+                now,
+                now,
+            )
+            .await
+            .unwrap();
+        let id = hex::encode(sha2::Sha256::digest(
+            format!("native-semantic-v1:{turn}").as_bytes(),
+        ))[..21]
+            .to_owned();
+        store.save_turn_execution_checkpoint(pioneer_crud::NewTurnExecutionCheckpointRecord {
+            id:Some(id),window_id:window.id,workspace_id:workspace.into(),thread_id:thread.into(),turn_id:turn.into(),
+            checkpoint_kind:TurnExecutionCheckpointKind::SemanticState,
+            payload_json:serde_json::json!({"schema_version":99,"workspace_id":workspace,"thread_id":thread,"turn_id":turn}),
+            created_at:now,
+        }).await.unwrap();
+        let job = coordinator
+            .enqueue_runtime_failure_job(
+                &RuntimeFailureCandidate {
+                    turn_id: turn.into(),
+                    item_id: "reasoning_bad_progress_cp".into(),
+                    item_type: TurnItemType::Reasoning,
+                    trigger: RecoveryTrigger::RuntimeFailure,
+                    action: RecoveryAction::RestartTurn,
+                    reason: "fixture".into(),
+                    base_backoff_secs: 1,
+                    max_attempts: 10,
+                    max_wall_clock_secs: 900,
+                    no_progress_limit: 2,
+                    metadata: Default::default(),
+                },
+                now.timestamp(),
+            )
+            .await
+            .unwrap()
+            .into_job();
+        let claimed = store
+            .claim_due_recovery_jobs(now.timestamp() + 1, 45, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        let events = coordinator
+            .run_claimed_recovery_job_for_test(claimed, now.timestamp() + 1)
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [RecoveryCoordinatorEvent::RecoveryBlocked { .. }]
+        ));
+        let saved = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(saved.status, RecoveryJobStatus::Blocked);
+        assert_eq!(
+            saved.run_count, 0,
+            "unprovable admission cannot charge unstarted work"
+        );
+        assert!(saved.active_attempt_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn incompatible_progress_has_safe_terminal_outcome_with_current_provider_facts() {
+        for permanent in [false, true] {
+            let (store, coordinator) = setup_coordinator().await;
+            let job = coordinator
+                .enqueue_runtime_failure_job(
+                    &RuntimeFailureCandidate {
+                        turn_id: "turn_future_progress".into(),
+                        item_id: "reasoning_future_progress".into(),
+                        item_type: TurnItemType::Reasoning,
+                        trigger: RecoveryTrigger::RuntimeFailure,
+                        action: RecoveryAction::RestartTurn,
+                        reason: "fixture".into(),
+                        base_backoff_secs: 1,
+                        max_attempts: 10,
+                        max_wall_clock_secs: 900,
+                        no_progress_limit: 2,
+                        metadata: Default::default(),
+                    },
+                    1_700_000_000,
+                )
+                .await
+                .unwrap()
+                .into_job();
+            let attempt = claim_and_activate(&store, &job.id).await;
+            store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "UPDATE recovery_job SET diagnostic=json_set(diagnostic,'$.semanticProgress.schema_version',99) WHERE id=?",
+                [job.id.clone().into()])).await.unwrap();
+            let mut failure = provider_failure(
+                if permanent {
+                    ProviderFailureClass::AuthOrPermission
+                } else {
+                    ProviderFailureClass::StreamTruncated
+                },
+                "private fixture response",
+            );
+            failure.is_recoverable_hint = !permanent;
+            let events = coordinator
+                .record_recovery_provider_failure(
+                    &job.id,
+                    &attempt,
+                    failure.clone(),
+                    1_700_000_002,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!events.is_empty());
+            let saved = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+            assert_eq!(
+                saved.status,
+                if permanent {
+                    RecoveryJobStatus::Failed
+                } else {
+                    RecoveryJobStatus::Blocked
+                }
+            );
+            assert_eq!(saved.run_count, 1);
+            assert_eq!(
+                saved.progress,
+                pioneer_crud::RecoveryProgressLoad::Unavailable
+            );
+            let diagnostic = saved.diagnostic.unwrap();
+            assert_eq!(
+                diagnostic.last_failure,
+                Some(pioneer_protocol::RecoveryProviderFailure::from(&failure))
+            );
+            assert_eq!(
+                diagnostic.stop_reason,
+                if permanent {
+                    Some(pioneer_protocol::RecoveryStopReason::PolicyRejected)
+                } else {
+                    None
+                }
+            );
+            assert!(
+                coordinator
+                    .record_recovery_provider_failure(
+                        &job.id,
+                        &attempt,
+                        failure,
+                        1_700_000_002,
+                        None
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn time_and_total_attempt_stops_preserve_last_provider_fact() {
+        for (max_wall_clock_secs, no_progress_limit, max_attempts, stop_reason) in [
             (
                 0,
                 9,
+                10,
                 pioneer_protocol::RecoveryStopReason::WallClockExhausted,
             ),
-            (900, 1, pioneer_protocol::RecoveryStopReason::NoProgress),
+            (
+                900,
+                1,
+                1,
+                pioneer_protocol::RecoveryStopReason::AttemptsExhausted,
+            ),
         ] {
             let (store, coordinator) = setup_coordinator().await;
             let job = coordinator
@@ -9096,7 +10693,7 @@ mod tests {
                         action: RecoveryAction::RestartTurn,
                         reason: "raw initial runtime failure".to_owned(),
                         base_backoff_secs: 1,
-                        max_attempts: 10,
+                        max_attempts,
                         max_wall_clock_secs,
                         no_progress_limit,
                         metadata: pioneer_protocol::ToolMetadata::default(),
@@ -9107,9 +10704,8 @@ mod tests {
                 .unwrap()
                 .into_job();
             let attempt = claim_and_activate(&store, &job.id).await;
-            let mut failure =
-                provider_failure(ProviderFailureClass::AuthOrPermission, "raw last failure");
-            failure.http_status = Some(403);
+            let mut failure = provider_failure(ProviderFailureClass::RateLimit, "raw last failure");
+            failure.http_status = Some(429);
             let events = coordinator
                 .record_recovery_provider_failure(
                     &job.id,
@@ -11073,7 +12669,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_tool_calling_plan_disables_tools_without_terminal_reason() {
+    async fn unsupported_tool_calling_plan_preserves_semantics_and_rejects_retry() {
         let (_crud_store, coordinator) = setup_coordinator().await;
         let job = provider_plan_job(ProviderFailureClass::UnsupportedToolCalling, "stream");
 
@@ -11082,14 +12678,14 @@ mod tests {
             .await
             .expect("unsupported tool-calling plan should build");
 
-        assert!(plan.disable_tool_calling);
-        assert!(plan.force_non_stream);
+        assert!(!plan.disable_tool_calling);
+        assert!(!plan.force_non_stream);
         assert!(!plan.disable_image_input);
-        assert!(plan.terminal_reason.is_none());
+        assert!(plan.terminal_reason.is_some());
     }
 
     #[tokio::test]
-    async fn unsupported_image_input_plan_removes_images_without_terminal_reason() {
+    async fn unsupported_image_input_plan_preserves_semantics_and_rejects_retry() {
         let (_crud_store, coordinator) = setup_coordinator().await;
         let job = provider_plan_job(ProviderFailureClass::UnsupportedImageInput, "non_stream");
 
@@ -11098,10 +12694,10 @@ mod tests {
             .await
             .expect("unsupported image-input plan should build");
 
-        assert!(plan.disable_image_input);
+        assert!(!plan.disable_image_input);
         assert!(!plan.disable_tool_calling);
         assert!(!plan.force_non_stream);
-        assert!(plan.terminal_reason.is_none());
+        assert!(plan.terminal_reason.is_some());
     }
 
     #[tokio::test]
@@ -11264,7 +12860,22 @@ mod tests {
             None,
         )
         .await;
-        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        persist_test_runtime_snapshot(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
+        seed_test_native_semantic_checkpoint(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
         crud_store
             .update_turn_status(
                 thread_id,

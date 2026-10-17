@@ -10,6 +10,53 @@ use reqwest::{Client, Proxy, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
 use std::cell::RefCell;
 
+tokio::task_local! {
+    static PROVIDER_ATTEMPT_CONTEXT: crate::ProviderAttemptContext;
+}
+
+pub fn current_provider_attempt_context() -> Option<crate::ProviderAttemptContext> {
+    PROVIDER_ATTEMPT_CONTEXT.try_with(Clone::clone).ok()
+}
+
+pub async fn with_provider_attempt_context<T>(
+    context: crate::ProviderAttemptContext,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    struct CancelOnDrop(tokio_util::sync::CancellationToken);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.cancel();
+        }
+    }
+    let _owned = CancelOnDrop(context.cancellation.clone());
+    PROVIDER_ATTEMPT_CONTEXT.scope(context, future).await
+}
+
+async fn next_response_chunk<S>(
+    stream: &mut S,
+    context: Option<&crate::ProviderAttemptContext>,
+) -> Option<Result<Bytes>>
+where
+    S: futures_util::Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Unpin,
+{
+    let result = if let Some(context) = context {
+        if context.cancellation.is_cancelled() || tokio::time::Instant::now() >= context.deadline {
+            return Some(Err(crate::failure::transport_timeout_error()));
+        }
+        tokio::select! {
+            biased;
+            _ = context.cancellation.cancelled() => return Some(Err(crate::failure::transport_timeout_error())),
+            result = tokio::time::timeout_at(context.deadline, stream.next()) => match result {
+                Ok(chunk) => chunk,
+                Err(_) => return Some(Err(crate::failure::transport_timeout_error())),
+            },
+        }
+    } else {
+        stream.next().await
+    };
+    result.map(|chunk| chunk.map_err(crate::failure::safe_transport_error))
+}
+
 pub(crate) fn build_client(policy: ProviderTimeoutPolicy) -> Client {
     let proxy_url = active_provider_proxy_url();
     build_client_with_proxy(policy, proxy_url.as_deref()).expect("failed to build HTTP client")
@@ -59,34 +106,51 @@ pub(crate) fn non_stream_request(
     builder: RequestBuilder,
     policy: ProviderTimeoutPolicy,
 ) -> RequestBuilder {
-    builder.timeout(policy.non_stream_request_timeout)
+    let remaining = current_provider_attempt_context()
+        .map(|context| {
+            context
+                .deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+        })
+        .unwrap_or(policy.non_stream_request_timeout);
+    builder.timeout(remaining.min(policy.non_stream_request_timeout))
 }
 
 pub(crate) fn stream_request(
     builder: RequestBuilder,
     policy: ProviderTimeoutPolicy,
 ) -> RequestBuilder {
-    if let Some(timeout) = policy.max_stream_duration {
-        builder.timeout(timeout)
-    } else {
-        builder
-    }
+    let remaining = current_provider_attempt_context()
+        .map(|context| {
+            context
+                .deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+        })
+        .unwrap_or_else(|| policy.stream_attempt_duration());
+    builder.timeout(remaining.min(policy.stream_attempt_duration()))
 }
 
 pub(crate) async fn send_stream_request(
     builder: RequestBuilder,
     policy: ProviderTimeoutPolicy,
 ) -> Result<Response> {
+    let context = match current_provider_attempt_context() {
+        Some(context) => context,
+        None => crate::ProviderAttemptContext::new(policy, true)?,
+    };
+    if context.cancellation.is_cancelled()
+        || tokio::time::Instant::now() >= context.first_output_deadline
+    {
+        return Err(crate::failure::transport_timeout_error());
+    }
     let send = stream_request(builder, policy).send();
-    tokio::time::timeout(policy.first_chunk_timeout, send)
-        .await
-        .map_err(|_| {
-            anyhow!(
-                "provider stream timed out before response headers after {:?}",
-                policy.first_chunk_timeout
-            )
-        })?
-        .map_err(Into::into)
+    tokio::select! {
+        biased;
+        _ = context.cancellation.cancelled() => Err(crate::failure::transport_timeout_error()),
+        result = tokio::time::timeout_at(context.first_output_deadline, send) => result
+        .map_err(|_| crate::failure::transport_timeout_error())?
+        .map_err(crate::failure::safe_transport_error),
+    }
 }
 
 pub(crate) async fn read_response_bytes_bounded(
@@ -119,7 +183,8 @@ pub(crate) async fn read_response_bytes_bounded(
         .min(limit);
     let mut body = Vec::with_capacity(capacity);
     let mut byte_stream = response.bytes_stream();
-    while let Some(chunk) = byte_stream.next().await {
+    let context = current_provider_attempt_context();
+    while let Some(chunk) = next_response_chunk(&mut byte_stream, context.as_ref()).await {
         let chunk = chunk?;
         let observed = body.len().saturating_add(chunk.len());
         if observed > limit {
@@ -145,7 +210,7 @@ pub(crate) async fn read_response_text_bounded(
     component: &'static str,
 ) -> Result<String> {
     let body = read_response_bytes_bounded(response, limit, component).await?;
-    String::from_utf8(body).context("provider response body was not valid UTF-8")
+    String::from_utf8(body).map_err(|_| anyhow!("provider response body was not valid UTF-8"))
 }
 
 pub(crate) async fn read_response_json_bounded<T: DeserializeOwned>(
@@ -154,7 +219,8 @@ pub(crate) async fn read_response_json_bounded<T: DeserializeOwned>(
     component: &'static str,
 ) -> Result<T> {
     let body = read_response_bytes_bounded(response, limits.max_transport_bytes, component).await?;
-    serde_json::from_slice(body.as_slice()).context("provider response body was not valid JSON")
+    serde_json::from_slice(body.as_slice())
+        .map_err(|_| anyhow!("provider response body was not valid JSON"))
 }
 
 /// Wrap a provider stream with the same hard byte limit used for non-stream
@@ -167,9 +233,10 @@ pub(crate) fn bounded_response_stream(
 ) -> BoxStream<'static, Result<Bytes>> {
     let content_length = response.content_length();
     let byte_stream = response.bytes_stream();
-    Box::pin(stream::unfold(
-        Some((byte_stream, 0usize)),
-        move |state| async move {
+    let context = current_provider_attempt_context();
+    Box::pin(stream::unfold(Some((byte_stream, 0usize)), move |state| {
+        let context = context.clone();
+        async move {
             let Some((mut byte_stream, total)) = state else {
                 return None;
             };
@@ -188,7 +255,7 @@ pub(crate) fn bounded_response_stream(
                 ));
             }
 
-            match byte_stream.next().await {
+            match next_response_chunk(&mut byte_stream, context.as_ref()).await {
                 Some(Ok(chunk)) => {
                     let observed = total.saturating_add(chunk.len());
                     if observed > limit {
@@ -200,11 +267,11 @@ pub(crate) fn bounded_response_stream(
                         Some((Ok(chunk), Some((byte_stream, observed))))
                     }
                 }
-                Some(Err(error)) => Some((Err(error.into()), None)),
+                Some(Err(error)) => Some((Err(error), None)),
                 None => None,
             }
-        },
-    ))
+        }
+    }))
 }
 
 #[cfg(test)]

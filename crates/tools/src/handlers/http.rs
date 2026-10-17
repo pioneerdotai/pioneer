@@ -40,6 +40,30 @@ pub(crate) struct BufferedHttpResponse {
     pub elapsed_ms: u64,
 }
 
+/// Count actual decoded stream bytes before allocating; all stages spend the
+/// same caller-owned allowance. Header hints cannot weaken this bound.
+pub(crate) async fn read_stream_bounded<S, B, E>(
+    stream: S,
+    remaining_bytes: &mut usize,
+) -> Result<Vec<u8>, ToolError>
+where
+    S: futures_util::Stream<Item = Result<B, E>>,
+    B: AsRef<[u8]>,
+{
+    futures_util::pin_mut!(stream);
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| ToolError::execution_failed("response stream failed"))?;
+        let bytes = chunk.as_ref();
+        if bytes.len() > *remaining_bytes {
+            return Err(ToolError::ResponseLimitExceeded);
+        }
+        *remaining_bytes -= bytes.len();
+        body.extend_from_slice(bytes);
+    }
+    Ok(body)
+}
+
 pub(crate) fn build_http_client(
     timeout_ms: u64,
     follow_redirects: bool,
@@ -380,7 +404,11 @@ pub(crate) fn map_http_request_error(error: reqwest::Error, context: &str) -> To
         }
         source = current.source();
     }
-    ToolError::execution_failed(format!("{context}: {error}"))
+    if error.is_timeout() {
+        ToolError::TimedOut
+    } else {
+        ToolError::execution_failed(format!("{context}: HTTP transport failed"))
+    }
 }
 
 pub(crate) fn validate_http_url(input: &str) -> Result<(), ToolError> {

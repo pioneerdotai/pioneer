@@ -564,8 +564,8 @@ impl AnthropicProvider {
                         .unwrap_or_else(|| "tool".to_owned());
                     content.push(ApiMessageContentBlock::ToolResult {
                         tool_use_id,
-                        content: ToolResultContent::Text(m.content.clone()),
-                        is_error: None,
+                        content: ToolResultContent::Text(m.wire_content()),
+                        is_error: m.tool_outcome.and_then(|outcome| outcome.is_error()),
                     });
                 }
                 _ => {
@@ -627,9 +627,9 @@ impl AnthropicProvider {
                         );
                     }
 
-                    if !m.content.is_empty() {
+                    if !m.wire_content_is_empty() {
                         content.push(ApiMessageContentBlock::Text {
-                            text: m.content.clone(),
+                            text: m.wire_content(),
                         });
                     }
 
@@ -673,9 +673,9 @@ impl AnthropicProvider {
             if m.role == Role::Tool {
                 if !media.is_empty() {
                     let mut blocks = Vec::new();
-                    if !m.content.is_empty() {
+                    if !m.wire_content_is_empty() {
                         blocks.push(ApiMessageContentBlock::Text {
-                            text: m.content.clone(),
+                            text: m.wire_content(),
                         });
                     }
                     blocks.extend(media);
@@ -749,18 +749,7 @@ impl AnthropicProvider {
     }
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
-        let status = response.status();
-        let body = match crate::http::read_response_text_bounded(
-            response,
-            16 * 1024,
-            "provider_error_body",
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(error) => return error,
-        };
-        anyhow!("Anthropic API error ({status}): {body}")
+        crate::failure::http_error(response).await
     }
 }
 
@@ -1403,7 +1392,8 @@ impl crate::traits::Provider for AnthropicProvider {
         }
         let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
-            .await?;
+            .await
+            .map_err(crate::failure::safe_transport_error)?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);
@@ -1503,7 +1493,8 @@ impl crate::traits::Provider for AnthropicProvider {
             .header("anthropic-version", ANTHROPIC_VERSION);
         let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
-            .await?;
+            .await
+            .map_err(crate::failure::safe_transport_error)?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);
@@ -2541,10 +2532,21 @@ mod tests {
         )
         .get_or_create("anthropic")
         .unwrap();
-        let mut stream = provider
-            .stream_chat(request(vec![ChatMessage::user("start")]))
-            .await
-            .unwrap();
+        let mut request = request(vec![ChatMessage::user("start")]);
+        request.tools = Some(
+            ["first", "second"]
+                .into_iter()
+                .map(|name| crate::types::ToolDefinition {
+                    name: name.into(),
+                    description: "history fixture".into(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {"x": {"type": "integer"}},
+                    }),
+                })
+                .collect(),
+        );
+        let mut stream = provider.stream_chat(request).await.unwrap();
         let mut calls = Vec::new();
         let mut state = None;
         while let Some(chunk) = stream.next().await {
@@ -3348,3 +3350,7 @@ mod media_contract_tests {
 #[cfg(test)]
 #[path = "wire_tests/anthropic.rs"]
 mod wire_contract_tests;
+
+#[cfg(test)]
+#[path = "wire_tests/r03_anthropic.rs"]
+mod r03_wire_contract_tests;

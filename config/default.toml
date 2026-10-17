@@ -144,6 +144,10 @@ max_consecutive_no_progress_steps = 4
 max_recovery_attempts_per_step = 2
 max_recovery_attempts_per_run = 12
 
+# Heuristic policy is frozen at Turn admission; security and budgets stay active.
+[gateway.tools]
+no_progress_mode = "enforce"
+
 [gateway.tools.budget]
 max_agent_rounds_per_turn = 32
 max_tool_calls_per_turn = 128
@@ -155,6 +159,7 @@ max_wall_clock_ms_per_window = 1800000
 
 [gateway.tools.execution_windows.total]
 max_consecutive_no_progress_windows = 3
+max_consecutive_unconfirmed_progress_windows = 128
 
 [gateway.tools.retry]
 max_recoverable_retry_rounds_per_episode = 32

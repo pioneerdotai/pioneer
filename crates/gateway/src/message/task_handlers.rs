@@ -192,15 +192,11 @@ impl MessageProcessor {
             Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime { .. })
                 | Some(pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime { .. })
         ) {
-            request.provider_authority_fingerprint = Some(
-                self.provider_registry
-                    .authority_fingerprint_for_workspace(
-                        response.task.workspace_id.as_str(),
-                        request.provider.as_str(),
-                    )?
-                    .as_str()
-                    .to_owned(),
-            );
+            let authority = self.provider_registry.authority_fingerprint_for_workspace(
+                response.task.workspace_id.as_str(),
+                request.provider.as_str(),
+            )?;
+            request.bind_resolved_provider_authority(&authority);
         }
         let revision = self.current_authorization_revision().await?;
         let requested_permission_cap = response
@@ -944,8 +940,7 @@ impl MessageProcessor {
                         return;
                     }
                 };
-                execution_request.provider_authority_fingerprint =
-                    Some(authority.as_str().to_owned());
+                execution_request.bind_resolved_provider_authority(&authority);
             }
             let policy_revision = match self.authorization_invalidation_hub.current_revision().await
             {

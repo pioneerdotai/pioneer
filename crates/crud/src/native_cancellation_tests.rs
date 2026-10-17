@@ -2746,6 +2746,11 @@ async fn native_recovery_pre_start_and_refusal_share_attempt_owner_and_terminal_
                 )
                 .await
                 .unwrap();
+            let progress = store
+                .prepare_recovery_progress_outcome(&job.id, &source.attempt_id)
+                .await
+                .unwrap()
+                .unwrap();
             let now = match fence {
                 "accepted_marker" => {
                     let mut completed = turn.clone();
@@ -2884,14 +2889,16 @@ async fn native_recovery_pre_start_and_refusal_share_attempt_owner_and_terminal_
                 );
                 assert!(
                     !store
-                        .record_native_recovery_start_failure_owned(
+                        .record_native_recovery_start_failure_owned_and_progress(
                             &execution,
                             &source,
                             RecoveryJobStatus::Pending,
                             Some(now + 2),
                             Some("late refusal".into()),
                             None,
-                            now
+                            now,
+                            None,
+                            Some(&progress),
                         )
                         .await
                         .unwrap()
@@ -2917,6 +2924,190 @@ async fn native_recovery_pre_start_and_refusal_share_attempt_owner_and_terminal_
                     .unwrap()
                     .preparation,
                 plan
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_recovery_refusal_commits_progress_atomically_and_rejects_stale_preparation() {
+    use crate::{NewTurnExecution, TurnExecutionStatus, TurnExecutorKind};
+    let unchanged = |actual: &crate::RecoveryJobRecord, expected: &crate::RecoveryJobRecord| {
+        assert_eq!(actual.status, expected.status);
+        assert_eq!(actual.run_count, expected.run_count);
+        assert_eq!(actual.active_attempt_id, expected.active_attempt_id);
+        assert_eq!(
+            actual.last_failure_attempt_id,
+            expected.last_failure_attempt_id
+        );
+        assert_eq!(actual.next_run_at_unix, expected.next_run_at_unix);
+        assert_eq!(actual.scheduled_at_unix, expected.scheduled_at_unix);
+        assert_eq!(actual.last_error, expected.last_error);
+        assert_eq!(
+            serde_json::to_value(&actual.diagnostic).unwrap(),
+            serde_json::to_value(&expected.diagnostic).unwrap()
+        );
+    };
+    for status in [
+        RecoveryJobStatus::Pending,
+        RecoveryJobStatus::Exhausted,
+        RecoveryJobStatus::Blocked,
+    ] {
+        for stale in [false, true] {
+            let (store, turn, plan) =
+                fixture(&format!("refusal_progress_{status:?}_{stale}")).await;
+            repositories::turn_execution::insert_immutable(
+                &store.connection,
+                NewTurnExecution {
+                    turn_id: turn.id.clone(),
+                    thread_id: plan.thread_id.clone(),
+                    workspace_id: plan.workspace_id.clone(),
+                    executor_kind: TurnExecutorKind::NativeAgent,
+                    executor_key: Some("fixture".into()),
+                    status: TurnExecutionStatus::Starting,
+                    owner_id: OWNER.into(),
+                    lease_until: unix_to_datetime(NOW + 100),
+                    created_at: unix_to_datetime(NOW),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                repositories::turn_execution::mark_recovering_owned(
+                    &store.connection,
+                    &turn.id,
+                    OWNER,
+                    unix_to_datetime(NOW)
+                )
+                .await
+                .unwrap()
+            );
+            let execution = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+            let job = store
+                .enqueue_recovery_job(
+                    turn.id.clone(),
+                    "refusal-progress".into(),
+                    TurnItemType::Reasoning,
+                    None,
+                    RecoveryTrigger::Timeout,
+                    RecoveryAction::RestartTurn,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                    3,
+                    serde_json::json!({}),
+                    serde_json::json!({}),
+                    NOW,
+                )
+                .await
+                .unwrap();
+            let claimed = store.claim_due_recovery_jobs(NOW, 45, 1).await.unwrap();
+            assert!(matches!(
+                store
+                    .mark_claimed_recovery_job_active(
+                        &job.id,
+                        claimed[0].claim_token.as_deref().unwrap(),
+                        "refusal-attempt",
+                        NOW
+                    )
+                    .await
+                    .unwrap(),
+                ClaimedRecoveryActivation::Activated
+            ));
+            let recovery = pioneer_protocol::RecoveryAttemptContext {
+                job_id: job.id.clone(),
+                attempt_id: "refusal-attempt".into(),
+            };
+            let progress = store
+                .prepare_recovery_progress_outcome(&job.id, &recovery.attempt_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(progress.state().consecutive_unconfirmed, 1);
+            if stale {
+                store
+                    .run_serialized_write(|| async {
+                        repositories::recovery_job::set_diagnostic(
+                            &store.connection,
+                            &job.id,
+                            r#"{"stopReason":"policy_rejected"}"#.into(),
+                        )
+                        .await
+                    })
+                    .await
+                    .unwrap();
+                // Rewriting an empty diagnostic preserves the same stored
+                // progress and is not drift. Prove this newer diagnostic is.
+                assert!(!progress.current(&store.connection).await.unwrap());
+            }
+            let before = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+            let applied = store
+                .record_native_recovery_start_failure_owned_and_progress(
+                    &execution,
+                    &recovery,
+                    status,
+                    Some(NOW + 5),
+                    Some("required restore refused".into()),
+                    None,
+                    NOW,
+                    None,
+                    Some(&progress),
+                )
+                .await
+                .unwrap();
+            assert_eq!(applied, !stale);
+            let after = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+            if stale {
+                unchanged(&after, &before);
+            } else {
+                assert_eq!(after.status, status);
+                assert_eq!(after.run_count, before.run_count + 1);
+                let raw = store
+                    .connection
+                    .query_one_raw(sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Sqlite,
+                        "SELECT diagnostic FROM recovery_job WHERE id=?",
+                        [job.id.clone().into()],
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .try_get::<String>("", "diagnostic")
+                    .unwrap();
+                let (_, saved) =
+                    repositories::recovery_job::decode_stored_diagnostic(Some(&raw)).unwrap();
+                assert_eq!(saved.as_ref(), Some(progress.state()));
+                assert!(
+                    !store
+                        .record_native_recovery_start_failure_owned_and_progress(
+                            &execution,
+                            &recovery,
+                            status,
+                            Some(NOW + 5),
+                            Some("duplicate refusal".into()),
+                            None,
+                            NOW,
+                            None,
+                            Some(&progress)
+                        )
+                        .await
+                        .unwrap()
+                );
+                unchanged(
+                    &store.get_recovery_job(&job.id).await.unwrap().unwrap(),
+                    &after,
+                );
+            }
+            assert_eq!(
+                store
+                    .get_turn_execution(&turn.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .owner_generation,
+                execution.owner_generation
             );
         }
     }

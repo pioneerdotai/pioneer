@@ -1,26 +1,168 @@
 use anyhow::{Context, Result};
-use pioneer_entity::{turn, turn_execution_checkpoint, turn_execution_window, turn_item};
+use pioneer_entity::{turn_execution_checkpoint, turn_execution_window, turn_item};
 use pioneer_protocol::{
     ExecutionWindowExhaustionReason, ExecutionWindowStatus, TurnItem, TurnStatus, generate_id,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter,
-    QueryOrder, Set, Unchanged,
+    QueryOrder, QuerySelect, Set, Unchanged,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::convention::{
     DB_ID_LEN, execution_window_exhaustion_reason_from_db,
     execution_window_exhaustion_reason_to_db, execution_window_status_from_db,
-    execution_window_status_to_db, turn_item_type_from_db, turn_status_from_db, turn_status_to_db,
+    execution_window_status_to_db,
 };
 
 pub const TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES: usize = 128 * 1024;
 
+pub(crate) fn semantic_checkpoint_id(turn_id: &str) -> String {
+    pioneer_protocol::native_semantic_checkpoint_id(turn_id)
+}
+
+pub(crate) async fn native_event_frontier<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+) -> Result<pioneer_protocol::ExecutionCheckpointNativeFrontier> {
+    let row = db
+        .query_one_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "SELECT coalesce((SELECT max(sequence) FROM turn_event WHERE turn_id=?1),0) AS events, \
+         coalesce((SELECT max(sequence) FROM turn_llm_context WHERE turn_id=?1),-1) AS contexts",
+            [turn_id.to_owned().into()],
+        ))
+        .await?
+        .context("native event frontier unavailable")?;
+    Ok(pioneer_protocol::ExecutionCheckpointNativeFrontier {
+        schema_version: 1,
+        event_sequence: row.try_get("", "events")?,
+        context_sequence: row.try_get("", "contexts")?,
+    })
+}
+
+/// Only this bounded checkpoint row is replaced. All preparation reads are
+/// revalidated by scalar predicates and exact predecessor bytes in this write.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_semantic_checkpoint_commit(
+    payload: &pioneer_protocol::ExecutionCheckpointPayload,
+    next_json: String,
+    previous_json: Option<String>,
+    owner_id: &str,
+    owner_generation: u64,
+    context_sha256: &str,
+    frontier: &pioneer_protocol::ExecutionCheckpointNativeFrontier,
+    now: DateTimeWithTimeZone,
+) -> Result<sea_orm::Statement> {
+    anyhow::ensure!(
+        next_json.len() <= TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES,
+        "native semantic checkpoint exceeds byte limit"
+    );
+    Ok(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
+        "INSERT INTO turn_execution_checkpoint \
+        (id,window_id,workspace_id,thread_id,turn_id,checkpoint_kind,payload_json,created_at) \
+        SELECT ?1,w.id,?2,?3,?4,'semantic_state',?5,?6 FROM turn_execution_window w \
+        JOIN \"turn\" t ON t.id=w.turn_id JOIN thread th ON th.id=t.thread_id \
+        JOIN turn_execution e ON e.turn_id=t.id JOIN native_cancellation_context c ON c.turn_id=t.id \
+        WHERE w.turn_id=?4 AND w.workspace_id=?2 AND w.thread_id=?3 AND w.window_index=?7 \
+        AND w.status='running' AND w.window_index=(SELECT max(window_index) FROM turn_execution_window WHERE turn_id=?4) \
+        AND t.thread_id=?3 AND th.workspace_id=?2 AND t.status='in_progress' AND t.message_deleted_at IS NULL \
+        AND e.workspace_id=?2 AND e.thread_id=?3 AND e.owner_id=?8 AND e.owner_generation=?9 \
+        AND e.executor_kind IN ('native_agent','api_provider') AND e.status IN ('queued','starting','running','recovering') \
+        AND c.workspace_id=?2 AND c.thread_id=?3 AND c.context_sha256=?10 AND c.accepted_event_id IS NULL \
+        AND coalesce((SELECT max(sequence) FROM turn_event WHERE turn_id=?4),0)=?11 \
+        AND coalesce((SELECT max(sequence) FROM turn_llm_context WHERE turn_id=?4),-1)=?12 \
+        AND ((?13 IS NULL AND NOT EXISTS(SELECT 1 FROM turn_execution_checkpoint WHERE id=?1)) \
+          OR EXISTS(SELECT 1 FROM turn_execution_checkpoint WHERE id=?1 AND turn_id=?4 AND workspace_id=?2 AND thread_id=?3 AND payload_json=?13)) \
+        ON CONFLICT(id) DO UPDATE SET window_id=excluded.window_id,payload_json=excluded.payload_json,created_at=excluded.created_at \
+        WHERE turn_execution_checkpoint.payload_json=?13 AND turn_execution_checkpoint.checkpoint_kind='semantic_state'",
+        [
+            semantic_checkpoint_id(&payload.turn_id).into(),
+            payload.workspace_id.clone().into(),
+            payload.thread_id.clone().into(),
+            payload.turn_id.clone().into(),
+            next_json.into(),
+            now.into(),
+            i64::from(payload.window.window_index).into(),
+            owner_id.to_owned().into(),
+            i64::try_from(owner_generation)?.into(),
+            context_sha256.to_owned().into(),
+            frontier.event_sequence.into(),
+            frontier.context_sequence.into(),
+            previous_json.into(),
+        ],
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_semantic_recovery_close(
+    window: &TurnExecutionWindowRecord,
+    previous_json: String,
+    stats: &TurnExecutionWindowStatsRecord,
+    reason: ExecutionWindowExhaustionReason,
+    owner_id: &str,
+    owner_generation: u64,
+    context_sha256: &str,
+    frontier: &pioneer_protocol::ExecutionCheckpointNativeFrontier,
+) -> Result<sea_orm::Statement> {
+    let metadata = serde_json::to_string(&stats.metadata_json)?;
+    anyhow::ensure!(
+        metadata.len() <= TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES,
+        "window metadata byte limit"
+    );
+    Ok(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
+        "UPDATE turn_execution_window SET status='checkpointed',exhaustion_reason=?1, \
+        agent_round_count=max(agent_round_count,?2),tool_call_count=max(tool_call_count,?3), \
+        provider_token_count=max(provider_token_count,?4),metadata_json=?5,completed_at=?6,updated_at=?7 \
+        WHERE id=?8 AND turn_id=?9 AND workspace_id=?10 AND thread_id=?11 AND status='running' \
+        AND window_index=(SELECT max(window_index) FROM turn_execution_window WHERE turn_id=?9) \
+        AND metadata_json=?12 \
+        AND agent_round_count=?20 AND tool_call_count=?21 AND provider_token_count=?22 \
+        AND EXISTS(SELECT 1 FROM \"turn\" t JOIN thread th ON th.id=t.thread_id \
+          JOIN turn_execution e ON e.turn_id=t.id JOIN native_cancellation_context c ON c.turn_id=t.id \
+          WHERE t.id=?9 AND t.thread_id=?11 AND th.workspace_id=?10 AND t.status='in_progress' \
+          AND t.message_deleted_at IS NULL AND e.workspace_id=?10 AND e.thread_id=?11 \
+          AND e.owner_id=?13 AND e.owner_generation=?14 AND e.status IN ('queued','starting','running','recovering') \
+          AND e.executor_kind IN ('native_agent','api_provider') AND c.workspace_id=?10 AND c.thread_id=?11 \
+          AND c.context_sha256=?15 AND c.accepted_event_id IS NULL) \
+        AND EXISTS(SELECT 1 FROM turn_execution_checkpoint WHERE id=?16 AND window_id=?8 \
+          AND workspace_id=?10 AND thread_id=?11 AND turn_id=?9 AND checkpoint_kind='semantic_state' AND payload_json=?17) \
+        AND coalesce((SELECT max(sequence) FROM turn_event WHERE turn_id=?9),0)=?18 \
+        AND coalesce((SELECT max(sequence) FROM turn_llm_context WHERE turn_id=?9),-1)=?19",
+        [
+            execution_window_exhaustion_reason_to_db(reason).into(),
+            i64::from(stats.agent_round_count).into(),
+            i64::from(stats.tool_call_count).into(),
+            i64::try_from(stats.provider_token_count)?.into(),
+            metadata.into(),
+            stats.completed_at.into(),
+            stats.updated_at.into(),
+            window.id.clone().into(),
+            window.turn_id.clone().into(),
+            window.workspace_id.clone().into(),
+            window.thread_id.clone().into(),
+            serde_json::to_string(&window.metadata_json)?.into(),
+            owner_id.to_owned().into(),
+            i64::try_from(owner_generation)?.into(),
+            context_sha256.to_owned().into(),
+            semantic_checkpoint_id(&window.turn_id).into(),
+            previous_json.into(),
+            frontier.event_sequence.into(),
+            frontier.context_sequence.into(),
+            i64::from(window.agent_round_count).into(),
+            i64::from(window.tool_call_count).into(),
+            i64::try_from(window.provider_token_count)?.into(),
+        ],
+    ))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnExecutionCheckpointKind {
+    SemanticState,
     WindowExhausted,
     TurnBlocked,
     StartupRecovery,
@@ -81,6 +223,9 @@ pub struct TurnExecutionWindowUsageAggregateRecord {
     pub total_provider_tokens: u64,
     pub provider_token_usage_unknown: bool,
     pub consecutive_no_progress_windows: u32,
+    pub consecutive_unconfirmed_progress_windows: u32,
+    /// A bounded page contains an authoritative reset; prefixes otherwise carry.
+    pub semantic_progress_advanced: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -501,12 +646,20 @@ pub(crate) async fn window_metadata_string_is_present<C: ConnectionTrait>(
     )
 }
 
-pub async fn aggregate_turn_execution_window_usage<C: ConnectionTrait>(
+pub(crate) async fn window_usage_batch<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
-) -> Result<TurnExecutionWindowUsageAggregateRecord> {
-    let windows = list_turn_execution_windows(db, turn_id).await?;
-    Ok(aggregate_turn_execution_window_records(windows.as_slice()))
+    after_index: u32,
+) -> Result<Vec<turn_execution_window::Model>> {
+    use sea_orm::QuerySelect;
+    turn_execution_window::Entity::find()
+        .filter(turn_execution_window::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_execution_window::Column::WindowIndex.gt(i64::from(after_index)))
+        .order_by_asc(turn_execution_window::Column::WindowIndex)
+        .limit(32)
+        .all(db)
+        .await
+        .context("failed to read execution-window usage batch")
 }
 
 pub fn aggregate_turn_execution_window_records(
@@ -528,24 +681,47 @@ pub fn aggregate_turn_execution_window_records(
         aggregate.total_provider_tokens = aggregate
             .total_provider_tokens
             .saturating_add(window.provider_token_count);
-        if window.agent_round_count > 0 && window.provider_token_count == 0 {
+        if (window.agent_round_count > 0
+            || window.provider_token_count > 0
+            || window.metadata_json["providerUsageAvailable"].as_bool() == Some(false))
+            && (window
+                .metadata_json
+                .get("accountingSchemaVersion")
+                .and_then(serde_json::Value::as_u64)
+                != Some(1)
+                || window
+                    .metadata_json
+                    .get("providerUsageAvailable")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true))
+        {
             aggregate.provider_token_usage_unknown = true;
         }
 
-        let no_progress_recovery = window.agent_round_count == 0
-            && window.tool_call_count == 0
-            && matches!(
-                window.exhaustion_reason,
-                Some(
-                    ExecutionWindowExhaustionReason::ProviderFailureContinuation
-                        | ExecutionWindowExhaustionReason::RuntimeShutdownContinuation
-                )
-            );
-        if no_progress_recovery {
-            aggregate.consecutive_no_progress_windows =
-                aggregate.consecutive_no_progress_windows.saturating_add(1);
-        } else {
-            aggregate.consecutive_no_progress_windows = 0;
+        match pioneer_protocol::ExecutionProgressSummary::from_value(
+            &window.metadata_json["semanticProgress"],
+        )
+        .map_or(
+            pioneer_protocol::ExecutionProgressKind::Unknown,
+            |progress| progress.kind(),
+        ) {
+            pioneer_protocol::ExecutionProgressKind::Advanced => {
+                aggregate.semantic_progress_advanced = true;
+                aggregate.consecutive_no_progress_windows = 0;
+                aggregate.consecutive_unconfirmed_progress_windows = 0;
+            }
+            pioneer_protocol::ExecutionProgressKind::Unchanged => {
+                aggregate.consecutive_no_progress_windows =
+                    aggregate.consecutive_no_progress_windows.saturating_add(1);
+                aggregate.consecutive_unconfirmed_progress_windows = aggregate
+                    .consecutive_unconfirmed_progress_windows
+                    .saturating_add(1);
+            }
+            pioneer_protocol::ExecutionProgressKind::Unknown => {
+                aggregate.consecutive_unconfirmed_progress_windows = aggregate
+                    .consecutive_unconfirmed_progress_windows
+                    .saturating_add(1);
+            }
         }
 
         if let Some(completed_at) = window.completed_at.as_ref() {
@@ -744,104 +920,23 @@ pub(crate) async fn transition_window_with_prepared_status<C: ConnectionTrait>(
     )
 }
 
-pub async fn close_active_execution_windows_for_terminal_turns<C: ConnectionTrait>(
+pub(crate) async fn terminal_active_window_batch<C: ConnectionTrait>(
     db: &C,
-    now: DateTimeWithTimeZone,
-) -> Result<u64> {
-    let active_window_statuses = [
-        execution_window_status_to_db(ExecutionWindowStatus::Running),
-        execution_window_status_to_db(ExecutionWindowStatus::Checkpointed),
-    ];
-    let terminal_turn_statuses = [
-        turn_status_to_db(TurnStatus::Completed).to_owned(),
-        turn_status_to_db(TurnStatus::Failed).to_owned(),
-        turn_status_to_db(TurnStatus::Interrupted).to_owned(),
-        turn_status_to_db(TurnStatus::Blocked).to_owned(),
-    ];
-
-    let terminal_turn_ids = turn::Entity::find()
-        .filter(turn::Column::Status.is_in(terminal_turn_statuses))
+    after_window_id: Option<&str>,
+) -> Result<Vec<turn_execution_window::Model>> {
+    use sea_orm::QuerySelect;
+    let mut query = turn_execution_window::Entity::find()
+        .filter(turn_execution_window::Column::Status.is_in(["running", "exhausted", "checkpointed"]))
+        .filter(sea_orm::sea_query::Expr::cust(
+            "EXISTS (SELECT 1 FROM \"turn\" WHERE \"turn\".id = turn_execution_window.turn_id AND \"turn\".status IN ('completed', 'failed', 'interrupted', 'blocked'))"))
+        .order_by_asc(turn_execution_window::Column::Id).limit(32);
+    if let Some(after) = after_window_id {
+        query = query.filter(turn_execution_window::Column::Id.gt(after.to_owned()));
+    }
+    query
         .all(db)
         .await
-        .context("failed to list terminal turns for execution-window repair")?
-        .into_iter()
-        .map(|turn| turn.id)
-        .collect::<Vec<_>>();
-    if terminal_turn_ids.is_empty() {
-        return Ok(0);
-    }
-
-    let windows = turn_execution_window::Entity::find()
-        .filter(turn_execution_window::Column::TurnId.is_in(terminal_turn_ids))
-        .filter(turn_execution_window::Column::Status.is_in(active_window_statuses))
-        .all(db)
-        .await
-        .context("failed to list active execution windows for terminal turn repair")?;
-
-    let mut repaired = 0u64;
-    for window_model in windows {
-        let window = window_record_from_model(window_model)?;
-        let Some(turn_model) = turn::Entity::find_by_id(window.turn_id.clone())
-            .one(db)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to query turn `{}` for execution-window repair",
-                    window.turn_id
-                )
-            })?
-        else {
-            continue;
-        };
-        let Some(turn_status) = turn_status_from_db(turn_model.status.as_str()) else {
-            continue;
-        };
-        let Some(window_status) = terminal_window_status_for_turn_status(turn_status) else {
-            continue;
-        };
-
-        let counts = count_turn_execution_window_terminal_items_since(
-            db,
-            window.turn_id.as_str(),
-            window.started_at.clone(),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "failed to count terminal items for execution-window repair on turn `{}`",
-                window.turn_id
-            )
-        })?;
-        let metadata_json = repaired_terminal_turn_window_metadata(
-            &window.metadata_json,
-            window_status,
-            turn_model.error.as_deref(),
-        );
-        update_window_with_stats(
-            db,
-            window.id.as_str(),
-            window_status,
-            None,
-            TurnExecutionWindowStatsRecord {
-                agent_round_count: window.agent_round_count.max(counts.agent_round_count),
-                tool_call_count: window.tool_call_count.max(counts.tool_call_count),
-                provider_token_count: window.provider_token_count,
-                metadata_json,
-                completed_at: now.clone(),
-                updated_at: now.clone(),
-            },
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "failed to repair active execution window `{}` for terminal turn `{}`",
-                window.id, window.turn_id
-            )
-        })?;
-        repaired = repaired.saturating_add(1);
-    }
-
-    Ok(repaired)
+        .context("failed to discover terminal execution-window repair batch")
 }
 
 pub async fn count_turn_execution_window_terminal_items<C: ConnectionTrait>(
@@ -873,25 +968,129 @@ async fn count_turn_execution_window_terminal_items_query<C: ConnectionTrait>(
     query: sea_orm::Select<turn_item::Entity>,
     db: &C,
 ) -> Result<TurnExecutionWindowTerminalItemCountsRecord> {
+    use sea_orm::{FromQueryResult, QuerySelect};
+    #[derive(FromQueryResult)]
+    struct Counts {
+        agent_round_count: i64,
+        tool_call_count: i64,
+    }
+    let counts = query.select_only()
+        .column_as(sea_orm::sea_query::Expr::cust("COALESCE(SUM(CASE WHEN item_type = 'reasoning' THEN 1 ELSE 0 END), 0)"), "agent_round_count")
+        .column_as(sea_orm::sea_query::Expr::cust("COALESCE(SUM(CASE WHEN item_type IN ('command_execution','file_change','web_search','web_fetch','download','dynamic_tool_call') THEN 1 ELSE 0 END), 0)"), "tool_call_count")
+        .into_model::<Counts>().one(db).await
+        .context("failed to count execution-window terminal items")?
+        .context("missing execution-window item counts")?;
+    Ok(TurnExecutionWindowTerminalItemCountsRecord {
+        agent_round_count: u32::try_from(counts.agent_round_count).unwrap_or(u32::MAX),
+        tool_call_count: u32::try_from(counts.tool_call_count).unwrap_or(u32::MAX),
+    })
+}
+
+pub fn provider_usage_observation_tokens(payload: &str) -> (u64, bool) {
+    provider_usage_observation_payload(payload).unwrap_or((0, false))
+}
+
+fn provider_usage_observation_payload(payload: &str) -> Option<(u64, bool)> {
+    let item: TurnItem = serde_json::from_str(payload).ok()?;
+    let TurnItem::SystemEvent {
+        code,
+        details: Some(details),
+        ..
+    } = item
+    else {
+        return None;
+    };
+    if code.as_deref() != Some("provider_usage") || details["schema_version"].as_u64() != Some(1) {
+        return None;
+    }
+    let usage = details.get("usage")?;
+    let input = usage
+        .get("input_tokens")
+        .and_then(serde_json::Value::as_u64);
+    let output = usage
+        .get("output_tokens")
+        .and_then(serde_json::Value::as_u64);
+    Some((
+        input.unwrap_or(0).saturating_add(output.unwrap_or(0)),
+        input.is_some()
+            && output.is_some()
+            && matches!(
+                details["status"].as_str(),
+                Some("started" | "completed" | "failed")
+            )
+            && match details.get("complete") {
+                Some(serde_json::Value::Bool(complete)) => *complete,
+                None => details["status"].as_str() == Some("completed"),
+                _ => false,
+            },
+    ))
+}
+
+pub(crate) async fn commit_checkpoint_usage_availability<C: ConnectionTrait>(
+    db: &C,
+    window_id: &str,
+    available: bool,
+    progress_json: &str,
+) -> Result<()> {
+    let result = turn_execution_window::Entity::update_many()
+        .col_expr(turn_execution_window::Column::MetadataJson,
+            sea_orm::sea_query::Expr::cust_with_values(
+                "json_set(metadata_json, '$.accountingSchemaVersion', 1, '$.providerUsageAvailable', json(?), '$.semanticProgress', json(?))",
+                [if available { "true" } else { "false" }, progress_json],
+            ))
+        .filter(turn_execution_window::Column::Id.eq(window_id.to_owned()))
+        .filter(turn_execution_window::Column::Status.eq(execution_window_status_to_db(ExecutionWindowStatus::Checkpointed)))
+        .exec(db).await.context("failed to commit checkpoint usage availability")?;
+    anyhow::ensure!(result.rows_affected == 1, "checkpoint usage owner changed");
+    Ok(())
+}
+
+pub async fn execution_window_usage_observation_batch<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    window_index: u32,
+    after_item_id: Option<&str>,
+) -> Result<Vec<(String, String)>> {
+    use sea_orm::{FromQueryResult, QuerySelect};
+    #[derive(FromQueryResult)]
+    struct ObservationRow {
+        item_id: String,
+        payload: String,
+    }
+    let mut query = turn_item::Entity::find()
+        .select_only()
+        .column(turn_item::Column::ItemId)
+        // Corrupt/oversize records become explicit Unknown without allocating
+        // their unbounded payload while a reader is occupied.
+        .column_as(
+            sea_orm::sea_query::Expr::cust(
+                "CASE WHEN length(CAST(payload AS BLOB)) <= 65536 THEN payload ELSE '' END",
+            ),
+            "payload",
+        )
+        .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_item::Column::ItemType.eq("system_event"))
+        .filter(sea_orm::sea_query::Expr::cust(
+            "json_extract(payload, '$.code') = 'provider_usage'",
+        ))
+        .filter(sea_orm::sea_query::Expr::cust_with_values(
+            "json_extract(payload, '$.details.window_index') = ?",
+            [i64::from(window_index)],
+        ))
+        .order_by_asc(turn_item::Column::ItemId)
+        .limit(128);
+    if let Some(after) = after_item_id {
+        query = query.filter(turn_item::Column::ItemId.gt(after.to_owned()));
+    }
     let rows = query
+        .into_model::<ObservationRow>()
         .all(db)
         .await
-        .context("failed to list turn_item rows for execution-window terminal stats")?;
-
-    let mut counts = TurnExecutionWindowTerminalItemCountsRecord::default();
-    for row in rows {
-        let Some(item_type) = turn_item_type_from_db(row.item_type.as_str()) else {
-            continue;
-        };
-        if item_type == pioneer_protocol::TurnItemType::Reasoning {
-            counts.agent_round_count = counts.agent_round_count.saturating_add(1);
-        }
-        if item_type.is_tool_item() {
-            counts.tool_call_count = counts.tool_call_count.saturating_add(1);
-        }
-    }
-
-    Ok(counts)
+        .context("failed to read bounded provider usage observations")?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.item_id, row.payload))
+        .collect())
 }
 
 pub async fn list_turn_execution_window_items<C: ConnectionTrait>(
@@ -944,11 +1143,38 @@ pub(crate) async fn insert_prepared_turn_execution_checkpoint<C: ConnectionTrait
     Ok(())
 }
 
+/// Preserve the selected row, including a poisoned newest row. Filtering it
+/// out would allow recovery to use an older checkpoint with fewer obligations.
+/// NULL in the required String column is an explicit unavailable read outcome;
+/// oversized legacy TEXT never crosses the physical reader boundary.
+fn bounded_checkpoint_query() -> sea_orm::Select<turn_execution_checkpoint::Entity> {
+    use turn_execution_checkpoint::Column as C;
+    turn_execution_checkpoint::Entity::find()
+        .select_only()
+        .columns([
+            C::Id,
+            C::WindowId,
+            C::WorkspaceId,
+            C::ThreadId,
+            C::TurnId,
+            C::CheckpointKind,
+            C::CreatedAt,
+        ])
+        .column_as(
+            sea_orm::sea_query::Expr::cust_with_values(
+                "CASE WHEN length(CAST(payload_json AS BLOB)) <= ? THEN payload_json ELSE NULL END",
+                [TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES as i64],
+            ),
+            C::PayloadJson,
+        )
+}
+
 pub async fn get_turn_execution_checkpoint<C: ConnectionTrait>(
     db: &C,
     checkpoint_id: &str,
 ) -> Result<Option<TurnExecutionCheckpointRecord>> {
-    turn_execution_checkpoint::Entity::find_by_id(checkpoint_id.to_owned())
+    bounded_checkpoint_query()
+        .filter(turn_execution_checkpoint::Column::Id.eq(checkpoint_id.to_owned()))
         .one(db)
         .await
         .context("failed to query turn_execution_checkpoint row")?
@@ -960,7 +1186,8 @@ pub(crate) async fn get_turn_execution_checkpoint_model<C: ConnectionTrait>(
     db: &C,
     checkpoint_id: &str,
 ) -> Result<Option<turn_execution_checkpoint::Model>> {
-    turn_execution_checkpoint::Entity::find_by_id(checkpoint_id.to_owned())
+    bounded_checkpoint_query()
+        .filter(turn_execution_checkpoint::Column::Id.eq(checkpoint_id.to_owned()))
         .one(db)
         .await
         .context("failed to query raw turn_execution_checkpoint row")
@@ -970,9 +1197,18 @@ pub async fn list_turn_execution_checkpoints_for_window<C: ConnectionTrait>(
     db: &C,
     window_id: &str,
 ) -> Result<Vec<TurnExecutionCheckpointRecord>> {
-    turn_execution_checkpoint::Entity::find()
+    bounded_checkpoint_query()
         .filter(turn_execution_checkpoint::Column::WindowId.eq(window_id.to_owned()))
+        // The completed-window checkpoint supersedes the replaceable Running
+        // projection even when recovery uses a coarser/backdated timestamp.
+        .order_by(
+            sea_orm::sea_query::Expr::cust(
+                "CASE WHEN checkpoint_kind='semantic_state' THEN 0 ELSE 1 END",
+            ),
+            sea_orm::Order::Asc,
+        )
         .order_by_asc(turn_execution_checkpoint::Column::CreatedAt)
+        .order_by_asc(turn_execution_checkpoint::Column::Id)
         .all(db)
         .await
         .context("failed to list turn_execution_checkpoint rows for window")?
@@ -985,9 +1221,18 @@ pub async fn latest_turn_execution_checkpoint_for_turn<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
 ) -> Result<Option<TurnExecutionCheckpointRecord>> {
-    turn_execution_checkpoint::Entity::find()
+    bounded_checkpoint_query()
         .filter(turn_execution_checkpoint::Column::TurnId.eq(turn_id.to_owned()))
+        .order_by(
+            sea_orm::sea_query::Expr::cust("(SELECT window_index FROM turn_execution_window WHERE id=turn_execution_checkpoint.window_id)"),
+            sea_orm::Order::Desc,
+        )
+        .order_by(
+            sea_orm::sea_query::Expr::cust("CASE WHEN checkpoint_kind='semantic_state' THEN 0 ELSE 1 END"),
+            sea_orm::Order::Desc,
+        )
         .order_by_desc(turn_execution_checkpoint::Column::CreatedAt)
+        .order_by_desc(turn_execution_checkpoint::Column::Id)
         .one(db)
         .await
         .context("failed to query latest turn_execution_checkpoint row for turn")?
@@ -1043,7 +1288,9 @@ pub async fn delete_turn_execution_data_for_turn<C: ConnectionTrait>(
     })
 }
 
-fn terminal_window_status_for_turn_status(status: TurnStatus) -> Option<ExecutionWindowStatus> {
+pub(crate) fn terminal_window_status_for_turn_status(
+    status: TurnStatus,
+) -> Option<ExecutionWindowStatus> {
     match status {
         TurnStatus::Completed => Some(ExecutionWindowStatus::Completed),
         TurnStatus::Failed => Some(ExecutionWindowStatus::Failed),
@@ -1053,7 +1300,7 @@ fn terminal_window_status_for_turn_status(status: TurnStatus) -> Option<Executio
     }
 }
 
-fn repaired_terminal_turn_window_metadata(
+pub(crate) fn repaired_terminal_turn_window_metadata(
     existing: &serde_json::Value,
     status: ExecutionWindowStatus,
     reason: Option<&str>,
@@ -1194,6 +1441,172 @@ fn active_model_id(value: &ActiveValue<String>) -> Result<String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn progress_aggregate_carries_unknown_and_stall_across_bounded_pages_after_restart() {
+        use migration::{Migrator, MigratorTrait};
+        let connection = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&connection, None).await.unwrap();
+        let store = crate::CrudStore::new(connection).with_maintenance_access();
+        let now = chrono::Utc::now().fixed_offset();
+        // More than the actual128-row query quantum, with a reset in its suffix.
+        for index in 1..=260_u32 {
+            let (baseline, frontier) = match index {
+                1 => ([0, 0, 0], [1, 0, 0]),
+                2..=130 => ([1, u64::from(index - 2), 0], [1, u64::from(index - 1), 0]),
+                131 => ([1, 129, 0], [2, 129, 0]),
+                _ => (
+                    [2, 129, u64::from(index - 132)],
+                    [2, 129, u64::from(index - 131)],
+                ),
+            };
+            store.create_turn_execution_window(NewTurnExecutionWindowRecord {
+                workspace_id: "ws_progress".into(), thread_id: "thread_progress".into(), turn_id: "turn_progress".into(),
+                window_index: index, status: ExecutionWindowStatus::Checkpointed,
+                exhaustion_reason: Some(ExecutionWindowExhaustionReason::ProviderFailureContinuation),
+                agent_round_count: 5, tool_call_count: 7, provider_token_count: 20,
+                metadata_json: serde_json::json!({"semanticProgress":pioneer_protocol::ExecutionProgressSummary {
+                    schema_version: 1, baseline, frontier }}), started_at: now,
+            }, now, now).await.unwrap();
+        }
+        for index in 1..=260_u32 {
+            let (baseline, frontier) = if index <= 130 {
+                ([1, u64::from(index - 1), 0], [1, u64::from(index), 0])
+            } else {
+                (
+                    [1, 130, u64::from(index - 131)],
+                    [1, 130, u64::from(index - 130)],
+                )
+            };
+            store.create_turn_execution_window(NewTurnExecutionWindowRecord {
+                workspace_id: "ws_progress".into(), thread_id: "thread_progress".into(), turn_id: "turn_stall".into(),
+                window_index: index, status: ExecutionWindowStatus::Checkpointed, exhaustion_reason: None,
+                agent_round_count: 10, tool_call_count: 10, provider_token_count: 20,
+                metadata_json: serde_json::json!({"semanticProgress": pioneer_protocol::ExecutionProgressSummary {
+                    schema_version: 1, baseline, frontier }}), started_at: now,
+            }, now, now).await.unwrap();
+        }
+        let stalled = store
+            .aggregate_turn_execution_window_usage("turn_stall")
+            .await
+            .unwrap();
+        assert_eq!(stalled.consecutive_no_progress_windows, 130);
+        assert_eq!(stalled.consecutive_unconfirmed_progress_windows, 260);
+        assert!(
+            !stalled.semantic_progress_advanced,
+            "rounds/unknown suffix cannot clear an earlier confirmed stall"
+        );
+        let usage = store
+            .aggregate_turn_execution_window_usage("turn_progress")
+            .await
+            .unwrap();
+        assert_eq!(usage.total_windows, 260);
+        assert_eq!(usage.total_tool_calls, 260 * 7);
+        assert_eq!(usage.consecutive_no_progress_windows, 0);
+        assert_eq!(usage.consecutive_unconfirmed_progress_windows, 129);
+        assert!(usage.semantic_progress_advanced);
+        let restored = crate::CrudStore::new(store.connection.clone()).with_maintenance_access();
+        assert_eq!(
+            restored
+                .aggregate_turn_execution_window_usage("turn_progress")
+                .await
+                .unwrap(),
+            usage
+        );
+        assert_eq!(
+            restored.database_connection().read_class(),
+            pioneer_sqlite::SqliteReadClass::Maintenance
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_oversized_newest_checkpoint_is_unavailable_without_stale_fallback() {
+        use migration::{Migrator, MigratorTrait};
+        let connection = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&connection, None).await.unwrap();
+        let store = crate::CrudStore::new(connection).with_maintenance_access();
+        let db = store.database_connection();
+        assert_eq!(
+            db.read_class(),
+            pioneer_sqlite::SqliteReadClass::Maintenance
+        );
+        let now = chrono::Utc::now().fixed_offset();
+        let window = store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: "workspace".to_owned(),
+                    thread_id: "thread".to_owned(),
+                    turn_id: "turn".to_owned(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 0,
+                    tool_call_count: 0,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({}),
+                    started_at: now,
+                },
+                now,
+                now,
+            )
+            .await
+            .unwrap();
+        let first = store
+            .save_turn_execution_checkpoint(NewTurnExecutionCheckpointRecord {
+                id: Some("original".to_owned()),
+                window_id: window.id.clone(),
+                workspace_id: "workspace".to_owned(),
+                thread_id: "thread".to_owned(),
+                turn_id: "turn".to_owned(),
+                checkpoint_kind: TurnExecutionCheckpointKind::WindowExhausted,
+                payload_json: serde_json::json!({"original": true}),
+                created_at: now,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .latest_turn_execution_checkpoint_for_turn("turn")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            first.id
+        );
+        // Simulate a legacy writer; no production limit is disabled.
+        let poison = serde_json::json!({"text": "界".repeat(TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES / 2)}).to_string();
+        assert!(poison.len() > TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES);
+        db.execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO turn_execution_checkpoint(id,window_id,workspace_id,thread_id,turn_id,checkpoint_kind,payload_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            ["poison".into(), window.id.clone().into(), "workspace".into(), "thread".into(), "turn".into(),
+             "window_exhausted".into(), poison.into(), (now + chrono::Duration::seconds(1)).into()],
+        )).await.unwrap();
+        assert!(store.get_turn_execution_checkpoint("poison").await.is_err());
+        assert!(
+            get_turn_execution_checkpoint_model(&db, "poison")
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .latest_turn_execution_checkpoint_for_turn("turn")
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .list_turn_execution_checkpoints_for_window(&window.id)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .get_turn_execution_checkpoint("original")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[test]
     fn execution_window_status_and_reason_roundtrip_through_db_strings() {
         let status = ExecutionWindowStatus::Interrupted;
@@ -1216,5 +1629,88 @@ mod tests {
         let encoded = checkpoint_kind_to_db(kind);
         assert_eq!(encoded, "window_exhausted");
         assert_eq!(checkpoint_kind_from_db(&encoded).unwrap(), kind);
+    }
+}
+
+#[cfg(test)]
+mod usage_accounting_tests {
+    use super::provider_usage_observation_tokens;
+    fn payload(usage: serde_json::Value, status: &str) -> String {
+        serde_json::json!({"type":"systemEvent", "id":"observation", "level":"info",
+            "message":"Provider usage observation", "code":"provider_usage",
+            "details":{"schema_version":1,"window_index":1,"status":status,"usage":usage}})
+        .to_string()
+    }
+    #[test]
+    fn explicit_usage_completion_and_legacy_safe_outcomes_preserve_known_lower_bound() {
+        for status in ["started", "failed", "completed"] {
+            for (completion, available) in [
+                (serde_json::json!(false), false),
+                (serde_json::json!(true), true),
+                (serde_json::json!("unknown"), false),
+            ] {
+                let mut item: serde_json::Value = serde_json::from_str(&payload(
+                    serde_json::json!({"input_tokens":100,"output_tokens":0}),
+                    status,
+                ))
+                .unwrap();
+                item["details"]["complete"] = completion;
+                assert_eq!(
+                    provider_usage_observation_tokens(&item.to_string()),
+                    (100, available)
+                );
+            }
+        }
+        assert_eq!(
+            provider_usage_observation_tokens(&payload(
+                serde_json::json!({"input_tokens":100,"output_tokens":0}),
+                "failed"
+            )),
+            (100, false),
+            "legacy failure with both fields cannot prove terminal usage"
+        );
+        assert_eq!(
+            provider_usage_observation_tokens(&payload(
+                serde_json::json!({"input_tokens":100,"output_tokens":0}),
+                "completed"
+            )),
+            (100, true)
+        );
+        let mut future: serde_json::Value = serde_json::from_str(&payload(
+            serde_json::json!({"input_tokens":100,"output_tokens":0}),
+            "future",
+        ))
+        .unwrap();
+        future["details"]["complete"] = true.into();
+        assert_eq!(
+            provider_usage_observation_tokens(&future.to_string()),
+            (100, false)
+        );
+    }
+
+    #[test]
+    fn terminal_usage_reads_confirmed_lower_bound_and_unknown_separately() {
+        assert_eq!(
+            provider_usage_observation_tokens(&payload(
+                serde_json::json!({"input_tokens":30}),
+                "failed"
+            )),
+            (30, false)
+        );
+        assert_eq!(
+            provider_usage_observation_tokens(&payload(
+                serde_json::json!({"input_tokens":30,"output_tokens":2}),
+                "started"
+            )),
+            (32, false)
+        );
+        assert_eq!(
+            provider_usage_observation_tokens(&payload(
+                serde_json::json!({"input_tokens":0,"output_tokens":0}),
+                "completed"
+            )),
+            (0, true)
+        );
+        assert_eq!(provider_usage_observation_tokens("invalid"), (0, false));
     }
 }

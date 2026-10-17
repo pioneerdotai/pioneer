@@ -135,3 +135,49 @@ mod real_desktop;
 mod recovery;
 mod tree;
 mod verify;
+
+#[tokio::test]
+async fn required_recursive_process_policy_rejects_gui_execution_and_preserves_cleanup_admission() {
+    let (handler, _) = test_handler();
+    let session_id = 999;
+    let mut snapshot = pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(
+        "/tmp/gui-policy",
+        1,
+    );
+    snapshot.process.command_risk.denied_commands = vec!["rm".into()];
+    for action in ["preflight", "list_apps", "snapshot"] {
+        let payload = if action == "snapshot" {
+            serde_json::json!({"action": action, "session_id": session_id})
+        } else {
+            serde_json::json!({"action":action})
+        };
+        let mut call = invocation(payload);
+        call.execution_security_snapshot = Some(snapshot.clone());
+        let result = handler
+            .handle(
+                call,
+                ToolEventBus::default().start_trace("turn", "call", "computer_use"),
+            )
+            .await;
+        assert!(matches!(result, Err(crate::error::ToolError::Rejected(_))));
+    }
+    for payload in [
+        serde_json::json!({"action":"status","session_id":session_id}),
+        serde_json::json!({"action":"stop","session_id":session_id,"outcome":"stopped"}),
+    ] {
+        let mut call = invocation(payload);
+        call.execution_security_snapshot = Some(snapshot.clone());
+        assert!(
+            matches!(
+                handler
+                    .handle(
+                        call,
+                        ToolEventBus::default().start_trace("turn", "call", "computer_use")
+                    )
+                    .await,
+                Err(crate::error::ToolError::NotFound(_))
+            ),
+            "status/stop keep their existing owned-session lookup rather than recursive-policy rejection"
+        );
+    }
+}

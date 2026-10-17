@@ -1,13 +1,13 @@
 use crate::{
     ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream, ItemStartedNotification,
     ItemToolRetryExhaustedNotification, ItemToolRetryResolvedNotification,
-    ItemToolRetryScheduledNotification, McpTurnBindingSummary, ProviderFailureDetails, SkillId,
-    TaskEvent, TaskEventPayload, ThreadLineage, ToolOutputPolicySnapshot, TurnCapabilityKind,
-    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
-    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
-    TurnExecutionWindowStartedNotification, TurnItemType, TurnPermissionActionKind,
-    TurnPermissionDecisionReason, TurnPermissionMode, TurnPermissionProfileSource,
-    TurnToolLoopBudgetExceededNotification,
+    ItemToolRetryScheduledNotification, ItemUpdatedNotification, McpTurnBindingSummary,
+    ProviderFailureDetails, SkillId, TaskEvent, TaskEventPayload, ThreadLineage,
+    ToolOutputPolicySnapshot, TurnCapabilityKind, TurnExecutionWindowBlockedNotification,
+    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
+    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification, TurnItemType,
+    TurnPermissionActionKind, TurnPermissionDecisionReason, TurnPermissionMode,
+    TurnPermissionProfileSource, TurnToolLoopBudgetExceededNotification,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,90 @@ pub enum ProtocolEventClass {
     InternalTelemetry,
 }
 
+/// Native failure policy captured by its owner, before display projection.
+/// Legacy events without this metadata remain Unknown, never inferred from text.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnFailureDisposition {
+    Permanent,
+    Transient,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeFailureStage {
+    Execution,
+    Runtime,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeFailureReason {
+    ContractRejected,
+    RuntimeUnavailable,
+}
+
+/// Version 1 is enum-only and has a fixed byte/cardinality bound. Legacy
+/// absence and unknown versions must not authorize an automatic native retry.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NativeFailureMetadata {
+    pub schema_version: u32,
+    pub disposition: TurnFailureDisposition,
+    pub stage: NativeFailureStage,
+    pub reason: NativeFailureReason,
+}
+
+impl NativeFailureMetadata {
+    pub const fn execution(disposition: TurnFailureDisposition) -> Self {
+        Self {
+            schema_version: 1,
+            disposition,
+            stage: NativeFailureStage::Execution,
+            reason: NativeFailureReason::ContractRejected,
+        }
+    }
+    pub const fn runtime() -> Self {
+        Self {
+            schema_version: 1,
+            disposition: TurnFailureDisposition::Transient,
+            stage: NativeFailureStage::Runtime,
+            reason: NativeFailureReason::RuntimeUnavailable,
+        }
+    }
+    pub const fn effective_disposition(self) -> TurnFailureDisposition {
+        if self.schema_version == 1 {
+            self.disposition
+        } else {
+            TurnFailureDisposition::Unknown
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct NativeInitialPhaseAdvance {
+    pub execution_owner_generation: Option<u64>,
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub window_index: u32,
+    pub runtime_generation: u64,
+    pub expected_sha256: String,
+    pub initial_phase_json: String,
+}
+
+impl std::fmt::Debug for NativeInitialPhaseAdvance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeInitialPhaseAdvance")
+            .field("window_index", &self.window_index)
+            .field("runtime_generation", &self.runtime_generation)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentDurableEvent {
@@ -33,6 +117,18 @@ pub enum AgentDurableEvent {
     ToolOutputRecorded {
         id: String,
         notification: ItemDeltaNotification,
+    },
+    NativeInitialPhaseAdvanced {
+        preparation: NativeInitialPhaseAdvance,
+    },
+    /// A bounded mutable projection, acknowledged before the next provider use.
+    /// The checkpoint owns the state; canonical events remain authoritative.
+    NativeSemanticCheckpoint {
+        execution_owner_generation: Option<u64>,
+        runtime_generation: u64,
+        checkpoint: crate::ExecutionCheckpointPayload,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        control: Option<crate::NativeControlRecord>,
     },
     PromptManifestCompiled {
         thread_id: String,
@@ -87,6 +183,10 @@ pub enum AgentDurableEvent {
     },
     ItemCompleted {
         notification: ItemCompletedNotification,
+    },
+    /// Cumulative provider usage for an existing observation, never another charge.
+    ProviderUsageObserved {
+        notification: ItemUpdatedNotification,
     },
     /// Complete accepted provider response captured before terminal Turn
     /// publication. Gateway persists this intent and later commits the item
@@ -148,6 +248,12 @@ pub enum AgentDurableEvent {
     NativeCancellationContextPrepared {
         preparation: NativeTerminalEffectPreparation,
         initial_turn: bool,
+        /// Normal execution admission prepares obligations; Stop fallback only
+        /// persists cancellation and must never depend on artifact state.
+        #[serde(default)]
+        prepare_artifact_obligations: bool,
+        #[serde(default)]
+        execution_owner_generation: Option<u64>,
     },
     /// Bounded obligations prepared before a canonical terminal result; the
     /// subsequent terminal projection atomically makes the current batch runnable.
@@ -164,6 +270,8 @@ pub enum AgentDurableEvent {
         thread_id: String,
         turn_id: String,
         error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<NativeFailureMetadata>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recovery: Option<RecoveryAttemptContext>,
     },
@@ -452,6 +560,12 @@ impl AgentDurableEvent {
             | Self::TurnInterrupted { turn_id, .. } => DurableEventCausalityKey::Turn {
                 turn_id: turn_id.clone(),
             },
+            Self::NativeInitialPhaseAdvanced { preparation } => DurableEventCausalityKey::Turn {
+                turn_id: preparation.turn_id.clone(),
+            },
+            Self::NativeSemanticCheckpoint { checkpoint, .. } => DurableEventCausalityKey::Turn {
+                turn_id: checkpoint.turn_id.clone(),
+            },
             Self::NativeCancellationContextPrepared { preparation, .. }
             | Self::NativeTerminalEffectsPrepared { preparation } => {
                 DurableEventCausalityKey::Turn {
@@ -462,6 +576,9 @@ impl AgentDurableEvent {
                 turn_id: event.turn_id.clone(),
             },
             Self::ToolOutputRecorded { notification, .. } => DurableEventCausalityKey::Turn {
+                turn_id: notification.turn_id.clone(),
+            },
+            Self::ProviderUsageObserved { notification } => DurableEventCausalityKey::Turn {
                 turn_id: notification.turn_id.clone(),
             },
             Self::ItemStarted { notification } => DurableEventCausalityKey::Turn {
@@ -519,7 +636,9 @@ impl AgentDurableEvent {
             | Self::TurnFinalizationPrepared { .. }
             | Self::ItemToolRetryExhausted { .. } => true,
             Self::TaskEvent { event } => event.is_terminal(),
-            Self::PromptManifestCompiled { .. }
+            Self::NativeInitialPhaseAdvanced { .. }
+            | Self::NativeSemanticCheckpoint { .. }
+            | Self::PromptManifestCompiled { .. }
             | Self::TurnSkillsResolved { .. }
             | Self::TurnCapabilitiesResolved { .. }
             | Self::SkillAuditEvents { .. }
@@ -529,6 +648,7 @@ impl AgentDurableEvent {
             | Self::NativeCancellationContextPrepared { .. }
             | Self::NativeTerminalEffectsPrepared { .. }
             | Self::ToolOutputRecorded { .. }
+            | Self::ProviderUsageObserved { .. }
             | Self::ItemStarted { .. }
             | Self::ItemToolRetryScheduled { .. }
             | Self::ItemToolRetryResolved { .. }
@@ -753,6 +873,41 @@ impl TaskEventPayload {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_failure_disposition_survives_durable_roundtrip_and_legacy_is_unknown() {
+        for disposition in [
+            super::TurnFailureDisposition::Permanent,
+            super::TurnFailureDisposition::Transient,
+            super::TurnFailureDisposition::Unknown,
+        ] {
+            let event = super::AgentDurableEvent::TurnFailed {
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                error: "controlled failure".into(),
+                failure: Some(super::NativeFailureMetadata::execution(disposition)),
+                recovery: None,
+            };
+            let value = serde_json::to_value(&event).unwrap();
+            assert_eq!(
+                serde_json::from_value::<super::AgentDurableEvent>(value).unwrap(),
+                event
+            );
+        }
+        let mut future = super::NativeFailureMetadata::runtime();
+        future.schema_version = 2;
+        assert_eq!(
+            future.effective_disposition(),
+            super::TurnFailureDisposition::Unknown
+        );
+        let event: super::AgentDurableEvent = serde_json::from_value(serde_json::json!({
+            "kind": "turn_failed", "thread_id": "thread", "turn_id": "turn", "error": "rate limit unsupported auth arbitrary legacy text"
+        })).unwrap();
+        assert!(matches!(
+            event,
+            super::AgentDurableEvent::TurnFailed { failure: None, .. }
+        ));
+    }
+
     use super::*;
     use crate::{TaskErrorClass, TurnItem};
 

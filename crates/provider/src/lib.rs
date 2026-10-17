@@ -6,6 +6,8 @@
 //! adapters.
 
 pub mod attachments;
+mod azure_connection;
+pub use azure_connection::AzureResolvedConnection;
 pub mod catalog;
 pub mod continuation;
 pub mod definition;
@@ -14,6 +16,8 @@ pub mod failure;
 pub mod file_tools;
 mod generation;
 pub mod history;
+mod model_contract;
+pub use model_contract::AcceptedProviderModelContract;
 mod http;
 pub mod providers;
 pub mod reasoning_registry;
@@ -44,21 +48,24 @@ pub use file_tools::{
     NativePatchWireShape, apply_patch_tool_schema, read_file_tool_schema,
     select_native_file_tool_capability,
 };
-pub use http::validate_proxy_url;
+pub use http::{
+    current_provider_attempt_context, validate_proxy_url, with_provider_attempt_context,
+};
 pub use registry::{
     ProviderAuthorityFingerprint, ProviderAuthorityRevoked, ProviderRegistry,
     ProviderRegistryCapacityExceeded, ProviderRegistryDefinitionCapacityExceeded,
     ProviderRegistryLimits, ProviderRegistryStats,
 };
-pub use traits::{Provider, ProviderWarmupOutcome};
+pub use traits::{ModelToolSupport, Provider, ProviderWarmupOutcome};
 pub use types::{
     AttachmentArtifactContext, AttachmentDataSource, CanonicalProviderRoundEnvelope, ChatMessage,
     ChatRequest, ChatResponse, CompiledPromptPayload, EmbeddingRequest, EmbeddingResponse,
     InputContentType, InputTypeSupport, MessageAttachment, MessageContentPart, MessageProvenance,
     MessageSourceAlias, MessageSourceIdentity, MessageSourceRef, ModelInputItem,
-    ProviderCallIdentity, ProviderCapabilities, ProviderFailureClassification,
-    ProviderHttpErrorBodyTooLarge, ProviderInputCapabilities, ProviderReplayState,
-    ProviderResponseLimits, ProviderResponseTooLarge, ProviderStream, ProviderStreamDiagnostics,
-    ProviderTermination, ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig, ReasoningEffort,
-    Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+    ProviderAttemptContext, ProviderCallIdentity, ProviderCapabilities,
+    ProviderFailureClassification, ProviderHttpErrorBodyTooLarge, ProviderInputCapabilities,
+    ProviderReplayState, ProviderResponseLimits, ProviderResponseTooLarge, ProviderStream,
+    ProviderStreamDiagnostics, ProviderTermination, ProviderTimeoutPolicy, ProviderToolCall,
+    ReasoningConfig, ReasoningEffort, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+    ToolResultOutcome, ToolResultStatus,
 };

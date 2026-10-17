@@ -4,6 +4,9 @@
 //! providers continue through `pioneer-agent`, while local `CLIAgentRuntime`
 //! executions are routed through `pioneer-cli-agent-runtime`.
 
+// Gateway orchestration nests async futures beyond rustc's default query depth.
+#![recursion_limit = "256"]
+
 mod administrative_audit;
 mod artifact_delivery;
 mod artifact_prompt_refs;
@@ -34,6 +37,8 @@ mod memory_policy;
 mod memory_runtime;
 mod memory_tools;
 mod message;
+#[cfg(test)]
+mod native_recovery_test_support;
 mod operations;
 mod patch_history_observer;
 mod permissions;
@@ -610,6 +615,14 @@ async fn run_gateway_until_shutdown_inner(
     )?;
 
     let tool_loop_config = ToolLoopConfig {
+        no_progress_mode: config
+            .gateway
+            .tools
+            .no_progress_mode
+            .as_deref()
+            .unwrap_or("enforce")
+            .parse::<pioneer_tools::ToolNoProgressMode>()
+            .map_err(anyhow::Error::msg)?,
         provider: provider_timeout_policy,
         preflight: pioneer_agent::PreflightLoopConfig {
             provider_name: config.gateway.preflight_model.model_provider_override(),
@@ -1364,6 +1377,9 @@ fn execution_windows_config_from_gateway_execution_windows_config(
             max_wall_clock_ms_per_turn: config.total.max_wall_clock_ms_per_turn,
             max_provider_tokens_per_turn: config.total.max_provider_tokens_per_turn,
             max_consecutive_no_progress_windows: config.total.max_consecutive_no_progress_windows,
+            max_consecutive_unconfirmed_progress_windows: config
+                .total
+                .max_consecutive_unconfirmed_progress_windows,
         },
     }
     .normalized()
@@ -1851,6 +1867,7 @@ mod runtime_tests {
                     max_wall_clock_ms_per_turn: Some(3_000),
                     max_provider_tokens_per_turn: Some(4_000),
                     max_consecutive_no_progress_windows: 2,
+                    max_consecutive_unconfirmed_progress_windows: 128,
                 },
             }),
             retry: GatewayToolRetryBudgetConfig::default(),

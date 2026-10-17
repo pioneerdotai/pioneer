@@ -17,6 +17,98 @@ use pioneer_compaction::{
 use pioneer_provider::{ChatRequest, MessageProvenance, MessageSourceRef, ProviderRegistry};
 use std::collections::BTreeSet;
 
+/// Restore the exact acknowledged roots, including the active Turn's own
+/// working context, through the existing bounded coverage/body materializer.
+pub(crate) async fn restore_native_history_roots(
+    processor: &crate::message::MessageProcessor,
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    roots: &[pioneer_compaction::SourceRef],
+) -> Result<Vec<pioneer_provider::ChatMessage>> {
+    ensure!(
+        roots.len() <= 64,
+        "native history root cardinality exceeded"
+    );
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut prepared = processor
+        .capture_current_context_basis_prepared(store, workspace, thread, turn, Some(turn))
+        .await?;
+    restore_native_history_roots_with_scope(
+        store,
+        workspace,
+        thread,
+        roots,
+        &prepared.accepted_scopes,
+        &mut prepared.checkpoint_graphs,
+    )
+    .await
+}
+
+pub(super) async fn restore_native_history_roots_with_scope(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    roots: &[pioneer_compaction::SourceRef],
+    allowed: &BTreeSet<String>,
+    resolver: &mut super::coverage::CheckpointGraphResolver,
+) -> Result<Vec<pioneer_provider::ChatMessage>> {
+    ensure!(
+        roots.len() <= 64,
+        "native history root cardinality exceeded"
+    );
+    let mut messages = Vec::with_capacity(roots.len());
+    for (index, root) in roots.iter().enumerate() {
+        ensure!(
+            root.scope.starts_with("checkpoint:")
+                && root.scope.len() <= 512
+                && !root.id.is_empty()
+                && root.id.len() <= pioneer_compaction::CHECKPOINT_ID_MAX_BYTES
+                && !root.version.is_empty()
+                && root.version.len() <= 256
+                && !roots[..index].contains(root),
+            "native history root identity unavailable"
+        );
+        let source_thread = store
+            .compaction_reference_thread(workspace, root)
+            .await?
+            .ok_or(pioneer_agent::NativeHistorySourceUnavailable)?;
+        if !allowed.contains(&source_thread) {
+            return Err(pioneer_agent::NativeHistorySourceUnavailable.into());
+        }
+        let owner = native_owner(workspace, &source_thread);
+        if root.scope != format!("checkpoint:{owner}") {
+            return Err(pioneer_agent::NativeHistorySourceUnavailable.into());
+        }
+        let message = super::checkpoint::checkpoint_message_with_resolver(
+            store,
+            super::checkpoint::ProjectionContext {
+                workspace,
+                context_thread: thread,
+                source_thread: &source_thread,
+                owner: &owner,
+                allowed,
+                allow_historical_gaps: false,
+            },
+            &root.id,
+            resolver,
+        )
+        .await?;
+        if !message.provenance.as_ref().is_some_and(|origin| {
+            origin.sources.iter().any(|source| {
+                source.scope == root.scope && source.id == root.id && source.version == root.version
+            })
+        }) {
+            return Err(pioneer_agent::NativeHistorySourceUnavailable.into());
+        }
+        messages.push(message);
+    }
+    Ok(messages)
+}
+
 fn history_check_metadata(
     prepared: &pioneer_agent::compaction::request::EvaluatedRequest,
 ) -> Result<NativeHistoryCheckMetadata> {
@@ -315,7 +407,7 @@ async fn prepare_native_projection_with_prepared(
     }
     // This deadline includes reader/writer queues and admission, not just LLM time.
     let prepared = async {
-        let catalog = pioneer_provider::catalog::model_catalog()?;
+        let catalog = context.provider.model_catalog_for_request(&request.model)?;
         let version = store
             .compaction_projection_version(workspace, thread)
             .await?;
@@ -718,6 +810,7 @@ async fn prepare_native_projection_with_prepared(
     }
     let Some((snapshot, summarizer, projection, summary_index)) = operation else {
         return Ok(NativePreparedRequest {
+            covered_native_control_ids: Vec::new(),
             request,
             receipt,
             history_check,
@@ -790,6 +883,7 @@ async fn prepare_native_projection_with_prepared(
             Some(id),
         )?;
         Ok(NativePreparedRequest {
+            covered_native_control_ids: Vec::new(),
             request: evaluated.request,
             receipt,
             history_check,
@@ -876,6 +970,45 @@ impl GatewayNativeContextController {
 impl pioneer_agent::compaction::controller::NativeContextController
     for GatewayNativeContextController
 {
+    async fn load_native_history_roots(
+        &self,
+        context: &NativeContext,
+        roots: &[pioneer_compaction::SourceRef],
+    ) -> Result<Vec<pioneer_provider::ChatMessage>> {
+        let processor = self
+            .processor
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("context owner stopped"))?;
+        let store = crate::message::ordinary_history_store(processor.crud_store.as_ref());
+        restore_native_history_roots(
+            &processor,
+            &store,
+            &context.workspace_id,
+            &context.thread_id,
+            &context.turn_id,
+            roots,
+        )
+        .await
+    }
+    async fn load_native_controls(
+        &self,
+        context: &NativeContext,
+        references: &[pioneer_protocol::NativeControlRef],
+    ) -> Result<Vec<pioneer_protocol::NativeControlRecord>> {
+        let processor = self
+            .processor
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("context owner stopped"))?;
+        crate::message::ordinary_history_store(processor.crud_store.as_ref())
+            .load_native_controls(
+                &context.workspace_id,
+                &context.thread_id,
+                &context.turn_id,
+                references,
+            )
+            .await
+    }
+
     async fn stop(&self, context: &NativeContext) -> Result<()> {
         let processor = self
             .processor
@@ -930,6 +1063,21 @@ impl pioneer_agent::compaction::controller::NativeContextController
             ) => result?.ok_or_else(|| anyhow::anyhow!("native context owner unavailable"))?,
         };
         drop(startup_wait);
+        let control_inputs = request
+            .messages
+            .iter()
+            .filter_map(|message| {
+                let origin = message.provenance.as_ref()?;
+                let id = origin
+                    .unit_id
+                    .strip_prefix(&format!("{}:native-control:", context.turn_id))?;
+                Some((id.to_owned(), origin.protected_input))
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            control_inputs.len() <= pioneer_protocol::NATIVE_CONTROL_MAX_PENDING,
+            "native control input bound exceeded"
+        );
         let refresh = refresh_native_history(&processor, &history_store, context, request);
         let (request, projection) = tokio::select! { biased;
             _ = context.cancellation.cancelled() => anyhow::bail!("native context preparation cancelled"),
@@ -940,7 +1088,8 @@ impl pioneer_agent::compaction::controller::NativeContextController
         context.recovery_deadline_ms = Some(deadline);
         context.cancellation = lease.cancellation();
         let settings = processor.compaction_settings_for_workspace(&context.workspace_id)?;
-        let prepared = prepare_native_projection_with_prepared(
+        let allowed_control_sources = projection.accepted_scopes.clone();
+        let mut prepared = prepare_native_projection_with_prepared(
             &history_store,
             processor.provider_registry().as_ref(),
             &settings,
@@ -949,11 +1098,79 @@ impl pioneer_agent::compaction::controller::NativeContextController
             measurement,
             recovery,
             self.observer(&context, &history_store),
-            clock,
+            clock.clone(),
             Some(AcceptedProjection::Prepared(projection)),
             Some(&processor),
         )
         .await?;
+        // Resolve exact coverage from roots actually present in the accepted request.
+        // A checkpoint ID by itself never proves that a missing control was summarized.
+        let source_proof = async {
+            let mut graphs = super::coverage::CheckpointGraphResolver::default();
+            for (id, protected) in control_inputs {
+                if prepared.request.messages.iter().any(|message| {
+                    message.provenance.as_ref().is_some_and(|origin| {
+                        origin.unit_id == format!("{}:native-control:{id}", context.turn_id)
+                    })
+                }) {
+                    continue;
+                }
+                ensure!(
+                    !protected,
+                    "pending native control was removed from request"
+                );
+                let source = history_store
+                    .native_control_event_reference(
+                        &context.workspace_id,
+                        &context.thread_id,
+                        &context.turn_id,
+                        &id,
+                    )
+                    .await?
+                    .context("native control coverage source unavailable")?;
+                let expected = pioneer_agent::compaction::composition::ScopedHistorySource {
+                    thread: context.thread_id.clone(),
+                    source,
+                };
+                let mut covered = false;
+                for root in prepared
+                    .request
+                    .messages
+                    .iter()
+                    .filter_map(|message| message.provenance.as_ref())
+                    .flat_map(|origin| origin.sources.iter())
+                    .filter(|source| source.scope.starts_with("checkpoint:"))
+                {
+                    let root = pioneer_compaction::SourceRef {
+                        scope: root.scope.clone(),
+                        id: root.id.clone(),
+                        version: root.version.clone(),
+                    };
+                    if let Some(graph) = graphs
+                        .resolve(
+                            &history_store,
+                            &context.workspace_id,
+                            Some(&allowed_control_sources),
+                            &root,
+                        )
+                        .await?
+                    {
+                        covered |= graph.leaves.contains(&expected);
+                    }
+                }
+                ensure!(
+                    covered,
+                    "accepted projection cannot drop an uncovered native control"
+                );
+                prepared.covered_native_control_ids.push(id);
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        tokio::select! { biased;
+            _ = context.cancellation.cancelled() => anyhow::bail!("native control coverage cancelled"),
+            _ = clock.sleep_until(deadline) => anyhow::bail!("native control coverage preparation deadline exceeded"),
+            result = source_proof => result?,
+        }
         // Registration is part of foreground preparation: a provider call can
         // only begin after this durable, idempotent intent exists. The worker
         // still gates execution on the turn's durable completed status.
@@ -1006,6 +1223,7 @@ async fn refresh_native_history(
                             | "pending-assistant"
                             | "pending-tool"
                             | "pending-item"
+                            | "pending-control"
                     )
             })
     };

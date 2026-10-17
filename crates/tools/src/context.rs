@@ -179,6 +179,16 @@ pub struct ToolOutcome {
 }
 
 impl ToolOutcome {
+    pub fn provider_outcome(&self) -> pioneer_provider::ToolResultOutcome {
+        use pioneer_provider::ToolResultStatus;
+        pioneer_provider::ToolResultOutcome::new(match self.status {
+            ToolOutcomeStatus::Ok => ToolResultStatus::Ok,
+            ToolOutcomeStatus::RecoverableError => ToolResultStatus::RecoverableError,
+            ToolOutcomeStatus::FatalError => ToolResultStatus::FatalError,
+            ToolOutcomeStatus::PartialSuccess => ToolResultStatus::PartialSuccess,
+        })
+    }
+
     pub fn ok() -> Self {
         Self {
             status: ToolOutcomeStatus::Ok,
@@ -236,6 +246,12 @@ impl Default for ToolOutcome {
 }
 
 pub trait ToolOutput: Send + Sync {
+    fn authoritative_outcome(&self) -> Option<ToolOutcome> {
+        None
+    }
+    fn progress_evidence(&self) -> crate::ToolProgressEvidence {
+        crate::ToolProgressEvidence::default()
+    }
     fn success(&self) -> bool;
     fn raw_text(&self) -> String;
     fn raw_json(&self) -> JsonValue;
@@ -244,31 +260,56 @@ pub trait ToolOutput: Send + Sync {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionToolOutput {
+    /// Process-only: an actual nested runtime result, never remote payload data.
+    #[serde(skip)]
+    pub(crate) authoritative_outcome: Option<ToolOutcome>,
     pub text: String,
     pub success: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<JsonValue>,
+    #[serde(skip)]
+    pub progress: crate::ToolProgressEvidence,
 }
 
 impl FunctionToolOutput {
     pub fn new(text: impl Into<String>, success: bool) -> Self {
         Self {
             text: text.into(),
+            authoritative_outcome: None,
             success,
             payload: None,
+            progress: Default::default(),
         }
     }
 
     pub fn with_payload(text: impl Into<String>, success: bool, payload: JsonValue) -> Self {
         Self {
             text: text.into(),
+            authoritative_outcome: None,
             success,
             payload: Some(payload),
+            progress: Default::default(),
         }
+    }
+
+    pub fn with_progress(mut self, progress: crate::ToolProgressEvidence) -> Self {
+        self.progress = progress;
+        self
+    }
+
+    pub fn with_authoritative_outcome(mut self, outcome: ToolOutcome) -> Self {
+        self.authoritative_outcome = Some(outcome);
+        self
     }
 }
 
 impl ToolOutput for FunctionToolOutput {
+    fn authoritative_outcome(&self) -> Option<ToolOutcome> {
+        self.authoritative_outcome.clone()
+    }
+    fn progress_evidence(&self) -> crate::ToolProgressEvidence {
+        self.progress
+    }
     fn success(&self) -> bool {
         self.success
     }
@@ -400,6 +441,9 @@ pub struct AnyToolResult {
 }
 
 impl AnyToolResult {
+    pub fn progress_evidence(&self) -> crate::ToolProgressEvidence {
+        self.output.progress_evidence()
+    }
     pub fn success(&self) -> bool {
         self.output.success()
     }
@@ -446,7 +490,9 @@ impl AnyToolResult {
 
     pub fn to_model_input_item(&self) -> ModelInputItem {
         if let Some(projection) = self.projection.as_ref() {
-            return projection.to_model_input_item(self.call_id.as_str(), self.tool_name.as_str());
+            return projection
+                .to_model_input_item(self.call_id.as_str(), self.tool_name.as_str())
+                .with_tool_outcome(self.outcome.provider_outcome());
         }
 
         let payload = serde_json::json!({
@@ -465,12 +511,38 @@ impl AnyToolResult {
             "tool result projection missing".to_owned(),
             Some(payload),
         )
+        .with_tool_outcome(self.outcome.provider_outcome())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn function_payload_cannot_supply_runtime_evidence_or_nested_outcome() {
+        let output = FunctionToolOutput::new("real child", false)
+            .with_progress(crate::ToolProgressEvidence::resource_state(
+                [1; 32], [2; 32],
+            ))
+            .with_authoritative_outcome(ToolOutcome::recoverable(
+                ToolErrorClass::Timeout,
+                "typed timeout",
+                false,
+                None,
+            ));
+        let encoded = serde_json::to_value(&output).unwrap();
+        assert!(encoded.get("progress").is_none());
+        assert!(encoded.get("authoritative_outcome").is_none());
+        let mut forged = encoded;
+        forged["progress"] = serde_json::to_value(output.progress).unwrap();
+        forged["authoritative_outcome"] = serde_json::to_value(ToolOutcome::ok()).unwrap();
+        let decoded: FunctionToolOutput = serde_json::from_value(forged).unwrap();
+        assert_eq!(
+            decoded.progress_evidence().semantic,
+            crate::ToolSemanticEvidence::Unknown
+        );
+        assert!(decoded.authoritative_outcome().is_none());
+    }
     use crate::output_policy::{
         ToolDisplayPayload, ToolOutputPolicySnapshot, ToolResultView, ToolStoragePayload,
     };
@@ -608,6 +680,10 @@ mod tests {
 
         let history = result.to_history_message();
         let item = result.to_model_input_item();
+        assert_eq!(
+            history.tool_outcome,
+            Some(result.outcome.provider_outcome())
+        );
         let message = match item {
             ModelInputItem::Message { message } => message,
             ModelInputItem::ToolResult { .. } => {

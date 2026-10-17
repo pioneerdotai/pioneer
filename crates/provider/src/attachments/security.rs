@@ -16,10 +16,8 @@ pub fn canonicalize_path(
         return Err(AttachmentPipelineError::unsupported_attachment_source("empty_path").into());
     }
 
-    let canonical = Path::new(trimmed).canonicalize().map_err(|error| {
-        AttachmentPipelineError::unsupported_attachment_source(
-            format!("path_not_accessible:{trimmed}:{error}").as_str(),
-        )
+    let canonical = Path::new(trimmed).canonicalize().map_err(|_| {
+        AttachmentPipelineError::unsupported_attachment_source("path_not_accessible")
     })?;
 
     if policy.enforce_path_allowlist {
@@ -96,7 +94,37 @@ pub fn parse_and_validate_url(
     Ok(parsed)
 }
 
+pub(crate) fn parse_url_without_dns(
+    provider: &str,
+    raw: &str,
+    policy: &AttachmentSecurityPolicy,
+) -> Result<Url> {
+    if !policy.allow_url_sources || policy.url_allowed_domains.is_empty() {
+        return Err(
+            AttachmentPipelineError::url_source_blocked("URL ingestion not allowed").into(),
+        );
+    }
+    let url =
+        Url::parse(raw).map_err(|_| AttachmentPipelineError::url_source_blocked("invalid URL"))?;
+    validate_url_without_dns(provider, &url, policy)?;
+    Ok(url)
+}
+
 pub fn validate_url(
+    provider_name: &str,
+    url: &Url,
+    policy: &AttachmentSecurityPolicy,
+) -> Result<()> {
+    validate_url_without_dns(provider_name, url, policy)?;
+    resolve_and_validate_host(
+        provider_name,
+        url.host_str().unwrap_or(""),
+        url.port_or_known_default(),
+        policy,
+    )
+}
+
+pub(crate) fn validate_url_without_dns(
     provider_name: &str,
     url: &Url,
     policy: &AttachmentSecurityPolicy,
@@ -117,7 +145,7 @@ pub fn validate_url(
         return enforce_or_dry_run(
             provider_name,
             safe_url_label(url).as_str(),
-            format!("URL scheme `{scheme}` is not allowed").as_str(),
+            "URL scheme is not allowed",
             policy,
             AttachmentPipelineError::url_source_blocked("scheme not allowed"),
         )
@@ -129,7 +157,6 @@ pub fn validate_url(
     };
 
     validate_host_name(provider_name, host, policy)?;
-    resolve_and_validate_host(provider_name, host, url.port_or_known_default(), policy)?;
 
     Ok(())
 }
@@ -185,7 +212,7 @@ pub fn validate_host_name(
     if blocked {
         return enforce_or_dry_run(
             provider_name,
-            format!("host:{host}").as_str(),
+            "host:[redacted]",
             "host is blocked by url_blocked_domains policy",
             policy,
             AttachmentPipelineError::url_source_blocked("blocked host"),
@@ -201,7 +228,7 @@ pub fn validate_host_name(
         if !allowed {
             return enforce_or_dry_run(
                 provider_name,
-                format!("host:{host}").as_str(),
+                "host:[redacted]",
                 "host is not present in url_allowed_domains policy",
                 policy,
                 AttachmentPipelineError::url_source_blocked("host not allowlisted"),
@@ -252,9 +279,8 @@ where
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
-    let resolved = resolve(host, port).map_err(|error| {
-        AttachmentPipelineError::url_source_blocked(format!("dns resolve failed: {error}"))
-    })?;
+    let resolved = resolve(host, port)
+        .map_err(|_| AttachmentPipelineError::url_source_blocked("dns resolve failed"))?;
 
     let mut addresses = Vec::new();
     for addr in resolved {

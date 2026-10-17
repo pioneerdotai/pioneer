@@ -1068,9 +1068,18 @@ fn intersect_process_policies(
     left: &TurnProcessPolicySnapshot,
     right: &TurnProcessPolicySnapshot,
 ) -> TurnProcessPolicySnapshot {
+    let allowed_command_families = intersect_optional_allow_lists(
+        &left.command_risk.allowed_command_families,
+        &right.command_risk.allowed_command_families,
+    );
+    // Empty means unrestricted in this existing DTO. A disjoint intersection
+    // must use the existing disabled capability, never drop both restrictions.
+    let disjoint_command_families = !left.command_risk.allowed_command_families.is_empty()
+        && !right.command_risk.allowed_command_families.is_empty()
+        && allowed_command_families.is_empty();
     TurnProcessPolicySnapshot {
         shell: TurnShellPolicy {
-            enabled: left.shell.enabled && right.shell.enabled,
+            enabled: left.shell.enabled && right.shell.enabled && !disjoint_command_families,
             allow_stdin: left.shell.allow_stdin && right.shell.allow_stdin,
             allow_session_inheritance: left.shell.allow_session_inheritance
                 && right.shell.allow_session_inheritance,
@@ -1097,10 +1106,7 @@ fn intersect_process_policies(
                 &left.command_risk.denied_commands,
                 &right.command_risk.denied_commands,
             ),
-            allowed_command_families: intersect_optional_allow_lists(
-                &left.command_risk.allowed_command_families,
-                &right.command_risk.allowed_command_families,
-            ),
+            allowed_command_families,
         },
     }
 }
@@ -1109,11 +1115,38 @@ fn process_policy_within(
     child: &TurnProcessPolicySnapshot,
     parent: &TurnProcessPolicySnapshot,
 ) -> bool {
-    (!child.shell.enabled || parent.shell.enabled)
+    let basic = (!child.shell.enabled || parent.shell.enabled)
         && (!child.shell.allow_stdin || parent.shell.allow_stdin)
         && (!child.shell.allow_session_inheritance || parent.shell.allow_session_inheritance)
         && (!child.environment.inherit || parent.environment.inherit)
-        && child.timeout.max_duration_ms <= parent.timeout.max_duration_ms
+        && child.timeout.max_duration_ms <= parent.timeout.max_duration_ms;
+    if !basic || !child.shell.enabled {
+        return basic;
+    }
+    // Policy preparation runs outside DB capacity. Sets avoid a quadratic
+    // scan when an otherwise byte-bounded accepted cap contains many entries.
+    let child_denied = child
+        .command_risk
+        .denied_commands
+        .iter()
+        .collect::<BTreeSet<_>>();
+    let parent_allowed = parent
+        .command_risk
+        .allowed_command_families
+        .iter()
+        .collect::<BTreeSet<_>>();
+    parent
+        .command_risk
+        .denied_commands
+        .iter()
+        .all(|denied| child_denied.contains(denied))
+        && (parent_allowed.is_empty()
+            || (!child.command_risk.allowed_command_families.is_empty()
+                && child
+                    .command_risk
+                    .allowed_command_families
+                    .iter()
+                    .all(|family| parent_allowed.contains(family))))
 }
 
 fn intersect_optional_allow_lists(left: &[String], right: &[String]) -> Vec<String> {
@@ -1634,6 +1667,74 @@ mod tests {
         );
 
         assert_eq!(snapshot.sandbox.filesystem, filesystem_before);
+    }
+
+    #[test]
+    fn task_process_cap_cannot_drop_required_command_restrictions() {
+        let mut parent = TurnProcessPolicySnapshot::restricted();
+        parent.command_risk.denied_commands = vec!["rm".into()];
+        parent.command_risk.allowed_command_families = vec!["python".into(), "make".into()];
+        let mut child = parent.clone();
+        child.command_risk.denied_commands.clear();
+        assert!(!process_policy_within(&child, &parent));
+        child = parent.clone();
+        child.command_risk.allowed_command_families.clear();
+        assert!(!process_policy_within(&child, &parent));
+        child = parent.clone();
+        child.command_risk.allowed_command_families = vec!["python".into()];
+        child.command_risk.denied_commands.push("curl".into());
+        assert!(process_policy_within(&child, &parent));
+        let mut other = parent.clone();
+        other.command_risk.allowed_command_families = vec!["node".into()];
+        let disjoint = intersect_process_policies(&parent, &other);
+        assert_eq!(
+            disjoint.execution_profile(),
+            pioneer_protocol::TurnProcessExecutionProfile::Disabled
+        );
+        assert!(!disjoint.shell.enabled);
+        let still_disabled =
+            intersect_process_policies(&disjoint, &TurnProcessPolicySnapshot::unrestricted());
+        assert_eq!(
+            still_disabled.execution_profile(),
+            pioneer_protocol::TurnProcessExecutionProfile::Disabled
+        );
+        assert!(process_policy_within(&still_disabled, &parent));
+    }
+
+    #[test]
+    fn actual_inherited_task_snapshot_keeps_original_recursive_policy_on_restore() {
+        let mut parent =
+            TurnExecutionSecuritySnapshot::unrestricted_full_access("/tmp/frozen-task-process", 1);
+        parent.process.command_risk.denied_commands = vec!["rm".into()];
+        parent.process.command_risk.allowed_command_families = vec!["python".into(), "sh".into()];
+        parent.authority_cap.process = parent.process.clone();
+        let cap = task_security_cap_from_snapshot(&parent);
+        let child = resolve_task_child_execution_security(
+            "workspace",
+            "parent",
+            &parent,
+            &cap,
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::FullAccess,
+                TurnPermissionProfileSource::TaskPermissionCap,
+            ),
+            "openai",
+            "child_thread",
+            "child_turn",
+            2,
+        )
+        .unwrap();
+        let cold: TurnExecutionSecuritySnapshot =
+            serde_json::from_slice(&serde_json::to_vec(&child).unwrap()).unwrap();
+        assert_eq!(cold.process.command_risk, parent.process.command_risk);
+        assert_eq!(
+            cold.process.execution_profile(),
+            pioneer_protocol::TurnProcessExecutionProfile::RequiredRecursive
+        );
+        assert_eq!(
+            cold.authority_cap.process.execution_profile(),
+            pioneer_protocol::TurnProcessExecutionProfile::RequiredRecursive
+        );
     }
 
     #[test]

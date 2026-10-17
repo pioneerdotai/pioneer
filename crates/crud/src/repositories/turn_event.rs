@@ -3,7 +3,10 @@ use pioneer_entity::turn_event;
 use pioneer_protocol::TurnItem;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
+    QuerySelect,
+};
 
 use crate::events::{AppendedTurnEvent, TurnEventPayload};
 use pioneer_protocol::generate_id;
@@ -39,6 +42,14 @@ impl PreparedTurnEvent {
             .context("failed to derive turn event idempotency key")?;
         let (context_item_id, context_projection_kind) =
             crate::compaction::history::event_projection_metadata(&payload);
+        if matches!(&payload, TurnEventPayload::ItemCompleted(notification) if matches!(&notification.item,
+            TurnItem::SystemEvent { code: Some(code), .. } if code == "native.control" || code == "artifact.obligations"))
+        {
+            anyhow::ensure!(
+                payload_json.len() <= pioneer_protocol::NATIVE_CONTROL_STORAGE_MAX_BYTES,
+                "native control event exceeds storage byte limit"
+            );
+        }
         Ok(Self {
             context_item_id,
             context_projection_kind,
@@ -68,13 +79,7 @@ impl PreparedTurnEvent {
     /// compare fence, preserving the old idempotent replay semantics without
     /// parsing JSON while the writer is held.
     pub async fn preflight_idempotency<C: ConnectionTrait>(mut self, db: &C) -> Result<Self> {
-        if let Some(existing) = turn_event::Entity::find()
-            .filter(turn_event::Column::TurnId.eq(self.turn_id.clone()))
-            .filter(turn_event::Column::IdempotencyKey.eq(self.idempotency_key.clone()))
-            .one(db)
-            .await
-            .context("failed to preflight idempotent turn event")?
-        {
+        if let Some(existing) = find_existing_prepared_event(db, &self).await? {
             let existing_id = existing.id.clone();
             let existing = appended_event_from_model(existing)?;
             if existing.payload != self.payload {
@@ -86,6 +91,39 @@ impl PreparedTurnEvent {
             self.semantically_matching_existing_id = Some(existing_id);
         }
         Ok(self)
+    }
+}
+
+/// The concrete new record never materializes a poison legacy payload. Ordinary
+/// event compatibility keeps its existing semantic preflight path.
+async fn find_existing_prepared_event<C: ConnectionTrait>(
+    db: &C,
+    prepared: &PreparedTurnEvent,
+) -> Result<Option<turn_event::Model>> {
+    if matches!(prepared.payload(), TurnEventPayload::ItemCompleted(notification) if matches!(&notification.item,
+        TurnItem::SystemEvent { code: Some(code), .. } if code == "native.control" || code == "artifact.obligations"))
+    {
+        let row = db
+            .query_one_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT id,thread_id,turn_id,sequence,event_type,created_at,idempotency_key, \
+             CASE WHEN length(CAST(payload AS BLOB))<=?1 THEN payload ELSE NULL END AS payload \
+             FROM turn_event WHERE turn_id=?2 AND idempotency_key=?3 LIMIT 1",
+                [
+                    (pioneer_protocol::NATIVE_CONTROL_STORAGE_MAX_BYTES as i64).into(),
+                    prepared.turn_id.clone().into(),
+                    prepared.idempotency_key.clone().into(),
+                ],
+            ))
+            .await?;
+        row.map(|row| turn_event::Model::from_query_result(&row, "").map_err(Into::into))
+            .transpose()
+    } else {
+        Ok(turn_event::Entity::find()
+            .filter(turn_event::Column::TurnId.eq(prepared.turn_id.clone()))
+            .filter(turn_event::Column::IdempotencyKey.eq(prepared.idempotency_key.clone()))
+            .one(db)
+            .await?)
     }
 }
 
@@ -112,12 +150,7 @@ pub async fn prepared_event_already_exists<C: ConnectionTrait>(
     db: &C,
     prepared: &PreparedTurnEvent,
 ) -> Result<bool> {
-    let existing = turn_event::Entity::find()
-        .filter(turn_event::Column::TurnId.eq(prepared.turn_id.clone()))
-        .filter(turn_event::Column::IdempotencyKey.eq(prepared.idempotency_key.clone()))
-        .one(db)
-        .await
-        .context("failed to query idempotent turn event")?;
+    let existing = find_existing_prepared_event(db, prepared).await?;
     let Some(existing) = existing else {
         return Ok(false);
     };
@@ -142,13 +175,7 @@ pub async fn append_prepared_event<C: ConnectionTrait>(
     prepared: PreparedTurnEvent,
     created_at: DateTimeWithTimeZone,
 ) -> Result<AppendedTurnEvent> {
-    if let Some(existing) = turn_event::Entity::find()
-        .filter(turn_event::Column::TurnId.eq(prepared.turn_id.clone()))
-        .filter(turn_event::Column::IdempotencyKey.eq(prepared.idempotency_key.clone()))
-        .one(db)
-        .await
-        .context("failed to query idempotent turn event")?
-    {
+    if let Some(existing) = find_existing_prepared_event(db, &prepared).await? {
         validate_existing_prepared_event(&existing, &prepared)?;
         return Ok(AppendedTurnEvent {
             id: existing.id,

@@ -2711,6 +2711,7 @@ impl AgentMcpToolProvider for McpService {
             })
             .collect::<Vec<_>>();
         Ok(AgentMcpMaterialization {
+            descriptors,
             bundles: materialized.bundles,
             available_mcp: projection.available_mcp,
             blocked_mcp: projection.blocked_mcp,
@@ -2727,6 +2728,46 @@ impl AgentMcpToolProvider for McpService {
             mcp_bindings,
             persistence: Some(persistence),
         })
+    }
+
+    async fn restore_mcp_tools(
+        &self,
+        workspace_id: &str,
+        turn_id: &str,
+        manifest_hash: &str,
+        descriptors: &[pioneer_tools::McpDynamicToolDescriptor],
+    ) -> Result<Vec<pioneer_tools::ToolExtensionBundle>, String> {
+        let unavailable = || "accepted MCP projection cannot be restored".to_owned();
+        if descriptors.len() > McpProjectionLimits::default().max_tools
+            || descriptors.iter().any(|d| d.workspace_id != workspace_id)
+        {
+            return Err(unavailable());
+        }
+        let projection = self
+            .inner
+            .crud_store
+            .get_turn_mcp_projection(turn_id)
+            .await
+            .map_err(|_| unavailable())?
+            .ok_or_else(unavailable)?;
+        if projection.workspace_id != workspace_id
+            || projection.turn_id != turn_id
+            || projection.projection_version != MCP_TURN_PROJECTION_VERSION as i32
+            || projection.manifest_hash != manifest_hash
+            || projection.tool_count != descriptors.len() as i32
+            || !matches!(
+                projection.resolution_status.as_str(),
+                "resolved" | "resolved_degraded"
+            )
+        {
+            return Err(unavailable());
+        }
+        let materialized =
+            pioneer_tools::materialize_mcp_runtime_tools(descriptors, Arc::new(self.clone()));
+        if !materialized.excluded_tools.is_empty() {
+            return Err(unavailable());
+        }
+        Ok(materialized.bundles)
     }
 
     async fn persist_mcp_projection(
@@ -3561,6 +3602,14 @@ fn map_shared_tool_error(error: pioneer_tools::ToolError) -> TurnMcpInvocationEr
     use pioneer_tools::ToolError;
 
     let (code, message) = match error {
+        ToolError::ResponseLimitExceeded => (
+            TurnMcpInvocationErrorCode::ExecutionFailed,
+            "MCP response exceeds bounded read limits".to_owned(),
+        ),
+        ToolError::TimedOut => (
+            TurnMcpInvocationErrorCode::TimedOut,
+            "MCP tool attempt deadline exceeded".to_owned(),
+        ),
         ToolError::InvalidArguments(_) => (
             TurnMcpInvocationErrorCode::InvalidRequest,
             "MCP invocation arguments are invalid".to_owned(),
@@ -5106,6 +5155,108 @@ mod tests {
             .collect::<Vec<_>>();
         names.sort();
         names
+    }
+
+    #[tokio::test]
+    async fn cold_initial_mcp_owner_uses_original_descriptors_without_live_rediscovery_or_projection_write()
+     {
+        let fixture = turn_mcp_invoker_fixture().await;
+        let materialized = fixture
+            .service
+            .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                workspace_id: fixture.workspace_id.clone(),
+                turn_id: fixture.turn_id.clone(),
+                explicit_servers: Vec::new(),
+                explicit_tools: vec![tool_ref("mcp-tool:workspace:resend:send", "resend", "send")],
+            })
+            .await
+            .unwrap();
+        assert!(!materialized.descriptors.is_empty());
+        let before = fixture
+            .crud_store
+            .get_turn_mcp_projection(&fixture.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let bindings = fixture
+            .crud_store
+            .list_turn_mcp_bindings(&fixture.turn_id)
+            .await
+            .unwrap();
+        // A cold rebind must not query the live runtime to resolve new tools.
+        fixture.service.inner.snapshots.lock().await.clear();
+        let restored = fixture
+            .service
+            .restore_mcp_tools(
+                &fixture.workspace_id,
+                &fixture.turn_id,
+                &fixture.manifest_hash,
+                &materialized.descriptors,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored[0].specs).unwrap(),
+            serde_json::to_value(&materialized.bundles[0].specs).unwrap()
+        );
+        assert_eq!(
+            fixture
+                .crud_store
+                .get_turn_mcp_projection(&fixture.turn_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            fixture
+                .crud_store
+                .list_turn_mcp_bindings(&fixture.turn_id)
+                .await
+                .unwrap(),
+            bindings
+        );
+        assert!(
+            fixture
+                .service
+                .restore_mcp_tools(
+                    "foreign-workspace",
+                    &fixture.turn_id,
+                    &fixture.manifest_hash,
+                    &materialized.descriptors
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            fixture
+                .service
+                .restore_mcp_tools(
+                    &fixture.workspace_id,
+                    &fixture.turn_id,
+                    "changed-manifest",
+                    &materialized.descriptors
+                )
+                .await
+                .is_err()
+        );
+        fixture.crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "UPDATE turn_mcp_projection SET resolution_status='resolved_future_unknown' WHERE turn_id=?",
+            [fixture.turn_id.clone().into()],
+        )).await.unwrap();
+        assert!(
+            fixture
+                .service
+                .restore_mcp_tools(
+                    &fixture.workspace_id,
+                    &fixture.turn_id,
+                    &fixture.manifest_hash,
+                    &materialized.descriptors,
+                )
+                .await
+                .is_err()
+        );
     }
 
     async fn turn_mcp_invoker_fixture() -> TestTurnMcpInvokerFixture {

@@ -60,6 +60,21 @@ pub(crate) struct BoundAgentActionAdapter {
     depth: u16,
 }
 
+/// Only the original launch catalog/opaque mapping persists. Security,
+/// resource admission and the mutable execution attempt remain with their
+/// existing durable owners and are reconstructed independently.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeAgentActionLaunchContract {
+    schema_version: u32,
+    execution_id: AgentExecutionId,
+    identity_fingerprint: String,
+    profile_fingerprint: String,
+    start_options: pioneer_protocol::AgentStartOptionsProjection,
+    routes: Vec<AgentRouteFacts>,
+    same_capsule_targets: Vec<(String, String)>,
+}
+
 /// Immutable facts needed to persist the execution graph.  Runtime adapters
 /// may hold provider-specific state, but these values are server-derived from
 /// the same pinned binding and therefore remain stable across reconnects.
@@ -237,6 +252,168 @@ impl BoundAgentActionAdapter {
             &mut safe,
         );
         safe
+    }
+
+    pub(crate) fn capture_native_launch_contract(&self) -> anyhow::Result<String> {
+        #[derive(serde::Serialize)]
+        struct Borrowed<'a> {
+            schema_version: u32,
+            execution_id: &'a AgentExecutionId,
+            identity_fingerprint: &'a str,
+            profile_fingerprint: &'a str,
+            start_options: &'a pioneer_protocol::AgentStartOptionsProjection,
+            routes: &'a [AgentRouteFacts],
+            same_capsule_targets: &'a [(String, String)],
+        }
+        self.validate_native_launch_catalog_bounds()?;
+        crate::turn_runtime_snapshot::to_snapshot_json(
+            &Borrowed {
+                schema_version: 1,
+                execution_id: &self.root.execution_id,
+                identity_fingerprint: &self.root.identity_source_fingerprint,
+                profile_fingerprint: &self.root.profile.fingerprint,
+                start_options: &self.start_options,
+                routes: &self.routes,
+                same_capsule_targets: &self.same_capsule_targets,
+            },
+            "native Agent launch contract",
+        )
+    }
+
+    pub(crate) async fn native_launch_contract_can_restore(
+        store: &pioneer_crud::CrudStore,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        encoded: &str,
+    ) -> anyhow::Result<bool> {
+        if encoded.len() > pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES {
+            return Ok(false);
+        }
+        let Ok(accepted) = serde_json::from_str::<NativeAgentActionLaunchContract>(encoded) else {
+            return Ok(false);
+        };
+        if accepted.schema_version != 1
+            || accepted.identity_fingerprint.is_empty()
+            || accepted.profile_fingerprint.is_empty()
+            || accepted
+                .same_capsule_targets
+                .iter()
+                .any(|(id, _)| id.trim().is_empty())
+            || accepted.routes.iter().any(|route| {
+                route.source_identity_id.is_none()
+                    || (route.kind == pioneer_protocol::AgentRouteKind::ExecutionBound
+                        && route.source_execution_id != accepted.execution_id.as_str())
+            })
+            || accepted.start_options.agents.len()
+                > pioneer_protocol::ChildAgentLaunchGrantSet::MAX_IDENTITIES
+            || accepted.start_options.profiles.len()
+                > pioneer_protocol::ChildAgentLaunchGrantSet::MAX_PROFILES
+            || accepted.routes.len() > 256
+            || accepted.same_capsule_targets.len() > 256
+            || accepted
+                .routes
+                .iter()
+                .map(|r| &r.route_id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != accepted.routes.len()
+            || accepted
+                .same_capsule_targets
+                .iter()
+                .map(|(id, _)| id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != accepted.same_capsule_targets.len()
+        {
+            return Ok(false);
+        }
+        pioneer_crud::native_initial_agent_owner_exists(
+            &store.database_connection(),
+            accepted.execution_id.as_str(),
+            workspace,
+            thread,
+            turn,
+            &accepted.identity_fingerprint,
+            &accepted.profile_fingerprint,
+        )
+        .await
+    }
+
+    fn validate_native_launch_catalog_bounds(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.start_options.agents.len()
+                <= pioneer_protocol::ChildAgentLaunchGrantSet::MAX_IDENTITIES
+                && self.start_options.profiles.len()
+                    <= pioneer_protocol::ChildAgentLaunchGrantSet::MAX_PROFILES
+                && self.routes.len() <= 256
+                && self.same_capsule_targets.len() <= 256,
+            "native Agent launch catalog exceeds owner limits"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn restore_native_launch_contract(
+        &mut self,
+        encoded: &str,
+    ) -> anyhow::Result<AgentToolOptionsProjection> {
+        anyhow::ensure!(
+            encoded.len() <= pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+            "native Agent launch contract exceeds execution allowance"
+        );
+        let accepted: NativeAgentActionLaunchContract = serde_json::from_str(encoded)
+            .map_err(|_| anyhow::anyhow!("native Agent launch contract unavailable"))?;
+        anyhow::ensure!(
+            accepted.schema_version == 1
+                && accepted.execution_id == self.root.execution_id
+                && accepted.identity_fingerprint == self.root.identity_source_fingerprint
+                && accepted.profile_fingerprint == self.root.profile.fingerprint,
+            "native Agent launch contract differs from its durable owner"
+        );
+        anyhow::ensure!(
+            accepted.start_options.agents.len()
+                <= pioneer_protocol::ChildAgentLaunchGrantSet::MAX_IDENTITIES
+                && accepted.start_options.profiles.len()
+                    <= pioneer_protocol::ChildAgentLaunchGrantSet::MAX_PROFILES
+                && accepted.routes.len() <= 256
+                && accepted.same_capsule_targets.len() <= 256,
+            "native Agent launch catalog exceeds owner limits"
+        );
+        anyhow::ensure!(
+            accepted
+                .routes
+                .iter()
+                .map(|r| &r.route_id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                == accepted.routes.len()
+                && accepted
+                    .same_capsule_targets
+                    .iter()
+                    .map(|(id, _)| id)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    == accepted.same_capsule_targets.len(),
+            "native Agent launch catalog contains ambiguous targets"
+        );
+        self.replace_persisted_routes(accepted.routes)
+            .map_err(|_| anyhow::anyhow!("native Agent launch routes unavailable"))?;
+        self.replace_same_capsule_targets(accepted.same_capsule_targets)
+            .map_err(|_| anyhow::anyhow!("native Agent launch targets unavailable"))?;
+        self.start_options = accepted.start_options;
+        self.validate_native_launch_catalog_bounds()?;
+        self.root.options_generation_fingerprint =
+            self.start_options.generation_fingerprint.clone();
+        let capabilities = task_agent_capabilities(&self.envelope);
+        let mut safe = self.start_options.clone().safe_tool_projection();
+        populate_binding_options(
+            &self.root,
+            &self.same_capsule_targets,
+            &self.routes,
+            &capabilities,
+            &mut safe,
+        );
+        Ok(safe)
     }
 
     pub(crate) fn resolve_task_launch(
@@ -1911,6 +2088,99 @@ mod tests {
 
     fn test_skill_id() -> SkillId {
         SkillId::new("K12345678901234567890").unwrap()
+    }
+
+    #[test]
+    fn cold_native_launch_catalog_restores_original_targets_and_keeps_fresh_authority() {
+        let mut original = test_adapter();
+        original
+            .replace_same_capsule_targets(vec![(
+                "T22345678901234567890".into(),
+                "Original target".into(),
+            )])
+            .unwrap();
+        let accepted = test_options(&mut original);
+        let encoded = original.capture_native_launch_contract().unwrap();
+        let mut restored = test_adapter();
+        restored
+            .replace_same_capsule_targets(vec![(
+                "T32345678901234567890".into(),
+                "Changed target".into(),
+            )])
+            .unwrap();
+        assert_ne!(test_options(&mut restored), accepted);
+        restored.current_policy_generation = 42;
+        let envelope = restored.envelope.clone();
+        assert_eq!(
+            restored.restore_native_launch_contract(&encoded).unwrap(),
+            accepted
+        );
+        assert_eq!(restored.current_policy_generation, 42);
+        assert_eq!(restored.envelope, envelope);
+        let mut future: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        future["schema_version"] = serde_json::json!(2);
+        assert!(
+            restored
+                .restore_native_launch_contract(&future.to_string())
+                .is_err()
+        );
+        future["schema_version"] = serde_json::json!(1);
+        future["profile_fingerprint"] = serde_json::json!("PRIVATE changed");
+        let error = restored
+            .restore_native_launch_contract(&future.to_string())
+            .unwrap_err();
+        assert!(!format!("{error:#}").contains("PRIVATE"));
+        assert!(
+            restored
+                .restore_native_launch_contract(
+                    &"x".repeat(pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES + 1)
+                )
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_owner_check_rejects_missing_original_execution_and_future_contract() {
+        use migration::MigratorTrait;
+        let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        migration::Migrator::up(&db, None).await.unwrap();
+        let store = pioneer_crud::CrudStore::new(db);
+        let encoded = test_adapter().capture_native_launch_contract().unwrap();
+        assert!(
+            !BoundAgentActionAdapter::native_launch_contract_can_restore(
+                &store,
+                "workspace",
+                "thread",
+                "turn",
+                &encoded,
+            )
+            .await
+            .unwrap()
+        );
+        let mut future: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        future["schema_version"] = serde_json::json!(2);
+        assert!(
+            !BoundAgentActionAdapter::native_launch_contract_can_restore(
+                &store,
+                "workspace",
+                "thread",
+                "turn",
+                &future.to_string(),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !BoundAgentActionAdapter::native_launch_contract_can_restore(
+                &store,
+                "workspace",
+                "thread",
+                "turn",
+                "PRIVATE incompatible",
+            )
+            .await
+            .unwrap()
+        );
     }
 
     fn test_options(adapter: &mut BoundAgentActionAdapter) -> AgentToolOptionsProjection {

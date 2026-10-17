@@ -44,6 +44,23 @@ impl ArtifactExternalRefCacheBackend for CrudArtifactExternalRefCacheBackend {
             .map(|found| found.external_id))
     }
 
+    async fn compare_delete_uploaded_reference(
+        &self,
+        request: ArtifactExternalRefLookupRequest,
+        rejected_id: &str,
+    ) -> Result<bool> {
+        let Some(artifact) = &request.artifact else {
+            return Ok(false);
+        };
+        self.store
+            .with_maintenance_access()
+            .compare_delete_artifact_external_ref(
+                &external_ref_key(&request, artifact),
+                rejected_id,
+            )
+            .await
+    }
+
     async fn store_uploaded_reference(
         &self,
         request: ArtifactExternalRefStoreRequest,
@@ -161,6 +178,80 @@ mod tests {
             artifact_id: "artifact_a".to_owned(),
             artifact_version_id: Some("version_a".to_owned()),
         }
+    }
+
+    #[tokio::test]
+    async fn rejected_reference_compare_delete_preserves_newer_upload_and_authority() {
+        let backend = setup_backend().await;
+        let request = ArtifactExternalRefLookupRequest {
+            provider: "openai".to_owned(),
+            authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
+            model_family: "gpt-4.1-mini".to_owned(),
+            transport_kind: AttachmentTransportKind::Upload,
+            sha256: "hash".to_owned(),
+            registry_key: "key".to_owned(),
+            now_unix_ms: 100,
+            artifact: Some(artifact_context("ws_a")),
+        };
+        let store = |id: &str| ArtifactExternalRefStoreRequest {
+            provider: request.provider.clone(),
+            authority_fingerprint: request.authority_fingerprint.clone(),
+            model_family: request.model_family.clone(),
+            transport_kind: request.transport_kind,
+            sha256: request.sha256.clone(),
+            registry_key: request.registry_key.clone(),
+            provider_file_id: id.to_owned(),
+            uploaded_at_unix_ms: 100,
+            ttl_secs: 3600,
+            expires_at_unix_ms: 3_600_100,
+            mime_type: "application/pdf".to_owned(),
+            size_bytes: 5,
+            file_name: "owned.pdf".to_owned(),
+            artifact: request.artifact.clone(),
+        };
+        backend
+            .store_uploaded_reference(store("old"))
+            .await
+            .unwrap();
+        backend
+            .store_uploaded_reference(store("new"))
+            .await
+            .unwrap();
+        assert!(
+            !backend
+                .compare_delete_uploaded_reference(request.clone(), "old")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            backend
+                .lookup_uploaded_reference(request.clone())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("new")
+        );
+        let mut foreign = request.clone();
+        foreign.authority_fingerprint = "other-authority".to_owned();
+        assert!(
+            !backend
+                .compare_delete_uploaded_reference(foreign, "new")
+                .await
+                .unwrap()
+        );
+        assert!(
+            backend
+                .compare_delete_uploaded_reference(request.clone(), "new")
+                .await
+                .unwrap()
+        );
+        assert!(
+            backend
+                .lookup_uploaded_reference(request)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

@@ -25,6 +25,14 @@ pub trait AgentMemoryProvider: Send + Sync {
         &self,
         context: MemoryTurnContext,
     ) -> Result<MemoryToolMaterialization, String>;
+
+    async fn restore_memory_tools(
+        &self,
+        _context: MemoryTurnContext,
+        _accepted_specs: &[Vec<pioneer_tools::ConfiguredToolSpec>],
+    ) -> Result<MemoryToolMaterialization, String> {
+        Err("accepted Memory tool owner does not support cold restoration".to_owned())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

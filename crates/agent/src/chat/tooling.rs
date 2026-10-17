@@ -110,6 +110,22 @@ pub(super) async fn forward_tool_event_to_agent(
                 );
             }
         }
+        ToolEventPayload::OwnerHeartbeat => {
+            let should_forward = pending_tool_ui
+                .lock()
+                .await
+                .get(event.call_id.as_str())
+                .is_some_and(|state| state.started_sent);
+            if should_forward {
+                event_tx.publish_heartbeat(
+                    workspace_id.to_owned(),
+                    thread_id.to_owned(),
+                    turn_id.to_owned(),
+                    event.call_id,
+                    tool_item_type_from_name(event.tool_name.as_str()),
+                );
+            }
+        }
         ToolEventPayload::PermissionAudit(audit_event) => {
             event_tx
                 .publish_durable_and_wait(AgentDurableEvent::TurnPermissionAudit {
@@ -406,7 +422,11 @@ fn protocol_delta_from_tool_delta(
             })),
         )),
         ToolDeltaPayload::Progress { stage, metadata } => Some((
-            stage.clone(),
+            if stage == "attempt_work_started" {
+                String::new()
+            } else {
+                stage.clone()
+            },
             ItemDeltaStream::ToolProgress,
             Some(serde_json::json!({
                 "kind": "progress",
@@ -964,42 +984,6 @@ pub(super) fn build_failed_tool_turn_item(
     ))
 }
 
-pub(super) fn build_completed_tool_turn_item(
-    id: String,
-    tool_name: String,
-    arguments: String,
-    recovery_policy: Option<ToolRecoveryPolicySnapshot>,
-    turn_item_execution_class: TurnItemExecutionClass,
-    output_policy: Option<ToolOutputPolicySnapshot>,
-    observation: Option<ToolObservation>,
-) -> TurnItem {
-    let output_policy = output_policy
-        .unwrap_or_else(|| ToolOutputPolicySnapshot::for_tool_name(tool_name.as_str()));
-    let summary = summary_payload(
-        format!("{tool_name} completed"),
-        Vec::new(),
-        ToolMetadata::from_json(serde_json::json!({ "state": "completed" })),
-        false,
-    );
-    let display = display_for_policy(&output_policy, summary.clone());
-    let storage = storage_for_policy(&output_policy, summary);
-    build_tool_turn_item(ProjectedToolItemInput {
-        id,
-        tool_name,
-        arguments: parse_arguments_json(arguments.as_str()),
-        status: ToolCallStatus::Completed,
-        success: Some(true),
-        outcome: None,
-        output_policy,
-        recovery_policy,
-        turn_item_execution_class,
-        display,
-        storage,
-        recovery: None,
-        observation,
-    })
-}
-
 fn display_for_policy(
     output_policy: &ToolOutputPolicySnapshot,
     summary: ToolOutputSummary,
@@ -1391,6 +1375,7 @@ pub(super) fn build_tool_error_message(
         error_message,
         Some(payload),
     )
+    .with_tool_outcome(outcome.provider_outcome())
     .into_chat_message()
 }
 
@@ -1432,15 +1417,23 @@ mod tests {
                         None,
                         None,
                     ),
-                    build_completed_tool_turn_item(
-                        "call".into(),
-                        tool_name.into(),
-                        arguments.into(),
-                        None,
-                        TurnItemExecutionClass::Standard,
-                        None,
-                        None,
-                    ),
+                    build_tool_turn_item(ProjectedToolItemInput {
+                        id: "call".into(),
+                        tool_name: tool_name.into(),
+                        arguments: parse_arguments_json(arguments),
+                        status: ToolCallStatus::Completed,
+                        success: Some(true),
+                        outcome: Some(protocol_outcome_from_tool_outcome(&ToolOutcome::ok())),
+                        output_policy: ToolOutputPolicySnapshot::for_tool_name(tool_name),
+                        recovery_policy: None,
+                        turn_item_execution_class: TurnItemExecutionClass::Standard,
+                        display: ToolDisplayPayload::Hidden,
+                        storage: ToolStoragePayload::Metadata {
+                            metadata: ToolMetadata::empty(),
+                        },
+                        recovery: None,
+                        observation: None,
+                    }),
                     build_failed_tool_turn_item(
                         "call".into(),
                         tool_name.into(),
@@ -1751,6 +1744,73 @@ mod tests {
             assert!(!message.content.contains("12345"));
             assert!(!message.content.contains("floating point"));
             assert_eq!(executions.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_owner_heartbeat_is_lease_only_and_requires_a_committed_start() {
+        let hub = AgentEventHub::with_capacity(8, 8);
+        let mut live = hub.subscribe_live();
+        let pending = Arc::new(Mutex::new(HashMap::from([(
+            "child".to_owned(),
+            super::PendingToolUiState {
+                started_sent: true,
+                ..Default::default()
+            },
+        )])));
+        for (payload, expected) in [
+            (
+                ToolEventPayload::OwnerHeartbeat,
+                pioneer_protocol::ItemHeartbeatSource::OwnerLease,
+            ),
+            (
+                ToolEventPayload::Heartbeat,
+                pioneer_protocol::ItemHeartbeatSource::ConfirmedExternalActivity,
+            ),
+        ] {
+            let event = ToolEvent {
+                schema_version: 1,
+                call_id: "child".into(),
+                tool_name: "exec_command".into(),
+                ts_unix_ms: 1,
+                observation: ObservationContext {
+                    trace_id: "child_trace".into(),
+                    turn_id: "turn".into(),
+                    tool_call_id: "child".into(),
+                    attempt_id: 1,
+                    pipeline_stage: "heartbeat".into(),
+                    ts_unix_ms: 1,
+                    mono_ns: 1,
+                    event_seq: 2,
+                },
+                payload,
+            };
+            forward_tool_event_to_agent(
+                event.clone(),
+                &hub,
+                Arc::new(Mutex::new(HashMap::new())),
+                "ws",
+                "thread",
+                "turn",
+            )
+            .await
+            .unwrap();
+            hub.flush_progress_for_item("ws", "thread", "turn", "child")
+                .await;
+            assert!(matches!(
+                live.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ));
+            forward_tool_event_to_agent(event, &hub, pending.clone(), "ws", "thread", "turn")
+                .await
+                .unwrap();
+            hub.flush_progress_for_item("ws", "thread", "turn", "child")
+                .await;
+            let heartbeat = live.recv().await.unwrap();
+            assert!(
+                matches!(heartbeat, pioneer_protocol::AgentProgressEvent::ItemHeartbeat { source, item_id, .. }
+                if source == expected && item_id == "child")
+            );
         }
     }
 

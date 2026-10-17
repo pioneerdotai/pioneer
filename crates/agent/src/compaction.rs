@@ -12,7 +12,7 @@ use pioneer_compaction::summary::{
     CompletionKind, INSTRUCTIONS, Summarizer, SummaryCompletion, SummaryFailure, SummaryRequest,
 };
 use pioneer_compaction::{ModelBudget, ModelSelection, Transport, text_tokens};
-use pioneer_protocol::{ProviderFailureClass, ProviderFailureStage};
+use pioneer_protocol::ProviderFailureClass;
 use pioneer_provider::{
     ChatMessage, ChatRequest, Provider, ProviderTermination, ReasoningConfig, ReasoningEffort,
 };
@@ -132,13 +132,12 @@ impl Summarizer for NativeSummarizer {
         }
         let prepared = self.prepare(&request).map_err(|_| invalid())?;
         let response = self.provider.chat(prepared).await.map_err(|error| {
-            let classification = self.provider.classify_failure(&error);
-            let class = classification.as_ref().map(|c| c.class).unwrap_or_else(|| {
-                crate::classify_provider_failure_message(
-                    &pioneer_provider::usage::classification_source(&error).to_string(),
-                    ProviderFailureStage::Connect,
-                )
-            });
+            let classification = pioneer_provider::failure::classify_transport_error(&error)
+                .or_else(|| self.provider.classify_failure(&error));
+            let class = classification
+                .as_ref()
+                .map(|c| c.class)
+                .unwrap_or(ProviderFailureClass::Unknown);
             let transient = matches!(
                 class,
                 ProviderFailureClass::NetworkTransient

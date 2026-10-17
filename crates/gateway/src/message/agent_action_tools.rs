@@ -1051,12 +1051,32 @@ async fn restore_persisted_agent_action_binding(
     context: &TurnToolContext,
     execution_id: &AgentExecutionId,
 ) -> anyhow::Result<()> {
+    restore_persisted_agent_action_binding_with_native_contract(
+        processor,
+        context,
+        execution_id,
+        None,
+    )
+    .await
+}
+
+async fn restore_persisted_agent_action_binding_with_native_contract(
+    processor: &Arc<MessageProcessor>,
+    context: &TurnToolContext,
+    execution_id: &AgentExecutionId,
+    native_contract: Option<&str>,
+) -> anyhow::Result<()> {
     let database = processor.crud_store.database_connection();
     let execution = pioneer_crud::load_agent_execution(&database, execution_id.as_str())
         .await?
         .ok_or_else(|| anyhow::anyhow!("persisted AgentExecution is missing"))?;
     if execution.workspace_id != context.workspace_id
         || execution.parent_thread_id.as_deref() != Some(context.thread_id.as_str())
+        || (native_contract.is_some()
+            && !matches!(
+                execution.status.as_str(),
+                "created" | "queued" | "running" | "recovering"
+            ))
         || execution.finished_at.is_some()
         || matches!(
             execution.status.as_str(),
@@ -1176,12 +1196,18 @@ async fn restore_persisted_agent_action_binding(
             allowed_action_names.as_slice(),
         )
         .map_err(|error| anyhow::anyhow!("failed to restore Agent action binding: {error:?}"))?;
-    let binding = processor
-        .prepare_agent_action_binding(
-            context.turn_id.clone(),
-            AgentActionRuntimeBinding::new(adapter, options, capabilities),
-        )
-        .await?;
+    let mut binding = AgentActionRuntimeBinding::new(adapter, options, capabilities);
+    if let Some(encoded) = native_contract {
+        binding.options = binding
+            .adapter
+            .lock()
+            .await
+            .restore_native_launch_contract(encoded)?;
+    } else {
+        binding = processor
+            .prepare_agent_action_binding(context.turn_id.clone(), binding)
+            .await?;
+    }
     processor
         .register_agent_action_binding(context.turn_id.clone(), binding)
         .await;
@@ -1914,6 +1940,27 @@ pub(crate) async fn materialize(
     ensure_root_agent_action_binding(&processor, &context, None, None)
         .await
         .map_err(|error| format!("failed to bind root Agent execution: {error:#}"))?;
+    project_materialized_agent_action_tools(processor, context).await
+}
+
+fn native_agent_tool_parameters(
+    parameters: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let mut schema = schemars::Schema::try_from(parameters)
+        .map_err(|_| "native Agent tool schema is unavailable".to_owned())?;
+    let mut objects = schemars::transform::ReplaceBoolSchemas::default();
+    objects.skip_additional_properties = true;
+    schemars::transform::Transform::transform(&mut objects, &mut schema);
+    // The protocol schema keeps its dialect annotation; native functions use
+    // the same constraints through their existing non-strict JSON profile.
+    schema.remove("$schema");
+    Ok(schema.to_value())
+}
+
+async fn project_materialized_agent_action_tools(
+    processor: Arc<MessageProcessor>,
+    context: TurnToolContext,
+) -> Result<pioneer_agent::TurnToolMaterialization, String> {
     let Some(binding) = processor
         .agent_action_binding(context.turn_id.as_str())
         .await
@@ -1933,10 +1980,19 @@ pub(crate) async fn materialize(
             .persistence_facts()
             .home_root_thread_id,
     );
+    let native_agent_action_contract = Some(
+        binding
+            .adapter
+            .lock()
+            .await
+            .capture_native_launch_contract()
+            .map_err(|_| "native Agent launch contract cannot be captured".to_owned())?,
+    );
     let catalog = project_agent_model_tool_catalog(&binding.capabilities, options.as_ref());
     if catalog.is_empty() {
         return Ok(pioneer_agent::TurnToolMaterialization {
             initiating_thread_id,
+            native_agent_action_contract,
             ..Default::default()
         });
     }
@@ -1951,7 +2007,7 @@ pub(crate) async fn materialize(
                 ToolSpec::new(
                     name.clone(),
                     entry.description,
-                    entry.parameters,
+                    native_agent_tool_parameters(entry.parameters)?,
                     PayloadKind::Function,
                 )
                 .with_recovery(agent_tool_recovery(entry.name)),
@@ -1975,7 +2031,48 @@ pub(crate) async fn materialize(
         bundles: vec![bundle],
         diagnostics: Vec::new(),
         initiating_thread_id,
+        native_agent_action_contract,
     })
+}
+
+pub(crate) async fn restore_native_agent_action_tools(
+    processor: Arc<MessageProcessor>,
+    context: TurnToolContext,
+    contract: Option<&str>,
+) -> Result<pioneer_agent::TurnToolMaterialization, String> {
+    let encoded =
+        contract.ok_or_else(|| "accepted Agent launch contract is unavailable".to_owned())?;
+    // Only an existing durable responding execution is eligible. No root
+    // admission or current launch-catalog refresh is allowed on this path.
+    let database = processor.crud_store.database_connection();
+    let execution_id = if let Some(response) =
+        pioneer_crud::load_agent_turn_response(&database, &context.turn_id)
+            .await
+            .map_err(|_| "accepted Agent execution lookup failed".to_owned())?
+    {
+        AgentExecutionId::new(response.execution_id)
+            .map_err(|_| "accepted Agent execution identity invalid".to_owned())?
+    } else {
+        let (_, turn) = processor
+            .crud_store
+            .get_turn(&context.thread_id, &context.turn_id)
+            .await
+            .map_err(|_| "accepted Agent Turn lookup failed".to_owned())?
+            .ok_or_else(|| "accepted Agent Turn unavailable".to_owned())?;
+        match turn.author.map(|author| author.actor) {
+            Some(PersistedActorRef::AgentExecution(execution_id)) => execution_id,
+            _ => return Err("accepted Agent responding execution unavailable".to_owned()),
+        }
+    };
+    restore_persisted_agent_action_binding_with_native_contract(
+        &processor,
+        &context,
+        &execution_id,
+        Some(encoded),
+    )
+    .await
+    .map_err(|_| "accepted Agent action owner cannot be restored".to_owned())?;
+    project_materialized_agent_action_tools(processor, context).await
 }
 
 fn agent_tool_recovery(tool: AgentModelToolName) -> ToolRecoveryMetadata {
@@ -2872,12 +2969,10 @@ impl AgentActionToolHandler {
             pioneer_protocol::AgentExecutionProfileBackend::ApiProvider
         )
         .then(|| {
-            processor
-                .provider_registry
-                .authority_fingerprint_for_workspace(
-                    self.context.workspace_id.as_str(),
-                    child.grant.profile.provider_id.as_str(),
-                )
+            parent_authority.resolve_continuation_provider_authority(
+                processor.provider_registry.as_ref(),
+                child.grant.profile.provider_id.as_str(),
+            )
         })
         .transpose()
         .map_err(|error| {
@@ -2894,6 +2989,9 @@ impl AgentActionToolHandler {
                 normalized_capabilities.execution.as_slice(),
                 &permission_profile,
                 provider_authority.as_ref().map(|value| value.as_str()),
+                provider_authority
+                    .as_ref()
+                    .and_then(|value| value.azure_connection()),
             )
             .map_err(|error| {
                 ToolError::execution_failed(format!(
@@ -3918,6 +4016,8 @@ pub(crate) fn sanitize_agent_tool_error(error: ToolError) -> ToolError {
     }
 
     match error {
+        ToolError::ResponseLimitExceeded => ToolError::ResponseLimitExceeded,
+        ToolError::TimedOut => ToolError::TimedOut,
         // This exact public code is assigned at decoding boundaries. Unknown
         // InvalidArguments also include semantic failures after decoding.
         ToolError::InvalidArguments(message) if message == "agent_invalid_arguments" => {
@@ -3962,6 +4062,75 @@ fn denied_output(outcome: AgentPublicOutcome, message: &str) -> Box<dyn ToolOutp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_agent_catalog_crosses_the_real_wire_gate_without_losing_constraints() {
+        let options = AgentToolOptionsProjection {
+            identities: vec![],
+            profiles: vec![],
+            inherit_parent_identity_available: true,
+            default_pioneer_identity_available: false,
+            derived_ephemeral_identity_available: false,
+            inherit_parent_profile_available: true,
+            allowed_skill_ids: vec![],
+            allowed_mcp_server_ids: vec![],
+            max_permission_profile: pioneer_protocol::task_permission_cap_from_snapshot(
+                &pioneer_protocol::default_turn_permission_profile_snapshot(),
+            ),
+            thread_creation_options: vec![],
+            target_options: vec![],
+            generation_fingerprint: "wire-fixture".into(),
+        };
+        let capabilities = [
+            AgentToolCapability::MessageCreate,
+            AgentToolCapability::ThreadCreate,
+            AgentToolCapability::ChildStart,
+        ]
+        .into_iter()
+        .collect();
+        let tools = project_agent_model_tool_catalog(&capabilities, Some(&options))
+            .into_iter()
+            .map(|entry| {
+                assert!(entry.parameters.get("$schema").is_some());
+                let parameters = native_agent_tool_parameters(entry.parameters).unwrap();
+                assert!(parameters.get("$schema").is_none());
+                assert_eq!(
+                    parameters.get("additionalProperties"),
+                    Some(&serde_json::json!(false))
+                );
+                pioneer_provider::ToolDefinition {
+                    name: entry.name.as_str().into(),
+                    description: entry.description,
+                    parameters,
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tools.len(), 4);
+        let registry = pioneer_provider::ProviderRegistry::with_provider(
+            "echo",
+            Arc::new(pioneer_provider::providers::EchoProvider::new()),
+        );
+        let provider = registry
+            .get_or_create_for_workspace("agent-schema-workspace", "echo")
+            .unwrap();
+        let response = provider
+            .chat(pioneer_provider::ChatRequest {
+                model: "test-model".into(),
+                messages: vec![pioneer_provider::ChatMessage::user(
+                    "agent schema admission",
+                )],
+                temperature: None,
+                max_tokens: Some(32),
+                tools: Some(tools),
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: None,
+                compiled_prompt: None,
+            })
+            .await
+            .expect("the full native Agent catalog must cross the real wire gate");
+        assert_eq!(response.text, "agent schema admission");
+    }
 
     fn identity(id: &str, revision: u64) -> pioneer_protocol::AgentIdentityProjection {
         pioneer_protocol::AgentIdentityProjection::new(

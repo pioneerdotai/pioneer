@@ -24,14 +24,6 @@ impl Drop for CliHistoryMonitorDrop {
 pub(super) struct PreparedApiProviderTurnStart {
     outcome: crate::thread::TurnStartOutcome,
     user_message_capability_attachments: Vec<pioneer_protocol::UserMessageAttachment>,
-    workspace_skill_policies:
-        HashMap<pioneer_skills::SkillPolicyKey, pioneer_agent::WorkspaceSkillPolicy>,
-    skill_catalog: pioneer_skills::SkillCatalogSnapshot,
-    agent_skill_overlay: Vec<pioneer_skills::AgentSkillRuntimeEntry>,
-    resolved_artifacts: Vec<ResolvedArtifactInput>,
-    runtime_environment: HashMap<String, String>,
-    history: Vec<ChatMessage>,
-    effective_reasoning_effort: Option<String>,
     permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
     execution_security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
 }
@@ -105,6 +97,8 @@ impl TurnStartFailure {
     }
 
     fn into_public_error(self) -> pioneer_protocol::PublicError {
+        #[cfg(test)]
+        eprintln!("native admission fixture diagnostic: {}", self.diagnostic);
         let public_error = crate::public_error::build_public_error(
             self.public_code,
             pioneer_protocol::PublicErrorStage::Admission,
@@ -989,7 +983,7 @@ impl MessageProcessor {
             )
             .with_task_cause(pioneer_tasks::TaskStartCause::Policy));
         }
-        let provider_authority_fingerprint = match params.execution_backend.as_ref() {
+        let provider_authority = match params.execution_backend.as_ref() {
             Some(AgentExecutionBackend::CLIAgentRuntime { .. })
             | Some(AgentExecutionBackend::ACPAgentRuntime { .. }) => None,
             _ => Some(
@@ -999,12 +993,10 @@ impl MessageProcessor {
                         TurnStartFailure::unavailable(format!(
                             "provider authority could not be resolved: {error:#}"
                         ))
-                    })?
-                    .as_str()
-                    .to_owned(),
+                    })?,
             ),
         };
-        let request = crate::authorization::ExecutionAdmissionRequest::for_turn(
+        let mut request = crate::authorization::ExecutionAdmissionRequest::for_turn(
             entry_point,
             crate::authorization::ResourceAction::AgentTurnStart,
             additional_required_actions,
@@ -1014,11 +1006,16 @@ impl MessageProcessor {
             model,
             params,
             capabilities,
-            provider_authority_fingerprint,
+            provider_authority
+                .as_ref()
+                .map(|authority| authority.as_str().to_owned()),
         )
         .map_err(|error| {
             TurnStartFailure::invalid_input(format!("invalid composite execution intent: {error}"))
         })?;
+        if let Some(authority) = provider_authority.as_ref() {
+            request.bind_resolved_provider_authority(authority);
+        }
         admission
             .authorize_composite(self.crud_store.as_ref(), &request)
             .await
@@ -2669,7 +2666,7 @@ impl MessageProcessor {
             }
         };
         drop(startup_persist);
-        let outcome = outcome_result.map_err(|error| {
+        let mut outcome = outcome_result.map_err(|error| {
             TurnStartFailure::internal(format!("failed to start turn: {error:#}"))
         })?;
         let effective_reasoning_effort = match self
@@ -2716,6 +2713,7 @@ impl MessageProcessor {
             && self.native_api_provider_supports_agent_skill_overlay(
                 outcome.started_notification.workspace_id.as_str(),
                 outcome.materialization.thread.model_provider.as_str(),
+                execution_admission.provider_azure_connection(),
             ) {
             if let Some(scoped_principal_id) = scoped_principal_id.as_ref() {
                 match self
@@ -2880,6 +2878,47 @@ impl MessageProcessor {
         } else {
             None
         };
+        // The original digest remains the idempotency identity. Accepted durable
+        // semantic input is replaced only with exact immutable artifact refs.
+        match crate::turn_runtime_snapshot::capture_native_media_inputs(
+            self.artifact_service.as_ref(),
+            self.provider_registry.as_ref(),
+            &outcome.materialization.thread.workspace_id,
+            &outcome.materialization.thread.id,
+            &outcome.materialization.thread.model_provider,
+            execution_admission.provider_azure_connection(),
+            &outcome.materialization.input,
+            &execution_security_snapshot,
+            &request_actor,
+        )
+        .await
+        {
+            Ok(input) => outcome.materialization.input = input,
+            Err(_) => {
+                self.thread_manager
+                    .rollback_turn_start(outcome.rollback_context.clone())
+                    .await;
+                return Err(TurnStartFailure::unavailable(
+                    "media input could not be captured under the authorized bounded policy",
+                ));
+            }
+        }
+        if self
+            .validate_turn_artifact_user_inputs(
+                &outcome.materialization.thread.workspace_id,
+                &outcome.materialization.thread.id,
+                &outcome.materialization.input,
+            )
+            .await
+            .is_err()
+        {
+            self.thread_manager
+                .rollback_turn_start(outcome.rollback_context.clone())
+                .await;
+            return Err(TurnStartFailure::unavailable(
+                "captured media artifact is unavailable",
+            ));
+        }
         let persisted = message_future(persist_admitted_turn_start(
             self.crud_store.as_ref(),
             self.provider_registry.as_ref(),
@@ -3061,7 +3100,7 @@ impl MessageProcessor {
                 pioneer_observability::turn_startup::Stage::Artifacts,
             );
             match self
-                .resolve_provider_artifact_inputs(
+                .resolve_owned_provider_artifact_inputs(
                     outcome.started_notification.workspace_id.as_str(),
                     outcome.materialization.input.as_slice(),
                 )
@@ -3135,6 +3174,7 @@ impl MessageProcessor {
                 &runtime_environment,
                 history.as_slice(),
                 &mut agent_skill_overlay,
+                &skill_catalog,
                 Some(&prepared_history),
             )
             .await;
@@ -3169,13 +3209,6 @@ impl MessageProcessor {
             PreparedApiProviderTurnStart {
                 outcome,
                 user_message_capability_attachments,
-                workspace_skill_policies,
-                skill_catalog,
-                agent_skill_overlay,
-                resolved_artifacts,
-                runtime_environment,
-                history,
-                effective_reasoning_effort,
                 permission_profile,
                 execution_security_snapshot,
             },
@@ -3219,28 +3252,25 @@ impl MessageProcessor {
     ) {
         let outcome = prepared.outcome;
         let start_result = self
-            .agent_manager
-            .start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_security_snapshot_and_agent_skill_overlay(
+            .start_admitted_native_snapshot_turn(
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
-                outcome.materialization.turn.mode,
-                &outcome.materialization.thread.model,
-                &outcome.materialization.thread.model_provider,
-                prepared.workspace_skill_policies,
-                prepared.skill_catalog,
-                prepared.agent_skill_overlay,
-                outcome.materialization.input.clone(),
-                outcome.materialization.capabilities.clone(),
-                prepared.resolved_artifacts,
-                prepared.runtime_environment,
-                prepared.history,
-                prepared.effective_reasoning_effort.as_deref(),
                 prepared.permission_profile,
                 prepared.execution_security_snapshot,
+                None,
             )
             .await;
         if let Err(error) = start_result {
-            let reason = format!("failed to dispatch turn to agent runtime: {error}");
+            let reason = format!("failed to dispatch turn to agent runtime: {error:#}");
+            if error.is::<crate::turn_runtime_snapshot::NativeHistoryUnavailable>() {
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    reason,
+                )
+                .await;
+                return;
+            }
             if !self
                 .report_turn_failure(
                     outcome.started_notification.thread_id.clone(),
@@ -3401,7 +3431,7 @@ impl MessageProcessor {
             })
             .collect::<HashMap<_, _>>();
         let resolved_artifacts = self
-            .resolve_provider_artifact_inputs(
+            .resolve_owned_provider_artifact_inputs(
                 outcome.started_notification.workspace_id.as_str(),
                 outcome.materialization.input.as_slice(),
             )
@@ -3434,6 +3464,7 @@ impl MessageProcessor {
             &runtime_environment,
             history.as_slice(),
             &mut agent_skill_overlay,
+            &skill_catalog,
             Some(&prepared_history),
         )
         .await
@@ -3445,13 +3476,6 @@ impl MessageProcessor {
         Ok(PreparedApiProviderTurnStart {
             outcome,
             user_message_capability_attachments: Vec::new(),
-            workspace_skill_policies,
-            skill_catalog,
-            agent_skill_overlay,
-            resolved_artifacts,
-            runtime_environment,
-            history,
-            effective_reasoning_effort,
             permission_profile,
             execution_security_snapshot,
         })
@@ -9325,7 +9349,7 @@ impl MessageProcessor {
                     )
                     .await?;
                     let history = self
-                        .materialize_historical_artifacts(
+                        .materialize_cli_historical_artifacts(
                             outcome.started_notification.workspace_id.as_str(),
                             accepted.messages.clone(),
                         )
@@ -9598,75 +9622,60 @@ impl MessageProcessor {
     pub(crate) async fn materialize_historical_artifacts(
         &self,
         workspace_id: &str,
-        mut history: Vec<ChatMessage>,
+        history: Vec<ChatMessage>,
     ) -> anyhow::Result<Vec<ChatMessage>> {
-        scope_current_stage(Stage::HistoryArtifacts, async {
-            for (message_index, message) in history.iter_mut().enumerate() {
-                for (part_index, part) in message.content_parts.iter_mut().enumerate() {
-                    let (attachment, expected_image) = match part {
-                        pioneer_provider::MessageContentPart::Image { image } => (image, true),
-                        pioneer_provider::MessageContentPart::File { file } => (file, false),
-                        pioneer_provider::MessageContentPart::Text { .. }
-                        | pioneer_provider::MessageContentPart::Audio { .. }
-                        | pioneer_provider::MessageContentPart::Video { .. } => continue,
-                    };
-                    let Some(artifact) = attachment.artifact.as_ref() else {
-                        continue;
-                    };
-                    if !matches!(
-                        &attachment.source,
-                        pioneer_provider::AttachmentDataSource::Reference { reference }
-                            if reference == &format!("pioneer-artifact:{}", artifact.artifact_id)
-                    ) {
-                        continue;
-                    }
-                    anyhow::ensure!(
-                        artifact.workspace_id.is_empty() || artifact.workspace_id == workspace_id,
-                        "historical attachment {message_index}:{part_index} belongs to another workspace"
-                    );
-                    let version_id = artifact.artifact_version_id.as_deref().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "historical attachment {message_index}:{part_index} has no accepted artifact version"
-                        )
-                    })?;
-                    let resolved = self
-                        .artifact_service
-                        .resolve_provider_attachment(
-                            workspace_id,
-                            artifact.artifact_id.as_str(),
-                            Some(version_id),
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "failed to materialize accepted historical artifact `{}` version `{version_id}`",
-                                artifact.artifact_id
-                            )
-                        })?;
-                    anyhow::ensure!(
-                        resolved.version_id.as_deref() == Some(version_id),
-                        "historical artifact resolver changed the accepted version"
-                    );
-                    let resolved_is_image = match resolved.content_type {
-                        pioneer_provider::InputContentType::Image => true,
-                        pioneer_provider::InputContentType::File
-                        | pioneer_provider::InputContentType::Text => false,
-                        pioneer_provider::InputContentType::Audio
-                        | pioneer_provider::InputContentType::Video => anyhow::bail!(
-                            "historical artifact {message_index}:{part_index} has unsupported content type {:?}",
-                            resolved.content_type
-                        ),
-                    };
-                    anyhow::ensure!(
-                        resolved_is_image == expected_image,
-                        "historical attachment kind changed after accepted capture"
-                    );
-                    *attachment = resolved.attachment;
-                }
-            }
-            Ok(history)
-        })
+        crate::turn_runtime_snapshot::materialize_owned_history(
+            self.artifact_service.as_ref(),
+            workspace_id,
+            history,
+        )
         .await
+    }
+
+    async fn materialize_cli_historical_artifacts(
+        &self,
+        workspace_id: &str,
+        history: Vec<ChatMessage>,
+    ) -> anyhow::Result<Vec<ChatMessage>> {
+        // Native consumers retain owned bytes. CLI delivery uses its existing
+        // file transport, after the same bounded exact-version validation.
+        let mut history = self
+            .materialize_historical_artifacts(workspace_id, history)
+            .await?;
+        for message in &mut history {
+            for part in &mut message.content_parts {
+                let expected_kind = part.kind();
+                let attachment = match part {
+                    pioneer_provider::MessageContentPart::Image { image } => image,
+                    pioneer_provider::MessageContentPart::File { file } => file,
+                    pioneer_provider::MessageContentPart::Audio { audio } => audio,
+                    pioneer_provider::MessageContentPart::Video { video } => video,
+                    pioneer_provider::MessageContentPart::Text { .. } => continue,
+                };
+                let Some(artifact) = attachment.artifact.as_ref() else {
+                    continue;
+                };
+                let version = artifact
+                    .artifact_version_id
+                    .as_deref()
+                    .context("CLI historical artifact has no accepted version")?;
+                let resolved = self
+                    .artifact_service
+                    .resolve_provider_attachment(workspace_id, &artifact.artifact_id, Some(version))
+                    .await?;
+                anyhow::ensure!(
+                    resolved.artifact_id == artifact.artifact_id
+                        && resolved.version_id.as_deref() == Some(version)
+                        && resolved.content_type == expected_kind
+                        && resolved.attachment.sha256 == attachment.sha256
+                        && resolved.attachment.size_bytes == attachment.size_bytes
+                        && resolved.attachment.mime_type == attachment.mime_type,
+                    "CLI historical artifact changed after accepted validation"
+                );
+                *attachment = resolved.attachment;
+            }
+        }
+        Ok(history)
     }
 
     async fn persist_cli_runtime_prompt_manifest(

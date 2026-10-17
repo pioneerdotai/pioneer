@@ -1,6 +1,4 @@
 use super::{ActiveTurnRequest, RecoveryAttemptRequest};
-use pioneer_protocol::{TurnCapabilityKind, UserInput};
-use pioneer_provider::InputContentType;
 
 pub(super) fn apply_recovery_adjustments(
     turn_request: &mut ActiveTurnRequest,
@@ -16,27 +14,8 @@ pub(super) fn apply_recovery_adjustments(
     turn_request.execution_options.context_overflow_recovery = request.compact_history;
     turn_request.execution_options.context_recovery_deadline_ms =
         request.context_recovery_deadline_ms;
-    if request.disable_tool_calling {
-        turn_request.capabilities.retain(|capability| {
-            !matches!(
-                capability.kind,
-                TurnCapabilityKind::McpServer { .. } | TurnCapabilityKind::McpTool { .. }
-            )
-        });
-    }
-    if request.disable_image_input {
-        turn_request.input.retain(|input| {
-            !matches!(
-                input,
-                UserInput::Image { .. } | UserInput::LocalImage { .. }
-            )
-        });
-        turn_request
-            .resolved_artifacts
-            .retain(|artifact| artifact.content_type != InputContentType::Image);
-    }
     turn_request.execution_options.force_non_stream = request.force_non_stream;
-    turn_request.execution_options.disable_tool_calling = request.disable_tool_calling;
+    // Legacy adjustment flags never grant permission to drop accepted semantics.
     turn_request.execution_options.continue_generation_hint = request.continue_generation;
     turn_request.retained_provider_history = request.retained_provider_history.clone();
     turn_request.execution_checkpoint_context = request.execution_checkpoint_context.clone();
@@ -63,7 +42,7 @@ mod tests {
         build_execution_checkpoint_payload,
     };
     use pioneer_provider::ChatMessage;
-    use pioneer_provider::MessageAttachment;
+    use pioneer_provider::{InputContentType, MessageAttachment};
     use std::collections::HashMap;
 
     fn empty_skill_catalog() -> pioneer_skills::SkillCatalogSnapshot {
@@ -82,7 +61,18 @@ mod tests {
             mode: ThreadMode::Agent,
             hook_runtime_context: crate::AgentTurnHookRuntimeContext::default(),
             model: "test-model".to_owned(),
-            provider_name: "test-provider".to_owned(),
+            provider_name: "azure-openai".to_owned(),
+            azure_connection: Some(
+                pioneer_provider::AzureResolvedConnection::from_values(
+                    "resource-before".into(),
+                    "deployment-before".into(),
+                    "v1".into(),
+                    None,
+                )
+                .unwrap(),
+            ),
+            provider_model_contract: None,
+            initial_preparation: None,
             reasoning: None,
             workspace_skill_policies:
                 HashMap::<pioneer_skills::SkillPolicyKey, WorkspaceSkillPolicy>::new(),
@@ -126,7 +116,9 @@ mod tests {
             execution_checkpoint_context: None,
         };
 
+        let accepted_connection = turn_request.azure_connection.clone();
         apply_recovery_adjustments(&mut turn_request, &request);
+        assert_eq!(turn_request.azure_connection, accepted_connection);
 
         assert_eq!(
             turn_request.input,
@@ -158,6 +150,9 @@ mod tests {
             hook_runtime_context: crate::AgentTurnHookRuntimeContext::default(),
             model: "test-model".to_owned(),
             provider_name: "test-provider".to_owned(),
+            azure_connection: None,
+            provider_model_contract: None,
+            initial_preparation: None,
             reasoning: None,
             workspace_skill_policies:
                 HashMap::<pioneer_skills::SkillPolicyKey, WorkspaceSkillPolicy>::new(),
@@ -190,6 +185,7 @@ mod tests {
                 attachment_kinds: Vec::new(),
             },
             ExecutionCheckpointWindowSummary {
+                progress: None,
                 window_id: Some("window_4".to_owned()),
                 window_index: 4,
                 started_at_unix_ms: Some(1),
@@ -265,6 +261,7 @@ mod tests {
                 total_wall_clock_ms: 0,
                 total_provider_tokens: 0,
                 provider_token_usage_unknown: false,
+                consecutive_unconfirmed_progress_windows: 0,
                 consecutive_no_progress_windows: 0,
             }
         );
@@ -279,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_adjustments_downgrade_unsupported_tools_and_images() {
+    fn recovery_adjustments_preserve_inputs_despite_legacy_degradation_flags() {
         let mut turn_request = ActiveTurnRequest {
             turn_id: "turn_downgrade".to_owned(),
             execution_window_index: 1,
@@ -287,6 +284,9 @@ mod tests {
             hook_runtime_context: crate::AgentTurnHookRuntimeContext::default(),
             model: "test-model".to_owned(),
             provider_name: "test-provider".to_owned(),
+            azure_connection: None,
+            provider_model_contract: None,
+            initial_preparation: None,
             reasoning: None,
             workspace_skill_policies:
                 HashMap::<pioneer_skills::SkillPolicyKey, WorkspaceSkillPolicy>::new(),
@@ -381,17 +381,17 @@ mod tests {
 
         apply_recovery_adjustments(&mut turn_request, &request);
 
-        assert!(turn_request.execution_options.disable_tool_calling);
-        assert_eq!(turn_request.input.len(), 1);
-        assert_eq!(turn_request.capabilities.len(), 1);
+        assert!(!turn_request.execution_options.disable_tool_calling);
+        assert_eq!(turn_request.input.len(), 3);
+        assert_eq!(turn_request.capabilities.len(), 3);
         assert!(matches!(
             turn_request.capabilities[0].kind,
             TurnCapabilityKind::Skill { .. }
         ));
-        assert_eq!(turn_request.resolved_artifacts.len(), 1);
+        assert_eq!(turn_request.resolved_artifacts.len(), 2);
         assert_eq!(
             turn_request.resolved_artifacts[0].content_type,
-            InputContentType::File
+            InputContentType::Image
         );
     }
 }

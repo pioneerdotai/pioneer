@@ -66,10 +66,21 @@ fn capsule_step_with_rounds(
         )
         .await
         .expect("start independent root execution");
+        let status =
+            wait_for_task_status(store.clone(), &response.task.id, TaskStatus::Completed).await;
+        let diagnostic_lineage =
+            wait_for_child_lineage_for_run(store.clone(), &response.run.as_ref().unwrap().id).await;
+        let diagnostic_turn = store
+            .get_turn(
+                &diagnostic_lineage.child_thread_id,
+                &diagnostic_lineage.child_turn_id,
+            )
+            .await
+            .unwrap();
         assert_eq!(
-            wait_for_task_status(store.clone(), &response.task.id, TaskStatus::Completed).await,
+            status,
             TaskStatus::Completed,
-            "capsule step {step} must finish"
+            "capsule step {step} must finish; child={diagnostic_turn:?}"
         );
         let lineage =
             wait_for_child_lineage_for_run(store.clone(), &response.run.unwrap().id).await;

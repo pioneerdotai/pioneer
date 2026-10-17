@@ -38,23 +38,11 @@ impl GatewayArtifactToolProvider {
     }
 }
 
-impl GatewayArtifactFinalizationProvider {
-    pub(crate) fn new(processor: Weak<MessageProcessor>) -> Self {
-        Self { processor }
-    }
-
-    fn processor(&self) -> Result<Arc<MessageProcessor>, String> {
-        self.processor
-            .upgrade()
-            .ok_or_else(|| "message processor is no longer available".to_owned())
-    }
-}
-
-#[async_trait]
-impl TurnToolProvider for GatewayArtifactToolProvider {
-    async fn materialize_turn_tools(
+impl GatewayArtifactToolProvider {
+    async fn bind_turn_tools(
         &self,
         context: TurnToolContext,
+        restore: Option<(Option<&str>, &[Vec<pioneer_tools::ConfiguredToolSpec>])>,
     ) -> Result<TurnToolMaterialization, String> {
         let processor = self.processor()?;
         let can_read = processor
@@ -87,16 +75,28 @@ impl TurnToolProvider for GatewayArtifactToolProvider {
             )
             .await
             .is_ok();
-        let artifact_state = processor
-            .artifact_tool_state_for_turn(context.turn_id.as_str())
-            .await;
+        let native_fence = processor
+            .crud_store
+            .native_artifact_execution_fence(
+                &context.workspace_id,
+                &context.thread_id,
+                &context.turn_id,
+                processor.turn_execution_owner_id.as_ref(),
+            )
+            .await
+            .map_err(|_| "native artifact execution binding unavailable".to_owned())?;
         let agent_tool_context = context.clone();
         let context_for_results = context.clone();
         let artifact_context = ArtifactToolContext {
             workspace_id: context.workspace_id,
             thread_id: context.thread_id,
             turn_id: context.turn_id,
+            native_fence,
         };
+        let artifact_state = processor
+            .artifact_tool_state_for_turn(&artifact_context, restore.is_none())
+            .await
+            .map_err(|_| "native artifact obligations unavailable".to_owned())?;
         let artifact_handler = Arc::new(GatewayAuthorizedArtifactToolHandler {
             processor: processor.clone(),
             context: artifact_context.clone(),
@@ -126,9 +126,18 @@ impl TurnToolProvider for GatewayArtifactToolProvider {
             bundle.handlers.push((name, artifact_handler.clone()));
         }
 
-        let agent_actions = processor
-            .materialize_agent_action_tools(agent_tool_context)
-            .await?;
+        let agent_actions = if let Some((contract, _)) = restore {
+            super::agent_action_tools::restore_native_agent_action_tools(
+                processor.clone(),
+                agent_tool_context,
+                contract,
+            )
+            .await?
+        } else {
+            processor
+                .materialize_agent_action_tools(agent_tool_context)
+                .await?
+        };
         let mut bundles = (!bundle.specs.is_empty())
             .then_some(bundle)
             .into_iter()
@@ -137,11 +146,67 @@ impl TurnToolProvider for GatewayArtifactToolProvider {
         bundles.push(processor.html_tools(context_for_results.clone()));
         bundles.push(processor.thread_result_tools(context_for_results));
 
+        if let Some((_, accepted)) = restore {
+            if bundles.len() != accepted.len() {
+                return Err("accepted Turn tool bundles changed".to_owned());
+            }
+            for (bundle, original) in bundles.iter().zip(accepted) {
+                let actual = crate::turn_runtime_snapshot::to_snapshot_json(
+                    &bundle.specs,
+                    "Turn tool specs",
+                )
+                .map_err(|_| "Turn tool specs cannot be encoded".to_owned())?;
+                let expected = crate::turn_runtime_snapshot::to_snapshot_json(
+                    original,
+                    "accepted Turn tool specs",
+                )
+                .map_err(|_| "accepted Turn tool specs cannot be encoded".to_owned())?;
+                if actual != expected {
+                    return Err("accepted Turn tool specs changed".to_owned());
+                }
+            }
+        }
         Ok(TurnToolMaterialization {
             bundles,
             diagnostics: agent_actions.diagnostics,
             initiating_thread_id: agent_actions.initiating_thread_id,
+            native_agent_action_contract: agent_actions.native_agent_action_contract,
         })
+    }
+}
+
+impl GatewayArtifactFinalizationProvider {
+    pub(crate) fn new(processor: Weak<MessageProcessor>) -> Self {
+        Self { processor }
+    }
+
+    fn processor(&self) -> Result<Arc<MessageProcessor>, String> {
+        self.processor
+            .upgrade()
+            .ok_or_else(|| "message processor is no longer available".to_owned())
+    }
+}
+
+#[async_trait]
+impl TurnToolProvider for GatewayArtifactToolProvider {
+    async fn materialize_turn_tools(
+        &self,
+        context: TurnToolContext,
+    ) -> Result<TurnToolMaterialization, String> {
+        self.bind_turn_tools(context, None).await
+    }
+
+    async fn restore_turn_tools(
+        &self,
+        context: TurnToolContext,
+        native_agent_action_contract: Option<&str>,
+        accepted_specs: &[Vec<pioneer_tools::ConfiguredToolSpec>],
+    ) -> Result<TurnToolMaterialization, String> {
+        self.bind_turn_tools(
+            context,
+            Some((native_agent_action_contract, accepted_specs)),
+        )
+        .await
     }
 
     async fn authorize_skill_continuation(
@@ -388,13 +453,86 @@ impl MessageProcessor {
 
     pub(crate) async fn artifact_tool_state_for_turn(
         &self,
-        turn_id: &str,
-    ) -> Arc<ArtifactToolState> {
-        let mut states = self.artifact_tool_states.lock().await;
-        states
-            .entry(turn_id.to_owned())
-            .or_insert_with(|| Arc::new(ArtifactToolState::default()))
-            .clone()
+        context: &ArtifactToolContext,
+        initialize: bool,
+    ) -> Result<Arc<ArtifactToolState>> {
+        let state = {
+            let mut states = self.artifact_tool_states.lock().await;
+            states
+                .entry(context.turn_id.clone())
+                .or_insert_with(|| Arc::new(ArtifactToolState::default()))
+                .clone()
+        };
+        {
+            let _mutation = state.mutation_guard().await;
+            self.artifact_service
+                .restore_native_artifact_state(context, &state, initialize)
+                .await
+                .map_err(|_| anyhow::anyhow!("native artifact obligations unavailable"))?;
+        }
+        Ok(state)
+    }
+
+    pub(super) async fn persist_native_execution_preparation(
+        &self,
+        preparation: pioneer_protocol::NativeTerminalEffectPreparation,
+        initial_turn: bool,
+        prepare_artifact_obligations: bool,
+        execution_owner_generation: Option<u64>,
+    ) -> Result<()> {
+        let thread = preparation.thread_id.clone();
+        let turn = preparation.turn_id.clone();
+        self.crud_store
+            .persist_native_cancellation_context(
+                preparation,
+                self.turn_execution_owner_id.as_ref(),
+                super::now_timestamp_secs(),
+                initial_turn,
+            )
+            .await?;
+        // This ACK gates normal provider work in every fresh native mode.
+        // Stop fallback persists cancellation independently of artifact state.
+        if initial_turn && prepare_artifact_obligations {
+            let context = self
+                .artifact_context_for_finalization(&thread, &turn)
+                .await?;
+            anyhow::ensure!(context.native_fence.as_ref().is_some_and(|fence|
+                Some(fence.owner_generation) == execution_owner_generation),
+                "initial artifact execution epoch changed");
+            self.artifact_tool_state_for_turn(&context, true).await?;
+        }
+        Ok(())
+    }
+
+    async fn artifact_context_for_finalization(
+        &self,
+        thread: &str,
+        turn: &str,
+    ) -> Result<ArtifactToolContext> {
+        let (actual_thread, workspace) = self
+            .crud_store
+            .get_turn_location(turn)
+            .await?
+            .context("artifact Turn scope unavailable")?;
+        anyhow::ensure!(
+            actual_thread == thread,
+            "artifact finalization scope differs"
+        );
+        let native_fence = self
+            .crud_store
+            .native_artifact_execution_fence(
+                &workspace,
+                thread,
+                turn,
+                self.turn_execution_owner_id.as_ref(),
+            )
+            .await?;
+        Ok(ArtifactToolContext {
+            workspace_id: workspace,
+            thread_id: thread.to_owned(),
+            turn_id: turn.to_owned(),
+            native_fence,
+        })
     }
 
     pub(super) async fn artifact_finalization_decision(
@@ -403,27 +541,54 @@ impl MessageProcessor {
         turn_id: &str,
         final_text: &str,
     ) -> TurnFinalizationDecision {
-        let diagnostics = self
-            .artifact_finalization_diagnostics_for_final_text(turn_id, Some(final_text))
-            .await;
+        let diagnostics = match self
+            .artifact_finalization_diagnostics_for_final_text(thread_id, turn_id, Some(final_text))
+            .await
+        {
+            Ok(diagnostics) => diagnostics,
+            Err(_) => {
+                return TurnFinalizationDecision::Fail {
+                    message: "native artifact obligations unavailable for finalization".to_owned(),
+                };
+            }
+        };
         if diagnostics.is_empty() {
             return TurnFinalizationDecision::Allow;
         }
 
-        let retry_already_used = self
-            .artifact_finalization_retry_turns
-            .lock()
-            .await
-            .contains(turn_id);
+        let retry_already_used = match self.artifact_retry_used(thread_id, turn_id).await {
+            Ok(used) => used,
+            Err(_) => {
+                return TurnFinalizationDecision::Fail {
+                    message: "native artifact retry state unavailable".to_owned(),
+                };
+            }
+        };
         if let Some(instruction) =
             artifact_finalization_diagnostics::artifact_finalization_retry_instruction(
                 diagnostics.as_slice(),
                 retry_already_used,
             )
-            && self.mark_artifact_finalization_retry_used(turn_id).await
         {
-            self.log_artifact_finalization_diagnostics(thread_id, turn_id, diagnostics.as_slice());
-            return TurnFinalizationDecision::Retry { instruction };
+            match self
+                .mark_artifact_finalization_retry_used(thread_id, turn_id)
+                .await
+            {
+                Ok(true) => {
+                    self.log_artifact_finalization_diagnostics(
+                        thread_id,
+                        turn_id,
+                        diagnostics.as_slice(),
+                    );
+                    return TurnFinalizationDecision::Retry { instruction };
+                }
+                Ok(false) => {}
+                Err(_) => {
+                    return TurnFinalizationDecision::Fail {
+                        message: "native artifact retry ACK unavailable".to_owned(),
+                    };
+                }
+            }
         }
 
         self.log_artifact_finalization_diagnostics(thread_id, turn_id, diagnostics.as_slice());
@@ -445,9 +610,26 @@ impl MessageProcessor {
             .await
             .get(turn_id)
             .cloned();
-        let diagnostics = self
-            .artifact_finalization_diagnostics_for_final_text(turn_id, final_text.as_deref())
-            .await;
+        let diagnostics = match self
+            .artifact_finalization_diagnostics_for_final_text(
+                thread_id,
+                turn_id,
+                final_text.as_deref(),
+            )
+            .await
+        {
+            Ok(diagnostics) => diagnostics,
+            Err(_) => {
+                self.report_turn_failure(
+                    thread_id.to_owned(),
+                    turn_id.to_owned(),
+                    TurnFailureRecoveryKind::ArtifactFinalization,
+                    "native artifact obligations or final message unavailable".to_owned(),
+                )
+                .await;
+                return true;
+            }
+        };
         if diagnostics.is_empty() {
             return false;
         }
@@ -467,28 +649,98 @@ impl MessageProcessor {
 
     async fn artifact_finalization_diagnostics_for_final_text(
         &self,
+        thread_id: &str,
         turn_id: &str,
         final_text: Option<&str>,
-    ) -> Vec<artifact_finalization_diagnostics::ArtifactFinalizationDiagnostic> {
-        let prepared_outputs = self
-            .artifact_tool_states
-            .lock()
-            .await
-            .get(turn_id)
-            .map(|state| state.prepared_outputs())
-            .unwrap_or_default();
-        let output_dir = self
-            .artifact_output_dirs
-            .lock()
-            .await
-            .get(turn_id)
-            .map(|output| output.path.display().to_string());
-
-        artifact_finalization_diagnostics::diagnose_artifact_finalization(
-            prepared_outputs.as_slice(),
+    ) -> Result<Vec<artifact_finalization_diagnostics::ArtifactFinalizationDiagnostic>> {
+        let context = self
+            .artifact_context_for_finalization(thread_id, turn_id)
+            .await?;
+        let (prepared_outputs, output_dir, restored_text, pending_registrations) =
+            if context.native_fence.is_some() {
+                let state = self.artifact_tool_state_for_turn(&context, false).await?;
+                let prepared = state
+                    .try_prepared_outputs()
+                    .map_err(|_| anyhow::anyhow!("artifact state unavailable"))?;
+                let snapshot = self
+                    .crud_store
+                    .get_turn_runtime_snapshot(turn_id)
+                    .await?
+                    .context("artifact accepted environment unavailable")?;
+                anyhow::ensure!(
+                    snapshot.workspace_id == context.workspace_id
+                        && snapshot.thread_id == thread_id,
+                    "artifact environment scope differs"
+                );
+                let environment: std::collections::HashMap<String, String> =
+                    crate::turn_runtime_snapshot::from_snapshot_json(
+                        &snapshot.runtime_environment_json,
+                        "artifact accepted environment",
+                    )?;
+                let output_dir = environment
+                    .get(pioneer_artifacts::ARTIFACT_OUTPUT_DIR_ENV)
+                    .cloned();
+                let restored_text = if final_text.is_none() {
+                    Some(
+                        self.crud_store
+                            .native_artifact_final_text(&context.workspace_id, thread_id, turn_id)
+                            .await?
+                            .context("native artifact final message unavailable")?,
+                    )
+                } else {
+                    None
+                };
+                let pending = state.try_pending_registration_count().map_err(|_| {
+                    anyhow::anyhow!("artifact pending registration state unavailable")
+                })?;
+                (prepared, output_dir, restored_text, pending)
+            } else {
+                let prepared = self
+                    .artifact_tool_states
+                    .lock()
+                    .await
+                    .get(turn_id)
+                    .map(|state| state.try_prepared_outputs())
+                    .transpose()
+                    .map_err(|_| anyhow::anyhow!("artifact state unavailable"))?
+                    .unwrap_or_default();
+                let output = self
+                    .artifact_output_dirs
+                    .lock()
+                    .await
+                    .get(turn_id)
+                    .map(|output| output.path.display().to_string());
+                (prepared, output, None, 0)
+            };
+        let mut diagnostics = artifact_finalization_diagnostics::diagnose_artifact_finalization(
+            &prepared_outputs,
             output_dir.as_deref(),
-            final_text,
-        )
+            final_text.or(restored_text.as_deref()),
+        );
+        if pending_registrations > 0 {
+            diagnostics.push(artifact_finalization_diagnostics::ArtifactFinalizationDiagnostic {
+                code: artifact_finalization_diagnostics::ArtifactFinalizationDiagnosticCode::RegistrationUnconfirmed,
+                message: "artifact registration has no confirmed exact-version receipt".to_owned(),
+                path: None,
+            });
+        }
+        Ok(diagnostics)
+    }
+
+    async fn artifact_retry_used(&self, thread: &str, turn: &str) -> Result<bool> {
+        let context = self.artifact_context_for_finalization(thread, turn).await?;
+        if context.native_fence.is_some() {
+            let state = self.artifact_tool_state_for_turn(&context, false).await?;
+            state
+                .try_retry_used()
+                .map_err(|_| anyhow::anyhow!("artifact retry state unavailable"))
+        } else {
+            Ok(self
+                .artifact_finalization_retry_turns
+                .lock()
+                .await
+                .contains(turn))
+        }
     }
 
     fn log_artifact_finalization_diagnostics(
@@ -509,9 +761,25 @@ impl MessageProcessor {
         }
     }
 
-    async fn mark_artifact_finalization_retry_used(&self, turn_id: &str) -> bool {
-        let mut retry_turns = self.artifact_finalization_retry_turns.lock().await;
-        retry_turns.insert(turn_id.to_owned())
+    async fn mark_artifact_finalization_retry_used(
+        &self,
+        thread: &str,
+        turn: &str,
+    ) -> Result<bool> {
+        let context = self.artifact_context_for_finalization(thread, turn).await?;
+        if context.native_fence.is_some() {
+            let state = self.artifact_tool_state_for_turn(&context, false).await?;
+            self.artifact_service
+                .mark_native_artifact_retry_used(&context, &state)
+                .await
+                .map_err(|_| anyhow::anyhow!("artifact retry ACK unavailable"))
+        } else {
+            Ok(self
+                .artifact_finalization_retry_turns
+                .lock()
+                .await
+                .insert(turn.to_owned()))
+        }
     }
 
     pub(super) async fn clear_artifact_finalization_state(&self, turn_id: &str) {

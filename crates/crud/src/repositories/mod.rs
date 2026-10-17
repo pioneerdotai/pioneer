@@ -38,6 +38,7 @@ pub mod mcp_audit_event;
 pub mod mcp_server_catalog_snapshot;
 pub mod mcp_server_installation;
 pub(crate) mod membership;
+pub(crate) mod native_artifact_obligations;
 pub(crate) mod native_cancellation_context;
 pub(crate) mod native_event_cleanup;
 #[cfg(test)]

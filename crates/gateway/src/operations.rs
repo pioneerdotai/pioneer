@@ -620,6 +620,7 @@ mod tests {
                     response_reserve_tokens: 16_000,
                 },
                 tools: GatewayToolsConfig {
+                    no_progress_mode: None,
                     web: GatewayWebToolsConfig::default(),
                     computer_use: GatewayComputerUseToolsConfig::default(),
                     budget: GatewayToolLoopBudgetConfig::default(),

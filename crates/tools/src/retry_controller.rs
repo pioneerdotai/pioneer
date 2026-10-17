@@ -3,7 +3,8 @@ use crate::output_policy::ToolRecoveryView;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolRetryBudgetConfig {
     pub max_recoverable_retry_rounds_per_episode: u32,
     pub max_same_tool_error_retries_per_episode: u32,
@@ -97,6 +98,7 @@ pub fn default_tool_retry_class_budgets() -> Vec<ToolRetryClassBudget> {
 
 #[derive(Debug, Clone)]
 pub struct ToolRetryObservation {
+    pub progress: crate::ToolProgressEvidence,
     pub item_id: String,
     pub item_type: String,
     pub attempt_number: u32,
@@ -120,6 +122,7 @@ impl ToolRetryObservation {
     ) -> Self {
         Self {
             item_id: item_id.into(),
+            progress: Default::default(),
             item_type: item_type.into(),
             attempt_number,
             tool_name: tool_name.into(),
@@ -133,6 +136,11 @@ impl ToolRetryObservation {
 
     pub fn with_recovery_view(mut self, recovery_view: Option<ToolRecoveryView>) -> Self {
         self.recovery_view = recovery_view;
+        self
+    }
+
+    pub fn with_progress(mut self, progress: crate::ToolProgressEvidence) -> Self {
+        self.progress = progress;
         self
     }
 
@@ -402,14 +410,160 @@ pub struct ToolRetryEpisodeState {
     pub by_failure_signature: HashMap<ToolFailureSignature, u32>,
 }
 
+/// The compound signature is represented as a list, never a JSON object key.
+/// This is the checkpoint view of the existing controller, not a second budget.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolRetryCheckpoint {
+    pub schema_version: u32,
+    pub exhausted: bool,
+    pub active_episode: Option<ToolRetryCheckpointEpisode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolRetryCheckpointEpisode {
+    pub total_retry_rounds: u32,
+    pub by_tool_name: Vec<(String, u32)>,
+    pub by_failure_signature: Vec<(String, String, ToolErrorClass, u32)>,
+}
+
 #[derive(Debug)]
 pub struct ToolRetryController {
     budget: ToolRetryBudgetConfig,
     class_limits: HashMap<ToolErrorClass, u32>,
+    exhausted: bool,
     active_episode: Option<ToolRetryEpisodeState>,
 }
 
 impl ToolRetryController {
+    pub fn checkpoint(&self) -> Result<ToolRetryCheckpoint, &'static str> {
+        let active_episode = self
+            .active_episode
+            .as_ref()
+            .map(|episode| {
+                if episode.by_tool_name.len() > 256
+                    || episode.by_failure_signature.len() > 256
+                    || episode.by_tool_name.keys().any(|name| name.len() > 4096)
+                    || episode.by_failure_signature.keys().any(|signature| {
+                        signature.tool_name.len() > 4096
+                            || !valid_budget_digest(&signature.arguments_fingerprint)
+                    })
+                {
+                    return Err("retry checkpoint exceeds its bounds");
+                }
+                let mut by_tool_name = episode
+                    .by_tool_name
+                    .iter()
+                    .map(|(name, count)| (name.clone(), *count))
+                    .collect::<Vec<_>>();
+                by_tool_name.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut by_failure_signature = episode
+                    .by_failure_signature
+                    .iter()
+                    .map(|(signature, count)| {
+                        (
+                            signature.tool_name.clone(),
+                            signature.arguments_fingerprint.clone(),
+                            signature.error_class,
+                            *count,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                by_failure_signature.sort_by(|a, b| {
+                    (&a.0, &a.1, error_class_code(a.2)).cmp(&(&b.0, &b.1, error_class_code(b.2)))
+                });
+                Ok(ToolRetryCheckpointEpisode {
+                    total_retry_rounds: episode.total_retry_rounds,
+                    by_tool_name,
+                    by_failure_signature,
+                })
+            })
+            .transpose()?;
+        Ok(ToolRetryCheckpoint {
+            schema_version: 2,
+            exhausted: self.exhausted,
+            active_episode,
+        })
+    }
+
+    pub fn from_checkpoint(
+        budget: ToolRetryBudgetConfig,
+        checkpoint: ToolRetryCheckpoint,
+    ) -> Result<Self, &'static str> {
+        if checkpoint.schema_version != 2
+            || (checkpoint.exhausted && checkpoint.active_episode.is_some())
+        {
+            return Err("retry checkpoint version is unavailable");
+        }
+        let mut controller = Self::new(budget);
+        controller.exhausted = checkpoint.exhausted;
+        if let Some(saved) = checkpoint.active_episode {
+            if saved.by_tool_name.len() > 256
+                || saved.by_failure_signature.len() > 256
+                || saved.total_retry_rounds == 0
+                || saved.total_retry_rounds
+                    > controller.budget.max_recoverable_retry_rounds_per_episode
+            {
+                return Err("retry checkpoint episode is invalid");
+            }
+            let mut episode = ToolRetryEpisodeState {
+                total_retry_rounds: saved.total_retry_rounds,
+                ..Default::default()
+            };
+            for (name, count) in saved.by_tool_name {
+                if name.is_empty()
+                    || name.len() > 4096
+                    || count == 0
+                    || count > controller.budget.max_retries_per_tool_name_per_episode
+                    || episode.by_tool_name.insert(name, count).is_some()
+                {
+                    return Err("retry checkpoint tool counters are invalid");
+                }
+            }
+            let mut totals = HashMap::<String, u64>::new();
+            for (tool_name, arguments_fingerprint, error_class, count) in saved.by_failure_signature
+            {
+                if tool_name.is_empty()
+                    || tool_name.len() > 4096
+                    || !valid_budget_digest(&arguments_fingerprint)
+                    || count == 0
+                    || count > controller.class_limit(error_class)
+                    || count > controller.budget.max_same_tool_error_retries_per_episode
+                {
+                    return Err("retry checkpoint signature counters are invalid");
+                }
+                *totals.entry(tool_name.clone()).or_default() += u64::from(count);
+                if episode
+                    .by_failure_signature
+                    .insert(
+                        ToolFailureSignature {
+                            tool_name,
+                            arguments_fingerprint,
+                            error_class,
+                        },
+                        count,
+                    )
+                    .is_some()
+                {
+                    return Err("retry checkpoint has duplicate signatures");
+                }
+            }
+            if totals.is_empty()
+                || totals.len() != episode.by_tool_name.len()
+                || episode
+                    .by_tool_name
+                    .iter()
+                    .any(|(name, count)| totals.get(name) != Some(&u64::from(*count)))
+                || totals.values().sum::<u64>() < u64::from(episode.total_retry_rounds)
+            {
+                return Err("retry checkpoint counters disagree");
+            }
+            controller.active_episode = Some(episode);
+        }
+        Ok(controller)
+    }
+
     pub fn new(budget: ToolRetryBudgetConfig) -> Self {
         Self::with_class_budgets(budget, default_tool_retry_class_budgets())
     }
@@ -426,8 +580,14 @@ impl ToolRetryController {
         Self {
             budget: budget.normalized(),
             class_limits,
+            exhausted: false,
             active_episode: None,
         }
+    }
+
+    /// Capability mode survives a window/restart after a typed exhaustion.
+    pub fn is_exhausted(&self) -> bool {
+        self.exhausted
     }
 
     pub fn state_snapshot(&self) -> ToolRetryBudgetSnapshot {
@@ -437,6 +597,9 @@ impl ToolRetryController {
     }
 
     pub fn decide(&mut self, observations: &[ToolRetryObservation]) -> ToolRetryDecision {
+        // A new observed batch may resolve/start an episode. Restoring a checkpoint
+        // does neither: the native loop first reinstates exhausted capability mode.
+        self.exhausted = false;
         let mut candidates = observations
             .iter()
             .filter_map(RetryCandidate::from_observation)
@@ -484,7 +647,7 @@ impl ToolRetryController {
 
         for candidate in &candidates {
             let signature_used = projected_by_failure_signature
-                .get(&candidate.signature)
+                .get(&budget_signature(&candidate.signature))
                 .copied()
                 .unwrap_or(0);
             let class_limit = self.class_limit(candidate.error_class);
@@ -522,7 +685,8 @@ impl ToolRetryController {
                 };
                 return self.exhausted_and_close(entries, reason);
             }
-            projected_by_failure_signature.insert(candidate.signature.clone(), signature_next);
+            projected_by_failure_signature
+                .insert(budget_signature(&candidate.signature), signature_next);
         }
 
         let episode = {
@@ -533,7 +697,10 @@ impl ToolRetryController {
             episode.total_retry_rounds = episode.total_retry_rounds.saturating_add(1);
             for candidate in &candidates {
                 increment_string(&mut episode.by_tool_name, candidate.tool_name.as_str());
-                increment_signature(&mut episode.by_failure_signature, &candidate.signature);
+                increment_signature(
+                    &mut episode.by_failure_signature,
+                    &budget_signature(&candidate.signature),
+                );
             }
             episode.clone()
         };
@@ -566,6 +733,7 @@ impl ToolRetryController {
             drafts: vec![ToolRetryEventDraft::Exhausted { entries, reason }],
         };
         self.active_episode = None;
+        self.exhausted = true;
         decision
     }
 
@@ -666,7 +834,7 @@ impl ToolRetryController {
     ) -> u32 {
         episode
             .by_failure_signature
-            .get(signature)
+            .get(&budget_signature(signature))
             .copied()
             .unwrap_or(0)
     }
@@ -738,6 +906,25 @@ impl RetryCandidate {
     }
 }
 
+// Only budget state uses a bounded digest. Public failure identity and native
+// lifecycle facts keep their existing canonical argument representation.
+fn budget_signature(signature: &ToolFailureSignature) -> ToolFailureSignature {
+    use sha2::{Digest, Sha256};
+    ToolFailureSignature {
+        tool_name: signature.tool_name.clone(),
+        arguments_fingerprint: hex::encode(Sha256::digest(
+            signature.arguments_fingerprint.as_bytes(),
+        )),
+        error_class: signature.error_class,
+    }
+}
+fn valid_budget_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn increment_string(map: &mut HashMap<String, u32>, key: &str) {
     let next = map.get(key).copied().unwrap_or(0).saturating_add(1);
     map.insert(key.to_owned(), next);
@@ -805,6 +992,122 @@ fn error_class_code(error_class: ToolErrorClass) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_preserves_remaining_episode_budget_and_rejects_duplicate_counters() {
+        let budget = ToolRetryBudgetConfig::default();
+        let mut controller = ToolRetryController::new(budget.clone());
+        let failed = observation(
+            "read_file",
+            "{\"path\":\"owned-input\"}",
+            ToolOutcome::recoverable(
+                ToolErrorClass::NotFound,
+                "select an existing input",
+                false,
+                None,
+            ),
+        );
+        assert!(matches!(
+            controller.decide(&[failed.clone()]),
+            ToolRetryDecision::Retry { .. }
+        ));
+        let encoded = serde_json::to_vec(&controller.checkpoint().unwrap()).unwrap();
+        let checkpoint: ToolRetryCheckpoint = serde_json::from_slice(&encoded).unwrap();
+        let mut restored =
+            ToolRetryController::from_checkpoint(budget.clone(), checkpoint.clone()).unwrap();
+        assert_eq!(restored.state_snapshot(), controller.state_snapshot());
+        assert!(matches!(
+            controller.decide(&[failed.clone()]),
+            ToolRetryDecision::Retry { .. }
+        ));
+        assert!(matches!(
+            restored.decide(&[failed.clone()]),
+            ToolRetryDecision::Retry { .. }
+        ));
+        assert_eq!(restored.state_snapshot(), controller.state_snapshot());
+        assert!(matches!(
+            controller.decide(&[failed.clone()]),
+            ToolRetryDecision::Exhausted { .. }
+        ));
+        assert!(matches!(
+            restored.decide(&[failed]),
+            ToolRetryDecision::Exhausted { .. }
+        ));
+        let mut duplicate = checkpoint;
+        let episode = duplicate.active_episode.as_mut().unwrap();
+        episode
+            .by_failure_signature
+            .push(episode.by_failure_signature[0].clone());
+        assert!(ToolRetryController::from_checkpoint(budget.clone(), duplicate).is_err());
+        let mut unknown = controller.checkpoint().unwrap();
+        unknown.schema_version = 3;
+        assert!(ToolRetryController::from_checkpoint(budget, unknown).is_err());
+    }
+
+    #[test]
+    fn large_canonical_arguments_keep_bounded_retry_identity_and_exhaustion_after_restore() {
+        let budget = ToolRetryBudgetConfig {
+            max_recoverable_retry_rounds_per_episode: 8,
+            max_same_tool_error_retries_per_episode: 1,
+            max_retries_per_tool_name_per_episode: 8,
+        };
+        let body = "界".repeat(8000);
+        let first_arguments = serde_json::json!({"body": body, "a": 1}).to_string();
+        let reordered_arguments = format!(
+            "{{\"body\":{},\"a\":1}}",
+            serde_json::to_string(&body).unwrap()
+        );
+        let signature = ToolFailureSignature::from_arguments(
+            "apply_patch",
+            &first_arguments,
+            ToolErrorClass::ExecutionFailed,
+        );
+        assert!(signature.arguments_fingerprint.len() > 4096);
+        let mut warm = ToolRetryController::new(budget.clone());
+        assert!(matches!(
+            warm.decide(&[observation(
+                "apply_patch",
+                &first_arguments,
+                recoverable(ToolErrorClass::ExecutionFailed)
+            )]),
+            ToolRetryDecision::Retry { .. }
+        ));
+        let checkpoint = warm.checkpoint().unwrap();
+        let bytes = serde_json::to_vec(&checkpoint).unwrap();
+        assert!(
+            bytes.len() < 1024,
+            "large admitted arguments must not be retained in the checkpoint"
+        );
+        let mut cold = ToolRetryController::from_checkpoint(
+            budget.clone(),
+            serde_json::from_slice(&bytes).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(cold.decide(&[observation("apply_patch", &reordered_arguments, recoverable(ToolErrorClass::ExecutionFailed))]), ToolRetryDecision::Exhausted {reason: ToolRetryExhaustionReason::FailureSignature {signature: actual, used: 1, limit: 1}, ..} if actual == signature)
+        );
+        assert!(cold.is_exhausted());
+        let exhausted = cold.checkpoint().unwrap();
+        assert!(
+            ToolRetryController::from_checkpoint(budget.clone(), exhausted.clone())
+                .unwrap()
+                .is_exhausted()
+        );
+        let mut legacy = exhausted;
+        legacy.schema_version = 1;
+        assert!(ToolRetryController::from_checkpoint(budget.clone(), legacy).is_err());
+        let mut malformed = checkpoint.clone();
+        malformed
+            .active_episode
+            .as_mut()
+            .unwrap()
+            .by_failure_signature[0]
+            .1 = "not-a-digest".to_owned();
+        assert!(ToolRetryController::from_checkpoint(budget.clone(), malformed).is_err());
+        let mut contradictory = checkpoint;
+        contradictory.exhausted = true;
+        assert!(ToolRetryController::from_checkpoint(budget, contradictory).is_err());
+    }
 
     fn observation(tool_name: &str, arguments: &str, outcome: ToolOutcome) -> ToolRetryObservation {
         ToolRetryObservation::from_tool_outcome(

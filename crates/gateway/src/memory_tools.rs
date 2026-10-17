@@ -147,6 +147,129 @@ struct MemoryExecutionBoundary {
 }
 
 impl GatewayMemoryProvider {
+    async fn bind_memory_tools(
+        &self,
+        context: MemoryTurnContext,
+        accepted_specs: Option<&[Vec<pioneer_tools::ConfiguredToolSpec>]>,
+    ) -> Result<MemoryToolMaterialization, String> {
+        let processor = self.processor()?;
+        if !processor.memory_loop_config().tools_enabled {
+            if accepted_specs.is_some() {
+                return Err("accepted Memory tools were disabled".to_owned());
+            }
+            return Ok(MemoryToolMaterialization {
+                bundles: Vec::new(),
+                diagnostics: vec!["memory tools disabled by runtime settings".into()],
+            });
+        }
+        let runtime = processor.memory_runtime();
+        if let Err(error) = runtime.ensure_enabled() {
+            if accepted_specs.is_some() {
+                return Err("accepted Memory runtime unavailable".to_owned());
+            }
+            return Ok(MemoryToolMaterialization {
+                bundles: Vec::new(),
+                diagnostics: vec![format!("memory runtime unavailable: {error:#}")],
+            });
+        }
+        let read_boundary = authorize_memory_execution(
+            processor.as_ref(),
+            context.workspace_id.as_str(),
+            context.thread_id.as_str(),
+            context.turn_id.as_str(),
+            context.principal_id.as_deref(),
+            MemoryExecutionAccess::Read,
+        )
+        .await;
+        let upsert_boundary = authorize_memory_upsert_execution(
+            processor.as_ref(),
+            context.workspace_id.as_str(),
+            context.thread_id.as_str(),
+            context.turn_id.as_str(),
+            context.principal_id.as_deref(),
+        )
+        .await;
+        let forget_boundary = authorize_memory_execution(
+            processor.as_ref(),
+            context.workspace_id.as_str(),
+            context.thread_id.as_str(),
+            context.turn_id.as_str(),
+            context.principal_id.as_deref(),
+            MemoryExecutionAccess::Forget,
+        )
+        .await;
+
+        let handler = Arc::new(MemoryToolHandler { processor, context });
+        let mut bundle = ToolExtensionBundle::default();
+        for mut configured in memory_tool_specs() {
+            let name = configured.spec.name.clone();
+            let boundary = match name.as_str() {
+                MEMORY_SEARCH_TOOL | MEMORY_LIST_TOOL | MEMORY_GET_TOOL => {
+                    read_boundary.as_ref().ok()
+                }
+                MEMORY_REMEMBER_TOOL => upsert_boundary.as_ref().ok(),
+                MEMORY_FORGET_TOOL => forget_boundary.as_ref().ok(),
+                _ => None,
+            };
+            let Some(boundary) = boundary else {
+                continue;
+            };
+            let operation = handler
+                .operation_context(None, boundary.scoped_collaboration)
+                .map_err(|error| error.to_string())?;
+            configured.spec.description.push(' ');
+            configured
+                .spec
+                .description
+                .push_str(&operation.tool_scope_contract(matches!(
+                    name.as_str(),
+                    MEMORY_REMEMBER_TOOL | MEMORY_FORGET_TOOL
+                )));
+            bundle.specs.push(configured);
+            bundle.handlers.push((name, handler.clone()));
+        }
+
+        if let Some(accepted) = accepted_specs {
+            if accepted.len() != 1 {
+                return Err("accepted Memory bundles unavailable".to_owned());
+            }
+            let mut restored = ToolExtensionBundle::default();
+            for original in &accepted[0] {
+                let actual = bundle
+                    .specs
+                    .iter()
+                    .find(|s| s.spec.name == original.spec.name)
+                    .ok_or_else(|| "accepted Memory tool authorization unavailable".to_owned())?;
+                let actual = crate::turn_runtime_snapshot::to_snapshot_json(actual, "Memory spec")
+                    .map_err(|_| "Memory spec cannot be encoded".to_owned())?;
+                let expected = crate::turn_runtime_snapshot::to_snapshot_json(
+                    original,
+                    "accepted Memory spec",
+                )
+                .map_err(|_| "accepted Memory spec cannot be encoded".to_owned())?;
+                if actual != expected {
+                    return Err("accepted Memory tool contract changed".to_owned());
+                }
+                restored.specs.push(original.clone());
+                restored.handlers.push((
+                    original.spec.name.clone(),
+                    handler.clone() as Arc<dyn ToolHandler>,
+                ));
+            }
+            return Ok(MemoryToolMaterialization {
+                bundles: vec![restored],
+                diagnostics: Vec::new(),
+            });
+        }
+        Ok(MemoryToolMaterialization {
+            bundles: (!bundle.specs.is_empty())
+                .then_some(bundle)
+                .into_iter()
+                .collect(),
+            diagnostics: Vec::new(),
+        })
+    }
+
     pub(crate) fn new(processor: Weak<MessageProcessor>) -> Self {
         Self { processor }
     }
@@ -469,84 +592,15 @@ impl AgentMemoryProvider for GatewayMemoryProvider {
         &self,
         context: MemoryTurnContext,
     ) -> Result<MemoryToolMaterialization, String> {
-        let processor = self.processor()?;
-        if !processor.memory_loop_config().tools_enabled {
-            return Ok(MemoryToolMaterialization {
-                bundles: Vec::new(),
-                diagnostics: vec!["memory tools disabled by runtime settings".into()],
-            });
-        }
-        let runtime = processor.memory_runtime();
-        if let Err(error) = runtime.ensure_enabled() {
-            return Ok(MemoryToolMaterialization {
-                bundles: Vec::new(),
-                diagnostics: vec![format!("memory runtime unavailable: {error:#}")],
-            });
-        }
-        let read_boundary = authorize_memory_execution(
-            processor.as_ref(),
-            context.workspace_id.as_str(),
-            context.thread_id.as_str(),
-            context.turn_id.as_str(),
-            context.principal_id.as_deref(),
-            MemoryExecutionAccess::Read,
-        )
-        .await;
-        let upsert_boundary = authorize_memory_upsert_execution(
-            processor.as_ref(),
-            context.workspace_id.as_str(),
-            context.thread_id.as_str(),
-            context.turn_id.as_str(),
-            context.principal_id.as_deref(),
-        )
-        .await;
-        let forget_boundary = authorize_memory_execution(
-            processor.as_ref(),
-            context.workspace_id.as_str(),
-            context.thread_id.as_str(),
-            context.turn_id.as_str(),
-            context.principal_id.as_deref(),
-            MemoryExecutionAccess::Forget,
-        )
-        .await;
+        self.bind_memory_tools(context, None).await
+    }
 
-        let handler = Arc::new(MemoryToolHandler { processor, context });
-        let mut bundle = ToolExtensionBundle::default();
-        for mut configured in memory_tool_specs() {
-            let name = configured.spec.name.clone();
-            let boundary = match name.as_str() {
-                MEMORY_SEARCH_TOOL | MEMORY_LIST_TOOL | MEMORY_GET_TOOL => {
-                    read_boundary.as_ref().ok()
-                }
-                MEMORY_REMEMBER_TOOL => upsert_boundary.as_ref().ok(),
-                MEMORY_FORGET_TOOL => forget_boundary.as_ref().ok(),
-                _ => None,
-            };
-            let Some(boundary) = boundary else {
-                continue;
-            };
-            let operation = handler
-                .operation_context(None, boundary.scoped_collaboration)
-                .map_err(|error| error.to_string())?;
-            configured.spec.description.push(' ');
-            configured
-                .spec
-                .description
-                .push_str(&operation.tool_scope_contract(matches!(
-                    name.as_str(),
-                    MEMORY_REMEMBER_TOOL | MEMORY_FORGET_TOOL
-                )));
-            bundle.specs.push(configured);
-            bundle.handlers.push((name, handler.clone()));
-        }
-
-        Ok(MemoryToolMaterialization {
-            bundles: (!bundle.specs.is_empty())
-                .then_some(bundle)
-                .into_iter()
-                .collect(),
-            diagnostics: Vec::new(),
-        })
+    async fn restore_memory_tools(
+        &self,
+        context: MemoryTurnContext,
+        accepted_specs: &[Vec<pioneer_tools::ConfiguredToolSpec>],
+    ) -> Result<MemoryToolMaterialization, String> {
+        self.bind_memory_tools(context, Some(accepted_specs)).await
     }
 
     async fn recall_memory_mode(
@@ -805,10 +859,11 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
             .provider_registry()
             .get_or_create_for_workspace(context.workspace_id.as_str(), provider_name)
             .map_err(|error| {
-                let class = pioneer_agent::classify_provider_failure_message(
-                    error.to_string().as_str(),
-                    ProviderFailureStage::Connect,
-                );
+                let classification = pioneer_provider::failure::classify_transport_error(&error)
+                    .unwrap_or_else(|| {
+                        ProviderFailureClassification::new(ProviderFailureClass::Unknown)
+                    });
+                let class = classification.class;
                 tracing::warn!(
                     target: "pioneer::memory_post_turn_extractor",
                     stage = "provider_resolution",
@@ -823,7 +878,7 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                     model,
                     "provider_resolution",
                     ProviderFailureStage::Connect,
-                    ProviderFailureClassification::new(class),
+                    classification,
                 )
             })?;
         // Extraction is post-turn work: never inherit an interactive handle.
@@ -1333,14 +1388,9 @@ fn memory_provider_request_error(
     stage: ProviderFailureStage,
     error: &anyhow::Error,
 ) -> HookError {
-    let classification = provider.classify_failure(error).unwrap_or_else(|| {
-        ProviderFailureClassification::new(pioneer_agent::classify_provider_failure_message(
-            pioneer_provider::usage::classification_source(error)
-                .to_string()
-                .as_str(),
-            stage,
-        ))
-    });
+    let classification = provider
+        .classify_failure(error)
+        .unwrap_or_else(|| ProviderFailureClassification::new(ProviderFailureClass::Unknown));
     classified_memory_provider_error(provider.name(), model, stage_name, stage, classification)
 }
 

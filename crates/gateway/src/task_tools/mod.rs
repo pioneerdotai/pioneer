@@ -1,4 +1,5 @@
 use crate::message::{MessageProcessor, now_timestamp_secs};
+use anyhow::Context as _;
 use async_trait::async_trait;
 use pioneer_agent::{
     PendingAttachedTask, ReviewRequiredTaskObservation, TaskFinalizationSnapshot,
@@ -31,7 +32,7 @@ use pioneer_tools::{
     ToolRecoveryMetadata, ToolRetryClass, ToolSpec, dynamic_unknown_output_policy,
     normalize_tool_arguments_from_schema,
 };
-use schemars::{JsonSchema, schema_for};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
@@ -133,6 +134,67 @@ impl GatewayTaskToolProvider {
 impl TaskToolProvider for GatewayTaskToolProvider {
     fn terminal_cleanup_runtime_contract(&self) -> &'static str {
         "pioneer.gateway.attached-task-cleanup.v1"
+    }
+
+    async fn restore_task_tools(
+        &self,
+        context: TaskTurnContext,
+        accepted_specs: &[Vec<pioneer_tools::ConfiguredToolSpec>],
+    ) -> Result<TaskToolMaterialization, String> {
+        let processor = self.processor()?;
+        let authorization = resolve_task_tool_authorization_scope(processor.as_ref(), &context)
+            .await
+            .map_err(|_| "accepted Task tool authorization unavailable".to_owned())?;
+        let handler = Arc::new(TaskToolHandler {
+            processor,
+            context,
+            mutation_cache: Arc::new(TaskToolMutationCache::default()),
+        });
+        let catalog = task_tool_specs();
+        let mut bundles = Vec::new();
+        for original in accepted_specs {
+            let mut bundle = ToolExtensionBundle::default();
+            for configured in original {
+                let name = &configured.spec.name;
+                let canonical = catalog
+                    .iter()
+                    .find(|s| &s.spec.name == name)
+                    .ok_or_else(|| "accepted Task tool schema owner unavailable".to_owned())?;
+                let encoded = crate::turn_runtime_snapshot::to_snapshot_json(
+                    configured,
+                    "accepted Task spec",
+                )
+                .map_err(|_| "accepted Task spec unavailable".to_owned())?;
+                let expected =
+                    crate::turn_runtime_snapshot::to_snapshot_json(canonical, "Task spec")
+                        .map_err(|_| "Task spec unavailable".to_owned())?;
+                if encoded != expected
+                    || !authorization.granted_actions.contains(
+                        &task_tool_resource_action(name)
+                            .map_err(|_| "Task action unavailable".to_owned())?,
+                    )
+                {
+                    return Err("accepted Task tool contract unavailable".to_owned());
+                }
+                authorization
+                    .authorize_root_action(
+                        handler.processor.crud_store.as_ref(),
+                        task_tool_resource_action(name)
+                            .map_err(|_| "Task action unavailable".to_owned())?,
+                    )
+                    .await
+                    .map_err(|_| "accepted Task action revoked".to_owned())?;
+                bundle.specs.push(configured.clone());
+                bundle
+                    .handlers
+                    .push((name.clone(), handler.clone() as Arc<dyn ToolHandler>));
+            }
+            bundles.push(bundle);
+        }
+        Ok(TaskToolMaterialization {
+            bundles,
+            diagnostics: Vec::new(),
+        })
     }
 
     async fn materialize_task_tools(
@@ -799,17 +861,14 @@ impl TaskToolAuthorizationScope {
             Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime { .. })
                 | Some(pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime { .. })
         ) {
-            request.provider_authority_fingerprint = Some(
-                processor
-                    .provider_registry()
-                    .authority_fingerprint_for_workspace(
-                        workspace_id.as_str(),
-                        request.provider.as_str(),
-                    )
-                    .map_err(|_| task_tool_authorization_error())?
-                    .as_str()
-                    .to_owned(),
-            );
+            let authority = processor
+                .provider_registry()
+                .authority_fingerprint_for_workspace(
+                    workspace_id.as_str(),
+                    request.provider.as_str(),
+                )
+                .map_err(|_| task_tool_authorization_error())?;
+            request.bind_resolved_provider_authority(&authority);
         }
         let revision = processor
             .current_authorization_revision()
@@ -1213,8 +1272,107 @@ async fn resolve_task_tool_action_scope(
 
 #[derive(Default)]
 struct TaskToolMutationCache {
-    outputs: Mutex<HashMap<String, JsonValue>>,
+    outputs: Mutex<HashMap<String, TaskToolMutationCacheEntry>>,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+}
+
+impl TaskToolMutationCache {
+    async fn cached_mutation_output(
+        &self,
+        invocation: &ToolInvocation,
+        cache_key: &str,
+    ) -> Result<Option<JsonValue>, ToolError> {
+        let arguments_sha256 = invocation_arguments_sha256(invocation)?;
+        let cached = self.outputs.lock().await.get(cache_key).cloned();
+        let Some(cached) = cached else {
+            return Ok(None);
+        };
+        if cached.arguments_sha256 != arguments_sha256 {
+            return Err(ToolError::invalid_arguments(
+                "task mutation idempotency key refers to different arguments",
+            ));
+        }
+        Ok(Some(cached.output.as_ref().clone()))
+    }
+
+    async fn cache_mutation_output(
+        &self,
+        invocation: &ToolInvocation,
+        cache_key: Option<&str>,
+        output: &JsonValue,
+    ) -> Result<(), ToolError> {
+        if let Some(key) = cache_key {
+            let entry = TaskToolMutationCacheEntry {
+                arguments_sha256: invocation_arguments_sha256(invocation)?,
+                output: Arc::new(output.clone()),
+            };
+            self.outputs.lock().await.insert(key.to_owned(), entry);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct TaskToolMutationCacheEntry {
+    arguments_sha256: String,
+    output: Arc<JsonValue>,
+}
+
+fn mutation_arguments_sha256(arguments: &JsonValue) -> String {
+    let canonical = pioneer_tools::ToolFailureSignature::from_arguments(
+        "",
+        &arguments.to_string(),
+        pioneer_tools::ToolErrorClass::Unknown,
+    )
+    .arguments_fingerprint;
+    hex::encode(Sha256::digest(canonical.as_bytes()))
+}
+
+fn invocation_arguments_sha256(invocation: &ToolInvocation) -> Result<String, ToolError> {
+    let ToolPayload::Function { arguments } = &invocation.payload else {
+        return Err(ToolError::invalid_arguments(
+            "task mutation requires canonical function arguments",
+        ));
+    };
+    Ok(mutation_arguments_sha256(arguments))
+}
+
+fn cached_task_mutation_receipt<'a>(
+    invocation: &ToolInvocation,
+    output: &'a JsonValue,
+) -> Result<Option<(&'a str, i64, bool)>, ToolError> {
+    let creation = invocation.tool_name == TASK_CREATE_TOOL;
+    if !creation
+        && !matches!(
+            invocation.tool_name.as_str(),
+            TASK_UPDATE_TOOL | TASK_RESCHEDULE_TOOL
+        )
+    {
+        return Ok(None);
+    }
+    let unavailable =
+        || ToolError::execution_failed("previous task mutation postcondition is unavailable");
+    let id = output
+        .get("taskId")
+        .and_then(JsonValue::as_str)
+        .or_else(|| output.pointer("/task/id").and_then(JsonValue::as_str))
+        .filter(|id| id.len() == 21)
+        .ok_or_else(unavailable)?;
+    let revision = output
+        .get("revision")
+        .and_then(JsonValue::as_i64)
+        .or_else(|| output.pointer("/task/revision").and_then(JsonValue::as_i64))
+        .filter(|revision| *revision > 0)
+        .ok_or_else(unavailable)?;
+    if !creation {
+        let ToolPayload::Function { arguments } = &invocation.payload else {
+            return Err(unavailable());
+        };
+        if arguments.get("taskId").and_then(JsonValue::as_str) != Some(id) {
+            return Err(unavailable());
+        }
+    }
+    Ok(Some((id, revision, creation)))
 }
 
 #[async_trait]
@@ -1469,17 +1627,53 @@ impl TaskToolHandler {
         Some(lock.lock_owned().await)
     }
 
-    async fn cached_mutation_output(&self, cache_key: Option<&str>) -> Option<JsonValue> {
-        let key = cache_key?;
-        let mutation_outputs = self.mutation_cache.outputs.lock().await;
-        mutation_outputs.get(key).cloned()
+    async fn cached_mutation_output(
+        &self,
+        invocation: &ToolInvocation,
+        cache_key: &str,
+    ) -> Result<Option<JsonValue>, ToolError> {
+        self.mutation_cache
+            .cached_mutation_output(invocation, cache_key)
+            .await
     }
 
-    async fn cache_mutation_output(&self, cache_key: Option<&str>, output: &JsonValue) {
-        if let Some(key) = cache_key {
-            let mut mutation_outputs = self.mutation_cache.outputs.lock().await;
-            mutation_outputs.insert(key.to_owned(), output.clone());
+    async fn cache_mutation_output(
+        &self,
+        invocation: &ToolInvocation,
+        cache_key: Option<&str>,
+        output: &JsonValue,
+    ) -> Result<(), ToolError> {
+        self.mutation_cache
+            .cache_mutation_output(invocation, cache_key, output)
+            .await
+    }
+
+    async fn validate_cached_task_mutation_receipt(
+        &self,
+        invocation: &ToolInvocation,
+        output: &JsonValue,
+    ) -> Result<(), ToolError> {
+        let Some((task_id, revision, creation)) = cached_task_mutation_receipt(invocation, output)?
+        else {
+            return Ok(());
+        };
+        let current = self
+            .processor
+            .crud_store
+            .task_mutation_receipt_is_current(
+                &self.context.workspace_id,
+                task_id,
+                revision,
+                creation.then_some(self.context.turn_id.as_str()),
+            )
+            .await
+            .map_err(|_| ToolError::internal("task mutation receipt state unavailable"))?;
+        if !current {
+            return Err(ToolError::execution_failed(
+                "previous task mutation postcondition is no longer current",
+            ));
         }
+        Ok(())
     }
 
     async fn cached_or_prior_mutation_output(
@@ -1490,13 +1684,18 @@ impl TaskToolHandler {
         let Some(cache_key) = cache_key else {
             return Ok(None);
         };
-        if let Some(output) = self.cached_mutation_output(Some(cache_key)).await {
+        if let Some(output) = self.cached_mutation_output(invocation, cache_key).await? {
+            self.validate_cached_task_mutation_receipt(invocation, &output)
+                .await?;
             return Ok(Some(output));
         }
         let Some(output) = self.prior_successful_mutation_output(invocation).await? else {
             return Ok(None);
         };
-        self.cache_mutation_output(Some(cache_key), &output).await;
+        self.validate_cached_task_mutation_receipt(invocation, &output)
+            .await?;
+        self.cache_mutation_output(invocation, Some(cache_key), &output)
+            .await?;
         Ok(Some(output))
     }
 
@@ -1940,6 +2139,7 @@ impl TaskToolHandler {
                 }
             };
         let anchor = self.persist_task_anchor(response.task.id.as_str()).await?;
+        let progress = task_state_progress(&response.task);
         let mut output = task_create_tool_output(&response, &anchor);
         if let Some(object) = output.as_object_mut() {
             object.insert(
@@ -1952,9 +2152,9 @@ impl TaskToolHandler {
                 })?,
             );
         }
-        self.cache_mutation_output(cache_key.as_deref(), &output)
-            .await;
-        Ok(function_output(output))
+        self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
+            .await?;
+        Ok(function_output_with_progress(output, progress))
     }
 
     async fn handle_wait(
@@ -2120,11 +2320,17 @@ impl TaskToolHandler {
             }
         };
         let final_answer_allowed = self.final_answer_allowed_after_accept(&response).await;
+        let progress = task_review_progress(
+            &response.task,
+            &response.run,
+            &response.candidate.id,
+            &response.review_event.id,
+        );
         let mut output = task_accept_tool_output(&response, final_answer_allowed);
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
-        self.cache_mutation_output(cache_key.as_deref(), &output)
-            .await;
-        Ok(function_output(output))
+        self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
+            .await?;
+        Ok(function_output_with_progress(output, progress))
     }
 
     async fn final_answer_allowed_after_accept(&self, response: &TaskAcceptResponse) -> bool {
@@ -2208,11 +2414,17 @@ impl TaskToolHandler {
                 )));
             }
         };
+        let progress = task_review_progress(
+            &response.task,
+            &response.run,
+            &response.candidate.id,
+            &response.review_event.id,
+        );
         let mut output = task_revise_tool_output(&response);
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
-        self.cache_mutation_output(cache_key.as_deref(), &output)
-            .await;
-        Ok(function_output(output))
+        self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
+            .await?;
+        Ok(function_output_with_progress(output, progress))
     }
 
     async fn handle_cancel(
@@ -2261,11 +2473,12 @@ impl TaskToolHandler {
             .cancel_task(mutation_context, params)
             .await
             .map_err(task_runtime_tool_error)?;
+        let progress = task_state_progress(&response.task);
         let mut output = json!({ "task": task_summary(&response.task) });
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
-        self.cache_mutation_output(cache_key.as_deref(), &output)
-            .await;
-        Ok(function_output(output))
+        self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
+            .await?;
+        Ok(function_output_with_progress(output, progress))
     }
 
     async fn handle_update(
@@ -2330,11 +2543,12 @@ impl TaskToolHandler {
             .update_task(mutation_context, params)
             .await
             .map_err(task_runtime_tool_error)?;
+        let progress = task_state_progress(&response.task);
         let mut output = task_update_tool_output(&response);
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
-        self.cache_mutation_output(cache_key.as_deref(), &output)
-            .await;
-        Ok(function_output(output))
+        self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
+            .await?;
+        Ok(function_output_with_progress(output, progress))
     }
 
     async fn handle_detach(
@@ -2383,11 +2597,12 @@ impl TaskToolHandler {
             .detach_task(mutation_context, params)
             .await
             .map_err(task_runtime_tool_error)?;
+        let progress = task_state_progress(&response.task);
         let mut output = json!({ "task": task_summary(&response.task) });
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
-        self.cache_mutation_output(cache_key.as_deref(), &output)
-            .await;
-        Ok(function_output(output))
+        self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
+            .await?;
+        Ok(function_output_with_progress(output, progress))
     }
 
     async fn handle_list(
@@ -2498,13 +2713,14 @@ impl TaskToolHandler {
             .list_task_run_execution_observations(&run_ids)
             .await
             .map_err(task_runtime_tool_error)?;
+        let progress = task_observation_progress(&response);
         let payload = task_get_tool_output(
             &response,
             configuration_allowed,
             &observations,
             now_timestamp_secs(),
         )?;
-        Ok(function_output(payload))
+        Ok(function_output_with_progress(payload, progress))
     }
 
     async fn handle_result(
@@ -2602,14 +2818,15 @@ impl TaskToolHandler {
             .reschedule_task(mutation_context, params)
             .await
             .map_err(task_runtime_tool_error)?;
+        let progress = task_state_progress(&response.task);
         let mut output = json!({
             "task": task_summary(&response.task),
             "trigger": task_trigger_model_output(&response.trigger),
         });
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
-        self.cache_mutation_output(cache_key.as_deref(), &output)
-            .await;
-        Ok(function_output(output))
+        self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
+            .await?;
+        Ok(function_output_with_progress(output, progress))
     }
 
     async fn handle_pause(
@@ -2656,14 +2873,15 @@ impl TaskToolHandler {
             .pause_task(mutation_context, params)
             .await
             .map_err(task_runtime_tool_error)?;
+        let progress = task_state_progress(&response.task);
         let mut output = json!({
             "task": task_summary(&response.task),
             "triggers": task_trigger_details_output(&response.triggers),
         });
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
-        self.cache_mutation_output(cache_key.as_deref(), &output)
-            .await;
-        Ok(function_output(output))
+        self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
+            .await?;
+        Ok(function_output_with_progress(output, progress))
     }
 
     async fn handle_resume(
@@ -2722,14 +2940,15 @@ impl TaskToolHandler {
             .resume_task(mutation_context, params)
             .await
             .map_err(task_runtime_tool_error)?;
+        let progress = task_state_progress(&response.task);
         let mut output = json!({
             "task": task_summary(&response.task),
             "triggers": task_trigger_details_output(&response.triggers),
         });
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
-        self.cache_mutation_output(cache_key.as_deref(), &output)
-            .await;
-        Ok(function_output(output))
+        self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
+            .await?;
+        Ok(function_output_with_progress(output, progress))
     }
 
     async fn create_params(
@@ -2882,6 +3101,7 @@ impl TaskToolHandler {
                 status,
                 storage,
                 success,
+                outcome,
                 ..
             } = item
             else {
@@ -2899,9 +3119,23 @@ impl TaskToolHandler {
             {
                 continue;
             }
-            if let Some(output) = wait_result_from_storage(&storage) {
-                return Ok(Some(output));
+            if success != Some(true)
+                || !outcome.is_some_and(|outcome| {
+                    outcome.status == pioneer_protocol::ToolOutcomeStatus::Ok
+                })
+            {
+                return Err(ToolError::execution_failed(
+                    "previous task mutation outcome is unavailable",
+                ));
             }
+            if mutation_arguments_sha256(&arguments) != invocation_arguments_sha256(invocation)? {
+                return Err(ToolError::invalid_arguments(
+                    "task mutation idempotency key refers to different arguments",
+                ));
+            }
+            return wait_result_from_storage(&storage).map(Some).ok_or_else(|| {
+                ToolError::execution_failed("previous task mutation receipt is unavailable")
+            });
         }
 
         Ok(None)
@@ -4025,7 +4259,15 @@ fn tool_input_schema<T>() -> JsonValue
 where
     T: JsonSchema,
 {
-    let mut schema = serde_json::to_value(schema_for!(T)).expect("tool schema should serialize");
+    // Keep recursive TaskValue references and every input constraint. Convert
+    // schema booleans to equivalent objects for the native function surface.
+    let mut objects = schemars::transform::ReplaceBoolSchemas::default();
+    objects.skip_additional_properties = true;
+    let generated = schemars::generate::SchemaSettings::default()
+        .with(|settings| settings.transforms.push(Box::new(objects)))
+        .into_generator()
+        .into_root_schema_for::<T>();
+    let mut schema = serde_json::to_value(generated).expect("tool schema should serialize");
     if let Some(object) = schema.as_object_mut() {
         object.remove("$schema");
     }
@@ -4420,8 +4662,84 @@ fn dedup_preserve_order(values: &mut Vec<String>) {
 }
 
 fn function_output(payload: JsonValue) -> Box<dyn ToolOutput> {
+    function_output_with_progress(payload, Default::default())
+}
+
+fn function_output_with_progress(
+    payload: JsonValue,
+    progress: pioneer_tools::ToolProgressEvidence,
+) -> Box<dyn ToolOutput> {
     let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
-    Box::new(FunctionToolOutput::with_payload(text, true, payload))
+    Box::new(FunctionToolOutput::with_payload(text, true, payload).with_progress(progress))
+}
+
+// Only typed domain fields enter these small tokens, before output projection.
+// A refreshed lease/timestamp or cached JSON is never a semantic revision.
+fn task_state_progress(task: &Task) -> pioneer_tools::ToolProgressEvidence {
+    if task.revision < 0
+        || task.workspace_id.is_empty()
+        || task.workspace_id.len() > 512
+        || task.id.is_empty()
+        || task.id.len() > 256
+        || task
+            .parent_task_id
+            .as_ref()
+            .is_some_and(|id| id.len() > 256)
+    {
+        return Default::default();
+    }
+    let resource = serde_json::to_vec(&("task-state-v1", &task.workspace_id, &task.id))
+        .expect("fixed typed task identity");
+    let revision = serde_json::to_vec(&(task.revision, task.status, &task.parent_task_id))
+        .expect("fixed typed task domain state");
+    pioneer_tools::ToolProgressEvidence::resource_state(
+        Sha256::digest(resource).into(),
+        Sha256::digest(revision).into(),
+    )
+}
+
+fn task_review_progress(
+    task: &Task,
+    run: &TaskRun,
+    candidate_id: &str,
+    review_id: &str,
+) -> pioneer_tools::ToolProgressEvidence {
+    if task.workspace_id.is_empty()
+        || task.workspace_id.len() > 512
+        || task.id.is_empty()
+        || task.id.len() > 256
+        || run.id.is_empty()
+        || run.id.len() > 256
+        || candidate_id.is_empty()
+        || review_id.is_empty()
+        || candidate_id.len() > 256
+        || review_id.len() > 256
+        || run.task_id != task.id
+    {
+        return Default::default();
+    }
+    let resource = serde_json::to_vec(&("task-review-v1", &task.workspace_id, &task.id, &run.id))
+        .expect("fixed typed review identity");
+    let revision = serde_json::to_vec(&(candidate_id, review_id, run.status))
+        .expect("fixed typed committed review receipt");
+    pioneer_tools::ToolProgressEvidence::resource_state(
+        Sha256::digest(resource).into(),
+        Sha256::digest(revision).into(),
+    )
+}
+
+fn task_observation_progress(response: &TaskGetResponse) -> pioneer_tools::ToolProgressEvidence {
+    // An unchanged parent configuration cannot attest that a live child stalled.
+    if !response.task.status.is_terminal()
+        || response.runs.len() > MAX_TASK_OBSERVATION_TARGETS
+        || response
+            .runs
+            .iter()
+            .any(|run| !run.status.is_terminal() || run.task_id != response.task.id)
+    {
+        return Default::default();
+    }
+    task_state_progress(&response.task)
 }
 
 fn required_tool_string(value: Option<&str>, field: &str) -> Result<String, ToolError> {
@@ -4554,6 +4872,113 @@ async fn observed_terminal_task_ids(
     processor: &Arc<MessageProcessor>,
     context: &TaskTurnContext,
 ) -> anyhow::Result<BTreeSet<String>> {
+    if processor
+        .crud_store
+        .get_turn_execution(&context.turn_id)
+        .await?
+        .is_some_and(|execution| {
+            matches!(
+                execution.executor_kind,
+                pioneer_crud::TurnExecutorKind::NativeAgent
+                    | pioneer_crud::TurnExecutorKind::ApiProvider
+            )
+        })
+    {
+        let Some(checkpoint) = processor
+            .crud_store
+            .native_semantic_checkpoint_for_turn(&context.turn_id)
+            .await?
+        else {
+            // No acknowledged native state proves observation. Returning all
+            // terminal facts as unobserved does not create/reset a semantic Turn.
+            return Ok(BTreeSet::new());
+        };
+        anyhow::ensure!(
+            checkpoint.workspace_id == context.workspace_id
+                && checkpoint.thread_id == context.thread_id,
+            "native task observation checkpoint scope differs"
+        );
+        let semantic = checkpoint
+            .payload_json
+            .get("native_semantic_state")
+            .context("native task observation semantic state missing")?;
+        anyhow::ensure!(
+            semantic.get("schema_version").and_then(JsonValue::as_u64)
+                == Some(u64::from(
+                    pioneer_agent::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION
+                )),
+            "native task observation state incompatible"
+        );
+        anyhow::ensure!(
+            semantic
+                .get("controls")
+                .and_then(|state| state.get("retained"))
+                .and_then(JsonValue::as_array)
+                .is_some_and(|refs| refs.len() <= pioneer_protocol::NATIVE_CONTROL_MAX_PENDING),
+            "native task observation reference bound exceeded"
+        );
+        let controls: pioneer_protocol::NativeControlCheckpointState = serde_json::from_value(
+            semantic
+                .get("controls")
+                .context("native task observation controls missing")?
+                .clone(),
+        )?;
+        anyhow::ensure!(controls.valid(), "native task observation cursor invalid");
+        let markers = semantic
+            .get("observed_terminal_task_ids")
+            .and_then(JsonValue::as_array)
+            .filter(|markers| markers.len() <= 256)
+            .context("native task observation markers invalid")?;
+        let mut observed = BTreeSet::new();
+        for marker in markers {
+            let marker = marker
+                .as_str()
+                .filter(|marker| !marker.is_empty() && marker.len() <= 4096)
+                .context("native task observation identity invalid")?;
+            observed.insert(marker.to_owned());
+        }
+        // A queued directive is durable, but has not yet been observed by the
+        // model. Retain its terminal IDs as outstanding until the applied ACK.
+        let pending = controls
+            .retained
+            .iter()
+            .filter(|reference| reference.sequence > controls.applied_sequence)
+            .cloned()
+            .collect::<Vec<_>>();
+        for record in processor
+            .crud_store
+            .load_native_controls(
+                &context.workspace_id,
+                &context.thread_id,
+                &context.turn_id,
+                &pending,
+            )
+            .await?
+        {
+            if record.host.directive != pioneer_protocol::NativeHostDirective::ObserveTaskResults {
+                continue;
+            }
+            let observation = record
+                .observation
+                .context("native terminal observation missing")?;
+            anyhow::ensure!(
+                observation.origin == pioneer_protocol::NativeControlOrigin::TaskService,
+                "native terminal observation origin differs"
+            );
+            let ids = observation
+                .value
+                .get("taskIds")
+                .and_then(JsonValue::as_array)
+                .context("native terminal observation identities missing")?;
+            for id in ids {
+                observed.remove(
+                    id.as_str()
+                        .context("native terminal observation identity invalid")?,
+                );
+            }
+        }
+        return Ok(observed);
+    }
     let parent_items = processor
         .crud_store
         .list_turn_items_by_type(context.turn_id.as_str(), "system_event")
@@ -4644,6 +5069,7 @@ fn task_create_tool_output(response: &TaskCreateResponse, anchor: &TaskTurnItem)
 
     json!({
         "taskId": response.task.id,
+        "revision": response.task.revision,
         "runId": response.run.as_ref().map(|run| run.id.clone()),
         "waitable": waitable,
         "waitRecommendation": task_create_wait_recommendation(response, waitable),
@@ -5068,6 +5494,52 @@ fn wait_mode_label(mode: pioneer_protocol::TaskWaitMode) -> &'static str {
     }
 }
 
+fn candidate_review_revision(candidate: &pioneer_protocol::TaskResultCandidate) -> Option<String> {
+    use sha2::Digest;
+    struct DigestWriter {
+        hash: sha2::Sha256,
+        bytes: usize,
+    }
+    impl std::io::Write for DigestWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes = self
+                .bytes
+                .checked_add(bytes.len())
+                .filter(|count| *count <= 16 * 1024 * 1024)
+                .ok_or_else(|| std::io::Error::other("candidate revision input unavailable"))?;
+            self.hash.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = DigestWriter {
+        hash: sha2::Sha256::new(),
+        bytes: 0,
+    };
+    serde_json::to_writer(
+        &mut writer,
+        &(
+            &candidate.id,
+            &candidate.task_id,
+            &candidate.run_id,
+            &candidate.task_run_turn_id,
+            &candidate.thread_id,
+            &candidate.turn_id,
+            candidate.round,
+            candidate.status,
+            &candidate.result,
+            &candidate.extraction_error,
+            &candidate.summary,
+            &candidate.diagnostics,
+            &candidate.final_review_event_id,
+        ),
+    )
+    .ok()?;
+    Some(hex::encode(writer.hash.finalize()))
+}
+
 fn review_required_task_observation(
     item: &pioneer_protocol::TaskWaitReviewItem,
 ) -> ReviewRequiredTaskObservation {
@@ -5085,6 +5557,7 @@ fn review_required_task_observation(
             .map(|run| run.id.clone())
             .unwrap_or_else(|| candidate.run_id.clone()),
         candidate_id: candidate.id.clone(),
+        candidate_revision: candidate_review_revision(candidate).unwrap_or_default(),
         title: bounded_preview(item.item.task.title.as_str(), 160),
         status: wait_item_status(&item.item.task, run),
         candidate_status: candidate_status_label(candidate.status),
@@ -5463,6 +5936,54 @@ mod tests {
     use super::*;
     use sea_orm::ConnectionTrait;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn task_catalog_crosses_the_real_native_wire_gate_with_nested_constraints() {
+        use pioneer_provider::{ChatMessage, ChatRequest, ToolDefinition};
+        let registry = pioneer_provider::ProviderRegistry::with_provider(
+            "echo",
+            Arc::new(pioneer_provider::providers::EchoProvider::new()),
+        );
+        let provider = registry
+            .get_or_create_for_workspace("task-schema-workspace", "echo")
+            .unwrap();
+        let request = ChatRequest {
+            model: "test-model".into(),
+            messages: vec![ChatMessage::user("schema admission")],
+            temperature: None,
+            max_tokens: Some(32),
+            tools: Some(
+                task_tool_specs()
+                    .into_iter()
+                    .map(|configured| ToolDefinition {
+                        name: configured.spec.name,
+                        description: configured.spec.description,
+                        parameters: configured.spec.parameters,
+                    })
+                    .collect(),
+            ),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+        let response = provider
+            .chat(request)
+            .await
+            .expect("every current Task schema must cross the native manifest gate");
+        assert_eq!(response.text, "schema admission");
+        assert!(decode_tool_args::<TaskCreateToolInput>(task_tool_invocation(TASK_CREATE_TOOL,
+            json!({"title":"scheduled", "goal":"Check changes", "trigger":{"kind":"cron","cronExpr":"0 5 * * *","timezone":"UTC"}}))).is_ok());
+        assert!(decode_tool_args::<TaskCreateToolInput>(task_tool_invocation(TASK_CREATE_TOOL,
+            json!({"title":"scheduled", "goal":"Check changes", "trigger":{"kind":"not-a-trigger"}}))).is_err());
+        assert!(
+            decode_tool_args::<TaskCreateToolInput>(task_tool_invocation(
+                TASK_CREATE_TOOL,
+                json!({"title":"scheduled", "goal":"Check changes", "unexpectedPrivilege":true})
+            ))
+            .is_err()
+        );
+    }
 
     #[test]
     fn attached_task_launch_keeps_exact_inherited_capabilities_across_nested_launches() {
@@ -6094,6 +6615,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn authoritative_task_domain_evidence_excludes_liveness_and_model_projection() {
+        let mut task = sample_task(TaskStatus::Running);
+        let state = task_state_progress(&task);
+        assert!(matches!(
+            state.semantic,
+            pioneer_tools::ToolSemanticEvidence::ResourceState { .. }
+        ));
+        task.updated_at += 1000;
+        task.title = "different rendered display".into();
+        assert_eq!(task_state_progress(&task), state);
+        task.revision += 1;
+        assert_ne!(task_state_progress(&task).semantic, state.semantic);
+        task.workspace_id = "other_workspace".into();
+        assert_ne!(task_state_progress(&task).semantic, state.semantic);
+        let mut run = sample_run(TaskRunStatus::WaitingReview);
+        let review = task_review_progress(&task, &run, "candidate1", "review1");
+        run.heartbeat_at = Some(99999);
+        run.lock_expires_at = Some(199999);
+        run.updated_at += 500;
+        assert_eq!(
+            task_review_progress(&task, &run, "candidate1", "review1"),
+            review
+        );
+        assert_ne!(
+            task_review_progress(&task, &run, "candidate1", "review2"),
+            review
+        );
+        let response = sample_task_response(
+            TaskStatus::Running,
+            vec![sample_run(TaskRunStatus::Running)],
+            None,
+        );
+        assert_eq!(
+            task_observation_progress(&response).semantic,
+            pioneer_tools::ToolSemanticEvidence::Unknown
+        );
+        let mut response = sample_task_response(
+            TaskStatus::Completed,
+            vec![sample_run(TaskRunStatus::Succeeded)],
+            None,
+        );
+        let completed = task_observation_progress(&response);
+        assert!(matches!(
+            completed.semantic,
+            pioneer_tools::ToolSemanticEvidence::ResourceState { .. }
+        ));
+        response.runs[0].heartbeat_at = Some(123456);
+        assert_eq!(task_observation_progress(&response), completed);
+        response.runs[0].status = TaskRunStatus::Running;
+        assert_eq!(
+            task_observation_progress(&response).semantic,
+            pioneer_tools::ToolSemanticEvidence::Unknown
+        );
+        assert_eq!(
+            function_output(json!({"task":{"revision":999999},"progress":"advanced"}))
+                .progress_evidence()
+                .semantic,
+            pioneer_tools::ToolSemanticEvidence::Unknown,
+            "cached/projected JSON cannot inject domain facts"
+        );
+        task.id = "x".repeat(257);
+        assert_eq!(
+            task_state_progress(&task).semantic,
+            pioneer_tools::ToolSemanticEvidence::Unknown
+        );
+    }
+
     fn sample_task(status: TaskStatus) -> Task {
         Task {
             id: "task_1234567890123456".to_owned(),
@@ -6245,6 +6834,44 @@ mod tests {
             non_waitable_count: 0,
             mode: TaskWaitMode::AllTerminalOrReviewRequired,
         }
+    }
+
+    #[test]
+    fn review_projection_revision_covers_hidden_result_changes_and_excludes_liveness() {
+        let mut response = sample_review_wait_response(
+            vec![pioneer_protocol::TaskWaitReviewAction::TaskAccept],
+            1,
+            None,
+            TaskResultCandidateStatus::PendingReview,
+        );
+        let item = &mut response.review_required[0];
+        let first = review_required_task_observation(item);
+        assert_eq!(first.candidate_revision.len(), 64);
+        item.candidate.result.as_mut().unwrap().data = Some(pioneer_protocol::TaskValue::String(
+            "different hidden result suffix".into(),
+        ));
+        let changed = review_required_task_observation(item);
+        assert_eq!(first.result_preview, changed.result_preview);
+        assert_eq!(first.candidate_id, changed.candidate_id);
+        assert_ne!(first.candidate_revision, changed.candidate_revision);
+        item.item.task.updated_at += 1;
+        item.item.run.as_mut().unwrap().heartbeat_at = Some(999);
+        item.item.run.as_mut().unwrap().lock_expires_at = Some(9999);
+        item.candidate.updated_at += 1;
+        assert_eq!(
+            changed.candidate_revision,
+            review_required_task_observation(item).candidate_revision
+        );
+        item.candidate.result.as_mut().unwrap().data = Some(pioneer_protocol::TaskValue::String(
+            "x".repeat(17 * 1024 * 1024),
+        ));
+        assert!(candidate_review_revision(&item.candidate).is_none());
+        assert!(
+            review_required_task_observation(item)
+                .candidate_revision
+                .is_empty(),
+            "no partial digest may authorize delivery"
+        );
     }
 
     fn sample_task_response(
@@ -6954,6 +7581,81 @@ mod tests {
             apply_patch_preflight: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn mutation_cache_rejects_reused_key_with_changed_postcondition() {
+        let cache = TaskToolMutationCache::default();
+        let original = task_tool_invocation(
+            TASK_UPDATE_TOOL,
+            json!({"taskId": "AAAAAAAAAAAAAAAAAAAAA", "title": "accepted"}),
+        );
+        let output = json!({"task": {"id": "AAAAAAAAAAAAAAAAAAAAA", "revision": 3}});
+        cache
+            .cache_mutation_output(&original, Some("task_update:original"), &output)
+            .await
+            .unwrap();
+        assert_eq!(
+            cache
+                .cached_mutation_output(&original, "task_update:original")
+                .await
+                .unwrap(),
+            Some(output)
+        );
+        let changed = task_tool_invocation(
+            TASK_UPDATE_TOOL,
+            json!({"taskId": "AAAAAAAAAAAAAAAAAAAAA", "title": "changed"}),
+        );
+        assert!(
+            cache
+                .cached_mutation_output(&changed, "task_update:original")
+                .await
+                .is_err()
+        );
+        assert!(
+            cache
+                .cached_mutation_output(&changed, "missing")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cached_mutation_receipts_require_canonical_identity_revision_and_bound_arguments() {
+        let original = json!({"taskId": "AAAAAAAAAAAAAAAAAAAAA", "title": "accepted", "metadata": {"a": 1, "b": 2}});
+        let reordered = json!({"metadata": {"b": 2, "a": 1}, "title": "accepted", "taskId": "AAAAAAAAAAAAAAAAAAAAA"});
+        assert_eq!(
+            mutation_arguments_sha256(&original),
+            mutation_arguments_sha256(&reordered)
+        );
+        let mut changed = original.clone();
+        changed["title"] = json!("different postcondition");
+        assert_ne!(
+            mutation_arguments_sha256(&original),
+            mutation_arguments_sha256(&changed)
+        );
+        let invocation = task_tool_invocation(TASK_UPDATE_TOOL, original);
+        let accepted = json!({"task": {"id": "AAAAAAAAAAAAAAAAAAAAA", "revision": 8}});
+        assert_eq!(
+            cached_task_mutation_receipt(&invocation, &accepted).unwrap(),
+            Some(("AAAAAAAAAAAAAAAAAAAAA", 8, false))
+        );
+        let foreign = json!({"task": {"id": "BBBBBBBBBBBBBBBBBBBBB", "revision": 8}});
+        assert!(cached_task_mutation_receipt(&invocation, &foreign).is_err());
+        let missing_revision = json!({"task": {"id": "AAAAAAAAAAAAAAAAAAAAA"}});
+        assert!(cached_task_mutation_receipt(&invocation, &missing_revision).is_err());
+        let creation = task_tool_invocation(
+            TASK_CREATE_TOOL,
+            json!({"idempotencyKey": "original-creation"}),
+        );
+        let legacy = json!({"taskId": "AAAAAAAAAAAAAAAAAAAAA"});
+        assert!(cached_task_mutation_receipt(&creation, &legacy).is_err());
+        let current = json!({"taskId": "AAAAAAAAAAAAAAAAAAAAA", "revision": 1});
+        assert_eq!(
+            cached_task_mutation_receipt(&creation, &current).unwrap(),
+            Some(("AAAAAAAAAAAAAAAAAAAAA", 1, true))
+        );
     }
 
     #[test]

@@ -122,6 +122,12 @@ impl ErrorClassifier for DefaultErrorClassifier {
     }
 
     fn classify_error(&self, invocation: &ToolInvocation, error: &ToolError) -> ToolOutcome {
+        if matches!(error, ToolError::ResponseLimitExceeded) {
+            return response_limit_outcome();
+        }
+        if matches!(error, ToolError::TimedOut) {
+            return attempt_timeout_outcome();
+        }
         if is_native_file_tool(invocation.tool_name.as_str()) {
             return classify_native_file_tool_error(invocation.tool_name.as_str(), error);
         }
@@ -147,6 +153,8 @@ impl ErrorClassifier for DefaultErrorClassifier {
         }
 
         match error {
+            ToolError::ResponseLimitExceeded => response_limit_outcome(),
+            ToolError::TimedOut => attempt_timeout_outcome(),
             ToolError::InvalidArguments(_) => ToolOutcome::recoverable(
                 ToolErrorClass::InvalidArguments,
                 "Fix tool arguments and call the tool again.",
@@ -186,6 +194,24 @@ impl ErrorClassifier for DefaultErrorClassifier {
     }
 }
 
+fn response_limit_outcome() -> ToolOutcome {
+    ToolOutcome::recoverable(
+        ToolErrorClass::NeedsNarrowing,
+        "Response exceeded bounded read limits. Narrow the query or use a smaller source before retrying.",
+        true,
+        Some("response_read_limit".to_owned()),
+    )
+}
+
+fn attempt_timeout_outcome() -> ToolOutcome {
+    ToolOutcome::recoverable(
+        ToolErrorClass::Timeout,
+        "Tool attempt reached its bounded work deadline. Inspect partial state and change the strategy before retrying.",
+        true,
+        Some("attempt_deadline".to_owned()),
+    )
+}
+
 fn is_native_file_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -206,6 +232,8 @@ fn classify_native_file_tool_error(tool_name: &str, error: &ToolError) -> ToolOu
     }
 
     match error {
+        ToolError::ResponseLimitExceeded => response_limit_outcome(),
+        ToolError::TimedOut => attempt_timeout_outcome(),
         ToolError::InvalidArguments(message) => ToolOutcome::recoverable(
             ToolErrorClass::InvalidArguments,
             format!(
@@ -412,6 +440,8 @@ fn classify_mcp_result(raw_output_json: &JsonValue, success: bool) -> ToolOutcom
 
 fn classify_mcp_error(invocation: &ToolInvocation, error: &ToolError) -> ToolOutcome {
     match error {
+        ToolError::ResponseLimitExceeded => response_limit_outcome(),
+        ToolError::TimedOut => attempt_timeout_outcome(),
         ToolError::InvalidArguments(_) => ToolOutcome::fatal(
             ToolErrorClass::InvalidArguments,
             Some("MCP tool arguments were invalid for the materialized schema.".to_owned()),
@@ -759,6 +789,8 @@ fn classify_computer_use_result(raw_output_json: &JsonValue, success: bool) -> T
 
 fn classify_computer_use_error(error: &ToolError) -> ToolOutcome {
     match error {
+        ToolError::ResponseLimitExceeded => response_limit_outcome(),
+        ToolError::TimedOut => attempt_timeout_outcome(),
         ToolError::InvalidArguments(message) => {
             let lower = message.to_lowercase();
             if lower.contains("session_id") {
@@ -981,6 +1013,8 @@ fn computer_use_failure_outcome(failure_class: &'static str, stopped: bool) -> T
 
 fn classify_shell_error(error: &ToolError) -> ToolOutcome {
     match error {
+        ToolError::ResponseLimitExceeded => response_limit_outcome(),
+        ToolError::TimedOut => attempt_timeout_outcome(),
         ToolError::InvalidArguments(_) => ToolOutcome::recoverable(
             ToolErrorClass::InvalidArguments,
             "Shell tool arguments are invalid. Fix args and retry.",
@@ -1032,6 +1066,8 @@ fn classify_shell_error(error: &ToolError) -> ToolOutcome {
 
 fn classify_web_error(error: &ToolError) -> ToolOutcome {
     match error {
+        ToolError::ResponseLimitExceeded => response_limit_outcome(),
+        ToolError::TimedOut => attempt_timeout_outcome(),
         ToolError::InvalidArguments(_) => ToolOutcome::recoverable(
             ToolErrorClass::InvalidArguments,
             "Web tool arguments are invalid. Fix parameters and retry.",
@@ -1140,6 +1176,34 @@ fn classify_shell_error_class(stderr_lower: &str) -> ToolErrorClass {
 mod tests {
     use super::*;
     use crate::shell_format::{ExecPayloadInput, build_exec_model_payload};
+
+    #[test]
+    fn strict_response_limit_requires_narrower_work_and_never_claims_success() {
+        let outcome = DefaultErrorClassifier.classify_error(
+            &invocation_for("web_search"),
+            &ToolError::ResponseLimitExceeded,
+        );
+        assert_eq!(outcome.status, ToolOutcomeStatus::RecoverableError);
+        assert_eq!(outcome.error_class, Some(ToolErrorClass::NeedsNarrowing));
+        assert!(outcome.incomplete);
+        let observation = crate::retry_controller::ToolRetryObservation::from_tool_outcome(
+            "search",
+            "web_search",
+            1,
+            "web_search",
+            "{}",
+            false,
+            outcome,
+        );
+        let decision = crate::retry_controller::ToolRetryController::new(
+            crate::retry_controller::ToolRetryBudgetConfig::default(),
+        )
+        .decide(&[observation]);
+        assert!(matches!(
+            decision,
+            crate::retry_controller::ToolRetryDecision::Exhausted { .. }
+        ));
+    }
 
     fn invocation_for(tool_name: &str) -> ToolInvocation {
         ToolInvocation {

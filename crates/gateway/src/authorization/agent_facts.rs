@@ -14,7 +14,8 @@ use std::collections::BTreeSet;
 
 use super::{ResourceAction, RoleDefinitionRegistry};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AgentRouteFacts {
     pub(crate) source_execution_id: String,
     pub(crate) source_capsule_id: String,

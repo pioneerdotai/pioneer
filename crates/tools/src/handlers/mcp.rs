@@ -33,7 +33,8 @@ pub struct McpDynamicToolAnnotations {
     pub open_world_hint: Option<bool>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpDynamicToolDescriptor {
     pub callable_name: String,
     pub workspace_id: String,
@@ -261,6 +262,21 @@ struct McpToolHandler {
 
 #[async_trait]
 impl ToolHandler for McpToolHandler {
+    fn attempt_work_budget(&self, _: &ToolInvocation) -> Result<std::time::Duration, ToolError> {
+        let millis = self
+            .descriptor
+            .timeout_ms
+            .unwrap_or(DEFAULT_MCP_TOOL_TIMEOUT_MS)
+            .max(1)
+            .checked_add(5_000)
+            .ok_or_else(|| ToolError::invalid_arguments("MCP timeout is out of range"))?;
+        let duration = std::time::Duration::from_millis(millis);
+        tokio::time::Instant::now()
+            .checked_add(duration)
+            .ok_or_else(|| ToolError::invalid_arguments("MCP timeout is out of range"))?;
+        Ok(duration)
+    }
+
     async fn handle(
         &self,
         invocation: ToolInvocation,

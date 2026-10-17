@@ -668,6 +668,7 @@ fn run_command_plan(
     purpose: &str,
     environment: &ProcessEnvironmentPlan,
 ) -> Result<(), ToolError> {
+    environment.require_supported_spawn()?;
     if plan.wait_for_exit {
         let mut command = Command::new(plan.program.as_str());
         command.args(plan.args.iter().map(String::as_str));
@@ -812,6 +813,29 @@ fn parse_lsappinfo_key_values(text: &str) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_recursive_policy_rejects_native_open_or_launch_before_command_creation() {
+        let mut snapshot =
+            pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(
+                "/tmp/native-launch-policy",
+                1,
+            );
+        snapshot.process.command_risk.allowed_command_families = vec!["open".into()];
+        let environment =
+            ProcessEnvironmentPlan::from_snapshot(Some(&snapshot), &Default::default());
+        for wait_for_exit in [false, true] {
+            let plan = CommandPlan {
+                program: "must-not-spawn-policy-fixture".into(),
+                args: vec![],
+                wait_for_exit,
+            };
+            assert!(matches!(
+                run_command_plan(&plan, "fixture", &environment),
+                Err(ToolError::Rejected(_))
+            ));
+        }
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

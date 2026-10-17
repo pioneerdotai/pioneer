@@ -12,11 +12,6 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, stream::BoxStream};
 use sha2::{Digest, Sha256};
 
-use crate::factory::create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority;
-use crate::failure::{
-    classify_http_error_body_too_large, classify_provider_failure_class, extract_provider_code,
-    extract_retry_after_ms,
-};
 use crate::traits::{Provider, ProviderWarmupOutcome};
 use crate::types::{
     ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, ProviderCapabilities,
@@ -120,11 +115,24 @@ impl Display for ProviderRegistryDefinitionCapacityExceeded {
 impl Error for ProviderRegistryDefinitionCapacityExceeded {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ProviderAuthorityFingerprint(String);
-
+pub struct ProviderAuthorityFingerprint {
+    value: String,
+    revocation_identity: String,
+    azure_connection: Option<crate::AzureResolvedConnection>,
+}
 impl ProviderAuthorityFingerprint {
+    fn opaque(value: String) -> Self {
+        Self {
+            revocation_identity: value.clone(),
+            value,
+            azure_connection: None,
+        }
+    }
     pub fn as_str(&self) -> &str {
-        self.0.as_str()
+        &self.value
+    }
+    pub fn azure_connection(&self) -> Option<&crate::AzureResolvedConnection> {
+        self.azure_connection.as_ref()
     }
 }
 
@@ -212,33 +220,23 @@ impl Error for RedactedEndpointError {
     }
 }
 
-fn endpoint_error_status(error: &anyhow::Error) -> Option<u16> {
-    if let Some(status) = error.downcast_ref::<crate::types::ProviderHttpErrorBodyTooLarge>() {
-        return Some(status.status);
-    }
-    for cause in error.chain() {
-        if let Some(request) = cause.downcast_ref::<reqwest::Error>()
-            && let Some(status) = request.status()
-        {
-            return Some(status.as_u16());
-        }
-    }
-    // The supported adapters format non-success responses as `API error
-    // (429 Too Many Requests): ...`. Parse only that fixed prefix, never an
-    // arbitrary three-digit sequence in a provider-controlled body or URL.
-    let message = format!("{error:#}");
-    let rest = message.split_once("API error (")?.1;
-    let status = rest.get(..3)?.parse::<u16>().ok()?;
-    (100..600).contains(&status).then_some(status)
-}
-
 fn redacted_endpoint_error(
     inner: &dyn Provider,
     error: anyhow::Error,
-    stage: ProviderFailureStage,
+    _stage: ProviderFailureStage,
 ) -> anyhow::Error {
     if error.is::<RedactedEndpointError>() {
         return error;
+    }
+    if let Some(classification) = crate::failure::classify_transport_error(&error) {
+        // Owned attachment cancellation is a transport fact even when the
+        // preparation stage added a static media-policy context.
+        let observed = crate::usage::error_usage(&error).cloned();
+        let safe = crate::failure::ProviderTransportFailure { classification }.into();
+        return match observed {
+            Some(usage) => crate::usage::with_error_usage(safe, &usage),
+            None => safe,
+        };
     }
     if let Some(rejection) = error.downcast_ref::<crate::attachments::MediaInputRejection>() {
         // Keep only the controlled diagnostic, dropping any raw context chain.
@@ -247,44 +245,12 @@ fn redacted_endpoint_error(
     // Adapters can supply structured status even when their error does not
     // contain a reqwest source or the usual `API error (...)` prefix.
     let adapter_classification = inner.classify_failure(&error);
-    let status = adapter_classification
-        .as_ref()
-        .and_then(|classification| classification.http_status)
-        .or_else(|| endpoint_error_status(&error));
-    let is_network = error.chain().any(|cause| cause.is::<reqwest::Error>())
-        || adapter_classification
-            .as_ref()
-            .is_some_and(|value| value.is_network_error);
-    let raw_message = format!("{error:#}");
-    let lower = raw_message.to_ascii_lowercase();
-    let provider_code = extract_provider_code(&raw_message);
-    let mut class =
-        classify_provider_failure_class(&lower, stage, status, provider_code.as_deref());
-    if let Some(oversized) = error.downcast_ref::<crate::types::ProviderHttpErrorBodyTooLarge>() {
-        class = classify_http_error_body_too_large(oversized.status).class;
-    } else if error.is::<crate::types::ProviderResponseTooLarge>() {
-        class = ProviderFailureClass::ProviderRejected;
-    } else if class == ProviderFailureClass::Unknown && is_network {
-        class = ProviderFailureClass::NetworkTransient;
-    }
-    let mut classification =
-        adapter_classification.unwrap_or_else(|| ProviderFailureClassification::new(class));
-    // Preserve the old custom-endpoint reqwest fallback even when the adapter
-    // has already discarded the unsafe source and retained only transport facts.
-    if classification.class == ProviderFailureClass::Unknown && classification.is_network_error {
-        classification.class = ProviderFailureClass::NetworkTransient;
-    }
-    classification.http_status = classification.http_status.or(status);
-    // `retry-after` is useful for recovery. Retain only the numeric interval.
-    classification.retry_after_ms = classification
-        .retry_after_ms
-        .or_else(|| extract_retry_after_ms(&lower));
-    // Provider-supplied codes may themselves contain the endpoint path.
-    classification.provider_code =
-        crate::failure::anthropic_stream_error(&error).and_then(|native| {
-            (native != crate::failure::AnthropicStreamError::Unknown)
-                .then(|| native.code().to_owned())
-        });
+    let classification = crate::failure::classify_transport_error(&error)
+        .or(adapter_classification)
+        .or_else(|| crate::failure::classify_stream_error(&error))
+        .unwrap_or_else(|| ProviderFailureClassification::new(ProviderFailureClass::Unknown));
+    let status = classification.http_status;
+    let is_network = classification.is_network_error;
     let message = if is_network {
         "provider network request failed"
     } else if status.is_some() {
@@ -307,11 +273,11 @@ fn redacted_endpoint_error(
 }
 
 impl AuthorityBoundProvider {
-    fn model_tool_calling_with_catalog(
+    fn model_tool_support_with_catalog(
         &self,
         model: &str,
         catalog: Option<&crate::catalog::ModelCatalog>,
-    ) -> bool {
+    ) -> crate::ModelToolSupport {
         let discovery = self
             .discovery_tools
             .read()
@@ -322,8 +288,22 @@ impl AuthorityBoundProvider {
             .use_public_catalog
             .then(|| catalog.and_then(|c| c.tool_support(self.name(), model)))
             .flatten();
-        self.capabilities().tool_calling
-            && crate::catalog::merge_tool_support(discovery, source) != Some(false)
+        if !self.capabilities().tool_calling {
+            return crate::ModelToolSupport::Unsupported;
+        }
+        crate::ModelToolSupport::from_optional(crate::catalog::merge_tool_support(
+            self.inner.model_tool_support(model).as_optional(),
+            crate::catalog::merge_tool_support(discovery, source),
+        ))
+    }
+
+    #[cfg(test)]
+    fn model_tool_calling_with_catalog(
+        &self,
+        model: &str,
+        catalog: Option<&crate::catalog::ModelCatalog>,
+    ) -> bool {
+        self.model_tool_support_with_catalog(model, catalog) == crate::ModelToolSupport::Supported
     }
 
     fn enrich_discovery(
@@ -360,7 +340,21 @@ impl AuthorityBoundProvider {
             .collect();
     }
 
+    fn request_public_catalog(&self) -> bool {
+        crate::model_contract::current().map_or(self.use_public_catalog, |contract| {
+            contract.public_catalog()
+        })
+    }
+    fn request_input_admission(&self) -> Arc<crate::attachments::admission::AdmissionState> {
+        crate::model_contract::current().map_or_else(
+            || self.input_admission.clone(),
+            |contract| Arc::new(self.input_admission.frozen(&contract)),
+        )
+    }
     fn discovery_reasoning_snapshot(&self) -> BTreeMap<String, crate::generation::NativeReasoning> {
+        if let Some(contract) = crate::model_contract::current() {
+            return contract.reasoning();
+        }
         self.discovery_reasoning
             .read()
             .expect("discovery reasoning lock")
@@ -368,6 +362,9 @@ impl AuthorityBoundProvider {
     }
 
     fn discovery_tool_snapshot(&self) -> BTreeMap<String, bool> {
+        if let Some(contract) = crate::model_contract::current() {
+            return contract.tools();
+        }
         self.discovery_tools
             .read()
             .expect("discovery tools lock")
@@ -375,6 +372,12 @@ impl AuthorityBoundProvider {
     }
 
     fn ensure_not_revoked(&self) -> Result<()> {
+        if let Some(contract) = crate::model_contract::current() {
+            contract.require_provider_authority(
+                self.name(),
+                Some(self.authority_fingerprint.as_str()),
+            )?;
+        }
         if self.revoked.load(Ordering::Acquire) {
             return Err(ProviderAuthorityRevoked.into());
         }
@@ -388,6 +391,25 @@ impl AuthorityBoundProvider {
         Ok(())
     }
 
+    async fn prepare_tool_wire_request(
+        &self,
+        request: ChatRequest,
+    ) -> Result<(ChatRequest, crate::tools::wire::ToolWireManifest)> {
+        // The existing completed-history projection owns portability. Apply it
+        // before checking native name bindings, under the same reasoning policy
+        // as the transport, so a completed foreign round remains portable.
+        let mut request = crate::generation::with_native_reasoning(
+            self.name(),
+            self.request_public_catalog(),
+            self.discovery_reasoning_snapshot(),
+            async { crate::history::project_request_for_provider(self.name(), request) },
+        )
+        .await?;
+        let manifest = crate::tools::wire::ToolWireManifest::new(self.name(), &request)?;
+        manifest.project(&mut request)?;
+        Ok((request, manifest))
+    }
+
     fn public_result<T>(&self, result: Result<T>) -> Result<T> {
         if self.redact_endpoint_errors {
             result.map_err(|error| {
@@ -397,6 +419,24 @@ impl AuthorityBoundProvider {
             result
         }
     }
+}
+
+pub(crate) fn bind_direct_provider(
+    inner: Box<dyn Provider>,
+    authority_fingerprint: &str,
+) -> Box<dyn Provider> {
+    Box::new(AuthorityBoundProvider {
+        inner: Arc::from(inner),
+        authority_fingerprint: ProviderAuthorityFingerprint::opaque(
+            authority_fingerprint.to_owned(),
+        ),
+        revoked: Arc::new(AtomicBool::new(false)),
+        redact_endpoint_errors: false,
+        input_admission: Arc::new(Default::default()),
+        use_public_catalog: true,
+        discovery_tools: RwLock::new(BTreeMap::new()),
+        discovery_reasoning: RwLock::new(BTreeMap::new()),
+    })
 }
 
 #[async_trait]
@@ -419,13 +459,42 @@ impl Provider for AuthorityBoundProvider {
         Some(self.authority_fingerprint.as_str())
     }
 
+    fn resolved_azure_connection(&self) -> Option<crate::AzureResolvedConnection> {
+        self.inner.resolved_azure_connection()
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         self.inner.capabilities()
     }
 
-    fn model_tool_calling(&self, model: &str) -> bool {
+    fn capture_model_contract_with_limit(
+        &self,
+        model: &str,
+        limit: usize,
+    ) -> Result<crate::AcceptedProviderModelContract> {
+        self.ensure_not_revoked()?;
+        let discovery = self.input_admission.bounded_model(model, limit)?;
+        let tools = discovery.as_ref().and_then(|m| m.capabilities.tool_calling);
+        let native = discovery
+            .as_ref()
+            .and_then(|m| m.capabilities.reasoning.as_ref())
+            .map(|r| r.native.clone())
+            .unwrap_or_default();
+        crate::AcceptedProviderModelContract::capture(
+            self,
+            model,
+            self.use_public_catalog,
+            discovery.as_ref(),
+            tools,
+            native,
+            self.inner.model_tool_support(model),
+            limit,
+        )
+    }
+
+    fn model_tool_support(&self, model: &str) -> crate::ModelToolSupport {
         let catalog = crate::catalog::model_catalog().ok();
-        self.model_tool_calling_with_catalog(model, catalog.as_deref())
+        self.model_tool_support_with_catalog(model, catalog.as_deref())
     }
 
     fn native_file_tool_capability(
@@ -447,39 +516,43 @@ impl Provider for AuthorityBoundProvider {
         request: ChatRequest,
     ) -> Result<crate::attachments::PreparedInputBudget> {
         self.ensure_not_revoked()?;
-        self.public_result(
+        let (request, manifest) = self.prepare_tool_wire_request(request).await?;
+        let mut prepared = self.public_result(
             crate::attachments::admission::scope(
-                self.input_admission.clone(),
+                self.request_input_admission(),
                 crate::attachments::runtime::with_async_authority_scope(
                     self.authority_fingerprint.as_str().to_owned(),
                     crate::generation::with_native_reasoning(
                         self.name(),
-                        self.use_public_catalog,
+                        self.request_public_catalog(),
                         self.discovery_reasoning_snapshot(),
                         self.inner.prepare_input_budget(request),
                     ),
                 ),
             )
             .await,
-        )
+        )?;
+        manifest.restore_request(&mut prepared.request)?;
+        Ok(prepared)
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         self.ensure_not_revoked()?;
         let context = crate::usage::UsageContext::capture(self.inner.as_ref(), &request.model);
+        let (request, manifest) = self.prepare_tool_wire_request(request).await?;
         let mut response = self
             .public_result(
                 crate::attachments::admission::scope(
-                    self.input_admission.clone(),
+                    self.request_input_admission(),
                     crate::attachments::runtime::with_async_authority_scope(
                         self.authority_fingerprint.as_str().to_owned(),
                         crate::tools::policy::with_discovery_tools(
                             self.name(),
-                            self.use_public_catalog,
+                            self.request_public_catalog(),
                             self.discovery_tool_snapshot(),
                             crate::generation::with_native_reasoning(
                                 self.name(),
-                                self.use_public_catalog,
+                                self.request_public_catalog(),
                                 self.discovery_reasoning_snapshot(),
                                 self.inner.chat(request),
                             ),
@@ -491,6 +564,9 @@ impl Provider for AuthorityBoundProvider {
             .map_err(|error| context.enrich_error(error))?;
         let usage = response.usage.get_or_insert_with(Default::default);
         context.enrich(usage);
+        manifest
+            .restore_calls(&mut response.tool_calls)
+            .map_err(|error| crate::usage::with_error_usage(error, usage))?;
         Ok(response)
     }
 
@@ -507,19 +583,20 @@ impl Provider for AuthorityBoundProvider {
     ) -> Result<crate::ProviderStream> {
         self.ensure_not_revoked()?;
         let context = crate::usage::UsageContext::capture(self.inner.as_ref(), &request.model);
+        let (request, manifest) = self.prepare_tool_wire_request(request).await?;
         let mut response = self
             .public_result(
                 crate::attachments::admission::scope(
-                    self.input_admission.clone(),
+                    self.request_input_admission(),
                     crate::attachments::runtime::with_async_authority_scope(
                         self.authority_fingerprint.as_str().to_owned(),
                         crate::tools::policy::with_discovery_tools(
                             self.name(),
-                            self.use_public_catalog,
+                            self.request_public_catalog(),
                             self.discovery_tool_snapshot(),
                             crate::generation::with_native_reasoning(
                                 self.name(),
-                                self.use_public_catalog,
+                                self.request_public_catalog(),
                                 self.discovery_reasoning_snapshot(),
                                 self.inner.stream_chat_with_diagnostics(request),
                             ),
@@ -551,7 +628,7 @@ impl Provider for AuthorityBoundProvider {
                     error
                 }
             });
-            result.map(|mut chunk| {
+            result.and_then(|mut chunk| {
                 if let Some(snapshot) = &chunk.usage {
                     accumulated.update(snapshot);
                 }
@@ -559,7 +636,13 @@ impl Provider for AuthorityBoundProvider {
                     context.enrich(&mut accumulated);
                     chunk.usage = Some(accumulated.clone());
                 }
-                chunk
+                manifest
+                    .restore_calls(&mut chunk.tool_calls)
+                    .map_err(|error| {
+                        context.enrich(&mut accumulated);
+                        crate::usage::with_error_usage(error, &accumulated)
+                    })?;
+                Ok(chunk)
             })
         }));
         Ok(response)
@@ -833,9 +916,50 @@ impl ProviderRegistry {
         Self::revoke_matching(&mut cache, |existing| {
             existing.workspace_id.as_deref() == Some(workspace_id)
                 && existing.provider_name == provider_name
-                && existing.authority_fingerprint != fingerprint
+                && existing.authority_fingerprint.revocation_identity
+                    != fingerprint.revocation_identity
         });
         Ok(fingerprint)
+    }
+
+    pub fn authority_fingerprint_for_workspace_with_frozen_azure(
+        &self,
+        workspace_id: &str,
+        provider_name: &str,
+        accepted: &crate::AzureResolvedConnection,
+    ) -> Result<ProviderAuthorityFingerprint> {
+        let provider_name = normalize_provider_name(provider_name);
+        let _scope = self.lock_authority_scope(Some(workspace_id), &provider_name);
+        let fingerprint = self
+            .resolve_authority_with_frozen_azure(
+                Some(workspace_id),
+                &provider_name,
+                Some(accepted),
+            )?
+            .3;
+        let mut cache = self
+            .cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::revoke_matching(&mut cache, |existing| {
+            existing.workspace_id.as_deref() == Some(workspace_id)
+                && existing.provider_name == provider_name
+                && existing.authority_fingerprint.revocation_identity
+                    != fingerprint.revocation_identity
+        });
+        Ok(fingerprint)
+    }
+    pub fn get_or_create_for_workspace_with_frozen_azure(
+        &self,
+        workspace_id: &str,
+        provider_name: &str,
+        accepted: &crate::AzureResolvedConnection,
+    ) -> Result<Arc<dyn Provider>> {
+        self.get_or_create_for_scope_with_frozen_azure(
+            Some(workspace_id),
+            provider_name,
+            Some(accepted),
+        )
     }
 
     /// Build and immediately discard a candidate adapter before its
@@ -875,20 +999,25 @@ impl ProviderRegistry {
         {
             return Ok(());
         }
+        let azure = (provider_name == "azure-openai")
+            .then(|| crate::AzureResolvedConnection::from_environment(base_url))
+            .transpose()?;
         let authority_fingerprint = Self::authority_fingerprint(
             Some(workspace_id),
             provider_name.as_str(),
             api_key.unwrap_or_default(),
             proxy_url,
             base_url,
+            azure.as_ref(),
         );
-        create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority(
+        crate::factory::create_provider_with_timeout_policy_and_proxy_and_base_url_and_resolved_azure(
             provider_name.as_str(),
             api_key.unwrap_or_default(),
             self.timeout_policy,
             proxy_url,
             base_url,
             authority_fingerprint.as_str(),
+            authority_fingerprint.azure_connection(),
         )?;
         Ok(())
     }
@@ -897,6 +1026,15 @@ impl ProviderRegistry {
         &self,
         workspace_id: Option<&str>,
         provider_name: &str,
+    ) -> Result<Arc<dyn Provider>> {
+        self.get_or_create_for_scope_with_frozen_azure(workspace_id, provider_name, None)
+    }
+
+    fn get_or_create_for_scope_with_frozen_azure(
+        &self,
+        workspace_id: Option<&str>,
+        provider_name: &str,
+        accepted: Option<&crate::AzureResolvedConnection>,
     ) -> Result<Arc<dyn Provider>> {
         let provider_name = normalize_provider_name(provider_name);
         // The same bounded stripe is also a per-scope singleflight gate. It
@@ -907,8 +1045,8 @@ impl ProviderRegistry {
         // injected-provider locks. The scope gate is deliberately retained so
         // the matching invalidation cannot return before this authority is
         // either published or discarded.
-        let (api_key, proxy_url, base_url, authority_fingerprint) =
-            self.resolve_authority(workspace_id, provider_name.as_str())?;
+        let (api_key, proxy_url, base_url, authority_fingerprint) = self
+            .resolve_authority_with_frozen_azure(workspace_id, provider_name.as_str(), accepted)?;
         let key = ProviderCacheKey::new(
             workspace_id,
             provider_name.as_str(),
@@ -938,7 +1076,8 @@ impl ProviderRegistry {
             Self::revoke_matching(&mut cache, |existing| {
                 existing.workspace_id == key.workspace_id
                     && existing.provider_name == key.provider_name
-                    && existing.authority_fingerprint != key.authority_fingerprint
+                    && existing.authority_fingerprint.revocation_identity
+                        != key.authority_fingerprint.revocation_identity
             });
         }
 
@@ -952,13 +1091,14 @@ impl ProviderRegistry {
             Some(provider) => (provider, ProviderOrigin::Injected),
             None => (
                 Arc::from(
-                    create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority(
+                    crate::factory::create_provider_with_timeout_policy_and_proxy_and_base_url_and_resolved_azure(
                         provider_name.as_str(),
                         &api_key,
                         self.timeout_policy,
                         proxy_url.as_deref(),
                         base_url.as_deref(),
                         authority_fingerprint.as_str(),
+                        authority_fingerprint.azure_connection(),
                     )?,
                 ),
                 ProviderOrigin::Factory,
@@ -1040,15 +1180,68 @@ impl ProviderRegistry {
         Option<String>,
         ProviderAuthorityFingerprint,
     )> {
+        self.resolve_authority_with_frozen_azure(workspace_id, provider_name, None)
+    }
+
+    fn resolve_authority_with_frozen_azure(
+        &self,
+        workspace_id: Option<&str>,
+        provider_name: &str,
+        accepted: Option<&crate::AzureResolvedConnection>,
+    ) -> Result<(
+        String,
+        Option<String>,
+        Option<String>,
+        ProviderAuthorityFingerprint,
+    )> {
         let api_key = (self.key_resolver)(workspace_id, provider_name)?;
         let proxy_url = (self.proxy_resolver)(workspace_id, provider_name)?;
         let base_url = (self.base_url_resolver)(workspace_id, provider_name)?;
+        let injected = self
+            .injected
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(provider_name)
+            .cloned();
+        let azure = if provider_name == "azure-openai" {
+            match accepted {
+                Some(connection) => {
+                    connection.validate(true)?;
+                    if let Some(inner) = &injected {
+                        anyhow::ensure!(
+                            inner.resolved_azure_connection().as_ref() == Some(connection),
+                            "accepted Azure adapter configuration changed"
+                        );
+                    } else {
+                        anyhow::ensure!(
+                            connection.configured_base_url.as_deref()
+                                == base_url.as_deref().map(|value| value.trim_end_matches('/')),
+                            "accepted Azure gateway route changed"
+                        );
+                    }
+                    Some(connection.clone())
+                }
+                None => match injected {
+                    Some(inner) => inner.resolved_azure_connection(),
+                    None => Some(crate::AzureResolvedConnection::from_environment(
+                        base_url.as_deref(),
+                    )?),
+                },
+            }
+        } else {
+            anyhow::ensure!(
+                accepted.is_none(),
+                "accepted Azure connection belongs to another provider"
+            );
+            None
+        };
         let authority_fingerprint = Self::authority_fingerprint(
             workspace_id,
             provider_name,
-            api_key.as_str(),
+            &api_key,
             proxy_url.as_deref(),
             base_url.as_deref(),
+            azure.as_ref(),
         );
         Ok((api_key, proxy_url, base_url, authority_fingerprint))
     }
@@ -1059,6 +1252,7 @@ impl ProviderRegistry {
         api_key: &str,
         proxy_url: Option<&str>,
         base_url: Option<&str>,
+        azure: Option<&crate::AzureResolvedConnection>,
     ) -> ProviderAuthorityFingerprint {
         let mut digest = Sha256::new();
         digest.update(PROVIDER_AUTHORITY_FINGERPRINT_VERSION.as_bytes());
@@ -1072,14 +1266,42 @@ impl ProviderRegistry {
         digest.update(proxy_url.unwrap_or("<direct>").as_bytes());
         digest.update([0]);
         digest.update(base_url.unwrap_or("<default>").as_bytes());
-        crate::factory::hash_connection_environment(&mut digest, provider_name);
-        ProviderAuthorityFingerprint(hex::encode(digest.finalize()))
+        if let Some(azure) = azure {
+            let revocation_identity = hex::encode(digest.clone().finalize());
+            azure.hash_into(&mut digest);
+            ProviderAuthorityFingerprint {
+                value: hex::encode(digest.finalize()),
+                revocation_identity,
+                azure_connection: Some(azure.clone()),
+            }
+        } else {
+            crate::factory::hash_connection_environment(&mut digest, provider_name);
+            ProviderAuthorityFingerprint::opaque(hex::encode(digest.finalize()))
+        }
     }
 
     pub fn insert(&self, name: impl Into<String>, provider: Arc<dyn Provider>) -> Result<()> {
         let name = normalize_provider_name(name.into().as_str());
         let _scopes = self.lock_all_authority_scopes();
-        let (_, _, _, authority_fingerprint) = self.resolve_authority(None, name.as_str())?;
+        let api_key = (self.key_resolver)(None, name.as_str())?;
+        let proxy_url = (self.proxy_resolver)(None, name.as_str())?;
+        let base_url = (self.base_url_resolver)(None, name.as_str())?;
+        let azure = provider.resolved_azure_connection();
+        if let Some(connection) = &azure {
+            anyhow::ensure!(
+                name == "azure-openai",
+                "injected Azure connection belongs to another provider"
+            );
+            connection.validate(true)?;
+        }
+        let authority_fingerprint = Self::authority_fingerprint(
+            None,
+            &name,
+            &api_key,
+            proxy_url.as_deref(),
+            base_url.as_deref(),
+            azure.as_ref(),
+        );
         let mut injected = self
             .injected
             .write()
@@ -1300,6 +1522,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn frozen_azure_configs_coexist_but_fresh_credential_rotation_revokes_old_authority() {
+        let keys = Arc::new(std::sync::Mutex::new("key-a".to_owned()));
+        let resolver_keys = keys.clone();
+        let registry = ProviderRegistry::new_scoped(move |workspace, _| {
+            format!(
+                "{}:{}",
+                workspace.unwrap_or("public"),
+                resolver_keys.lock().unwrap()
+            )
+        });
+        let accepted = crate::AzureResolvedConnection::from_values(
+            "resource-before".into(),
+            "deployment-before".into(),
+            "v1".into(),
+            None,
+        )
+        .unwrap();
+        let changed = crate::AzureResolvedConnection::from_values(
+            "resource-after".into(),
+            "deployment-after".into(),
+            "2025-04-01-preview".into(),
+            None,
+        )
+        .unwrap();
+        // These actual factory/cache paths receive owned values; no process
+        // environment mutation, discovery request, or provider dispatch.
+        let first = registry
+            .get_or_create_for_workspace_with_frozen_azure("a", "azure-openai", &accepted)
+            .unwrap();
+        let second = registry
+            .get_or_create_for_workspace_with_frozen_azure("a", "azure-openai", &changed)
+            .unwrap();
+        assert_eq!(first.resolved_azure_connection(), Some(accepted.clone()));
+        assert_eq!(second.resolved_azure_connection(), Some(changed.clone()));
+        assert_ne!(
+            first.authority_fingerprint(),
+            second.authority_fingerprint()
+        );
+        let repeated = registry
+            .get_or_create_for_workspace_with_frozen_azure("a", "azure-openai", &accepted)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &repeated));
+        let other_tenant = registry
+            .get_or_create_for_workspace_with_frozen_azure("b", "azure-openai", &accepted)
+            .unwrap();
+        *keys.lock().unwrap() = "key-b".into();
+        let refreshed = registry
+            .get_or_create_for_workspace_with_frozen_azure("a", "azure-openai", &accepted)
+            .unwrap();
+        assert_ne!(
+            first.authority_fingerprint(),
+            refreshed.authority_fingerprint()
+        );
+        assert_eq!(refreshed.resolved_azure_connection(), Some(accepted));
+        assert!(
+            registry
+                .cache
+                .read()
+                .unwrap()
+                .entries
+                .iter()
+                .filter(|(key, _)| key.workspace_id.as_deref() == Some("b"))
+                .all(|(_, entry)| !entry.revoked.load(Ordering::Acquire))
+        );
+        // Revocation is checked before request preparation could use network.
+        for old in [first, second] {
+            let error = old
+                .prepare_input_budget(chat_request())
+                .await
+                .err()
+                .expect("revoked authority");
+            assert!(error.is::<ProviderAuthorityRevoked>());
+        }
+        assert!(!Arc::ptr_eq(&other_tenant, &refreshed));
+        let current_b = registry
+            .get_or_create_for_workspace_with_frozen_azure("b", "azure-openai", &changed)
+            .unwrap();
+        assert_ne!(
+            other_tenant.authority_fingerprint(),
+            current_b.authority_fingerprint()
+        );
+        assert!(
+            other_tenant
+                .prepare_input_budget(chat_request())
+                .await
+                .err()
+                .expect("revoked authority")
+                .is::<ProviderAuthorityRevoked>()
+        );
+    }
+
+    #[test]
+    fn accepted_azure_revalidates_route_and_schema_without_disclosing_configuration() {
+        let route = Arc::new(std::sync::Mutex::new(Some(
+            "https://before.invalid".to_owned(),
+        )));
+        let resolver_route = route.clone();
+        let registry = ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+            |_, _| Ok("key".into()),
+            |_, _| Ok(None),
+            move |_, _| Ok(resolver_route.lock().unwrap().clone()),
+            ProviderTimeoutPolicy::default(),
+        );
+        let accepted = crate::AzureResolvedConnection::from_values(
+            String::new(),
+            "deployment".into(),
+            "v1".into(),
+            route.lock().unwrap().clone(),
+        )
+        .unwrap();
+        let first = registry
+            .authority_fingerprint_for_workspace_with_frozen_azure("a", "azure-openai", &accepted)
+            .unwrap();
+        assert_eq!(first.azure_connection(), Some(&accepted));
+        *route.lock().unwrap() = Some("https://after.invalid/SECRET".into());
+        let error = registry
+            .authority_fingerprint_for_workspace_with_frozen_azure("a", "azure-openai", &accepted)
+            .unwrap_err();
+        assert!(!format!("{error:#}").contains("SECRET"));
+        let mut future = accepted.clone();
+        future.schema_version = 2;
+        assert!(
+            registry
+                .authority_fingerprint_for_workspace_with_frozen_azure("a", "azure-openai", &future)
+                .is_err()
+        );
+        assert!(
+            registry
+                .authority_fingerprint_for_workspace_with_frozen_azure("a", "openai", &accepted)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn native_discovery_and_direct_chat_do_not_require_a_loaded_catalog() {
         let registry = ProviderRegistry::with_provider("openai", Arc::new(ToolDiscoveryProvider));
         let provider = registry.get_or_create("openai").unwrap();
@@ -1374,7 +1730,7 @@ mod tests {
             }
             let wrapper = AuthorityBoundProvider {
                 inner: Arc::new(NativeListFixture(definition.name)),
-                authority_fingerprint: ProviderAuthorityFingerprint(definition.name.into()),
+                authority_fingerprint: ProviderAuthorityFingerprint::opaque(definition.name.into()),
                 revoked: Arc::new(AtomicBool::new(false)),
                 redact_endpoint_errors: false,
                 input_admission: Arc::new(Default::default()),
@@ -1554,7 +1910,7 @@ mod tests {
                     catalog: catalog.clone(),
                     bodies: bodies.clone(),
                 }),
-                authority_fingerprint: ProviderAuthorityFingerprint(
+                authority_fingerprint: ProviderAuthorityFingerprint::opaque(
                     "router-reasoning-fixture".into(),
                 ),
                 revoked: Arc::new(AtomicBool::new(false)),
@@ -1688,7 +2044,7 @@ mod tests {
                                 catalog: catalog.clone(),
                                 bodies: bodies.clone(),
                             }),
-                            authority_fingerprint: ProviderAuthorityFingerprint(
+                            authority_fingerprint: ProviderAuthorityFingerprint::opaque(
                                 "router-budget-fixture".into(),
                             ),
                             revoked: Arc::new(AtomicBool::new(false)),
@@ -1828,7 +2184,7 @@ mod tests {
         let catalog = crate::catalog::tool_tests::generated_catalog();
         let wrapper = |authority: &str| AuthorityBoundProvider {
             inner: Arc::new(ToolDiscoveryProvider),
-            authority_fingerprint: ProviderAuthorityFingerprint(authority.into()),
+            authority_fingerprint: ProviderAuthorityFingerprint::opaque(authority.into()),
             revoked: Arc::new(AtomicBool::new(false)),
             redact_endpoint_errors: false,
             input_admission: Arc::new(Default::default()),
@@ -1842,14 +2198,22 @@ mod tests {
         // with an isolated source-generated snapshot rather than global state.
         assert!(!public.model_tool_calling_with_catalog("g03-negative", Some(&catalog)));
         assert!(public.model_tool_calling_with_catalog("g03-positive", Some(&catalog)));
-        assert!(public.model_tool_calling_with_catalog("unknown", Some(&catalog)));
+        assert_eq!(
+            public.model_tool_support_with_catalog("unknown", Some(&catalog)),
+            crate::ModelToolSupport::Unknown
+        );
+        assert!(!public.model_tool_calling_with_catalog("unknown", Some(&catalog)));
         let a = wrapper("authority-a");
         let b = wrapper("authority-b");
         let mut models = a.inner.list_models().await.unwrap();
         a.enrich_discovery(&catalog, &mut models);
         assert_eq!(models[0].capabilities.tool_calling, Some(false));
         assert!(!a.model_tool_calling("g03-positive"));
-        assert!(b.model_tool_calling("g03-positive"));
+        assert_eq!(
+            b.model_tool_support("g03-positive"),
+            crate::ModelToolSupport::Unknown
+        );
+        assert!(!b.model_tool_calling("g03-positive"));
         let mut request = crate::tools::policy::test_request();
         request.model = "g03-positive".into();
         assert!(
@@ -2045,7 +2409,19 @@ mod tests {
                 "malformed",
                 "custom-unknown",
             ] {
-                assert!(wrapper.model_tool_calling_with_catalog(id, Some(&catalog)));
+                let expected = if id == "native-positive" {
+                    crate::ModelToolSupport::Supported
+                } else {
+                    crate::ModelToolSupport::Unknown
+                };
+                assert_eq!(
+                    wrapper.model_tool_support_with_catalog(id, Some(&catalog)),
+                    expected
+                );
+                assert_eq!(
+                    wrapper.model_tool_calling_with_catalog(id, Some(&catalog)),
+                    id == "native-positive"
+                );
             }
             // A public source negative is still a veto against discovery true;
             // a foreign endpoint never inherits that same source restriction.
@@ -2056,7 +2432,11 @@ mod tests {
             let other = registry
                 .get_or_create_for_workspace("other", "openrouter")
                 .unwrap();
-            assert!(other.model_tool_calling("negative-no-source"));
+            assert_eq!(
+                other.model_tool_support("negative-no-source"),
+                crate::ModelToolSupport::Unknown
+            );
+            assert!(!other.model_tool_calling("negative-no-source"));
 
             // Native-normalized fixture adapter permits the allowed-path cases
             // without HTTP/preparation/runtime; registry constructors stay real.
@@ -2167,7 +2547,11 @@ mod tests {
                 // Public negative, positive and compat controls all stay out.
                 for id in ["g03-positive", "g03-negative"] {
                     assert_eq!(wrapper_support(&wrapper, id, &catalog).await, None);
-                    assert!(wrapper.model_tool_calling_with_catalog(id, Some(&catalog)));
+                    assert_eq!(
+                        wrapper.model_tool_support_with_catalog(id, Some(&catalog)),
+                        crate::ModelToolSupport::Unknown
+                    );
+                    assert!(!wrapper.model_tool_calling_with_catalog(id, Some(&catalog)));
                     let mut request = crate::tools::policy::test_request();
                     request.model = id.into();
                     request.parallel_tool_calls = Some(false);
@@ -2205,7 +2589,11 @@ mod tests {
                     wrapper_support(&other_wrapper, "g03-positive", &catalog).await,
                     None
                 );
-                assert!(other.model_tool_calling("g03-positive"));
+                assert_eq!(
+                    other.model_tool_support("g03-positive"),
+                    crate::ModelToolSupport::Unknown
+                );
+                assert!(!other.model_tool_calling("g03-positive"));
             }
         }
     }
@@ -2241,7 +2629,15 @@ mod tests {
                 );
                 assert_eq!(
                     wrapper.model_tool_calling_with_catalog("g03-negative", Some(&catalog)),
-                    !public
+                    false
+                );
+                assert_eq!(
+                    wrapper.model_tool_support_with_catalog("g03-negative", Some(&catalog)),
+                    if public {
+                        crate::ModelToolSupport::Unsupported
+                    } else {
+                        crate::ModelToolSupport::Unknown
+                    }
                 );
                 let mut request = crate::tools::policy::test_request();
                 request.model = "g03-positive".into();
@@ -3210,7 +3606,7 @@ mod tests {
             accepted_tx.send(()).unwrap();
             release_rx.await.unwrap();
             let body = format!("{{\"error\":\"rate limit at {response_url}; retry-after: 3\"}}");
-            stream.write_all(format!("HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            stream.write_all(format!("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 3\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
         });
         let request_provider = provider.clone();
         let request = tokio::spawn(async move { request_provider.chat(chat_request()).await });
@@ -3308,7 +3704,7 @@ mod tests {
                     })
                 );
                 let classification = provider.classify_failure(&error).unwrap();
-                assert_eq!(classification.class, ProviderFailureClass::StreamStall);
+                assert_eq!(classification.class, ProviderFailureClass::StreamTruncated);
                 assert_eq!(classification.http_status, None);
                 assert_eq!(classification.error_reason, None);
                 assert_eq!(
@@ -3329,32 +3725,32 @@ mod tests {
         use crate::failure::provider_stream_incomplete;
         let provider = EchoProvider::new();
         for (message, class) in [
-            ("connection reset", ProviderFailureClass::NetworkTransient),
+            ("connection reset", ProviderFailureClass::Unknown),
             (
                 "API error (429 Too Many Requests): rate limit",
-                ProviderFailureClass::RateLimit,
+                ProviderFailureClass::Unknown,
             ),
             (
                 "API error (403 Forbidden): permission denied",
-                ProviderFailureClass::AuthOrPermission,
+                ProviderFailureClass::Unknown,
             ),
             (
                 "API error (400 Bad Request): invalid request",
-                ProviderFailureClass::ProviderRejected,
+                ProviderFailureClass::Unknown,
             ),
-            ("stream stall", ProviderFailureClass::StreamStall),
+            ("stream stall", ProviderFailureClass::Unknown),
             (
                 "malformed OpenRouter SSE frame",
-                ProviderFailureClass::StreamStall,
+                ProviderFailureClass::Unknown,
             ),
             (
                 "provider sent payload after finish_reason",
-                ProviderFailureClass::StreamStall,
+                ProviderFailureClass::Unknown,
             ),
             // Identical text alone is deliberately insufficient proof.
             (
                 "provider stream ended before a terminal marker",
-                ProviderFailureClass::StreamStall,
+                ProviderFailureClass::Unknown,
             ),
         ] {
             let error = redacted_endpoint_error(
@@ -3449,7 +3845,7 @@ mod tests {
         let provider = registry.get_or_create_for_workspace("a", "gemini").unwrap();
         for (streaming, expected_class, expected_status) in [
             (false, ProviderFailureClass::RateLimit, 429),
-            (true, ProviderFailureClass::UnsupportedStreaming, 400),
+            (true, ProviderFailureClass::ProviderRejected, 400),
         ] {
             let error = if streaming {
                 provider
@@ -3484,7 +3880,7 @@ mod tests {
             let mut request = [0u8; 8192];
             socket.read(&mut request).await.unwrap();
             let body = serde_json::json!({
-                "error": {"message": format!("maximum context length exceeded at {echoed_url}")}
+                "error": {"code": "context_length_exceeded", "message": format!("maximum context length exceeded at {echoed_url}")}
             })
             .to_string();
             socket.write_all(format!(
@@ -3718,9 +4114,13 @@ mod tests {
                     paths,
                     vec![format!("POST /{secret}/v1/files HTTP/1.1"); attempts]
                 );
-                assert!(
-                    logs.contains(&format!("HTTP {}", status.unwrap())),
-                    "{logs}"
+                // Observability emits the safe class; HTTP status belongs to the
+                // typed failure source, rather than raw error text in the log.
+                assert_eq!(
+                    crate::failure::classify_transport_error(&error)
+                        .unwrap()
+                        .http_status,
+                    status
                 );
             }
         }
@@ -3807,5 +4207,69 @@ mod stream_error_redaction_tests {
             Some("overloaded_error")
         );
         assert!(!format!("{redacted:#?} {redacted:#}").contains("secret"));
+    }
+}
+
+#[cfg(test)]
+#[path = "registry_wire_tests.rs"]
+mod wire_contract_tests;
+
+#[cfg(test)]
+mod r04_failure_receipt_tests {
+    use super::*;
+    struct Fixture;
+    #[async_trait::async_trait]
+    impl crate::Provider for Fixture {
+        fn name(&self) -> &str {
+            "fixture"
+        }
+        async fn chat(&self, _: crate::ChatRequest) -> anyhow::Result<crate::ChatResponse> {
+            anyhow::bail!("unused fixture")
+        }
+        async fn stream_chat(
+            &self,
+            _: crate::ChatRequest,
+        ) -> anyhow::Result<
+            futures_util::stream::BoxStream<'static, anyhow::Result<crate::StreamChunk>>,
+        > {
+            anyhow::bail!("unused fixture")
+        }
+    }
+    #[test]
+    fn typed_media_transport_redaction_preserves_confirmed_error_usage() {
+        let mut classification = crate::ProviderFailureClassification::new(
+            pioneer_protocol::ProviderFailureClass::ProviderRejected,
+        );
+        classification.provider_code =
+            Some(crate::failure::REJECTED_CACHED_FILE_REFERENCE_CODE.into());
+        let usage = crate::TokenUsage {
+            input_tokens: Some(7),
+            output_tokens: Some(3),
+            ..Default::default()
+        };
+        let raw = anyhow::Error::new(crate::failure::ProviderTransportFailure { classification })
+            .context("SECRET source chain");
+        let wrapped = crate::usage::with_error_usage(raw, &usage);
+        let safe = redacted_endpoint_error(
+            &Fixture,
+            wrapped,
+            pioneer_protocol::ProviderFailureStage::Connect,
+        );
+        assert_eq!(
+            crate::usage::error_usage(&safe).unwrap().input_tokens,
+            Some(7)
+        );
+        assert_eq!(
+            crate::usage::error_usage(&safe).unwrap().output_tokens,
+            Some(3)
+        );
+        assert_eq!(
+            crate::failure::classify_transport_error(&safe)
+                .unwrap()
+                .provider_code
+                .as_deref(),
+            Some(crate::failure::REJECTED_CACHED_FILE_REFERENCE_CODE)
+        );
+        assert!(!format!("{safe:#?}").contains("SECRET"));
     }
 }

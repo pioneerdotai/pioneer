@@ -277,6 +277,7 @@ impl StreamDelta {
 #[derive(Debug, Deserialize)]
 struct StreamError {
     #[serde(default)]
+    #[cfg_attr(not(test), allow(dead_code))] // parsed only; never diagnostic or policy input
     message: Option<String>,
     #[serde(default)]
     code: Option<serde_json::Value>,
@@ -285,6 +286,7 @@ struct StreamError {
 }
 
 impl StreamError {
+    #[cfg(test)]
     fn description(self) -> String {
         let mut parts = Vec::new();
         if let Some(message) = self.message.filter(|message| !message.is_empty()) {
@@ -380,6 +382,7 @@ impl AzureOpenAiProvider {
         Ok(body)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_version_override(mut self, version: Option<&str>) -> Self {
         if let Some(version) = version {
             self.api_version = version.to_owned();
@@ -387,54 +390,42 @@ impl AzureOpenAiProvider {
         self
     }
 
-    fn validate_connection(&self, requires_deployment: bool) -> Result<()> {
-        if self.base_url.is_none()
-            && (self.resource_name.is_empty()
-                || !self
-                    .resource_name
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || c == b'-'))
-        {
-            anyhow::bail!(
-                "Azure OpenAI requires AZURE_OPENAI_RESOURCE or an explicit resource/gateway root base URL"
-            );
+    pub(crate) fn validate_connection(&self, requires_deployment: bool) -> Result<()> {
+        crate::AzureResolvedConnection::validate_parts(
+            1,
+            &self.resource_name,
+            self.base_url.as_deref(),
+            &self.deployment_name,
+            &self.api_version,
+            requires_deployment,
+        )
+    }
+
+    fn connection_snapshot(&self) -> crate::AzureResolvedConnection {
+        crate::AzureResolvedConnection {
+            schema_version: 1,
+            resource_name: self.resource_name.clone(),
+            configured_base_url: self.base_url.clone(),
+            deployment_name: self.deployment_name.clone(),
+            api_version: self.api_version.clone(),
         }
-        if requires_deployment && self.deployment_name.trim().is_empty() {
-            anyhow::bail!(
-                "Azure OpenAI requires AZURE_OPENAI_DEPLOYMENT (deployment name, not base model ID)"
-            );
-        }
-        if self.api_version == "v1" {
-            return Ok(());
-        }
-        if self
-            .base_url
-            .as_ref()
-            .is_some_and(|base| base.ends_with("/openai/v1"))
-        {
-            anyhow::bail!(
-                "Azure date-version Chat requires a resource/gateway root, not an openai/v1 prefix"
-            );
-        }
-        let version = self
-            .api_version
-            .strip_suffix("-preview")
-            .unwrap_or(&self.api_version);
-        let bytes = version.as_bytes();
-        if bytes.len() != 10
-            || !bytes.iter().enumerate().all(|(i, c)| {
-                if i == 4 || i == 7 {
-                    *c == b'-'
-                } else {
-                    c.is_ascii_digit()
-                }
-            })
-        {
-            anyhow::bail!(
-                "Azure Chat requires v1 or a date API version (YYYY-MM-DD or YYYY-MM-DD-preview); Responses needs a separate transport"
-            );
-        }
-        Ok(())
+    }
+
+    pub(crate) fn from_resolved_connection(
+        api_key: &str,
+        connection: &crate::AzureResolvedConnection,
+        timeout_policy: ProviderTimeoutPolicy,
+    ) -> Result<Self> {
+        connection.validate(true)?;
+        let mut provider = Self::with_api_version_and_timeout_policy(
+            api_key,
+            &connection.resource_name,
+            &connection.deployment_name,
+            &connection.api_version,
+            timeout_policy,
+        );
+        provider.base_url = connection.configured_base_url.clone();
+        Ok(provider)
     }
 
     pub fn new(
@@ -803,18 +794,7 @@ impl AzureOpenAiProvider {
     }
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
-        let status = response.status();
-        let body = match crate::http::read_response_text_bounded(
-            response,
-            16 * 1024,
-            "provider_error_body",
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(error) => return error,
-        };
-        anyhow!("Azure OpenAI API error ({status}): {body}")
+        crate::failure::http_error(response).await
     }
 }
 
@@ -918,7 +898,12 @@ impl AzureOpenAiProvider {
                                     .and_then(serde_json::Value::as_u64)
                                     .and_then(|code| u16::try_from(code).ok());
                                 let outcome = crate::failure::native_chat_stream_error(
-                                    &error.description(),
+                                    error
+                                        .code
+                                        .as_ref()
+                                        .and_then(serde_json::Value::as_str)
+                                        .or(error.error_type.as_deref())
+                                        .unwrap_or_default(),
                                     status,
                                 );
                                 let _ = tx.send(Err(outcome)).await;
@@ -1035,6 +1020,10 @@ impl AzureOpenAiProvider {
 
 #[async_trait]
 impl crate::traits::Provider for AzureOpenAiProvider {
+    fn resolved_azure_connection(&self) -> Option<crate::AzureResolvedConnection> {
+        Some(self.connection_snapshot())
+    }
+
     fn usage_api(&self) -> &'static str {
         "azure_deployment_chat_completions"
     }
@@ -1053,6 +1042,10 @@ impl crate::traits::Provider for AzureOpenAiProvider {
 
     fn name(&self) -> &str {
         "azure_openai"
+    }
+
+    fn model_tool_support(&self, model: &str) -> crate::ModelToolSupport {
+        crate::tools::policy::chat_tool_model_support(self.name(), model)
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -1096,7 +1089,8 @@ impl crate::traits::Provider for AzureOpenAiProvider {
             .json(&api_request);
         let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
-            .await?;
+            .await
+            .map_err(crate::failure::safe_transport_error)?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);
@@ -1211,7 +1205,8 @@ impl crate::traits::Provider for AzureOpenAiProvider {
             .header("api-key", &self.api_key);
         let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
-            .await?;
+            .await
+            .map_err(crate::failure::safe_transport_error)?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);
@@ -1482,7 +1477,13 @@ mod tests {
 
     #[tokio::test]
     async fn actual_azure_entrypoints_reject_responses_only_tools_before_http() {
-        let provider = AzureOpenAiProvider::new("unused", "unused", "opaque-deployment");
+        let provider = AzureOpenAiProvider::with_base_url_and_timeout_policy(
+            "unused",
+            "unused",
+            "opaque-deployment",
+            "http://127.0.0.1:9",
+            Default::default(),
+        );
         for model in ["gpt-6-astra", "gpt-6.1-sol-2026-09-01"] {
             for parallel in [None, Some(true), Some(false)] {
                 for choice in [
@@ -1504,7 +1505,7 @@ mod tests {
                             .err()
                             .unwrap()
                             .to_string()
-                            .contains("Responses API")
+                            .contains("model does not support tool definitions/history")
                     );
                     assert!(
                         provider
@@ -1513,7 +1514,7 @@ mod tests {
                             .err()
                             .unwrap()
                             .to_string()
-                            .contains("Responses API")
+                            .contains("model does not support tool definitions/history")
                     );
                 }
             }
