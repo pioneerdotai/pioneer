@@ -555,7 +555,8 @@ fn print_version(json_output: bool) -> Result<()> {
                 "name": binary_display_name(),
                 "version": env!("CARGO_PKG_VERSION"),
                 "os": std::env::consts::OS,
-                "arch": std::env::consts::ARCH
+                "arch": std::env::consts::ARCH,
+                "compiled_database_migrations": pioneer_gateway::compiled_database_migration_names()
             }))?
         );
     } else {

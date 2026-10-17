@@ -141,6 +141,8 @@ struct StartOutput {
 #[derive(Debug, Deserialize)]
 struct VersionOutput {
     version: String,
+    #[serde(default)]
+    compiled_database_migrations: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -315,7 +317,15 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
         },
     )?;
 
-    let existing = target_binary.is_file();
+    let existing = match fs::symlink_metadata(&target_binary) {
+        Ok(metadata) if metadata.is_file() => true,
+        Ok(_) => bail!("installed binary has unexpected file type; installation unchanged"),
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error)
+                .context("installed binary metadata unavailable; installation unchanged");
+        }
+    };
     let (was_active, runtime_home) = observe_install_stage(
         &mut stage_timings,
         install_started,
@@ -327,6 +337,46 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
             Ok(query_gateway_status(&target_binary)?
                 .map(|snapshot| (snapshot.service_active, snapshot.runtime_home))
                 .unwrap_or((false, None)))
+        },
+    )?;
+    observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.schema.preflight",
+        || {
+            // A failed status probe must not silently inspect another home.
+            if existing && runtime_home.is_none() {
+                bail!(
+                    "schema compatibility unknown: installed runtime home unavailable; installation unchanged"
+                );
+            }
+            let home = match runtime_home.clone() {
+                Some(home) => home,
+                None => config.runtime_home_dir()?,
+            };
+            let candidate = query_binary_version_output(&staged_binary)?;
+            let config = config.clone();
+            let applied = thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(pioneer_gateway::inspect_applied_database_migrations(
+                        &home, &config,
+                    ))
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("schema inspection worker failed"))??;
+            let applied = match applied {
+                Some(applied) => applied,
+                None if !existing => Vec::new(),
+                None => bail!(
+                    "schema compatibility unknown: installed database missing; installation unchanged"
+                ),
+            };
+            ensure_candidate_schema_compatible(
+                &applied,
+                candidate.compiled_database_migrations.as_deref(),
+            )
         },
     )?;
     let config_backup_dir = observe_install_stage(
@@ -465,15 +515,16 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
                 }));
             }
             Err(error) => {
-                rollback_and_restore(
+                let rollback = rollback_and_restore(
                     &target_binary,
                     &rollback_binary,
                     runtime_home.as_deref(),
                     config_backup_dir.as_deref(),
                     was_active,
                     &options.managed_by,
+                    RollbackSafety::SchemaMayHaveAdvanced,
                 );
-                bail!("failed to start gateway after update: {error:#}; update rolled back");
+                bail!("failed to start gateway after update: {error:#}; {rollback}");
             }
         };
 
@@ -486,15 +537,16 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
                 true,
                 "stop during rollback",
             );
-            rollback_and_restore(
+            let rollback = rollback_and_restore(
                 &target_binary,
                 &rollback_binary,
                 runtime_home.as_deref(),
                 config_backup_dir.as_deref(),
                 was_active,
                 &options.managed_by,
+                RollbackSafety::SchemaMayHaveAdvanced,
             );
-            bail!("gateway failed health check after update; update rolled back");
+            bail!("gateway failed health check after update; {rollback}");
         }
         stage_timings.push(successful_stage_timing(
             "health.wait",
@@ -516,15 +568,20 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
             )
         },
     ) {
-        rollback_and_restore(
+        let rollback = rollback_and_restore(
             &target_binary,
             &rollback_binary,
             runtime_home.as_deref(),
             config_backup_dir.as_deref(),
             was_active,
             &options.managed_by,
+            if should_start {
+                RollbackSafety::SchemaMayHaveAdvanced
+            } else {
+                RollbackSafety::BeforeGatewayStart
+            },
         );
-        bail!("failed to persist install-state: {error:#}; update rolled back");
+        bail!("failed to persist install-state: {error:#}; {rollback}");
     }
 
     observe_install_stage(
@@ -999,6 +1056,25 @@ fn persist_install_state(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RollbackSafety {
+    BeforeGatewayStart,
+    SchemaMayHaveAdvanced,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RollbackDisposition {
+    Attempted,
+    BlockedCompatibilityUnknown,
+}
+impl std::fmt::Display for RollbackDisposition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Attempted => "binary/config rollback attempted",
+            Self::BlockedCompatibilityUnknown => "rollback blocked: binary/schema compatibility is unknown after startup; candidate binary and backups retained",
+        })
+    }
+}
+
 fn rollback_and_restore(
     target_binary: &Path,
     rollback_binary: &Path,
@@ -1006,7 +1082,14 @@ fn rollback_and_restore(
     config_backup_dir: Option<&Path>,
     was_active: bool,
     managed_by: &InstallManagedBy,
-) {
+    safety: RollbackSafety,
+) -> RollbackDisposition {
+    // Starting a candidate can durably apply migrations before health fails.
+    // Restoring only the old binary cannot undo them. Without a read-only
+    // applied-history compatibility proof, preserve both binaries and data.
+    if safety == RollbackSafety::SchemaMayHaveAdvanced {
+        return RollbackDisposition::BlockedCompatibilityUnknown;
+    }
     restore_binary_and_config(
         target_binary,
         rollback_binary,
@@ -1014,6 +1097,7 @@ fn rollback_and_restore(
         config_backup_dir,
     );
     maybe_restore_service_after_rollback(target_binary, rollback_binary, was_active, managed_by);
+    RollbackDisposition::Attempted
 }
 
 fn restore_binary_and_config(
@@ -1084,7 +1168,7 @@ fn query_gateway_status(binary: &Path) -> Result<Option<ServiceSnapshot>> {
     }))
 }
 
-fn query_binary_version(binary: &Path) -> Result<String> {
+fn query_binary_version_output(binary: &Path) -> Result<VersionOutput> {
     let output = Command::new(binary)
         .arg("version")
         .arg("--json")
@@ -1106,7 +1190,35 @@ fn query_binary_version(binary: &Path) -> Result<String> {
         bail!("version probe output did not include a version");
     }
 
-    Ok(version.to_owned())
+    Ok(parsed)
+}
+
+fn query_binary_version(binary: &Path) -> Result<String> {
+    Ok(query_binary_version_output(binary)?
+        .version
+        .trim()
+        .to_owned())
+}
+
+fn ensure_candidate_schema_compatible(
+    applied: &[String],
+    compiled: Option<&[String]>,
+) -> Result<()> {
+    let compiled = compiled.context("schema compatibility unknown: candidate does not expose compiled migrations; installation unchanged")?;
+    anyhow::ensure!(
+        !compiled.is_empty() && compiled.len() <= 4096,
+        "schema compatibility unknown: invalid candidate migration set; installation unchanged"
+    );
+    let names: std::collections::HashSet<_> = compiled.iter().collect();
+    anyhow::ensure!(
+        names.len() == compiled.len() && compiled.iter().all(|name| !name.trim().is_empty()),
+        "schema compatibility unknown: invalid candidate migration names; installation unchanged"
+    );
+    anyhow::ensure!(
+        applied.iter().all(|name| names.contains(name)),
+        "candidate is incompatible with applied migration history; installation unchanged"
+    );
+    Ok(())
 }
 
 fn wait_for_gateway_health(binary: &Path, timeout: Duration) -> bool {
@@ -1987,6 +2099,33 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn schema_uncertainty_blocks_binary_only_rollback_before_any_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("candidate");
+        let rollback = dir.path().join("old");
+        fs::write(&target, "candidate-with-new-schema").unwrap();
+        fs::write(&rollback, "older-binary").unwrap();
+        let outcome = super::rollback_and_restore(
+            &target,
+            &rollback,
+            None,
+            None,
+            true,
+            &pioneer_config::InstallManagedBy::Manual,
+            super::RollbackSafety::SchemaMayHaveAdvanced,
+        );
+        assert_eq!(
+            outcome,
+            super::RollbackDisposition::BlockedCompatibilityUnknown
+        );
+        assert_eq!(
+            fs::read_to_string(target).unwrap(),
+            "candidate-with-new-schema"
+        );
+        assert_eq!(fs::read_to_string(rollback).unwrap(), "older-binary");
+    }
+
+    #[test]
     fn install_reports_preserve_transient_download_classification_after_output_failure() {
         struct FailedWriter(std::io::ErrorKind);
 
@@ -2673,6 +2812,38 @@ fi
             );
             read += received;
         }
+    }
+
+    #[test]
+    fn candidate_must_know_every_applied_migration_without_version_ordering() {
+        let applied = vec!["migration_new".to_owned()];
+        let old_candidate = vec!["migration_old".to_owned()];
+        assert!(super::ensure_candidate_schema_compatible(&applied, Some(&old_candidate)).is_err());
+        let compatible = vec![
+            "migration_old".to_owned(),
+            "migration_new".to_owned(),
+            "migration_future".to_owned(),
+        ];
+        super::ensure_candidate_schema_compatible(&applied, Some(&compatible)).unwrap();
+        assert!(super::ensure_candidate_schema_compatible(&applied, None).is_err());
+        assert!(super::ensure_candidate_schema_compatible(&applied, Some(&[])).is_err());
+        assert!(
+            super::ensure_candidate_schema_compatible(
+                &applied,
+                Some(&["migration_new".into(), "migration_new".into()])
+            )
+            .is_err()
+        );
+        // Legacy version JSON parses, but cannot supply compatibility proof.
+        let legacy: super::VersionOutput =
+            serde_json::from_str(r#"{"version":"999.0.0"}"#).unwrap();
+        assert!(
+            super::ensure_candidate_schema_compatible(
+                &applied,
+                legacy.compiled_database_migrations.as_deref()
+            )
+            .is_err()
+        );
     }
 
     fn http_response(status: u16, reason: &str, body: &[u8]) -> Vec<u8> {

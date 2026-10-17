@@ -5016,6 +5016,26 @@ impl CrudStore {
             .collect()
     }
 
+    /// Installer inspection only: never create the migration table or run
+    /// migrations. A missing/unreadable history is an unknown compatibility.
+    pub async fn inspect_applied_migration_names(&self) -> Result<Vec<String>> {
+        let rows = self
+            .connection
+            .query_all_raw(Statement::from_string(
+                self.connection.get_database_backend(),
+                "SELECT version FROM seaql_migrations ORDER BY version LIMIT 4097",
+            ))
+            .await
+            .context("failed to inspect applied migration history")?;
+        anyhow::ensure!(
+            rows.len() <= 4096,
+            "migration history exceeds inspection bound"
+        );
+        rows.into_iter()
+            .map(|row| row.try_get("", "version").map_err(Into::into))
+            .collect()
+    }
+
     pub async fn list_active_execution_authorities(
         &self,
         after_turn_id: Option<&str>,
