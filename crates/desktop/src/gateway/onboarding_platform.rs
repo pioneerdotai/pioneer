@@ -2,7 +2,7 @@
 use super::{
     connectivity::*,
     control::*,
-    registry::{load_registry_for_runtime, save_registry},
+    registry::{load_registry_for_runtime_traced, save_registry},
     timings::{gateway_timings_from_config, gateway_ws_timings_from_config},
 };
 use anyhow::{Context, Result, bail};
@@ -10,11 +10,30 @@ use pioneer_client::{
     core::ClientEffectResult,
     gateway::{onboarding_effects::*, session_refresh::GatewaySessionStorage},
 };
+use pioneer_observability::{DesktopStartupStage as Stage, DesktopStartupTrace};
 use pioneer_protocol::{AuthSecretString, ClientInstallationDescriptor, ClientKind};
+
+/// Measures only operations actually invoked; an unexecuted short-circuit branch has no record.
+pub(crate) fn observe_preconnect<T, E>(
+    trace: Option<&DesktopStartupTrace>,
+    stage: Stage,
+    operation: impl FnOnce() -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
+    let guard = trace.and_then(|trace| trace.gateway_preconnect_stage(stage));
+    let result = operation();
+    if let Some(guard) = guard {
+        if result.is_ok() {
+            guard.succeed();
+        }
+        // Err/unwind drops the guard as error; synchronous native work is not cancellable.
+    }
+    result
+}
 
 pub(crate) fn execute(
     effect: &OnboardingPlatformEffect,
     storage: &dyn GatewaySessionStorage,
+    trace: Option<&DesktopStartupTrace>,
 ) -> Result<ClientEffectResult> {
     let config = pioneer_config::AppConfig::load()?;
     let home = config.ensure_runtime_home_dir()?;
@@ -25,23 +44,42 @@ pub(crate) fn execute(
             anyhow::bail!("native binding journals are unsupported on Desktop")
         }
         OnboardingPlatformEffect::LoadGatewayEnvironment => {
-            let registry = load_registry_for_runtime(&path, &config)?.registry;
+            let registry = observe_preconnect(trace, Stage::GatewayRegistryLoad, || {
+                load_registry_for_runtime_traced(&path, &config, trace)
+            })?
+            .registry;
             let local_install_required =
-                super::runtime::discovery::managed_gateway_requires_install();
+                observe_preconnect(trace, Stage::GatewayInstallationCheck, || {
+                    Ok::<_, std::convert::Infallible>(
+                        super::runtime::discovery::managed_gateway_requires_install(),
+                    )
+                })
+                .unwrap();
             let local_update_required =
-                super::runtime::discovery::managed_gateway_requires_update();
+                observe_preconnect(trace, Stage::GatewayUpdateCheck, || {
+                    Ok::<_, std::convert::Infallible>(
+                        super::runtime::discovery::managed_gateway_requires_update(),
+                    )
+                })
+                .unwrap();
             let local_provisioned = registry
                 .local
                 .as_ref()
-                .map(|endpoint| storage.load(endpoint).map(|value| value.is_some()))
+                .map(|endpoint| {
+                    observe_preconnect(trace, Stage::GatewayEnvironmentCredentialsLoad, || {
+                        storage.load(endpoint)
+                    })
+                    .map(|value| value.is_some())
+                })
                 .transpose()?
                 .unwrap_or(false)
                 || !local_install_required
-                || is_configured_service_active(&config.gateway.service_name)?
-                || is_local_gateway_reachable(
-                    &config.gateway.listen_addr,
-                    timings.connect_timeout,
-                )?;
+                || observe_preconnect(trace, Stage::GatewayServiceCheck, || {
+                    is_configured_service_active(&config.gateway.service_name)
+                })?
+                || observe_preconnect(trace, Stage::GatewayReachabilityCheck, || {
+                    is_local_gateway_reachable(&config.gateway.listen_addr, timings.connect_timeout)
+                })?;
             let installation = ClientInstallationDescriptor {
                 installation_id: registry
                     .installation_id
@@ -70,7 +108,9 @@ pub(crate) fn execute(
             })
         }
         OnboardingPlatformEffect::PersistGatewayRegistry { registry } => {
-            save_registry(&path, registry)?;
+            observe_preconnect(trace, Stage::GatewayRegistrySave, || {
+                save_registry(&path, registry)
+            })?;
             Ok(ClientEffectResult::Completed)
         }
         OnboardingPlatformEffect::CreateLocalDeviceActivation { endpoint_id } => {
@@ -89,13 +129,21 @@ pub(crate) fn execute(
             );
             let service = &config.gateway.service_name;
             let address = &config.gateway.listen_addr;
-            let mut warnings = super::runtime::discovery::ensure_managed_gateway_up_to_date(
-                service, address, &timings, None,
-            )?;
-            let reachable = is_local_gateway_reachable(address, timings.connect_timeout)?;
-            let service_active = is_configured_service_active(service)?;
+            let mut warnings = observe_preconnect(trace, Stage::GatewayRuntimeUpdateCheck, || {
+                super::runtime::discovery::ensure_managed_gateway_up_to_date(
+                    service, address, &timings, None,
+                )
+            })?;
+            let reachable = observe_preconnect(trace, Stage::GatewayReachabilityCheck, || {
+                is_local_gateway_reachable(address, timings.connect_timeout)
+            })?;
+            let service_active = observe_preconnect(trace, Stage::GatewayServiceCheck, || {
+                is_configured_service_active(service)
+            })?;
             let readiness = if reachable {
-                local_gateway_readiness(address, timings.connect_timeout)?
+                observe_preconnect(trace, Stage::GatewayReadinessCheck, || {
+                    local_gateway_readiness(address, timings.connect_timeout)
+                })?
             } else {
                 LocalGatewayReadiness::Unavailable
             };
@@ -114,14 +162,23 @@ pub(crate) fn execute(
                 .is_some_and(|status| status.accepts_sessions())
             {
                 if reachable || readiness.status().is_some() || service_active {
-                    wait_for_gateway_service(address, &timings)?;
+                    observe_preconnect(trace, Stage::GatewayHealthWait, || {
+                        wait_for_gateway_service(address, &timings)
+                    })?;
                 } else {
-                    warnings.extend(start_gateway_service(service, address, &timings, None)?);
+                    warnings.extend(observe_preconnect(
+                        trace,
+                        Stage::GatewayRuntimeServiceStart,
+                        || start_gateway_service(service, address, &timings, None),
+                    )?);
                 }
             }
             let provisioned = endpoint.session_ref.is_some()
                 && endpoint.server_gateway_id.is_some()
-                && storage.load(endpoint)?.is_some();
+                && observe_preconnect(trace, Stage::GatewayEnvironmentCredentialsLoad, || {
+                    storage.load(endpoint)
+                })?
+                .is_some();
             let activation = if provisioned && !recover {
                 None
             } else {
