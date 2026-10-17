@@ -1703,6 +1703,14 @@ task = "कार्य"
 mark_read = "पढ़ा हुआ चिह्नित करें"
 completed = "कार्य पूरा हुआ"
 
+open = "थ्रेड खोलें"
+more = "और लोड करें"
+read = "पढ़ा गया"
+unread = "अपठित"
+retry = "फिर कोशिश करें"
+loading_failed = "कार्य के परिणाम लोड नहीं हो सके"
+timed_out = "समय समाप्त"
+
 [settings.self_improvement.status]
 title = "गतिविधि"
 refresh = "रीफ़्रेश करें"

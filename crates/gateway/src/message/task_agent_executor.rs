@@ -7517,6 +7517,7 @@ mod prepared_snapshot_tests {
             version: imported.sources[0].version.clone(),
         };
         let record = FrozenImportRecord {
+            preview_archive: None,
             message_ordinal: 2,
             source_thread: "parent".into(),
             source: source.clone(),

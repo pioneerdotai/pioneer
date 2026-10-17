@@ -485,8 +485,8 @@ async fn read_accepted_imports(
             let origin = references
                 .get(index)
                 .ok_or_else(|| anyhow::anyhow!("accepted own import has no canonical message"))?;
-            let direct_source = origin.source_thread == record.source_thread
-                && origin.sources.iter().any(|source| source == &record.source);
+            record.validate_preview_archive(store, workspace).await?;
+            let direct_source = record.matches_render_target(origin);
             let checkpoint_target = match origin.sources.as_slice() {
                 [source] if source.scope.starts_with("checkpoint:") => Some(ScopedHistorySource {
                     thread: origin.source_thread.clone(),
@@ -514,8 +514,8 @@ async fn read_accepted_imports(
                 }
             }
             entry.sources.insert(ScopedHistorySource {
-                thread: record.source_thread,
-                source: record.source,
+                thread: record.source_thread.clone(),
+                source: record.render_source().clone(),
             });
             entry.import_ordinals.push(ordinal);
             ordinal += 1;
@@ -1096,20 +1096,20 @@ async fn prepare_accepted_task_basis_prepared(
                 for (ordinal, record) in records.iter().enumerate() {
                     let leaf = ScopedHistorySource {
                         thread: record.source_thread.clone(),
-                        source: record.source.clone(),
+                        source: record.render_source().clone(),
                     };
                     // An immutable grant can name an atomic checkpoint, not
                     // just a raw leaf. Keep that identity and its import ordinal.
-                    let checkpoint_member = graph.checkpoints.contains(&record.source)
+                    let checkpoint_member = graph.checkpoints.contains(record.render_source())
                         && store
                             .compaction_checkpoint_source(
                                 workspace,
                                 &record.source_thread,
-                                &record.source.id,
+                                &record.render_source().id,
                             )
                             .await?
                             .as_ref()
-                            == Some(&record.source);
+                            == Some(record.render_source());
                     if graph.leaves.contains(&leaf) || checkpoint_member {
                         ordinals.push(ordinal as u64);
                     }
@@ -1131,7 +1131,7 @@ async fn prepare_accepted_task_basis_prepared(
                 }
             } else {
                 for (ordinal, record) in records.iter().enumerate() {
-                    if record.source_thread == key.thread && record.source == key.source {
+                    if record.source_thread == key.thread && record.render_source() == &key.source {
                         imports.entry(key.clone()).or_default().push(
                             store
                                 .compaction_prepare_accepted_import(
@@ -6125,6 +6125,150 @@ fn source_turn(source: &SourceRef) -> Option<&str> {
     source.scope.split_once(':').map(|(_, turn)| turn)
 }
 
+/// Verify a frozen rendering while its original canonical source still exists.
+/// Persist only the diagnostic wire hash; no HTML/image bytes are duplicated.
+pub(crate) async fn prepare_html_preview_archive_witness(
+    store: &CrudStore,
+    witness: &pioneer_crud::HtmlPreviewArchiveWitness,
+) -> Result<()> {
+    let reference = &witness.reference;
+    ensure!(
+        reference.tool_name.as_deref() == Some("html_preview")
+            && reference.source_aliases.is_empty()
+            && reference.ambiguous_input_aliases.is_empty()
+            && !reference.protected_input,
+        "unsupported preview archive provenance"
+    );
+    // An accepted import keeps its canonical source thread while its context
+    // belongs to the receiving manifest. Admit only that persisted owner, not
+    // an arbitrary context_thread from the reference. Receipt publication
+    // rechecks the same header owner together with the exact reference.
+    let allowed = BTreeSet::from([
+        reference.source_thread.clone(),
+        witness.owner_thread.clone(),
+    ]);
+    authorize(
+        &witness.workspace,
+        &allowed,
+        &reference_metadata_provenance(&witness.workspace, reference),
+    )?;
+    let original = restore_entry(
+        store,
+        &witness.workspace,
+        &allowed,
+        reference,
+        &mut super::coverage::CheckpointGraphResolver::default(),
+        FrozenRestoreProjection::Literal,
+        &mut FrozenExecutionRestoreState::default(),
+    )
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("preview has no literal result"))?;
+    let archived = pioneer_crud::archive_html_preview_result(
+        &serde_json::json!({"kind":"json","truncated":false,"value":original}).to_string(),
+    )?;
+    let view: pioneer_tools::ToolResultView = serde_json::from_str(&archived)?;
+    let pioneer_tools::ToolResultView::Json {
+        value,
+        truncated: false,
+    } = view
+    else {
+        anyhow::bail!("invalid preview archive");
+    };
+    let message: ChatMessage = serde_json::from_value(value)?;
+    let hash = wire_digest(&message)?;
+    let source = reference
+        .replay_source
+        .as_ref()
+        .or_else(|| reference.sources.first())
+        .ok_or_else(|| anyhow::anyhow!("preview has no canonical source"))?;
+    // Verify the other direction too: archival transformation must commute
+    // with this exact retained-tool rendering. Unsupported legacy/budget forms
+    // keep their media instead of leaving a hash that cannot be replayed.
+    let canonical = pioneer_crud::archive_html_preview_result(&witness.payload)?;
+    verified_preview_diagnostic(
+        store,
+        &witness.workspace,
+        reference,
+        &canonical,
+        source,
+        &hash,
+    )
+    .await?;
+    store
+        .record_html_preview_archive_witness(witness, &hash)
+        .await
+}
+
+async fn verified_preview_diagnostic(
+    store: &CrudStore,
+    workspace: &str,
+    reference: &FrozenMessageRef,
+    payload: &str,
+    current: &SourceRef,
+    hash: &str,
+) -> Result<ChatMessage> {
+    let view: pioneer_tools::ToolResultView = serde_json::from_str(payload)?;
+    let pioneer_tools::ToolResultView::Json {
+        value,
+        truncated: false,
+    } = view
+    else {
+        anyhow::bail!("invalid preview diagnostic");
+    };
+    let message: ChatMessage = serde_json::from_value(value)?;
+    let mut candidates = vec![FrozenModelCandidate::exact(message.clone())];
+    // Existing retained-tool rendering is another deterministic projection.
+    if let Some(item) = store
+        .compaction_replay_item_id(workspace, &reference.source_thread, current)
+        .await?
+    {
+        let turn = current
+            .scope
+            .strip_prefix("context:")
+            .ok_or_else(|| anyhow::anyhow!("invalid archived preview scope"))?;
+        let locator=serde_json::json!({"workspace_id":workspace,"thread_id":reference.source_thread,"turn_id":turn,"item_id":item}).to_string();
+        candidates.push(FrozenModelCandidate::exact(
+            pioneer_agent::compaction::restored_tool_result_message(&message, &locator)?,
+        ));
+    }
+    Ok(verified_model_candidate(hash, candidates)?.model)
+}
+
+async fn restore_archived_preview(
+    store: &CrudStore,
+    workspace: &str,
+    allowed: &BTreeSet<String>,
+    reference: &FrozenMessageRef,
+) -> Result<Option<ChatMessage>> {
+    if reference.tool_name.as_deref() != Some("html_preview") {
+        return Ok(None);
+    }
+    reference.validate()?;
+    authorize(
+        workspace,
+        allowed,
+        &reference_metadata_provenance(workspace, reference),
+    )?;
+    let Some((payload, hash, current)) = store
+        .html_preview_archived_frozen_result(workspace, reference)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut message =
+        verified_preview_diagnostic(store, workspace, reference, &payload, &current, &hash).await?;
+    let mut origin = reference_metadata_provenance(workspace, reference);
+    // A subsequent capture names the actual diagnostic revision. The original
+    // output manifest/identity and its delivery receipts remain unchanged.
+    for source in &mut origin.sources {
+        if source.scope == current.scope && source.id == current.id {
+            source.version = current.version.clone();
+        }
+    }
+    message.provenance = Some(origin);
+    Ok(Some(message))
+}
+
 async fn restore_entry(
     store: &CrudStore,
     workspace: &str,
@@ -6134,6 +6278,11 @@ async fn restore_entry(
     projection: FrozenRestoreProjection,
     state: &mut FrozenExecutionRestoreState,
 ) -> Result<Option<ChatMessage>> {
+    if let Some(message) =
+        restore_archived_preview(store, workspace, allowed_threads, reference).await?
+    {
+        return Ok(Some(message));
+    }
     reference.validate()?;
     for alias in &reference.source_aliases {
         if alias.represented_thread == reference.source_thread
@@ -6326,7 +6475,8 @@ async fn restore_execution_entries_page(
 }
 
 fn frozen_payload_batchable(reference: &FrozenMessageRef) -> bool {
-    reference.sources.len() == 1
+    reference.tool_name.as_deref() != Some("html_preview")
+        && reference.sources.len() == 1
         && reference.replay_source.is_none()
         && matches!(
             reference.sources[0]
@@ -6352,6 +6502,7 @@ fn bounded_preparation_group(references: &[FrozenMessageRef]) -> Result<(usize, 
         let count = reference.sources.len() + usize::from(reference.replay_source.is_some());
         if reference.source_thread != first.source_thread
             || reference.sources.is_empty()
+            || reference.tool_name.as_deref() == Some("html_preview")
             || frozen_payload_batchable(reference)
             || sources.len() + count > pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize
         {
@@ -6450,6 +6601,13 @@ async fn restore_entries_page_with_projection(
     let mut index = 0usize;
     while index < references.len() {
         let reference = &references[index];
+        if let Some(message) =
+            restore_archived_preview(store, workspace, allowed_threads, reference).await?
+        {
+            result.push(Some(message));
+            index += 1;
+            continue;
+        }
         if !frozen_payload_batchable(reference) {
             let (entries, sources) = bounded_preparation_group(&references[index..])?;
             // A singleton cannot save a query. False retains legacy registration
@@ -7008,6 +7166,26 @@ mod policy_tests {
         let mut entry = preparation_reference(0);
         entry.sources.clear();
         assert_eq!(bounded_preparation_group(&[entry]).unwrap(), (0, vec![]));
+    }
+
+    #[test]
+    fn preparation_group_stops_before_html_preview_archive_restore() {
+        let mut preview = preparation_reference(1);
+        preview.tool_name = Some("html_preview".into());
+        let references = vec![
+            preparation_reference(0),
+            preview.clone(),
+            preparation_reference(2),
+        ];
+        assert_eq!(bounded_preparation_group(&references).unwrap().0, 1);
+        assert_eq!(
+            bounded_preparation_group(&references[1..]).unwrap(),
+            (0, vec![])
+        );
+
+        preview.sources[0] = preview.replay_source.take().unwrap();
+        assert!(!frozen_payload_batchable(&preview));
+        assert_eq!(bounded_preparation_group(&[preview]).unwrap(), (0, vec![]));
     }
 
     #[test]

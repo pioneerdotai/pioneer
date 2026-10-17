@@ -1703,6 +1703,14 @@ task = "Tâche"
 mark_read = "Marquer comme lu"
 completed = "Tâche terminée"
 
+open = "Ouvrir le fil"
+more = "Charger plus"
+read = "Lu"
+unread = "Non lu"
+retry = "Réessayer"
+loading_failed = "Impossible de charger les résultats"
+timed_out = "Délai dépassé"
+
 [settings.self_improvement.status]
 title = "Activité"
 refresh = "Actualiser"

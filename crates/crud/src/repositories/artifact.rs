@@ -964,9 +964,35 @@ impl ArtifactRepository {
             || filter.task_id.is_some()
             || filter.task_run_id.is_some();
 
+        // Select eligible identities before either binding or workspace pagination.
+        // Provenance, rather than a file name/MIME, identifies temporary previews.
+        let mut eligible = artifact::Entity::find()
+            .select_only()
+            .column(artifact::Column::Id)
+            .filter(artifact::Column::WorkspaceId.eq(workspace_id.to_owned()))
+            .filter(sea_orm::sea_query::ExprTrait::not(
+                super::html_preview_retention::temporary_preview_predicate("artifact"),
+            ));
+        if !filter.include_deleted {
+            eligible = eligible.filter(artifact::Column::Status.ne("deleted"));
+        }
+        if !filter.kinds.is_empty() {
+            eligible = eligible.filter(
+                artifact::Column::Kind.is_in(
+                    filter
+                        .kinds
+                        .iter()
+                        .map(|kind| kind_to_db(*kind).to_owned())
+                        .collect::<Vec<_>>(),
+                ),
+            );
+        }
+        let eligible = eligible.into_query();
+
         let artifact_ids = if has_binding_filter {
             let mut query = artifact_binding::Entity::find()
-                .filter(artifact_binding::Column::WorkspaceId.eq(workspace_id.to_owned()));
+                .filter(artifact_binding::Column::WorkspaceId.eq(workspace_id.to_owned()))
+                .filter(artifact_binding::Column::ArtifactId.in_subquery(eligible.clone()));
             if let Some(authorized_artifact_ids) = &filter.authorized_artifact_ids {
                 query = query.filter(
                     artifact_binding::Column::ArtifactId
@@ -1038,29 +1064,26 @@ impl ArtifactRepository {
                         source,
                     })?
             } else {
-                let bindings = query
-                    .order_by_desc(artifact_binding::Column::CreatedAt)
-                    .order_by_desc(artifact_binding::Column::Id)
+                query
+                    .select_only()
+                    .column(artifact_binding::Column::ArtifactId)
+                    .group_by(artifact_binding::Column::ArtifactId)
+                    .order_by_desc(sea_orm::sea_query::Expr::cust("MAX(created_at)"))
+                    .order_by_desc(artifact_binding::Column::ArtifactId)
                     .limit(query_limit)
                     .offset(offset)
+                    .into_tuple::<String>()
                     .all(db)
                     .await
                     .map_err(|source| ArtifactCrudError::Database {
-                        message: "failed to list artifact bindings".to_owned(),
+                        message: "failed to list artifact identities".to_owned(),
                         source,
-                    })?;
-
-                let mut artifact_ids = Vec::<String>::new();
-                for binding in bindings {
-                    if !artifact_ids.iter().any(|id| id == &binding.artifact_id) {
-                        artifact_ids.push(binding.artifact_id);
-                    }
-                }
-                artifact_ids
+                    })?
             }
         } else {
             let mut query = artifact::Entity::find()
                 .filter(artifact::Column::WorkspaceId.eq(workspace_id.to_owned()))
+                .filter(artifact::Column::Id.in_subquery(eligible))
                 .order_by_desc(artifact::Column::UpdatedAt)
                 .order_by_desc(artifact::Column::Id)
                 .limit(query_limit)
@@ -1190,6 +1213,9 @@ impl ArtifactRepository {
         let artifacts = artifact::Entity::find()
             .filter(artifact::Column::WorkspaceId.eq(workspace_id.to_owned()))
             .filter(artifact::Column::Id.is_in(artifact_ids.into_iter().collect::<Vec<_>>()))
+            .filter(sea_orm::sea_query::ExprTrait::not(
+                super::html_preview_retention::temporary_preview_predicate("artifact"),
+            ))
             .all(db)
             .await
             .map_err(|source| ArtifactCrudError::Database {
@@ -1982,6 +2008,7 @@ pub async fn delete_blob_row<C: ConnectionTrait>(
     let result = artifact_blob::Entity::delete_many()
         .filter(artifact_blob::Column::WorkspaceId.eq(workspace_id.to_owned()))
         .filter(artifact_blob::Column::Id.eq(blob_id.to_owned()))
+        .filter(sea_orm::sea_query::Expr::cust("NOT EXISTS(SELECT 1 FROM artifact_version v WHERE v.blob_id=artifact_blob.id) AND NOT EXISTS(SELECT 1 FROM artifact_projection p WHERE p.blob_id=artifact_blob.id)"))
         .exec(db)
         .await
         .map_err(|source| ArtifactCrudError::Database {

@@ -3448,6 +3448,67 @@ pub struct TaskUserNotificationDeliveredNotification {
     pub created_at: i64,
 }
 
+/// One saved terminal run in the current user's workspace inbox. Contains no
+/// execution-thread identity, raw failure, HTML, or full result payload.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCompletionInboxEntry {
+    pub workspace_id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub title: String,
+    pub thread_id: String,
+    pub thread_title: String,
+    pub status: TaskRunStatus,
+    pub completed_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCompletionInboxListParams {
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCompletionInboxListResponse {
+    pub entries: Vec<TaskCompletionInboxEntry>,
+    pub unread_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCompletionInboxEntryParams {
+    pub workspace_id: String,
+    pub run_id: String,
+}
+
+/// An invalidation only: clients reload authoritative rows and count.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCompletionInboxChangedNotification {
+    pub workspace_id: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCompletionInboxEntryResponse {
+    pub entry: TaskCompletionInboxEntry,
+    pub unread_count: u64,
+}
+
 /// Durable exact-recipient Task notification returned by the user inbox.
 ///
 /// The websocket notification is only a live invalidation hint. This record is
