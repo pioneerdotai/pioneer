@@ -291,11 +291,25 @@ impl VoiceInputSupervisor {
     }
 
     pub(crate) fn runtime_snapshot(&self) -> GatewayVoiceInputRuntimeSnapshot {
-        self.lock_inner().state.runtime.clone()
+        self.settings_tx.borrow().runtime.clone()
     }
 
     pub(crate) fn settings_snapshot(&self) -> GatewayVoiceInputSettings {
-        self.lock_inner().state.settings_snapshot()
+        // Native inference owns inner. Control-plane reads must remain usable
+        // during recording, including requests preceding cancel on one socket.
+        self.settings_tx.borrow().clone()
+    }
+
+    pub(crate) fn try_session_generation(&self) -> Option<u64> {
+        // Do not block a Tokio ingress thread behind native inference. A busy
+        // engine can refuse a new recording; existing recordings keep their slot.
+        let inner = self.inner.try_lock().ok()?;
+        (inner.state.runtime.phase == GatewayVoiceInputRuntimePhase::Ready
+            && inner.state.runtime.effective_enabled
+            && inner.state.desired.selected_identity().as_ref()
+                == inner.state.loaded_model.as_ref()
+            && inner.loaded_engine.is_some())
+        .then_some(inner.state.generation)
     }
 
     pub(crate) fn subscribe_settings(&self) -> watch::Receiver<GatewayVoiceInputSettings> {
@@ -466,11 +480,38 @@ impl VoiceInputSupervisor {
         &self,
         buffer: &super::transcription::PreparedSpeechBuffer,
     ) -> std::result::Result<String, VoiceTranscriptionError> {
+        self.transcribe_inner(buffer, None)
+    }
+
+    pub(crate) fn transcribe_for_session(
+        &self,
+        buffer: &PreparedSpeechBuffer,
+        generation: u64,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<String, VoiceTranscriptionError> {
+        self.transcribe_inner(buffer, Some((generation, cancellation)))
+    }
+
+    fn transcribe_inner(
+        &self,
+        buffer: &PreparedSpeechBuffer,
+        session: Option<(u64, &CancellationToken)>,
+    ) -> std::result::Result<String, VoiceTranscriptionError> {
         let startup_wait = pioneer_observability::turn_startup::current_stage(
             pioneer_observability::turn_startup::Stage::VoiceTranscriberWait,
         );
         let mut inner = self.lock_inner();
         drop(startup_wait);
+        // Recheck after waiting for another session's native call. No queued
+        // cancelled call may start, and a recording never switches generations.
+        if let Some((generation, cancellation)) = session {
+            if cancellation.is_cancelled() || inner.state.generation != generation {
+                return Err(super::transcription::transcription_error(
+                    super::transcription::VoiceTranscriptionErrorKind::ModelUnavailable,
+                    "voice session model generation is no longer available",
+                ));
+            }
+        }
         let desired = inner.state.desired.selected_identity();
         if inner.state.runtime.phase != GatewayVoiceInputRuntimePhase::Ready
             || !inner.state.runtime.effective_enabled
@@ -1872,6 +1913,67 @@ mod tests {
         assert_eq!(install_calls.load(Ordering::SeqCst), 0);
         assert_eq!(loader_calls.load(Ordering::SeqCst), 0);
         assert!(!supervisor.has_loaded_engine());
+    }
+
+    #[test]
+    fn voice_supervisor_session_generation_and_cancellation_fence_native_entry() {
+        let (supervisor, _, _) = supervisor();
+        let applied = supervisor.apply_desired(selected("small"), false).unwrap();
+        supervisor.mark_loading(applied.generation).unwrap();
+        supervisor
+            .mark_ready(
+                applied.generation,
+                selected("small").selected_identity().unwrap(),
+                LoadedVoiceEngine::test_stub_with_transcript("accepted"),
+            )
+            .unwrap();
+        {
+            let _native_guard = supervisor.lock_inner();
+            assert_eq!(
+                supervisor.settings_snapshot().runtime.phase,
+                GatewayVoiceInputRuntimePhase::Ready
+            );
+            assert_eq!(
+                supervisor.runtime_snapshot().phase,
+                GatewayVoiceInputRuntimePhase::Ready
+            );
+            assert!(supervisor.try_session_generation().is_none());
+        }
+        assert_eq!(
+            supervisor.try_session_generation(),
+            Some(applied.generation)
+        );
+        let buffer = PreparedSpeechBuffer {
+            sample_rate_hz: 16000,
+            total_samples: 960,
+            segments: vec![super::super::vad::VoiceSpeechSegment {
+                start_sample: 0,
+                end_sample: 960,
+                samples: vec![0.5; 960],
+            }],
+        };
+        let token = CancellationToken::new();
+        assert!(
+            supervisor
+                .transcribe_for_session(&buffer, applied.generation + 1, &token)
+                .is_err()
+        );
+        token.cancel();
+        assert!(
+            supervisor
+                .transcribe_for_session(&buffer, applied.generation, &token)
+                .is_err()
+        );
+        assert!(
+            supervisor.has_loaded_engine(),
+            "fencing must not fail the shared engine"
+        );
+        assert_eq!(
+            supervisor
+                .transcribe_for_session(&buffer, applied.generation, &CancellationToken::new())
+                .unwrap(),
+            "accepted"
+        );
     }
 
     #[test]

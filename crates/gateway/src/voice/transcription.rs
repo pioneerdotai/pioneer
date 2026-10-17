@@ -116,6 +116,7 @@ pub(crate) struct VoiceTranscriptionDiagnostics {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VoiceTranscriptionStrategy {
+    IncrementalGatewaySession,
     BufferedGatewaySession,
     ExperimentalStreaming,
 }

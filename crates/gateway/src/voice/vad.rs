@@ -190,6 +190,32 @@ where
         }
     }
 
+    // Unlike one-shot segmentation, an incremental caller owns emitted audio.
+    // Never return that prefix again as prefill at the next onset.
+    pub(super) fn push_incremental_frame(&mut self, frame: &[f32]) -> Result<SmoothedVadFrame> {
+        let result = self.push_frame(frame)?;
+        if matches!(result, SmoothedVadFrame::Speech(_)) {
+            self.frame_buffer.clear();
+        }
+        Ok(result)
+    }
+
+    pub(super) fn finish_incremental_tail(&mut self, tail: &[f32]) -> Result<Vec<f32>> {
+        if self.in_speech {
+            return Ok(tail.to_vec());
+        }
+        // A final onset need not contain two full frames. Classify the actual
+        // remainder, without padding it away or dropping short voiced input.
+        let voiced_tail = !tail.is_empty()
+            && self.detector.speech_probability(tail)? > self.config.speech_threshold;
+        if self.onset_counter == 0 && !voiced_tail {
+            return Ok(Vec::new());
+        }
+        let mut samples: Vec<_> = self.frame_buffer.drain(..).flatten().collect();
+        samples.extend_from_slice(tail);
+        Ok(samples)
+    }
+
     fn push_frame(&mut self, frame: &[f32]) -> Result<SmoothedVadFrame> {
         self.frame_buffer.push_back(frame.to_vec());
         while self.frame_buffer.len() > self.config.prefill_frames + 1 {
@@ -235,7 +261,7 @@ where
     }
 }
 
-enum SmoothedVadFrame {
+pub(super) enum SmoothedVadFrame {
     Speech(Vec<f32>),
     Noise,
 }
