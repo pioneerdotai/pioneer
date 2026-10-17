@@ -2807,9 +2807,12 @@ mod tests {
             "openrouter",
             vec![
                 Ok(embedding_response(vec![vec![3.0, 4.0]])),
-                Err(anyhow::anyhow!(
-                    "error decoding response body: missing field `data`"
-                )),
+                Err(
+                    OpaqueEmbeddingFailure(pioneer_provider::ProviderFailureClassification::new(
+                        pioneer_protocol::ProviderFailureClass::NetworkTransient,
+                    ))
+                    .into(),
+                ),
                 Ok(embedding_response(vec![vec![3.0, 4.0]])),
             ],
         ));
