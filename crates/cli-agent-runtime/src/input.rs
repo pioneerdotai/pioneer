@@ -44,10 +44,32 @@ pub struct CLIRuntimeTurnInputMapping {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum CLIRuntimeTurnInputItem {
-    Text { text: String },
-    Image { url: String },
-    LocalImage { path: String },
-    Skill { name: String, path: String },
+    Text {
+        text: String,
+    },
+    Image {
+        url: String,
+    },
+    LocalImage {
+        path: String,
+    },
+    Skill {
+        name: String,
+        path: String,
+    },
+    /// A standard block after capability-driven preparation. The ACP adapter
+    /// unwraps this local envelope before serializing session/prompt.
+    AcpContent {
+        content: serde_json::Value,
+    },
+    /// Preparatory source only. Must be materialized through Pioneer's existing
+    /// attachment policy before the accepted input mapping is persisted or a
+    /// prompt can be dispatched. Never sent directly to an ACP peer.
+    AcpAttachment {
+        content_type: String,
+        attachment: serde_json::Value,
+        uri: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

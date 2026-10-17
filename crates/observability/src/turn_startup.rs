@@ -42,6 +42,7 @@ pub enum Runtime {
     Native,
     Codex,
     Claude,
+    Acp,
 }
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -380,6 +381,7 @@ impl Observation {
                     Runtime::Native => "native",
                     Runtime::Codex => "codex",
                     Runtime::Claude => "claude",
+                    Runtime::Acp => "acp",
                 },
             ),
             KeyValue::new(

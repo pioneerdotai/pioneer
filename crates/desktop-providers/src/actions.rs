@@ -329,6 +329,10 @@ fn normalize_cli_runtime_provider_inline_field(
             }
         }
         cli_provider_settings::CLIRuntimeProviderDraftField::ShadowHomePath => trimmed.to_owned(),
+        cli_provider_settings::CLIRuntimeProviderDraftField::Arguments
+        | cli_provider_settings::CLIRuntimeProviderDraftField::EnvironmentReferences => {
+            trimmed.to_owned()
+        }
         cli_provider_settings::CLIRuntimeProviderDraftField::Id => return None,
     })
 }
@@ -347,6 +351,12 @@ fn current_cli_runtime_provider_inline_field_value(
         }
         cli_provider_settings::CLIRuntimeProviderDraftField::DisplayName => {
             instance.display_name.clone()
+        }
+        cli_provider_settings::CLIRuntimeProviderDraftField::Arguments => {
+            cli_provider_settings::CLIRuntimeProviderDraft::edit(instance).args_json
+        }
+        cli_provider_settings::CLIRuntimeProviderDraftField::EnvironmentReferences => {
+            cli_provider_settings::CLIRuntimeProviderDraft::edit(instance).env_from_json
         }
         cli_provider_settings::CLIRuntimeProviderDraftField::Id => String::new(),
     }

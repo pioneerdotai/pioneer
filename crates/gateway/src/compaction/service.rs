@@ -76,6 +76,9 @@ fn make_cli_summarizer(
         "selected CLI service instance is disabled"
     );
     let kind = match instance.kind {
+        GatewayCliAgentRuntimeKindConfig::Acp => anyhow::bail!(
+            "ACP v1 has no native summary service; select an API or native CLI compaction model"
+        ),
         GatewayCliAgentRuntimeKindConfig::Codex => Transport::Codex,
         GatewayCliAgentRuntimeKindConfig::Claude => Transport::Claude,
     };
@@ -100,6 +103,7 @@ fn make_cli_summarizer(
             })),
             "anthropic",
         ),
+        Transport::Acp => anyhow::bail!("ACP is not a native summary service"),
         Transport::Api => unreachable!(),
     };
     let limits = pioneer_provider::catalog::model_catalog()?.limits(catalog, &selection.model);
@@ -708,6 +712,7 @@ print(json.dumps([{'type':'system','subtype':'init','model':'claude-sonnet-4-6'}
             shadow_home_path: None,
             custom_models: vec![],
             app_server_args: vec![],
+            env_from: Default::default(),
             startup_probe_timeout_ms: 1000,
             request_timeout_ms: 1000,
             idle_session_ttl_secs: 60,

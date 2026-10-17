@@ -31,6 +31,12 @@ pub(crate) const MAX_CODEX_INPUT_TEXT_CHARS: usize = 1 << 20;
 pub(crate) fn codex_input_text_chars(input: &[CLIRuntimeTurnInputItem]) -> usize {
     input.iter().fold(0_usize, |total, item| {
         total.saturating_add(match item {
+            CLIRuntimeTurnInputItem::AcpContent { content } => content
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .map(|text| text.chars().count())
+                .unwrap_or(0),
+            CLIRuntimeTurnInputItem::AcpAttachment { .. } => 0,
             CLIRuntimeTurnInputItem::Text { text } => text.chars().count(),
             CLIRuntimeTurnInputItem::Image { .. }
             | CLIRuntimeTurnInputItem::LocalImage { .. }
@@ -149,6 +155,7 @@ pub(crate) fn compile_cli_runtime_delivery_plan(
             initiating_thread_id: input.initiating_thread_id.to_owned(),
             turn_id: input.turn_id.to_owned(),
             runtime_id: input.runtime_id.to_owned(),
+            runtime_kind: input.runtime_kind,
             runtime_label: Some(input.runtime_label.to_owned()),
             model: input.model.and_then(normalized_optional).map(str::to_owned),
             cwd: input.cwd.and_then(normalized_optional).map(str::to_owned),

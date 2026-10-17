@@ -473,7 +473,12 @@ impl GatewayTurnMcpInvoker {
                 invocation.workspace_id.as_str(),
                 invocation.thread_id.as_str(),
                 invocation.turn_id.as_str(),
-                ResourceAction::McpUse,
+                if binding.server_installation_id == crate::cli_runtime::acp_skills::SKILL_SERVER_ID
+                {
+                    ResourceAction::SkillUse
+                } else {
+                    ResourceAction::McpUse
+                },
                 self.authorization_invalidation_hub
                     .current_revision()
                     .await
@@ -494,6 +499,7 @@ impl GatewayTurnMcpInvoker {
 
         if binding.server_installation_id != FIRST_PARTY_FILE_SERVER_ID
             && binding.server_installation_id != pioneer_tools::html::HTML_SERVER_ID
+            && binding.server_installation_id != crate::cli_runtime::acp_skills::SKILL_SERVER_ID
         {
             let action_gate = AuthorizationService::new().authorize_action(
                 revalidated.principal().kind,

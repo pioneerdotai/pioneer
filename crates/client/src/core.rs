@@ -1747,6 +1747,9 @@ impl ClientCore {
         if let crate::transport::ws::GatewayWsEvent::Notification { notification, .. } = event {
             self.observe_administration_notification(notification);
             self.observe_provider_runtime_notification(notification);
+            if self.observe_acp_session_notification(notification) {
+                return None;
+            }
             if self.observe_mcp_oauth_notification(notification) {
                 return None;
             }

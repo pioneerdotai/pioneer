@@ -1664,7 +1664,13 @@ pub fn write_client_schemas(
     fs::create_dir_all(output_directory)?;
 
     for document in client_schema_documents() {
-        let schema_json = serde_json::to_string_pretty(&document.schema)?;
+        // ACP SDK enables serde_json/preserve_order for the workspace graph.
+        // Keep the established export order independent of feature unification;
+        // Schemars still applies its normal schema keyword presentation order.
+        let mut value = document.schema.to_value();
+        value.sort_all_objects();
+        let schema = Schema::try_from(value)?;
+        let schema_json = serde_json::to_string_pretty(&schema)?;
         let path = output_directory.join(document.file_name);
         fs::write(path, schema_json)?;
     }

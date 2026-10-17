@@ -162,6 +162,7 @@ pub enum GatewayNotification {
     CLIRuntimeRequestResolved(CLIRuntimeRequestResolvedNotification),
     #[serde(rename = "cli_runtime_apps_changed")]
     CLIRuntimeAppsChanged(CLIRuntimeAppsChangedNotification),
+    AcpSessionChanged(crate::AcpSessionSnapshot),
     #[serde(rename = "gateway_remote_access_status_changed")]
     GatewayRemoteAccessStatusChanged(GatewayRemoteAccessStatusChangedNotification),
     #[serde(rename = "gateway_thread_episodic_vector_refill_status_changed")]
@@ -476,6 +477,11 @@ impl GatewayNotification {
                     .ok()
                     .map(Self::McpServerCatalogChanged)
             }
+            events::CLI_RUNTIME_ACP_SESSION_CHANGED => parse_cli_runtime_notification::<
+                crate::AcpSessionSnapshot,
+            >(
+                method, params, Self::AcpSessionChanged
+            ),
             events::CLI_RUNTIME_STATUS_CHANGED => parse_cli_runtime_notification::<
                 CLIRuntimeStatusChangedNotification,
             >(

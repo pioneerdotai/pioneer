@@ -661,7 +661,7 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
         let launch_projection = match &launch_spec.mcp {
             CliMcpSessionLaunch::Disabled | CliMcpSessionLaunch::ManagementOnly => None,
             CliMcpSessionLaunch::Claude(projection) => Some(projection),
-            CliMcpSessionLaunch::Codex(_) => {
+            CliMcpSessionLaunch::Acp(_) | CliMcpSessionLaunch::Codex(_) => {
                 bail!("Claude CLI runtime cannot consume a Codex MCP launch projection")
             }
         };
@@ -1220,7 +1220,8 @@ fn claude_process_config_from_instance_with_managed_mcp(
             .context("invalid Claude bounded fork continuation")?
             .append_process_args(&mut args);
         }
-        CliProviderContinuation::CodexRpcThread { .. } => {
+        CliProviderContinuation::AcpSession { .. }
+        | CliProviderContinuation::CodexRpcThread { .. } => {
             bail!("Claude process launch requires a typed Claude continuation");
         }
     }
@@ -2993,6 +2994,7 @@ impl ClaudeStreamClient {
                         ));
                     }
                     events.push(RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                        item: None,
                         native_thread_id: state.native_thread_id.clone(),
                         native_turn_id: state.active_turn_id.clone().unwrap_or_default(),
                         native_item_id: item_id,
@@ -3029,6 +3031,7 @@ impl ClaudeStreamClient {
                         ));
                     }
                     events.push(RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                        item: None,
                         native_thread_id: state.native_thread_id.clone(),
                         native_turn_id: state.active_turn_id.clone().unwrap_or_default(),
                         native_item_id: item_id,
@@ -3199,6 +3202,7 @@ impl ClaudeStreamClient {
             )];
         }
         let event = RuntimeEvent::ItemStarted(RuntimeItemStarted {
+            item: None,
             native_thread_id: Some(binding.native_thread_id.clone()),
             native_turn_id: binding.native_turn_id.clone(),
             native_item_id: binding.native_item_id.clone(),
@@ -3270,6 +3274,7 @@ impl ClaudeStreamClient {
                 );
             }
             return vec![RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                item: None,
                 native_thread_id: Some(tool.binding.native_thread_id.clone()),
                 native_turn_id: tool.binding.native_turn_id.clone(),
                 native_item_id: tool.binding.native_item_id.clone(),
@@ -3335,6 +3340,7 @@ impl ClaudeStreamClient {
             }
         }
         events.push(RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+            item: None,
             native_thread_id: state.native_thread_id.clone(),
             native_turn_id: state.active_turn_id.clone().unwrap_or_default(),
             native_item_id: tool.item_id,
@@ -3390,6 +3396,7 @@ impl ClaudeStreamClient {
                 ));
             }
             events.push(RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                item: None,
                 native_thread_id: Some(native_thread_id.clone()),
                 native_turn_id: native_turn_id.clone(),
                 native_item_id: item_id,
@@ -3740,6 +3747,7 @@ fn item_started(
     metadata: Option<JsonValue>,
 ) -> RuntimeEvent {
     RuntimeEvent::ItemStarted(RuntimeItemStarted {
+        item: None,
         native_thread_id: state.native_thread_id.clone(),
         native_turn_id: state.active_turn_id.clone().unwrap_or_default(),
         native_item_id: item_id.to_owned(),
@@ -3839,6 +3847,7 @@ fn terminalize_running_claude_tools(
         metadata["message"] = json!(message);
         metadata["error"] = json!({"message":message});
         events.push(RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+            item: None,
             native_thread_id: state.native_thread_id.clone(),
             native_turn_id: state.active_turn_id.clone().unwrap_or_default(),
             native_item_id: tool.item_id,
@@ -3878,6 +3887,7 @@ fn terminalize_running_claude_tools(
             );
         }
         events.push(RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+            item: None,
             native_thread_id: Some(item.binding.native_thread_id.clone()),
             native_turn_id: item.binding.native_turn_id.clone(),
             native_item_id: item.binding.native_item_id.clone(),
@@ -4112,6 +4122,7 @@ pub(crate) mod tests {
         };
         for (success, text) in [(true, "ok\n"), (false, "shell failed\n")] {
             let e = RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                item: None,
                 native_thread_id: Some("nt".into()),
                 native_turn_id: "nu".into(),
                 native_item_id: "cmd".into(),
@@ -5179,6 +5190,7 @@ done
             shadow_home_path: None,
             custom_models: Vec::new(),
             app_server_args: Vec::new(),
+            env_from: Default::default(),
             startup_probe_timeout_ms: 1_000,
             request_timeout_ms: 1_000,
             idle_session_ttl_secs: 60,
@@ -5484,6 +5496,7 @@ done
         let config = claude_process_config_from_instance(
             &instance,
             &CLIAgentRuntimeSessionStartOptions {
+                additional_directories: Vec::new(),
                 cwd: None,
                 approval_policy: Some("acceptEdits".to_owned()),
                 authorization_scope_fingerprint: None,
@@ -5509,6 +5522,7 @@ done
         let config = claude_process_config_from_instance(
             &instance,
             &CLIAgentRuntimeSessionStartOptions {
+                additional_directories: Vec::new(),
                 cwd: None,
                 approval_policy: Some("bypassPermissions".to_owned()),
                 authorization_scope_fingerprint: None,
@@ -5543,6 +5557,7 @@ done
             let config = claude_process_config_from_instance(
                 &instance,
                 &CLIAgentRuntimeSessionStartOptions {
+                    additional_directories: Vec::new(),
                     cwd: None,
                     approval_policy: Some(permission_mode.to_owned()),
                     authorization_scope_fingerprint: None,
@@ -5942,6 +5957,7 @@ done
 
         client
             .emit(RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                item: None,
                 native_thread_id: Some("claude-thread".to_owned()),
                 native_turn_id: "claude-turn".to_owned(),
                 native_item_id: "claude-final".to_owned(),

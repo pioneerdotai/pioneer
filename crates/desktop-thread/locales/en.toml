@@ -334,3 +334,23 @@
 
 "timeline.html.loading" = "Loading page…"
 "timeline.html.failed" = "Couldn’t display this page"
+
+[chat.acp]
+prepare = "Prepare session"
+send_input = "Send input"
+refresh_output = "Refresh output"
+close_terminal = "Close terminal"
+session_id = "Session ID"
+additional_directories = "Additional directories (one absolute path per line)"
+logout = "Sign out"
+list = "List sessions"
+load = "Load"
+resume = "Resume"
+delete = "Delete session"
+close_session = "Close session"
+more = "More sessions"
+partial_input = "Only part of the input was accepted. It has not been sent again."
+
+output_truncated = "Earlier output was truncated."
+auth_finished = "Auth invocation finished (exit %{code}). Close and reconnect to refresh authentication."
+close_reconnect = "Close to reconnect"

@@ -70,6 +70,20 @@ pub(crate) fn validate_instance_launch_args(
     instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
 ) -> Result<()> {
     match instance.kind {
+        GatewayCliAgentRuntimeKindConfig::Acp => {
+            anyhow::ensure!(
+                !instance.binary_path.trim().is_empty(),
+                "ACP requires a configured executable"
+            );
+            anyhow::ensure!(
+                instance.home_path.is_empty() && instance.shadow_home_path.is_none(),
+                "ACP does not use native agent home paths"
+            );
+            anyhow::ensure!(
+                instance.custom_models.is_empty(),
+                "ACP models come from session configuration descriptors"
+            );
+        }
         GatewayCliAgentRuntimeKindConfig::Codex => {
             validate_codex_custom_args(&instance.app_server_args)?;
         }
@@ -78,6 +92,27 @@ pub(crate) fn validate_instance_launch_args(
         }
     }
     Ok(())
+}
+
+pub(crate) fn acp_launch_environment(
+    instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
+    base: &SensitiveEnvironment,
+) -> Result<SensitiveEnvironment> {
+    let mut environment = base.clone();
+    for (name, source) in &instance.env_from {
+        anyhow::ensure!(
+            !name.is_empty()
+                && !source.is_empty()
+                && !name.contains(['=', '\0'])
+                && !source.contains(['=', '\0']),
+            "invalid ACP environment reference"
+        );
+        let value = std::env::var(source).map_err(|_| {
+            anyhow::anyhow!("configured ACP environment reference `{source}` is unavailable")
+        })?;
+        environment.insert_secret(name, SecretString::new(value));
+    }
+    Ok(environment)
 }
 
 /// Resolve the MCP stdio helper to the exact Pioneer executable that is
@@ -184,6 +219,7 @@ mod tests {
             shadow_home_path: None,
             custom_models: Vec::new(),
             app_server_args,
+            env_from: Default::default(),
             startup_probe_timeout_ms: 1_000,
             request_timeout_ms: 1_000,
             idle_session_ttl_secs: 60,

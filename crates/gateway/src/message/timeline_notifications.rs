@@ -18,7 +18,7 @@ enum TurnWorkProjectionAvailability {
 }
 
 impl MessageProcessor {
-    pub(super) async fn notify_semantic_timeline_item_changed(
+    pub(crate) async fn notify_semantic_timeline_item_changed(
         &self,
         workspace_id: &str,
         thread_id: &str,

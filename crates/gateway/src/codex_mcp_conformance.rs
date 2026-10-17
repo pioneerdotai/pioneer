@@ -308,6 +308,7 @@ fn empty_projection(turn_id: &str) -> Result<ResolvedMcpTurnProjection> {
 
 fn native_item_event(callable_name: &str) -> RuntimeEvent {
     RuntimeEvent::ItemStarted(RuntimeItemStarted {
+        item: None,
         native_thread_id: Some(NATIVE_THREAD_ID.to_owned()),
         native_turn_id: "native-turn-a".to_owned(),
         native_item_id: "native-item-a".to_owned(),

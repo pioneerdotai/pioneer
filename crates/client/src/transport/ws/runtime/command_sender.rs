@@ -634,6 +634,13 @@ impl GatewayWsCommandSender {
         client_ws_commands::cli_runtime_list(self, params)
     }
 
+    pub fn acp_session_control(
+        &self,
+        params: pioneer_protocol::AcpSessionParams,
+    ) -> Result<pioneer_protocol::AcpSessionResponse> {
+        client_ws_commands::acp_session_control(self, params)
+    }
+
     pub fn cli_runtime_list_models(
         &self,
         params: CLIRuntimeListModelsParams,

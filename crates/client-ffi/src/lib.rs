@@ -917,6 +917,28 @@ impl ClientFfiRuntime {
             .map_err(|error| format!("{error:#}"))
     }
 
+    // Nitro runs this thin boundary on its existing bounded native async worker.
+    fn provider_command(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::providers::operations::ProviderOperationCompletion, String> {
+        let command = serde_json::from_str(input_json).map_err(|error| error.to_string())?;
+        self.core
+            .execute_provider_command(command)
+            .map_err(|error| error.to_string())
+    }
+    fn cli_runtime_provider_drafts(
+        &self,
+        input_json: &str,
+    ) -> Result<Vec<pioneer_client::providers::cli_runtime_settings::CLIRuntimeProviderDraft>, String>
+    {
+        let workspace: String =
+            serde_json::from_str(input_json).map_err(|error| error.to_string())?;
+        self.core
+            .cli_runtime_provider_drafts(&workspace)
+            .map_err(|error| error.to_string())
+    }
+
     fn pending_request_presentation(
         &self,
         input_json: &str,
@@ -1485,6 +1507,11 @@ ffi_client_json_method!(
 ffi_client_json_method!(
     pioneer_client_ffi_voice_session_cancel,
     voice_session_cancel
+);
+ffi_client_json_method!(pioneer_client_ffi_provider_command, provider_command);
+ffi_client_json_method!(
+    pioneer_client_ffi_cli_runtime_provider_drafts,
+    cli_runtime_provider_drafts
 );
 ffi_client_json_method!(
     pioneer_client_ffi_pending_request_presentation,

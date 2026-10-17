@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 pub enum GatewayCliRuntimeKind {
     Codex,
     Claude,
+    Acp,
 }
 
 impl GatewayCliRuntimeKind {
@@ -17,6 +18,7 @@ impl GatewayCliRuntimeKind {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Acp => "acp",
         }
     }
 }

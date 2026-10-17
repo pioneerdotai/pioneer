@@ -38,9 +38,10 @@ impl GatewayEventRoute {
             | GatewayThreadEpisodicVectorRefillStatusChanged(_)
             | GatewayVoiceInputStatusChanged(_) => Self::Settings,
             MemoryChanged(_) | MemoryCandidateCreated(_) | MemoryForgotten(_) => Self::Memory,
-            CLIRuntimeStatusChanged(_) | CLIRuntimeAccountUpdated(_) | CLIRuntimeAppsChanged(_) => {
-                Self::Provider
-            }
+            CLIRuntimeStatusChanged(_)
+            | CLIRuntimeAccountUpdated(_)
+            | CLIRuntimeAppsChanged(_)
+            | AcpSessionChanged(_) => Self::Provider,
             CLIRuntimeRequestOpened(_)
             | CLIRuntimeRequestResolved(_)
             | TurnPermissionRequestOpened(_)

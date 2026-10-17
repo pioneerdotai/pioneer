@@ -5324,3 +5324,8 @@ mod event_class_tests {
         );
     }
 }
+
+// The generic ACP transport materializes the same resolved skill tool contracts.
+pub use chat::skill_tools::{
+    materialize_skill_tooling, resolved_skill_runtime_plan, skill_runtime_recheck_policy,
+};

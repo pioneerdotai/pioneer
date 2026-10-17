@@ -21,6 +21,7 @@ pub fn from_selector(
                 .find(|runtime| runtime.id == id && runtime.enabled)?;
             (
                 match runtime.kind {
+                    CLIAgentRuntimeKind::Acp => return None,
                     CLIAgentRuntimeKind::Codex => ModelSelectionTransport::Codex,
                     CLIAgentRuntimeKind::Claude => ModelSelectionTransport::Claude,
                 },

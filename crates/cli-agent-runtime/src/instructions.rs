@@ -61,6 +61,71 @@ impl fmt::Debug for CLIRuntimeElevatedInstructions {
     }
 }
 
+/// ACP v1 has no elevated instruction channel. Carrying accepted context as
+/// ordinary user content is a different delivery contract, even when its
+/// text and immutable digest originate in the same instruction compiler.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CLIRuntimeInstructionDelivery {
+    Elevated(CLIRuntimeElevatedInstructions),
+    UserContext(CLIUserContext),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CLIUserContext(CLIRuntimeElevatedInstructions);
+
+impl CLIRuntimeInstructionDelivery {
+    pub fn for_runtime(
+        kind: CLIAgentRuntimeKind,
+        text: impl Into<String>,
+        fingerprint: impl Into<String>,
+    ) -> Result<Self> {
+        let validated = CLIRuntimeElevatedInstructions::try_new(text, fingerprint)?;
+        Ok(match kind {
+            CLIAgentRuntimeKind::Acp => Self::UserContext(CLIUserContext(validated)),
+            CLIAgentRuntimeKind::Codex | CLIAgentRuntimeKind::Claude => Self::Elevated(validated),
+        })
+    }
+
+    pub fn elevated(&self) -> Result<&CLIRuntimeElevatedInstructions> {
+        match self {
+            Self::Elevated(instructions) => Ok(instructions),
+            Self::UserContext(_) => {
+                bail!("ordinary user context cannot be delivered as elevated instructions")
+            }
+        }
+    }
+
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Elevated(value) => value.text(),
+            Self::UserContext(value) => value.0.text(),
+        }
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        match self {
+            Self::Elevated(value) => value.fingerprint(),
+            Self::UserContext(value) => value.0.fingerprint(),
+        }
+    }
+
+    pub fn transport(&self, kind: CLIAgentRuntimeKind) -> Result<&'static str> {
+        match (kind, self) {
+            (CLIAgentRuntimeKind::Acp, Self::UserContext(_)) => Ok("acp_user_context"),
+            (_, Self::Elevated(_)) => CLIRuntimeElevatedInstructionTransport::for_runtime(kind)
+                .map(CLIRuntimeElevatedInstructionTransport::as_str)
+                .ok_or_else(|| anyhow::anyhow!("ACP has no elevated instruction transport")),
+            _ => bail!("instruction delivery does not match the runtime transport"),
+        }
+    }
+}
+
+impl From<CLIRuntimeElevatedInstructions> for CLIRuntimeInstructionDelivery {
+    fn from(value: CLIRuntimeElevatedInstructions) -> Self {
+        Self::Elevated(value)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CLIRuntimeElevatedInstructionTransport {
     CodexTurnCollaborationMode,
@@ -68,10 +133,11 @@ pub enum CLIRuntimeElevatedInstructionTransport {
 }
 
 impl CLIRuntimeElevatedInstructionTransport {
-    pub fn for_runtime(kind: CLIAgentRuntimeKind) -> Self {
+    pub fn for_runtime(kind: CLIAgentRuntimeKind) -> Option<Self> {
         match kind {
-            CLIAgentRuntimeKind::Codex => Self::CodexTurnCollaborationMode,
-            CLIAgentRuntimeKind::Claude => Self::ClaudeAppendSystemPromptFile,
+            CLIAgentRuntimeKind::Codex => Some(Self::CodexTurnCollaborationMode),
+            CLIAgentRuntimeKind::Claude => Some(Self::ClaudeAppendSystemPromptFile),
+            CLIAgentRuntimeKind::Acp => None,
         }
     }
 
@@ -121,14 +187,34 @@ mod tests {
     }
 
     #[test]
+    fn acp_context_cannot_claim_an_elevated_transport() {
+        use super::CLIRuntimeInstructionDelivery;
+        let text = "accepted context";
+        let fingerprint = hex::encode(Sha256::digest(text.as_bytes()));
+        let context =
+            CLIRuntimeInstructionDelivery::for_runtime(CLIAgentRuntimeKind::Acp, text, fingerprint)
+                .unwrap();
+        assert!(context.elevated().is_err());
+        assert_eq!(
+            context.transport(CLIAgentRuntimeKind::Acp).unwrap(),
+            "acp_user_context"
+        );
+        assert!(context.transport(CLIAgentRuntimeKind::Codex).is_err());
+        assert_eq!(
+            CLIRuntimeElevatedInstructionTransport::for_runtime(CLIAgentRuntimeKind::Acp),
+            None
+        );
+    }
+
+    #[test]
     fn runtime_transport_mapping_is_explicit() {
         assert_eq!(
             CLIRuntimeElevatedInstructionTransport::for_runtime(CLIAgentRuntimeKind::Codex),
-            CLIRuntimeElevatedInstructionTransport::CodexTurnCollaborationMode
+            Some(CLIRuntimeElevatedInstructionTransport::CodexTurnCollaborationMode)
         );
         assert_eq!(
             CLIRuntimeElevatedInstructionTransport::for_runtime(CLIAgentRuntimeKind::Claude),
-            CLIRuntimeElevatedInstructionTransport::ClaudeAppendSystemPromptFile
+            Some(CLIRuntimeElevatedInstructionTransport::ClaudeAppendSystemPromptFile)
         );
     }
 }

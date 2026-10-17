@@ -106,6 +106,7 @@ pub use permissions::{
     PermissionDecision, PermissionDecisionReason, PermissionEvaluationContext, PermissionIntent,
     PermissionRequestKey, PermissionRequestScope, ProfileToolPermissionEvaluator,
     StaticPermissionApprovalBroker, ToolPermissionEvaluator, extract_permission_intent,
+    prepare_full_text_write,
 };
 pub use process_policy::{ProcessSpawnPlan, build_process_spawn_plan, resolve_process_cwd};
 pub use registry::{ToolHandler, ToolRegistry, ToolRegistryBuilder};

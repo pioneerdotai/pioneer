@@ -105,6 +105,7 @@ pub(crate) struct CLIAgentRuntimeSessionStartOptions {
     pub authorization_scope_fingerprint: Option<String>,
     pub app_server_args: Vec<String>,
     pub env: SensitiveEnvironment,
+    pub additional_directories: Vec<PathBuf>,
     /// Exact selected Claude skill installations. Claude receives these as
     /// generation-scoped managed plugins; the shared user settings source is
     /// never enabled for skill discovery.
@@ -155,7 +156,7 @@ pub(crate) struct CLIAgentRuntimeTurnStartParams {
     pub effort: Option<String>,
     pub personality: Option<String>,
     pub summary: Option<String>,
-    pub elevated_instructions: CLIRuntimeElevatedInstructions,
+    pub instructions: pioneer_cli_agent_runtime::instructions::CLIRuntimeInstructionDelivery,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -228,6 +229,49 @@ pub(crate) trait CLIAgentRuntimeSession: Send + Sync {
     }
 
     fn take_event_receivers(&self) -> Option<CLIAgentRuntimeEventReceivers> {
+        None
+    }
+
+    fn is_closed(&self) -> bool {
+        false
+    }
+    fn acp_snapshot(&self) -> Result<pioneer_protocol::AcpSessionSnapshot> {
+        bail!("not an ACP session")
+    }
+    async fn acp_initialize(
+        &self,
+        _timeout: Duration,
+    ) -> Result<pioneer_protocol::AcpSessionSnapshot> {
+        bail!("not an ACP session")
+    }
+    async fn acp_apply_configuration(
+        &self,
+        _session: &str,
+        _selected: &pioneer_protocol::AcpTurnConfiguration,
+        _timeout: Duration,
+        _cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        bail!("not an ACP session")
+    }
+    async fn acp_control(
+        &self,
+        _operation: pioneer_protocol::AcpSessionOperation,
+        _timeout: Duration,
+    ) -> Result<Option<JsonValue>> {
+        bail!("not an ACP session")
+    }
+    async fn execute_acp_skill_tool(
+        &self,
+        _invocation: &crate::turn_mcp::invoker::ValidatedTurnMcpInvocation,
+        _cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<crate::turn_mcp::result::CanonicalMcpToolResult> {
+        bail!("session has no ACP skill runtime")
+    }
+    fn acp_can_continue(&self, _expected: Option<&str>) -> bool {
+        false
+    }
+
+    fn acp_connection(&self) -> Option<Arc<pioneer_cli_agent_runtime::acp::Connection>> {
         None
     }
 
@@ -821,7 +865,7 @@ impl CLIAgentRuntimeManager {
     ) -> Option<CLIAgentRuntimeSessionHandle> {
         let mut sessions = self.sessions.lock().await;
         let cached = sessions.get_mut(key)?;
-        if requires_restart(&cached.launch_spec, launch_spec) {
+        if cached.session.is_closed() || requires_restart(&cached.launch_spec, launch_spec) {
             return None;
         }
         // Continuation is resolved before every acquisition. Retain the newest
@@ -841,6 +885,17 @@ impl CLIAgentRuntimeManager {
         let cached = sessions.get_mut(key)?;
         cached.last_used_at_ms = now_ms;
         Some(cached.handle())
+    }
+
+    pub(crate) async fn cached_launch_spec(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+    ) -> Option<CliSessionLaunchSpec> {
+        self.sessions
+            .lock()
+            .await
+            .get(key)
+            .map(|cached| cached.launch_spec.clone())
     }
 
     pub(crate) async fn existing_session(
@@ -888,7 +943,7 @@ impl CLIAgentRuntimeManager {
     ) -> Option<CLIAgentRuntimeCachedSession> {
         let sessions = self.sessions.lock().await;
         let cached = sessions.get(key)?;
-        if !requires_restart(&cached.launch_spec, launch_spec) {
+        if !cached.session.is_closed() && !requires_restart(&cached.launch_spec, launch_spec) {
             return None;
         }
         Some(cached.clone())
@@ -1384,6 +1439,7 @@ mod tests {
         let manager = manager_with_factory(factory.clone());
         let key = key("thread-a");
         let options_a = CLIAgentRuntimeSessionStartOptions {
+            additional_directories: Vec::new(),
             cwd: None,
             approval_policy: Some("on-request".to_owned()),
             authorization_scope_fingerprint: Some("scope-a".to_owned()),
@@ -1393,6 +1449,7 @@ mod tests {
             elevated_instructions: None,
         };
         let options_b = CLIAgentRuntimeSessionStartOptions {
+            additional_directories: Vec::new(),
             cwd: None,
             approval_policy: Some("never".to_owned()),
             authorization_scope_fingerprint: Some("scope-b".to_owned()),

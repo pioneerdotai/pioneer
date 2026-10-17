@@ -3136,3 +3136,49 @@ mod tests {
         );
     }
 }
+
+/// Bounded canonical compaction hydration for an already-owned ACP session.
+/// Eagerly materialize rows before decoding payloads or projecting notifications.
+pub async fn list_acp_compaction_items<C: ConnectionTrait>(
+    connection: &C,
+    workspace: &str,
+    runtime: &str,
+    continuation: &str,
+    session: &str,
+) -> Result<Vec<pioneer_protocol::ItemUpdatedNotification>> {
+    let rows = connection.query_all_raw(Statement::from_sql_and_values(
+        connection.get_database_backend(),
+        "WITH selected AS (SELECT b.workspace_id, b.thread_id, i.turn_id, length(CAST(i.payload AS BLOB)) AS payload_bytes, i.created_at, i.id \
+         FROM turn_item i JOIN turn_cli_runtime_binding b ON b.turn_id = i.turn_id \
+         WHERE b.workspace_id = ? AND b.runtime_id = ? AND b.continuation_thread_id = ? \
+         AND b.runtime_kind = 'acp' AND b.native_thread_id = ? AND i.item_type = 'system_event' \
+         AND json_extract(i.payload, '$.code') = 'agent_context_compaction' \
+         AND json_type(i.payload, '$.details.compactionId') = 'text' \
+         AND json_type(i.payload, '$.details.acpStatus') = 'text' \
+         ORDER BY i.created_at ASC, i.id ASC LIMIT 8193), \
+         bounded AS (SELECT *, SUM(payload_bytes) OVER (ORDER BY created_at, id) AS retained_bytes FROM selected) \
+         SELECT b.workspace_id, b.thread_id, b.turn_id, CASE WHEN b.retained_bytes <= 16777216 THEN i.payload ELSE NULL END AS payload \
+         FROM bounded b JOIN turn_item i ON i.id = b.id AND i.turn_id = b.turn_id ORDER BY b.created_at, b.id",
+        [workspace.into(), runtime.into(), continuation.into(), session.into()],
+    )).await?;
+    if rows.len() > 8192 {
+        bail!("ACP canonical compaction capacity exceeded");
+    }
+    let mut bytes = 0usize;
+    rows.into_iter()
+        .map(|row| {
+            let payload: Option<String> = row.try_get("", "payload")?;
+            let payload = payload.context("ACP canonical compaction byte budget exceeded")?;
+            bytes = bytes.saturating_add(payload.len());
+            if bytes > 16 * 1024 * 1024 {
+                bail!("ACP canonical compaction byte budget exceeded");
+            }
+            Ok(pioneer_protocol::ItemUpdatedNotification {
+                workspace_id: row.try_get("", "workspace_id")?,
+                thread_id: row.try_get("", "thread_id")?,
+                turn_id: row.try_get("", "turn_id")?,
+                item: serde_json::from_str(&payload).context("invalid canonical ACP compaction")?,
+            })
+        })
+        .collect()
+}

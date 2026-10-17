@@ -2537,25 +2537,29 @@ impl MessageProcessor {
         let interaction = cli_runtime_pending_request_from_record(&pending);
         let interaction_service =
             crate::human_interaction::HumanInteractionService::from_budget(interaction_budget);
-        let validated_interaction =
-            match interaction_service.validate_client_resolution(&interaction, &resolution) {
-                Ok(validated) => validated,
-                Err(error) => {
-                    self.send_error(
-                        connection_id,
-                        cli_runtime_public_error(
-                            Some(request_id),
-                            INVALID_PARAMS_CODE,
-                            format!(
-                                "invalid CLI runtime request `{}` canonical response: {error:#}",
-                                pending.request_id
-                            ),
+        let validated_interaction = match interaction_service
+            .validate_client_resolution_for_runtime(
+                &interaction,
+                &resolution,
+                pending.runtime_kind.as_str(),
+            ) {
+            Ok(validated) => validated,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    cli_runtime_public_error(
+                        Some(request_id),
+                        INVALID_PARAMS_CODE,
+                        format!(
+                            "invalid CLI runtime request `{}` canonical response: {error:#}",
+                            pending.request_id
                         ),
-                    )
-                    .await;
-                    return;
-                }
-            };
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
 
         let native_response_session = match self
             .cli_runtime_existing_session_for_pending_request(&pending)
@@ -2886,6 +2890,21 @@ impl MessageProcessor {
         &self,
         request: NewCliRuntimePendingRequest,
     ) -> anyhow::Result<CliRuntimePendingRequestRecord> {
+        let opened = self
+            .open_cli_runtime_pending_request_unpublished(request)
+            .await?;
+        if opened.status == StoredCliRuntimePendingRequestStatus::Pending {
+            self.emit_cli_runtime_request_opened(opened.clone()).await;
+        }
+        Ok(opened)
+    }
+
+    // Process-origin capture must precede publishing an ACP interaction, so an
+    // immediate answer cannot race registration of its exact response lane.
+    async fn open_cli_runtime_pending_request_unpublished(
+        &self,
+        request: NewCliRuntimePendingRequest,
+    ) -> anyhow::Result<CliRuntimePendingRequestRecord> {
         let interaction = pioneer_crud::deserialize_cli_runtime_json::<CLIRuntimePendingRequest>(
             request.payload_json.as_str(),
         )
@@ -2907,7 +2926,7 @@ impl MessageProcessor {
                     authorization_context.human_interaction_budget(),
                 );
             interaction_service
-                .validate_cli_request(&interaction)
+                .validate_cli_request_for_runtime(&interaction, request.runtime_kind.as_str())
                 .context("CLI human interaction exceeds its immutable execution budget")?;
             let runtime_kind =
                 cli_runtime_kind_config_from_stored_kind(request.runtime_kind.as_str())
@@ -2945,15 +2964,12 @@ impl MessageProcessor {
             // Machine-level requests cannot be approved by a Member and have no
             // user turn whose immutable authority could be bound here.
             crate::human_interaction::HumanInteractionService::new()
-                .validate_cli_request(&interaction)
+                .validate_cli_request_for_runtime(&interaction, request.runtime_kind.as_str())
                 .context("CLI machine interaction exceeds its server budget")?;
             self.crud_store
                 .open_cli_runtime_pending_request(request)
                 .await?
         };
-        if opened.status == StoredCliRuntimePendingRequestStatus::Pending {
-            self.emit_cli_runtime_request_opened(opened.clone()).await;
-        }
         Ok(opened)
     }
 
@@ -4768,6 +4784,22 @@ impl MessageProcessor {
         let instance = origin.to_session_instance();
         let instance = &instance;
         match event {
+            RuntimeEvent::SessionCompaction { entries } => {
+                for entry in entries {
+                    if let Err(error) = self
+                        .project_acp_compaction(instance, entry.started, entry.updated)
+                        .await
+                    {
+                        warn!(error = %error, "ACP compaction projection rejected");
+                    }
+                }
+            }
+            RuntimeEvent::SessionStateChanged(change) if change.status == "acp_session_changed" => {
+                if !self.cli_runtime_instance_is_current(instance).await {
+                    return;
+                }
+                self.emit_acp_session_snapshot(instance).await;
+            }
             RuntimeEvent::AccountUpdated(_) | RuntimeEvent::AppListUpdated(_) => {
                 if !self.cli_runtime_instance_is_current(instance).await {
                     self.audit_stale_cli_runtime_process_activity(
@@ -4798,6 +4830,266 @@ impl MessageProcessor {
         }
     }
 
+    pub(crate) async fn execute_acp_skill_tool(
+        &self,
+        validated: &crate::turn_mcp::invoker::ValidatedTurnMcpInvocation,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<crate::turn_mcp::result::CanonicalMcpToolResult> {
+        let invocation = &validated.invocation;
+        anyhow::ensure!(
+            matches!(
+                invocation.origin,
+                crate::turn_mcp::invoker::TurnMcpInvocationOrigin::CliFacade
+            ),
+            "Skill facade requires a CLI origin"
+        );
+        self.revalidate_persisted_turn_skill_projection(&invocation.thread_id, &invocation.turn_id)
+            .await?;
+        let binding = self
+            .crud_store
+            .get_cli_runtime_turn_binding(&invocation.turn_id)
+            .await?
+            .context("ACP skill execution binding unavailable")?;
+        anyhow::ensure!(
+            binding.runtime_kind == "acp"
+                && binding.workspace_id == invocation.workspace_id
+                && binding.thread_id == invocation.thread_id
+                && invocation.runtime_id.as_deref() == Some(binding.runtime_id.as_str()),
+            "Skill facade execution scope mismatch"
+        );
+        let key = CLIAgentRuntimeSessionKey::new(
+            &binding.workspace_id,
+            &binding.runtime_id,
+            &binding.continuation_thread_id,
+        )?;
+        let handle = self
+            .cli_runtime_manager
+            .as_ref()
+            .context("CLI manager unavailable")?
+            .existing_session(&key)
+            .await
+            .context("ACP skill process unavailable")?;
+        anyhow::ensure!(
+            invocation.session_generation == Some(handle.instance().generation())
+                && self
+                    .cli_runtime_instance_is_current(handle.instance())
+                    .await,
+            "ACP skill generation is stale"
+        );
+        handle
+            .session()
+            .execute_acp_skill_tool(validated, cancellation)
+            .await
+    }
+
+    /// Session-scoped presentation patches retain their first canonical turn.
+    /// They never re-enter execution/finalization, even between prompts.
+    pub(crate) async fn project_acp_compaction(
+        &self,
+        instance: &CliSessionInstanceId,
+        started: Option<pioneer_protocol::ItemStartedNotification>,
+        notification: pioneer_protocol::ItemUpdatedNotification,
+    ) -> anyhow::Result<()> {
+        let transition = self
+            .cli_runtime_session_transition_mutex(instance.key())
+            .await;
+        let _transition = transition.lock().await;
+        let store = self.crud_store.with_maintenance_access();
+        let TurnItem::SystemEvent {
+            code: Some(code), ..
+        } = &notification.item
+        else {
+            anyhow::bail!("ACP session patch must be a compaction entity");
+        };
+        anyhow::ensure!(
+            code == "agent_context_compaction",
+            "invalid ACP session patch"
+        );
+        let binding = store
+            .get_cli_runtime_turn_binding(&notification.turn_id)
+            .await?
+            .context("ACP compaction origin binding missing")?;
+        anyhow::ensure!(
+            binding.workspace_id == instance.key().workspace_id
+                && binding.runtime_id == instance.key().runtime_id
+                && binding.runtime_kind == "acp"
+                && binding.continuation_thread_id == instance.key().thread_id
+                && binding.thread_id == notification.thread_id
+                && notification.workspace_id == binding.workspace_id,
+            "ACP compaction origin mismatch"
+        );
+        anyhow::ensure!(
+            self.cli_runtime_instance_is_current(instance).await,
+            "stale ACP compaction process"
+        );
+        // Only this process's retained reducer supplies ids/origin tuples.
+        // No peer turn/thread fields or replay admission are consumed here.
+        if let Some(started) = started {
+            anyhow::ensure!(
+                started.workspace_id == notification.workspace_id
+                    && started.thread_id == notification.thread_id
+                    && started.turn_id == notification.turn_id
+                    && started.item.item_id() == notification.item.item_id(),
+                "ACP compaction start/update scope mismatch"
+            );
+            store
+                .materialize_item_started(started.clone(), chrono::Utc::now().timestamp())
+                .await?;
+            self.send_notification_to_thread_subscribers(
+                &started.thread_id,
+                events::ITEM_STARTED,
+                &started,
+            )
+            .await;
+        }
+        store
+            .materialize_item_updated(notification.clone(), chrono::Utc::now().timestamp())
+            .await?;
+        self.send_notification_to_thread_subscribers(
+            &notification.thread_id,
+            events::ITEM_UPDATED,
+            &notification,
+        )
+        .await;
+        self.notify_semantic_timeline_item_changed(
+            &notification.workspace_id,
+            &notification.thread_id,
+            &notification.turn_id,
+            &notification.item,
+            None,
+        )
+        .await;
+        Ok(())
+    }
+
+    pub(crate) async fn invalidate_acp_session_snapshot(&self, instance: &CliSessionInstanceId) {
+        let Some(manager) = &self.cli_runtime_manager else {
+            return;
+        };
+        let Some(handle) = manager
+            .existing_session(instance.key())
+            .await
+            .filter(|handle| handle.instance() == instance)
+        else {
+            return;
+        };
+        let Ok(mut snapshot) = handle.session().acp_snapshot() else {
+            return;
+        };
+        snapshot.connected = false;
+        snapshot.session_id = None;
+        snapshot.version = None;
+        let candidates = self
+            .session_manager
+            .connection_ids_for_workspace(&snapshot.workspace_id)
+            .await;
+        self.send_cli_runtime_notification_to_reauthorized_connections(
+            &snapshot.workspace_id,
+            &snapshot.runtime_id,
+            super::notifications::CliRuntimeNotificationDisclosure::Full,
+            events::CLI_RUNTIME_ACP_SESSION_CHANGED,
+            &snapshot,
+            candidates,
+        )
+        .await;
+    }
+
+    pub(crate) async fn emit_acp_session_snapshot(&self, instance: &CliSessionInstanceId) {
+        if !self.cli_runtime_instance_is_current(instance).await {
+            return;
+        }
+        let Some(manager) = &self.cli_runtime_manager else {
+            return;
+        };
+        let Some(handle) = manager
+            .existing_session(instance.key())
+            .await
+            .filter(|handle| handle.instance() == instance)
+        else {
+            return;
+        };
+        let Ok(snapshot) = handle.session().acp_snapshot() else {
+            return;
+        };
+        let candidates = self
+            .session_manager
+            .connection_ids_for_workspace(&snapshot.workspace_id)
+            .await;
+        self.send_cli_runtime_notification_to_reauthorized_connections(
+            &snapshot.workspace_id,
+            &snapshot.runtime_id,
+            super::notifications::CliRuntimeNotificationDisclosure::Full,
+            events::CLI_RUNTIME_ACP_SESSION_CHANGED,
+            &snapshot,
+            candidates,
+        )
+        .await;
+    }
+
+    async fn reject_acp_request_presentation(
+        &self,
+        instance: &CliSessionInstanceId,
+        request: &pioneer_cli_agent_runtime::event::RuntimeRequestOpened,
+    ) {
+        let Some(id) = request.native_request_id_json.clone() else {
+            return;
+        };
+        let Some(manager) = &self.cli_runtime_manager else {
+            return;
+        };
+        let Some(handle) = manager
+            .existing_session(instance.key())
+            .await
+            .filter(|handle| handle.instance() == instance)
+        else {
+            return;
+        };
+        // An unpresentable callback must receive an error instead of waiting
+        // indefinitely for a pending row the user could never see or answer.
+        let _ = handle.session().fail_request(
+            id, -32603, "Pioneer could not present this interaction within its current authority or resource budget".into(), None,
+        ).await;
+    }
+
+    async fn capture_acp_request_origin(
+        &self,
+        instance: &CliSessionInstanceId,
+        request: &pioneer_cli_agent_runtime::event::RuntimeRequestOpened,
+        opened: &CliRuntimePendingRequestRecord,
+    ) -> anyhow::Result<()> {
+        let handle = self
+            .cli_runtime_manager
+            .as_ref()
+            .context("CLI manager unavailable")?
+            .existing_session(instance.key())
+            .await
+            .context("ACP process no longer current")?;
+        anyhow::ensure!(handle.instance() == instance, "ACP process was replaced");
+        let id = request
+            .native_request_id_json
+            .clone()
+            .context("ACP request id missing")?;
+        let method = request
+            .payload_redacted
+            .as_ref()
+            .and_then(|payload| payload.pointer("/acp/method"))
+            .and_then(JsonValue::as_str)
+            .context("ACP request method missing")?;
+        self.register_cli_runtime_request_origin(
+            instance,
+            method,
+            &id,
+            CLIAgentRuntimeMachineRequestResponder::new(
+                instance.clone(),
+                id.clone(),
+                handle.session(),
+            ),
+            opened,
+        )
+        .await;
+        Ok(())
+    }
+
     async fn handle_cli_runtime_request_opened_event(
         &self,
         instance: &CliSessionInstanceId,
@@ -4808,6 +5100,50 @@ impl MessageProcessor {
             return;
         }
         let key = instance.key();
+        if request.native_turn_id.is_none()
+            && request.payload_redacted.as_ref().is_some_and(|payload| {
+                payload.pointer("/acp/method").and_then(JsonValue::as_str)
+                    == Some("elicitation/create")
+                    && (payload.pointer("/acp/params/requestId").is_some()
+                        || payload.pointer("/acp/params/sessionId").is_some())
+            })
+        {
+            let payload = cli_runtime_pending_request_from_runtime_event(
+                &request,
+                CLIRuntimeRequestKind::UserInput,
+            );
+            let now = cli_runtime_request_timestamp();
+            let opening = async {
+                let opened = self
+                    .open_cli_runtime_pending_request_unpublished(NewCliRuntimePendingRequest {
+                        request_id: format!("cli_req_{}", generate_id(21)),
+                        runtime_id: key.runtime_id.clone(),
+                        runtime_kind: "acp".into(),
+                        workspace_id: key.workspace_id.clone(),
+                        thread_id: key.thread_id.clone(),
+                        turn_id: None,
+                        native_thread_id: request.native_thread_id.clone(),
+                        native_turn_id: None,
+                        native_item_id: None,
+                        request_kind: "user_input".into(),
+                        payload_json: pioneer_crud::serialize_cli_runtime_json(&payload)?,
+                        created_at: now,
+                        updated_at: now,
+                    })
+                    .await?;
+                self.capture_acp_request_origin(instance, &request, &opened)
+                    .await?;
+                self.emit_cli_runtime_request_opened(opened).await;
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = opening {
+                tracing::warn!(error = %error, "cannot open scoped ACP interaction");
+                self.reject_acp_request_presentation(instance, &request)
+                    .await;
+            }
+            return;
+        }
         let Some(turn_binding) = self
             .cli_runtime_turn_binding_for_native_turn_option(
                 instance,
@@ -5044,8 +5380,9 @@ impl MessageProcessor {
             }
         };
         let now = cli_runtime_request_timestamp();
-        if let Err(error) = self
-            .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+        let acp_request = (turn_binding.runtime_kind == "acp").then(|| request.clone());
+        let opened = match self
+            .open_cli_runtime_pending_request_unpublished(NewCliRuntimePendingRequest {
                 request_id: format!("cli_req_{}", generate_id(21)),
                 runtime_id: key.runtime_id.clone(),
                 runtime_kind: turn_binding.runtime_kind,
@@ -5062,15 +5399,36 @@ impl MessageProcessor {
             })
             .await
         {
-            warn!(
-                workspace_id = key.workspace_id.as_str(),
-                runtime_id = key.runtime_id.as_str(),
-                thread_id = key.thread_id.as_str(),
-                native_request_id = request.native_request_id.as_str(),
-                error = %format!("{error:#}"),
-                "failed to open CLI runtime pending request"
-            );
-            return;
+            Ok(opened) => opened,
+            Err(error) => {
+                warn!(
+                    workspace_id = key.workspace_id.as_str(),
+                    runtime_id = key.runtime_id.as_str(),
+                    thread_id = key.thread_id.as_str(),
+                    native_request_id = request.native_request_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to open CLI runtime pending request"
+                );
+                if let Some(request) = acp_request.as_ref() {
+                    self.reject_acp_request_presentation(instance, request)
+                        .await;
+                }
+                return;
+            }
+        };
+        if let Some(request) = acp_request {
+            if let Err(error) = self
+                .capture_acp_request_origin(instance, &request, &opened)
+                .await
+            {
+                tracing::warn!(error = %error, "cannot capture ACP request origin");
+                self.reject_acp_request_presentation(instance, &request)
+                    .await;
+                return;
+            }
+        }
+        if opened.status == StoredCliRuntimePendingRequestStatus::Pending {
+            self.emit_cli_runtime_request_opened(opened).await;
         }
         if let Some(native_turn_id) = recovery_native_turn_id.as_deref() {
             self.confirm_cli_runtime_recovery_for_native_progress(
@@ -5598,6 +5956,24 @@ impl MessageProcessor {
         else {
             anyhow::bail!("accepted CLI terminal outcome awaits current execution authority");
         };
+        delivery.terminal_delivery_id = Some(record.id.clone());
+        if expected.binding.runtime_kind == "acp" {
+            // A journaled outcome is already execution evidence. Delivery must
+            // not recreate a process, session, MCP catalog or skill runtime.
+            anyhow::ensure!(
+                self.process_bound_cli_runtime_event_from_source(
+                    None,
+                    expected.binding.clone(),
+                    event,
+                    Some(transition),
+                    Some(&delivery),
+                )
+                .await,
+                "saved ACP terminal outcome could not be delivered in this quantum"
+            );
+            self.ack_cli_runtime_terminal_event(&record).await?;
+            return Ok(true);
+        }
         let manager = self
             .cli_runtime_manager
             .as_ref()
@@ -5646,20 +6022,81 @@ impl MessageProcessor {
     async fn process_bound_cli_runtime_event_inner(
         &self,
         instance: &CliSessionInstanceId,
+        turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
+        event: RuntimeEvent,
+        turn_transition: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
+        terminal_delivery: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+    ) -> bool {
+        self.process_bound_cli_runtime_event_from_source(
+            Some(instance),
+            turn_binding,
+            event,
+            turn_transition,
+            terminal_delivery,
+        )
+        .await
+    }
+
+    async fn process_bound_cli_runtime_event_from_source(
+        &self,
+        instance: Option<&CliSessionInstanceId>,
         mut turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
         event: RuntimeEvent,
         turn_transition: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
         terminal_delivery: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> bool {
-        if !self.cli_runtime_instance_is_current(instance).await {
-            self.audit_stale_cli_runtime_process_activity(instance, "bound_event");
-            return false;
-        }
-        let key = instance.key();
+        let persisted_key;
+        let key = if let Some(instance) = instance {
+            if !self.cli_runtime_instance_is_current(instance).await {
+                self.audit_stale_cli_runtime_process_activity(instance, "bound_event");
+                return false;
+            }
+            instance.key()
+        } else {
+            // Only the saved ACP terminal lane may lack a live process fence.
+            // The existing durable commit reauthorizes the exact journal entry
+            // under retained execution ownership before canonical delivery.
+            if turn_binding.runtime_kind != "acp"
+                || turn_transition.is_none()
+                || !terminal_delivery.is_some_and(|guard| guard.terminal_delivery_id.is_some())
+                || cli_runtime_turn_status_for_terminal_event(&event).is_none()
+            {
+                return false;
+            }
+            persisted_key = match CLIAgentRuntimeSessionKey::new(
+                &turn_binding.workspace_id,
+                &turn_binding.runtime_id,
+                &turn_binding.continuation_thread_id,
+            ) {
+                Ok(key) => key,
+                Err(_) => return false,
+            };
+            &persisted_key
+        };
         let native_turn_id = cli_runtime_native_turn_id_for_event(&event);
         let native_turn_id_label = native_turn_id.unwrap_or("<none>");
         let native_thread_id = cli_runtime_native_thread_id_for_event(&event);
         let event_label = cli_runtime_event_log_label(&event);
+        if turn_binding.runtime_kind == "acp"
+            && matches!(&event, RuntimeEvent::Error(error) if error.code.as_deref() == Some("acp_outcome_unknown"))
+        {
+            self.mark_turn_blocked_with_transition(
+                turn_binding.thread_id.clone(),
+                turn_binding.turn_id.clone(),
+                "ACP connection closed; execution outcome is unknown. The prompt was not retried."
+                    .into(),
+                turn_transition.cloned(),
+            )
+            .await;
+            self.cleanup_cli_runtime_terminal_turn_status_with_transition(
+                &turn_binding,
+                TurnStatus::Blocked,
+                "acp_outcome_unknown",
+                turn_transition,
+            )
+            .await;
+            return true;
+        }
         let terminal_status = cli_runtime_turn_status_for_terminal_event(&event);
         let native_owner = if let Some(native_turn_id) = native_turn_id {
             match self
@@ -5805,7 +6242,8 @@ impl MessageProcessor {
         } else {
             None
         };
-        if terminal_status.is_some()
+        if instance.is_some()
+            && terminal_status.is_some()
             && let Some(native_turn_id) = native_turn_id
         {
             self.commit_cli_runtime_final_diff_snapshot(key, &turn_binding, native_turn_id)
@@ -5851,8 +6289,10 @@ impl MessageProcessor {
                     return false;
                 }
             }
-            self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
-                .await;
+            if let Some(instance) = instance {
+                self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
+                    .await;
+            }
             if let (Some(attempt), Some(recovery)) = (turn_attempt, recovery.as_ref()) {
                 self.confirm_cli_runtime_recovery_progress(attempt, recovery, event_label.as_str())
                     .await;
@@ -5903,13 +6343,16 @@ impl MessageProcessor {
                 return false;
             }
         }
-        if terminal_status.is_some()
+        if turn_binding.runtime_kind != "acp"
+            && terminal_status.is_some()
             && let Some(provider_failure) =
                 classify_runtime_provider_failure(&event, chrono::Local::now().fixed_offset())
         {
             let failure_message = provider_failure.message.clone();
-            self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
-                .await;
+            if let Some(instance) = instance {
+                self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
+                    .await;
+            }
             let committed = self
                 .handle_provider_failure_detected_with_transition(
                     turn_binding.thread_id.clone(),
@@ -5997,8 +6440,10 @@ impl MessageProcessor {
                 ),
                 _ => unreachable!(),
             };
-            self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
-                .await;
+            if let Some(instance) = instance {
+                self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
+                    .await;
+            }
             if !self
                 .handle_cli_runtime_recovery_native_failure(
                     turn_binding.turn_id.clone(),
@@ -6043,13 +6488,19 @@ impl MessageProcessor {
             }
             return true;
         }
-        if recovery.is_none() && matches!(&event, RuntimeEvent::TurnInterrupted(_)) {
+        if turn_binding.runtime_kind != "acp"
+            && instance.is_some()
+            && recovery.is_none()
+            && matches!(&event, RuntimeEvent::TurnInterrupted(_))
+        {
             let failure_message = match &event {
                 RuntimeEvent::TurnInterrupted(interrupted) => interrupted.reason.clone(),
                 _ => unreachable!(),
             };
-            self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
-                .await;
+            if let Some(instance) = instance {
+                self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
+                    .await;
+            }
             let committed = self
                 .report_turn_failure(
                     turn_binding.thread_id.clone(),
@@ -6188,15 +6639,26 @@ impl MessageProcessor {
         };
         let projected = crate::cli_runtime::projector::project_cli_runtime_event(&context, &event);
         for durable in projected.durable {
-            if let Err(error) = self
-                .publish_cli_runtime_durable_guarded(
+            let committed = if let Some(instance) = instance {
+                self.publish_cli_runtime_durable_guarded(
                     instance,
                     durable,
                     turn_transition,
                     terminal_delivery.cloned(),
                 )
                 .await
-            {
+                .map_err(|error| error.to_string())
+            } else {
+                self.scoped_for_background_reconciliation()
+                    .commit_durable_agent_event_with_cli_blocked_guard(
+                        durable,
+                        terminal_delivery.cloned(),
+                        turn_transition.cloned(),
+                    )
+                    .await
+                    .map_err(|error| format!("{error:?}"))
+            };
+            if let Err(error) = committed {
                 warn!(
                     workspace_id = key.workspace_id.as_str(),
                     runtime_id = key.runtime_id.as_str(),
@@ -6255,34 +6717,39 @@ impl MessageProcessor {
                 );
             }
         }
-        let event_hub = self.ensure_cli_runtime_execution_event_hub(instance).await;
-        for snapshot in projected.snapshot {
-            if !event_hub.publish_snapshot(snapshot) {
-                warn!(
-                    workspace_id = key.workspace_id.as_str(),
-                    runtime_id = key.runtime_id.as_str(),
-                    thread_id = key.thread_id.as_str(),
-                    turn_id = turn_binding.turn_id.as_str(),
-                    event = %event_label,
-                    "failed to enqueue CLI runtime snapshot because execution hub is closed"
-                );
-                if let Some(status) = terminal_status {
-                    self.cleanup_cli_runtime_terminal_turn_status_with_transition(
-                        &turn_binding,
-                        status,
-                        event_label.as_str(),
-                        turn_transition,
-                    )
-                    .await;
+        if let Some(instance) = instance {
+            let event_hub = self.ensure_cli_runtime_execution_event_hub(instance).await;
+            for snapshot in projected.snapshot {
+                if !event_hub.publish_snapshot(snapshot) {
+                    warn!(
+                        workspace_id = key.workspace_id.as_str(),
+                        runtime_id = key.runtime_id.as_str(),
+                        thread_id = key.thread_id.as_str(),
+                        turn_id = turn_binding.turn_id.as_str(),
+                        event = %event_label,
+                        "failed to enqueue CLI runtime snapshot because execution hub is closed"
+                    );
+                    if let Some(status) = terminal_status {
+                        self.cleanup_cli_runtime_terminal_turn_status_with_transition(
+                            &turn_binding,
+                            status,
+                            event_label.as_str(),
+                            turn_transition,
+                        )
+                        .await;
+                    }
+                    return false;
                 }
-                return false;
             }
+            for progress in projected.progress {
+                event_hub.publish_progress(progress);
+            }
+            self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
+                .await;
+        } else {
+            // Terminal projections carry durable lifecycle events only.
+            debug_assert!(projected.snapshot.is_empty() && projected.progress.is_empty());
         }
-        for progress in projected.progress {
-            event_hub.publish_progress(progress);
-        }
-        self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
-            .await;
         if cli_runtime_event_confirms_recovery(&event)
             && let (Some(attempt), Some(recovery)) = (turn_attempt, recovery.as_ref())
         {
@@ -6457,6 +6924,13 @@ impl MessageProcessor {
         recovery: pioneer_protocol::RecoveryAttemptContext,
         transition: &Arc<tokio::sync::OwnedMutexGuard<()>>,
     ) -> CLIRuntimeObservationGapReconciliation {
+        if binding.runtime_kind == "acp" {
+            // Standard load/resume cannot establish an interrupted prompt's
+            // outcome. Never start a process or dispatch a recovery prompt.
+            return CLIRuntimeObservationGapReconciliation::Unavailable {
+                diagnostic: "ACP execution outcome is unknown; no automatic prompt retry or session-based proof is available".into(),
+            };
+        }
         let native_turn_id = match binding.native_turn_id.as_deref() {
             Some(native_turn_id) if !native_turn_id.trim().is_empty() => native_turn_id,
             _ => {
@@ -9408,6 +9882,44 @@ impl MessageProcessor {
     ) -> anyhow::Result<()> {
         let request_kind = cli_runtime_request_kind_from_stored(pending.request_kind.as_str());
         let Some(turn_id) = pending.turn_id.as_deref() else {
+            if pending.runtime_kind == "acp" && request_kind == CLIRuntimeRequestKind::UserInput {
+                let payload = cli_runtime_pending_request_from_record(pending)
+                    .payload
+                    .context("ACP payload missing")?;
+                let request = crate::cli_runtime::acp_requests::request(&payload)?;
+                let origin = self
+                    .cli_runtime_machine_request(&pending.request_id)
+                    .await
+                    .context("ACP origin is no longer current")?;
+                anyhow::ensure!(
+                    self.cli_runtime_instance_is_current(origin.responder.instance())
+                        .await,
+                    "ACP process generation was retired"
+                );
+                match request {
+                    pioneer_cli_agent_runtime::acp::CallbackRequest::CreateElicitationRequest(
+                        request,
+                    ) => match request.scope() {
+                        pioneer_cli_agent_runtime::acp::schema::ElicitationScope::Request(_) => {}
+                        pioneer_cli_agent_runtime::acp::schema::ElicitationScope::Session(
+                            scope,
+                        ) => {
+                            let snapshot = origin.responder.session().acp_snapshot()?;
+                            let scope_id = scope.session_id.to_string();
+                            anyhow::ensure!(
+                                snapshot.connected
+                                    && snapshot.session_id.as_deref() == Some(scope_id.as_str())
+                                    && pending.native_thread_id.as_deref()
+                                        == snapshot.session_id.as_deref(),
+                                "ACP interaction session was closed or replaced"
+                            );
+                        }
+                        _ => anyhow::bail!("Unsupported ACP interaction scope"),
+                    },
+                    _ => anyhow::bail!("Turnless ACP interaction must be an elicitation"),
+                }
+                return Ok(());
+            }
             if cli_runtime_request_kind_requires_turn_binding(request_kind) {
                 anyhow::bail!(
                     "CLI runtime request `{}` is not bound to a Pioneer turn",
@@ -10091,8 +10603,21 @@ impl MessageProcessor {
         responder: CLIAgentRuntimeMachineRequestResponder,
         opened: &CliRuntimePendingRequestRecord,
     ) {
+        let id = serde_json::to_value(&request.id).expect("JSON-RPC id serializes");
+        self.register_cli_runtime_request_origin(instance, &request.method, &id, responder, opened)
+            .await;
+    }
+
+    async fn register_cli_runtime_request_origin(
+        &self,
+        instance: &CliSessionInstanceId,
+        method: &str,
+        request_id: &JsonValue,
+        responder: CLIAgentRuntimeMachineRequestResponder,
+        opened: &CliRuntimePendingRequestRecord,
+    ) {
         let provider_request_id_json =
-            serde_json::to_string(&request.id).unwrap_or_else(|_| format!("\"{}\"", request.id));
+            serde_json::to_string(request_id).expect("JSON-RPC id serializes");
         let responder_request_id_json = serde_json::to_string(responder.native_request_id())
             .unwrap_or_else(|_| responder.native_request_id().to_string());
         if responder.instance() != instance || responder_request_id_json != provider_request_id_json
@@ -10101,7 +10626,7 @@ impl MessageProcessor {
                 &responder,
                 CLI_RUNTIME_MACHINE_REQUEST_STALE_CODE,
                 "server request responder origin does not match request envelope",
-                Some(json!({"method": request.method})),
+                Some(json!({"method": method})),
             )
             .await;
             let _ = self
@@ -10116,7 +10641,7 @@ impl MessageProcessor {
         };
         let pending = CLIRuntimePendingMachineRequest {
             pioneer_request_id: opened.request_id.clone(),
-            method: request.method.clone(),
+            method: method.to_owned(),
             responder: responder.clone(),
             registered_sequence: self
                 .cli_runtime_pending_turn_activity_sequence
@@ -10146,7 +10671,7 @@ impl MessageProcessor {
                 &responder,
                 CLI_RUNTIME_MACHINE_REQUEST_UNAVAILABLE_CODE,
                 reason,
-                Some(json!({"method": request.method})),
+                Some(json!({"method": method})),
             )
             .await;
             let _ = self
@@ -10436,9 +10961,7 @@ impl MessageProcessor {
             return Ok(None);
         }
 
-        if cli_runtime_kind_config_from_stored_kind(request.runtime_kind.as_str())
-            == Some(GatewayCliAgentRuntimeKindConfig::Codex)
-        {
+        if matches!(request.runtime_kind.as_str(), "codex" | "acp") {
             if self
                 .cli_runtime_machine_request_is_registered(request.request_id.as_str())
                 .await
@@ -10488,6 +11011,16 @@ impl MessageProcessor {
     ) -> anyhow::Result<()> {
         let (response, should_interrupt) =
             match cli_runtime_kind_config_from_stored_kind(request.runtime_kind.as_str()) {
+                Some(GatewayCliAgentRuntimeKindConfig::Acp) => {
+                    let pending = cli_runtime_pending_request_from_record(request);
+                    crate::cli_runtime::acp_requests::response(
+                        pending
+                            .payload
+                            .as_ref()
+                            .context("ACP pending payload is missing")?,
+                        resolution,
+                    )?
+                }
                 Some(GatewayCliAgentRuntimeKindConfig::Claude) => {
                     claude_permission_response_from_resolution(request, resolution)?
                 }
@@ -10531,7 +11064,7 @@ impl MessageProcessor {
                 }
             };
         let native_request_id = cli_runtime_native_request_id_json_from_record(request)?;
-        let response_session = if request.runtime_kind == "codex" {
+        let response_session = if matches!(request.runtime_kind.as_str(), "codex" | "acp") {
             let Some(pending) = self
                 .cli_runtime_machine_request(request.request_id.as_str())
                 .await
@@ -10930,6 +11463,253 @@ impl MessageProcessor {
         }
     }
 
+    pub(super) async fn acp_session_control(
+        &self,
+        context: &RequestContext,
+        request_id: RequestId,
+        params: pioneer_protocol::AcpSessionParams,
+    ) {
+        let result = async {
+            let policy = AuthorizationService::new();
+            anyhow::ensure!(
+                policy.cli_management_details_allowed(
+                    context.principal().kind,
+                    context.principal().role_key.as_ref(),
+                    &params.runtime_id
+                ),
+                "ACP session management requires runtime management authority"
+            );
+            let cleanup = matches!(
+                &params.operation,
+                pioneer_protocol::AcpSessionOperation::TerminalAuthClose { .. }
+            );
+            // A picker may release after its thread view has been unloaded.
+            // Cleanup still requires the same persisted thread/workspace owner.
+            let workspace =
+                if let Some(thread) = self.thread_manager.thread_get(&params.thread_id).await {
+                    thread.workspace_id.clone()
+                } else if cleanup {
+                    self.crud_store
+                        .get_thread_model(&params.thread_id)
+                        .await?
+                        .context("ACP cleanup thread unavailable")?
+                        .workspace_id
+                } else {
+                    anyhow::bail!("ACP preparation thread unavailable");
+                };
+            anyhow::ensure!(
+                workspace == params.workspace_id,
+                "ACP session thread/workspace mismatch"
+            );
+            let instance = self
+                .load_cli_runtime_instances()?
+                .into_iter()
+                .find(|instance| {
+                    instance.id == params.runtime_id
+                        && instance.enabled
+                        && instance.kind == GatewayCliAgentRuntimeKindConfig::Acp
+                });
+            anyhow::ensure!(
+                instance.is_some() || cleanup,
+                "configured ACP runtime unavailable"
+            );
+            let manager = self
+                .cli_runtime_manager
+                .as_ref()
+                .context("CLI runtime manager unavailable")?;
+            let key = CLIAgentRuntimeSessionKey::new(
+                &params.workspace_id,
+                &params.runtime_id,
+                &params.thread_id,
+            )?;
+            let _lease = if matches!(
+                &params.operation,
+                pioneer_protocol::AcpSessionOperation::Snapshot
+                    | pioneer_protocol::AcpSessionOperation::Close { .. }
+            ) {
+                None
+            } else {
+                Some(
+                    self.cli_runtime_session_turn_mutex(&key)
+                        .await
+                        .lock_owned()
+                        .await,
+                )
+            };
+            // Finish old canonical patches before replacing their process.
+            // Release before any load/resume replay can fill ordered ingress.
+            let management_transition = self
+                .cli_runtime_session_transition_mutex(&key)
+                .await
+                .lock_owned()
+                .await;
+            let current = manager.existing_session(&key).await;
+            if let pioneer_protocol::AcpSessionOperation::TerminalAuthClose {
+                expected_generation,
+                ..
+            } = &params.operation
+            {
+                if current
+                    .as_ref()
+                    .is_none_or(|handle| handle.instance().generation() != *expected_generation)
+                {
+                    return Ok(pioneer_protocol::AcpSessionResponse {
+                        snapshot: pioneer_protocol::AcpSessionSnapshot {
+                            workspace_id: params.workspace_id.clone(),
+                            thread_id: params.thread_id.clone(),
+                            runtime_id: params.runtime_id.clone(),
+                            generation: *expected_generation,
+                            presentation_revision: u64::MAX,
+                            connected: false,
+                            ..Default::default()
+                        },
+                        result: Some(serde_json::json!({"already_retired":true})),
+                    });
+                }
+            }
+            if let pioneer_protocol::AcpSessionOperation::TerminalAuthStart {
+                expected_generation,
+                ..
+            } = &params.operation
+            {
+                anyhow::ensure!(
+                    current
+                        .as_ref()
+                        .is_some_and(|handle| handle.instance().generation()
+                            == *expected_generation
+                            && !handle.session().is_closed()),
+                    "stale ACP auth process; refresh descriptors"
+                );
+            }
+            let handle = if let Some(handle) =
+                manager.existing_session(&key).await.filter(|handle| {
+                    !handle.session().is_closed()
+                        || matches!(
+                            &params.operation,
+                            pioneer_protocol::AcpSessionOperation::TerminalAuthClose { .. }
+                        )
+                }) {
+                if !cleanup {
+                    handle
+                        .session()
+                        .acp_initialize(std::time::Duration::from_millis(
+                            instance
+                                .as_ref()
+                                .context("configured ACP runtime unavailable")?
+                                .startup_probe_timeout_ms,
+                        ))
+                        .await?;
+                }
+                handle
+            } else {
+                anyhow::ensure!(
+                    !matches!(
+                        &params.operation,
+                        pioneer_protocol::AcpSessionOperation::TerminalAuthClose { .. }
+                    ),
+                    "ACP auth invocation process already retired"
+                );
+                manager
+                    .get_or_start_with_launch_spec(
+                        key,
+                        crate::cli_runtime::continuation::CliSessionLaunchSpec::acp(
+                            crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
+                                cwd: Some(std::env::current_dir()?),
+                                env: crate::cli_runtime::config::proxy_env(
+                                    self.cli_runtime_proxy_url(
+                                        &params.workspace_id,
+                                        &params.runtime_id,
+                                    )
+                                    .await
+                                    .as_deref(),
+                                ),
+                                ..Default::default()
+                            },
+                            crate::cli_runtime::continuation::CliMcpSessionLaunch::ManagementOnly,
+                            None,
+                        ),
+                    )
+                    .await?
+            };
+            drop(management_transition);
+            self.ensure_cli_runtime_session_event_pumps(handle.instance(), handle.session(), false)
+                .await;
+            let result = handle
+                .session()
+                .acp_control(
+                    params.operation,
+                    std::time::Duration::from_millis(
+                        instance
+                            .as_ref()
+                            .map_or(30_000, |instance| instance.request_timeout_ms),
+                    ),
+                )
+                .await;
+            self.emit_acp_session_snapshot(handle.instance()).await;
+            let result = result?;
+            Ok::<_, anyhow::Error>(pioneer_protocol::AcpSessionResponse {
+                snapshot: handle.session().acp_snapshot()?,
+                result,
+            })
+        }
+        .await;
+        match result {
+            Ok(response) => {
+                self.send_cli_runtime_response(
+                    context.connection_id(),
+                    request_id,
+                    methods::CLI_RUNTIME_ACP_SESSION,
+                    &response,
+                )
+                .await;
+            }
+            Err(error) => {
+                self.send_error(
+                    context.connection_id(),
+                    cli_runtime_public_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("ACP session operation failed: {error:#}"),
+                    ),
+                )
+                .await
+            }
+        }
+    }
+
+    pub(crate) async fn acp_management_session(
+        &self,
+        workspace_id: &str,
+        instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
+    ) -> anyhow::Result<CLIAgentRuntimeSessionHandle> {
+        let manager = self
+            .cli_runtime_manager
+            .as_ref()
+            .context("CLI runtime manager unavailable")?;
+        let key = CLIAgentRuntimeSessionKey::new(workspace_id, &instance.id, "__acp_management__")?;
+        let handle = manager
+            .get_or_start_with_launch_spec(
+                key,
+                crate::cli_runtime::continuation::CliSessionLaunchSpec::acp(
+                    crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
+                        cwd: Some(std::env::current_dir()?),
+                        env: crate::cli_runtime::config::proxy_env(
+                            self.cli_runtime_proxy_url(workspace_id, &instance.id)
+                                .await
+                                .as_deref(),
+                        ),
+                        ..Default::default()
+                    },
+                    crate::cli_runtime::continuation::CliMcpSessionLaunch::ManagementOnly,
+                    None,
+                ),
+            )
+            .await?;
+        self.ensure_cli_runtime_session_event_pumps(handle.instance(), handle.session(), false)
+            .await;
+        Ok(handle)
+    }
+
     pub(super) async fn cli_runtime_live_summary_from_instance_with_trace(
         &self,
         workspace_id: &str,
@@ -10939,6 +11719,7 @@ impl MessageProcessor {
         let runtime_kind = match instance.kind {
             GatewayCliAgentRuntimeKindConfig::Codex => GatewayCliRuntimeKind::Codex,
             GatewayCliAgentRuntimeKindConfig::Claude => GatewayCliRuntimeKind::Claude,
+            GatewayCliAgentRuntimeKindConfig::Acp => GatewayCliRuntimeKind::Acp,
         };
         let proxy_stage = refresh_trace.map(|trace| {
             trace.runtime_stage(GatewayProviderWarmupStage::RuntimeProxyLoad, runtime_kind)
@@ -10958,6 +11739,47 @@ impl MessageProcessor {
         }
 
         let (summary, mcp_readiness) = match instance.kind {
+            GatewayCliAgentRuntimeKindConfig::Acp => {
+                let handle = self.acp_management_session(workspace_id, &instance).await?;
+                let connection = handle
+                    .session()
+                    .acp_connection()
+                    .context("ACP connection unavailable")?;
+                let initialized = tokio::time::timeout(
+                    std::time::Duration::from_millis(instance.startup_probe_timeout_ms),
+                    connection.initialize(),
+                )
+                .await
+                .context("ACP initialize deadline exceeded")?
+                .map_err(|error| anyhow::anyhow!(error.message))?;
+                let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
+                let readiness = crate::cli_runtime::acp_mcp::readiness(
+                    &instance,
+                    initialized
+                        .agent_info
+                        .as_ref()
+                        .map(|info| info.version.clone()),
+                    max_tools,
+                    max_schema_bytes,
+                )
+                .await?;
+                let mut summary = summary;
+                summary.status = RuntimeStatus::Ready;
+                summary.version = initialized.agent_info.map(|info| info.version);
+                summary.account = None;
+                summary.capabilities = cli_runtime_capabilities_for_kind_with_policy(
+                    instance.kind,
+                    CliRuntimeCapabilityPolicy::from_readiness(true, true, Some(&readiness)),
+                );
+                summary.capabilities.supports_resume = initialized.agent_capabilities.load_session
+                    || initialized
+                        .agent_capabilities
+                        .session_capabilities
+                        .resume
+                        .is_some();
+                summary.diagnostics.clear();
+                (summary, readiness)
+            }
             GatewayCliAgentRuntimeKindConfig::Codex => {
                 let account_stage = refresh_trace.map(|trace| {
                     trace.runtime_stage(
@@ -11107,11 +11929,22 @@ impl MessageProcessor {
         let runtime_kind = match instance.kind {
             GatewayCliAgentRuntimeKindConfig::Codex => GatewayCliRuntimeKind::Codex,
             GatewayCliAgentRuntimeKindConfig::Claude => GatewayCliRuntimeKind::Claude,
+            GatewayCliAgentRuntimeKindConfig::Acp => GatewayCliRuntimeKind::Acp,
         };
         let model_stage = trace.map(|trace| {
             trace.runtime_stage(GatewayProviderWarmupStage::RuntimeModelsLoad, runtime_kind)
         });
         let result = match instance.kind {
+            GatewayCliAgentRuntimeKindConfig::Acp => RuntimeModelListResult {
+                models: Vec::new(),
+                diagnostics: vec![RuntimeDiagnostic {
+                    level: RuntimeDiagnosticLevel::Info,
+                    code: "acp.session_configuration".into(),
+                    message: "Model and parameter choices are supplied by the prepared ACP session"
+                        .into(),
+                }],
+                error_message: None,
+            },
             GatewayCliAgentRuntimeKindConfig::Codex => {
                 let probe = CodexProbe::model_list(
                     codex_account_probe_config_from_instance_with_proxy(instance, proxy_url),
@@ -11284,6 +12117,7 @@ fn cli_runtime_thread_binding_from_record(
     let runtime_kind = match binding.runtime_kind.as_str() {
         "codex" => CLIAgentRuntimeKind::Codex,
         "claude" => CLIAgentRuntimeKind::Claude,
+        "acp" => CLIAgentRuntimeKind::Acp,
         other => anyhow::bail!("unknown CLI runtime kind `{other}`"),
     };
 
@@ -11541,6 +12375,7 @@ fn cli_runtime_kind_from_config(kind: GatewayCliAgentRuntimeKindConfig) -> CLIAg
     match kind {
         GatewayCliAgentRuntimeKindConfig::Codex => CLIAgentRuntimeKind::Codex,
         GatewayCliAgentRuntimeKindConfig::Claude => CLIAgentRuntimeKind::Claude,
+        GatewayCliAgentRuntimeKindConfig::Acp => CLIAgentRuntimeKind::Acp,
     }
 }
 
@@ -11548,6 +12383,7 @@ fn cli_runtime_protocol_kind_label(kind: CLIAgentRuntimeKind) -> &'static str {
     match kind {
         CLIAgentRuntimeKind::Codex => "codex",
         CLIAgentRuntimeKind::Claude => "claude",
+        pioneer_protocol::CLIAgentRuntimeKind::Acp => "acp",
     }
 }
 
@@ -11561,6 +12397,7 @@ fn cli_runtime_kind_config_from_stored_kind(
     match kind {
         "codex" => Some(GatewayCliAgentRuntimeKindConfig::Codex),
         "claude" => Some(GatewayCliAgentRuntimeKindConfig::Claude),
+        "acp" => Some(GatewayCliAgentRuntimeKindConfig::Acp),
         _ => None,
     }
 }
@@ -11579,6 +12416,21 @@ fn cli_runtime_capabilities_for_kind_with_policy(
     capability_policy: CliRuntimeCapabilityPolicy,
 ) -> RuntimeCapabilities {
     match kind {
+        GatewayCliAgentRuntimeKindConfig::Acp => RuntimeCapabilities {
+            supports_skills: capability_policy.supports_skills(),
+            supports_mcp_tools: capability_policy.supports_mcp_tools(),
+            supports_threads: true,
+            supports_interrupt: true,
+            supports_approvals: true,
+            supports_file_change_approvals: true,
+            supports_command_approvals: true,
+            supports_user_input_requests: true,
+            supports_auth_management: true,
+            supports_diff_updates: true,
+            supports_history_read: true,
+            // Remaining optional operations are advertised per prepared session.
+            ..Default::default()
+        },
         GatewayCliAgentRuntimeKindConfig::Codex => RuntimeCapabilities {
             supports_skills: capability_policy.supports_skills(),
             supports_mcp_tools: capability_policy.supports_mcp_tools(),
@@ -12527,6 +13379,17 @@ fn validate_cli_runtime_native_request_resolution(
     resolution: &CLIRuntimeRequestResolution,
 ) -> anyhow::Result<()> {
     match cli_runtime_kind_config_from_stored_kind(record.runtime_kind.as_str()) {
+        Some(GatewayCliAgentRuntimeKindConfig::Acp) => {
+            let pending = cli_runtime_pending_request_from_record(record);
+            let _ = crate::cli_runtime::acp_requests::response(
+                pending
+                    .payload
+                    .as_ref()
+                    .context("ACP pending payload is missing")?,
+                resolution,
+            )?;
+            return Ok(());
+        }
         Some(GatewayCliAgentRuntimeKindConfig::Claude) => {
             let _ = claude_permission_response_from_resolution(record, resolution)?;
             return Ok(());
@@ -13052,6 +13915,7 @@ fn cli_runtime_raw_method_can_use_running_turn_fallback(method: &str) -> bool {
 fn cli_runtime_event_log_label(event: &RuntimeEvent) -> String {
     match event {
         RuntimeEvent::Raw(raw) => raw.native_method.clone(),
+        RuntimeEvent::SessionCompaction { .. } => "session_compaction".to_owned(),
         RuntimeEvent::SessionStateChanged(_) => "session_state_changed".to_owned(),
         RuntimeEvent::ThreadStateChanged(_) => "thread_state_changed".to_owned(),
         RuntimeEvent::ThreadGoalUpdated(_) => "thread_goal_updated".to_owned(),
@@ -13094,7 +13958,8 @@ fn cli_runtime_native_turn_id_for_event(event: &RuntimeEvent) -> Option<&str> {
         RuntimeEvent::Error(event) => event.native_turn_id.as_deref(),
         RuntimeEvent::Raw(event) => event.native_turn_id.as_deref(),
         RuntimeEvent::RequestOpened(event) => event.native_turn_id.as_deref(),
-        RuntimeEvent::SessionStateChanged(_)
+        RuntimeEvent::SessionCompaction { .. }
+        | RuntimeEvent::SessionStateChanged(_)
         | RuntimeEvent::ThreadStateChanged(_)
         | RuntimeEvent::ThreadGoalCleared(_)
         | RuntimeEvent::RequestResolved(_)
@@ -13135,7 +14000,8 @@ fn cli_runtime_native_thread_id_for_event(event: &RuntimeEvent) -> Option<&str> 
         RuntimeEvent::ReviewModeChanged(event) => event.native_thread_id.as_deref(),
         RuntimeEvent::Error(event) => event.native_thread_id.as_deref(),
         RuntimeEvent::Raw(event) => event.native_thread_id.as_deref(),
-        RuntimeEvent::SessionStateChanged(_)
+        RuntimeEvent::SessionCompaction { .. }
+        | RuntimeEvent::SessionStateChanged(_)
         | RuntimeEvent::RequestResolved(_)
         | RuntimeEvent::AccountUpdated(_)
         | RuntimeEvent::AppListUpdated(_) => None,
@@ -13189,7 +14055,8 @@ fn cli_runtime_event_confirms_recovery(event: &RuntimeEvent) -> bool {
         RuntimeEvent::ItemUpdated(item) => {
             !cli_runtime_item_is_native_user_message(item.item_kind.as_str())
         }
-        RuntimeEvent::SessionStateChanged(_)
+        RuntimeEvent::SessionCompaction { .. }
+        | RuntimeEvent::SessionStateChanged(_)
         | RuntimeEvent::ThreadStateChanged(_)
         | RuntimeEvent::ThreadGoalUpdated(_)
         | RuntimeEvent::ThreadGoalCleared(_)
@@ -13485,6 +14352,7 @@ mod tests {
             shadow_home_path: None,
             custom_models: Vec::new(),
             app_server_args: Vec::new(),
+            env_from: Default::default(),
             startup_probe_timeout_ms: 15_000,
             request_timeout_ms: 60_000,
             idle_session_ttl_secs: 1_800,
@@ -13543,6 +14411,7 @@ mod tests {
         )));
         assert!(!cli_runtime_event_confirms_recovery(
             &RuntimeEvent::ItemStarted(RuntimeItemStarted {
+                item: None,
                 native_thread_id: native_thread_id.clone(),
                 native_turn_id: native_turn_id.clone(),
                 native_item_id: "user_echo".to_owned(),
@@ -13557,6 +14426,7 @@ mod tests {
 
         assert!(cli_runtime_event_confirms_recovery(
             &RuntimeEvent::ItemStarted(RuntimeItemStarted {
+                item: None,
                 native_thread_id: native_thread_id.clone(),
                 native_turn_id: native_turn_id.clone(),
                 native_item_id: "reasoning".to_owned(),

@@ -619,7 +619,31 @@ impl ProviderCatalogView {
                             }),
                     );
 
-                if runtime.capabilities.supports_auth_management {
+                if runtime.kind == pioneer_client::providers::types::CLIAgentRuntimeKind::Acp {
+                    menu = menu.item(
+                        PopupMenuItem::new(t!("providers.cli.action.edit_launch").to_string())
+                            .disabled(!is_connected)
+                            .on_click({
+                                let runtime_id = runtime_id.clone();
+                                let desktop_entity = desktop_entity.clone();
+                                move |_, window, cx| {
+                                    let _ = desktop_entity.update(cx, |view, cx| {
+                                        let instance = cli_provider_settings::find_cli_runtime_provider_instance(
+                                            view.gateway.settings.as_ref(), &runtime_id,
+                                        ).cloned();
+                                        if let Some(instance) = instance {
+                                            view.open_cli_runtime_provider_dialog(
+                                                cli_provider_settings::CLIRuntimeProviderDraft::edit(&instance), window, cx,
+                                            );
+                                        }
+                                    });
+                                }
+                            }),
+                    ).item(PopupMenuItem::new(t!("providers.cli.action.acp_auth_hint").to_string()).disabled(true));
+                }
+
+                if runtime.capabilities.supports_auth_management
+                    && runtime.kind != pioneer_client::providers::types::CLIAgentRuntimeKind::Acp {
                     menu = menu.item(
                         PopupMenuItem::new(t!("providers.cli.action.login").to_string())
                             .disabled(!is_connected || !can_login)
@@ -801,6 +825,7 @@ impl ProviderCatalogView {
                                             window,
                                             cx,
                                         ))
+                                        .when(runtime.kind != pioneer_client::providers::types::CLIAgentRuntimeKind::Acp, |this| this
                                         .child(cli_runtime_inline_settings_row(
                                             runtime,
                                             Some(CLIRuntimeProviderDraftField::HomePath),
@@ -836,6 +861,7 @@ impl ProviderCatalogView {
                                             window,
                                             cx,
                                         ))
+                                        )
                                         .child(cli_runtime_inline_settings_row(
                                             runtime,
                                             None,
@@ -947,6 +973,7 @@ fn cli_runtime_provider_logo(kind: CLIAgentRuntimeKind) -> (&'static str, &'stat
     match kind {
         CLIAgentRuntimeKind::Codex => ("openai", "logos/providers/openai.svg"),
         CLIAgentRuntimeKind::Claude => ("claude", "logos/providers/claude.svg"),
+        CLIAgentRuntimeKind::Acp => ("acp", "icons/terminal.svg"),
     }
 }
 
@@ -1337,7 +1364,11 @@ fn cli_runtime_inline_field_value(
         Some(CLIRuntimeProviderDraftField::ShadowHomePath) => {
             runtime.shadow_home_path.clone().unwrap_or_default()
         }
-        Some(CLIRuntimeProviderDraftField::Id) => String::new(),
+        Some(
+            CLIRuntimeProviderDraftField::Arguments
+            | CLIRuntimeProviderDraftField::EnvironmentReferences
+            | CLIRuntimeProviderDraftField::Id,
+        ) => String::new(),
         None => runtime.proxy_url.clone().unwrap_or_default(),
     }
 }
@@ -1363,6 +1394,8 @@ fn cli_runtime_inline_field_placeholder(
             )
             .to_owned()
         }
+        CLIRuntimeProviderDraftField::Arguments => "[]".into(),
+        CLIRuntimeProviderDraftField::EnvironmentReferences => "{}".into(),
         CLIRuntimeProviderDraftField::Id => String::new(),
     }
 }
@@ -1372,6 +1405,8 @@ fn cli_runtime_inline_field_key(field_id: Option<CLIRuntimeProviderDraftField>) 
         Some(CLIRuntimeProviderDraftField::BinaryPath) => "binary-path",
         Some(CLIRuntimeProviderDraftField::HomePath) => "home-path",
         Some(CLIRuntimeProviderDraftField::ShadowHomePath) => "shadow-home-path",
+        Some(CLIRuntimeProviderDraftField::Arguments) => "arguments",
+        Some(CLIRuntimeProviderDraftField::EnvironmentReferences) => "environment-references",
         Some(CLIRuntimeProviderDraftField::Id) => "id",
         Some(CLIRuntimeProviderDraftField::DisplayName) => "display-name",
         None => "proxy-url",

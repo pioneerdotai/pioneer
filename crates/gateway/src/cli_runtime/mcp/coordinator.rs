@@ -172,6 +172,9 @@ struct CliMcpActiveTurn {
     turn_id: String,
     native_thread_id: Option<String>,
     native_turn_id: Option<String>,
+    // ACP may initialize MCP lazily during prompt. Arming records the admitted
+    // binding; only an authenticated tools/list makes that binding callable.
+    activate_when_ready: bool,
     state: CliMcpActiveTurnState,
     cancellation: CancellationToken,
 }
@@ -312,6 +315,7 @@ impl CliMcpCoordinator {
                 turn_id,
                 native_thread_id: None,
                 native_turn_id: None,
+                activate_when_ready: false,
                 state: CliMcpActiveTurnState::Preparing,
                 cancellation,
             },
@@ -343,11 +347,119 @@ impl CliMcpCoordinator {
         match projection.readiness {
             CliMcpProjectionReadiness::Preparing | CliMcpProjectionReadiness::Ready => {
                 projection.readiness = CliMcpProjectionReadiness::Ready;
+                let armed = state
+                    .active_turns
+                    .get_mut(&bound.grant_id())
+                    .filter(|turn| {
+                        turn.activate_when_ready
+                            && turn.state == CliMcpActiveTurnState::Preparing
+                            && turn.projection_generation == projection_generation
+                            && turn.process_instance == bound.scope().process_instance
+                    });
+                if let Some(turn) = armed {
+                    turn.state = CliMcpActiveTurnState::Active;
+                    state
+                        .projections
+                        .get_mut(&bound.grant_id())
+                        .expect("validated projection")
+                        .readiness = CliMcpProjectionReadiness::Active;
+                }
                 signal.notify_waiters();
                 Ok(())
             }
             CliMcpProjectionReadiness::Active => Err(CliMcpCoordinatorError::InvalidTransition),
         }
+    }
+
+    /// Linearize nonblocking prompt enqueue with call admission. This is the
+    /// protocol coordinator mutex, never database capacity. A failed dispatch
+    /// does not arm the turn; real authenticated tools/list is still required.
+    pub(crate) async fn arm_turn_and_dispatch<T, E>(
+        &self,
+        grant: &CliMcpGrantRef,
+        generation: CliMcpActivationGeneration,
+        native_thread_id: String,
+        native_turn_id: String,
+        dispatch: impl FnOnce() -> Result<T, E>,
+    ) -> Result<Result<T, E>, CliMcpCoordinatorError> {
+        let native_thread_id = normalize_identity(native_thread_id)?;
+        let native_turn_id = normalize_identity(native_turn_id)?;
+        let mut state = self.state.lock().await;
+        state.grants.validate_ref(grant, now_unix_ms())?;
+        let turn = state
+            .active_turns
+            .get(&grant.grant_id())
+            .ok_or(CliMcpCoordinatorError::MissingTurn)?;
+        if turn.activation_generation != generation
+            || turn.process_instance != grant.scope().process_instance
+            || turn.state != CliMcpActiveTurnState::Preparing
+            || turn.activate_when_ready
+        {
+            return Err(CliMcpCoordinatorError::InvalidTransition);
+        }
+        let projection = state
+            .projections
+            .get(&grant.grant_id())
+            .ok_or(CliMcpCoordinatorError::MissingProjection)?;
+        if projection.generation != turn.projection_generation
+            || projection.process_instance != turn.process_instance
+        {
+            return Err(CliMcpCoordinatorError::StaleProjectionGeneration);
+        }
+        let ready = projection.readiness == CliMcpProjectionReadiness::Ready;
+        if !matches!(
+            projection.readiness,
+            CliMcpProjectionReadiness::Preparing | CliMcpProjectionReadiness::Ready
+        ) {
+            return Err(CliMcpCoordinatorError::InvalidTransition);
+        }
+        let sent = match dispatch() {
+            Ok(sent) => sent,
+            Err(error) => return Ok(Err(error)),
+        };
+        let turn = state
+            .active_turns
+            .get_mut(&grant.grant_id())
+            .expect("validated turn");
+        turn.native_thread_id = Some(native_thread_id);
+        turn.native_turn_id = Some(native_turn_id);
+        turn.activate_when_ready = true;
+        if ready {
+            turn.state = CliMcpActiveTurnState::Active;
+            state
+                .projections
+                .get_mut(&grant.grant_id())
+                .expect("validated projection")
+                .readiness = CliMcpProjectionReadiness::Active;
+        }
+        Ok(Ok(sent))
+    }
+
+    /// Cancellation must also settle a reserved turn whose helper never attached.
+    pub(crate) async fn terminal_reserved_turn(
+        &self,
+        grant: &CliMcpGrantRef,
+        generation: CliMcpActivationGeneration,
+    ) -> Result<(), CliMcpCoordinatorError> {
+        let mut state = self.state.lock().await;
+        state.grants.validate_ref(grant, now_unix_ms())?;
+        let turn = state
+            .active_turns
+            .get_mut(&grant.grant_id())
+            .ok_or(CliMcpCoordinatorError::MissingTurn)?;
+        if turn.activation_generation != generation
+            || turn.process_instance != grant.scope().process_instance
+        {
+            return Err(CliMcpCoordinatorError::StaleActivationGeneration);
+        }
+        turn.cancellation.cancel();
+        turn.state = CliMcpActiveTurnState::Terminal;
+        if let Some(projection) = state.projections.get_mut(&grant.grant_id()) {
+            if projection.readiness == CliMcpProjectionReadiness::Active {
+                projection.readiness = CliMcpProjectionReadiness::Ready;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn wait_projection_ready(
@@ -1012,5 +1124,112 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+    #[tokio::test]
+    async fn acp_lazy_mcp_requires_dispatch_and_exact_list_before_calls() {
+        for list_first in [false, true] {
+            let coordinator = CliMcpCoordinator::default();
+            let exact = scope(1, "acp-turn", b'a');
+            let issued = issue(&coordinator, exact.clone()).await;
+            let grant = issued.grant_ref();
+            let fingerprint = CliMcpProjectionFingerprint::new("c".repeat(64)).unwrap();
+            let projection = coordinator
+                .stage_projection(&grant, fingerprint.clone())
+                .await
+                .unwrap();
+            let turn = coordinator
+                .reserve_turn(&grant, projection.generation, "actual-child", "turn")
+                .await
+                .unwrap();
+            let bound = coordinator
+                .attach(
+                    &attach_request(&issued),
+                    &exact,
+                    CliMcpConnectionId::for_test(1),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                coordinator
+                    .arm_turn_and_dispatch(
+                        &grant,
+                        turn.activation_generation,
+                        "session".into(),
+                        "prompt".into(),
+                        || Err::<(), _>("queue full"),
+                    )
+                    .await
+                    .unwrap(),
+                Err("queue full")
+            );
+            assert_eq!(
+                coordinator
+                    .authorize_call(&bound, turn.activation_generation)
+                    .await,
+                Err(CliMcpCoordinatorError::CallsNotActive)
+            );
+            if list_first {
+                coordinator
+                    .mark_projection_ready(&bound, projection.generation, &fingerprint)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    coordinator
+                        .authorize_call(&bound, turn.activation_generation)
+                        .await,
+                    Err(CliMcpCoordinatorError::CallsNotActive)
+                );
+            }
+            coordinator
+                .arm_turn_and_dispatch(
+                    &grant,
+                    turn.activation_generation,
+                    "session".into(),
+                    "prompt".into(),
+                    || Ok::<_, ()>(()),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            if !list_first {
+                assert_eq!(
+                    coordinator
+                        .authorize_call(&bound, turn.activation_generation)
+                        .await,
+                    Err(CliMcpCoordinatorError::CallsNotActive)
+                );
+                coordinator
+                    .mark_projection_ready(&bound, projection.generation, &fingerprint)
+                    .await
+                    .unwrap();
+            }
+            let call = coordinator
+                .authorize_call(&bound, turn.activation_generation)
+                .await
+                .unwrap();
+            assert_eq!(
+                (call.thread_id.as_str(), call.turn_id.as_str()),
+                ("actual-child", "turn")
+            );
+            assert_eq!(
+                (call.native_thread_id.as_str(), call.native_turn_id.as_str()),
+                ("session", "prompt")
+            );
+            coordinator
+                .terminal_reserved_turn(&grant, turn.activation_generation)
+                .await
+                .unwrap();
+            assert!(turn.cancellation.is_cancelled());
+            coordinator
+                .mark_projection_ready(&bound, projection.generation, &fingerprint)
+                .await
+                .unwrap();
+            assert_eq!(
+                coordinator
+                    .authorize_call(&bound, turn.activation_generation)
+                    .await,
+                Err(CliMcpCoordinatorError::CallsNotActive)
+            );
+        }
     }
 }

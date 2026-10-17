@@ -90,6 +90,7 @@ fn adapter_base_mapping(
     mode: TurnPermissionMode,
 ) -> BaseMapping {
     match runtime_kind {
+        CLIAgentRuntimeKind::Acp => BaseMapping { approval_policy: "client_callbacks", mapping_quality: CLIRuntimePermissionMappingQuality::StricterFallback, notes: vec!["ACP permission callbacks authorize individual operations; they do not establish isolation of the agent process".into()] },
         CLIAgentRuntimeKind::Codex => codex_base_mapping(mode),
         CLIAgentRuntimeKind::Claude => claude_base_mapping(mode),
     }
@@ -139,6 +140,7 @@ fn claude_base_mapping(mode: TurnPermissionMode) -> BaseMapping {
 
 fn empty_cli_runtime_options() -> TurnCLIRuntimeOptions {
     TurnCLIRuntimeOptions {
+        acp_configuration: None,
         sandbox: None,
         effort: None,
         personality: None,
@@ -175,6 +177,7 @@ mod tests {
             CLIAgentRuntimeKind::Codex,
             None,
             Some(TurnCLIRuntimeOptions {
+                acp_configuration: None,
                 sandbox: None,
                 effort: Some("high".to_owned()),
                 personality: None,
@@ -199,6 +202,7 @@ mod tests {
             CLIAgentRuntimeKind::Codex,
             Some(&selection(TurnPermissionMode::Supervised)),
             Some(TurnCLIRuntimeOptions {
+                acp_configuration: None,
                 sandbox: None,
                 effort: None,
                 personality: None,
@@ -261,6 +265,7 @@ mod tests {
             CLIAgentRuntimeKind::Claude,
             Some(&selection(TurnPermissionMode::AutoAcceptEdits)),
             Some(TurnCLIRuntimeOptions {
+                acp_configuration: None,
                 sandbox: None,
                 effort: None,
                 personality: Some("concise".to_owned()),
@@ -331,6 +336,7 @@ mod tests {
             CLIAgentRuntimeKind::Codex,
             Some(&selection(TurnPermissionMode::FullAccess)),
             Some(TurnCLIRuntimeOptions {
+                acp_configuration: None,
                 sandbox: None,
                 effort: Some("low".to_owned()),
                 personality: Some("direct".to_owned()),
@@ -352,6 +358,7 @@ mod tests {
             CLIAgentRuntimeKind::Codex,
             Some(&selection(TurnPermissionMode::FullAccess)),
             Some(TurnCLIRuntimeOptions {
+                acp_configuration: None,
                 sandbox: Some(CLIAgentRuntimeSandboxPolicy(serde_json::json!({
                     "type": "workspaceWrite",
                     "networkAccess": false

@@ -27,6 +27,9 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Duration, Instant as TokioInstant, sleep, sleep_until};
 
+mod terminal;
+pub use terminal::{ProcessTerminal, ProcessTerminalExit, ProcessTerminalOutput};
+
 const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_YIELD_MS: u64 = 120;
 const MAX_ACTIVE_SESSIONS: usize = 64;

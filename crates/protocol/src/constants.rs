@@ -83,6 +83,7 @@ pub mod methods {
     pub const CLI_RUNTIME_GET: &str = "cli_runtime/get";
     pub const CLI_RUNTIME_STATUS: &str = "cli_runtime/status";
     pub const CLI_RUNTIME_REFRESH: &str = "cli_runtime/refresh";
+    pub const CLI_RUNTIME_ACP_SESSION: &str = "cli_runtime/acp_session";
     pub const CLI_RUNTIME_LIST_MODELS: &str = "cli_runtime/list_models";
     pub const CLI_RUNTIME_THREAD_BINDING_GET: &str = "cli_runtime/thread_binding/get";
     pub const CLI_RUNTIME_THREAD_FORK: &str = "cli_runtime/thread/fork";
@@ -406,6 +407,7 @@ pub mod events {
     pub const CLI_RUNTIME_ACCOUNT_UPDATED: &str = "cli_runtime/account_updated";
     pub const CLI_RUNTIME_REQUEST_OPENED: &str = "cli_runtime/request_opened";
     pub const CLI_RUNTIME_REQUEST_RESOLVED: &str = "cli_runtime/request_resolved";
+    pub const CLI_RUNTIME_ACP_SESSION_CHANGED: &str = "cli_runtime/acp_session_changed";
     pub const CLI_RUNTIME_APPS_CHANGED: &str = "cli_runtime/apps_changed";
     pub const TASK_CREATED: &str = "task/created";
     pub const TASK_SCHEDULED: &str = "task/scheduled";

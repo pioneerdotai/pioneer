@@ -43,6 +43,7 @@ pub(crate) enum TurnSecurityResolverExecutionBackend {
     NativeApiProvider { provider: String },
     CodexCli { runtime_id: String },
     ClaudeCli { runtime_id: String },
+    Acp { runtime_id: String },
 }
 
 impl TurnSecurityResolverExecutionBackend {
@@ -52,6 +53,7 @@ impl TurnSecurityResolverExecutionBackend {
             Self::NativeApiProvider { .. } => TurnSecurityExecutionBackendKind::Native,
             Self::CodexCli { .. } => TurnSecurityExecutionBackendKind::CodexCli,
             Self::ClaudeCli { .. } => TurnSecurityExecutionBackendKind::ClaudeCli,
+            Self::Acp { .. } => TurnSecurityExecutionBackendKind::Acp,
         }
     }
 }
@@ -461,6 +463,22 @@ fn backend_snapshot_for(input: &TurnSecurityResolverInput) -> TurnSecurityBacken
                 sandbox_backend: cli_provider_sandbox_backend(capabilities),
                 provider: Some(runtime_id.clone()),
                 capabilities: backend_capabilities_from_cli_provider(capabilities),
+            }
+        }
+        TurnSecurityResolverExecutionBackend::Acp { runtime_id } => {
+            // Standard permission callbacks authorize an agent's proposed
+            // action. They do not attest a sandbox around its own syscalls.
+            // Required filesystem/network/process isolation therefore keeps
+            // the existing enforcement gate until a real process sandbox is
+            // installed; ordinary unrestricted execution remains available.
+            TurnSecurityBackendSnapshot {
+                execution_backend: TurnSecurityExecutionBackendKind::Acp,
+                sandbox_backend: None,
+                provider: Some(runtime_id.clone()),
+                capabilities: BackendSecurityCapabilities {
+                    supports_turn_scope_approval: true,
+                    ..BackendSecurityCapabilities::unrestricted()
+                },
             }
         }
     }
@@ -1160,13 +1178,15 @@ fn resolve_execution_backend(
                 CLIAgentRuntimeKind::Claude => {
                     Ok(TurnSecurityResolverExecutionBackend::ClaudeCli { runtime_id })
                 }
+                CLIAgentRuntimeKind::Acp => {
+                    Ok(TurnSecurityResolverExecutionBackend::Acp { runtime_id })
+                }
             }
         }
         Some(AgentExecutionBackend::ACPAgentRuntime { runtime_id }) => {
-            bail!(
-                "ACP agent runtime `{}` cannot build a turn security resolver input",
-                runtime_id
-            )
+            Ok(TurnSecurityResolverExecutionBackend::Acp {
+                runtime_id: required_trimmed("ACP runtime id", runtime_id)?,
+            })
         }
         None => Ok(TurnSecurityResolverExecutionBackend::NativeApiProvider {
             provider: required_trimmed("effective model provider", effective_model_provider)?,
@@ -1334,6 +1354,7 @@ mod tests {
             reasoning: None,
             permission_profile: None,
             cli_runtime_options: Some(TurnCLIRuntimeOptions {
+                acp_configuration: None,
                 sandbox: Some(CLIAgentRuntimeSandboxPolicy(json!({
                     "type": "dangerFullAccess"
                 }))),

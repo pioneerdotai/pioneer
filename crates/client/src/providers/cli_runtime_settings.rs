@@ -23,6 +23,8 @@ pub enum CLIRuntimeProviderDraftField {
     BinaryPath,
     HomePath,
     ShadowHomePath,
+    Arguments,
+    EnvironmentReferences,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -40,6 +42,10 @@ pub struct CLIRuntimeProviderDraft {
     pub binary_path: String,
     pub home_path: String,
     pub shadow_home_path: String,
+    #[serde(default)]
+    pub args_json: String,
+    #[serde(default)]
+    pub env_from_json: String,
     /// Whole override; Inherit explicitly clears it instead of persisting fallback.
     #[serde(default)]
     pub compaction_model: GatewayModelSelection,
@@ -59,6 +65,7 @@ pub enum CLIRuntimeProviderSettingsRejection {
     ShadowHomeMatchesHome,
     UnsupportedKind { kind: CLIAgentRuntimeKind },
     InvalidCompactionModel { message: String },
+    InvalidLaunchData { message: String },
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -85,6 +92,8 @@ impl CLIRuntimeProviderDraft {
             binary_path: defaults.binary_path.to_owned(),
             home_path: defaults.home_path.to_owned(),
             shadow_home_path: String::new(),
+            args_json: "[]".to_owned(),
+            env_from_json: "{}".to_owned(),
             compaction_model: GatewayModelSelection::Inherit,
         }
     }
@@ -106,6 +115,9 @@ impl CLIRuntimeProviderDraft {
             binary_path: instance.binary_path.clone(),
             home_path: instance.home_path.clone(),
             shadow_home_path: instance.shadow_home_path.clone().unwrap_or_default(),
+            args_json: serde_json::to_string(&instance.args).expect("string argv is serializable"),
+            env_from_json: serde_json::to_string(&instance.env_from)
+                .expect("environment references are serializable"),
             compaction_model: instance.compaction_model.clone().unwrap_or_default(),
         }
     }
@@ -135,6 +147,9 @@ impl CLIRuntimeProviderDraft {
             binary_path: instance.binary_path.clone(),
             home_path: instance.home_path.clone(),
             shadow_home_path: instance.shadow_home_path.clone().unwrap_or_default(),
+            args_json: serde_json::to_string(&instance.args).expect("string argv is serializable"),
+            env_from_json: serde_json::to_string(&instance.env_from)
+                .expect("environment references are serializable"),
             compaction_model: instance.compaction_model.clone().unwrap_or_default(),
         }
     }
@@ -146,6 +161,8 @@ impl CLIRuntimeProviderDraft {
             CLIRuntimeProviderDraftField::BinaryPath => self.binary_path = value,
             CLIRuntimeProviderDraftField::HomePath => self.home_path = value,
             CLIRuntimeProviderDraftField::ShadowHomePath => self.shadow_home_path = value,
+            CLIRuntimeProviderDraftField::Arguments => self.args_json = value,
+            CLIRuntimeProviderDraftField::EnvironmentReferences => self.env_from_json = value,
         }
     }
 }
@@ -238,6 +255,7 @@ pub fn cli_runtime_provider_settings_rejection_message(
             "Shadow home must differ from home".to_owned()
         }
         CLIRuntimeProviderSettingsRejection::InvalidCompactionModel { message } => message.clone(),
+        CLIRuntimeProviderSettingsRejection::InvalidLaunchData { message } => message.clone(),
         CLIRuntimeProviderSettingsRejection::UnsupportedKind { kind } => {
             format!("CLI provider kind cannot be changed from `{kind:?}` while editing")
         }
@@ -306,8 +324,35 @@ fn cli_runtime_provider_instance_from_draft(
         normalize_cli_runtime_provider_display_name(draft.display_name.as_str(), id.as_str())?;
     let binary_path =
         normalize_cli_runtime_provider_required_path("binary_path", draft.binary_path.as_str())?;
-    let home_path =
-        normalize_cli_runtime_provider_required_path("home_path", draft.home_path.as_str())?;
+    let home_path = if draft.kind == CLIAgentRuntimeKind::Acp {
+        if !draft.home_path.is_empty() || !draft.shadow_home_path.is_empty() {
+            return Err(CLIRuntimeProviderSettingsRejection::InvalidLaunchData {
+                message: "ACP instances do not use native agent home paths".to_owned(),
+            });
+        }
+        String::new()
+    } else {
+        normalize_cli_runtime_provider_required_path("home_path", draft.home_path.as_str())?
+    };
+    let args = if draft.args_json.trim().is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str::<Vec<String>>(&draft.args_json).map_err(|_| {
+            CLIRuntimeProviderSettingsRejection::InvalidLaunchData {
+                message: "Arguments must be a JSON array of strings".to_owned(),
+            }
+        })?
+    };
+    let env_from = if draft.env_from_json.trim().is_empty() {
+        Default::default()
+    } else {
+        serde_json::from_str::<std::collections::BTreeMap<String, String>>(&draft.env_from_json)
+            .map_err(|_| CLIRuntimeProviderSettingsRejection::InvalidLaunchData {
+                message:
+                    "Environment references must map child variable names to host variable names"
+                        .to_owned(),
+            })?
+    };
     let shadow_home_path = normalize_cli_runtime_provider_optional_path(
         "shadow_home_path",
         draft.shadow_home_path.as_str(),
@@ -335,6 +380,13 @@ fn cli_runtime_provider_instance_from_draft(
     } = &mut compaction_model
     {
         let expected_transport = match draft.kind {
+            CLIAgentRuntimeKind::Acp => return Err(
+                CLIRuntimeProviderSettingsRejection::InvalidCompactionModel {
+                    message:
+                        "Select an API or native CLI model for Pioneer-managed history compaction"
+                            .to_owned(),
+                },
+            ),
             CLIAgentRuntimeKind::Codex => ModelSelectionTransport::Codex,
             CLIAgentRuntimeKind::Claude => ModelSelectionTransport::Claude,
         };
@@ -365,6 +417,8 @@ fn cli_runtime_provider_instance_from_draft(
         binary_path,
         home_path,
         shadow_home_path,
+        args,
+        env_from,
     })
 }
 
@@ -389,8 +443,34 @@ fn validate_cli_runtime_provider_instances(
         }
 
         normalize_cli_runtime_provider_required_path("binary_path", instance.binary_path.as_str())?;
-        let home_path =
-            normalize_cli_runtime_provider_required_path("home_path", instance.home_path.as_str())?;
+        let home_path = if instance.kind == CLIAgentRuntimeKind::Acp {
+            if !instance.home_path.is_empty() || instance.shadow_home_path.is_some() {
+                return Err(CLIRuntimeProviderSettingsRejection::InvalidLaunchData {
+                    message: "ACP instances do not use native agent home paths".to_owned(),
+                });
+            }
+            String::new()
+        } else {
+            normalize_cli_runtime_provider_required_path("home_path", instance.home_path.as_str())?
+        };
+        if instance.args.iter().any(|argument| argument.contains('\0'))
+            || instance.env_from.iter().any(|(name, source)| {
+                name.is_empty()
+                    || source.is_empty()
+                    || name.contains(['=', '\0'])
+                    || source.contains(['=', '\0'])
+            })
+        {
+            return Err(CLIRuntimeProviderSettingsRejection::InvalidLaunchData {
+                message: "Launch data contains an invalid argument or environment reference"
+                    .to_owned(),
+            });
+        }
+        if instance.kind != CLIAgentRuntimeKind::Acp && !instance.env_from.is_empty() {
+            return Err(CLIRuntimeProviderSettingsRejection::InvalidLaunchData {
+                message: "Environment references are available for ACP launches".to_owned(),
+            });
+        }
         let shadow_home_path = normalize_cli_runtime_provider_optional_path(
             "shadow_home_path",
             instance.shadow_home_path.as_deref().unwrap_or_default(),
@@ -601,11 +681,22 @@ pub fn cli_runtime_provider_default_shadow_home_placeholder(
     cli_runtime_provider_kind_defaults(kind).shadow_home_placeholder
 }
 
-pub const CLI_RUNTIME_PROVIDER_SUPPORTED_KINDS: [CLIAgentRuntimeKind; 2] =
-    [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude];
+pub const CLI_RUNTIME_PROVIDER_SUPPORTED_KINDS: [CLIAgentRuntimeKind; 3] = [
+    CLIAgentRuntimeKind::Codex,
+    CLIAgentRuntimeKind::Claude,
+    CLIAgentRuntimeKind::Acp,
+];
 
 fn cli_runtime_provider_kind_defaults(kind: CLIAgentRuntimeKind) -> CLIRuntimeProviderKindDefaults {
     match kind {
+        CLIAgentRuntimeKind::Acp => CLIRuntimeProviderKindDefaults {
+            id_base: "acp",
+            kind_label: "ACP",
+            display_name: "ACP agent",
+            binary_path: "",
+            home_path: "",
+            shadow_home_placeholder: "",
+        },
         CLIAgentRuntimeKind::Codex => CLIRuntimeProviderKindDefaults {
             id_base: "codex",
             kind_label: "Codex",
@@ -671,6 +762,8 @@ mod tests {
             binary_path: "codex".to_owned(),
             home_path: "~/.codex".to_owned(),
             shadow_home_path: None,
+            args: Vec::new(),
+            env_from: Default::default(),
         }
     }
 
@@ -880,5 +973,38 @@ mod tests {
                 .instances[0]
                 .enabled
         );
+    }
+}
+
+impl crate::core::ClientCore {
+    /// Existing settings authority and store own refresh and stale auth fencing.
+    /// Shells receive editable launch data, never resolved environment values.
+    pub fn cli_runtime_provider_drafts(
+        &self,
+        workspace: &str,
+    ) -> anyhow::Result<Vec<CLIRuntimeProviderDraft>> {
+        anyhow::ensure!(
+            self.capability_management_allowed(workspace),
+            "Provider management unavailable"
+        );
+        let epoch = self.current_auth_ticket();
+        let settings = self.refresh_gateway_settings()?.settings;
+        anyhow::ensure!(
+            self.current_auth_ticket() == epoch && self.capability_management_allowed(workspace),
+            "Provider settings scope changed"
+        );
+        let mut drafts = vec![CLIRuntimeProviderDraft::create_for_kind(
+            Some(&settings),
+            CLIAgentRuntimeKind::Acp,
+        )];
+        drafts.extend(
+            settings
+                .cli_runtimes
+                .instances
+                .iter()
+                .filter(|instance| instance.kind == CLIAgentRuntimeKind::Acp)
+                .map(CLIRuntimeProviderDraft::edit),
+        );
+        Ok(drafts)
     }
 }

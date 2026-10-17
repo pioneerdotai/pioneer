@@ -121,6 +121,22 @@ pub fn extract_permission_intent(invocation: &ToolInvocation) -> PermissionInten
 pub(crate) fn extract_permission_intent_with_preflight(
     invocation: &ToolInvocation,
 ) -> (PermissionIntent, Option<ApplyPatchPreflight>) {
+    if invocation.tool_name == "write_text_file" {
+        // This name has no model-visible handler. Only the typed client
+        // callback adapter constructs its sealed, exact-text manifest.
+        if let Some(ApplyPatchPreflight::Ready(resolved)) = &invocation.apply_patch_preflight
+            && resolved.document().operations.len() == 1
+            && let crate::apply_patch::OperationBody::ExactText { text } =
+                &resolved.document().operations[0].operation.body
+            && matches!(&invocation.payload, ToolPayload::Custom { input } if input == text)
+        {
+            return resolved_patch_permission_intent(base_scope(invocation), resolved.clone());
+        }
+        return (
+            invalid_patch_permission_intent(base_scope(invocation)),
+            None,
+        );
+    }
     if invocation.tool_name == "apply_patch" {
         return apply_patch_intent_with_preflight(invocation);
     }
@@ -1383,6 +1399,13 @@ fn apply_patch_intent_with_preflight(
         }
     };
 
+    resolved_patch_permission_intent(scope, resolved)
+}
+
+fn resolved_patch_permission_intent(
+    mut scope: PermissionRequestScope,
+    resolved: crate::apply_patch::ResolvedPatch,
+) -> (PermissionIntent, Option<ApplyPatchPreflight>) {
     let mut resolved_paths = resolved
         .target_manifest()
         .targets()
@@ -1469,6 +1492,91 @@ fn apply_patch_intent_with_preflight(
         },
         Some(ApplyPatchPreflight::Ready(resolved)),
     )
+}
+
+/// Prepare an exact full-text write using the existing policy/permission
+/// manifest and mutation engine. The trusted callback adapter must evaluate
+/// the returned intent through its ordinary approval broker before dispatch.
+/// No source contents are read and no mutation occurs during this preflight.
+pub fn prepare_full_text_write(
+    invocation: &mut ToolInvocation,
+    path: &Path,
+    content: String,
+) -> Result<PermissionIntent, crate::ToolError> {
+    use crate::apply_patch::file_mutation::{TargetExpectation, TargetKind};
+    use crate::apply_patch::{Operation, OperationBody, ValidatedOperation};
+    if invocation.tool_name != "write_text_file" {
+        return Err(crate::ToolError::invalid_arguments(
+            "typed text write requires the client callback invocation kind",
+        ));
+    }
+    if invocation.execution_security_snapshot.is_none() {
+        return Err(crate::ToolError::Rejected(
+            "full-text write requires an execution security snapshot".to_owned(),
+        ));
+    }
+    if !path.is_absolute() || content.len() as u64 > PatchLimits::default().max_patch_bytes {
+        return Err(crate::ToolError::invalid_arguments(
+            "full-text write requires an absolute path and content within the write budget",
+        ));
+    }
+    let path = path
+        .to_str()
+        .ok_or_else(|| crate::ToolError::invalid_arguments("write path must be UTF-8"))?;
+    let document = ValidatedPatchDocument {
+        schema_version: 1,
+        input_bytes: content.len() as u64,
+        payload_hash: Sha256::digest(content.as_bytes()).into(),
+        operations: vec![ValidatedOperation {
+            operation: Operation {
+                kind: OperationKind::Add,
+                path: path.to_owned(),
+                source_guard: None,
+                destination_guard: None,
+                source_guard_line: None,
+                destination_guard_line: None,
+                move_to: None,
+                body: OperationBody::ExactText {
+                    text: content.clone(),
+                },
+                header_line: 1,
+            },
+            source_guard: None,
+            destination_guard: None,
+        }],
+    };
+    let (mut document, root) = authorize_and_normalize_patch_paths(invocation, document)
+        .map_err(|error| crate::ToolError::Rejected(error.to_string()))?;
+    let resolver = TargetResolver::new(root)
+        .map_err(|error| crate::ToolError::Rejected(error.to_string()))?
+        .with_absolute_paths(true);
+    let target = resolver
+        .resolve(
+            &document.operations[0].operation.path,
+            TargetRole::Destination,
+            TargetExpectation::ExistingOrMissing,
+        )
+        .map_err(|error| crate::ToolError::Rejected(error.to_string()))?;
+    document.operations[0].operation.kind = match target
+        .inspect_kind()
+        .map_err(|error| crate::ToolError::Rejected(error.to_string()))?
+    {
+        TargetKind::Missing => OperationKind::Add,
+        TargetKind::RegularFile => OperationKind::Replace,
+        _ => {
+            return Err(crate::ToolError::Rejected(
+                "full-text write target must be a regular file or absent".to_owned(),
+            ));
+        }
+    };
+    let resolved = resolve_patch(&document, &resolver, PrepareOptions::default())
+        .map_err(|error| crate::ToolError::Rejected(error.to_string()))?;
+    let (mut intent, preflight) =
+        resolved_patch_permission_intent(base_scope(invocation), resolved);
+    intent.summary = Some(format!("write text file `{path}`"));
+    invocation.payload = ToolPayload::Custom { input: content };
+    invocation.apply_patch_preflight = preflight;
+    Ok(intent)
 }
 
 fn authorize_patch_paths_with_maximum_consent_authority(
