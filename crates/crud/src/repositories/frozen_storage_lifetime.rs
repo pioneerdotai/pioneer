@@ -19,7 +19,10 @@ use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryOrder,
     QuerySelect, QueryTrait, Statement, TransactionTrait,
 };
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    time::{Duration, Instant},
+};
 
 const FRAGMENT_BYTES: i64 = 64 * 1024;
 const META_ROWS: u64 = 64;
@@ -37,6 +40,9 @@ pub struct FrozenStorageLifetimeProgress {
     pass_done: [bool; 6],
     // Reconciliation/sealing can release holds discovered earlier this pass.
     pass_changed: bool,
+    // Periodic admission for already completed cleanup, independent of active
+    // continuations and of the worker's separate conversion discovery EOF.
+    cleanup_revisit_at: Option<Instant>,
     locator_done: [bool; 4],
     physical_done: [bool; 2],
     scope: ScopeDiscovery,
@@ -1667,9 +1673,18 @@ impl FrozenStorageLifetimeProgress {
         Ok(true)
     }
     /// Start another discovery epoch for completed cleanup families between
-    /// worker batches. An unfinished proof graph must not delay newly free data.
+    /// worker batches, admitted by the worker's periodic idle interval. An
+    /// unfinished proof graph alone is not a reason to reopen discovery.
     /// Active container continuations and paged preparations are preserved.
-    pub fn revisit_completed_cleanup(&mut self) {
+    /// The worker supplies its existing idle interval and monotonic batch time.
+    pub fn revisit_completed_cleanup(&mut self, now: Instant, interval: Duration) {
+        let due = self.cleanup_revisit_at.is_some_and(|at| now >= at);
+        if self.cleanup_revisit_at.is_none() || due {
+            self.cleanup_revisit_at = Some(now + interval);
+        }
+        if !due {
+            return;
+        }
         // Once proof discovery reaches EOF, let every family finish together
         // so a quiet database still reaches the existing idle/backoff state.
         if self.pass_done[1] {
@@ -2158,6 +2173,14 @@ impl FrozenStorageLifetimeProgress {
         let status: String = row.try_get("", "status")?;
         let generation: Option<i64> = row.try_get("", "generation")?;
         let state: String = row.try_get("", "state")?;
+        // One exact-key metadata read, after LIMIT has selected this candidate.
+        // A failed read acknowledges nothing; a successful refusal advances the
+        // keyset without allocating a reverse traversal or decoding runner JSON.
+        let admitted = discard_preflight(store, &id).await?;
+        if !admitted {
+            self.discard_after = id;
+            return Ok(true);
+        }
         let scope = compaction::checkpoint_row(&store.connection, &id).await?;
         self.discard_after = id.clone();
         ensure!(
@@ -2174,6 +2197,27 @@ impl FrozenStorageLifetimeProgress {
         });
         Ok(true)
     }
+}
+
+// Advisory only: mutable facts are all rechecked by cleanup's serialized writer.
+// Use the same broad incoming-edge predicates as its final guard, including
+// unknown foreign scope/version combinations that must conservatively retain.
+async fn discard_preflight(store: &CrudStore, id: &str) -> Result<bool> {
+    let row = store
+        .connection
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT 1 AS admitted FROM compaction_checkpoint c WHERE c.id=?1 \
+             AND NOT EXISTS(SELECT 1 FROM compaction_checkpoint WHERE previous=?1) \
+             AND NOT EXISTS(SELECT 1 FROM compaction_coverage WHERE source_id=?1 AND source_scope LIKE 'checkpoint:%') \
+             AND (c.proof_version=1 \
+             OR EXISTS(SELECT 1 FROM compaction_checkpoint_import WHERE checkpoint_id=?1) \
+             OR EXISTS(SELECT 1 FROM compaction_checkpoint_replay_alias WHERE checkpoint_id=?1) \
+             OR EXISTS(SELECT 1 FROM compaction_checkpoint_event_input WHERE checkpoint_id=?1)) LIMIT 1",
+            [id.into()],
+        ))
+        .await?;
+    Ok(row.is_some())
 }
 
 struct DiscardPreparation {
@@ -4527,41 +4571,303 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn published_dependency_added_after_discard_discovery_preserves_proofs() {
+    async fn discard_preflight_skips_incoming_and_empty_keys_and_retries_db_errors() {
         let (store, _) = fixture(false).await;
+        let store = store.with_maintenance_access();
         checkpoint_proofs::prepare_graph(&store, "cp-1")
             .await
             .unwrap();
-        let mut expiry = prepared_expiry(&store).await;
-        expiry
+        prepared_expiry(&store)
+            .await
             .step(&store, &mut SweepAccounting::default())
             .await
             .unwrap();
-        let mut discard = DiscardPreparation {
-            id: "cp-1".into(),
-            manifest: "origin".into(),
-            status: "failed".into(),
-            generation: Some(0),
-            reverse: Reachability::new("cp-1", "ws"),
-        };
-        while !discard.reverse.done() {
-            discard.reverse.step(&store).await.unwrap();
+        store.connection.execute_unprepared("INSERT INTO compaction_checkpoint(id,operation_id,owner,previous,portion,summary,identity_sha256,selection,projection_version,format_version,status) SELECT 'cp-05-empty',operation_id,owner,NULL,2,summary,identity_sha256,selection,projection_version,format_version,'candidate' FROM compaction_checkpoint WHERE id='cp-0'").await.unwrap();
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        progress.scope.done = true;
+        progress.phase = 4;
+        store
+            .connection
+            .execute_unprepared(
+                "ALTER TABLE compaction_checkpoint_import RENAME TO unavailable_import",
+            )
+            .await
+            .unwrap();
+        let error = progress.quantum(&store).await.unwrap_err();
+        assert!(error.downcast_ref::<sea_orm::DbErr>().is_some());
+        assert!(progress.discard_after.is_empty());
+        assert!(progress.discard.is_none() && !progress.pass_done[4]);
+        store
+            .connection
+            .execute_unprepared(
+                "ALTER TABLE unavailable_import RENAME TO compaction_checkpoint_import",
+            )
+            .await
+            .unwrap();
+
+        for id in ["cp-0", "cp-05-empty"] {
+            assert!(progress.discard_quantum(&store).await.unwrap());
+            assert_eq!(progress.discard_after, id);
+            assert!(
+                progress.discard.is_none(),
+                "refusal must not start reverse traversal"
+            );
         }
-        // A newly saved incoming edge is enough; no publication/state guess.
-        store.connection.execute_unprepared("INSERT INTO compaction_checkpoint(id,operation_id,owner,previous,portion,summary,identity_sha256,selection,projection_version,format_version,status) SELECT 'incoming',operation_id,owner,id,2,summary,identity_sha256,selection,projection_version,format_version,'candidate' FROM compaction_checkpoint WHERE id='cp-1'").await.unwrap();
-        discard.cleanup(&store).await.unwrap();
-        assert_eq!(
-            compaction::checkpoint_topology(&store.connection, "cp-1")
-                .await
-                .unwrap()
-                .unwrap()
-                .row
-                .proof_version,
-            1
+        assert!(discard_preflight(&store, "cp-1").await.unwrap());
+        // Even an unknown foreign owner/version uses the final guard's broad
+        // retention predicate; preflight must not reinterpret it as safe.
+        store.connection.execute_unprepared("INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES('cp-05-empty','checkpoint:unknown','cp-1','unknown')").await.unwrap();
+        assert!(!discard_preflight(&store, "cp-1").await.unwrap());
+        store
+            .connection
+            .execute_unprepared("DELETE FROM compaction_coverage WHERE checkpoint_id='cp-05-empty'")
+            .await
+            .unwrap();
+        assert!(progress.discard_quantum(&store).await.unwrap());
+        assert_eq!(progress.discard.as_ref().unwrap().id, "cp-1");
+        for _ in 0..64 {
+            if progress.discard.is_none() {
+                break;
+            }
+            progress.discard_quantum(&store).await.unwrap();
+        }
+        assert!(progress.discard.is_none());
+        assert!(
+            !discard_preflight(&store, "cp-1").await.unwrap(),
+            "demoted empty key has no work"
         );
         assert_eq!(
             value(&store, "compaction_checkpoint_event_input", "cp-1").await,
+            0
+        );
+
+        let mut restart = FrozenStorageLifetimeProgress::default();
+        for id in ["cp-0", "cp-05-empty", "cp-1"] {
+            assert!(restart.discard_quantum(&store).await.unwrap());
+            assert_eq!(restart.discard_after, id);
+            assert!(restart.discard.is_none());
+        }
+        assert!(!restart.discard_quantum(&store).await.unwrap());
+        assert!(restart.discard_after.is_empty());
+    }
+
+    #[tokio::test]
+    async fn periodic_cleanup_revisit_sees_released_reader_before_proof_eof() {
+        let (store, descriptor) = fixture(false).await;
+        checkpoint_proofs::prepare_graph(&store, "cp-1")
+            .await
+            .unwrap();
+        let hold = store
+            .compaction_acquire_frozen_history("ws", &descriptor)
+            .await
+            .unwrap();
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        progress.scope.done = true;
+        progress.pass_done = [true, false, false, true, true, true];
+        progress.proof = Some(checkpoint_proofs::GraphPreparation::new("cp-1"));
+        progress.expiry = Some(prepared_expiry(&store).await);
+        progress.expiry_after = "origin".into();
+        let now = Instant::now();
+        let interval = Duration::from_secs(60);
+        progress.revisit_completed_cleanup(now, interval);
+        progress.phase = 2;
+        assert!(progress.quantum(&store).await.unwrap());
+        assert!(progress.expiry.is_none());
+        progress.phase = 2;
+        assert!(progress.quantum(&store).await.unwrap());
+        assert!(progress.pass_done[2], "held expiry visit reached real EOF");
+        assert_eq!(
+            history::Entity::find_by_id("origin")
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap()
+                .expired,
+            0
+        );
+
+        drop(hold);
+        progress.revisit_completed_cleanup(now + interval - Duration::from_secs(1), interval);
+        assert!(progress.pass_done[2]);
+        progress.revisit_completed_cleanup(now + interval, interval);
+        assert!(!progress.pass_done[2] && !progress.pass_done[1]);
+        progress.phase = 2;
+        assert!(progress.quantum(&store).await.unwrap());
+        assert!(
+            progress.expiry.is_some(),
+            "periodic revisit rediscovers released origin"
+        );
+        for _ in 0..500 {
+            if progress.expiry.is_none() {
+                break;
+            }
+            progress.expiry_quantum(&store).await.unwrap();
+        }
+        assert!(progress.expiry.is_none());
+        assert_eq!(
+            history::Entity::find_by_id("origin")
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap()
+                .expired,
             1
         );
+        assert!(progress.proof.is_some() && !progress.pass_done[1]);
+    }
+
+    #[tokio::test]
+    async fn cleanup_revisit_keeps_active_preparations_frontiers_and_pass_confirmation() {
+        let (store, _) = fixture(false).await;
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        progress.scope.done = true;
+        progress.pass_done = [true, false, true, false, true, true];
+        progress.proof = Some(checkpoint_proofs::GraphPreparation::new("cp-1"));
+        progress.proof_pending.push_back("queued-proof".into());
+        progress.proof_after = "proof-frontier".into();
+        progress.physical_after = [
+            Some("message-frontier".into()),
+            Some("import-frontier".into()),
+        ];
+        progress.physical_until = [Some("message-end".into()), Some("import-end".into())];
+        progress.physical_started = [true; 2];
+        progress.physical_done = [true, false];
+        progress.sweep = Some(SweepPreparation::new("active".into(), 0, 42));
+        progress
+            .sweep_pending
+            .push_back(SweepPreparation::new("queued".into(), 1, 24));
+        let now = Instant::now();
+        let interval = Duration::from_secs(60);
+        // Repeated unchanged worker batches do not reopen completed families,
+        // even while a real proof preparation and queue remain unfinished.
+        for seconds in 0..60 {
+            progress.revisit_completed_cleanup(now + Duration::from_secs(seconds), interval);
+            assert_eq!(progress.pass_done, [true, false, true, false, true, true]);
+        }
+        progress.revisit_completed_cleanup(now + interval, interval);
+        assert_eq!(progress.pass_done, [true, false, false, false, false, true]);
+        assert!(progress.proof.is_some());
+        assert_eq!(progress.proof_after, "proof-frontier");
+        assert_eq!(progress.proof_pending.front().unwrap(), "queued-proof");
+        assert_eq!(
+            progress.physical_after[0].as_deref(),
+            Some("message-frontier")
+        );
+        assert_eq!(progress.physical_until[1].as_deref(), Some("import-end"));
+        assert_eq!(progress.physical_started, [true; 2]);
+        assert_eq!(progress.physical_done, [true, false]);
+        assert_eq!(progress.sweep.as_ref().unwrap().until, 42);
+        assert_eq!(progress.sweep_pending.front().unwrap().manifest, "queued");
+
+        // A finished physical family starts a new finite keyset only when it
+        // has no active containers. Other families' continuations survive.
+        progress.sweep = None;
+        progress.sweep_pending.clear();
+        progress.pass_done[3] = true;
+        progress.revisit_completed_cleanup(now + interval * 2, interval);
+        assert_eq!(progress.physical_after, [None, None]);
+        assert_eq!(progress.physical_until, [None, None]);
+        assert_eq!(progress.physical_started, [false; 2]);
+        assert_eq!(progress.physical_done, [false; 2]);
+
+        progress.proof = None;
+        progress.proof_pending.clear();
+        progress.pass_done = [true, true, true, true, true, false];
+        progress.pass_changed = true;
+        progress.revisit_completed_cleanup(now + interval * 3, interval);
+        assert_eq!(progress.pass_done, [true, true, true, true, true, false]);
+        assert!(
+            progress.quantum(&store).await.unwrap(),
+            "real change requests confirmation pass"
+        );
+        progress.pass_done = [true, true, true, true, true, false];
+        assert!(
+            !progress.quantum(&store).await.unwrap(),
+            "unchanged complete pass reaches idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn discard_preflight_does_not_authorize_later_incoming_hold_generation_or_status_change()
+    {
+        for change in ["previous", "foreign", "reader", "generation", "status"] {
+            let (store, _) = fixture(false).await;
+            checkpoint_proofs::prepare_graph(&store, "cp-1")
+                .await
+                .unwrap();
+            prepared_expiry(&store)
+                .await
+                .step(&store, &mut SweepAccounting::default())
+                .await
+                .unwrap();
+            let mut progress = FrozenStorageLifetimeProgress::default();
+            // cp-0's incoming-edge refusal is covered in the keyset test.
+            progress.discard_after = "cp-0".into();
+            progress.discard_quantum(&store).await.unwrap();
+            let mut discard = progress.discard.take().expect("preflight admitted cp-1");
+            assert_eq!(discard.id, "cp-1");
+            while !discard.reverse.done() {
+                discard.reverse.step(&store).await.unwrap();
+            }
+            let mut hold = None;
+            match change {
+                "previous" => {
+                    store.connection.execute_unprepared("INSERT INTO compaction_checkpoint(id,operation_id,owner,previous,portion,summary,identity_sha256,selection,projection_version,format_version,status) SELECT 'incoming',operation_id,owner,id,2,summary,identity_sha256,selection,projection_version,format_version,'candidate' FROM compaction_checkpoint WHERE id='cp-1'").await.unwrap();
+                }
+                "foreign" => {
+                    store.connection.execute_unprepared("INSERT INTO compaction_checkpoint(id,operation_id,owner,previous,portion,summary,identity_sha256,selection,projection_version,format_version,status) SELECT 'incoming',operation_id,owner,NULL,2,summary,identity_sha256,selection,projection_version,format_version,'candidate' FROM compaction_checkpoint WHERE id='cp-1'").await.unwrap();
+                    store.connection.execute_unprepared("INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES('incoming','checkpoint:unknown','cp-1','unknown')").await.unwrap();
+                }
+                "reader" => {
+                    // Exercise the last writer hold fence directly: normal
+                    // public acquire already refuses an expired manifest.
+                    hold = Some(crate::FrozenReadHold::register(
+                        &store.frozen_readers,
+                        "origin",
+                    ));
+                }
+                "generation" => {
+                    let row = runner::Entity::find_by_id("op")
+                        .one(&store.connection)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let mut state: RunnerState = serde_json::from_str(&row.state).unwrap();
+                    state.generation += 1;
+                    store.connection.execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        "UPDATE compaction_runner_state SET generation=generation+1,state=?1 WHERE operation_id='op'",
+                        [serde_json::to_string(&state).unwrap().into()],
+                    )).await.unwrap();
+                }
+                "status" => {
+                    store
+                        .connection
+                        .execute_unprepared(
+                            "UPDATE compaction_operation SET status='cancelled' WHERE id='op'",
+                        )
+                        .await
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            discard.cleanup(&store).await.unwrap();
+            assert_eq!(
+                compaction::checkpoint_topology(&store.connection, "cp-1")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .row
+                    .proof_version,
+                1,
+                "{change}"
+            );
+            assert_eq!(
+                value(&store, "compaction_checkpoint_event_input", "cp-1").await,
+                1,
+                "{change}"
+            );
+            drop(hold);
+        }
     }
 }

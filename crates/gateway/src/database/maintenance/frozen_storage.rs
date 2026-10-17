@@ -15,25 +15,46 @@ const BATCH_STEPS: usize = 64;
 const BATCH_CONVERSION_STEPS: usize = 1;
 const BATCH_TIME: Duration = Duration::from_millis(50);
 const BATCH_PAUSE: Duration = Duration::from_millis(1);
+const IDLE_INTERVAL: Duration = Duration::from_secs(60);
+
+// Owned by this worker, like the bounded preparations. Only a successful false
+// result records EOF; budgets, scope steps, errors and cancellation do not.
+#[derive(Default)]
+struct DiscoveryAdmission {
+    next_probe: [Option<Instant>; 2],
+}
+impl DiscoveryAdmission {
+    fn ready(&self, path: usize, now: Instant) -> bool {
+        self.next_probe[path].is_none_or(|at| now >= at)
+    }
+
+    fn completed(&mut self, path: usize, more: bool, now: Instant) {
+        self.next_probe[path] = if more {
+            None
+        } else {
+            Some(now + IDLE_INTERVAL)
+        };
+    }
+}
 
 pub(crate) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) {
     let store = store.with_maintenance_access();
     let mut progress = FrozenStorageLifetimeProgress::default();
     let mut lifetime = false;
-    let mut idle = [false; 2];
+    let mut admission = DiscoveryAdmission::default();
     loop {
         let outcome = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return,
-            outcome = batch(&store, &mut progress, &mut lifetime, &mut idle, BATCH_STEPS, BATCH_TIME) => outcome,
+            outcome = batch(&store, &mut progress, &mut lifetime, &mut admission, BATCH_STEPS, BATCH_TIME) => outcome,
         };
         let pause = match outcome {
-            Ok(more) => pause_after_batch(more),
+            Ok(more) => pause_after_batch(more, &admission, Instant::now()),
             Err(_) => {
                 tracing::warn!(
                     "frozen storage maintenance quantum failed; original history preserved"
                 );
-                Duration::from_secs(60)
+                IDLE_INTERVAL
             }
         };
         tokio::select! {
@@ -47,18 +68,20 @@ async fn batch(
     store: &CrudStore,
     progress: &mut FrozenStorageLifetimeProgress,
     lifetime: &mut bool,
-    idle: &mut [bool; 2],
+    admission: &mut DiscoveryAdmission,
     step_limit: usize,
     time_limit: Duration,
 ) -> anyhow::Result<bool> {
-    progress.revisit_completed_cleanup();
     let started = Instant::now();
-    // Poll an empty path at most once per batch, but reconsider it in the next
-    // batch: new conversion work must not wait for a long proof traversal's EOF.
-    let mut finished = [false; 2];
+    progress.revisit_completed_cleanup(started, IDLE_INTERVAL);
+    // A per-batch conversion budget is distinct from actual discovery EOF.
+    // Completed paths remain latched across batches while the other advances.
+    let mut finished = [!admission.ready(0, started), !admission.ready(1, started)];
     let mut steps = 0;
     let mut conversion_steps = 0;
-    while can_start_step(steps, started.elapsed(), step_limit, time_limit) {
+    while !finished.iter().all(|done| *done)
+        && can_start_step(steps, started.elapsed(), step_limit, time_limit)
+    {
         let mut path = usize::from(*lifetime);
         if finished[path] {
             path = 1 - path;
@@ -72,13 +95,7 @@ async fn batch(
         };
         steps += 1;
         finished[path] = !more;
-        idle[path] = !more;
-        // EOF is meaningful only after both discovery paths finish. A changed
-        // lifetime pass returns true and confirms EOF again before this wait.
-        if idle.iter().all(|done| *done) {
-            *idle = [false; 2];
-            return Ok(false);
-        }
+        admission.completed(path, more, Instant::now());
         if conversion_steps == BATCH_CONVERSION_STEPS {
             finished[0] = true;
         }
@@ -89,7 +106,8 @@ async fn batch(
         // cancellation and other tasks a cooperative scheduling point.
         tokio::task::yield_now().await;
     }
-    Ok(true)
+    let now = Instant::now();
+    Ok(admission.ready(0, now) || admission.ready(1, now))
 }
 
 fn can_start_step(
@@ -101,11 +119,18 @@ fn can_start_step(
     steps < step_limit && (steps == 0 || elapsed < time_limit)
 }
 
-fn pause_after_batch(more: bool) -> Duration {
+fn pause_after_batch(more: bool, admission: &DiscoveryAdmission, now: Instant) -> Duration {
     if more {
         BATCH_PAUSE
     } else {
-        Duration::from_secs(60)
+        // Lifetime may finish partway through conversion's cooldown (or vice
+        // versa). Wake for the earliest probe, without adding another minute.
+        admission
+            .next_probe
+            .iter()
+            .flatten()
+            .min()
+            .map_or(BATCH_PAUSE, |at| at.saturating_duration_since(now))
     }
 }
 
@@ -174,6 +199,10 @@ mod tests {
     // Real separate read-only reader and FK OFF serialized writer. Seed through
     // existing domain APIs; installed guards remain on during every action.
     async fn fixture() -> (tempfile::TempDir, CrudStore, Arc<Observer>) {
+        fixture_with_metadata(512).await
+    }
+
+    async fn fixture_with_metadata(count: usize) -> (tempfile::TempDir, CrudStore, Arc<Observer>) {
         use sha2::{Digest, Sha256};
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("frozen-batch.sqlite");
@@ -201,7 +230,7 @@ mod tests {
             .unwrap();
         writer.execute_unprepared("INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
         let seed = CrudStore::new(writer.clone());
-        for index in 0..512 {
+        for index in 0..count {
             seed.compaction_begin_frozen_history(
                 "ws",
                 "thread",
@@ -262,18 +291,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_metadata_batches_are_bounded_continue_and_reset_idle_without_empty_sleeps() {
+    async fn real_metadata_batches_are_bounded_continue_and_revisit_idle_without_empty_sleeps() {
         let (_directory, store, observer) = fixture().await;
         let mut progress = FrozenStorageLifetimeProgress::default();
         let mut lifetime = false;
-        let mut idle = [false; 2];
+        let mut admission = DiscoveryAdmission::default();
         let before = observer.operations();
         assert!(
             batch(
                 &store,
                 &mut progress,
                 &mut lifetime,
-                &mut idle,
+                &mut admission,
                 BATCH_STEPS,
                 Duration::ZERO
             )
@@ -291,7 +320,7 @@ mod tests {
                 &store,
                 &mut progress,
                 &mut lifetime,
-                &mut idle,
+                &mut admission,
                 BATCH_STEPS,
                 Duration::from_secs(60)
             )
@@ -309,7 +338,7 @@ mod tests {
                 &store,
                 &mut progress,
                 &mut lifetime,
-                &mut idle,
+                &mut admission,
                 BATCH_STEPS,
                 Duration::from_secs(60),
             )
@@ -321,14 +350,17 @@ mod tests {
             }
         }
         assert!(eof);
-        assert_eq!(idle, [false; 2]);
-        assert_eq!(pause_after_batch(false), Duration::from_secs(60));
+        assert!(admission.next_probe.iter().all(Option::is_some));
+        let pause = pause_after_batch(false, &admission, Instant::now());
+        assert!(pause > Duration::ZERO && pause <= IDLE_INTERVAL);
+        // Advance only admission time; no real minute-long wait in this fixture.
+        admission.next_probe = [Some(Instant::now()); 2];
         assert!(
             batch(
                 &store,
                 &mut progress,
                 &mut lifetime,
-                &mut idle,
+                &mut admission,
                 1,
                 BATCH_TIME
             )
@@ -379,7 +411,7 @@ mod tests {
                 &worker_store,
                 &mut progress,
                 &mut false,
-                &mut [false; 2],
+                &mut DiscoveryAdmission::default(),
                 BATCH_STEPS,
                 BATCH_TIME,
             )
@@ -404,7 +436,10 @@ mod tests {
             2,
             "only current scope step completes after wait"
         );
-        assert_eq!(pause_after_batch(true), BATCH_PAUSE);
+        assert_eq!(
+            pause_after_batch(true, &DiscoveryAdmission::default(), Instant::now()),
+            BATCH_PAUSE
+        );
 
         let held = store.database_connection().begin_read().await.unwrap();
         let cancellation = CancellationToken::new();
@@ -462,9 +497,403 @@ mod tests {
         assert!(!admits(1, BATCH_TIME));
         assert!(!admits(1, Duration::from_secs(30)));
         // A DB queue wait ends this batch, but cannot multiply the next pause.
-        assert_eq!(pause_after_batch(true), Duration::from_millis(1));
-        assert_eq!(pause_after_batch(false), Duration::from_secs(60));
+        assert_eq!(
+            pause_after_batch(true, &DiscoveryAdmission::default(), Instant::now()),
+            Duration::from_millis(1)
+        );
+        let now = Instant::now();
+        for first in 0..2 {
+            let mut admission = DiscoveryAdmission::default();
+            admission.completed(first, false, now);
+            admission.completed(1 - first, false, now + Duration::from_secs(40));
+            assert_eq!(
+                pause_after_batch(false, &admission, now + Duration::from_secs(40)),
+                Duration::from_secs(20)
+            );
+            assert_eq!(
+                pause_after_batch(false, &admission, now + IDLE_INTERVAL),
+                Duration::ZERO
+            );
+            assert!(admission.ready(first, now + IDLE_INTERVAL));
+            assert!(!admission.ready(1 - first, now + IDLE_INTERVAL));
+        }
     }
+    #[tokio::test]
+    async fn conversion_eof_survives_batches_and_due_probe_discovers_new_work() {
+        use pioneer_entity::{
+            compaction_frozen_history as history, compaction_frozen_layout as layout,
+        };
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        use sha2::{Digest, Sha256};
+
+        for finish_lifetime in [false, true] {
+            let (_directory, store, observer) = fixture_with_metadata(0).await;
+            let mut progress = FrozenStorageLifetimeProgress::default();
+            let mut lifetime = false;
+            let mut admission = DiscoveryAdmission::default();
+            admission.next_probe[1] = Some(Instant::now() + Duration::from_secs(3600));
+            let mut useful = 0;
+            for _ in 0..128 {
+                let more = batch(
+                    &store,
+                    &mut progress,
+                    &mut lifetime,
+                    &mut admission,
+                    1,
+                    BATCH_TIME,
+                )
+                .await
+                .unwrap();
+                if admission.next_probe[0].is_some() {
+                    assert!(!more);
+                    break;
+                }
+                useful += 1;
+                assert!(
+                    more,
+                    "scope and active conversion continue in the next batch"
+                );
+            }
+            assert!(
+                useful > 4,
+                "scope and staged layout validation took bounded steps"
+            );
+            let eof = admission.next_probe[0].expect("actual conversion EOF");
+            assert_eq!(
+                history::Entity::find_by_id("live")
+                    .one(&store.database_connection())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .storage_registered,
+                1
+            );
+            let layouts = layout::Entity::find()
+                .filter(layout::Column::ManifestId.eq("live"))
+                .all(&store.database_connection())
+                .await
+                .unwrap();
+            assert_eq!(layouts.len(), 2);
+            assert!(
+                layouts
+                    .iter()
+                    .all(|row| row.active == 1 && row.pending == 0 && row.failed == 0)
+            );
+
+            admission.next_probe[1] = None;
+            // Initial locator and proof discovery each issue one metadata read.
+            // Repeating the three conversion discovery reads would change the count.
+            for _ in 0..2 {
+                let before = observer.operations();
+                assert!(
+                    batch(
+                        &store,
+                        &mut progress,
+                        &mut lifetime,
+                        &mut admission,
+                        1,
+                        BATCH_TIME
+                    )
+                    .await
+                    .unwrap()
+                );
+                assert_eq!(observer.operations() - before, 1);
+                assert_eq!(admission.next_probe[0], Some(eof));
+            }
+            if finish_lifetime {
+                let mut idle = false;
+                for _ in 0..32 {
+                    if !batch(
+                        &store,
+                        &mut progress,
+                        &mut lifetime,
+                        &mut admission,
+                        BATCH_STEPS,
+                        BATCH_TIME,
+                    )
+                    .await
+                    .unwrap()
+                    {
+                        idle = true;
+                        break;
+                    }
+                }
+                assert!(
+                    idle,
+                    "lifetime reaches its real EOF during conversion cooldown"
+                );
+                assert_eq!(admission.next_probe[0], Some(eof));
+                assert!(admission.next_probe[1].is_some());
+            }
+
+            let new = FrozenHistoryRef {
+                format: 1,
+                manifest_id: "new-work".into(),
+                messages: 0,
+                identity_sha256: hex::encode(Sha256::digest([])),
+            };
+            store
+                .compaction_begin_frozen_history("ws", "thread", &new)
+                .await
+                .unwrap();
+            drop(
+                store
+                    .compaction_finish_frozen_history_held("ws", "thread", &new)
+                    .await
+                    .unwrap(),
+            );
+            if finish_lifetime {
+                let before = observer.operations();
+                for _ in 0..3 {
+                    assert!(
+                        !batch(
+                            &store,
+                            &mut progress,
+                            &mut lifetime,
+                            &mut admission,
+                            BATCH_STEPS,
+                            BATCH_TIME
+                        )
+                        .await
+                        .unwrap()
+                    );
+                }
+                assert_eq!(
+                    observer.operations(),
+                    before,
+                    "cooldown performs no SQL or RAM quantum"
+                );
+                assert!(pause_after_batch(false, &admission, Instant::now()) > Duration::ZERO);
+            } else {
+                assert!(
+                    admission.next_probe[1].is_none(),
+                    "lifetime is still admitted"
+                );
+            }
+            assert_eq!(
+                history::Entity::find_by_id("new-work")
+                    .one(&store.database_connection())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .storage_registered,
+                0
+            );
+
+            admission.next_probe[0] = Some(Instant::now());
+            assert!(
+                batch(
+                    &store,
+                    &mut progress,
+                    &mut lifetime,
+                    &mut admission,
+                    1,
+                    BATCH_TIME
+                )
+                .await
+                .unwrap()
+            );
+            assert!(admission.next_probe[0].is_none());
+            assert_eq!(
+                history::Entity::find_by_id("new-work")
+                    .one(&store.database_connection())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .storage_registered,
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discard_preflight_uses_maintenance_reader_without_writer_admission() {
+        use pioneer_compaction::{
+            ModelSelection, Transport,
+            runner::{FailureKind, RunnerPhase, RunnerState},
+        };
+        use sha2::{Digest, Sha256};
+
+        let (_directory, store, observer) = fixture_with_metadata(0).await;
+        let origin = FrozenHistoryRef {
+            format: 1,
+            manifest_id: "discard-origin".into(),
+            messages: 0,
+            identity_sha256: hex::encode(Sha256::digest([])),
+        };
+        store
+            .compaction_begin_frozen_history("ws", "thread", &origin)
+            .await
+            .unwrap();
+        drop(
+            store
+                .compaction_finish_frozen_history_held("ws", "thread", &origin)
+                .await
+                .unwrap(),
+        );
+        // Bind the projection while the ready input is available; expire it
+        // only after that guarded insert, before maintenance starts.
+        for sql in [
+            "INSERT INTO compaction_context(owner,workspace_id,thread_id,format_version) VALUES('discard-owner','ws','thread',1)",
+            "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms,next_portion) VALUES('discard-op','discard-owner','discard-op','failed','{}',1000,0)",
+            "INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) SELECT 'discard-op',id,identity_sha256,imports_sha256,import_count FROM compaction_frozen_history WHERE id='discard-origin'",
+            "UPDATE compaction_frozen_history SET expired=1 WHERE id='discard-origin'",
+        ] {
+            store
+                .database_connection()
+                .execute_unprepared(sql)
+                .await
+                .unwrap();
+        }
+        let state = RunnerState {
+            generation: 0,
+            deadline_ms: 1000,
+            attempts: 0,
+            retries: 0,
+            portion_attempts: 0,
+            corrections: 0,
+            target_tokens: 10,
+            source_text_projection_version: 0,
+            cursor: Default::default(),
+            previous_checkpoint: None,
+            phase: RunnerPhase::Failed {
+                kind: FailureKind::Deadline,
+            },
+            resume_phase: None,
+            observation: None,
+            diagnostic: None,
+        };
+        store.database_connection().execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO compaction_runner_state(operation_id,generation,state) VALUES('discard-op',0,?1)",
+            [serde_json::to_string(&state).unwrap().into()],
+        )).await.unwrap();
+        let selection = ModelSelection {
+            transport: Transport::Api,
+            instance: "p".into(),
+            model: "m".into(),
+            effort: None,
+        };
+        store.database_connection().execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES('discard-key','discard-op','discard-owner',0,'s','identity',?1,1,1,'candidate')",
+            [serde_json::to_string(&selection).unwrap().into()],
+        )).await.unwrap();
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        let mut eof = false;
+        for _ in 0..128 {
+            if !store
+                .compact_frozen_storage_quantum(&mut progress)
+                .await
+                .unwrap()
+            {
+                eof = true;
+                break;
+            }
+        }
+        assert!(eof, "initial scope and conversion have completed");
+        // The first rotation visits locator, proof, expiry and sweep, then the
+        // concrete discard candidate. Scope was established by conversion.
+        for _ in 0..4 {
+            assert!(progress.quantum(&store).await.unwrap());
+        }
+        let reads = observer.operations();
+        let writes = observer.writes.lock().unwrap().len();
+        assert!(progress.quantum(&store).await.unwrap());
+        assert_eq!(
+            observer.operations() - reads,
+            2,
+            "candidate + exact-key preflight, no reverse read"
+        );
+        assert_eq!(observer.writes.lock().unwrap().len(), writes);
+        assert!(
+            observer
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| match event {
+                    SqliteReadEvent::OperationFinished { class, .. } =>
+                        *class == SqliteReadClass::Maintenance,
+                    _ => true,
+                })
+        );
+        assert!(
+            store
+                .database_connection()
+                .reader_query_only_enabled()
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_error_and_cancelled_admission_do_not_record_eof() {
+        let (_directory, store, observer) = fixture_with_metadata(0).await;
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        let mut lifetime = false;
+        let mut admission = DiscoveryAdmission::default();
+        assert!(
+            batch(
+                &store,
+                &mut progress,
+                &mut lifetime,
+                &mut admission,
+                1,
+                Duration::ZERO
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            admission.next_probe, [None; 2],
+            "scope/budget stop is not EOF"
+        );
+
+        let held = store.database_connection().begin_read().await.unwrap();
+        {
+            let work = batch(
+                &store,
+                &mut progress,
+                &mut lifetime,
+                &mut admission,
+                1,
+                BATCH_TIME,
+            );
+            tokio::pin!(work);
+            tokio::select! {
+                result = &mut work => panic!("queued batch unexpectedly completed: {result:?}"),
+                _ = observer.queued() => {},
+            }
+            // Dropping this owned future cancels the queued operation.
+        }
+        assert_eq!(admission.next_probe, [None; 2]);
+        drop(held);
+        store
+            .database_connection()
+            .execute_unprepared("ALTER TABLE compaction_frozen_layout RENAME TO unavailable_layout")
+            .await
+            .unwrap();
+        progress = FrozenStorageLifetimeProgress::default();
+        lifetime = false;
+        assert!(
+            batch(
+                &store,
+                &mut progress,
+                &mut lifetime,
+                &mut admission,
+                1,
+                BATCH_TIME
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            admission.next_probe, [None; 2],
+            "DB errors do not latch EOF"
+        );
+    }
+
     #[tokio::test]
     async fn html_preview_index_uses_scoped_readers_and_serial_writer_and_cancels_admission() {
         let (directory, store, observer) = fixture().await;
