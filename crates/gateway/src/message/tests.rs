@@ -78358,36 +78358,24 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
                 .any(|source| source.scope == "input:background-copy-turn")
         })
     }));
-    let expected_request = ChatRequest {
-        model: current.model.clone(),
-        messages: expected_messages.clone(),
-        temperature: None,
-        max_tokens: Some(512),
-        tools: None,
-        tool_choice: None,
-        parallel_tool_calls: None,
-        reasoning: None,
-        compiled_prompt: None,
+    // This is Claude CLI history: measure its portable input frame rather
+    // than the API request envelope. Keep the duplicate as a negative control.
+    let cli_tokens = |messages: &[ChatMessage]| {
+        crate::cli_runtime::context::completed_cli_history_budget(
+            messages,
+            workspace,
+            None,
+            pioneer_protocol::CLIAgentRuntimeKind::Claude,
+        )
+        .unwrap()
+        .0
     };
-    let expected_projection = pioneer_agent::compaction::request::NativeRequestProjection::full(
-        expected_request.clone(),
-        vec![],
-        budget.clone(),
-        false,
-    )
-    .unwrap();
-    let mut duplicated_request = expected_request;
-    duplicated_request.messages.push(launch_copy);
-    let duplicated_projection = pioneer_agent::compaction::request::NativeRequestProjection::full(
-        duplicated_request,
-        vec![],
-        budget.clone(),
-        false,
-    )
-    .unwrap();
-    let estimate = expected_projection.estimated_input_tokens;
+    let estimate = cli_tokens(&expected_messages);
+    let mut duplicated_messages = expected_messages.clone();
+    duplicated_messages.push(launch_copy);
+    let duplicated_estimate = cli_tokens(&duplicated_messages);
     assert_eq!(baseline.estimated_input_tokens, Some(estimate));
-    assert!(duplicated_projection.estimated_input_tokens > estimate);
+    assert!(duplicated_estimate > estimate);
     assert_eq!(
         expected_messages
             .iter()
@@ -78402,11 +78390,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
     let raw_boundary = (available as u128 * 100 / 105).min(u64::MAX as u128) as u64;
     let fitting_fixed = raw_boundary.saturating_sub(estimate);
     assert!(budget.fits(estimate + fitting_fixed, reserve, false));
-    assert!(!budget.fits(
-        duplicated_projection.estimated_input_tokens + fitting_fixed,
-        reserve,
-        false
-    ));
+    assert!(!budget.fits(duplicated_estimate + fitting_fixed, reserve, false));
     let mut fitting = HistoryCheckDiagnostic::default();
     let fitting_outcome = crate::compaction::prepare_completed_history_owned(
         &harness.processor,
