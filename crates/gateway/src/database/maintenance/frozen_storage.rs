@@ -561,7 +561,7 @@ mod tests {
             let eof = admission.next_probe[0].expect("actual conversion EOF");
             assert_eq!(
                 history::Entity::find_by_id("live")
-                    .one(store.database_connection())
+                    .one(&store.database_connection())
                     .await
                     .unwrap()
                     .unwrap()
@@ -570,7 +570,7 @@ mod tests {
             );
             let layouts = layout::Entity::find()
                 .filter(layout::Column::ManifestId.eq("live"))
-                .all(store.database_connection())
+                .all(&store.database_connection())
                 .await
                 .unwrap();
             assert_eq!(layouts.len(), 2);
@@ -672,7 +672,7 @@ mod tests {
             }
             assert_eq!(
                 history::Entity::find_by_id("new-work")
-                    .one(store.database_connection())
+                    .one(&store.database_connection())
                     .await
                     .unwrap()
                     .unwrap()
@@ -696,7 +696,7 @@ mod tests {
             assert!(admission.next_probe[0].is_none());
             assert_eq!(
                 history::Entity::find_by_id("new-work")
-                    .one(store.database_connection())
+                    .one(&store.database_connection())
                     .await
                     .unwrap()
                     .unwrap()
