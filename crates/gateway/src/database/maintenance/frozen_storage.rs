@@ -436,7 +436,10 @@ mod tests {
             2,
             "only current scope step completes after wait"
         );
-        assert_eq!(pause_after_batch(true, &DiscoveryAdmission::default(), Instant::now()), BATCH_PAUSE);
+        assert_eq!(
+            pause_after_batch(true, &DiscoveryAdmission::default(), Instant::now()),
+            BATCH_PAUSE
+        );
 
         let held = store.database_connection().begin_read().await.unwrap();
         let cancellation = CancellationToken::new();
@@ -494,7 +497,10 @@ mod tests {
         assert!(!admits(1, BATCH_TIME));
         assert!(!admits(1, Duration::from_secs(30)));
         // A DB queue wait ends this batch, but cannot multiply the next pause.
-        assert_eq!(pause_after_batch(true, &DiscoveryAdmission::default(), Instant::now()), Duration::from_millis(1));
+        assert_eq!(
+            pause_after_batch(true, &DiscoveryAdmission::default(), Instant::now()),
+            Duration::from_millis(1)
+        );
         let now = Instant::now();
         for first in 0..2 {
             let mut admission = DiscoveryAdmission::default();
@@ -514,7 +520,9 @@ mod tests {
     }
     #[tokio::test]
     async fn conversion_eof_survives_batches_and_due_probe_discovers_new_work() {
-        use pioneer_entity::{compaction_frozen_history as history, compaction_frozen_layout as layout};
+        use pioneer_entity::{
+            compaction_frozen_history as history, compaction_frozen_layout as layout,
+        };
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
         use sha2::{Digest, Sha256};
 
@@ -526,46 +534,94 @@ mod tests {
             admission.next_probe[1] = Some(Instant::now() + Duration::from_secs(3600));
             let mut useful = 0;
             for _ in 0..128 {
-                let more = batch(&store, &mut progress, &mut lifetime, &mut admission, 1, BATCH_TIME)
-                    .await.unwrap();
+                let more = batch(
+                    &store,
+                    &mut progress,
+                    &mut lifetime,
+                    &mut admission,
+                    1,
+                    BATCH_TIME,
+                )
+                .await
+                .unwrap();
                 if admission.next_probe[0].is_some() {
                     assert!(!more);
                     break;
                 }
                 useful += 1;
-                assert!(more, "scope and active conversion continue in the next batch");
+                assert!(
+                    more,
+                    "scope and active conversion continue in the next batch"
+                );
             }
-            assert!(useful > 4, "scope and staged layout validation took bounded steps");
+            assert!(
+                useful > 4,
+                "scope and staged layout validation took bounded steps"
+            );
             let eof = admission.next_probe[0].expect("actual conversion EOF");
-            assert_eq!(history::Entity::find_by_id("live").one(store.database_connection())
-                .await.unwrap().unwrap().storage_registered, 1);
+            assert_eq!(
+                history::Entity::find_by_id("live")
+                    .one(store.database_connection())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .storage_registered,
+                1
+            );
             let layouts = layout::Entity::find()
                 .filter(layout::Column::ManifestId.eq("live"))
                 .all(store.database_connection())
-                .await.unwrap();
+                .await
+                .unwrap();
             assert_eq!(layouts.len(), 2);
-            assert!(layouts.iter().all(|row| row.active == 1 && row.pending == 0 && row.failed == 0));
+            assert!(
+                layouts
+                    .iter()
+                    .all(|row| row.active == 1 && row.pending == 0 && row.failed == 0)
+            );
 
             admission.next_probe[1] = None;
             // Initial locator and proof discovery each issue one metadata read.
             // Repeating the three conversion discovery reads would change the count.
             for _ in 0..2 {
                 let before = observer.operations();
-                assert!(batch(&store, &mut progress, &mut lifetime, &mut admission, 1, BATCH_TIME)
-                    .await.unwrap());
+                assert!(
+                    batch(
+                        &store,
+                        &mut progress,
+                        &mut lifetime,
+                        &mut admission,
+                        1,
+                        BATCH_TIME
+                    )
+                    .await
+                    .unwrap()
+                );
                 assert_eq!(observer.operations() - before, 1);
                 assert_eq!(admission.next_probe[0], Some(eof));
             }
             if finish_lifetime {
                 let mut idle = false;
                 for _ in 0..32 {
-                    if !batch(&store, &mut progress, &mut lifetime, &mut admission, BATCH_STEPS, BATCH_TIME)
-                        .await.unwrap() {
+                    if !batch(
+                        &store,
+                        &mut progress,
+                        &mut lifetime,
+                        &mut admission,
+                        BATCH_STEPS,
+                        BATCH_TIME,
+                    )
+                    .await
+                    .unwrap()
+                    {
                         idle = true;
                         break;
                     }
                 }
-                assert!(idle, "lifetime reaches its real EOF during conversion cooldown");
+                assert!(
+                    idle,
+                    "lifetime reaches its real EOF during conversion cooldown"
+                );
                 assert_eq!(admission.next_probe[0], Some(eof));
                 assert!(admission.next_probe[1].is_some());
             }
@@ -576,28 +632,77 @@ mod tests {
                 messages: 0,
                 identity_sha256: hex::encode(Sha256::digest([])),
             };
-            store.compaction_begin_frozen_history("ws", "thread", &new).await.unwrap();
-            drop(store.compaction_finish_frozen_history_held("ws", "thread", &new).await.unwrap());
+            store
+                .compaction_begin_frozen_history("ws", "thread", &new)
+                .await
+                .unwrap();
+            drop(
+                store
+                    .compaction_finish_frozen_history_held("ws", "thread", &new)
+                    .await
+                    .unwrap(),
+            );
             if finish_lifetime {
                 let before = observer.operations();
                 for _ in 0..3 {
-                    assert!(!batch(&store, &mut progress, &mut lifetime, &mut admission, BATCH_STEPS, BATCH_TIME)
-                        .await.unwrap());
+                    assert!(
+                        !batch(
+                            &store,
+                            &mut progress,
+                            &mut lifetime,
+                            &mut admission,
+                            BATCH_STEPS,
+                            BATCH_TIME
+                        )
+                        .await
+                        .unwrap()
+                    );
                 }
-                assert_eq!(observer.operations(), before, "cooldown performs no SQL or RAM quantum");
+                assert_eq!(
+                    observer.operations(),
+                    before,
+                    "cooldown performs no SQL or RAM quantum"
+                );
                 assert!(pause_after_batch(false, &admission, Instant::now()) > Duration::ZERO);
             } else {
-                assert!(admission.next_probe[1].is_none(), "lifetime is still admitted");
+                assert!(
+                    admission.next_probe[1].is_none(),
+                    "lifetime is still admitted"
+                );
             }
-            assert_eq!(history::Entity::find_by_id("new-work").one(store.database_connection())
-                .await.unwrap().unwrap().storage_registered, 0);
+            assert_eq!(
+                history::Entity::find_by_id("new-work")
+                    .one(store.database_connection())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .storage_registered,
+                0
+            );
 
             admission.next_probe[0] = Some(Instant::now());
-            assert!(batch(&store, &mut progress, &mut lifetime, &mut admission, 1, BATCH_TIME)
-                .await.unwrap());
+            assert!(
+                batch(
+                    &store,
+                    &mut progress,
+                    &mut lifetime,
+                    &mut admission,
+                    1,
+                    BATCH_TIME
+                )
+                .await
+                .unwrap()
+            );
             assert!(admission.next_probe[0].is_none());
-            assert_eq!(history::Entity::find_by_id("new-work").one(store.database_connection())
-                .await.unwrap().unwrap().storage_registered, 1);
+            assert_eq!(
+                history::Entity::find_by_id("new-work")
+                    .one(store.database_connection())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .storage_registered,
+                1
+            );
         }
     }
 
@@ -616,8 +721,16 @@ mod tests {
             messages: 0,
             identity_sha256: hex::encode(Sha256::digest([])),
         };
-        store.compaction_begin_frozen_history("ws", "thread", &origin).await.unwrap();
-        drop(store.compaction_finish_frozen_history_held("ws", "thread", &origin).await.unwrap());
+        store
+            .compaction_begin_frozen_history("ws", "thread", &origin)
+            .await
+            .unwrap();
+        drop(
+            store
+                .compaction_finish_frozen_history_held("ws", "thread", &origin)
+                .await
+                .unwrap(),
+        );
         // Bind the projection while the ready input is available; expire it
         // only after that guarded insert, before maintenance starts.
         for sql in [
@@ -626,14 +739,29 @@ mod tests {
             "INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) SELECT 'discard-op',id,identity_sha256,imports_sha256,import_count FROM compaction_frozen_history WHERE id='discard-origin'",
             "UPDATE compaction_frozen_history SET expired=1 WHERE id='discard-origin'",
         ] {
-            store.database_connection().execute_unprepared(sql).await.unwrap();
+            store
+                .database_connection()
+                .execute_unprepared(sql)
+                .await
+                .unwrap();
         }
         let state = RunnerState {
-            generation: 0, deadline_ms: 1000, attempts: 0, retries: 0,
-            portion_attempts: 0, corrections: 0, target_tokens: 10,
-            source_text_projection_version: 0, cursor: Default::default(),
-            previous_checkpoint: None, phase: RunnerPhase::Failed { kind: FailureKind::Deadline },
-            resume_phase: None, observation: None, diagnostic: None,
+            generation: 0,
+            deadline_ms: 1000,
+            attempts: 0,
+            retries: 0,
+            portion_attempts: 0,
+            corrections: 0,
+            target_tokens: 10,
+            source_text_projection_version: 0,
+            cursor: Default::default(),
+            previous_checkpoint: None,
+            phase: RunnerPhase::Failed {
+                kind: FailureKind::Deadline,
+            },
+            resume_phase: None,
+            observation: None,
+            diagnostic: None,
         };
         store.database_connection().execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
@@ -641,7 +769,10 @@ mod tests {
             [serde_json::to_string(&state).unwrap().into()],
         )).await.unwrap();
         let selection = ModelSelection {
-            transport: Transport::Api, instance: "p".into(), model: "m".into(), effort: None,
+            transport: Transport::Api,
+            instance: "p".into(),
+            model: "m".into(),
+            effort: None,
         };
         store.database_connection().execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
@@ -651,7 +782,11 @@ mod tests {
         let mut progress = FrozenStorageLifetimeProgress::default();
         let mut eof = false;
         for _ in 0..128 {
-            if !store.compact_frozen_storage_quantum(&mut progress).await.unwrap() {
+            if !store
+                .compact_frozen_storage_quantum(&mut progress)
+                .await
+                .unwrap()
+            {
                 eof = true;
                 break;
             }
@@ -665,13 +800,31 @@ mod tests {
         let reads = observer.operations();
         let writes = observer.writes.lock().unwrap().len();
         assert!(progress.quantum(&store).await.unwrap());
-        assert_eq!(observer.operations() - reads, 2, "candidate + exact-key preflight, no reverse read");
+        assert_eq!(
+            observer.operations() - reads,
+            2,
+            "candidate + exact-key preflight, no reverse read"
+        );
         assert_eq!(observer.writes.lock().unwrap().len(), writes);
-        assert!(observer.reads.lock().unwrap().iter().all(|event| match event {
-            SqliteReadEvent::OperationFinished { class, .. } => *class == SqliteReadClass::Maintenance,
-            _ => true,
-        }));
-        assert!(store.database_connection().reader_query_only_enabled().await.unwrap());
+        assert!(
+            observer
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| match event {
+                    SqliteReadEvent::OperationFinished { class, .. } =>
+                        *class == SqliteReadClass::Maintenance,
+                    _ => true,
+                })
+        );
+        assert!(
+            store
+                .database_connection()
+                .reader_query_only_enabled()
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -680,13 +833,33 @@ mod tests {
         let mut progress = FrozenStorageLifetimeProgress::default();
         let mut lifetime = false;
         let mut admission = DiscoveryAdmission::default();
-        assert!(batch(&store, &mut progress, &mut lifetime, &mut admission, 1, Duration::ZERO)
-            .await.unwrap());
-        assert_eq!(admission.next_probe, [None; 2], "scope/budget stop is not EOF");
+        assert!(
+            batch(
+                &store,
+                &mut progress,
+                &mut lifetime,
+                &mut admission,
+                1,
+                Duration::ZERO
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            admission.next_probe, [None; 2],
+            "scope/budget stop is not EOF"
+        );
 
         let held = store.database_connection().begin_read().await.unwrap();
         {
-            let work = batch(&store, &mut progress, &mut lifetime, &mut admission, 1, BATCH_TIME);
+            let work = batch(
+                &store,
+                &mut progress,
+                &mut lifetime,
+                &mut admission,
+                1,
+                BATCH_TIME,
+            );
             tokio::pin!(work);
             tokio::select! {
                 result = &mut work => panic!("queued batch unexpectedly completed: {result:?}"),
@@ -696,14 +869,29 @@ mod tests {
         }
         assert_eq!(admission.next_probe, [None; 2]);
         drop(held);
-        store.database_connection().execute_unprepared(
-            "ALTER TABLE compaction_frozen_layout RENAME TO unavailable_layout"
-        ).await.unwrap();
+        store
+            .database_connection()
+            .execute_unprepared("ALTER TABLE compaction_frozen_layout RENAME TO unavailable_layout")
+            .await
+            .unwrap();
         progress = FrozenStorageLifetimeProgress::default();
         lifetime = false;
-        assert!(batch(&store, &mut progress, &mut lifetime, &mut admission, 1, BATCH_TIME)
-            .await.is_err());
-        assert_eq!(admission.next_probe, [None; 2], "DB errors do not latch EOF");
+        assert!(
+            batch(
+                &store,
+                &mut progress,
+                &mut lifetime,
+                &mut admission,
+                1,
+                BATCH_TIME
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            admission.next_probe, [None; 2],
+            "DB errors do not latch EOF"
+        );
     }
 
     #[tokio::test]
