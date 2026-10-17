@@ -585,7 +585,10 @@ impl PersistentCredentials {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
-    pub(crate) async fn commit_consent(&self) -> Result<(), AuthError> {
+    pub(crate) async fn commit_consent(
+        &self,
+        flow_cancellation: &CancellationToken,
+    ) -> Result<(), AuthError> {
         let mut record = self
             .persistence
             .read_raw(&self.id)
@@ -618,7 +621,14 @@ impl PersistentCredentials {
                 Err(_) => {
                     // An uncertain delete is not a Failed commit. The owned
                     // exchange retains its lease and resolves it with backoff.
-                    tokio::select! { _=self.cancellation.cancelled()=>return Err(AuthError::AuthorizationRequired), _=tokio::time::sleep(std::time::Duration::from_millis(250))=>{} }
+                    // Quiesce drains this flow before it revokes established
+                    // sessions' credential access. Do not wait for that later
+                    // credential shutdown to release an uncertain promotion.
+                    tokio::select! {
+                        _=flow_cancellation.cancelled()=>return Err(AuthError::AuthorizationRequired),
+                        _=self.cancellation.cancelled()=>return Err(AuthError::AuthorizationRequired),
+                        _=tokio::time::sleep(std::time::Duration::from_millis(250))=>{}
+                    }
                 }
             }
         }
@@ -1063,7 +1073,8 @@ mod tests {
             .unwrap();
         secrets.delete_after_error.store(true, SeqCst);
         let owner = writer.clone();
-        let mut commit = tokio::spawn(async move { owner.commit_consent().await });
+        let mut commit =
+            tokio::spawn(async move { owner.commit_consent(&owner.cancellation).await });
         tokio::time::timeout(
             std::time::Duration::from_secs(3),
             secrets.marker_deleted.notified(),
@@ -1131,7 +1142,7 @@ mod tests {
                     secrets.fail_readback.store(unknown, SeqCst);
                     let save = writer.save(serde_json::from_value(response).unwrap()).await;
                     let outcome = if save.is_ok() {
-                        writer.commit_consent().await
+                        writer.commit_consent(&writer.cancellation).await
                     } else {
                         save
                     };
@@ -1237,7 +1248,7 @@ mod tests {
                 "independent reader must await terminal lease release"
             );
             if outcome == 0 {
-                writer.commit_consent().await.unwrap();
+                writer.commit_consent(&writer.cancellation).await.unwrap();
             } else {
                 writer.restore_record(previous.clone()).await.unwrap();
             }
@@ -1368,7 +1379,7 @@ mod tests {
                 "independent plain reader must wait consent admission"
             );
             if commit {
-                writer.commit_consent().await.unwrap();
+                writer.commit_consent(&writer.cancellation).await.unwrap();
             } else {
                 cancellation.cancel();
                 writer.restore_record(previous.clone()).await.unwrap();

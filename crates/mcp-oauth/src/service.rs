@@ -1723,8 +1723,12 @@ impl McpOAuthService {
             data.status = OAuthState::Resolving;
             self.event(&id, &entry, &data, None, None).await;
         }
-        let commit_failed =
-            decision == OAuthState::Authorized && entry.credentials.commit_consent().await.is_err();
+        let commit_failed = decision == OAuthState::Authorized
+            && entry
+                .credentials
+                .commit_consent(&entry.cancellation)
+                .await
+                .is_err();
         if commit_failed {
             // Retirement while an acknowledged promotion's fence cleanup is
             // uncertain must not publish Failed for a possibly committed grant.

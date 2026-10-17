@@ -3079,13 +3079,22 @@ async fn terminal_decision_after_successful_put_linearizes_cancel_timeout_and_su
                 serde_json::to_value(h.persistence.read("installation").await.unwrap().unwrap())
                     .unwrap();
             if let Some(reader) = earlier_reader {
-                let token = reader.await.unwrap().unwrap();
-                let expected = if decision == OAuthState::Authorized {
-                    &written["pending_consent"]["candidate"]["token_response"]["access_token"]
+                let result = reader.await.unwrap();
+                if decision == OAuthState::Cancelled {
+                    // Cancel retires this generation, including readers that
+                    // were waiting for the exchange's refresh lease.
+                    assert!(matches!(
+                        result,
+                        Err(rmcp::transport::auth::AuthError::AuthorizationRequired)
+                    ));
                 } else {
-                    &previous["credentials"]["token_response"]["access_token"]
-                };
-                assert_eq!(token, expected.as_str().unwrap());
+                    let expected = if decision == OAuthState::Authorized {
+                        &written["pending_consent"]["candidate"]["token_response"]["access_token"]
+                    } else {
+                        &previous["credentials"]["token_response"]["access_token"]
+                    };
+                    assert_eq!(result.unwrap(), expected.as_str().unwrap());
+                }
             }
             if decision == OAuthState::Authorized {
                 let mut committed = written.clone();
@@ -3112,6 +3121,21 @@ async fn terminal_decision_after_successful_put_linearizes_cancel_timeout_and_su
                     "cancel/expiry must preserve the pre-consent atomic record"
                 );
                 if let Some(client) = &prior_client {
+                    let client = if decision == OAuthState::Cancelled {
+                        assert!(matches!(
+                            client.get_access_token().await,
+                            Err(rmcp::transport::auth::AuthError::AuthorizationRequired)
+                        ));
+                        // The prior grant survives; only a fresh generation
+                        // may use it after the cancelled exchange drains.
+                        service
+                            .client("installation", &h.server.installation())
+                            .await
+                            .unwrap()
+                            .unwrap()
+                    } else {
+                        client.clone()
+                    };
                     assert_eq!(
                         client.get_access_token().await.unwrap(),
                         previous["credentials"]["token_response"]["access_token"]
@@ -3680,8 +3704,8 @@ async fn shutdown_waits_for_admitted_bind_cleanup_before_final_mutation_drain() 
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn uncertain_promotion_is_manageable_and_retired_without_false_terminal_outcome() {
-    // Successful reconciliation, deadline, initiator loss, clear, replacement, shutdown.
-    for retirement in 0..6 {
+    // Reconciliation, deadline, initiator loss, clear, replacement, shutdown, quiesce.
+    for retirement in 0..7 {
         let h = Harness::new(true).await;
         h.login().await;
         h.service.shutdown().await;
@@ -3778,6 +3802,13 @@ async fn uncertain_promotion_is_manageable_and_retired_without_false_terminal_ou
         }
         if retirement == 5 {
             tokio::time::timeout(Duration::from_secs(3), service.shutdown())
+                .await
+                .unwrap();
+        }
+        if retirement == 6 {
+            // Draining flows must complete before credential cancellation,
+            // which remains deferred until established MCP sessions close.
+            tokio::time::timeout(Duration::from_secs(3), service.quiesce())
                 .await
                 .unwrap();
         }
