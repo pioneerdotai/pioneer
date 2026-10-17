@@ -783,7 +783,7 @@ fn command_execution_item(
         status,
         recovery_policy: None,
         // The canonical item kind determines the shell payload policy. Native
-        // names such as OpenCode's `bash` and Claude's `Bash` are not core tools.
+        // names such as OpenCode's `shell` and Claude's `Bash` are not core tools.
         output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
         display,
         storage,

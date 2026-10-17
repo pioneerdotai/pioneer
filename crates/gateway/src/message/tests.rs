@@ -595,7 +595,7 @@ async fn persist_test_cli_instruction_projection(
         ),
         CLIAgentRuntimeKind::OpenCode => (
             "opencode",
-            CLIRuntimeElevatedInstructionTransport::OpenCodeSystemPrompt,
+            CLIRuntimeElevatedInstructionTransport::OpenCodeInstructionEntry,
         ),
     };
     let now = chrono::Utc::now().fixed_offset();
@@ -83130,3 +83130,171 @@ mod task_start_failure;
 
 #[path = "tests/frozen_history_lifetime.rs"]
 mod frozen_history_lifetime;
+
+#[tokio::test]
+async fn opencode_v2_summary_totals_and_native_categories_reach_completion_and_journal_once() {
+    use crate::cli_runtime::opencode_session::opencode_summary_result;
+    let (_, store, workspace) = setup_execution_window_terminal_turn(
+        "thr_opencode_summary_usage",
+        "turn_opencode_summary_usage",
+    )
+    .await;
+    let selected = serde_json::json!({"providerID":"local","id":"model"});
+    let step = serde_json::json!({"type":"assistant","model":selected,"content":[{"type":"text","text":"Summary"}],"tokens":{"input":10,"output":3,"reasoning":7,"cache":{"read":80,"write":20}}});
+    let cases = [
+        (
+            serde_json::json!([step]),
+            Some(110_u64),
+            Some(10_u64),
+            Some(10_u64),
+            Some(7_u64),
+        ),
+        (
+            serde_json::json!([step, step]),
+            Some(220),
+            Some(20),
+            Some(20),
+            Some(14),
+        ),
+        (
+            serde_json::json!([step,{"type":"compaction","tokens":{"input":2,"output":1,"reasoning":3,"cache":{"read":4,"write":5}}}]),
+            Some(121),
+            Some(14),
+            Some(12),
+            Some(10),
+        ),
+        (
+            serde_json::json!([{"type":"assistant","model":selected,"content":[{"type":"text","text":"Summary"}],"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}]),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+        ),
+        (
+            serde_json::json!([{"type":"assistant","model":selected,"content":[{"type":"text","text":"Summary"}]}]),
+            None,
+            None,
+            None,
+            None,
+        ),
+    ];
+    for (index, (messages, input, output, uncached, reasoning)) in cases.into_iter().enumerate() {
+        let mut history = vec![serde_json::json!({"type":"user","id":"msg_summary"})];
+        history.extend(messages.as_array().unwrap().iter().cloned());
+        history.extend([
+            serde_json::json!({"type":"idle","outcome":"succeeded"}),
+            serde_json::json!({"type":"user","id":"msg_other"}),
+            serde_json::json!({"type":"assistant","tokens":{"input":9999,"output":9999}}),
+        ]);
+        let history = serde_json::json!(history);
+        let (text, summary_input, summary_output, raw) =
+            opencode_summary_result(&selected, &history, "msg_summary").unwrap();
+        assert_eq!(summary_input, input);
+        assert_eq!(summary_output, output);
+        let owner = format!("opencode-summary-usage-{index}");
+        let mut observed = pioneer_provider::TokenUsage {
+            provider: Some("opencode-cli".into()),
+            ..Default::default()
+        };
+        let call = crate::usage_journal::Call::start(
+            store.as_ref(),
+            &workspace,
+            "summary",
+            &owner,
+            &observed,
+        )
+        .await
+        .unwrap();
+        // Actual service history boundary -> actual summary consumer -> journal.
+        let completion = crate::compaction::finish_cli_summary(
+            &mut observed,
+            text,
+            summary_input,
+            summary_output,
+            &raw,
+        );
+        assert_eq!(completion.input_tokens, input);
+        assert_eq!(completion.output_tokens, output);
+        call.record("completed", &observed).await.unwrap();
+        call.record("completed", &observed).await.unwrap();
+        let rows = store
+            .provider_usage_page(&workspace, &owner, "", 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "completed");
+        let retained: pioneer_provider::TokenUsage =
+            serde_json::from_str(&rows[0].usage_json).unwrap();
+        assert_eq!(retained.input_tokens, completion.input_tokens);
+        assert_eq!(retained.output_tokens, completion.output_tokens);
+        assert_eq!(retained.uncached_input_tokens, uncached);
+        assert_eq!(retained.reasoning_tokens, reasoning);
+        assert_eq!(
+            retained.raw_usage.as_ref().unwrap()["native_tokens"],
+            raw["native_tokens"]
+        );
+        assert_eq!(
+            retained.cache_read_input_tokens,
+            raw["cache_read_input_tokens"].as_u64()
+        );
+        assert_eq!(
+            retained.cache_write_input_tokens,
+            raw["cache_creation_input_tokens"].as_u64()
+        );
+        crate::compaction::apply_cli_usage(&mut observed, &raw);
+        assert_eq!(observed.input_tokens, input);
+        assert_eq!(observed.output_tokens, output);
+        // A failed attempt owns a separate journal entry. Terminal outcomes
+        // cannot change from completed to failed on the same call.
+        let failed_owner = format!("opencode-summary-usage-failed-{index}");
+        let mut failed_observed = pioneer_provider::TokenUsage {
+            provider: Some("opencode-cli".into()),
+            ..Default::default()
+        };
+        let failed_call = crate::usage_journal::Call::start(
+            store.as_ref(),
+            &workspace,
+            "summary",
+            &failed_owner,
+            &failed_observed,
+        )
+        .await
+        .unwrap();
+        let mut failed = history.clone();
+        failed[messages.as_array().unwrap().len() + 1]["outcome"] = serde_json::json!("failed");
+        let error = opencode_summary_result(&selected, &failed, "msg_summary").unwrap_err();
+        if let Some(usage) =
+            error.downcast_ref::<pioneer_cli_agent_runtime::service::ObservedServiceUsage>()
+        {
+            crate::compaction::apply_cli_usage(&mut failed_observed, &usage.0);
+        }
+        failed_call
+            .record("failed", &failed_observed)
+            .await
+            .unwrap();
+        failed_call
+            .record("failed", &failed_observed)
+            .await
+            .unwrap();
+        let rows = store
+            .provider_usage_page(&workspace, &failed_owner, "", 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "failed");
+        let failed: pioneer_provider::TokenUsage =
+            serde_json::from_str(&rows[0].usage_json).unwrap();
+        assert_eq!(failed.input_tokens, input);
+        assert_eq!(failed.output_tokens, output);
+        assert_eq!(failed.uncached_input_tokens, uncached);
+        assert_eq!(failed.reasoning_tokens, reasoning);
+        assert_eq!(
+            failed.cache_read_input_tokens,
+            retained.cache_read_input_tokens
+        );
+        assert_eq!(
+            failed.cache_write_input_tokens,
+            retained.cache_write_input_tokens
+        );
+    }
+}

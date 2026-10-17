@@ -233,6 +233,16 @@ fn cli_runtime_ready_for_model_discovery(runtime: &RuntimeSummary) -> bool {
 }
 
 impl MessageProcessor {
+    pub(crate) fn opencode_managed_data_home(
+        &self,
+        instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
+    ) -> PathBuf {
+        crate::cli_runtime::opencode_session::opencode_managed_data_home(
+            &self.artifact_runtime_home,
+            instance,
+        )
+    }
+
     fn uses_collaborator_cli_disclosure(request_context: &RequestContext) -> bool {
         crate::authorization::AuthorizationService::new().role_disclosure_policy(
             request_context.principal().kind,
@@ -13244,12 +13254,13 @@ fn opencode_request_response_from_resolution(
                             anyhow::bail!("OpenCode question does not permit custom answers");
                         }
                     }
-                    json!({ "kind": "question", "answers": ordered })
+                    json!({ "kind": "form", "answer": crate::cli_runtime::opencode_session::opencode_form_answer(
+                        payload.get("formFields").context("OpenCode V2 request is missing its native form fields")?, &ordered)? })
                 }
                 CLIRuntimeRequestResolution::Cancelled
                 | CLIRuntimeRequestResolution::Expired
                 | CLIRuntimeRequestResolution::Error { .. } => {
-                    json!({ "kind": "question", "reject": true })
+                    json!({ "kind": "form", "reject": true })
                 }
                 CLIRuntimeRequestResolution::Approved
                 | CLIRuntimeRequestResolution::ApprovedForSession
