@@ -1851,3 +1851,208 @@ fn reviewer_late_cli_preparation_preserves_blocked_transition_and_safe_storage_e
             .contains(correlation)
     );
 }
+
+#[test]
+fn terminal_child_pending_parent_receipt_retains_capsule_until_replayed_cleanup() {
+    capture_task_start(async {
+        let (harness, processor) = review_cli_fixture().await;
+        let (task, child) =
+            create_review_cli_child(&harness, &processor, "receipt-cleanup", false, false).await;
+        let store = &harness.crud_store;
+        let run_id = &task.run.as_ref().unwrap().id;
+        let parent_thread = child
+            .created_by_thread_id
+            .as_deref()
+            .unwrap_or(&child.parent_thread_id);
+        let parent_turn = child.created_by_turn_id.as_deref().unwrap();
+        let (workspace_id, mut parent) = store
+            .get_turn(parent_thread, parent_turn)
+            .await
+            .unwrap()
+            .unwrap();
+        parent.status = TurnStatus::Completed;
+        let now = now_timestamp_secs();
+        // Real canonical acceptance, held before projection while child
+        // reconciliation commits the aggregate and encounters the same event.
+        store
+            .accept_turn_event_before_projection_for_test(
+                pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
+                    workspace_id,
+                    thread_id: parent_thread.to_owned(),
+                    turn: parent,
+                }),
+                now,
+            )
+            .await
+            .unwrap();
+        store
+            .insert_turn_llm_context(pioneer_crud::NewTurnLlmContextEntry {
+                turn_id: child.child_turn_id.clone(),
+                item_id: None,
+                attempt_id: None,
+                sequence: 999,
+                source: "receipt_cleanup_fixture".into(),
+                tool_name: None,
+                payload: "{}".into(),
+                output_policy_snapshot: "{}".into(),
+                created_at: chrono::Utc::now().fixed_offset(),
+                expires_at: Some(chrono::Utc::now().fixed_offset()),
+            })
+            .await
+            .unwrap();
+        persist_completed_child(&harness, &child, now).await;
+        let activations = harness.cli_session.turn_starts.lock().await.len();
+        let background = processor.for_background_reconciliation();
+        let pending = background
+            .reconcile_terminal_task_child_turns(64)
+            .await
+            .unwrap_err();
+        assert!(pending.to_string().contains("pending_projection=1"));
+        assert_eq!(
+            store.get_task_run(run_id).await.unwrap().unwrap().status,
+            TaskRunStatus::Succeeded
+        );
+        let candidate = store
+            .get_accepted_task_result_candidate(run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .terminal_task_child_cleanup_ready(&child.child_thread_id, &child.child_turn_id)
+                .await
+                .unwrap(),
+            Some(false)
+        );
+        assert!(
+            !processor
+                .task_agent_executor
+                .reconcile_child_turn_completed(
+                    &child.child_thread_id,
+                    &child.child_turn_id,
+                    super::super::TaskChildReconciliationOrigin::Live,
+                )
+                .await
+                .unwrap(),
+            "terminal run alone is not a cleanup ACK"
+        );
+        // Bootstrap/TTL and a fresh worker scope simulate loss of local state.
+        store
+            .delete_turn_runtime_snapshots_for_closed_turns()
+            .await
+            .unwrap();
+        store
+            .delete_turn_llm_context_for_terminal_turns()
+            .await
+            .unwrap();
+        store.delete_expired_turn_llm_context().await.unwrap();
+        assert!(
+            store
+                .get_turn_runtime_snapshot(&child.child_turn_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .list_turn_llm_context(&child.child_turn_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|c| c.source == "receipt_cleanup_fixture")
+        );
+        assert_eq!(
+            processor
+                .for_background_reconciliation()
+                .reconcile_terminal_task_child_turns(64)
+                .await
+                .unwrap(),
+            0
+        );
+        // A quarantined projection remains visible and cannot authorize ACK.
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+        store.database_connection().execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE turn_event_projection_stream_state SET status = 'quarantined' WHERE turn_id = ?",
+            [parent_turn.into()],
+        )).await.unwrap();
+        assert_eq!(
+            store
+                .get_turn_event_projection_stream_state(parent_turn)
+                .await
+                .unwrap()
+                .unwrap()
+                .health,
+            pioneer_crud::TurnProjectionStreamHealth::Quarantined
+        );
+        assert_eq!(
+            background
+                .reconcile_terminal_task_child_turns(64)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            store
+                .get_turn_runtime_snapshot(&child.child_turn_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        store.database_connection().execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE turn_event_projection_stream_state SET status = 'healthy' WHERE turn_id = ?",
+            [parent_turn.into()],
+        )).await.unwrap();
+        let replay = store
+            .with_maintenance_access()
+            .replay_due_turn_event_projections(now + 120, 64)
+            .await
+            .unwrap();
+        assert!(replay.projected > 0);
+        assert_eq!(
+            processor
+                .for_background_reconciliation()
+                .reconcile_terminal_task_child_turns(64)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            store
+                .get_turn_runtime_snapshot(&child.child_turn_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !store
+                .list_turn_llm_context(&child.child_turn_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|c| c.source == "receipt_cleanup_fixture")
+        );
+        assert_eq!(
+            processor
+                .for_background_reconciliation()
+                .reconcile_terminal_task_child_turns(64)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            harness.cli_session.turn_starts.lock().await.len(),
+            activations
+        );
+        assert_eq!(
+            store
+                .get_accepted_task_result_candidate(run_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            candidate,
+            "no repeated extraction or new result"
+        );
+    });
+}

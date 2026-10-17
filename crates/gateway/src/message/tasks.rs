@@ -234,6 +234,22 @@ impl MessageProcessor {
             match result {
                 Ok(true) => {
                     if turn.status != TurnStatus::Blocked {
+                        match self
+                            .crud_store
+                            .cleanup_terminal_task_child_capsule(&turn.thread_id, &turn.turn_id)
+                            .await
+                        {
+                            Ok(Some(true)) => {
+                                reconciled = reconciled.saturating_add(1);
+                                continue;
+                            }
+                            Ok(Some(false)) => continue,
+                            Ok(None) => {} // Active aggregate: existing cleanup below.
+                            Err(error) => {
+                                errors.push(&turn.thread_id, &turn.turn_id, error);
+                                continue;
+                            }
+                        }
                         if let Err(error) = self
                             .crud_store
                             .delete_turn_llm_context_for_turn(turn.turn_id.as_str())
