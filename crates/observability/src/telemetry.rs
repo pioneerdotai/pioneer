@@ -1,3 +1,7 @@
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "otlp_http.rs"]
+mod otlp_http;
+
 use crate::metrics::{
     DesktopGatewayLifecycleMetrics, DesktopUpdateMetrics, GatewayMetrics, StartupMetrics,
 };
@@ -146,7 +150,13 @@ pub fn init_otlp_observability_for(
         .with_endpoint(config.metrics_endpoint.trim())
         .with_timeout(config.export_timeout)
         .with_retry_policy(otlp_retry_policy())
-        .with_temporality(Temporality::Delta)
+        .with_temporality(Temporality::Delta);
+    #[cfg(not(target_arch = "wasm32"))]
+    let metric_exporter = metric_exporter.with_http_client(otlp_http::OtlpHttpClient::new(
+        config.export_timeout,
+        "metrics",
+    )?);
+    let metric_exporter = metric_exporter
         .build()
         .context("failed to build OTLP/HTTP metrics exporter")?;
     let metric_reader = PeriodicReader::builder(ConsentGatedMetricExporter {
@@ -160,7 +170,13 @@ pub fn init_otlp_observability_for(
         .with_http()
         .with_endpoint(config.traces_endpoint.trim())
         .with_timeout(config.export_timeout)
-        .with_retry_policy(otlp_retry_policy())
+        .with_retry_policy(otlp_retry_policy());
+    #[cfg(not(target_arch = "wasm32"))]
+    let trace_exporter = trace_exporter.with_http_client(otlp_http::OtlpHttpClient::new(
+        config.export_timeout,
+        "traces",
+    )?);
+    let trace_exporter = trace_exporter
         .build()
         .context("failed to build OTLP/HTTP traces exporter")?;
 

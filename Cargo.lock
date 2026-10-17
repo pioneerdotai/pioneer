@@ -10827,10 +10827,13 @@ name = "pioneer-observability"
 version = "0.60.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dotenvy",
  "opentelemetry",
+ "opentelemetry-http",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "reqwest",
  "sentry",
  "serde",
  "serde_json",
