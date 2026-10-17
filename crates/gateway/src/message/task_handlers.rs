@@ -2000,7 +2000,7 @@ impl MessageProcessor {
         }
     }
 
-    fn send_task_response<'a, T: Serialize + Sync + 'a>(
+    pub(super) fn send_task_response<'a, T: Serialize + Sync + 'a>(
         &'a self,
         connection_id: ConnectionId,
         request_id: RequestId,

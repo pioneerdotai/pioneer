@@ -10815,7 +10815,6 @@ version = "0.60.0"
 dependencies = [
  "anyhow",
  "hex",
- "pioneer-entity",
  "sea-orm-migration",
  "serde_json",
  "sha2 0.11.1",

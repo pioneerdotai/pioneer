@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskCompletionInboxEntryResponse",
+  "type": "object",
+  "properties": {
+    "entry": {
+      "$ref": "#/$defs/TaskCompletionInboxEntry"
+    },
+    "unreadCount": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "entry",
+    "unreadCount"
+  ],
+  "$defs": {
+    "TaskCompletionInboxEntry": {
+      "description": "One saved terminal run in the current user's workspace inbox. Contains no\nexecution-thread identity, raw failure, HTML, or full result payload.",
+      "type": "object",
+      "properties": {
+        "completedAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "readAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/TaskRunStatus"
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "threadTitle": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "workspaceId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "taskId",
+        "runId",
+        "title",
+        "threadId",
+        "threadTitle",
+        "status",
+        "completedAt"
+      ]
+    },
+    "TaskRunStatus": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "starting",
+        "running",
+        "waiting",
+        "waiting_review",
+        "succeeded",
+        "failed",
+        "blocked",
+        "cancelled",
+        "timed_out"
+      ]
+    }
+  }
+}

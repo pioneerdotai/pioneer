@@ -236,6 +236,7 @@ fn main() {
         let ui_components_stage = startup_for_app
             .stage(pioneer_observability::DesktopStartupStage::UiComponentsInitialize);
         gpui_kit::init(cx);
+        pioneer_desktop_task_notifications::init(cx);
         client_runtime::DesktopRuntimeCoordinator::install(cx);
         theme::init(cx);
         menu::init_system_menus(cx);

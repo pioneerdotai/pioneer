@@ -83131,6 +83131,246 @@ mod task_start_failure;
 #[path = "tests/frozen_history_lifetime.rs"]
 mod frozen_history_lifetime;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_completion_inbox_rpc_uses_root_acl_and_syncs_personal_reads_without_timeline() {
+    use pioneer_protocol::constants::methods;
+    use pioneer_protocol::{TaskCompletionInboxEntryResponse, TaskCompletionInboxListResponse};
+    let (_dir, workspace_manager, crud_store, workspace_id) =
+        setup_pooled_file_workspace_manager().await;
+    let db = crud_store.database_connection();
+    for sql in [
+        "INSERT INTO gateway_principal(id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,created_at,updated_at) VALUES('P0000000000000000000A','G00000000000000000001','user','member','active','Inbox A','inbox-a','inbox-a',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('P0000000000000000000B','G00000000000000000001','user','member','active','Inbox B','inbox-b','inbox-b',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO workspace_membership(principal_id,workspace_id,granted_by_actor_kind,created_at,updated_at) SELECT id,(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),'system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM gateway_principal WHERE id IN ('P0000000000000000000A','P0000000000000000000B')",
+        "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) SELECT 'T0000000000000000000I',id,'Inbox root','','agent','m','p','active','user','private',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM workspace WHERE is_current=1 LIMIT 1",
+        "INSERT INTO thread_membership(principal_id,thread_id,added_by_actor_kind,created_at,updated_at) SELECT id,'T0000000000000000000I','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM gateway_principal WHERE id IN ('P0000000000000000000A','P0000000000000000000B')",
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,executor_kind,status,title,goal,priority,revision,created_at,updated_at) SELECT 'K0000000000000000000I',id,'workspace',id,'T0000000000000000000I','system','completed','Shared task','Goal',0,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM workspace WHERE is_current=1 LIMIT 1",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,completed_at,created_at,updated_at) VALUES('R0000000000000000000I','K0000000000000000000I','R0000000000000000000I',1,1,'succeeded','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+    ] {
+        db.execute_unprepared(sql).await.expect("inbox fixture");
+    }
+    let sessions = Arc::new(SessionManager::new());
+    async fn device(
+        sessions: &SessionManager,
+        principal: &str,
+        device: &str,
+        session: &str,
+        workspace: &str,
+    ) -> (crate::session::ConnectionId, mpsc::Receiver<Message>) {
+        let mut p = (*authenticated_test_superuser()).clone();
+        p.kind = pioneer_protocol::PrincipalKind::User;
+        p.role_key = Some(RoleKey::member());
+        p.principal_id = PrincipalId::new(principal).unwrap();
+        p.device_id = pioneer_protocol::DeviceId::new(device).unwrap();
+        p.session_id = pioneer_protocol::AuthSessionId::new(session).unwrap();
+        let (tx, rx) = mpsc::channel(32);
+        let id = sessions.register_connection(tx, Arc::new(p)).await.unwrap();
+        sessions
+            .set_connection_workspace(id, Some(workspace.to_owned()))
+            .await;
+        (id, rx)
+    }
+    let (a, mut a_rx) = device(
+        &sessions,
+        "P0000000000000000000A",
+        "D0000000000000000000A",
+        "S0000000000000000000A",
+        &workspace_id,
+    )
+    .await;
+    let (a2, mut a2_rx) = device(
+        &sessions,
+        "P0000000000000000000A",
+        "D0000000000000000000C",
+        "S0000000000000000000C",
+        &workspace_id,
+    )
+    .await;
+    let (b, mut b_rx) = device(
+        &sessions,
+        "P0000000000000000000B",
+        "D0000000000000000000B",
+        "S0000000000000000000B",
+        &workspace_id,
+    )
+    .await;
+    let processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("o4-mini", "openai")),
+        test_provider(),
+        sessions.clone(),
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    );
+    async fn rpc(
+        processor: &MessageProcessor,
+        connection: crate::session::ConnectionId,
+        rx: &mut mpsc::Receiver<Message>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let id = generate_test_request_id("completion-inbox", "rpc");
+        processor
+            .process_request_for_connection(
+                connection,
+                &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}).to_string(),
+            )
+            .await;
+        recv_response_by_id(rx, &id).await
+    }
+    let params = json!({"workspaceId":workspace_id,"runId":"R0000000000000000000I"});
+    let response = rpc(
+        &processor,
+        b,
+        &mut b_rx,
+        methods::TASK_COMPLETION_INBOX_LIST,
+        json!({"workspaceId":workspace_id,"limit":1}),
+    )
+    .await;
+    let list: TaskCompletionInboxListResponse = serde_json::from_value(response.result).unwrap();
+    assert_eq!(list.unread_count, 1);
+    assert_eq!(list.entries.len(), 1);
+    assert_eq!(list.entries[0].thread_id, "T0000000000000000000I");
+    assert!(
+        list.entries[0].read_at.is_none(),
+        "opening the bell is not a read"
+    );
+    let read: TaskCompletionInboxEntryResponse = serde_json::from_value(
+        rpc(
+            &processor,
+            a,
+            &mut a_rx,
+            methods::TASK_COMPLETION_INBOX_READ,
+            params.clone(),
+        )
+        .await
+        .result,
+    )
+    .unwrap();
+    assert_eq!(read.unread_count, 0);
+    assert!(read.entry.read_at.is_some());
+    let thread_reads = db
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT COUNT(*) count FROM thread_read_cursor WHERE thread_id='T0000000000000000000I'",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        thread_reads.try_get::<i64>("", "count").unwrap(),
+        0,
+        "inbox read must not mark thread contents read"
+    );
+    let changed =
+        recv_notification_by_method(&mut a2_rx, events::TASK_COMPLETION_INBOX_CHANGED).await;
+    assert_eq!(
+        changed.params.as_ref().unwrap()["workspaceId"],
+        workspace_id
+    );
+    assert!(
+        b_rx.try_recv().is_err(),
+        "personal read does not notify other principals"
+    );
+    let same_user: TaskCompletionInboxEntryResponse = serde_json::from_value(
+        rpc(
+            &processor,
+            a2,
+            &mut a2_rx,
+            methods::TASK_COMPLETION_INBOX_GET,
+            params.clone(),
+        )
+        .await
+        .result,
+    )
+    .unwrap();
+    assert!(same_user.entry.read_at.is_some());
+    let other: TaskCompletionInboxEntryResponse = serde_json::from_value(
+        rpc(
+            &processor,
+            b,
+            &mut b_rx,
+            methods::TASK_COMPLETION_INBOX_GET,
+            params.clone(),
+        )
+        .await
+        .result,
+    )
+    .unwrap();
+    assert_eq!(other.unread_count, 1);
+    assert!(other.entry.read_at.is_none());
+    // Completion hints use workspace connections; no thread subscription was
+    // established on any of these devices.
+    for payload in [
+        TaskEventPayload::RunCompleted {
+            task_id: "K0000000000000000000I".into(),
+            run_id: "R0000000000000000000I".into(),
+            result: None,
+            completed_at: 1792144800,
+        },
+        TaskEventPayload::TaskCompleted {
+            task_id: "K0000000000000000000I".into(),
+            result: None,
+            completed_at: 1792144800,
+        },
+    ] {
+        let event = crud_store
+            .append_task_event(payload, 1792144800)
+            .await
+            .unwrap();
+        processor.emit_task_event(event.clone()).await.unwrap();
+        processor.emit_task_event(event).await.unwrap();
+    }
+    let _ = recv_notification_by_method(&mut a2_rx, events::TASK_COMPLETION_INBOX_CHANGED).await;
+    let _ = recv_notification_by_method(&mut b_rx, events::TASK_COMPLETION_INBOX_CHANGED).await;
+    let dedup: TaskCompletionInboxListResponse = serde_json::from_value(
+        rpc(
+            &processor,
+            b,
+            &mut b_rx,
+            methods::TASK_COMPLETION_INBOX_LIST,
+            json!({"workspaceId":workspace_id}),
+        )
+        .await
+        .result,
+    )
+    .unwrap();
+    assert_eq!(dedup.entries.len(), 1);
+    assert_eq!(dedup.unread_count, 1);
+    db.execute_unprepared("DELETE FROM thread_membership WHERE principal_id='P0000000000000000000B' AND thread_id='T0000000000000000000I'").await.unwrap();
+    let list: TaskCompletionInboxListResponse = serde_json::from_value(
+        rpc(
+            &processor,
+            b,
+            &mut b_rx,
+            methods::TASK_COMPLETION_INBOX_LIST,
+            json!({"workspaceId":workspace_id}),
+        )
+        .await
+        .result,
+    )
+    .unwrap();
+    assert!(list.entries.is_empty());
+    assert_eq!(list.unread_count, 0);
+    for method in [
+        methods::TASK_COMPLETION_INBOX_GET,
+        methods::TASK_COMPLETION_INBOX_READ,
+    ] {
+        let id = generate_test_request_id("completion-inbox", "denied");
+        processor
+            .process_request_for_connection(
+                b,
+                &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}).to_string(),
+            )
+            .await;
+        assert_eq!(
+            recv_error_by_id(&mut b_rx, &id).await.error.message,
+            "not_found"
+        );
+    }
+}
+
 #[tokio::test]
 async fn opencode_v2_summary_totals_and_native_categories_reach_completion_and_journal_once() {
     use crate::cli_runtime::opencode_session::opencode_summary_result;

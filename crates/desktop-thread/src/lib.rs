@@ -28,6 +28,7 @@ mod task_review;
 mod test_support;
 mod thread;
 mod timeline;
+pub use artifacts::format_local_timestamp;
 pub use thread::{ThreadNavigationEvent, ThreadView, ThreadViewConfig};
 
 pub use ports::{

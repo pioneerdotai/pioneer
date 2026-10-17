@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskCompletionInboxChangedNotification",
+  "description": "An invalidation only: clients reload authoritative rows and count.",
+  "type": "object",
+  "properties": {
+    "workspaceId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspaceId"
+  ]
+}

@@ -389,7 +389,24 @@ impl DesktopShellView {
                 t!("tasks.notifications.empty").to_string(),
                 t!("tasks.notifications.completed").to_string(),
                 t!("tasks.notifications.mark_read").to_string(),
-            ),
+            )
+            .history(
+                t!("tasks.notifications.open").to_string(),
+                t!("tasks.notifications.more").to_string(),
+                t!("tasks.notifications.read").to_string(),
+                t!("tasks.notifications.unread").to_string(),
+                t!("tasks.notifications.retry").to_string(),
+                t!("tasks.notifications.loading_failed").to_string(),
+            )
+            .terminal_statuses(
+                t!("timeline.task.status.failed").to_string(),
+                t!("timeline.task.status.blocked").to_string(),
+                t!("timeline.task.status.cancelled").to_string(),
+                t!("tasks.notifications.timed_out").to_string(),
+            )
+            .time_formatter(|at| {
+                pioneer_desktop_thread::format_local_timestamp(at.saturating_mul(1000))
+            }),
         );
         let task_notifications =
             cx.new(|cx| pioneer_desktop_task_notifications::TaskNotificationView::new(config, cx));

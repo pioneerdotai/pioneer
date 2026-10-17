@@ -33,6 +33,7 @@ pub(crate) mod skills;
 mod summary;
 mod task_agent_executor;
 mod task_artifacts;
+mod task_completion_inbox;
 mod task_delivery;
 mod task_handlers;
 mod tasks;

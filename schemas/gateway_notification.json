@@ -1335,6 +1335,22 @@
       "properties": {
         "kind": {
           "type": "string",
+          "const": "task_completion_inbox_changed"
+        },
+        "params": {
+          "$ref": "#/$defs/TaskCompletionInboxChangedNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "params"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
           "const": "task_tree_changed"
         },
         "params": {
@@ -7650,6 +7666,18 @@
         "complete_on_terminal_run",
         "keep_active_for_recurring",
         "manual"
+      ]
+    },
+    "TaskCompletionInboxChangedNotification": {
+      "description": "An invalidation only: clients reload authoritative rows and count.",
+      "type": "object",
+      "properties": {
+        "workspaceId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspaceId"
       ]
     },
     "TaskComposerWork": {

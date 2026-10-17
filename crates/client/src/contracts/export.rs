@@ -2398,6 +2398,48 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
+            "task_completion_inbox_entry.json",
+            pioneer_protocol::TaskCompletionInboxEntry,
+            Domain::Tasks,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_completion_inbox_list_params.json",
+            pioneer_protocol::TaskCompletionInboxListParams,
+            Domain::Tasks,
+            Kind::Command,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_completion_inbox_list_response.json",
+            pioneer_protocol::TaskCompletionInboxListResponse,
+            Domain::Tasks,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_completion_inbox_entry_params.json",
+            pioneer_protocol::TaskCompletionInboxEntryParams,
+            Domain::Tasks,
+            Kind::Command,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_completion_inbox_entry_response.json",
+            pioneer_protocol::TaskCompletionInboxEntryResponse,
+            Domain::Tasks,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_completion_inbox_changed_notification.json",
+            pioneer_protocol::TaskCompletionInboxChangedNotification,
+            Domain::Tasks,
+            Kind::Event,
+            Stability::Stable
+        ),
+        contract_type!(
             "task_user_notification.json",
             pioneer_protocol::TaskUserNotification,
             Domain::Tasks,
