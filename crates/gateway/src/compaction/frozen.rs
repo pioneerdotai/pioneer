@@ -76,6 +76,14 @@ pub(crate) fn observe_continuity_source_lookups(
 #[derive(Default)]
 struct StoreRestoreState {
     descriptors: std::sync::Mutex<Vec<FrozenHistoryRef>>,
+    literal_pages: std::sync::atomic::AtomicUsize,
+    execution_pages: std::sync::atomic::AtomicUsize,
+    execution_pause: std::sync::Mutex<
+        Option<(
+            std::sync::Arc<tokio::sync::Notify>,
+            std::sync::Arc<tokio::sync::Notify>,
+        )>,
+    >,
 }
 
 #[cfg(test)]
@@ -86,6 +94,32 @@ pub(crate) struct StoreRestoreObserver {
 
 #[cfg(test)]
 impl StoreRestoreObserver {
+    pub(crate) fn page_calls(&self) -> (usize, usize) {
+        use std::sync::atomic::Ordering;
+        (
+            self.state.literal_pages.load(Ordering::SeqCst),
+            self.state.execution_pages.load(Ordering::SeqCst),
+        )
+    }
+
+    pub(crate) fn pause_next_execution_page(
+        &self,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+        let resume = std::sync::Arc::new(tokio::sync::Notify::new());
+        let previous = self
+            .state
+            .execution_pause
+            .lock()
+            .unwrap()
+            .replace((reached.clone(), resume.clone()));
+        assert!(previous.is_none(), "execution pause already installed");
+        (reached, resume)
+    }
+
     pub(crate) fn calls(&self) -> usize {
         self.state.descriptors.lock().unwrap().len()
     }
@@ -124,6 +158,33 @@ pub(crate) fn observe_store_restores(store: &CrudStore, workspace: &str) -> Stor
         "store restore observer already installed"
     );
     StoreRestoreObserver { key, state }
+}
+
+// Observe the page wrappers so both capture and descriptor restoration count.
+// The optional pause owns no database capacity and is scoped to this observer.
+#[cfg(test)]
+async fn observe_restore_page(store: &CrudStore, workspace: &str, execution: bool) {
+    let state = STORE_RESTORE_CALLS
+        .lock()
+        .unwrap()
+        .get(&(
+            store.database_connection().runtime_identity(),
+            workspace.to_owned(),
+        ))
+        .and_then(std::sync::Weak::upgrade);
+    if let Some(state) = state {
+        use std::sync::atomic::Ordering;
+        if execution {
+            state.execution_pages.fetch_add(1, Ordering::SeqCst);
+            let pause = state.execution_pause.lock().unwrap().take();
+            if let Some((reached, resume)) = pause {
+                reached.notify_one();
+                resume.notified().await;
+            }
+        } else {
+            state.literal_pages.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 
 /// Extend trusted execution scope by the TaskRun's durably accepted parent
@@ -3276,9 +3337,76 @@ async fn capture_with_imports_prepared_using_renderer(
             Ok::<_, anyhow::Error>((references, digest))
         })
         .await?;
-        let (verified_messages, accepted_scopes) =
+        // Identity and ordered imports depend only on the built references and
+        // prepared grants, not on payload projection. Select before verifying so
+        // a hit authenticates the stored manifest and restores its payloads once.
+        let mut accepted = Vec::new();
+        for (ordinal, reference) in references.iter().enumerate() {
+            for source in &reference.sources {
+                if let Some(prepared) = imports.get(&ScopedHistorySource {
+                    thread: reference.source_thread.clone(),
+                    source: source.clone(),
+                }) {
+                    accepted.extend(
+                        prepared
+                            .iter()
+                            .cloned()
+                            .map(|prepared| (ordinal as u64, prepared)),
+                    );
+                }
+            }
+        }
+        let import_digest = pioneer_crud::compaction::frozen_import_identity(&accepted)?;
+        let identity_sha256 = hex::encode(digest.finalize());
+        let descriptor = FrozenHistoryRef {
+            format: 1,
+            manifest_id: format!("fh_{}", uuid::Uuid::new_v4().simple()),
+            messages: references.len() as u64,
+            identity_sha256,
+        };
+        let existing = scope_current_stage(Stage::HistoryFreezePersist, async {
+            store
+                .compaction_equivalent_frozen_history(
+                    workspace,
+                    owner_thread,
+                    &descriptor,
+                    accepted.len() as u64,
+                    &import_digest,
+                )
+                .await
+        })
+        .await?;
+        let (descriptor, references, frozen_hold, verified_messages, accepted_scopes) =
             scope_current_stage(Stage::HistoryFreezeVerify, async {
-                let mut verified_messages = Vec::with_capacity(messages.len());
+                let (descriptor, references, frozen_hold) = if let Some(existing) = existing {
+                    // Keep this outer hold through verification and the handoff.
+                    // Lookup/acquire races fail closed, without recapture or retry.
+                    let frozen_hold = store
+                        .compaction_acquire_frozen_history(workspace, &existing)
+                        .await?;
+                    let (_, references) = frozen_manifest_references(
+                        store,
+                        workspace,
+                        Some(owner_thread),
+                        &existing,
+                        Some(allowed_threads),
+                    )
+                    .await?;
+                    let _ = read_accepted_imports(
+                        store,
+                        workspace,
+                        owner_thread,
+                        &existing,
+                        &references,
+                        None,
+                        &mut checkpoint_graphs,
+                    )
+                    .await?;
+                    (existing, references, Some(frozen_hold))
+                } else {
+                    (descriptor, references, None)
+                };
+                let mut verified_messages = Vec::with_capacity(references.len());
                 let mut restore_state = FrozenExecutionRestoreState::from_references(
                     store,
                     workspace,
@@ -3324,59 +3452,21 @@ async fn capture_with_imports_prepared_using_renderer(
                     &mut checkpoint_graphs,
                 )
                 .await?;
-                Ok::<_, anyhow::Error>((verified_messages, accepted_scopes))
+                Ok::<_, anyhow::Error>((
+                    descriptor,
+                    references,
+                    frozen_hold,
+                    verified_messages,
+                    accepted_scopes,
+                ))
             })
             .await?;
-        let mut accepted = Vec::new();
-        for (ordinal, reference) in references.iter().enumerate() {
-            for source in &reference.sources {
-                if let Some(prepared) = imports.get(&ScopedHistorySource {
-                    thread: reference.source_thread.clone(),
-                    source: source.clone(),
-                }) {
-                    accepted.extend(
-                        prepared
-                            .iter()
-                            .cloned()
-                            .map(|prepared| (ordinal as u64, prepared)),
-                    );
-                }
-            }
-        }
-        let import_digest = pioneer_crud::compaction::frozen_import_identity(&accepted)?;
-        let identity_sha256 = hex::encode(digest.finalize());
-        let descriptor = FrozenHistoryRef {
-            format: 1,
-            manifest_id: format!("fh_{}", uuid::Uuid::new_v4().simple()),
-            messages: references.len() as u64,
-            identity_sha256,
-        };
         scope_current_stage(Stage::HistoryFreezePersist, async {
-            if let Some(existing) = store
-                .compaction_equivalent_frozen_history(
-                    workspace,
-                    owner_thread,
-                    &descriptor,
-                    accepted.len() as u64,
-                    &import_digest,
-                )
-                .await?
-            {
-                let frozen_hold = store
-                    .compaction_acquire_frozen_history(workspace, &existing)
-                    .await?;
-                let messages = restore_model_with_resolver(
-                    store,
-                    workspace,
-                    allowed_threads,
-                    &existing,
-                    &mut checkpoint_graphs,
-                )
-                .await?;
+            if let Some(frozen_hold) = frozen_hold {
                 return Ok(PreparedHistory {
                     frozen_hold: Some(frozen_hold),
-                    descriptor: existing,
-                    messages,
+                    descriptor,
+                    messages: verified_messages,
                     accepted_scopes,
                     source_epochs: BTreeMap::new(),
                     expected_checkpoint: None,
@@ -5960,59 +6050,6 @@ async fn restore_with_resolver(
     .await
 }
 
-async fn restore_model_with_resolver(
-    store: &CrudStore,
-    workspace: &str,
-    allowed_threads: &BTreeSet<String>,
-    descriptor: &FrozenHistoryRef,
-    checkpoint_graphs: &mut super::coverage::CheckpointGraphResolver,
-) -> Result<Vec<ChatMessage>> {
-    let _frozen_hold = store
-        .compaction_acquire_frozen_history(workspace, descriptor)
-        .await?;
-    scope_current_stage(Stage::HistoryRestoreModel, async {
-        let (owner, references) =
-            frozen_manifest_references(store, workspace, None, descriptor, Some(allowed_threads))
-                .await?;
-        let _ = read_accepted_imports(
-            store,
-            workspace,
-            &owner,
-            descriptor,
-            &references,
-            None,
-            checkpoint_graphs,
-        )
-        .await?;
-        let mut state = FrozenExecutionRestoreState::from_references(
-            store,
-            workspace,
-            allowed_threads,
-            &references,
-            checkpoint_graphs,
-        )
-        .await?;
-        let mut messages = Vec::with_capacity(references.len());
-        for page in references.chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize) {
-            messages.extend(
-                restore_execution_entries_page(
-                    store,
-                    workspace,
-                    allowed_threads,
-                    page,
-                    checkpoint_graphs,
-                    &mut state,
-                )
-                .await?
-                .into_iter()
-                .flatten(),
-            );
-        }
-        Ok(messages)
-    })
-    .await
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FrozenRestoreProjection {
     Literal,
@@ -6286,6 +6323,8 @@ async fn restore_entries_page(
     references: &[FrozenMessageRef],
     checkpoint_graphs: &mut super::coverage::CheckpointGraphResolver,
 ) -> Result<Vec<ChatMessage>> {
+    #[cfg(test)]
+    observe_restore_page(store, workspace, false).await;
     let mut state = FrozenExecutionRestoreState::default();
     let restored = restore_entries_page_with_projection(
         store,
@@ -6313,6 +6352,8 @@ async fn restore_execution_entries_page(
     checkpoint_graphs: &mut super::coverage::CheckpointGraphResolver,
     state: &mut FrozenExecutionRestoreState,
 ) -> Result<Vec<Option<ChatMessage>>> {
+    #[cfg(test)]
+    observe_restore_page(store, workspace, true).await;
     restore_entries_page_with_projection(
         store,
         workspace,
