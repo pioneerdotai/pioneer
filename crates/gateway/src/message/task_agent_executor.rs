@@ -1100,6 +1100,12 @@ async fn close_admitted_task_turn_on_error_with_start_failure<T>(
             thread_id,
             turn_id,
             failure_class = "task_turn_admission_close_failed",
+            failure_phase = "secondary_admission_cleanup",
+            original_stage = start_failure.map(|failure| failure.stage.label()),
+            original_cause = start_failure.map(|failure| failure.cause.label()),
+            original_reason =
+                start_failure.and_then(|failure| failure.reason.map(|reason| reason.label())),
+            correlation_id = start_failure.and_then(|failure| failure.correlation_id.as_deref()),
             "failed to durably close task turn after admission failure"
         );
     }
