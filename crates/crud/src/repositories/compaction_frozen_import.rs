@@ -416,10 +416,43 @@ async fn prepare_preview_archive_guards(
     let Some(projection) = &record.preview_archive else {
         return Ok(None);
     };
-    let row=store.connection.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "SELECT r.reference_json,r.archive_wire_sha256,m.reference_json AS output_reference_json FROM html_preview_frozen_result r JOIN compaction_frozen_history h ON h.id=r.manifest_id JOIN compaction_frozen_message m ON m.manifest_id=r.manifest_id AND m.ordinal=r.ordinal WHERE r.manifest_id=?1 AND r.ordinal=?2 AND h.workspace_id=?3 AND h.owner_thread=?4 AND h.ready=1 AND h.expired=0 AND r.source_id=?5 AND r.source_version=?6 AND length(CAST(r.reference_json AS BLOB))<=262144 AND m.bytes BETWEEN 0 AND 262144 AND length(CAST(m.reference_json AS BLOB))=m.bytes",
-        vec![record.output_manifest.clone().into(),i64::try_from(record.output_ordinal)?.into(),workspace.into(),record.source_thread.clone().into(),record.source.id.clone().into(),record.source.version.clone().into()])).await?
-        .ok_or_else(||anyhow::anyhow!("archival preview grant receipt is unavailable"))?;
+    use super::html_preview_retention::queries;
+    use pioneer_entity::{
+        compaction_source_revision as revision, html_preview_frozen_result as receipt, thread,
+        turn, turn_llm_context as context,
+    };
+    use queries::{bytes, col};
+    let base = queries::archive_receipt(
+        workspace,
+        &record.source_thread,
+        &record.output_manifest,
+        i64::try_from(record.output_ordinal)?,
+    );
+    let query = base
+        .clone()
+        .clear_selects()
+        .columns([
+            ("r", receipt::Column::ReferenceJson),
+            ("r", receipt::Column::ArchiveWireSha256),
+        ])
+        .expr_as(
+            col("m", compaction_frozen_message::Column::ReferenceJson),
+            "output_reference_json",
+        )
+        .and_where(col("r", receipt::Column::SourceId).eq(&record.source.id))
+        .and_where(col("r", receipt::Column::SourceVersion).eq(&record.source.version))
+        .and_where(bytes(col("r", receipt::Column::ReferenceJson)).lte(262144))
+        .and_where(col("m", compaction_frozen_message::Column::Bytes).between(0, 262144))
+        .and_where(
+            bytes(col("m", compaction_frozen_message::Column::ReferenceJson))
+                .eq(col("m", compaction_frozen_message::Column::Bytes)),
+        )
+        .to_owned();
+    let row = store
+        .connection
+        .query_one(&query)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("archival preview grant receipt is unavailable"))?;
     let json: String = row.try_get("", "reference_json")?;
     let original: FrozenMessageRef = serde_json::from_str(&json)?;
     original.validate()?;
@@ -450,26 +483,30 @@ async fn prepare_preview_archive_guards(
             && projection.wire_sha256 == row.try_get::<String>("", "archive_wire_sha256")?,
         "archival preview grant does not match its exact diagnostic"
     );
-    let common = "SELECT 1 FROM html_preview_frozen_result r JOIN compaction_frozen_history h ON h.id=r.manifest_id JOIN compaction_frozen_message m ON m.manifest_id=r.manifest_id AND m.ordinal=r.ordinal WHERE r.manifest_id=?1 AND r.ordinal=?2 AND h.workspace_id=?3 AND h.owner_thread=?4 AND h.ready=1 AND h.expired=0 AND r.reference_json=?5 AND r.archive_wire_sha256=?6 AND m.reference_json=?7";
-    let values: Vec<sea_orm::Value> = vec![
-        record.output_manifest.clone().into(),
-        i64::try_from(record.output_ordinal)?.into(),
-        workspace.into(),
-        record.source_thread.clone().into(),
-        json.into(),
-        projection.wire_sha256.clone().into(),
-        output_reference_json.into(),
-    ];
-    let historical = Statement::from_sql_and_values(DbBackend::Sqlite, common, values.clone());
-    let mut current_values = values;
-    current_values.push(projection.source.version.clone().into());
-    let current = Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        format!(
-            "{common} AND EXISTS(SELECT 1 FROM turn_llm_context c JOIN compaction_source_revision v ON v.source_id=c.id JOIN turn t ON t.id=c.turn_id JOIN thread th ON th.id=t.thread_id WHERE c.id=r.source_id AND c.turn_id=r.turn_id AND c.source='tool_result_v2' AND c.tool_name='html_preview' AND v.present=1 AND 'revision:'||v.revision=?8 AND th.workspace_id=?3 AND t.thread_id=?4 AND EXISTS(SELECT 1 FROM artifact a WHERE a.workspace_id=?3 AND a.created_by_kind='tool' AND a.created_by_actor_id='html_preview' AND CASE WHEN json_valid(a.metadata_json) THEN json_extract(a.metadata_json,'$.htmlTool.retention')='released' AND json_extract(a.metadata_json,'$.htmlTool.turnId')=c.turn_id AND json_extract(a.metadata_json,'$.htmlTool.callId')=c.item_id ELSE 0 END))"
-        ),
-        current_values,
-    );
+    let historical = base
+        .clone()
+        .and_where(col("r", receipt::Column::ReferenceJson).eq(json))
+        .and_where(col("r", receipt::Column::ArchiveWireSha256).eq(&projection.wire_sha256))
+        .and_where(
+            col("m", compaction_frozen_message::Column::ReferenceJson).eq(output_reference_json),
+        )
+        .to_owned();
+    let canonical = queries::canonical_preview()
+        .and_where(col("c", context::Column::Id).eq(col("r", receipt::Column::SourceId)))
+        .and_where(col("c", context::Column::TurnId).eq(col("r", receipt::Column::TurnId)))
+        .and_where(
+            queries::revision(col("v", revision::Column::Revision)).eq(&projection.source.version),
+        )
+        .and_where(col("th", thread::Column::WorkspaceId).eq(workspace))
+        .and_where(col("t", turn::Column::ThreadId).eq(&record.source_thread))
+        .and_where(Expr::exists(queries::released_marker(workspace)))
+        .to_owned();
+    let current = historical
+        .clone()
+        .and_where(Expr::exists(canonical))
+        .to_owned();
+    let historical = store.connection.get_database_backend().build(&historical);
+    let current = store.connection.get_database_backend().build(&current);
     Ok(Some((current, historical)))
 }
 impl FrozenImportRecord {

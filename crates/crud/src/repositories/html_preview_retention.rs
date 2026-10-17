@@ -2,38 +2,29 @@
 //! only unowned canonical preview results may become compact diagnostics.
 use crate::CrudStore;
 use anyhow::{Result, ensure};
-use pioneer_entity::{artifact, artifact_binding, artifact_version, turn_llm_context};
-use sea_orm::{
-    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QuerySelect, Statement,
-    TransactionTrait,
+use pioneer_entity::{
+    artifact, artifact_binding, artifact_blob, artifact_external_ref, artifact_projection,
+    artifact_version, compaction_frozen_history as history, compaction_source_revision,
+    html_preview_frozen_index as frozen_index, html_preview_frozen_result as frozen_result,
+    html_preview_frozen_turn as frozen_turn, html_preview_index_backfill as backfill,
+    thread as thread_entity, turn as turn_entity, turn_input, turn_llm_context,
 };
+use sea_orm::sea_query::{BinOper, Expr, ExprTrait, Func, JoinType, OnConflict, Order, Query};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
+    Set, TransactionTrait,
+};
+#[path = "html_preview_retention_queries.rs"]
+pub(super) mod queries;
+use queries::{bytes, col, json as json_field, revision};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 // Used by every user list, before identity pagination. A separate real binding
 // adopts the artifact; an ordinary screenshot from another tool never matches.
-pub(super) fn temporary_preview_predicate(a: &str) -> String {
-    format!(
-        r#"COALESCE(({a}.created_by_kind='tool' AND {a}.created_by_actor_id='html_preview'
-AND CASE WHEN json_valid({a}.metadata_json) THEN
- json_type({a}.metadata_json,'$.htmlTool.version')='integer'
- AND json_type({a}.metadata_json,'$.htmlTool.publication')='false'
- AND json_extract(CASE WHEN json_valid({a}.metadata_json) THEN {a}.metadata_json ELSE '{{}}' END,'$.htmlTool.version')=1
- AND json_extract(CASE WHEN json_valid({a}.metadata_json) THEN {a}.metadata_json ELSE '{{}}' END,'$.htmlTool.publication')=0
- AND json_type({a}.metadata_json,'$.htmlTool.turnId')='text'
- AND json_type({a}.metadata_json,'$.htmlTool.callId')='text'
- ELSE 0 END
-AND NOT EXISTS(SELECT 1 FROM artifact_binding adopted WHERE adopted.artifact_id={a}.id AND adopted.workspace_id={a}.workspace_id AND NOT (
- adopted.binding_kind='tool_output' AND adopted.direction='output' AND adopted.role IS 'tool'
- AND adopted.turn_id IS json_extract(CASE WHEN json_valid({a}.metadata_json) THEN {a}.metadata_json ELSE '{{}}' END,'$.htmlTool.turnId')
- AND adopted.tool_call_id IS json_extract(CASE WHEN json_valid({a}.metadata_json) THEN {a}.metadata_json ELSE '{{}}' END,'$.htmlTool.callId')
- AND adopted.thread_id IS {a}.primary_thread_id AND adopted.task_id IS NULL AND adopted.task_run_id IS NULL AND adopted.message_id IS NULL))),0)"#
-    )
-}
-
-fn statement(sql: impl Into<String>, values: Vec<sea_orm::Value>) -> Statement {
-    Statement::from_sql_and_values(DbBackend::Sqlite, sql, values)
+pub(super) fn temporary_preview_predicate(alias: &'static str) -> Expr {
+    queries::temporary_preview(alias)
 }
 
 /// One immutable manifest page per call. Existing logical views include shared
@@ -45,22 +36,100 @@ async fn index_quantum(
     imports: &mut Option<PreviewImportIndex>,
 ) -> Result<bool> {
     let previous_after = after.clone();
-    let row = store.connection.query_one_raw(statement("SELECT h.id,h.workspace_id,h.owner_thread,h.identity_sha256,h.message_count,h.import_count,h.imports_sha256,h.ready,h.expired,COALESCE(i.next_ordinal,0) AS next_ordinal,COALESCE(i.complete,0) AS complete,COALESCE(i.unknown,0) AS unknown FROM compaction_frozen_history h LEFT JOIN html_preview_frozen_index i ON i.manifest_id=h.id WHERE h.id>?1 ORDER BY h.id LIMIT 1",vec![after.as_str().into()])).await?;
+    let query = Query::select()
+        .columns([
+            ("h", history::Column::Id),
+            ("h", history::Column::WorkspaceId),
+            ("h", history::Column::OwnerThread),
+            ("h", history::Column::IdentitySha256),
+            ("h", history::Column::MessageCount),
+            ("h", history::Column::ImportCount),
+            ("h", history::Column::ImportsSha256),
+            ("h", history::Column::Ready),
+            ("h", history::Column::Expired),
+        ])
+        .expr_as(
+            Func::coalesce([col("i", frozen_index::Column::NextOrdinal), Expr::val(0)]),
+            "next_ordinal",
+        )
+        .expr_as(
+            Func::coalesce([col("i", frozen_index::Column::Complete), Expr::val(0)]),
+            "complete",
+        )
+        .expr_as(
+            Func::coalesce([col("i", frozen_index::Column::Unknown), Expr::val(0)]),
+            "unknown",
+        )
+        .from_as(history::Entity, "h")
+        .join_as(
+            JoinType::LeftJoin,
+            frozen_index::Entity,
+            "i",
+            col("i", frozen_index::Column::ManifestId).eq(col("h", history::Column::Id)),
+        )
+        .and_where(col("h", history::Column::Id).gt(after.as_str()))
+        .order_by(("h", history::Column::Id), Order::Asc)
+        .limit(1)
+        .to_owned();
+    let row = store.connection.query_one(&query).await?;
     let Some(row) = row else {
         // Every old header was visited. Header triggers cover every insertion,
         // update, key change and deletion concurrent with this keyset traversal.
-        store.run_serialized_write(||async {
-            store.connection.execute_unprepared("UPDATE html_preview_index_backfill SET complete=1 WHERE singleton=1 AND complete=0").await?;
-            Ok(())
-        }).await?;
+        store
+            .run_serialized_write(|| async {
+                backfill::Entity::update_many()
+                    .col_expr(backfill::Column::Complete, Expr::val(1))
+                    .filter(backfill::Column::Singleton.eq(1))
+                    .filter(backfill::Column::Complete.eq(0))
+                    .exec(&store.connection)
+                    .await?;
+                Ok(())
+            })
+            .await?;
         after.clear();
         return Ok(false);
     };
     let discovered_id: String = row.try_get("", "id")?;
-    store.run_serialized_write(||async {
-        store.connection.execute_raw(statement("INSERT INTO html_preview_frozen_index(manifest_id,workspace_id,identity_sha256,message_count,ready,expired) SELECT id,workspace_id,identity_sha256,message_count,ready,expired FROM compaction_frozen_history WHERE id=?1 ON CONFLICT DO NOTHING",vec![discovered_id.clone().into()])).await?;
-        Ok(())
-    }).await?;
+    store
+        .run_serialized_write(|| async {
+            store
+                .connection
+                .execute(
+                    &Query::insert()
+                        .into_table(frozen_index::Entity)
+                        .columns([
+                            frozen_index::Column::ManifestId,
+                            frozen_index::Column::WorkspaceId,
+                            frozen_index::Column::IdentitySha256,
+                            frozen_index::Column::MessageCount,
+                            frozen_index::Column::Ready,
+                            frozen_index::Column::Expired,
+                        ])
+                        .select_from(
+                            history::Entity::find()
+                                .select_only()
+                                .columns([
+                                    history::Column::Id,
+                                    history::Column::WorkspaceId,
+                                    history::Column::IdentitySha256,
+                                    history::Column::MessageCount,
+                                    history::Column::Ready,
+                                    history::Column::Expired,
+                                ])
+                                .filter(history::Column::Id.eq(&discovered_id))
+                                .into_query(),
+                        )?
+                        .on_conflict(
+                            OnConflict::column(frozen_index::Column::ManifestId)
+                                .do_nothing()
+                                .to_owned(),
+                        )
+                        .to_owned(),
+                )
+                .await?;
+            Ok(())
+        })
+        .await?;
     *after = row.try_get("", "id")?;
     // Older derived markers treated every import stream as opaque. Revisit
     // these metadata-only markers; they remain unsafe until fully verified.
@@ -69,9 +138,20 @@ async fn index_quantum(
         && row.try_get::<i64>("", "unknown")? == 1
         && row.try_get::<i64>("", "import_count")? > 0
     {
-        store.run_serialized_write(||async {
-            store.connection.execute_raw(statement("UPDATE html_preview_frozen_index SET next_ordinal=0,complete=0,unknown=0 WHERE manifest_id=?1 AND unknown=1 AND expired=0",vec![discovered_id.clone().into()])).await?;Ok(())
-        }).await?;
+        store
+            .run_serialized_write(|| async {
+                frozen_index::Entity::update_many()
+                    .col_expr(frozen_index::Column::NextOrdinal, Expr::val(0))
+                    .col_expr(frozen_index::Column::Complete, Expr::val(0))
+                    .col_expr(frozen_index::Column::Unknown, Expr::val(0))
+                    .filter(frozen_index::Column::ManifestId.eq(&discovered_id))
+                    .filter(frozen_index::Column::Unknown.eq(1))
+                    .filter(frozen_index::Column::Expired.eq(0))
+                    .exec(&store.connection)
+                    .await?;
+                Ok(())
+            })
+            .await?;
         *imports = None;
         *after = previous_after;
         return Ok(true);
@@ -172,23 +252,89 @@ async fn index_quantum(
     if unknown {
         tracing::warn!("HTML preview retention preserved an unknown frozen media scope");
     }
-    store.run_serialized_write(|| async {
-        let tx = store.connection.begin().await?;
-        let header = tx.query_one_raw(statement("SELECT 1 AS present FROM compaction_frozen_history WHERE id=?1 AND workspace_id=?2 AND owner_thread=?3 AND ready=1 AND expired=0 AND message_count=?4 AND next_ordinal=message_count AND identity_sha256=?5",vec![id.clone().into(),workspace.clone().into(),owner.clone().into(),count.into(),identity.clone().into()])).await?;
-        if header.is_none() { tx.rollback().await?; return Ok(()); }
-        let changed=tx.execute_raw(statement("UPDATE html_preview_frozen_index SET next_ordinal=?2,complete=?3,unknown=?4 WHERE manifest_id=?1 AND next_ordinal=?5 AND complete=0 AND unknown=0",vec![id.clone().into(),end.into(),i64::from(end==count && row.try_get::<i64>("","import_count")?==0).into(),i64::from(unknown).into(),next.into()])).await?.rows_affected();
-        if changed == 1 {
-            for turn in &turns {
-                tx.execute_raw(statement("INSERT INTO html_preview_frozen_turn(manifest_id,turn_id) VALUES(?1,?2) ON CONFLICT DO NOTHING",vec![id.clone().into(),turn.clone().into()])).await?;
+    store
+        .run_serialized_write(|| async {
+            let tx = store.connection.begin().await?;
+            let header = history::Entity::find_by_id(&id)
+                .filter(history::Column::WorkspaceId.eq(&workspace))
+                .filter(history::Column::OwnerThread.eq(&owner))
+                .filter(history::Column::Ready.eq(1))
+                .filter(history::Column::Expired.eq(0))
+                .filter(history::Column::MessageCount.eq(count))
+                .filter(
+                    Expr::col(history::Column::NextOrdinal)
+                        .eq(Expr::col(history::Column::MessageCount)),
+                )
+                .filter(history::Column::IdentitySha256.eq(&identity))
+                .one(&tx)
+                .await?;
+            if header.is_none() {
+                tx.rollback().await?;
+                return Ok(());
             }
-            for (ordinal, reference, source) in &results {
-                let turn = source.scope.strip_prefix("context:").expect("prepared context source");
-                tx.execute_raw(statement("INSERT INTO html_preview_frozen_result(manifest_id,ordinal,reference_json,turn_id,source_id,source_version) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT DO NOTHING",vec![id.clone().into(),(*ordinal).into(),reference.clone().into(),turn.into(),source.id.clone().into(),source.version.clone().into()])).await?;
+            let changed = frozen_index::Entity::update_many()
+                .col_expr(frozen_index::Column::NextOrdinal, Expr::val(end))
+                .col_expr(
+                    frozen_index::Column::Complete,
+                    Expr::val(i64::from(
+                        end == count && row.try_get::<i64>("", "import_count")? == 0,
+                    )),
+                )
+                .col_expr(frozen_index::Column::Unknown, Expr::val(i64::from(unknown)))
+                .filter(frozen_index::Column::ManifestId.eq(&id))
+                .filter(frozen_index::Column::NextOrdinal.eq(next))
+                .filter(frozen_index::Column::Complete.eq(0))
+                .filter(frozen_index::Column::Unknown.eq(0))
+                .exec(&tx)
+                .await?
+                .rows_affected;
+            if changed == 1 {
+                for turn in &turns {
+                    frozen_turn::Entity::insert(frozen_turn::ActiveModel {
+                        manifest_id: Set(id.clone()),
+                        turn_id: Set(turn.clone()),
+                    })
+                    .on_conflict(
+                        OnConflict::columns([
+                            frozen_turn::Column::ManifestId,
+                            frozen_turn::Column::TurnId,
+                        ])
+                        .do_nothing()
+                        .to_owned(),
+                    )
+                    .exec_without_returning(&tx)
+                    .await?;
+                }
+                for (ordinal, reference, source) in &results {
+                    let turn = source
+                        .scope
+                        .strip_prefix("context:")
+                        .expect("prepared context source");
+                    frozen_result::Entity::insert(frozen_result::ActiveModel {
+                        manifest_id: Set(id.clone()),
+                        ordinal: Set(*ordinal),
+                        reference_json: Set(reference.clone()),
+                        turn_id: Set(turn.to_owned()),
+                        source_id: Set(source.id.clone()),
+                        source_version: Set(source.version.clone()),
+                        archive_wire_sha256: Set(None),
+                    })
+                    .on_conflict(
+                        OnConflict::columns([
+                            frozen_result::Column::ManifestId,
+                            frozen_result::Column::Ordinal,
+                        ])
+                        .do_nothing()
+                        .to_owned(),
+                    )
+                    .exec_without_returning(&tx)
+                    .await?;
+                }
             }
-        }
-        tx.commit().await?;
-        Ok(())
-    }).await?;
+            tx.commit().await?;
+            Ok(())
+        })
+        .await?;
     if !unknown && (end < count || row.try_get::<i64>("", "import_count")? > 0) {
         *after = previous_after;
     }
@@ -324,9 +470,45 @@ async fn index_import_quantum(
         }
     };
     let done = state.next == count || unknown;
-    store.run_serialized_write(||async {
-        store.connection.execute_raw(statement("UPDATE html_preview_frozen_index SET complete=?2,unknown=?3 WHERE manifest_id=?1 AND complete=0 AND unknown=0 AND next_ordinal=?7 AND identity_sha256=?6 AND workspace_id=?4 AND ready=1 AND expired=0 AND EXISTS(SELECT 1 FROM compaction_frozen_history h WHERE h.id=?1 AND h.workspace_id=?4 AND h.owner_thread=?5 AND h.ready=1 AND h.expired=0 AND h.identity_sha256=?6 AND h.message_count=?7 AND h.next_ordinal=h.message_count AND h.import_count=?8 AND h.next_import=h.import_count AND h.imports_sha256=?9)",vec![id.clone().into(),i64::from(done && !unknown).into(),i64::from(unknown).into(),workspace.clone().into(),owner.clone().into(),identity.clone().into(),messages.into(),i64::try_from(count)?.into(),expected.clone().into()])).await?;Ok(())
-    }).await?;
+    let header = history::Entity::find()
+        .select_only()
+        .column(history::Column::Id)
+        .filter(history::Column::Id.eq(&id))
+        .filter(history::Column::WorkspaceId.eq(&workspace))
+        .filter(history::Column::OwnerThread.eq(&owner))
+        .filter(history::Column::Ready.eq(1))
+        .filter(history::Column::Expired.eq(0))
+        .filter(history::Column::IdentitySha256.eq(&identity))
+        .filter(history::Column::MessageCount.eq(messages))
+        .filter(
+            Expr::col(history::Column::NextOrdinal).eq(Expr::col(history::Column::MessageCount)),
+        )
+        .filter(history::Column::ImportCount.eq(i64::try_from(count)?))
+        .filter(Expr::col(history::Column::NextImport).eq(Expr::col(history::Column::ImportCount)))
+        .filter(history::Column::ImportsSha256.eq(&expected))
+        .into_query();
+    store
+        .run_serialized_write(|| async {
+            frozen_index::Entity::update_many()
+                .col_expr(
+                    frozen_index::Column::Complete,
+                    Expr::val(i64::from(done && !unknown)),
+                )
+                .col_expr(frozen_index::Column::Unknown, Expr::val(i64::from(unknown)))
+                .filter(frozen_index::Column::ManifestId.eq(&id))
+                .filter(frozen_index::Column::Complete.eq(0))
+                .filter(frozen_index::Column::Unknown.eq(0))
+                .filter(frozen_index::Column::NextOrdinal.eq(messages))
+                .filter(frozen_index::Column::IdentitySha256.eq(&identity))
+                .filter(frozen_index::Column::WorkspaceId.eq(&workspace))
+                .filter(frozen_index::Column::Ready.eq(1))
+                .filter(frozen_index::Column::Expired.eq(0))
+                .filter(Expr::exists(header.clone()))
+                .exec(&store.connection)
+                .await?;
+            Ok(())
+        })
+        .await?;
     if done {
         *progress = None;
     }
@@ -344,36 +526,9 @@ async fn unowned<C: ConnectionTrait>(
     root_execution: &str,
     readers: &crate::frozen_lifetime::ReaderCounts,
 ) -> Result<bool> {
-    let row = db.query_one_raw(statement(r#"SELECT 1 AS safe
-WHERE EXISTS(SELECT 1 FROM turn t JOIN thread th ON th.id=t.thread_id WHERE t.id=?3 AND t.thread_id=?2 AND th.workspace_id=?1 AND t.status IN ('completed','failed','interrupted'))
-AND NOT EXISTS(SELECT 1 FROM turn t JOIN thread th ON th.id=t.thread_id WHERE th.workspace_id=?1 AND t.status NOT IN ('completed','failed','interrupted'))
-AND NOT EXISTS(SELECT 1 FROM turn_runtime_snapshot WHERE workspace_id=?1 OR workspace_id='' OR turn_id=?3)
-AND NOT EXISTS(SELECT 1 FROM turn_llm_context WHERE turn_id=?3 AND source NOT IN ('assistant_round','tool_result_v2'))
-AND NOT EXISTS(SELECT 1 FROM recovery_job WHERE turn_id=?3 AND status NOT IN ('succeeded','failed','exhausted','cancelled'))
-AND NOT EXISTS(SELECT 1 FROM recovery_job WHERE turn_id=?3 AND resolution_pending=1)
-AND NOT EXISTS(SELECT 1 FROM recovery_terminalization_outbox WHERE turn_id=?3 AND status NOT IN ('delivered','cancelled'))
-AND NOT EXISTS(SELECT 1 FROM turn_finalization WHERE turn_id=?3 AND status='prepared')
-AND NOT EXISTS(SELECT 1 FROM native_terminal_effect_outbox WHERE turn_id=?3 AND status NOT IN ('succeeded','discarded','superseded'))
-AND NOT EXISTS(SELECT 1 FROM turn_event_delivery WHERE turn_id=?3 AND status NOT IN ('delivered','exhausted'))
-AND NOT EXISTS(SELECT 1 FROM task_run_turn r LEFT JOIN task_run tr ON tr.id=r.run_id LEFT JOIN task t ON t.id=tr.task_id WHERE r.turn_id=?3 AND (tr.id IS NULL OR t.id IS NULL OR t.status<>'completed'))
-AND NOT EXISTS(SELECT 1 FROM task_run_turn r JOIN task_delivery d ON d.task_id=r.task_id AND d.run_id=r.run_id WHERE r.turn_id=?3 AND d.status NOT IN ('delivered','failed','cancelled'))
-AND NOT EXISTS(SELECT 1 FROM agent_turn_response_execution r LEFT JOIN agent_execution e ON e.id=r.execution_id WHERE r.turn_id=?3 AND e.id IS NULL)
-AND NOT EXISTS(SELECT 1 FROM agent_execution e WHERE (e.id=?4 OR EXISTS(SELECT 1 FROM agent_turn_response_execution r WHERE r.turn_id=?3 AND r.execution_id=e.id)) AND e.status NOT IN ('completed','succeeded','failed','cancelled','timed_out'))
-AND NOT EXISTS(SELECT 1 FROM agent_execution_resource_state s WHERE (s.execution_id=?4 OR EXISTS(SELECT 1 FROM agent_turn_response_execution r WHERE r.turn_id=?3 AND r.execution_id=s.execution_id)) AND s.status NOT IN ('completed','failed','cancelled'))
-AND NOT EXISTS(SELECT 1 FROM task_run_conversation_snapshot s LEFT JOIN task t ON t.id=s.task_id WHERE (s.workspace_id=?1 OR s.workspace_id='' OR t.workspace_id=?1) AND (s.frozen_manifest_id='' OR (s.frozen_manifest_id IS NULL AND s.history_json<>'[]')) AND (t.id IS NULL OR t.status<>'completed'))
-AND NOT EXISTS(SELECT 1 FROM thread_cli_runtime_binding WHERE (workspace_id=?1 OR workspace_id='') AND (frozen_manifest_id='' OR (frozen_manifest_id IS NULL AND CASE WHEN json_valid(resume_cursor_json) THEN COALESCE(json_extract(resume_cursor_json,'$.pioneerContext.contextHistoryJson'),'[]')<>'[]' ELSE 1 END)))
-AND NOT EXISTS(SELECT 1 FROM turn_cli_runtime_binding WHERE (workspace_id=?1 OR workspace_id='') AND (frozen_manifest_id='' OR (frozen_manifest_id IS NULL AND CASE WHEN json_valid(input_mapping_json) THEN COALESCE(json_extract(input_mapping_json,'$.pioneerContextBasis.historyJson'),'[]')<>'[]' ELSE 1 END)))
-AND EXISTS(SELECT 1 FROM html_preview_index_backfill WHERE singleton=1 AND complete=1 AND inputs_complete=1)
-AND NOT EXISTS(SELECT 1 FROM html_preview_frozen_index WHERE workspace_id=?1 AND expired=0 AND (ready<>1 OR complete<>1 OR unknown<>0))
-AND NOT EXISTS(SELECT 1 FROM html_preview_frozen_turn p JOIN compaction_frozen_history h ON h.id=p.manifest_id WHERE p.turn_id=?3 AND h.workspace_id=?1 AND h.expired=0 AND (
- NOT EXISTS(SELECT 1 FROM compaction_task_output o JOIN task t ON t.id=o.task_id WHERE o.manifest_id=h.id AND t.status='completed')
- OR EXISTS(SELECT 1 FROM task_run_conversation_snapshot s LEFT JOIN task t ON t.id=s.task_id WHERE s.frozen_manifest_id=h.id AND (t.id IS NULL OR t.status<>'completed'))
- OR EXISTS(SELECT 1 FROM turn_runtime_snapshot s WHERE s.frozen_manifest_id=h.id)
- OR EXISTS(SELECT 1 FROM thread_cli_runtime_binding s WHERE s.frozen_manifest_id=h.id)
- OR EXISTS(SELECT 1 FROM turn_cli_runtime_binding s WHERE s.frozen_manifest_id=h.id)
- OR NOT EXISTS(SELECT 1 FROM html_preview_frozen_result r WHERE r.manifest_id=h.id AND r.turn_id=?3)
- OR EXISTS(SELECT 1 FROM html_preview_frozen_result r LEFT JOIN compaction_source_revision v ON v.source_id=r.source_id LEFT JOIN turn_llm_context c ON c.id=r.source_id WHERE r.manifest_id=h.id AND r.turn_id=?3 AND (r.archive_wire_sha256 IS NULL OR v.present IS NOT 1 OR NOT (r.source_version='revision:'||v.revision OR (r.source_version='revision:'||(v.revision-1) AND EXISTS(SELECT 1 FROM artifact a WHERE a.created_by_kind='tool' AND a.created_by_actor_id='html_preview' AND a.workspace_id=?1 AND CASE WHEN json_valid(a.metadata_json) THEN json_extract(a.metadata_json,'$.htmlTool.retention')='released' AND json_extract(a.metadata_json,'$.htmlTool.turnId')=r.turn_id AND json_extract(a.metadata_json,'$.htmlTool.callId')=c.item_id ELSE 0 END)))))))
-"#,vec![workspace.into(),thread.into(),turn.into(),root_execution.into()])).await?;
+    let row = db
+        .query_one(&queries::unowned(workspace, thread, turn, root_execution))
+        .await?;
     if row.is_none() {
         return Ok(false);
     }
@@ -390,7 +545,24 @@ AND NOT EXISTS(SELECT 1 FROM html_preview_frozen_turn p JOIN compaction_frozen_h
         return Ok(false);
     }
     for manifest in held_ids {
-        if db.query_one_raw(statement("SELECT 1 AS held FROM html_preview_frozen_turn p JOIN compaction_frozen_history h ON h.id=p.manifest_id WHERE p.manifest_id=?1 AND p.turn_id=?2 AND h.workspace_id=?3 AND h.expired=0 LIMIT 1",vec![manifest.into(),turn.into(),workspace.into()])).await?.is_some() {return Ok(false);}
+        let held = Query::select()
+            .expr(Expr::val(1))
+            .from_as(frozen_turn::Entity, "p")
+            .join_as(
+                JoinType::InnerJoin,
+                history::Entity,
+                "h",
+                col("h", history::Column::Id).eq(col("p", frozen_turn::Column::ManifestId)),
+            )
+            .and_where(col("p", frozen_turn::Column::ManifestId).eq(manifest))
+            .and_where(col("p", frozen_turn::Column::TurnId).eq(turn))
+            .and_where(col("h", history::Column::WorkspaceId).eq(workspace))
+            .and_where(col("h", history::Column::Expired).eq(0))
+            .limit(1)
+            .to_owned();
+        if db.query_one(&held).await?.is_some() {
+            return Ok(false);
+        }
     }
     Ok(true)
 }
@@ -462,7 +634,20 @@ impl HtmlPreviewRetentionProgress {
         }
     }
     async fn artifact_quantum(&mut self, store: &CrudStore) -> Result<bool> {
-        let row=store.connection.query_one_raw(statement("SELECT id,current_version_id,length(CAST(metadata_json AS BLOB)) AS bytes FROM artifact WHERE id>?1 AND created_by_kind='tool' AND created_by_actor_id='html_preview' ORDER BY id LIMIT 1",vec![self.after.as_str().into()])).await?;
+        let query = artifact::Entity::find()
+            .select_only()
+            .columns([artifact::Column::Id, artifact::Column::CurrentVersionId])
+            .column_as(bytes(Expr::col(artifact::Column::MetadataJson)), "bytes")
+            .filter(artifact::Column::Id.gt(self.after.as_str()))
+            .filter(Expr::col(artifact::Column::CreatedByKind).eq(Expr::Constant("tool".into())))
+            .filter(
+                Expr::col(artifact::Column::CreatedByActorId)
+                    .eq(Expr::Constant("html_preview".into())),
+            )
+            .order_by_asc(artifact::Column::Id)
+            .limit(1)
+            .into_query();
+        let row = store.connection.query_one(&query).await?;
         let Some(row) = row else {
             self.after.clear();
             return Ok(false);
@@ -479,9 +664,7 @@ impl HtmlPreviewRetentionProgress {
             return Ok(true);
         }
         let artifact = artifact::Entity::find_by_id(&self.after)
-            .filter(sea_orm::sea_query::Expr::cust(
-                "length(CAST(metadata_json AS BLOB))<=1048576",
-            ))
+            .filter(bytes(Expr::col(artifact::Column::MetadataJson)).lte(1048576))
             .one(&store.connection)
             .await?;
         let Some(artifact) = artifact else {
@@ -528,15 +711,43 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
     {
         return Ok(());
     }
-    let artifacts = artifact::Entity::find().filter(artifact::Column::WorkspaceId.eq(&candidate.workspace_id))
+    let artifacts = artifact::Entity::find()
+        .filter(artifact::Column::WorkspaceId.eq(&candidate.workspace_id))
         .filter(artifact::Column::PrimaryThreadId.eq(thread))
         // An adopted sibling can revisit this call after the other files retire.
         // Skip only completed retirements; unknown missing-version rows still
         // fail the provenance checks below and preserve their remaining owners.
-        .filter(sea_orm::sea_query::Expr::cust("NOT (artifact.current_version_id IS NULL AND artifact.status='deleted' AND json_extract(CASE WHEN json_valid(artifact.metadata_json) THEN artifact.metadata_json ELSE '{}' END,'$.htmlTool.retention') IS 'released')"))
-        .filter(sea_orm::sea_query::Expr::cust(temporary_preview_predicate("artifact")))
-        .filter(sea_orm::sea_query::Expr::cust_with_values("json_extract(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,'$.htmlTool.turnId')=? AND json_extract(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,'$.htmlTool.callId')=?",[turn,call]))
-        .limit(5).all(&store.connection).await?;
+        .filter(
+            artifact::Column::CurrentVersionId
+                .is_null()
+                .and(artifact::Column::Status.eq("deleted"))
+                .and(
+                    json_field(
+                        Expr::col(artifact::Column::MetadataJson),
+                        "$.htmlTool.retention",
+                    )
+                    .binary(BinOper::Is, Expr::val("released")),
+                )
+                .not(),
+        )
+        .filter(temporary_preview_predicate("artifact"))
+        .filter(
+            json_field(
+                Expr::col(artifact::Column::MetadataJson),
+                "$.htmlTool.turnId",
+            )
+            .eq(turn),
+        )
+        .filter(
+            json_field(
+                Expr::col(artifact::Column::MetadataJson),
+                "$.htmlTool.callId",
+            )
+            .eq(call),
+        )
+        .limit(5)
+        .all(&store.connection)
+        .await?;
     ensure!(artifacts.len() <= 4, "ambiguous preview artifact group");
     if artifacts.is_empty() {
         return Ok(());
@@ -594,7 +805,17 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
     }
     // Canonical call identity is also the existing durable tool item identity.
     // No v2 row is valid for a partial/failed capture; duplicate rows are unknown.
-    let context_ids=store.connection.query_all_raw(statement("SELECT id,length(CAST(payload AS BLOB)) AS bytes FROM turn_llm_context WHERE turn_id=?1 AND item_id=?2 AND source='tool_result_v2' AND tool_name='html_preview' LIMIT 2",vec![turn.into(),call.into()])).await?;
+    let query = turn_llm_context::Entity::find()
+        .select_only()
+        .column(turn_llm_context::Column::Id)
+        .column_as(bytes(Expr::col(turn_llm_context::Column::Payload)), "bytes")
+        .filter(turn_llm_context::Column::TurnId.eq(turn))
+        .filter(turn_llm_context::Column::ItemId.eq(call))
+        .filter(turn_llm_context::Column::Source.eq("tool_result_v2"))
+        .filter(turn_llm_context::Column::ToolName.eq("html_preview"))
+        .limit(2)
+        .into_query();
+    let context_ids = store.connection.query_all(&query).await?;
     ensure!(
         context_ids.len() <= 1,
         "duplicate canonical preview results"
@@ -608,9 +829,7 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
         );
         let id: String = row.try_get("", "id")?;
         let context = turn_llm_context::Entity::find_by_id(id)
-            .filter(sea_orm::sea_query::Expr::cust(
-                "length(CAST(payload AS BLOB))<=524288",
-            ))
+            .filter(bytes(Expr::col(turn_llm_context::Column::Payload)).lte(524288))
             .one(&store.connection)
             .await?
             .ok_or_else(|| anyhow::anyhow!("preview result changed during preparation"))?;
@@ -655,35 +874,141 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
         m["htmlTool"]["releasedCopies"] = json!(copies);
         metadata_updates.push(serde_json::to_string(&m)?);
     }
-    store.run_serialized_write(|| async {
-        let tx=store.connection.begin().await?;
-        if !unowned(&tx,&candidate.workspace_id,thread,turn,&root_execution,&store.frozen_readers).await? { tx.rollback().await?; return Ok(()); }
-        // Recheck mutable adoption/version/identity assumptions inside commit.
-        for ((a,v),b) in artifacts.iter().zip(&versions).zip(&bindings) {
-            ensure!(artifact::Entity::find_by_id(&a.id).one(&tx).await?.as_ref()==Some(a),"preview artifact changed");
-            ensure!(artifact_version::Entity::find().filter(artifact_version::Column::ArtifactId.eq(&a.id)).limit(2).all(&tx).await?==vec![v.clone()],"preview version changed");
-            ensure!(artifact_binding::Entity::find().filter(artifact_binding::Column::ArtifactId.eq(&a.id)).limit(2).all(&tx).await?==vec![b.clone()],"preview adopted concurrently");
-        }
-        ensure!(turn_llm_context::Entity::find().filter(turn_llm_context::Column::TurnId.eq(turn)).filter(turn_llm_context::Column::ItemId.eq(call)).filter(turn_llm_context::Column::Source.eq("tool_result_v2")).filter(turn_llm_context::Column::ToolName.eq("html_preview")).limit(2).all(&tx).await?==contexts,"preview context publication changed");
-        for (c, payload) in contexts.iter().zip(&archived) {
-            ensure!(turn_llm_context::Entity::find_by_id(&c.id).one(&tx).await?.as_ref()==Some(c),"preview result changed");
-            tx.execute_raw(statement("UPDATE turn_llm_context SET payload=?2 WHERE id=?1",vec![c.id.clone().into(),payload.clone().into()])).await?;
-        }
-        for ((a,v),metadata) in artifacts.iter().zip(&versions).zip(&metadata_updates) {
-            // Attribute these exact original/projection dependencies before
-            // dropping references, including legacy previews without staging metadata.
-            tx.execute_raw(statement("UPDATE artifact_blob SET metadata_json=json_set(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,'$.htmlToolTemporary',1) WHERE id=?1 OR id IN (SELECT blob_id FROM artifact_projection WHERE artifact_id=?2 AND workspace_id=?3)",vec![v.blob_id.clone().into(),a.id.clone().into(),a.workspace_id.clone().into()])).await?;
-            // Keep origin diagnostics and the binding scope for authorization.
-            // Only these temporary versions/projections lose their byte owners.
-            tx.execute_raw(statement("DELETE FROM artifact_external_ref WHERE artifact_id=?1 AND workspace_id=?2",vec![a.id.clone().into(),a.workspace_id.clone().into()])).await?;
-            tx.execute_raw(statement("DELETE FROM artifact_projection WHERE artifact_id=?1 AND workspace_id=?2",vec![a.id.clone().into(),a.workspace_id.clone().into()])).await?;
-            tx.execute_raw(statement("UPDATE artifact_binding SET artifact_version_id=NULL WHERE artifact_id=?1 AND workspace_id=?2",vec![a.id.clone().into(),a.workspace_id.clone().into()])).await?;
-            tx.execute_raw(statement("UPDATE artifact SET current_version_id=NULL,status='deleted',metadata_json=?3 WHERE id=?1 AND workspace_id=?2",vec![a.id.clone().into(),a.workspace_id.clone().into(),metadata.clone().into()])).await?;
-            tx.execute_raw(statement("DELETE FROM artifact_version WHERE id=?1 AND artifact_id=?2 AND workspace_id=?3",vec![v.id.clone().into(),a.id.clone().into(),a.workspace_id.clone().into()])).await?;
-        }
-        tx.commit().await?;
-        Ok(())
-    }).await
+    store
+        .run_serialized_write(|| async {
+            let tx = store.connection.begin().await?;
+            if !unowned(
+                &tx,
+                &candidate.workspace_id,
+                thread,
+                turn,
+                &root_execution,
+                &store.frozen_readers,
+            )
+            .await?
+            {
+                tx.rollback().await?;
+                return Ok(());
+            }
+            // Recheck mutable adoption/version/identity assumptions inside commit.
+            for ((a, v), b) in artifacts.iter().zip(&versions).zip(&bindings) {
+                ensure!(
+                    artifact::Entity::find_by_id(&a.id).one(&tx).await?.as_ref() == Some(a),
+                    "preview artifact changed"
+                );
+                ensure!(
+                    artifact_version::Entity::find()
+                        .filter(artifact_version::Column::ArtifactId.eq(&a.id))
+                        .limit(2)
+                        .all(&tx)
+                        .await?
+                        == vec![v.clone()],
+                    "preview version changed"
+                );
+                ensure!(
+                    artifact_binding::Entity::find()
+                        .filter(artifact_binding::Column::ArtifactId.eq(&a.id))
+                        .limit(2)
+                        .all(&tx)
+                        .await?
+                        == vec![b.clone()],
+                    "preview adopted concurrently"
+                );
+            }
+            ensure!(
+                turn_llm_context::Entity::find()
+                    .filter(turn_llm_context::Column::TurnId.eq(turn))
+                    .filter(turn_llm_context::Column::ItemId.eq(call))
+                    .filter(turn_llm_context::Column::Source.eq("tool_result_v2"))
+                    .filter(turn_llm_context::Column::ToolName.eq("html_preview"))
+                    .limit(2)
+                    .all(&tx)
+                    .await?
+                    == contexts,
+                "preview context publication changed"
+            );
+            for (c, payload) in contexts.iter().zip(&archived) {
+                ensure!(
+                    turn_llm_context::Entity::find_by_id(&c.id)
+                        .one(&tx)
+                        .await?
+                        .as_ref()
+                        == Some(c),
+                    "preview result changed"
+                );
+                turn_llm_context::Entity::update_many()
+                    .col_expr(
+                        turn_llm_context::Column::Payload,
+                        Expr::val(payload.clone()),
+                    )
+                    .filter(turn_llm_context::Column::Id.eq(&c.id))
+                    .exec(&tx)
+                    .await?;
+            }
+            for ((a, v), metadata) in artifacts.iter().zip(&versions).zip(&metadata_updates) {
+                // Attribute these exact original/projection dependencies before
+                // dropping references, including legacy previews without staging metadata.
+                let projections = artifact_projection::Entity::find()
+                    .select_only()
+                    .column(artifact_projection::Column::BlobId)
+                    .filter(artifact_projection::Column::ArtifactId.eq(&a.id))
+                    .filter(artifact_projection::Column::WorkspaceId.eq(&a.workspace_id))
+                    .into_query();
+                artifact_blob::Entity::update_many()
+                    .col_expr(
+                        artifact_blob::Column::MetadataJson,
+                        queries::mark_temporary_blob(),
+                    )
+                    .filter(
+                        artifact_blob::Column::Id
+                            .eq(&v.blob_id)
+                            .or(artifact_blob::Column::Id.in_subquery(projections)),
+                    )
+                    .exec(&tx)
+                    .await?;
+                // FK enforcement is disabled in production. Explicitly detach all
+                // byte owners in this transaction; never rely on ON DELETE CASCADE.
+                artifact_external_ref::Entity::delete_many()
+                    .filter(artifact_external_ref::Column::ArtifactId.eq(&a.id))
+                    .filter(artifact_external_ref::Column::WorkspaceId.eq(&a.workspace_id))
+                    .exec(&tx)
+                    .await?;
+                artifact_projection::Entity::delete_many()
+                    .filter(artifact_projection::Column::ArtifactId.eq(&a.id))
+                    .filter(artifact_projection::Column::WorkspaceId.eq(&a.workspace_id))
+                    .exec(&tx)
+                    .await?;
+                artifact_binding::Entity::update_many()
+                    .col_expr(
+                        artifact_binding::Column::ArtifactVersionId,
+                        Expr::val(None::<String>),
+                    )
+                    .filter(artifact_binding::Column::ArtifactId.eq(&a.id))
+                    .filter(artifact_binding::Column::WorkspaceId.eq(&a.workspace_id))
+                    .exec(&tx)
+                    .await?;
+                artifact::Entity::update_many()
+                    .col_expr(
+                        artifact::Column::CurrentVersionId,
+                        Expr::val(None::<String>),
+                    )
+                    .col_expr(artifact::Column::Status, Expr::val("deleted"))
+                    .col_expr(artifact::Column::MetadataJson, Expr::val(metadata.clone()))
+                    .filter(artifact::Column::Id.eq(&a.id))
+                    .filter(artifact::Column::WorkspaceId.eq(&a.workspace_id))
+                    .exec(&tx)
+                    .await?;
+                artifact_version::Entity::delete_many()
+                    .filter(artifact_version::Column::Id.eq(&v.id))
+                    .filter(artifact_version::Column::ArtifactId.eq(&a.id))
+                    .filter(artifact_version::Column::WorkspaceId.eq(&a.workspace_id))
+                    .exec(&tx)
+                    .await?;
+            }
+            tx.commit().await?;
+            Ok(())
+        })
+        .await
 }
 
 impl CrudStore {
@@ -694,8 +1019,15 @@ impl CrudStore {
         workspace: &str,
         key: &str,
     ) -> Result<bool> {
-        let row=self.connection.query_one_raw(statement("SELECT 1 AS safe WHERE NOT EXISTS(SELECT 1 FROM artifact_blob b WHERE b.workspace_id=?1 AND b.storage_key=?2 AND (EXISTS(SELECT 1 FROM artifact_version v WHERE v.blob_id=b.id) OR EXISTS(SELECT 1 FROM artifact_projection p WHERE p.blob_id=b.id)))",vec![workspace.into(),key.into()])).await?;
-        Ok(row.is_some())
+        let owners = artifact_blob::Entity::find()
+            .select_only()
+            .column(artifact_blob::Column::Id)
+            .filter(artifact_blob::Column::WorkspaceId.eq(workspace))
+            .filter(artifact_blob::Column::StorageKey.eq(key))
+            .filter(queries::blob_has_owners("artifact_blob"))
+            .limit(1)
+            .into_query();
+        Ok(self.connection.query_one(&owners).await?.is_none())
     }
 
     /// Bounded keyset discovery. Advance after a failed filesystem deletion too;
@@ -710,7 +1042,34 @@ impl CrudStore {
     )> {
         // Page the source rows first, even if every blob still has owners.
         // This bounds work independently of the number of GC candidates.
-        let rows=self.connection.query_all_raw(statement("SELECT b.workspace_id,b.id,b.storage_key,b.size_bytes,b.created_at<=?2 AND CASE WHEN json_valid(b.metadata_json) THEN COALESCE(json_extract(b.metadata_json,'$.htmlToolTemporary')=1,0) ELSE 0 END AND NOT EXISTS(SELECT 1 FROM artifact_version v WHERE v.blob_id=b.id) AND NOT EXISTS(SELECT 1 FROM artifact_projection p WHERE p.blob_id=b.id) AS orphan FROM artifact_blob b WHERE b.id>?1 ORDER BY b.id LIMIT 16",vec![after.into(),chrono::DateTime::from_timestamp_millis(cutoff_ms).ok_or_else(||anyhow::anyhow!("invalid artifact GC cutoff"))?.fixed_offset().into()])).await?;
+        let cutoff = chrono::DateTime::from_timestamp_millis(cutoff_ms)
+            .ok_or_else(|| anyhow::anyhow!("invalid artifact GC cutoff"))?
+            .fixed_offset();
+        let orphan = col("b", artifact_blob::Column::CreatedAt)
+            .lte(cutoff)
+            .and(Func::coalesce([
+                json_field(
+                    col("b", artifact_blob::Column::MetadataJson),
+                    "$.htmlToolTemporary",
+                )
+                .eq(1),
+                Expr::val(0),
+            ]))
+            .and(queries::blob_has_owners("b").not());
+        let query = Query::select()
+            .from_as(artifact_blob::Entity, "b")
+            .columns([
+                ("b", artifact_blob::Column::WorkspaceId),
+                ("b", artifact_blob::Column::Id),
+                ("b", artifact_blob::Column::StorageKey),
+                ("b", artifact_blob::Column::SizeBytes),
+            ])
+            .expr_as(orphan, "orphan")
+            .and_where(col("b", artifact_blob::Column::Id).gt(after))
+            .order_by(("b", artifact_blob::Column::Id), Order::Asc)
+            .limit(16)
+            .to_owned();
+        let rows = self.connection.query_all(&query).await?;
         let mut next = String::new();
         let mut candidates = Vec::new();
         for row in rows {
@@ -732,7 +1091,32 @@ impl CrudStore {
         &self,
         after: &str,
     ) -> Result<(String, Option<(String, String)>)> {
-        let row=self.connection.query_one_raw(statement("SELECT id,workspace_id,current_version_id,length(CAST(metadata_json AS BLOB)) AS bytes,substr(metadata_json,1,1048576) AS metadata_json FROM artifact WHERE id>?1 AND created_by_kind='tool' AND created_by_actor_id='html_preview' ORDER BY id LIMIT 1",vec![after.into()])).await?;
+        let query = artifact::Entity::find()
+            .select_only()
+            .columns([
+                artifact::Column::Id,
+                artifact::Column::WorkspaceId,
+                artifact::Column::CurrentVersionId,
+            ])
+            .column_as(bytes(Expr::col(artifact::Column::MetadataJson)), "bytes")
+            .column_as(
+                Func::cust(sea_orm::sea_query::Alias::new("substr")).args([
+                    Expr::col(artifact::Column::MetadataJson),
+                    Expr::val(1),
+                    Expr::val(1048576),
+                ]),
+                "metadata_json",
+            )
+            .filter(artifact::Column::Id.gt(after))
+            .filter(Expr::col(artifact::Column::CreatedByKind).eq(Expr::Constant("tool".into())))
+            .filter(
+                Expr::col(artifact::Column::CreatedByActorId)
+                    .eq(Expr::Constant("html_preview".into())),
+            )
+            .order_by_asc(artifact::Column::Id)
+            .limit(1)
+            .into_query();
+        let row = self.connection.query_one(&query).await?;
         let Some(row) = row else {
             return Ok((String::new(), None));
         };
@@ -769,9 +1153,16 @@ impl CrudStore {
         metadata: &str,
     ) -> Result<()> {
         self.run_serialized_write(|| async {
-            self.connection.execute_raw(statement("UPDATE artifact SET metadata_json=?3 WHERE id=?1 AND current_version_id IS NULL AND metadata_json=?2",vec![id.into(),previous.into(),metadata.into()])).await?;
+            artifact::Entity::update_many()
+                .col_expr(artifact::Column::MetadataJson, Expr::val(metadata))
+                .filter(artifact::Column::Id.eq(id))
+                .filter(artifact::Column::CurrentVersionId.is_null())
+                .filter(artifact::Column::MetadataJson.eq(previous))
+                .exec(&self.connection)
+                .await?;
             Ok(())
-        }).await
+        })
+        .await
     }
 }
 
@@ -782,7 +1173,38 @@ pub(crate) async fn preview_result_was_released<C: ConnectionTrait>(
     turn: &str,
     call: &str,
 ) -> Result<bool> {
-    Ok(db.query_one_raw(statement("SELECT 1 AS released FROM artifact WHERE created_by_kind='tool' AND created_by_actor_id='html_preview' AND current_version_id IS NULL AND CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json,'$.htmlTool.turnId')=?1 AND json_extract(metadata_json,'$.htmlTool.callId')=?2 AND json_extract(metadata_json,'$.htmlTool.retention')='released' ELSE 0 END LIMIT 1",vec![turn.into(),call.into()])).await?.is_some())
+    let query = artifact::Entity::find()
+        .select_only()
+        .column(artifact::Column::Id)
+        .filter(Expr::col(artifact::Column::CreatedByKind).eq(Expr::Constant("tool".into())))
+        .filter(
+            Expr::col(artifact::Column::CreatedByActorId).eq(Expr::Constant("html_preview".into())),
+        )
+        .filter(artifact::Column::CurrentVersionId.is_null())
+        .filter(
+            json_field(
+                Expr::col(artifact::Column::MetadataJson),
+                "$.htmlTool.turnId",
+            )
+            .eq(turn),
+        )
+        .filter(
+            json_field(
+                Expr::col(artifact::Column::MetadataJson),
+                "$.htmlTool.callId",
+            )
+            .eq(call),
+        )
+        .filter(
+            json_field(
+                Expr::col(artifact::Column::MetadataJson),
+                "$.htmlTool.retention",
+            )
+            .eq("released"),
+        )
+        .limit(1)
+        .into_query();
+    Ok(db.query_one(&query).await?.is_some())
 }
 
 /// A supported canonical UserInput is a real adoption even when Message edits
@@ -820,7 +1242,35 @@ pub(crate) async fn retain_preview_input<C: ConnectionTrait>(
     db: &C,
     input: &PreparedPreviewInputAdoption,
 ) -> Result<()> {
-    let row=db.query_one_raw(statement("SELECT a.workspace_id,a.current_version_id,t.thread_id,th.workspace_id AS target_workspace FROM artifact a JOIN turn t ON t.id=?2 JOIN thread th ON th.id=t.thread_id WHERE a.id=?1 AND a.created_by_kind='tool' AND a.created_by_actor_id='html_preview' LIMIT 1",vec![input.artifact.clone().into(),input.turn.clone().into()])).await?;
+    let query = Query::select()
+        .from_as(artifact::Entity, "a")
+        .columns([
+            ("a", artifact::Column::WorkspaceId),
+            ("a", artifact::Column::CurrentVersionId),
+        ])
+        .column(("t", turn_entity::Column::ThreadId))
+        .expr_as(
+            col("th", thread_entity::Column::WorkspaceId),
+            "target_workspace",
+        )
+        .join_as(
+            JoinType::InnerJoin,
+            turn_entity::Entity,
+            "t",
+            col("t", turn_entity::Column::Id).eq(&input.turn),
+        )
+        .join_as(
+            JoinType::InnerJoin,
+            thread_entity::Entity,
+            "th",
+            col("th", thread_entity::Column::Id).eq(col("t", turn_entity::Column::ThreadId)),
+        )
+        .and_where(col("a", artifact::Column::Id).eq(&input.artifact))
+        .and_where(col("a", artifact::Column::CreatedByKind).eq("tool"))
+        .and_where(col("a", artifact::Column::CreatedByActorId).eq("html_preview"))
+        .limit(1)
+        .to_owned();
+    let row = db.query_one(&query).await?;
     let Some(row) = row else {
         return Ok(());
     };
@@ -835,25 +1285,107 @@ pub(crate) async fn retain_preview_input<C: ConnectionTrait>(
         .clone()
         .or(row.try_get::<Option<String>>("", "current_version_id")?)
         .ok_or_else(|| anyhow::anyhow!("released preview input is unavailable"))?;
-    let available=db.query_one_raw(statement("SELECT 1 AS present FROM artifact_version WHERE id=?1 AND artifact_id=?2 AND workspace_id=?3",vec![version.clone().into(),input.artifact.clone().into(),workspace.clone().into()])).await?;
+    let available = artifact_version::Entity::find_by_id(&version)
+        .select_only()
+        .column(artifact_version::Column::Id)
+        .filter(artifact_version::Column::ArtifactId.eq(&input.artifact))
+        .filter(artifact_version::Column::WorkspaceId.eq(&workspace))
+        .into_query();
+    let available = db.query_one(&available).await?;
     ensure!(
         available.is_some(),
         "released preview input version is unavailable"
     );
     // An immutable real UserInput binding is the existing adoption path. The
     // current input projection remains authoritative for Message rendering.
-    db.execute_raw(statement("INSERT INTO artifact_binding(id,artifact_id,artifact_version_id,workspace_id,thread_id,turn_id,binding_kind,direction,item_index,role,created_at,metadata_json) SELECT ?1,?2,?3,?4,?5,?6,'user_input','input',?7,'user',?8,'{}' WHERE NOT EXISTS(SELECT 1 FROM artifact_binding WHERE artifact_id=?2 AND artifact_version_id=?3 AND workspace_id=?4 AND thread_id=?5 AND turn_id=?6 AND binding_kind='user_input' AND direction='input')",vec![input.binding.clone().into(),input.artifact.clone().into(),version.into(),workspace.into(),thread.into(),input.turn.clone().into(),input.index.into(),input.at.into()])).await?;
+    let existing = artifact_binding::Entity::find()
+        .select_only()
+        .column(artifact_binding::Column::Id)
+        .filter(artifact_binding::Column::ArtifactId.eq(&input.artifact))
+        .filter(artifact_binding::Column::ArtifactVersionId.eq(&version))
+        .filter(artifact_binding::Column::WorkspaceId.eq(&workspace))
+        .filter(artifact_binding::Column::ThreadId.eq(&thread))
+        .filter(artifact_binding::Column::TurnId.eq(&input.turn))
+        .filter(artifact_binding::Column::BindingKind.eq("user_input"))
+        .filter(artifact_binding::Column::Direction.eq("input"))
+        .into_query();
+    let values = Query::select()
+        .exprs([
+            Expr::val(input.binding.clone()),
+            Expr::val(input.artifact.clone()),
+            Expr::val(version),
+            Expr::val(workspace),
+            Expr::val(thread),
+            Expr::val(input.turn.clone()),
+            Expr::val("user_input"),
+            Expr::val("input"),
+            Expr::val(input.index),
+            Expr::val("user"),
+            Expr::val(input.at),
+            Expr::val("{}"),
+        ])
+        .and_where(Expr::exists(existing).not())
+        .to_owned();
+    db.execute(
+        &Query::insert()
+            .into_table(artifact_binding::Entity)
+            .columns([
+                artifact_binding::Column::Id,
+                artifact_binding::Column::ArtifactId,
+                artifact_binding::Column::ArtifactVersionId,
+                artifact_binding::Column::WorkspaceId,
+                artifact_binding::Column::ThreadId,
+                artifact_binding::Column::TurnId,
+                artifact_binding::Column::BindingKind,
+                artifact_binding::Column::Direction,
+                artifact_binding::Column::ItemIndex,
+                artifact_binding::Column::Role,
+                artifact_binding::Column::CreatedAt,
+                artifact_binding::Column::MetadataJson,
+            ])
+            .select_from(values)?
+            .to_owned(),
+    )
+    .await?;
     Ok(())
 }
 
 async fn input_adoption_quantum(store: &CrudStore, after: &mut String) -> Result<bool> {
     // Enumerate source IDs first: no request/commit scans all input payloads.
-    let row=store.connection.query_one_raw(statement("SELECT id,turn_id,input_type,input_index,created_at,CASE WHEN input_type='artifact' THEN length(CAST(payload AS BLOB)) ELSE 0 END AS bytes FROM turn_input WHERE id>?1 ORDER BY id LIMIT 1",vec![after.as_str().into()])).await?;
+    let query = turn_input::Entity::find()
+        .select_only()
+        .columns([
+            turn_input::Column::Id,
+            turn_input::Column::TurnId,
+            turn_input::Column::InputType,
+            turn_input::Column::InputIndex,
+            turn_input::Column::CreatedAt,
+        ])
+        .column_as(
+            Expr::case(
+                Expr::col(turn_input::Column::InputType).eq("artifact"),
+                bytes(Expr::col(turn_input::Column::Payload)),
+            )
+            .finally(0),
+            "bytes",
+        )
+        .filter(turn_input::Column::Id.gt(after.as_str()))
+        .order_by_asc(turn_input::Column::Id)
+        .limit(1)
+        .into_query();
+    let row = store.connection.query_one(&query).await?;
     let Some(row) = row else {
-        store.run_serialized_write(||async {
-            store.connection.execute_unprepared("UPDATE html_preview_index_backfill SET inputs_complete=1 WHERE singleton=1 AND inputs_complete=0").await?;
-            Ok(())
-        }).await?;
+        store
+            .run_serialized_write(|| async {
+                backfill::Entity::update_many()
+                    .col_expr(backfill::Column::InputsComplete, Expr::val(1))
+                    .filter(backfill::Column::Singleton.eq(1))
+                    .filter(backfill::Column::InputsComplete.eq(0))
+                    .exec(&store.connection)
+                    .await?;
+                Ok(())
+            })
+            .await?;
         after.clear();
         return Ok(false);
     };
@@ -865,13 +1397,12 @@ async fn input_adoption_quantum(store: &CrudStore, after: &mut String) -> Result
         tracing::warn!("HTML preview adoption backfill preserved oversized canonical input");
         return Ok(true);
     }
-    let current = store
-        .connection
-        .query_one_raw(statement(
-            "SELECT payload FROM turn_input WHERE id=?1 AND length(CAST(payload AS BLOB))<=8192",
-            vec![after.as_str().into()],
-        ))
-        .await?;
+    let query = turn_input::Entity::find_by_id(after.as_str())
+        .select_only()
+        .column(turn_input::Column::Payload)
+        .filter(bytes(Expr::col(turn_input::Column::Payload)).lte(8192))
+        .into_query();
+    let current = store.connection.query_one(&query).await?;
     let Some(current) = current else {
         return Ok(true);
     };
@@ -892,12 +1423,22 @@ async fn input_adoption_quantum(store: &CrudStore, after: &mut String) -> Result
         row.try_get("", "input_index")?,
         row.try_get("", "created_at")?,
     );
-    store.run_serialized_write(||async {
-        let tx=store.connection.begin().await?;
-        let current=tx.query_one_raw(statement("SELECT 1 AS present FROM turn_input WHERE id=?1 AND turn_id=?2 AND input_type='artifact' AND payload=?3",vec![after.as_str().into(),turn.clone().into(),payload.clone().into()])).await?;
-        if current.is_some(){retain_preview_input(&tx,&adoption).await?;}
-        tx.commit().await?;Ok(())
-    }).await?;
+    store
+        .run_serialized_write(|| async {
+            let tx = store.connection.begin().await?;
+            let current = turn_input::Entity::find_by_id(after.as_str())
+                .filter(turn_input::Column::TurnId.eq(&turn))
+                .filter(turn_input::Column::InputType.eq("artifact"))
+                .filter(turn_input::Column::Payload.eq(&payload))
+                .one(&tx)
+                .await?;
+            if current.is_some() {
+                retain_preview_input(&tx, &adoption).await?;
+            }
+            tx.commit().await?;
+            Ok(())
+        })
+        .await?;
     Ok(true)
 }
 
@@ -919,7 +1460,43 @@ impl CrudStore {
     ) -> Result<(Option<(String, i64)>, Option<HtmlPreviewArchiveWitness>)> {
         // Page source rows, even if expired/already verified; never search the
         // whole candidate pool inside one background quantum.
-        let row=self.connection.query_one_raw(statement("SELECT r.manifest_id,r.ordinal,r.reference_json,r.source_id,r.source_version,r.turn_id,r.archive_wire_sha256,h.workspace_id,h.owner_thread,h.expired FROM html_preview_frozen_result r LEFT JOIN compaction_frozen_history h ON h.id=r.manifest_id WHERE (r.manifest_id,r.ordinal)>(?1,?2) ORDER BY r.manifest_id,r.ordinal LIMIT 1",vec![after.0.clone().into(),after.1.into()])).await?;
+        let query = Query::select()
+            .from_as(frozen_result::Entity, "r")
+            .columns([
+                ("r", frozen_result::Column::ManifestId),
+                ("r", frozen_result::Column::Ordinal),
+                ("r", frozen_result::Column::ReferenceJson),
+                ("r", frozen_result::Column::SourceId),
+                ("r", frozen_result::Column::SourceVersion),
+                ("r", frozen_result::Column::TurnId),
+                ("r", frozen_result::Column::ArchiveWireSha256),
+            ])
+            .columns([
+                ("h", history::Column::WorkspaceId),
+                ("h", history::Column::OwnerThread),
+                ("h", history::Column::Expired),
+            ])
+            .join_as(
+                JoinType::LeftJoin,
+                history::Entity,
+                "h",
+                col("h", history::Column::Id).eq(col("r", frozen_result::Column::ManifestId)),
+            )
+            .and_where(
+                Expr::tuple([
+                    col("r", frozen_result::Column::ManifestId),
+                    col("r", frozen_result::Column::Ordinal),
+                ])
+                .gt(Expr::tuple([
+                    Expr::val(after.0.clone()),
+                    Expr::val(after.1),
+                ])),
+            )
+            .order_by(("r", frozen_result::Column::ManifestId), Order::Asc)
+            .order_by(("r", frozen_result::Column::Ordinal), Order::Asc)
+            .limit(1)
+            .to_owned();
+        let row = self.connection.query_one(&query).await?;
         let Some(r) = row else {
             return Ok((None, None));
         };
@@ -940,7 +1517,23 @@ impl CrudStore {
             }
         };
         let workspace: String = r.try_get("", "workspace_id")?;
-        let body=self.connection.query_one_raw(statement("SELECT c.payload FROM turn_llm_context c JOIN compaction_source_revision v ON v.source_id=c.id JOIN turn t ON t.id=c.turn_id JOIN thread th ON th.id=t.thread_id WHERE c.id=?1 AND c.turn_id=?2 AND c.source='tool_result_v2' AND c.tool_name='html_preview' AND v.present=1 AND 'revision:'||v.revision=?3 AND th.workspace_id=?4 AND length(CAST(c.payload AS BLOB))<=524288",vec![r.try_get::<String>("","source_id")?.into(),r.try_get::<String>("","turn_id")?.into(),r.try_get::<String>("","source_version")?.into(),workspace.clone().into()])).await?;
+        let query = queries::canonical_preview()
+            .clear_selects()
+            .column(("c", turn_llm_context::Column::Payload))
+            .and_where(
+                col("c", turn_llm_context::Column::Id).eq(r.try_get::<String>("", "source_id")?),
+            )
+            .and_where(
+                col("c", turn_llm_context::Column::TurnId).eq(r.try_get::<String>("", "turn_id")?),
+            )
+            .and_where(
+                revision(col("v", compaction_source_revision::Column::Revision))
+                    .eq(r.try_get::<String>("", "source_version")?),
+            )
+            .and_where(col("th", thread_entity::Column::WorkspaceId).eq(&workspace))
+            .and_where(bytes(col("c", turn_llm_context::Column::Payload)).lte(524288))
+            .to_owned();
+        let body = self.connection.query_one(&query).await?;
         if body.is_none() {
             tracing::warn!("HTML preview archive preserved an unavailable canonical revision");
         }
@@ -969,10 +1562,57 @@ impl CrudStore {
             "invalid archival hash"
         );
         let reference = serde_json::to_string(&witness.reference)?;
+        let current = queries::canonical_preview()
+            .join_as(
+                JoinType::InnerJoin,
+                history::Entity,
+                "h",
+                col("h", history::Column::Id).eq(Expr::col((
+                    frozen_result::Entity,
+                    frozen_result::Column::ManifestId,
+                ))),
+            )
+            .and_where(col("c", turn_llm_context::Column::Id).eq(Expr::col((
+                frozen_result::Entity,
+                frozen_result::Column::SourceId,
+            ))))
+            .and_where(col("c", turn_llm_context::Column::TurnId).eq(Expr::col((
+                frozen_result::Entity,
+                frozen_result::Column::TurnId,
+            ))))
+            .and_where(col("h", history::Column::WorkspaceId).eq(&witness.workspace))
+            .and_where(col("h", history::Column::OwnerThread).eq(&witness.owner_thread))
+            .and_where(col("h", history::Column::Ready).eq(1))
+            .and_where(col("h", history::Column::Expired).eq(0))
+            .and_where(
+                col("th", thread_entity::Column::WorkspaceId)
+                    .eq(col("h", history::Column::WorkspaceId)),
+            )
+            .and_where(col("t", turn_entity::Column::ThreadId).eq(&witness.reference.source_thread))
+            .and_where(col("c", turn_llm_context::Column::Payload).eq(&witness.payload))
+            .and_where(
+                revision(col("v", compaction_source_revision::Column::Revision)).eq(Expr::col((
+                    frozen_result::Entity,
+                    frozen_result::Column::SourceVersion,
+                ))),
+            )
+            .to_owned();
         self.run_serialized_write(|| async {
-            self.connection.execute_raw(statement("UPDATE html_preview_frozen_result SET archive_wire_sha256=?1 WHERE manifest_id=?2 AND ordinal=?3 AND reference_json=?4 AND archive_wire_sha256 IS NULL AND EXISTS(SELECT 1 FROM compaction_frozen_history h JOIN turn_llm_context c ON c.id=html_preview_frozen_result.source_id JOIN compaction_source_revision v ON v.source_id=c.id JOIN turn t ON t.id=c.turn_id JOIN thread th ON th.id=t.thread_id WHERE h.id=html_preview_frozen_result.manifest_id AND h.workspace_id=?5 AND h.owner_thread=?8 AND h.ready=1 AND h.expired=0 AND th.workspace_id=h.workspace_id AND t.thread_id=?6 AND c.turn_id=html_preview_frozen_result.turn_id AND c.source='tool_result_v2' AND c.tool_name='html_preview' AND c.payload=?7 AND v.present=1 AND 'revision:'||v.revision=html_preview_frozen_result.source_version)",vec![archive_hash.into(),witness.manifest.clone().into(),witness.ordinal.into(),reference.clone().into(),witness.workspace.clone().into(),witness.reference.source_thread.clone().into(),witness.payload.clone().into(),witness.owner_thread.clone().into()])).await?;
+            frozen_result::Entity::update_many()
+                .col_expr(
+                    frozen_result::Column::ArchiveWireSha256,
+                    Expr::val(archive_hash),
+                )
+                .filter(frozen_result::Column::ManifestId.eq(&witness.manifest))
+                .filter(frozen_result::Column::Ordinal.eq(witness.ordinal))
+                .filter(frozen_result::Column::ReferenceJson.eq(&reference))
+                .filter(frozen_result::Column::ArchiveWireSha256.is_null())
+                .filter(Expr::exists(current.clone()))
+                .exec(&self.connection)
+                .await?;
             Ok(())
-        }).await
+        })
+        .await
     }
 
     /// Only an exact, previously authenticated frozen preview can use this
@@ -997,7 +1637,51 @@ impl CrudStore {
         else {
             return Ok(None);
         };
-        let row=self.connection.query_one_raw(statement("SELECT c.payload,r.archive_wire_sha256,'revision:'||v.revision AS retired_version FROM html_preview_frozen_result r JOIN compaction_frozen_history h ON h.id=r.manifest_id JOIN turn_llm_context c ON c.id=r.source_id AND c.turn_id=r.turn_id JOIN compaction_source_revision v ON v.source_id=c.id JOIN turn t ON t.id=c.turn_id JOIN thread th ON th.id=t.thread_id WHERE r.source_id=?1 AND r.source_version=?2 AND r.reference_json=?3 AND h.workspace_id=?4 AND th.workspace_id=?4 AND t.thread_id=?5 AND c.source='tool_result_v2' AND c.tool_name='html_preview' AND v.present=1 AND r.source_version='revision:'||(v.revision-1) AND r.archive_wire_sha256<>json_extract(CASE WHEN json_valid(r.reference_json) THEN r.reference_json ELSE '{}' END,'$.wire_sha256') AND EXISTS(SELECT 1 FROM artifact a WHERE a.workspace_id=?4 AND a.created_by_kind='tool' AND a.created_by_actor_id='html_preview' AND CASE WHEN json_valid(a.metadata_json) THEN json_extract(a.metadata_json,'$.htmlTool.retention')='released' AND json_extract(a.metadata_json,'$.htmlTool.turnId')=c.turn_id AND json_extract(a.metadata_json,'$.htmlTool.callId')=c.item_id ELSE 0 END) AND length(CAST(c.payload AS BLOB))<=524288 LIMIT 1",vec![source.id.clone().into(),source.version.clone().into(),serialized.into(),workspace.into(),reference.source_thread.clone().into()])).await?;
+        let query = queries::canonical_preview()
+            .clear_selects()
+            .column(("c", turn_llm_context::Column::Payload))
+            .column(("r", frozen_result::Column::ArchiveWireSha256))
+            .expr_as(
+                revision(col("v", compaction_source_revision::Column::Revision)),
+                "retired_version",
+            )
+            .join_as(
+                JoinType::InnerJoin,
+                frozen_result::Entity,
+                "r",
+                col("r", frozen_result::Column::SourceId)
+                    .eq(col("c", turn_llm_context::Column::Id))
+                    .and(
+                        col("r", frozen_result::Column::TurnId)
+                            .eq(col("c", turn_llm_context::Column::TurnId)),
+                    ),
+            )
+            .join_as(
+                JoinType::InnerJoin,
+                history::Entity,
+                "h",
+                col("h", history::Column::Id).eq(col("r", frozen_result::Column::ManifestId)),
+            )
+            .and_where(col("r", frozen_result::Column::SourceId).eq(&source.id))
+            .and_where(col("r", frozen_result::Column::SourceVersion).eq(&source.version))
+            .and_where(col("r", frozen_result::Column::ReferenceJson).eq(serialized))
+            .and_where(col("h", history::Column::WorkspaceId).eq(workspace))
+            .and_where(col("th", thread_entity::Column::WorkspaceId).eq(workspace))
+            .and_where(col("t", turn_entity::Column::ThreadId).eq(&reference.source_thread))
+            .and_where(col("r", frozen_result::Column::SourceVersion).eq(revision(
+                col("v", compaction_source_revision::Column::Revision).sub(1),
+            )))
+            .and_where(
+                col("r", frozen_result::Column::ArchiveWireSha256).ne(json_field(
+                    col("r", frozen_result::Column::ReferenceJson),
+                    "$.wire_sha256",
+                )),
+            )
+            .and_where(Expr::exists(queries::released_marker(workspace)))
+            .and_where(bytes(col("c", turn_llm_context::Column::Payload)).lte(524288))
+            .limit(1)
+            .to_owned();
+        let row = self.connection.query_one(&query).await?;
         row.map(|r| {
             Ok((
                 r.try_get("", "payload")?,
