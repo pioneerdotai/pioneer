@@ -14898,7 +14898,9 @@ fn owned_voice_ingress_case(
             }
         }));
         let processor = Arc::new(processor);
-        let thread_id = "thr_g09_owned_voice";
+        // Revocation cases materialize thread_membership, whose CHECK requires
+        // a 21-character alphanumeric ID even though thread/start accepts more.
+        let thread_id = "T00000000000000000116";
         // Two distinct request contexts and a valid business ID outside the
         // telemetry key length bound. The latter must preserve None rather
         // than synthesizing a context from the session's turn ID.
