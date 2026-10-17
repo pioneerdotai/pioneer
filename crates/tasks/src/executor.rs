@@ -15,6 +15,27 @@ use std::sync::Arc;
 use tokio::sync::OnceCell;
 use tokio::sync::RwLock;
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TerminalCommitPhase {
+    Preparation,
+    AttemptFence,
+    Commit,
+}
+impl TerminalCommitPhase {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Preparation => "terminal_preparation",
+            Self::AttemptFence => "terminal_attempt_fence",
+            Self::Commit => "terminal_commit",
+        }
+    }
+}
+impl std::fmt::Display for TerminalCommitPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskExecutionContext {
     pub workspace_id: String,
@@ -329,13 +350,19 @@ impl TaskExecutionHandle {
         let prepared = self
             .store
             .prepare_task_terminal_transition(terminal)
-            .await?
-            .with_pinned_agent_attempt(self.agent_attempt_generation.get().copied().flatten())?;
+            .await
+            .context(TerminalCommitPhase::Preparation)?
+            .with_pinned_agent_attempt(self.agent_attempt_generation.get().copied().flatten())
+            .context(TerminalCommitPhase::AttemptFence)?;
         #[cfg(test)]
         if let Some(barrier) = self.terminal_preparation_barrier.as_ref() {
             barrier.wait().await;
         }
-        let outcome = self.store.commit_task_terminal_transition(prepared).await?;
+        let outcome = self
+            .store
+            .commit_task_terminal_transition(prepared)
+            .await
+            .context(TerminalCommitPhase::Commit)?;
         self.event_bus.publish_many(outcome.events).await;
         Ok(())
     }
