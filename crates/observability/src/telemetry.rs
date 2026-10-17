@@ -101,6 +101,7 @@ pub(crate) struct ObservabilityState {
     tracer_provider: SdkTracerProvider,
     pub(crate) tracer: SdkTracer,
     pub(crate) startup_metrics: StartupMetrics,
+    pub(crate) mobile_thread_open_duration: Option<opentelemetry::metrics::Histogram<f64>>,
     pub(crate) desktop_update_metrics: Option<DesktopUpdateMetrics>,
     pub(crate) desktop_gateway_lifecycle_metrics: Option<DesktopGatewayLifecycleMetrics>,
     pub(crate) gateway_metrics: Option<GatewayMetrics>,
@@ -189,6 +190,15 @@ pub fn init_otlp_observability_for(
         target.startup_failures_name(),
         target.label(),
     );
+    let mobile_thread_open_duration = (target == TelemetryTarget::Mobile).then(|| {
+        meter
+            .f64_histogram("pioneer.mobile.thread.open.duration")
+            .with_description(
+                "Time from thread navigation until the visible screen and composer are ready",
+            )
+            .with_unit("ms")
+            .build()
+    });
     let gateway_markdown_metrics = crate::performance::target_supports_gateway_markdown(target)
         .then(|| GatewayMarkdownMetrics::new(&meter));
     let desktop_timeline_metrics = crate::performance::target_supports_desktop_timeline(target)
@@ -207,6 +217,7 @@ pub fn init_otlp_observability_for(
             tracer_provider,
             tracer,
             startup_metrics,
+            mobile_thread_open_duration,
             desktop_update_metrics,
             desktop_gateway_lifecycle_metrics,
             gateway_metrics,
