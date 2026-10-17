@@ -14682,11 +14682,100 @@ macro_rules! owned_voice_ingress_test {
             // and connection-cleanup frames on the libtest thread.
             run_standard_stack_message_test(
                 stringify!($name),
-                owned_voice_ingress_case($terminal, $action),
+                owned_voice_ingress_case($terminal, $action, false),
+            );
+        }
+    };
+    ($name:ident, $terminal:literal, $action:literal, early) => {
+        #[test]
+        fn $name() {
+            run_standard_stack_message_test(
+                stringify!($name),
+                owned_voice_ingress_case($terminal, $action, true),
             );
         }
     };
 }
+
+owned_voice_ingress_test!(
+    owned_voice_incremental_inference_before_commit_and_backlog,
+    "transcript",
+    "winner",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_incremental_cancel_during_inference,
+    "transcript",
+    "cancel",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_incremental_disconnect_during_inference,
+    "transcript",
+    "disconnect",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_incremental_empty_transcript,
+    "no_speech",
+    "winner",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_incremental_engine_error,
+    "runtime_error",
+    "winner",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_incremental_native_tail_error_is_not_partial_transcript,
+    "tail_error",
+    "winner",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_incremental_engine_panic,
+    "panic",
+    "winner",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_incremental_revocation_during_inference,
+    "transcript",
+    "revocation",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_incremental_shutdown_during_inference,
+    "transcript",
+    "shutdown",
+    early
+);
+
+owned_voice_ingress_test!(
+    owned_voice_incremental_cancel_before_commit,
+    "transcript",
+    "cancel_recording",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_incremental_disconnect_before_commit,
+    "transcript",
+    "disconnect_recording",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_incremental_revocation_before_commit,
+    "transcript",
+    "revocation_recording",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_incremental_shutdown_before_commit,
+    "transcript",
+    "shutdown_recording",
+    early
+);
 
 owned_voice_ingress_test!(
     owned_voice_ingress_transcript_cancel,
@@ -14727,17 +14816,18 @@ owned_voice_ingress_test!(
 );
 
 // Erase the case future before the runtime/test wrapper polls it. Keep the
-// nine combinations independent so CI identifies a failing terminal boundary.
+// cases independent so CI identifies a failing terminal boundary.
 fn owned_voice_ingress_case(
     terminal: &'static str,
     action: &'static str,
+    early: bool,
 ) -> MessageFuture<'static, ()> {
     message_future(async move {
         use crate::voice::transcription::{VoiceTranscriptionErrorKind, transcription_error};
         let (tx, mut rx) = mpsc::channel(128);
         let sessions = Arc::new(SessionManager::new());
-        let connection_id = register_authenticated_test_connection(&sessions, tx).await;
-        let context = sessions.connection_context(connection_id).await.unwrap();
+        let mut connection_id = register_authenticated_test_connection(&sessions, tx).await;
+        let mut context = sessions.connection_context(connection_id).await.unwrap();
         let (foreign_tx, mut foreign_rx) = mpsc::channel(16);
         let foreign_id = register_authenticated_test_connection(&sessions, foreign_tx).await;
         let foreign_context = sessions.connection_context(foreign_id).await.unwrap();
@@ -14746,6 +14836,8 @@ fn owned_voice_ingress_case(
         let release = PendingVoiceRelease(gate.clone());
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<Vec<f32>>::new()));
+        let worker_captured = captured.clone();
         let mut processor = MessageProcessor::new(
             Arc::new(ThreadManager::new("test-model", "openai")),
             test_provider(),
@@ -14756,23 +14848,47 @@ fn owned_voice_ingress_case(
             test_summary_config(),
             test_tool_loop_config(),
         )
-        .with_voice_input_supervisor(ready_gateway_voice_supervisor("unused native stub"));
-        processor.voice_test_transcriber = Some(Arc::new(move |_buffer| {
+        .with_voice_input_supervisor(ready_gateway_voice_supervisor_for_model(
+            "unused native stub",
+            if early {
+                "moonshine-base"
+            } else {
+                "parakeet-tdt-0.6b-v3"
+            },
+        ));
+        processor.voice_test_transcriber = Some(Arc::new(move |buffer| {
+            // The real production adapter must satisfy Moonshine's SDK
+            // minimum before reaching this fake/native inference boundary.
+            if early && buffer.speech_samples() < 1600 {
+                return Err(transcription_error(
+                    VoiceTranscriptionErrorKind::RuntimeFailure,
+                    "Moonshine native input must contain at least 1600 samples",
+                ));
+            }
+            let call_count = {
+                let mut calls = worker_captured.lock().unwrap();
+                calls.push(buffer.flattened_samples());
+                calls.len()
+            };
             // Observe the production blocking scope before installing anything
             // in the fake. This must come from the actual request dispatcher.
-            entered_tx
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap()
-                .send(pioneer_observability::turn_startup::current_key())
-                .unwrap();
+            if let Some(sender) = entered_tx.lock().unwrap().take() {
+                sender
+                    .send(pioneer_observability::turn_startup::current_key())
+                    .unwrap();
+            }
             let (released, condition) = &*gate;
             let mut flag = released.lock().unwrap();
             while !*flag {
                 flag = condition.wait(flag).unwrap();
             }
+            drop(flag);
             match terminal {
+                "panic" => panic!("controlled fake panic"),
+                "tail_error" if call_count == 3 => Err(transcription_error(
+                    VoiceTranscriptionErrorKind::RuntimeFailure,
+                    "controlled native tail failure",
+                )),
                 "runtime_error" => Err(transcription_error(
                     VoiceTranscriptionErrorKind::RuntimeFailure,
                     "controlled fake failure",
@@ -14799,6 +14915,33 @@ fn owned_voice_ingress_case(
             thread_id,
         )
         .await;
+        if action.starts_with("revocation") {
+            ensure_test_superuser_execution_authority(crud.as_ref()).await;
+            materialize_test_member_collaborator(crud.as_ref(), &workspace_id, thread_id).await;
+            let (member_tx, member_rx) = mpsc::channel(128);
+            connection_id = processor
+                .session_manager
+                .register_connection(member_tx, authenticated_test_member_collaborator())
+                .await
+                .unwrap();
+            context = processor
+                .session_manager
+                .connection_context(connection_id)
+                .await
+                .unwrap();
+            rx = member_rx;
+            processor
+                .session_manager
+                .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+                .await;
+            subscribe_test_connection_to_materialized_thread(
+                &processor,
+                connection_id,
+                &workspace_id,
+                thread_id,
+            )
+            .await;
+        }
         let start_id = generate_test_request_id("voice", "start");
         let finalize_id = generate_test_request_id("voice", "finalize");
         let repeat_id = generate_test_request_id("voice", "repeat");
@@ -14827,14 +14970,94 @@ fn owned_voice_ingress_case(
             start_id.as_str(),
         )
         .await;
-        processor
-            .process_binary_frame_for_connection(
-                connection_id,
-                voice_test_frame(&session.session_id, 0, 960, 12000).as_slice(),
+        let mut entered_rx = Some(entered_rx);
+        let initial_chunks = if early { 30 } else { 1 };
+        for sequence in 0..initial_chunks {
+            processor
+                .process_binary_frame_for_connection(
+                    connection_id,
+                    &voice_test_frame(
+                        &session.session_id,
+                        sequence,
+                        if early { 1600 } else { 960 },
+                        12000,
+                    ),
+                )
+                .await
+                .unwrap();
+            let _ = recv_notification_by_method(&mut rx, events::VOICE_CHUNK_ACK).await;
+        }
+        if early {
+            let key = tokio::time::timeout(Duration::from_secs(5), entered_rx.take().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                key, None,
+                "pre-Commit inference must not be charged to turn startup"
+            );
+            assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
+            assert_eq!(
+                processor
+                    .voice_sessions
+                    .lookup_session(&session.session_id, connection_id)
+                    .unwrap()
+                    .state,
+                crate::voice::session_store::GatewayVoiceSessionState::Recording
+            );
+            // Duplicate accepted sequence is ACKed without replay. Keep a full
+            // second window and a seven-sample tail queued behind native work.
+            for sequence in 29..=60 {
+                let samples = if sequence == 60 { 7 } else { 1600 };
+                let amplitude = if sequence == 29 {
+                    12000
+                } else if sequence == 60 {
+                    3000
+                } else {
+                    6000
+                };
+                processor
+                    .process_binary_frame_for_connection(
+                        connection_id,
+                        &voice_test_frame(&session.session_id, sequence, samples, amplitude),
+                    )
+                    .await
+                    .unwrap();
+                let _ = recv_notification_by_method(&mut rx, events::VOICE_CHUNK_ACK).await;
+            }
+        }
+        if early && action == "winner" && terminal == "transcript" {
+            let occupied: Vec<_> = (1..=3)
+                .map(|offset| {
+                    processor
+                        .voice_finalizations
+                        .reserve(u64::MAX - offset)
+                        .unwrap()
+                })
+                .collect();
+            subscribe_test_connection_to_materialized_thread(
+                &processor,
+                foreign_id,
+                &workspace_id,
+                thread_id,
             )
-            .await
-            .unwrap();
-        let _ = recv_notification_by_method(&mut rx, events::VOICE_CHUNK_ACK).await;
+            .await;
+            let overloaded_id = generate_test_request_id("voice", "overload");
+            processor.clone().process_owned_request(
+                processor.session_manager.connection_context(foreign_id).await.unwrap(),
+                json!({"jsonrpc":"2.0","id":overloaded_id,"method":"voice/session/start","params":{
+                    "context":{"workspace_id":workspace_id,"thread_id":thread_id,"turn_id":"turn_voice_overloaded"},
+                    "audio_format":{"sample_rate_hz":16000,"channels":1,"encoding":"pcm_s16_le"}
+                }}).to_string(),
+            ).await;
+            let refusal = recv_error_by_id(&mut foreign_rx, &overloaded_id).await;
+            assert!(
+                serde_json::to_string(&refusal)
+                    .unwrap()
+                    .contains("gateway_busy")
+            );
+            drop(occupied);
+        }
         let before = crud
             .get_thread_history(thread_id, Some(64))
             .await
@@ -14854,35 +15077,39 @@ fn owned_voice_ingress_case(
             pioneer_observability::turn_startup::request_key(&request["params"]),
             expected_startup_key
         );
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            // An unrelated caller key must not override request-derived
-            // context or leak into the absent-context case.
-            pioneer_observability::turn_startup::scope(
-                Some("unrelated-ingress-context".to_owned()),
-                processor
-                    .clone()
-                    .process_owned_request(context.clone(), finalize.to_string()),
-            ),
-        )
-        .await
-        .expect("reader must return at ACK while transcriber remains pending");
-        let ack = recv_response_by_id(&mut rx, finalize_id.as_str()).await;
-        assert_eq!(ack.result["status"], json!("transcribing"));
-        let worker_startup_key = tokio::time::timeout(Duration::from_secs(5), entered_rx)
+        if !action.ends_with("_recording") {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                // An unrelated caller key must not override request-derived
+                // context or leak into the absent-context case.
+                pioneer_observability::turn_startup::scope(
+                    Some("unrelated-ingress-context".to_owned()),
+                    processor
+                        .clone()
+                        .process_owned_request(context.clone(), finalize.to_string()),
+                ),
+            )
             .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(worker_startup_key, expected_startup_key);
-        // Same owner repeated finalize is bounded/rejected; another connection
-        // cannot claim the authenticated owner's session (connection_id retained).
-        let mut repeated_finalize = finalize.clone();
-        repeated_finalize["id"] = json!(repeat_id);
-        processor
-            .clone()
-            .process_owned_request(context.clone(), repeated_finalize.to_string())
-            .await;
-        let _ = recv_error_by_id(&mut rx, repeat_id.as_str()).await;
+            .expect("reader must return at ACK while transcriber remains pending");
+            let ack = recv_response_by_id(&mut rx, finalize_id.as_str()).await;
+            assert_eq!(ack.result["status"], json!("transcribing"));
+            if let Some(entered_rx) = entered_rx {
+                let worker_startup_key = tokio::time::timeout(Duration::from_secs(5), entered_rx)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(worker_startup_key, expected_startup_key);
+            }
+            // Same owner repeated finalize is bounded/rejected; another connection
+            // cannot claim the authenticated owner's session (connection_id retained).
+            let mut repeated_finalize = finalize.clone();
+            repeated_finalize["id"] = json!(repeat_id);
+            processor
+                .clone()
+                .process_owned_request(context.clone(), repeated_finalize.to_string())
+                .await;
+            let _ = recv_error_by_id(&mut rx, repeat_id.as_str()).await;
+        }
         let mut cancel = json!({"jsonrpc":"2.0","id":foreign_request_id,"method":"voice/session/cancel","params":{"session_id":session.session_id}});
         processor
             .clone()
@@ -14890,7 +15117,7 @@ fn owned_voice_ingress_case(
             .await;
         let _ = recv_error_by_id(&mut foreign_rx, foreign_request_id.as_str()).await;
         assert!(crud.get_turn(thread_id, turn_id).await.unwrap().is_none());
-        if action == "cancel" {
+        if action.starts_with("cancel") {
             cancel["id"] = json!(cancel_id);
             tokio::time::timeout(
                 Duration::from_secs(5),
@@ -14906,7 +15133,7 @@ fn owned_voice_ingress_case(
             let result: VoiceSessionResultNotification =
                 serde_json::from_value(event.params.unwrap()).unwrap();
             assert_eq!(result.outcome, VoiceSessionOutcome::Cancelled);
-        } else if action == "disconnect" {
+        } else if action.starts_with("disconnect") {
             processor.connection_closed(connection_id).await;
             assert!(!processor.voice_sessions.has_active_sessions().unwrap());
             assert!(
@@ -14915,6 +15142,64 @@ fn owned_voice_ingress_case(
                     .take_session_audio(&session.session_id)
                     .is_err()
             );
+        }
+        if action.starts_with("revocation") {
+            crud.database_connection()
+                .execute_raw(sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DbBackend::Sqlite,
+                    "DELETE FROM workspace_membership WHERE principal_id=? AND workspace_id=?",
+                    [
+                        TEST_COLLABORATOR_PRINCIPAL_ID.to_owned().into(),
+                        workspace_id.clone().into(),
+                    ],
+                ))
+                .await
+                .unwrap();
+            processor
+                .publish_committed_workspace_membership_invalidation(
+                    authenticated_test_member_collaborator()
+                        .principal_id
+                        .clone(),
+                    workspace_id.clone(),
+                )
+                .await;
+            assert!(
+                processor
+                    .voice_sessions
+                    .lookup_session(&session.session_id, connection_id)
+                    .is_err()
+            );
+            assert!(
+                processor
+                    .voice_session_buffers
+                    .buffered_bytes_for_test(&session.session_id)
+                    .is_err()
+            );
+        }
+        let shutdown_task = if action.starts_with("shutdown") {
+            let shutdown_processor = processor.clone();
+            let task = tokio::spawn(async move {
+                shutdown_processor.shutdown_voice_finalizations().await;
+            });
+            processor.voice_finalizations.shutdown.cancelled().await;
+            assert!(
+                !task.is_finished(),
+                "shutdown must wait for the native call"
+            );
+            Some(task)
+        } else {
+            None
+        };
+        if action != "winner" {
+            assert!(
+                processor
+                    .voice_finalizations
+                    .reserve(connection_id)
+                    .is_none(),
+                "cancel must retain native capacity until actual return"
+            );
+            assert!(processor.voice_finalizations.has_active_work());
+            assert!(!processor.voice_finalizations.tasks.is_empty());
         }
         release.release();
         // Closing the tracker enables waiting for completion; it does
@@ -14926,6 +15211,45 @@ fn owned_voice_ingress_case(
         )
         .await
         .unwrap();
+        if let Some(task) = shutdown_task {
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert!(!processor.voice_finalizations.has_active_work());
+        {
+            let calls = captured.lock().unwrap();
+            if early
+                && action == "winner"
+                && matches!(terminal, "transcript" | "no_speech" | "tail_error")
+            {
+                assert_eq!(
+                    calls.iter().map(Vec::len).collect::<Vec<_>>(),
+                    vec![48000, 48000, 1600]
+                );
+                for ((call, amplitude), source_count) in calls
+                    .iter()
+                    .zip([12000_i16, 6000, 3000])
+                    .zip([48000, 48000, 7])
+                {
+                    assert_eq!(
+                        &call[..source_count],
+                        vec![f32::from(amplitude) / 32768.0; source_count]
+                    );
+                    assert!(
+                        call[source_count..].iter().all(|sample| *sample == 0.0),
+                        "only synthetic silence may follow the exact source prefix"
+                    );
+                }
+            } else {
+                assert_eq!(
+                    calls.len(),
+                    1,
+                    "no further inference after failure/cancellation"
+                );
+            }
+        }
         if action == "winner" {
             let event = recv_notification_by_method(&mut rx, events::VOICE_SESSION_RESULT).await;
             let result: VoiceSessionResultNotification =
@@ -14940,6 +15264,19 @@ fn owned_voice_ingress_case(
                 crud.get_turn(thread_id, turn_id).await.unwrap().is_some(),
                 terminal == "transcript"
             );
+            if early && terminal == "transcript" {
+                let history = crud
+                    .get_thread_history(thread_id, Some(64))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    serde_json::to_string(&history.events).unwrap().contains(
+                        "controlled transcript controlled transcript controlled transcript"
+                    ),
+                    "Commit must concatenate each completed fragment exactly once"
+                );
+            }
             cancel["id"] = json!(late_cancel_id);
             processor
                 .clone()
@@ -14972,11 +15309,18 @@ fn owned_voice_ingress_case(
 fn ready_gateway_voice_supervisor(
     transcript: &str,
 ) -> Arc<crate::voice::supervisor::VoiceInputSupervisor> {
+    ready_gateway_voice_supervisor_for_model(transcript, "parakeet-tdt-0.6b-v3")
+}
+
+fn ready_gateway_voice_supervisor_for_model(
+    transcript: &str,
+    model: &str,
+) -> Arc<crate::voice::supervisor::VoiceInputSupervisor> {
     let supervisor = test_gateway_voice_supervisor();
     let desired = crate::voice::supervisor::VoiceInputDesiredState {
         enabled: true,
         provider: Some(pioneer_protocol::GatewayVoiceInputProvider::Local),
-        model: Some("parakeet-tdt-0.6b-v3".to_owned()),
+        model: Some(model.to_owned()),
     };
     let applied = supervisor
         .apply_desired(desired, false)
@@ -14989,7 +15333,7 @@ fn ready_gateway_voice_supervisor(
             applied.generation,
             crate::voice::supervisor::VoiceModelIdentity {
                 provider: pioneer_protocol::GatewayVoiceInputProvider::Local,
-                model: "parakeet-tdt-0.6b-v3".to_owned(),
+                model: model.to_owned(),
             },
             crate::voice::runtime::LoadedVoiceEngine::test_stub_with_transcript(transcript),
         )
@@ -16456,6 +16800,26 @@ async fn voice_reconfiguration_busy_blocks_all_active_states_before_persistence(
             .has_active_sessions()
             .expect("clean session store")
     );
+    let native_lease = processor
+        .voice_finalizations
+        .reserve(connection_id)
+        .unwrap();
+    let pending_id = generate_test_request_id("voicebusy", "cancelled_native");
+    processor.process_request_for_connection(connection_id, &json!({
+        "jsonrpc":"2.0", "id":pending_id, "method":"settings/update",
+        "params":{"update":{"voice_input":{"enabled":true,"provider":"local","model":"small"}}}
+    }).to_string()).await;
+    let error = recv_error_by_id(&mut rx, &pending_id).await;
+    assert_eq!(
+        error
+            .error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(JsonValue::as_str),
+        Some("voice_reconfiguration_busy")
+    );
+    drop(native_lease);
     let retry_request_id = generate_test_request_id("voicebusy", "after_cleanup");
     processor
         .process_request_for_connection(

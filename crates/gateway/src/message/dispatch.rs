@@ -273,7 +273,10 @@ impl MessageProcessor {
         if let Ok(request) = serde_json::from_str::<JsonRpcRequest>(&payload)
             && request.method == methods::VOICE_SESSION_FINALIZE
         {
-            let Some(lease) = self.voice_finalizations.reserve(connection.connection_id()) else {
+            let Some(lease) = self
+                .voice_finalizations
+                .begin_finalize(connection.connection_id())
+            else {
                 self.send_error(
                     connection.connection_id(),
                     JsonRpcErrorResponse::new(
@@ -7472,10 +7475,11 @@ impl MessageProcessor {
             None => false,
         };
         if voice_reconfiguration
-            && self
+            && (self
                 .voice_sessions
                 .has_active_sessions()
                 .context("failed to inspect active voice sessions")?
+                || self.voice_finalizations.has_active_work())
         {
             return Err(VoiceReconfigurationBusyError.into());
         }

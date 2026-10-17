@@ -1625,6 +1625,7 @@ impl MessageProcessor {
     /// workers before database shutdown. Native calls retain ownership to completion.
     pub async fn shutdown_voice_finalizations(&self) {
         self.voice_finalizations.close();
+        self.voice_session_buffers.cancel_all();
         self.voice_finalizations.tasks.wait().await;
     }
 
