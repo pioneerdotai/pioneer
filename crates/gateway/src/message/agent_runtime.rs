@@ -9187,6 +9187,7 @@ impl MessageProcessor {
             return false;
         }
         self.kick_native_turn_event_deliveries();
+        self.kick_native_terminal_effects();
         self.retire_execution_progress_state(&turn_id).await;
         self.finalize_agent_execution_for_turn(&committed.turn_completed.turn, "completed")
             .await;

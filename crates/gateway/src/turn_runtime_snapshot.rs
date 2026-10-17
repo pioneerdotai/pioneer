@@ -17,6 +17,18 @@ use pioneer_skills::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{HashMap, HashSet};
 
+/// Accepted history could not be materialized before an Agent was dispatched.
+/// This is a safe unavailable outcome for the same Turn, not an execution retry.
+#[derive(Debug)]
+pub(crate) struct NativeHistoryUnavailable;
+
+impl std::fmt::Display for NativeHistoryUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native context preparation failed")
+    }
+}
+impl std::error::Error for NativeHistoryUnavailable {}
+
 const MAX_AGENT_SKILL_PINS_JSON_BYTES: usize = 16 * 1024;
 const MAX_AGENT_SKILL_FINGERPRINT_CHARS: usize = 128;
 
@@ -818,7 +830,9 @@ pub(crate) async fn restored_recovery_turn_request_from_snapshot(
         }
         (
             fresh,
-            materialize_owned_history(artifacts, &snapshot.workspace_id, history).await?,
+            materialize_owned_history(artifacts, &snapshot.workspace_id, history)
+                .await
+                .context(NativeHistoryUnavailable)?,
         )
     } else {
         anyhow::ensure!(

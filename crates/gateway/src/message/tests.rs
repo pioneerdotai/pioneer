@@ -14463,6 +14463,35 @@ async fn followup_history_rejects_unavailable_accepted_artifact_before_provider(
     );
     assert!(error.contains("context preparation failed"));
     assert_eq!(
+        processor
+            .crud_store
+            .get_turn_execution(second_turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        pioneer_crud::TurnExecutionStatus::Blocked,
+        "pre-start unavailability must close the same execution aggregate"
+    );
+    assert!(
+        processor
+            .crud_store
+            .find_unresolved_recovery_job_for_turn(second_turn_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "unavailable accepted history must not leave an unstartable retry job"
+    );
+    assert!(
+        processor
+            .crud_store
+            .native_cancellation_context(second_turn_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a pre-dispatch failure must not manufacture an executed native context"
+    );
+    assert_eq!(
         capture_provider.snapshot_requests().len(),
         1,
         "an unavailable accepted version must not reach the provider"
@@ -23243,6 +23272,16 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
     assert!(accepted_payload.native_semantic_state.is_some());
     assert!(accepted_payload.window.progress.is_some());
     assert_eq!(accepted_payload.tools.executed_count, 0);
+    let accepted_input: Vec<UserInput> = serde_json::from_str(&child_snapshot.input_json).unwrap();
+    assert!(
+        accepted_input
+            .iter()
+            .any(|input| matches!(input, UserInput::Text { text, .. }
+        if text.contains("Recovered hidden preflight child")))
+    );
+    let expected_original =
+        pioneer_protocol::build_execution_checkpoint_original_request_summary(&accepted_input);
+    assert_eq!(accepted_payload.original_request, expected_original);
     let initial_phase = child_snapshot.initial_phase_json.clone();
     assert!(initial_phase.is_some());
     // Close the controlled pause from its real accepted state and receipts.
@@ -23422,11 +23461,22 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
             .contains("Completed window: index=1"),
         "restored child prompt should include checkpoint window facts"
     );
+    let preview_suffix = if expected_original.text_truncated {
+        " (truncated)"
+    } else {
+        ""
+    };
+    let expected_preview = format!(
+        "Original request preview{preview_suffix}: {}",
+        expected_original
+            .text_preview
+            .as_deref()
+            .expect("actual child input has text")
+            .trim()
+    );
     assert!(
-        restored_prompt
-            .full_system_text
-            .contains("Original request preview: Recovered hidden preflight child"),
-        "restored child prompt should include checkpoint original request facts"
+        restored_prompt.full_system_text.contains(&expected_preview),
+        "restored child prompt should include the exact accepted child request preview"
     );
     let recovered_main_request = &requests[child_main_pos];
     assert!(
@@ -37426,15 +37476,27 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
                 .any(|message| { message.tool_call_id.as_deref() == Some("call_guard_create") }),
             "the task_create tool result must reach the premature final round"
         );
+        let created_task_id = extract_task_id_from_messages(&requests[1].messages)
+            .expect("the real task_create result should identify its task");
         assert!(
             requests[2..].iter().any(|request| {
-                request.messages.iter().any(|message| {
-                    message
-                        .content
-                        .contains("Attached tasks created by this turn")
+                request.compiled_prompt.as_ref().is_some_and(|prompt| {
+                    prompt.full_system_text.contains(
+                        pioneer_protocol::NativeHostDirective::AwaitAttachedTasks.instruction(),
+                    )
+                }) && request.messages.iter().any(|message| {
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
+                    else {
+                        return false;
+                    };
+                    value.pointer("/observation/origin") == Some(&json!("task_service"))
+                        && value.pointer("/observation/trust") == Some(&json!("untrusted"))
+                        && value.pointer("/observation/value/pendingCount") == Some(&json!(1))
+                        && value.pointer("/observation/value/tasks/0/taskId")
+                            == Some(&json!(&created_task_id))
                 })
             }),
-            "guard observation should be model-visible"
+            "the fixed guard directive and exact untrusted pending Task observation should be model-visible"
         );
         assert!(
             requests[3]

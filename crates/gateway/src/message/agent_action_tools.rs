@@ -1943,6 +1943,20 @@ pub(crate) async fn materialize(
     project_materialized_agent_action_tools(processor, context).await
 }
 
+fn native_agent_tool_parameters(
+    parameters: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let mut schema = schemars::Schema::try_from(parameters)
+        .map_err(|_| "native Agent tool schema is unavailable".to_owned())?;
+    let mut objects = schemars::transform::ReplaceBoolSchemas::default();
+    objects.skip_additional_properties = true;
+    schemars::transform::Transform::transform(&mut objects, &mut schema);
+    // The protocol schema keeps its dialect annotation; native functions use
+    // the same constraints through their existing non-strict JSON profile.
+    schema.remove("$schema");
+    Ok(schema.to_value())
+}
+
 async fn project_materialized_agent_action_tools(
     processor: Arc<MessageProcessor>,
     context: TurnToolContext,
@@ -1993,7 +2007,7 @@ async fn project_materialized_agent_action_tools(
                 ToolSpec::new(
                     name.clone(),
                     entry.description,
-                    entry.parameters,
+                    native_agent_tool_parameters(entry.parameters)?,
                     PayloadKind::Function,
                 )
                 .with_recovery(agent_tool_recovery(entry.name)),
@@ -4048,6 +4062,75 @@ fn denied_output(outcome: AgentPublicOutcome, message: &str) -> Box<dyn ToolOutp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_agent_catalog_crosses_the_real_wire_gate_without_losing_constraints() {
+        let options = AgentToolOptionsProjection {
+            identities: vec![],
+            profiles: vec![],
+            inherit_parent_identity_available: true,
+            default_pioneer_identity_available: false,
+            derived_ephemeral_identity_available: false,
+            inherit_parent_profile_available: true,
+            allowed_skill_ids: vec![],
+            allowed_mcp_server_ids: vec![],
+            max_permission_profile: pioneer_protocol::task_permission_cap_from_snapshot(
+                &pioneer_protocol::default_turn_permission_profile_snapshot(),
+            ),
+            thread_creation_options: vec![],
+            target_options: vec![],
+            generation_fingerprint: "wire-fixture".into(),
+        };
+        let capabilities = [
+            AgentToolCapability::MessageCreate,
+            AgentToolCapability::ThreadCreate,
+            AgentToolCapability::ChildStart,
+        ]
+        .into_iter()
+        .collect();
+        let tools = project_agent_model_tool_catalog(&capabilities, Some(&options))
+            .into_iter()
+            .map(|entry| {
+                assert!(entry.parameters.get("$schema").is_some());
+                let parameters = native_agent_tool_parameters(entry.parameters).unwrap();
+                assert!(parameters.get("$schema").is_none());
+                assert_eq!(
+                    parameters.get("additionalProperties"),
+                    Some(&serde_json::json!(false))
+                );
+                pioneer_provider::ToolDefinition {
+                    name: entry.name.as_str().into(),
+                    description: entry.description,
+                    parameters,
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tools.len(), 4);
+        let registry = pioneer_provider::ProviderRegistry::with_provider(
+            "echo",
+            Arc::new(pioneer_provider::providers::EchoProvider::new()),
+        );
+        let provider = registry
+            .get_or_create_for_workspace("agent-schema-workspace", "echo")
+            .unwrap();
+        let response = provider
+            .chat(pioneer_provider::ChatRequest {
+                model: "test-model".into(),
+                messages: vec![pioneer_provider::ChatMessage::user(
+                    "agent schema admission",
+                )],
+                temperature: None,
+                max_tokens: Some(32),
+                tools: Some(tools),
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: None,
+                compiled_prompt: None,
+            })
+            .await
+            .expect("the full native Agent catalog must cross the real wire gate");
+        assert_eq!(response.text, "agent schema admission");
+    }
 
     fn identity(id: &str, revision: u64) -> pioneer_protocol::AgentIdentityProjection {
         pioneer_protocol::AgentIdentityProjection::new(

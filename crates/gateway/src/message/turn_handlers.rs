@@ -3261,7 +3261,16 @@ impl MessageProcessor {
             )
             .await;
         if let Err(error) = start_result {
-            let reason = format!("failed to dispatch turn to agent runtime: {error}");
+            let reason = format!("failed to dispatch turn to agent runtime: {error:#}");
+            if error.is::<crate::turn_runtime_snapshot::NativeHistoryUnavailable>() {
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    reason,
+                )
+                .await;
+                return;
+            }
             if !self
                 .report_turn_failure(
                     outcome.started_notification.thread_id.clone(),
