@@ -10081,6 +10081,27 @@ mod tests {
         )
         .await;
 
+        // The completed initial phase belongs to this immutable cancellation
+        // identity. A cold continuation must not invent a new runtime generation.
+        crud_store
+            .persist_native_cancellation_context(
+                pioneer_protocol::NativeTerminalEffectPreparation {
+                    batch_id: format!("{turn_id}:cancel"),
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    runtime_generation: 1,
+                    effects: Vec::new(),
+                },
+                coordinator.turn_execution_owner_id.as_ref(),
+                chrono::Utc::now().timestamp(),
+                true,
+            )
+            .await
+            .expect(
+                "the accepted native initial phase requires its original cancellation identity",
+            );
+
         let timestamp = chrono::Utc::now().fixed_offset();
         let window = crud_store
             .create_turn_execution_window(
@@ -10221,14 +10242,17 @@ mod tests {
             .await
             .expect("startup recovery job should run");
 
-        assert!(events.iter().any(|event| matches!(
-            event,
-            RecoveryCoordinatorEvent::RetryAttemptStarted {
-                turn_id: started_turn_id,
-                item_type: TurnItemType::Reasoning,
-                ..
-            } if started_turn_id == turn_id
-        )));
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                RecoveryCoordinatorEvent::RetryAttemptStarted {
+                    turn_id: started_turn_id,
+                    item_type: TurnItemType::Reasoning,
+                    ..
+                } if started_turn_id == turn_id
+            )),
+            "the valid native checkpoint must start recovery: {events:#?}"
+        );
         assert!(
             agent_manager.has_thread(thread_id).await,
             "restored recovery should create the agent thread after restart"
