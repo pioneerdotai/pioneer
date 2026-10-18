@@ -5,7 +5,7 @@ use reqwest::{StatusCode, blocking::Client, header::RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::error::Error;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Write};
@@ -388,11 +388,7 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
                 return Ok(None);
             };
             let backup_dir = bin_dir.join(format!("config.rollback.{}", unix_timestamp_secs()?));
-            if backup_runtime_toml(home, &backup_dir)? {
-                Ok(Some(backup_dir))
-            } else {
-                Ok(None)
-            }
+            backup_runtime_toml(home, &backup_dir)
         },
     )?;
 
@@ -430,18 +426,19 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
             }
 
             if let Err(error) = fs::rename(&staged_binary, &target_binary) {
-                restore_binary_and_config(
+                let rollback = rollback_and_restore(
                     &target_binary,
                     &rollback_binary,
                     runtime_home.as_deref(),
-                    config_backup_dir.as_deref(),
+                    config_backup_dir.as_ref(),
+                    was_active,
+                    &options.managed_by,
+                    RollbackSafety::BeforeGatewayStart,
                 );
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to replace binary with staged file `{}`",
-                        target_binary.display()
-                    )
-                });
+                return Err(InstallRecoveryFailure::error(
+                    anyhow::Error::new(error).context("failed to replace staged binary"),
+                    rollback,
+                ));
             }
             Ok(())
         },
@@ -455,19 +452,19 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
     ) {
         Ok(version) => version,
         Err(error) => {
-            restore_binary_and_config(
+            let rollback = rollback_and_restore(
                 &target_binary,
                 &rollback_binary,
                 runtime_home.as_deref(),
-                config_backup_dir.as_deref(),
-            );
-            maybe_restore_service_after_rollback(
-                &target_binary,
-                &rollback_binary,
+                config_backup_dir.as_ref(),
                 was_active,
                 &options.managed_by,
+                RollbackSafety::BeforeGatewayStart,
             );
-            bail!("installed binary failed version probe: {error:#}; update rolled back");
+            return Err(InstallRecoveryFailure::error(
+                error.context("installed binary failed version probe"),
+                rollback,
+            ));
         }
     };
 
@@ -479,19 +476,19 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
     ) {
         Ok(result) => result,
         Err(error) => {
-            restore_binary_and_config(
+            let rollback = rollback_and_restore(
                 &target_binary,
                 &rollback_binary,
                 runtime_home.as_deref(),
-                config_backup_dir.as_deref(),
-            );
-            maybe_restore_service_after_rollback(
-                &target_binary,
-                &rollback_binary,
+                config_backup_dir.as_ref(),
                 was_active,
                 &options.managed_by,
+                RollbackSafety::BeforeGatewayStart,
             );
-            bail!("failed to expose command globally: {error:#}; update rolled back");
+            return Err(InstallRecoveryFailure::error(
+                error.context("failed to expose command globally"),
+                rollback,
+            ));
         }
     };
     let command_link_created = link_result.link_created;
@@ -519,34 +516,38 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
                     &target_binary,
                     &rollback_binary,
                     runtime_home.as_deref(),
-                    config_backup_dir.as_deref(),
+                    config_backup_dir.as_ref(),
                     was_active,
                     &options.managed_by,
                     RollbackSafety::SchemaMayHaveAdvanced,
                 );
-                bail!("failed to start gateway after update: {error:#}; {rollback}");
+                return Err(InstallRecoveryFailure::error(
+                    error.context("failed to start gateway after update"),
+                    rollback,
+                ));
             }
         };
 
         let stage_started = Instant::now();
-        if !wait_for_gateway_health(&target_binary, Duration::from_secs(30)) {
-            let _ = run_gateway_command(
+        if let Err(health) = wait_for_gateway_health(&target_binary, Duration::from_secs(30)) {
+            let stop = run_gateway_command(
                 &target_binary,
                 &["stop"],
                 &options.managed_by,
-                true,
+                false,
                 "stop during rollback",
             );
-            let rollback = rollback_and_restore(
+            let mut rollback = rollback_and_restore(
                 &target_binary,
                 &rollback_binary,
                 runtime_home.as_deref(),
-                config_backup_dir.as_deref(),
+                config_backup_dir.as_ref(),
                 was_active,
                 &options.managed_by,
                 RollbackSafety::SchemaMayHaveAdvanced,
             );
-            bail!("gateway failed health check after update; {rollback}");
+            rollback.candidate_stop = Some(restore_outcome(stop));
+            return Err(InstallRecoveryFailure::error(health.into(), rollback));
         }
         stage_timings.push(successful_stage_timing(
             "health.wait",
@@ -572,7 +573,7 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
             &target_binary,
             &rollback_binary,
             runtime_home.as_deref(),
-            config_backup_dir.as_deref(),
+            config_backup_dir.as_ref(),
             was_active,
             &options.managed_by,
             if should_start {
@@ -581,7 +582,10 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
                 RollbackSafety::BeforeGatewayStart
             },
         );
-        bail!("failed to persist install-state: {error:#}; {rollback}");
+        return Err(InstallRecoveryFailure::error(
+            error.context("failed to persist install-state"),
+            rollback,
+        ));
     }
 
     observe_install_stage(
@@ -593,7 +597,7 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
                 let _ = fs::remove_file(&rollback_binary);
             }
             if let Some(backup_dir) = config_backup_dir.as_ref() {
-                let _ = fs::remove_dir_all(backup_dir);
+                let _ = fs::remove_dir_all(&backup_dir.directory);
             }
             Ok(())
         },
@@ -1061,111 +1065,203 @@ enum RollbackSafety {
     BeforeGatewayStart,
     SchemaMayHaveAdvanced,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RollbackDisposition {
-    Attempted,
-    BlockedCompatibilityUnknown,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RestoreOutcome {
+    NotRequired,
+    Restored,
+    Failed { kind: &'static str },
 }
-impl std::fmt::Display for RollbackDisposition {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Attempted => "binary/config rollback attempted",
-            Self::BlockedCompatibilityUnknown => "rollback blocked: binary/schema compatibility is unknown after startup; candidate binary and backups retained",
-        })
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GatewayHealthFailure {
+    NotObserved,
+    MissingBinary,
+    StatusCommand,
+    CommandRejected,
+    InvalidStatus,
+    ServiceInactive,
+    GatewayUnreachable,
+}
+impl fmt::Display for GatewayHealthFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "gateway health check failed ({self:?})")
+    }
+}
+impl Error for GatewayHealthFailure {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct RollbackOutcome {
+    pub blocked_compatibility_unknown: bool,
+    pub binary: RestoreOutcome,
+    pub config: RestoreOutcome,
+    pub service_start: RestoreOutcome,
+    pub health: Option<GatewayHealthFailure>,
+    pub candidate_stop: Option<RestoreOutcome>,
+}
+impl RollbackOutcome {
+    fn blocked() -> Self {
+        Self {
+            blocked_compatibility_unknown: true,
+            binary: RestoreOutcome::NotRequired,
+            config: RestoreOutcome::NotRequired,
+            service_start: RestoreOutcome::NotRequired,
+            health: None,
+            candidate_stop: None,
+        }
+    }
+    pub(crate) fn performed(&self) -> bool {
+        !self.blocked_compatibility_unknown
+            && self.binary == RestoreOutcome::Restored
+            && !matches!(self.config, RestoreOutcome::Failed { .. })
+    }
+    pub(crate) fn healthy(&self) -> bool {
+        self.performed() && self.service_start == RestoreOutcome::Restored && self.health.is_none()
+    }
+}
+impl fmt::Display for RollbackOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "rollback outcome: {self:?}")
+    }
+}
+/// Carries original failure and actual recovery result to text/JSON reporting.
+#[derive(Debug)]
+pub(crate) struct InstallRecoveryFailure {
+    pub rollback: RollbackOutcome,
+    source: anyhow::Error,
+}
+impl InstallRecoveryFailure {
+    fn error(source: anyhow::Error, rollback: RollbackOutcome) -> anyhow::Error {
+        Self { source, rollback }.into()
+    }
+}
+impl fmt::Display for InstallRecoveryFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}; {}", self.source, self.rollback)
+    }
+}
+impl Error for InstallRecoveryFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
     }
 }
 
+fn restore_error_kind(error: &anyhow::Error) -> &'static str {
+    match error
+        .downcast_ref::<std::io::Error>()
+        .map(std::io::Error::kind)
+    {
+        Some(ErrorKind::NotFound) => "not_found",
+        Some(ErrorKind::PermissionDenied) => "permission_denied",
+        Some(ErrorKind::AlreadyExists) => "already_exists",
+        Some(ErrorKind::StorageFull) => "storage_full",
+        _ => "other",
+    }
+}
+fn restore_outcome(result: Result<()>) -> RestoreOutcome {
+    match result {
+        Ok(()) => RestoreOutcome::Restored,
+        Err(error) => RestoreOutcome::Failed {
+            kind: restore_error_kind(&error),
+        },
+    }
+}
 fn rollback_and_restore(
     target_binary: &Path,
     rollback_binary: &Path,
     runtime_home: Option<&Path>,
-    config_backup_dir: Option<&Path>,
+    config_backup_dir: Option<&RuntimeConfigBackup>,
     was_active: bool,
     managed_by: &InstallManagedBy,
     safety: RollbackSafety,
-) -> RollbackDisposition {
-    // Starting a candidate can durably apply migrations before health fails.
-    // Restoring only the old binary cannot undo them. Without a read-only
-    // applied-history compatibility proof, preserve both binaries and data.
+) -> RollbackOutcome {
+    // No filesystem replacement before actual schema compatibility is known.
     if safety == RollbackSafety::SchemaMayHaveAdvanced {
-        return RollbackDisposition::BlockedCompatibilityUnknown;
+        return RollbackOutcome::blocked();
     }
-    restore_binary_and_config(
+    let mut outcome = restore_binary_and_config(
         target_binary,
         rollback_binary,
         runtime_home,
         config_backup_dir,
     );
-    maybe_restore_service_after_rollback(target_binary, rollback_binary, was_active, managed_by);
-    RollbackDisposition::Attempted
+    // A failed binary/config restore must not start the candidate as if it were
+    // the old installation. No backup is deleted on partial recovery.
+    if was_active && outcome.performed() {
+        outcome.service_start = restore_outcome(run_gateway_command(
+            target_binary,
+            &["start"],
+            managed_by,
+            false,
+            "rollback start",
+        ));
+        if outcome.service_start == RestoreOutcome::Restored {
+            outcome.health = wait_for_gateway_health(target_binary, Duration::from_secs(30)).err();
+        }
+    }
+    outcome
 }
-
 fn restore_binary_and_config(
     target_binary: &Path,
     rollback_binary: &Path,
     runtime_home: Option<&Path>,
-    config_backup_dir: Option<&Path>,
-) {
-    if rollback_binary.is_file() {
-        let _ = fs::rename(rollback_binary, target_binary);
-    }
-    if let (Some(home), Some(backup_dir)) = (runtime_home, config_backup_dir) {
-        let _ = restore_runtime_toml(home, backup_dir);
-    }
-}
-
-fn maybe_restore_service_after_rollback(
-    target_binary: &Path,
-    rollback_binary: &Path,
-    was_active: bool,
-    managed_by: &InstallManagedBy,
-) {
-    if !was_active || !target_binary.is_file() || rollback_binary.is_file() {
-        return;
-    }
-
-    let _ = run_gateway_command(
+    config_backup_dir: Option<&RuntimeConfigBackup>,
+) -> RollbackOutcome {
+    // Copy through a same-directory temporary file and atomically replace the
+    // target. Keep the sole rollback artifact for partial recovery and retry.
+    let binary = restore_outcome(restore_binary_preserving_backup(
         target_binary,
-        &["start"],
-        managed_by,
-        true,
-        "rollback start",
-    );
-}
-
-fn query_gateway_status(binary: &Path) -> Result<Option<ServiceSnapshot>> {
-    let output = match Command::new(binary).arg("status").arg("--json").output() {
-        Ok(output) => output,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to run `{}` status --json", binary.display()));
-        }
+        rollback_binary,
+    ));
+    let config = match (runtime_home, config_backup_dir) {
+        (Some(home), Some(backup)) => restore_outcome(restore_runtime_toml(home, backup)),
+        (None, Some(_)) => RestoreOutcome::Failed {
+            kind: "runtime_home_missing",
+        },
+        _ => RestoreOutcome::NotRequired,
     };
-
-    if !output.status.success() {
-        return Ok(None);
+    RollbackOutcome {
+        blocked_compatibility_unknown: false,
+        binary,
+        config,
+        service_start: RestoreOutcome::NotRequired,
+        health: None,
+        candidate_stop: None,
     }
-
-    let parsed: StatusOutput = match serde_json::from_slice(&output.stdout) {
-        Ok(parsed) => parsed,
-        Err(_) => return Ok(None),
-    };
-
-    let runtime_home = {
-        let trimmed = parsed.runtime_home.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(trimmed))
-        }
-    };
-
-    Ok(Some(ServiceSnapshot {
+}
+fn probe_gateway_status(
+    binary: &Path,
+) -> std::result::Result<ServiceSnapshot, GatewayHealthFailure> {
+    let output = Command::new(binary)
+        .arg("status")
+        .arg("--json")
+        .output()
+        .map_err(|error| {
+            if error.kind() == ErrorKind::NotFound {
+                GatewayHealthFailure::MissingBinary
+            } else {
+                GatewayHealthFailure::StatusCommand
+            }
+        })?;
+    if !output.status.success() {
+        return Err(GatewayHealthFailure::CommandRejected);
+    }
+    let parsed: StatusOutput =
+        serde_json::from_slice(&output.stdout).map_err(|_| GatewayHealthFailure::InvalidStatus)?;
+    let runtime_home =
+        (!parsed.runtime_home.trim().is_empty()).then(|| PathBuf::from(parsed.runtime_home.trim()));
+    Ok(ServiceSnapshot {
         service_active: parsed.service_active,
         gateway_reachable: parsed.gateway_reachable,
         runtime_home,
-    }))
+    })
+}
+fn query_gateway_status(binary: &Path) -> Result<Option<ServiceSnapshot>> {
+    match probe_gateway_status(binary) {
+        Ok(status) => Ok(Some(status)),
+        Err(GatewayHealthFailure::StatusCommand) => Err(GatewayHealthFailure::StatusCommand.into()),
+        Err(_) => Ok(None), // Preserve existing initial-install inspection semantics.
+    }
 }
 
 fn query_binary_version_output(binary: &Path) -> Result<VersionOutput> {
@@ -1221,32 +1317,22 @@ fn ensure_candidate_schema_compatible(
     Ok(())
 }
 
-fn wait_for_gateway_health(binary: &Path, timeout: Duration) -> bool {
-    let started = std::time::Instant::now();
+fn wait_for_gateway_health(
+    binary: &Path,
+    timeout: Duration,
+) -> std::result::Result<(), GatewayHealthFailure> {
+    let started = Instant::now();
+    let mut last = GatewayHealthFailure::NotObserved;
     while started.elapsed() < timeout {
-        if let Ok(Some(status)) = query_gateway_status(binary)
-            && status.service_active
-        {
-            let reachable = Command::new(binary)
-                .arg("status")
-                .arg("--json")
-                .output()
-                .ok()
-                .and_then(|output| {
-                    if !output.status.success() {
-                        return None;
-                    }
-                    serde_json::from_slice::<StatusOutput>(&output.stdout).ok()
-                })
-                .is_some_and(|status| status.service_active && status.gateway_reachable);
-
-            if reachable {
-                return true;
-            }
-        }
-        thread::sleep(Duration::from_secs(1));
+        last = match probe_gateway_status(binary) {
+            Ok(status) if status.service_active && status.gateway_reachable => return Ok(()),
+            Ok(status) if !status.service_active => GatewayHealthFailure::ServiceInactive,
+            Ok(_) => GatewayHealthFailure::GatewayUnreachable,
+            Err(reason) => reason,
+        };
+        thread::sleep(Duration::from_secs(1).min(timeout.saturating_sub(started.elapsed())));
     }
-    false
+    Err(last)
 }
 
 fn run_gateway_start_command(binary: &Path, managed_by: &InstallManagedBy) -> Result<StartOutput> {
@@ -1532,75 +1618,120 @@ fn make_binary_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn backup_runtime_toml(runtime_home: &Path, backup_dir: &Path) -> Result<bool> {
-    if !runtime_home.is_dir() {
-        return Ok(false);
-    }
-
-    fs::create_dir_all(backup_dir)
-        .with_context(|| format!("failed to create backup dir `{}`", backup_dir.display()))?;
-    let mut copied = 0usize;
-
-    for entry in fs::read_dir(runtime_home)
-        .with_context(|| format!("failed to list `{}`", runtime_home.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let is_toml = path
-            .extension()
-            .and_then(OsStr::to_str)
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"));
-        if !is_toml {
-            continue;
-        }
-
-        let target = backup_dir.join(entry.file_name());
-        fs::copy(&path, &target).with_context(|| {
-            format!(
-                "failed to backup config `{}` to `{}`",
-                path.display(),
-                target.display()
-            )
-        })?;
-        copied += 1;
-    }
-
-    if copied == 0 {
-        let _ = fs::remove_dir(backup_dir);
-        Ok(false)
-    } else {
-        Ok(true)
-    }
+#[derive(Debug)]
+struct RuntimeConfigBackup {
+    directory: PathBuf,
+    // The actual files selected by the existing TOML backup owner. Keep their
+    // content digests so missing/truncated/replaced backups cannot report success.
+    files: Vec<(OsString, String)>,
 }
 
-fn restore_runtime_toml(runtime_home: &Path, backup_dir: &Path) -> Result<()> {
-    if !backup_dir.is_dir() {
-        return Ok(());
-    }
-    fs::create_dir_all(runtime_home)
-        .with_context(|| format!("failed to create runtime home `{}`", runtime_home.display()))?;
+fn restore_binary_preserving_backup(target: &Path, backup: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(backup).context("binary backup metadata unavailable")?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() > 0,
+        "invalid binary backup"
+    );
+    let parent = target.parent().context("binary target has no parent")?;
+    let temporary = tempfile::NamedTempFile::new_in(parent)?;
+    fs::copy(backup, temporary.path()).context("failed to copy binary backup")?;
+    temporary
+        .as_file()
+        .sync_all()
+        .context("failed to sync restored binary")?;
+    temporary
+        .persist(target)
+        .map_err(|error| error.error)
+        .context("failed to replace binary from retained backup")?;
+    Ok(())
+}
 
-    for entry in fs::read_dir(backup_dir)
-        .with_context(|| format!("failed to list `{}`", backup_dir.display()))?
-    {
+fn backup_runtime_toml(
+    runtime_home: &Path,
+    backup_dir: &Path,
+) -> Result<Option<RuntimeConfigBackup>> {
+    match fs::symlink_metadata(runtime_home) {
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("runtime config metadata unavailable"),
+        Ok(metadata) => anyhow::ensure!(metadata.is_dir(), "runtime home is not a directory"),
+    }
+    let mut selected = Vec::new();
+    for entry in fs::read_dir(runtime_home).context("failed to list runtime config")? {
         let entry = entry?;
-        let src = entry.path();
-        if !src.is_file() {
+        let path = entry.path();
+        if !path
+            .extension()
+            .and_then(OsStr::to_str)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+        {
             continue;
         }
-        let dst = runtime_home.join(entry.file_name());
-        fs::copy(&src, &dst).with_context(|| {
-            format!(
-                "failed to restore config `{}` to `{}`",
-                src.display(),
-                dst.display()
-            )
-        })?;
+        let metadata = fs::symlink_metadata(&path).context("config entry metadata unavailable")?;
+        anyhow::ensure!(metadata.is_file(), "config entry is not a regular file");
+        selected.push(entry.file_name());
     }
+    if selected.is_empty() {
+        // Proven absence, unlike an unexpectedly empty expected backup.
+        return Ok(None);
+    }
+    fs::create_dir(backup_dir).context("failed to create unique config backup directory")?;
+    let mut backup = RuntimeConfigBackup {
+        directory: backup_dir.to_owned(),
+        files: Vec::new(),
+    };
+    for name in selected {
+        let src = runtime_home.join(&name);
+        let expected_digest = sha256_file(&src)?;
+        let dst = backup_dir.join(&name);
+        fs::copy(&src, &dst).context("failed to backup config")?;
+        anyhow::ensure!(
+            sha256_file(&dst)? == expected_digest,
+            "config changed during backup"
+        );
+        backup.files.push((name, expected_digest));
+    }
+    Ok(Some(backup))
+}
 
+fn restore_runtime_toml(runtime_home: &Path, backup: &RuntimeConfigBackup) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(&backup.directory).context("configuration backup unavailable")?;
+    anyhow::ensure!(metadata.is_dir(), "configuration backup is not a directory");
+    anyhow::ensure!(
+        !backup.files.is_empty(),
+        "expected configuration backup is empty"
+    );
+    // Validate the complete expected set before the first config mutation.
+    // Metadata errors are propagated; no is_file() branch silently skips them.
+    for (name, digest) in &backup.files {
+        let src = backup.directory.join(name);
+        let metadata =
+            fs::symlink_metadata(&src).context("config backup entry metadata unavailable")?;
+        anyhow::ensure!(
+            metadata.is_file(),
+            "config backup entry is not a regular file"
+        );
+        anyhow::ensure!(
+            sha256_file(&src)? == *digest,
+            "config backup content mismatch"
+        );
+    }
+    fs::create_dir_all(runtime_home).context("failed to create runtime home for config restore")?;
+    for (name, digest) in &backup.files {
+        // Atomic per-file restore keeps retries safe after any partial copy.
+        let temporary = tempfile::NamedTempFile::new_in(runtime_home)?;
+        fs::copy(backup.directory.join(name), temporary.path())
+            .context("failed to restore config")?;
+        anyhow::ensure!(
+            sha256_file(temporary.path())? == *digest,
+            "config backup changed during restore"
+        );
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(runtime_home.join(name))
+            .map_err(|error| error.error)
+            .context("failed to replace restored config")?;
+    }
     Ok(())
 }
 
@@ -2114,15 +2245,265 @@ mod tests {
             &pioneer_config::InstallManagedBy::Manual,
             super::RollbackSafety::SchemaMayHaveAdvanced,
         );
-        assert_eq!(
-            outcome,
-            super::RollbackDisposition::BlockedCompatibilityUnknown
-        );
+        assert!(outcome.blocked_compatibility_unknown);
+        assert!(!outcome.performed());
         assert_eq!(
             fs::read_to_string(target).unwrap(),
             "candidate-with-new-schema"
         );
         assert_eq!(fs::read_to_string(rollback).unwrap(), "older-binary");
+    }
+
+    #[test]
+    fn failed_restore_preserves_candidate_and_reports_missing_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("candidate");
+        fs::write(&target, "candidate").unwrap();
+        let backup = super::RuntimeConfigBackup {
+            directory: dir.path().join("missing-config"),
+            files: vec![("config.toml".into(), "missing".into())],
+        };
+        let outcome = super::restore_binary_and_config(
+            &target,
+            &dir.path().join("missing"),
+            Some(dir.path()),
+            Some(&backup),
+        );
+        assert_eq!(
+            outcome.binary,
+            super::RestoreOutcome::Failed { kind: "not_found" }
+        );
+        assert_eq!(
+            outcome.config,
+            super::RestoreOutcome::Failed { kind: "not_found" }
+        );
+        assert!(!outcome.performed());
+        assert!(!outcome.healthy());
+        assert_eq!(fs::read_to_string(target).unwrap(), "candidate");
+    }
+
+    #[test]
+    fn partial_config_restore_retains_binary_backup_and_can_continue_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_home = dir.path().join("source");
+        fs::create_dir(&source_home).unwrap();
+        fs::write(source_home.join("config.toml"), "setting = true\n").unwrap();
+        let backup = super::backup_runtime_toml(&source_home, &dir.path().join("config-backup"))
+            .unwrap()
+            .unwrap();
+        let target = dir.path().join("candidate");
+        let old = dir.path().join("rollback");
+        fs::write(&target, "candidate").unwrap();
+        fs::write(&old, "old-binary").unwrap();
+        let home = dir.path().join("restore-home");
+        fs::write(&home, "blocks directory creation").unwrap();
+        let partial = super::rollback_and_restore(
+            &target,
+            &old,
+            Some(&home),
+            Some(&backup),
+            true,
+            &pioneer_config::InstallManagedBy::Manual,
+            super::RollbackSafety::BeforeGatewayStart,
+        );
+        assert_eq!(partial.binary, super::RestoreOutcome::Restored);
+        assert!(matches!(
+            partial.config,
+            super::RestoreOutcome::Failed { .. }
+        ));
+        assert_eq!(
+            partial.service_start,
+            super::RestoreOutcome::NotRequired,
+            "must not execute the restored service after incomplete config"
+        );
+        assert!(!partial.performed());
+        assert_eq!(fs::read(&target).unwrap(), b"old-binary");
+        assert_eq!(fs::read(&old).unwrap(), b"old-binary");
+        assert!(backup.directory.join("config.toml").is_file());
+        let original = super::InstallRecoveryFailure::error(
+            anyhow::anyhow!("original replacement failure"),
+            partial,
+        );
+        let mut bytes = Vec::new();
+        crate::print_install_failure_json(super::InstallCommand::Update, &original, &mut bytes)
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["rollback_performed"], false);
+        assert_eq!(payload["rollback_outcome"]["binary"], "restored");
+        assert!(
+            original
+                .chain()
+                .any(|cause| cause.to_string() == "original replacement failure")
+        );
+        fs::remove_file(&home).unwrap();
+        for _ in 0..2 {
+            let restored = super::rollback_and_restore(
+                &target,
+                &old,
+                Some(&home),
+                Some(&backup),
+                false,
+                &pioneer_config::InstallManagedBy::Manual,
+                super::RollbackSafety::BeforeGatewayStart,
+            );
+            assert!(restored.performed());
+            assert!(
+                !restored.healthy(),
+                "restored artifacts alone are not health proof"
+            );
+            assert_eq!(
+                fs::read(home.join("config.toml")).unwrap(),
+                b"setting = true\n"
+            );
+            assert_eq!(fs::read(&old).unwrap(), b"old-binary");
+        }
+    }
+
+    #[test]
+    fn expected_config_backup_must_be_complete_and_match_captured_contents() {
+        for damage in [
+            "missing-directory",
+            "empty-directory",
+            "missing-file",
+            "directory-entry",
+            "empty-file",
+            "corrupt-file",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("source");
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("a.toml"), "original = true\n").unwrap();
+            fs::write(source.join("b.toml"), "second = true\n").unwrap();
+            let backup = super::backup_runtime_toml(&source, &dir.path().join("backup"))
+                .unwrap()
+                .unwrap();
+            let file = backup.directory.join("b.toml");
+            match damage {
+                "missing-directory" => fs::remove_dir_all(&backup.directory).unwrap(),
+                "empty-directory" => {
+                    fs::remove_file(backup.directory.join("a.toml")).unwrap();
+                    fs::remove_file(&file).unwrap();
+                }
+                "missing-file" => fs::remove_file(&file).unwrap(),
+                "directory-entry" => {
+                    fs::remove_file(&file).unwrap();
+                    fs::create_dir(&file).unwrap();
+                }
+                "empty-file" => fs::write(&file, "").unwrap(),
+                "corrupt-file" => fs::write(&file, "tampered = true\n").unwrap(),
+                _ => unreachable!(),
+            }
+            let home = dir.path().join("restored");
+            fs::create_dir(&home).unwrap();
+            fs::write(home.join("a.toml"), "candidate config").unwrap();
+            let error = super::restore_runtime_toml(&home, &backup).unwrap_err();
+            if matches!(
+                damage,
+                "missing-directory" | "empty-directory" | "missing-file"
+            ) {
+                assert!(
+                    error.downcast_ref::<std::io::Error>().is_some(),
+                    "metadata error source survives"
+                );
+            }
+            assert_eq!(
+                fs::read(home.join("a.toml")).unwrap(),
+                b"candidate config",
+                "validate full set before any restore"
+            );
+        }
+    }
+
+    #[test]
+    fn absence_of_config_is_distinct_from_unexpected_empty_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            super::backup_runtime_toml(dir.path(), &dir.path().join("unused"))
+                .unwrap()
+                .is_none()
+        );
+        let backup = super::RuntimeConfigBackup {
+            directory: dir.path().to_owned(),
+            files: Vec::new(),
+        };
+        assert!(super::restore_runtime_toml(&dir.path().join("restored"), &backup).is_err());
+        // A deliberately empty source TOML can be restored only if captured as
+        // such; corruption means disagreement with the captured source bytes.
+        fs::write(dir.path().join("config.toml"), "").unwrap();
+        let captured = super::backup_runtime_toml(dir.path(), &dir.path().join("captured"))
+            .unwrap()
+            .unwrap();
+        let home = dir.path().join("restored");
+        super::restore_runtime_toml(&home, &captured).unwrap();
+        assert_eq!(fs::read(home.join("config.toml")).unwrap(), b"");
+    }
+
+    #[test]
+    fn restored_files_require_separate_service_health_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("candidate");
+        let backup = dir.path().join("rollback");
+        fs::write(&target, "candidate").unwrap();
+        fs::write(&backup, "old-binary").unwrap();
+        let outcome = super::rollback_and_restore(
+            &target,
+            &backup,
+            None,
+            None,
+            false,
+            &pioneer_config::InstallManagedBy::Manual,
+            super::RollbackSafety::BeforeGatewayStart,
+        );
+        assert!(outcome.performed());
+        assert!(!outcome.healthy());
+        assert_eq!(fs::read_to_string(target).unwrap(), "old-binary");
+    }
+
+    #[test]
+    fn install_failure_json_uses_typed_recovery_instead_of_error_text() {
+        let mut bytes = Vec::new();
+        crate::print_install_failure_json(
+            super::InstallCommand::Update,
+            &anyhow::anyhow!("untrusted claim: update rolled back"),
+            &mut bytes,
+        )
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["rollback_performed"], false);
+        bytes.clear();
+        let error = super::InstallRecoveryFailure::error(
+            anyhow::anyhow!("original start failure"),
+            super::RollbackOutcome::blocked(),
+        )
+        .context("outer report context");
+        crate::print_install_failure_json(super::InstallCommand::Update, &error, &mut bytes)
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["rollback_performed"], false);
+        assert_eq!(payload["rollback_healthy"], false);
+        assert_eq!(
+            payload["rollback_outcome"]["blocked_compatibility_unknown"],
+            true
+        );
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap()
+                .contains("original start failure")
+        );
+    }
+
+    #[test]
+    fn health_failure_distinguishes_missing_status_command_from_no_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            super::probe_gateway_status(&dir.path().join("missing")),
+            Err(super::GatewayHealthFailure::MissingBinary)
+        ));
+        assert_eq!(
+            super::wait_for_gateway_health(&dir.path().join("missing"), Duration::ZERO),
+            Err(super::GatewayHealthFailure::NotObserved)
+        );
     }
 
     #[test]
