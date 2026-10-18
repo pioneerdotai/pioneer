@@ -68,11 +68,21 @@ impl std::fmt::Display for CliRuntimeClaudeSkillNotModelInvocable {
 
 impl std::error::Error for CliRuntimeClaudeSkillNotModelInvocable {}
 
+pub(crate) fn cli_orchestration_skill(definition: &pioneer_skills::SkillDefinition) -> bool {
+    matches!(
+        definition.identity.source_kind,
+        pioneer_skills::SkillSourceKind::System
+    ) && definition.identity.owner.as_deref() == Some("pioneer")
+        && matches!(definition.identity.slug.as_str(), "tasks" | "subagents")
+}
+
 pub(crate) fn ensure_cli_runtime_skills_exportable(
     resolved: &[pioneer_skills::ResolvedSkill],
 ) -> std::result::Result<&[pioneer_skills::ResolvedSkill], CliRuntimeSystemSkillNotExportable> {
     for skill in resolved {
-        if !pioneer_skills::skill_implicit_invocation_editable(&skill.definition) {
+        if !pioneer_skills::skill_implicit_invocation_editable(&skill.definition)
+            && !cli_orchestration_skill(&skill.definition)
+        {
             return Err(CliRuntimeSystemSkillNotExportable {
                 skill_slug: skill.slug.clone(),
                 display_name: skill.definition.identity.display_name.clone(),
@@ -878,6 +888,25 @@ mod tests {
         assert!(message.contains("export_boundary"));
         assert!(!message.contains("destination"));
         assert!(!message.contains("hash"));
+    }
+
+    #[test]
+    fn cli_required_task_skills_are_supported_without_enabling_other_required_skills() {
+        for slug in ["tasks", "subagents"] {
+            let mut skill = resolved_skill(slug, SkillSourceKind::System);
+            skill.definition.identity.owner = Some("pioneer".to_owned());
+            skill.definition.policy_hints.implicit_invocation =
+                SkillImplicitInvocationPolicy::Required;
+            assert!(!pioneer_skills::skill_implicit_invocation_editable(
+                &skill.definition
+            ));
+            assert!(ensure_cli_runtime_skills_exportable(&[skill]).is_ok());
+        }
+        let mut memory = resolved_skill("memory", SkillSourceKind::System);
+        memory.definition.identity.owner = Some("pioneer".to_owned());
+        memory.definition.policy_hints.implicit_invocation =
+            SkillImplicitInvocationPolicy::Required;
+        assert!(ensure_cli_runtime_skills_exportable(&[memory]).is_err());
     }
 
     #[test]

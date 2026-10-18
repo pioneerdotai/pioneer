@@ -1128,6 +1128,22 @@ fn claude_process_config_from_instance_with_managed_mcp(
         "pioneer".to_owned(),
     );
     env.extend_from(&options.env);
+    if allowed_tool_names
+        .iter()
+        .any(|name| name == "mcp__pioneer__task_wait")
+    {
+        // TaskService owns the durable observation/activity budget. Claude's
+        // stdio idle timer and automatic backgrounding must not reinterpret it.
+        env.insert_plain(
+            "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT".to_owned(),
+            "0".to_owned(),
+        );
+        env.insert_plain(
+            "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS".to_owned(),
+            "0".to_owned(),
+        );
+    }
+
     let permission_mode = options
         .approval_policy
         .as_deref()

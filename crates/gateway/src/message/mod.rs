@@ -1644,6 +1644,21 @@ impl MessageProcessor {
 
     pub(crate) fn with_cli_runtime_manager(mut self, manager: Arc<CLIAgentRuntimeManager>) -> Self {
         self.cli_runtime_manager = Some(manager);
+        #[cfg(test)]
+        if self.tool_loop_config.skills.system_roots.is_empty() {
+            // CLI fixtures need the same mandatory canonical orchestration
+            // packages as production. Keep all materialization in a test tempdir.
+            static SYSTEM_SKILLS: std::sync::OnceLock<(tempfile::TempDir, Vec<String>)> =
+                std::sync::OnceLock::new();
+            let (_, roots) = SYSTEM_SKILLS.get_or_init(|| {
+                let root = tempfile::tempdir().expect("CLI system skill fixture root");
+                let roots =
+                    crate::system_skills::materialize_bundled_system_skill_roots(root.path())
+                        .expect("canonical CLI system skills");
+                (root, roots)
+            });
+            self.tool_loop_config.skills.system_roots = roots.clone();
+        }
         self
     }
 
@@ -1825,6 +1840,13 @@ impl MessageProcessor {
                 error!(error = %error, "failed to build hook runtime");
             }
         }
+    }
+
+    pub(crate) async fn cli_task_mutation_cache(
+        &self,
+        turn_id: &str,
+    ) -> Arc<crate::task_tools::TaskToolMutationCache> {
+        self.mcp_service.cli_task_mutation_cache(turn_id).await
     }
 
     pub async fn bind_task_bridge(self: &Arc<Self>) {

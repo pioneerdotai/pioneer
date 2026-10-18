@@ -990,7 +990,17 @@ fn mcp_tool_item(item_id: &str, metadata: Option<&JsonValue>, status: ToolCallSt
         arguments: tool_arguments(item_id, arguments),
         status,
         recovery_policy: None,
-        execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
+        execution_class: metadata_string(metadata, "serverInstallationId")
+            .as_deref()
+            .and_then(crate::turn_mcp::native_tools::NativeToolFamily::from_server_id)
+            .and_then(|family| {
+                family
+                    .definitions()
+                    .into_iter()
+                    .find(|definition| definition.spec.name == raw_tool_name)
+            })
+            .map(|definition| definition.spec.turn_item_execution_class)
+            .unwrap_or_default(),
         output_policy,
         display,
         storage,
@@ -1264,7 +1274,7 @@ fn review_system_event_item(
     }
 }
 
-fn is_agent_message_kind(kind: &str) -> bool {
+pub(crate) fn is_agent_message_kind(kind: &str) -> bool {
     matches!(
         normalize_kind(kind).as_str(),
         "agentmessage" | "assistantmessage" | "message"

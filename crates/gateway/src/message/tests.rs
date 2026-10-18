@@ -1,3 +1,6 @@
+#[path = "tests/cli_task_tools.rs"]
+mod cli_task_tools;
+
 #[path = "tests/cli_runtime_active_bindings.rs"]
 mod cli_runtime_active_bindings;
 
@@ -720,6 +723,7 @@ struct RecordingCliRuntimeSession {
     turn_liveness_probe_started: tokio::sync::Notify,
     mcp_preparations: TokioMutex<Vec<(String, String)>>,
     projected_mcp_store: TokioMutex<Option<Arc<CrudStore>>>,
+    projected_mcp_metadata: TokioMutex<HashMap<String, CLIAgentRuntimeMcpTurnMetadata>>,
     mcp_retargets: TokioMutex<Vec<(String, String, String)>>,
     mcp_terminals: TokioMutex<Vec<String>>,
     goal_resets: TokioMutex<Vec<String>>,
@@ -945,6 +949,16 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         let Some(crud_store) = self.projected_mcp_store.lock().await.clone() else {
             return Ok(None);
         };
+        if let Some(metadata) = self
+            .projected_mcp_metadata
+            .lock()
+            .await
+            .get_mut(pioneer_turn_id)
+        {
+            let reserved = metadata.clone();
+            metadata.projection_activation_generation += 1;
+            return Ok(Some(reserved));
+        }
         let projection = crud_store
             .get_turn_mcp_projection(pioneer_turn_id)
             .await?
@@ -1202,7 +1216,7 @@ struct StaticCliRuntimeSessionFactory {
 impl CLIAgentRuntimeSessionFactory for StaticCliRuntimeSessionFactory {
     async fn start_session_with_launch_spec(
         &self,
-        _instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
+        instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
         launch_spec: &CliSessionLaunchSpec,
     ) -> anyhow::Result<Arc<dyn CLIAgentRuntimeSession>> {
         if let crate::cli_runtime::continuation::CliProviderContinuation::ClaudeFork {
@@ -1218,6 +1232,66 @@ impl CLIAgentRuntimeSessionFactory for StaticCliRuntimeSessionFactory {
                     *provider_session_id,
                 )
                 .await?;
+        }
+        if self.session.projected_mcp_store.lock().await.is_some() {
+            use crate::cli_runtime::continuation::CliMcpSessionLaunch;
+            let limits =
+                crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits::transport_bounded(
+                    1024,
+                );
+            let facts = match &launch_spec.mcp {
+                CliMcpSessionLaunch::Codex(launch) => Some((
+                    launch.canonical_projection.turn_id.clone(),
+                    "codex_synthetic_mcp",
+                    launch.canonical_projection.manifest_hash.clone(),
+                    launch.preflight.provider_contract_fingerprint.clone(),
+                    launch.semantic_restart_fingerprint().to_owned(),
+                    launch
+                        .facade_projection(limits)?
+                        .fingerprint()
+                        .as_str()
+                        .to_owned(),
+                )),
+                CliMcpSessionLaunch::Claude(launch) => Some((
+                    launch.canonical_projection.turn_id.clone(),
+                    "claude_strict_mcp",
+                    launch.canonical_projection.manifest_hash.clone(),
+                    launch.preflight.provider_contract_fingerprint.clone(),
+                    launch.semantic_restart_fingerprint().to_owned(),
+                    launch
+                        .facade_projection(limits)?
+                        .fingerprint()
+                        .as_str()
+                        .to_owned(),
+                )),
+                CliMcpSessionLaunch::OpenCode(launch) => Some((
+                    launch.canonical_projection.turn_id.clone(),
+                    "opencode_dynamic_mcp",
+                    launch.canonical_projection.manifest_hash.clone(),
+                    launch.provider_contract_fingerprint.clone(),
+                    launch.semantic_restart_fingerprint().to_owned(),
+                    launch
+                        .facade_projection(limits)?
+                        .fingerprint()
+                        .as_str()
+                        .to_owned(),
+                )),
+                _ => None,
+            };
+            if let Some((turn_id, adapter, manifest, contract, isolation, projection)) = facts {
+                self.session.projected_mcp_metadata.lock().await.insert(
+                    turn_id,
+                    CLIAgentRuntimeMcpTurnMetadata {
+                        adapter_kind: adapter.to_owned(),
+                        manifest_hash: manifest,
+                        projection_fingerprint: projection,
+                        provider_contract_fingerprint: contract,
+                        isolation_contract_fingerprint: isolation,
+                        session_generation: instance.generation(),
+                        projection_activation_generation: 1,
+                    },
+                );
+            }
         }
         if let Some(launch_specs) = self.launch_specs.as_ref() {
             launch_specs.lock().await.push(launch_spec.clone());
@@ -1964,7 +2038,7 @@ async fn setup_cli_runtime_skill_preflight_harness(
     let event_log = processor.cli_runtime_skill_preflight_test_events();
     cli_session.set_event_log(event_log.clone()).await;
 
-    CliRuntimeSkillPreflightHarness {
+    let harness = CliRuntimeSkillPreflightHarness {
         _temp: temp,
         rx,
         connection_id,
@@ -1982,7 +2056,18 @@ async fn setup_cli_runtime_skill_preflight_harness(
         user_root,
         registry_root,
         event_log,
+    };
+    for entry in
+        crate::system_skills::bundled_system_skill_catalog_entries(&harness.system_root).unwrap()
+    {
+        if matches!(entry.slug.as_str(), "tasks" | "subagents") {
+            let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../resources/skills/pioneer")
+                .join(&entry.slug);
+            pioneer_skills::replace_external_runtime_skill(&source, &entry.install_path).unwrap();
+        }
     }
+    harness
 }
 
 fn cli_runtime_turn_start_request_with_capabilities(
@@ -2284,7 +2369,10 @@ async fn capability_persistence_order_impl() {
             .crud_store
             .find_turn_skill_bindings(&turn_id)
             .await
-            .expect("must read persisted CLI runtime turn skill bindings");
+            .expect("must read persisted CLI runtime turn skill bindings")
+            .into_iter()
+            .filter(|binding| binding.source_kind != "system")
+            .collect::<Vec<_>>();
         assert_eq!(skill_bindings.len(), 2);
         assert_eq!(skill_bindings[0].skill_id, alpha_id);
         assert_eq!(skill_bindings[0].skill_owner.as_deref(), Some("tests"));
@@ -2322,12 +2410,9 @@ async fn capability_persistence_order_impl() {
             } if committed_turn_id == turn_id
                 && accepted.is_empty()
                 && rejected.is_empty()
-                && mcp_bindings.len() == 2
-                && mcp_bindings.iter().all(|binding| {
-                    binding.server_installation_id == pioneer_tools::html::HTML_SERVER_ID
-                })
-                && mcp_bindings.iter().map(|binding| binding.raw_tool_name.as_str())
-                    .eq(["html_preview", "html_render"])
+                && mcp_bindings.len() == 2 + crate::turn_mcp::native_tools::NativeToolFamily::Tasks.definitions().len()
+                && mcp_bindings.iter().all(|binding| crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(&binding.server_installation_id).is_some())
+                && mcp_bindings.iter().any(|binding| binding.raw_tool_name == "task_wait")
         ));
         let committed_skills = timeout(Duration::from_secs(1), committed_rx.recv())
             .await
@@ -2339,7 +2424,7 @@ async fn capability_persistence_order_impl() {
                 turn_id: committed_turn_id,
                 bindings,
                 ..
-            } if committed_turn_id == turn_id && bindings.len() == 2
+            } if committed_turn_id == turn_id && bindings.len() == 4
         ));
         if matches!(
             runtime_kind,
@@ -2348,7 +2433,10 @@ async fn capability_persistence_order_impl() {
             let input = native_turn.input.as_array().unwrap();
             let skill_items = input
                 .iter()
-                .filter(|item| item["type"] == "skill")
+                .filter(|item| {
+                    item["type"] == "skill"
+                        && !matches!(item["name"].as_str(), Some("tasks" | "subagents"))
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             assert_eq!(
@@ -2472,7 +2560,10 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
                 .crud_store
                 .find_turn_skill_bindings(&turn_id)
                 .await
-                .expect("must read persisted CLI runtime turn skill bindings");
+                .expect("must read persisted CLI runtime turn skill bindings")
+                .into_iter()
+                .filter(|binding| binding.source_kind != "system")
+                .collect::<Vec<_>>();
             assert_eq!(bindings.len(), 1);
             assert_eq!(bindings[0].skill_id, lifecycle_id);
             assert_eq!(bindings[0].skill_owner.as_deref(), Some("tests"));
@@ -2493,7 +2584,7 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
 
         let first_receipt_bytes = first_receipt_snapshot.unwrap();
         let first_receipt = pioneer_skills::read_external_runtime_receipt(&receipt_path).unwrap();
-        assert_eq!(first_receipt.entries.len(), 1);
+        assert_eq!(first_receipt.entries.len(), 3);
         assert_eq!(first_receipt.entries[0].skill_id, lifecycle_id);
         assert_eq!(first_receipt.entries[0].owner.as_deref(), Some("tests"));
         assert_eq!(first_receipt.entries[0].slug, "lifecycle");
@@ -2544,7 +2635,10 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
             .crud_store
             .find_turn_skill_bindings(&update_turn)
             .await
-            .expect("must read updated CLI runtime turn skill bindings");
+            .expect("must read updated CLI runtime turn skill bindings")
+            .into_iter()
+            .filter(|binding| binding.source_kind != "system")
+            .collect::<Vec<_>>();
         assert_eq!(updated_bindings.len(), 1);
         assert_eq!(updated_bindings[0].skill_id, lifecycle_id);
         assert_eq!(updated_bindings[0].skill_slug, "lifecycle");
@@ -2588,7 +2682,9 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
                 .find_turn_skill_bindings(&zero_turn)
                 .await
                 .expect("must read zero-skill CLI runtime turn bindings")
-                .is_empty()
+                .iter()
+                .all(|binding| binding.source_kind == "system"
+                    && matches!(binding.skill_slug.as_str(), "tasks" | "subagents"))
         );
         assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt_after_update);
         assert_eq!(

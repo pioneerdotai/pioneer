@@ -1078,6 +1078,14 @@ async fn ack_cli_runtime_recovery_outcome<C: ConnectionTrait>(
     connection: &C,
     source: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
 ) -> Result<()> {
+    ack_cli_runtime_outcome(connection, source, "gateway/terminal_recovery_ack").await
+}
+
+async fn ack_cli_runtime_outcome<C: ConnectionTrait>(
+    connection: &C,
+    source: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+    method: &str,
+) -> Result<()> {
     let Some(id) = source.and_then(|source| source.terminal_delivery_id.as_deref()) else {
         return Ok(());
     };
@@ -1095,7 +1103,7 @@ async fn ack_cli_runtime_recovery_outcome<C: ConnectionTrait>(
             turn_id: saved.turn_id,
             native_thread_id: saved.native_thread_id,
             native_turn_id: saved.native_turn_id,
-            native_method: "gateway/terminal_recovery_ack".into(),
+            native_method: method.into(),
             payload_redacted_json: "{}".into(),
             sequence: saved.sequence,
             created_at: saved.created_at,
@@ -1227,10 +1235,18 @@ fn cli_runtime_blocked_guard_from_snapshot(
 fn cli_runtime_event_guard_from_snapshot(
     snapshot: &CliRuntimeTurnTerminalGuard,
 ) -> Option<pioneer_protocol::CliRuntimeBlockedTurnGuard> {
+    cli_runtime_continuation_guard_from_snapshot(snapshot, false)
+}
+
+fn cli_runtime_continuation_guard_from_snapshot(
+    snapshot: &CliRuntimeTurnTerminalGuard,
+    allow_completed: bool,
+) -> Option<pioneer_protocol::CliRuntimeBlockedTurnGuard> {
     let binding = &snapshot.binding;
     let attempt = snapshot.attempt.as_ref()?;
     if snapshot.turn_status != TurnStatus::InProgress
-        || !attempt.status.is_active()
+        || !(attempt.status.is_active()
+            || (allow_completed && attempt.status == CliRuntimeTurnAttemptStatus::Completed))
         || attempt.turn_id != binding.turn_id
         || attempt.runtime_id != binding.runtime_id
         || attempt.runtime_kind != binding.runtime_kind
@@ -6238,6 +6254,194 @@ impl CrudStore {
         .await
     }
 
+    /// Transfer a completed native attempt to task orchestration without
+    /// completing the logical Turn. The next attempt and source ACK are atomic.
+    /// All input serialization and task snapshot work happens before this call.
+    pub async fn prepare_cli_runtime_task_continuation(
+        &self,
+        source: pioneer_protocol::CliRuntimeBlockedTurnGuard,
+        owner_id: String,
+        attempt_id: String,
+        continuation: NewCliRuntimeNativeEvent,
+        ack: NewCliRuntimeNativeEvent,
+    ) -> Result<(CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord)> {
+        let source_terminal_id = source.terminal_delivery_id();
+        let expected_ack_id = format!("{source_terminal_id}:ack");
+        let expected_continuation_id = format!("{attempt_id}:task-continuation");
+        self.run_serialized_write(|| {
+            let source = source.clone();
+            let source_terminal_id = source_terminal_id.clone();
+            let expected_ack_id = expected_ack_id.clone();
+            let expected_continuation_id = expected_continuation_id.clone();
+            let owner_id = owner_id.clone();
+            let attempt_id = attempt_id.clone();
+            let continuation = continuation.clone();
+            let ack = ack.clone();
+            async move {
+                let tx = self.connection.begin().await?;
+                let now = continuation.created_at;
+                let binding = cli_runtime_binding::find_turn_binding(&tx, &source.turn_id)
+                    .await?
+                    .context("task continuation binding disappeared")?;
+                let latest = cli_runtime_binding::latest_turn_attempt(&tx, &source.turn_id)
+                    .await?
+                    .context("task continuation attempt disappeared")?;
+                let owner = turn_execution::find(&tx, &source.turn_id)
+                    .await?
+                    .context("task continuation owner disappeared")?;
+                anyhow::ensure!(
+                    owner.owner_id == owner_id
+                        && owner.executor_kind == TurnExecutorKind::CliRuntime
+                        && owner.executor_key.as_deref() == Some(source.runtime_id.as_str())
+                        && owner.status.is_active()
+                        && owner.lease_until > chrono::Utc::now().fixed_offset(),
+                    "task continuation execution authority unavailable"
+                );
+                let turn =
+                    turn::find_turn_by_thread_and_id(&tx, &binding.thread_id, &source.turn_id)
+                        .await?
+                        .context("task continuation Turn disappeared")?;
+                anyhow::ensure!(
+                    turn_status_from_db(&turn.status) == Some(TurnStatus::InProgress)
+                        && binding.workspace_id == source.workspace_id
+                        && binding.thread_id == source.thread_id
+                        && binding.continuation_thread_id == source.continuation_thread_id
+                        && binding.runtime_id == source.runtime_id
+                        && binding.runtime_kind == source.runtime_kind
+                        && binding.native_thread_id == source.native_thread_id,
+                    "task continuation execution is no longer current"
+                );
+                if latest.id == attempt_id {
+                    tx.commit().await?;
+                    return Ok((binding, latest));
+                }
+                let snapshot = cli_runtime_turn_terminal_snapshot(&tx, &source.turn_id).await?;
+                let current = snapshot.as_ref().and_then(|snapshot| {
+                    cli_runtime_continuation_guard_from_snapshot(snapshot, true)
+                });
+                anyhow::ensure!(
+                    current
+                        .as_ref()
+                        .is_some_and(|current| current.same_execution(&source)),
+                    "CLI source changed before task continuation"
+                );
+                let snapshot = snapshot
+                    .as_ref()
+                    .context("task continuation snapshot disappeared")?;
+                anyhow::ensure!(
+                    snapshot.turn_status == TurnStatus::InProgress,
+                    "task continuation Turn is no longer active"
+                );
+                anyhow::ensure!(
+                    latest.status == CliRuntimeTurnAttemptStatus::Completed
+                        || cli_runtime_terminal_outcome_pending(&tx, snapshot, &source_terminal_id)
+                            .await?,
+                    "task continuation has no pending accepted terminal outcome"
+                );
+                anyhow::ensure!(
+                    latest.id == source.attempt_id,
+                    "task continuation source attempt changed"
+                );
+                anyhow::ensure!(
+                    ack.id == expected_ack_id
+                        && ack.native_method == "gateway/terminal_ack"
+                        && continuation.id == expected_continuation_id
+                        && continuation.turn_id.as_deref() == Some(source.turn_id.as_str()),
+                    "invalid task continuation identity"
+                );
+                // The saved terminal outcome remains durable, but this ACK
+                // records that its effect is a continuation, never TurnCompleted.
+                cli_runtime_binding::append_native_event_if_absent(&tx, continuation).await?;
+                if cli_runtime_binding::find_native_event(&tx, &source_terminal_id)
+                    .await?
+                    .is_some()
+                    && cli_runtime_binding::find_native_event(&tx, &expected_ack_id)
+                        .await?
+                        .is_none()
+                {
+                    cli_runtime_binding::append_native_event_if_absent(&tx, ack).await?;
+                }
+                if latest.status.is_active() {
+                    anyhow::ensure!(
+                        cli_runtime_binding::mark_turn_attempt_terminal(
+                            &tx,
+                            &latest.id,
+                            CliRuntimeTurnAttemptStatus::Completed,
+                            None,
+                            now
+                        )
+                        .await?,
+                        "source attempt changed"
+                    );
+                } else {
+                    anyhow::ensure!(
+                        latest.status == CliRuntimeTurnAttemptStatus::Completed,
+                        "task continuation requires a completed attempt"
+                    );
+                }
+                let next_index = latest
+                    .attempt_index
+                    .checked_add(1)
+                    .context("task continuation attempt overflow")?;
+                let attempt = cli_runtime_binding::create_turn_attempt(
+                    &tx,
+                    NewCliRuntimeTurnAttempt {
+                        id: attempt_id,
+                        turn_id: source.turn_id.clone(),
+                        attempt_index: next_index,
+                        runtime_id: binding.runtime_id.clone(),
+                        runtime_kind: binding.runtime_kind.clone(),
+                        native_thread_id: binding.native_thread_id.clone(),
+                        native_turn_id: None,
+                        recovery_job_id: None,
+                        recovery_attempt_id: None,
+                        // Orchestration continues the current execution window;
+                        // waiting for children is not budget exhaustion or failure.
+                        execution_window_index: latest.execution_window_index,
+                        status: CliRuntimeTurnAttemptStatus::Starting,
+                        failure_reason: None,
+                        started_at: None,
+                        completed_at: None,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                )
+                .await?;
+                cli_runtime_binding::update_turn_control(
+                    &tx,
+                    NewCliRuntimeTurnBinding {
+                        turn_id: binding.turn_id.clone(),
+                        thread_id: binding.thread_id,
+                        continuation_thread_id: binding.continuation_thread_id,
+                        workspace_id: binding.workspace_id,
+                        runtime_id: binding.runtime_id,
+                        runtime_kind: binding.runtime_kind,
+                        native_thread_id: binding.native_thread_id,
+                        native_turn_id: None,
+                        request_id: binding.request_id,
+                        status: "starting".to_owned(),
+                        model: binding.model,
+                        cwd: binding.cwd,
+                        sandbox_json: binding.sandbox_json,
+                        approval_policy: binding.approval_policy,
+                        input_mapping_json: binding.input_mapping_json,
+                        created_at: binding.created_at,
+                        updated_at: now,
+                    },
+                )
+                .await?;
+                let binding =
+                    cli_runtime_binding::clear_turn_native_goal_state(&tx, &source.turn_id, now)
+                        .await?;
+                self.project_cli_runtime_turn_binding_state(&tx, &source.turn_id, now)
+                    .await?;
+                tx.commit().await?;
+                Ok((binding, attempt))
+            }
+        })
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn prepare_cli_runtime_recovery_turn_attempt(
         &self,
@@ -6692,6 +6896,27 @@ impl CrudStore {
         cli_runtime_turn_terminal_snapshot(&snapshot, turn_id).await
     }
 
+    /// A previously completed native attempt can still belong to an unfinished
+    /// logical Turn. Only Task orchestration uses this source; ordinary terminal
+    /// event admission remains restricted to active attempts.
+    pub async fn cli_runtime_completed_task_continuation_source(
+        &self,
+        binding: &CliRuntimeTurnBindingRecord,
+    ) -> Result<Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>> {
+        Ok(self
+            .cli_runtime_turn_terminal_guard(binding)
+            .await?
+            .as_ref()
+            .filter(|snapshot| {
+                snapshot.attempt.as_ref().is_some_and(|attempt| {
+                    attempt.status == CliRuntimeTurnAttemptStatus::Completed
+                        && attempt.native_turn_id.is_some()
+                        && attempt.native_turn_id == snapshot.binding.native_turn_id
+                })
+            })
+            .and_then(|snapshot| cli_runtime_continuation_guard_from_snapshot(snapshot, true)))
+    }
+
     /// Coherent provenance of an ordinary native terminal event. Unlike a
     /// destructive Blocked observation, a Goal completion may already have
     /// completed its segment while its owning attempt remains active.
@@ -6929,6 +7154,12 @@ impl CrudStore {
             "Blocked event does not match its native source"
         );
         let outcome_id = expected.terminal_delivery_id();
+        let accepted_outcome = expected.terminal_delivery_id.is_some();
+        if let Some(id) = expected.terminal_delivery_id.as_deref() {
+            anyhow::ensure!(id == outcome_id, "Blocked source outcome identity changed");
+        }
+        let mut expected_execution = expected.clone();
+        expected_execution.terminal_delivery_id = None;
         let event = TurnEventPayload::TurnBlocked(notification);
         let mut envelope =
             prepare_turn_event_envelope_for_permanent_storage(&self.connection, event).await?;
@@ -6996,9 +7227,13 @@ impl CrudStore {
                         execution_owner,
                         turn_status,
                     });
-            let actual = actual_snapshot
-                .as_ref()
-                .and_then(cli_runtime_blocked_guard_from_snapshot);
+            let actual = actual_snapshot.as_ref().and_then(|snapshot| {
+                if accepted_outcome {
+                    cli_runtime_event_guard_from_snapshot(snapshot)
+                } else {
+                    cli_runtime_blocked_guard_from_snapshot(snapshot)
+                }
+            });
             let recovery_is_current = if expected.recovery_confirmed {
                 // Existing durable confirmation ends recovery authority. The
                 // attempt identity and confirmation are still checked above.
@@ -7015,17 +7250,20 @@ impl CrudStore {
             } else {
                 expected.recovery_job_id.is_none() && expected.recovery_attempt_id.is_none()
             };
-            if actual.as_ref() != Some(expected) || !recovery_is_current {
+            if actual.as_ref() != Some(&expected_execution) || !recovery_is_current {
                 transaction.rollback().await?;
                 return Ok(false);
             }
-            if cli_runtime_terminal_outcome_pending(
+            let outcome_pending = cli_runtime_terminal_outcome_pending(
                 &transaction,
                 actual_snapshot.as_ref().expect("source checked"),
                 &outcome_id,
             )
-            .await?
-            {
+            .await?;
+            // Observational Blocked cannot consume a saved outcome. An explicit
+            // accepted-outcome delivery must still own that exact pending row;
+            // ACK and Blocked commit together, preserving restart/replay fencing.
+            if outcome_pending != accepted_outcome {
                 transaction.rollback().await?;
                 return Ok(false);
             }
@@ -7049,6 +7287,10 @@ impl CrudStore {
             {
                 transaction.rollback().await?;
                 return Ok(false);
+            }
+            if accepted_outcome {
+                ack_cli_runtime_outcome(&transaction, Some(expected), "gateway/terminal_ack")
+                    .await?;
             }
             self.append_and_project_turn_event_in_transaction(
                 &transaction,

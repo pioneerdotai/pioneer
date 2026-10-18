@@ -265,6 +265,7 @@ pub(crate) async fn run_codex_mcp_local_provider_probe(
                 "contract": "codex-managed-mcp-readiness-v1",
             }))?,
             overlay_policy_version: CodexHomeOverlayPolicy::v1().version,
+            tool_timeout_secs: None,
             tools: semantic_tools,
         },
         limits: CodexManagedMcpConfigLimits { max_tools },
@@ -1081,7 +1082,7 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
                     &launch_projection.preflight,
                     bootstrap_path.as_deref(),
                     self.mcp_limits.max_tools()
-                        + launch_projection.canonical_projection.html_tool_count(),
+                        + launch_projection.canonical_projection.native_tool_count(),
                 )
                 .map_err(|error| anyhow!("failed to build managed Codex MCP config: {error}"))?;
                 if artifact.semantic_restart_fingerprint
@@ -1119,7 +1120,7 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
                 requires_staged_artifact: true,
                 max_config_origins: codex_config_read_max_origins(
                     self.mcp_limits.max_tools()
-                        + launch_projection.canonical_projection.html_tool_count(),
+                        + launch_projection.canonical_projection.native_tool_count(),
                 )
                 .context("managed Codex HTML origin evidence limit overflow")?,
             };

@@ -3,6 +3,10 @@ use pioneer_cli_mcp_bridge::MAX_FRAME_PAYLOAD_BYTES;
 use std::fmt;
 use std::time::Duration;
 
+/// Long-call provider ceiling, aligned with OpenCode's existing 12-hour
+/// execution allowance. Gateway/native tools retain their own tighter limits.
+pub(crate) const MANAGED_DURABLE_TOOL_TIMEOUT_SECS: u64 = 12 * 60 * 60;
+
 pub(crate) const RESPONSE_ENVELOPE_RESERVE_BYTES: usize = 1024;
 pub(crate) const MAX_FACADE_LIST_RESULT_BYTES: usize =
     MAX_FRAME_PAYLOAD_BYTES - RESPONSE_ENVELOPE_RESERVE_BYTES;

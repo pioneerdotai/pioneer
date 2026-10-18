@@ -531,7 +531,8 @@ impl OpenCodeApiClient {
                 pioneer_cli_mcp_bridge::helper::BOOTSTRAP_FILE_FLAG, bootstrap.to_string_lossy()],
             "disabled":false, "codemode":false,
             "timeout":{"startup":timeout.as_millis().min(u128::from(u32::MAX)) as u64,
-                "catalog":timeout.as_millis().min(u128::from(u32::MAX)) as u64}
+                "catalog":timeout.as_millis().min(u128::from(u32::MAX)) as u64,
+                "execution":crate::cli_runtime::mcp::limits::MANAGED_DURABLE_TOOL_TIMEOUT_SECS * 1_000}
         }})), timeout).await?;
         let deadline = tokio::time::Instant::now() + timeout;
         loop {

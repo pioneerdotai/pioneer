@@ -1352,3 +1352,295 @@ async fn cli_accepted_outcome_wins_recovery_preparation_writer_and_preserves_sou
         event.payload_redacted_json
     );
 }
+
+#[tokio::test]
+async fn cli_task_continuation_rolls_back_and_replays_across_scopes_without_a_new_window() {
+    for already_completed in [false, true] {
+        let (store, _, mut terminal) = native_delivery_fixture().await;
+        let turn_id = terminal.turn_id.clone().unwrap();
+        crate::repositories::turn_execution::insert_immutable(
+            &store.database_connection(),
+            crate::NewTurnExecution {
+                turn_id: turn_id.clone(),
+                thread_id: terminal.thread_id.clone().unwrap(),
+                workspace_id: terminal.workspace_id.clone().unwrap(),
+                executor_kind: crate::TurnExecutorKind::CliRuntime,
+                executor_key: Some("codex".into()),
+                status: crate::TurnExecutionStatus::Running,
+                owner_id: "task-owner".into(),
+                lease_until: chrono::Utc::now().fixed_offset() + chrono::Duration::hours(1),
+                created_at: terminal.created_at,
+            },
+        )
+        .await
+        .unwrap();
+        let mut before = store
+            .cli_runtime_turn_terminal_guard_by_id(&turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut source = store
+            .cli_runtime_terminal_event_source(&before.binding, "native-delivery-A")
+            .await
+            .unwrap()
+            .unwrap();
+        terminal.id = source.terminal_delivery_id();
+        assert!(
+            store
+                .persist_cli_runtime_terminal_event(terminal.clone(), &source, "task-owner")
+                .await
+                .unwrap()
+        );
+        source.terminal_delivery_id = Some(terminal.id.clone());
+        let mut input = terminal.clone();
+        input.id = "task-attempt:task-continuation".into();
+        input.native_method = "gateway/task_continuation".into();
+        input.payload_redacted_json = "{\"input\":[]}".into();
+        let mut ack = terminal.clone();
+        ack.id.push_str(":ack");
+        ack.native_method = "gateway/terminal_ack".into();
+        ack.payload_redacted_json = "{}".into();
+        if already_completed {
+            store
+                .mark_cli_runtime_turn_attempt_terminal(
+                    &source.attempt_id,
+                    CliRuntimeTurnAttemptStatus::Completed,
+                    None,
+                    terminal.created_at,
+                )
+                .await
+                .unwrap();
+            store
+                .append_cli_runtime_native_event_if_absent(ack.clone())
+                .await
+                .unwrap();
+            source = store
+                .cli_runtime_completed_task_continuation_source(&before.binding)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(source.attempt_status, "completed");
+            before = store
+                .cli_runtime_turn_terminal_guard_by_id(&turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        store.database_connection().execute_unprepared(
+        "CREATE TRIGGER reject_task_continuation BEFORE INSERT ON turn_cli_runtime_attempt WHEN NEW.id = 'task-attempt' BEGIN SELECT RAISE(ABORT, 'injected task continuation failure'); END"
+    ).await.unwrap();
+        assert!(
+            store
+                .prepare_cli_runtime_task_continuation(
+                    source.clone(),
+                    "task-owner".into(),
+                    "task-attempt".into(),
+                    input.clone(),
+                    ack.clone()
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_cli_runtime_native_event(&ack.id)
+                .await
+                .unwrap()
+                .is_some(),
+            already_completed
+        );
+        assert!(
+            store
+                .get_cli_runtime_native_event(&input.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_cli_runtime_turn_attempt("task-attempt")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .cli_runtime_turn_terminal_guard_by_id(&turn_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        store
+            .database_connection()
+            .execute_unprepared("DROP TRIGGER reject_task_continuation")
+            .await
+            .unwrap();
+        let interactive = store.with_interactive_writes();
+        let maintenance = store.with_maintenance_access();
+        let (first, replay) = tokio::join!(
+            interactive.prepare_cli_runtime_task_continuation(
+                source.clone(),
+                "task-owner".into(),
+                "task-attempt".into(),
+                input.clone(),
+                ack.clone()
+            ),
+            maintenance.prepare_cli_runtime_task_continuation(
+                source.clone(),
+                "task-owner".into(),
+                "task-attempt".into(),
+                input.clone(),
+                ack.clone()
+            ),
+        );
+        let first = first.unwrap();
+        assert_eq!(first, replay.unwrap());
+        assert_eq!(
+            first.1.execution_window_index,
+            before.attempt.as_ref().unwrap().execution_window_index
+        );
+        assert_eq!(first.1.attempt_index, 2);
+        assert_eq!(first.1.status, CliRuntimeTurnAttemptStatus::Starting);
+        assert!(first.0.native_turn_id.is_none());
+        assert_eq!(
+            store
+                .get_turn(&source.thread_id, &turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .status,
+            TurnStatus::InProgress
+        );
+        assert_eq!(
+            store
+                .get_cli_runtime_turn_attempt(&source.attempt_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            CliRuntimeTurnAttemptStatus::Completed
+        );
+        assert!(
+            store
+                .get_cli_runtime_native_event(&ack.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get_cli_runtime_native_event(&input.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let reopened = CrudStore::new(store.database_connection()).with_maintenance_access();
+        assert_eq!(
+            reopened
+                .prepare_cli_runtime_task_continuation(
+                    source.clone(),
+                    "task-owner".into(),
+                    "task-attempt".into(),
+                    input.clone(),
+                    ack.clone()
+                )
+                .await
+                .unwrap(),
+            first
+        );
+        assert!(
+            reopened
+                .prepare_cli_runtime_task_continuation(
+                    source,
+                    "stale-owner".into(),
+                    "task-attempt".into(),
+                    input,
+                    ack
+                )
+                .await
+                .is_err(),
+            "replay still requires the active owner"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cli_stalled_task_blocked_commits_accepted_outcome_ack_atomically() {
+    let (store, mut source, mut terminal) = native_delivery_fixture().await;
+    terminal.id = source.terminal_delivery_id();
+    assert!(
+        store
+            .persist_cli_runtime_terminal_event(terminal.clone(), &source, "owner")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !commit_blocked_source(&store, &source).await.unwrap(),
+        "observational Blocked must not consume an accepted outcome"
+    );
+    source.terminal_delivery_id = Some(terminal.id.clone());
+    let ack_id = format!("{}:ack", terminal.id);
+    store.database_connection().execute_unprepared(
+        "CREATE TRIGGER reject_task_blocked_ack BEFORE INSERT ON cli_runtime_native_event WHEN NEW.native_method = 'gateway/terminal_ack' BEGIN SELECT RAISE(ABORT, 'injected task blocked ACK failure'); END"
+    ).await.unwrap();
+    assert!(commit_blocked_source(&store, &source).await.is_err());
+    assert!(
+        store
+            .get_cli_runtime_native_event(&ack_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .get_turn(&source.thread_id, &source.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::InProgress
+    );
+    assert_eq!(
+        store
+            .latest_cli_runtime_turn_attempt(&source.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        CliRuntimeTurnAttemptStatus::Running
+    );
+    store
+        .database_connection()
+        .execute_unprepared("DROP TRIGGER reject_task_blocked_ack")
+        .await
+        .unwrap();
+    assert!(commit_blocked_source(&store, &source).await.unwrap());
+    assert_eq!(
+        store
+            .get_turn(&source.thread_id, &source.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::Blocked
+    );
+    assert_eq!(
+        store
+            .get_cli_runtime_native_event(&ack_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .native_method,
+        "gateway/terminal_ack"
+    );
+    assert!(
+        !store
+            .has_pending_cli_runtime_terminal_event(&source.turn_id)
+            .await
+            .unwrap()
+    );
+}
