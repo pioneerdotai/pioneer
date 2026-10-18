@@ -957,6 +957,20 @@ async fn create_cli_child_with_attachment(
         "safe task input",
     );
     if attachment == TaskAttachmentMode::Attached {
+        // Composer launches are detached. An attached CLI Task selects its
+        // exact native launch independently of composer metadata.
+        params.metadata = None;
+        params.launch = Some(
+            exact_cli_task_launch_for_test(
+                processor,
+                &harness.workspace_id,
+                &format!("cli_runtime:{}", harness.runtime_id),
+                "gpt-5",
+                &harness.runtime_id,
+            )
+            .await
+            .unwrap(),
+        );
         params.lifecycle_policy = Some(TaskLifecyclePolicy {
             attachment,
             on_parent_cancel: TaskParentTerminalAction::Cancel,
@@ -1928,6 +1942,7 @@ fn terminal_child_pending_parent_receipt_retains_capsule_until_replayed_cleanup(
             .await
             .unwrap();
         persist_completed_child(&harness, &child, now).await;
+        retain_cleanup_fixture_snapshot(store, &child.child_turn_id).await;
         let activations = harness.cli_session.turn_starts.lock().await.len();
         let background = processor.for_background_reconciliation();
         let pending = background
@@ -2084,7 +2099,42 @@ fn terminal_child_pending_parent_receipt_retains_capsule_until_replayed_cleanup(
     });
 }
 
+async fn retain_cleanup_fixture_snapshot(store: &pioneer_crud::CrudStore, turn_id: &str) {
+    // Native CLI activation persists a binding, not a provider runtime
+    // snapshot. Seed a valid snapshot explicitly to exercise capsule cleanup
+    // for both storage forms without changing the native activation path.
+    let binding = store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .unwrap()
+        .expect("cleanup fixture must have an activated CLI binding");
+    let now = chrono::Utc::now().fixed_offset();
+    store
+        .upsert_turn_runtime_snapshot(pioneer_crud::NewTurnRuntimeSnapshot {
+            turn_id: turn_id.to_owned(),
+            thread_id: binding.thread_id,
+            workspace_id: binding.workspace_id,
+            mode_json: r#""Agent""#.to_owned(),
+            model: "gpt-5".to_owned(),
+            provider_name: format!("cli_runtime:{}", binding.runtime_id),
+            reasoning_effort: None,
+            agent_skill_versions_json: None,
+            hook_runtime_context_json: "{}".to_owned(),
+            workspace_skill_policies_json: "[]".to_owned(),
+            input_json: "[]".to_owned(),
+            capabilities_json: "[]".to_owned(),
+            resolved_artifacts_json: "[]".to_owned(),
+            runtime_environment_json: "{}".to_owned(),
+            history_json: "[]".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+}
+
 async fn retain_cleanup_fixture_context(store: &pioneer_crud::CrudStore, turn_id: &str) {
+    retain_cleanup_fixture_snapshot(store, turn_id).await;
     for (sequence, source) in [
         (998, "cleanup_obligation_fixture"),
         (999, "assistant_round"),
