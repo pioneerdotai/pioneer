@@ -55327,7 +55327,7 @@ async fn materialize_cli_runtime_approval_turn(
     .await;
 }
 
-async fn materialize_cli_runtime_turn_with_text(
+pub(super) async fn materialize_cli_runtime_turn_with_text(
     crud_store: &CrudStore,
     workspace_id: &str,
     thread_id: &str,
@@ -83356,7 +83356,7 @@ async fn acp_preparation_tracks_the_parent_continuation_and_rejects_old_submissi
         continuation_requested: false,
     };
     *session.acp_snapshot.lock().unwrap() = Some(snapshot.clone());
-    let mut params: TurnStartParams = serde_json::from_value(json!({
+    let mut params: pioneer_protocol::TurnStartParams = serde_json::from_value(json!({
         "thread_id":"parent-acp","turn_id":"submission-one","execution_backend":{"type":"acpAgentRuntime","runtime_id":"acp-test"},
         "cli_runtime_options":{"acp_configuration":selection}
     })).unwrap();
