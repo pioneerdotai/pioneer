@@ -382,7 +382,9 @@ async fn run_gateway_start_failure(
         );
     } else if matches!(case, PreparationFailure::ChildPersistence) {
         assert!(child_error.is_none());
-        assert_eq!(error.code, "task_executor_start_unclassified_failed");
+        // The trigger raises a real SQLite error after admission was reported.
+        assert_eq!(error.code, "task_executor_start_storage_failed");
+        assert_eq!(error.class, TaskErrorClass::Internal);
     } else {
         assert_eq!(
             child_error,

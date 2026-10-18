@@ -57,6 +57,6 @@ pub use service::{
 pub use trigger::TaskTriggerCalculator;
 
 pub use start_failure::{
-    TaskStartCause, TaskStartFailure, TaskStartFailureDescriptor, TaskStartReporting,
-    TaskStartStage,
+    TaskStartCause, TaskStartFailure, TaskStartFailureDescriptor, TaskStartReason,
+    TaskStartReporting, TaskStartStage,
 };
