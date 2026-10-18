@@ -1316,6 +1316,7 @@ mod lifecycle_tests {
                 providers_request: Default::default(),
                 models_request: Default::default(),
                 provider_rows: vec![],
+                acp_session: None,
                 reasoning_rows: vec![],
                 selected_provider_ready: true,
             });
