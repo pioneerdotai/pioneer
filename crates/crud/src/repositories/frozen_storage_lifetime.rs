@@ -26,6 +26,10 @@ use std::{
 
 const FRAGMENT_BYTES: i64 = 64 * 1024;
 const META_ROWS: u64 = 64;
+// Bound only the added multi-key page, not the legacy TEXT ID domain. A key
+// above this policy uses the original full-key single seek outside the page.
+// At most META_ROWS * SCOPE_PAGE_KEY_BYTES key bytes are retained in its page.
+const SCOPE_PAGE_KEY_BYTES: i64 = FRAGMENT_BYTES;
 // Legacy JSON has no producer byte cap. An oversized record remains unknown
 // (and blocks only its retaining scope), rather than allowing one worker job
 // to grow without bound. A normal authorized root replacement can verify it.
@@ -2416,9 +2420,10 @@ struct ScopeDiscovery {
     after: String,
     kind: i64,
     done: bool,
+    pending: VecDeque<(Option<String>, i64)>,
 }
 impl ScopeDiscovery {
-    fn next_query(&self) -> sea_orm::sea_query::SelectStatement {
+    fn discovery_query(&self, page: bool) -> sea_orm::sea_query::SelectStatement {
         let (table, key) = match self.family {
             0 => ("compaction_frozen_history", "id"),
             1 => ("compaction_frozen_layout", "manifest_id"),
@@ -2428,10 +2433,33 @@ impl ScopeDiscovery {
             _ => ("compaction_checkpoint", "id"),
         };
         let mut query = Query::select();
-        query
-            .from(Alias::new(table))
-            .expr_as(Expr::col(Alias::new(key)), Alias::new("manifest_id"));
-        if self.family == 1 {
+        query.from(Alias::new(table));
+        if page {
+            query.expr_as(
+                Expr::case(
+                    Expr::cust(format!(
+                        "length(CAST({key} AS BLOB)) <= {SCOPE_PAGE_KEY_BYTES}"
+                    )),
+                    Expr::col(Alias::new(key)),
+                )
+                .finally(Expr::val(Option::<String>::None)),
+                Alias::new("manifest_id"),
+            );
+        } else {
+            query.expr_as(Expr::col(Alias::new(key)), Alias::new("manifest_id"));
+        }
+        if self.family == 1 && page {
+            // INTEGER affinity alone does not bound malformed legacy TEXT.
+            // Return NULL (decode error), never an unbounded kind value.
+            query.expr_as(
+                Expr::case(
+                    Expr::cust("typeof(kind) = 'integer'"),
+                    Expr::col(Alias::new("kind")),
+                )
+                .finally(Expr::val(Option::<i64>::None)),
+                Alias::new("kind"),
+            );
+        } else if self.family == 1 {
             query.column(Alias::new("kind"));
         } else {
             query.expr_as(Expr::val(i64::from(self.family == 3)), Alias::new("kind"));
@@ -2444,24 +2472,77 @@ impl ScopeDiscovery {
             }
             query.and_where(after);
         }
-        query.order_by(Alias::new(key), Order::Asc);
+        query.order_by((Alias::new(table), Alias::new(key)), Order::Asc);
         if self.family == 1 {
-            query.order_by(Alias::new("kind"), Order::Asc);
+            query.order_by((Alias::new(table), Alias::new("kind")), Order::Asc);
         }
         if matches!(self.family, 2 | 3) {
             query.order_by(Alias::new("ordinal"), Order::Asc);
         }
-        query.limit(1);
+        // Physical rows are ordered by (manifest_id,ordinal). Keep the old
+        // single-group seek: paging rows would revisit a manifest per ordinal,
+        // and DISTINCT/GROUP BY could scan an unbounded container/table.
+        query.limit(if !page || matches!(self.family, 2 | 3) {
+            1
+        } else {
+            META_ROWS
+        });
         query
     }
 
+    async fn fetch_page(&self, store: &CrudStore) -> Result<VecDeque<(Option<String>, i64)>> {
+        // Owned rows only: query_all releases reader/permit before decoding or
+        // any scope oracle. Publish the page only after all rows decode.
+        store
+            .connection
+            .query_all(&self.discovery_query(true))
+            .await?
+            .into_iter()
+            .map(|row| Ok((row.try_get("", "manifest_id")?, row.try_get("", "kind")?)))
+            .collect()
+    }
+
     async fn step(&mut self, store: &CrudStore) -> Result<bool> {
+        let result = self.step_pending(store).await;
+        if result.is_err() {
+            // Re-seek from the acknowledged cursor on retry, just as the old
+            // single-key discovery did. A deleted/repaired pending identity
+            // must not become an eternal RAM-only poison entry.
+            self.pending.clear();
+        }
+        result
+    }
+
+    async fn step_pending(&mut self, store: &CrudStore) -> Result<bool> {
         if self.done {
             return Ok(false);
         }
-        let query = self.next_query();
-        let row = store.connection.query_one(&query).await?;
-        let Some(row) = row else {
+        if self.pending.is_empty() {
+            self.pending = self.fetch_page(store).await?;
+        }
+        let key = match self.pending.front() {
+            Some((Some(id), kind)) => Some((id.clone(), *kind)),
+            Some((None, _)) => {
+                // The sentinel carries no identity. Drop its entire unacked
+                // tail and re-seek from the confirmed cursor, so concurrent
+                // deletion/replacement cannot skip or duplicate a cached key.
+                // Full legacy-sized IDs stay local to this step, never in the
+                // multi-key page. Cancellation/error safely refetches on retry.
+                self.pending.clear();
+                store
+                    .connection
+                    .query_one(&self.discovery_query(false))
+                    .await?
+                    .map(|row| -> Result<(String, i64)> {
+                        Ok((row.try_get("", "manifest_id")?, row.try_get("", "kind")?))
+                    })
+                    .transpose()?
+            }
+            None => None,
+        };
+        let Some((id, kind)) = key else {
+            // Even a partial page needs a later empty probe after all keys
+            // pass. A sentinel's fresh single seek may also establish EOF.
             self.family += 1;
             self.after.clear();
             self.kind = -1;
@@ -2471,8 +2552,6 @@ impl ScopeDiscovery {
             }
             return Ok(true);
         };
-        let id: String = row.try_get("", "manifest_id")?;
-        let kind: i64 = row.try_get("", "kind")?;
         if self.family >= 4 {
             let node = Alias::new("node");
             let mut scoped = Query::select();
@@ -2521,6 +2600,7 @@ impl ScopeDiscovery {
                 store.connection.query_one(&scoped).await?.is_some(),
                 "legacy operation/checkpoint scope unknown; cleanup waits for repair"
             );
+            self.pending.pop_front();
             self.after = id;
             self.kind = kind;
             self.started = true;
@@ -2578,6 +2658,7 @@ impl ScopeDiscovery {
             known.is_some(),
             "legacy frozen dependency scope unknown; cleanup waits for repair"
         );
+        self.pending.pop_front();
         self.after = id;
         self.kind = kind;
         self.started = true;
@@ -3410,18 +3491,24 @@ mod tests {
             kind: 0,
             ..Default::default()
         };
-        let (sql, values) = scope.next_query().build(SqliteQueryBuilder);
+        let (sql, values) = scope.discovery_query(false).build(SqliteQueryBuilder);
         assert!(sql.contains(r#"WHERE ("manifest_id", "kind") > (?, ?)"#));
-        assert!(sql.ends_with(r#"ORDER BY "manifest_id" ASC, "kind" ASC LIMIT ?"#));
+        assert!(sql.ends_with(r#"ORDER BY "compaction_frozen_layout"."manifest_id" ASC, "compaction_frozen_layout"."kind" ASC LIMIT ?"#));
         assert!(!sql.contains(" OR ") && !sql.contains(&scope.after));
         assert_eq!(
             values,
             Values(vec![scope.after.clone().into(), 0_i64.into(), 1_u64.into()])
         );
+        // Both page discovery and the full-key fallback use the tuple seek.
+        let (page_sql, page_values) = scope.discovery_query(true).build(SqliteQueryBuilder);
+        assert!(page_sql.contains(r#"WHERE ("manifest_id", "kind") > (?, ?)"#));
+        assert!(page_sql.ends_with(r#"ORDER BY "compaction_frozen_layout"."manifest_id" ASC, "compaction_frozen_layout"."kind" ASC LIMIT ?"#));
+        assert!(!page_sql.contains(" OR ") && !page_sql.contains(&scope.after));
+        assert_eq!(page_values.0.last(), Some(&META_ROWS.into()));
         scope.started = false;
-        let (sql, values) = scope.next_query().build(SqliteQueryBuilder);
+        let (sql, values) = scope.discovery_query(false).build(SqliteQueryBuilder);
         assert!(!sql.contains("WHERE"));
-        assert!(sql.ends_with(r#"ORDER BY "manifest_id" ASC, "kind" ASC LIMIT ?"#));
+        assert!(sql.ends_with(r#"ORDER BY "compaction_frozen_layout"."manifest_id" ASC, "compaction_frozen_layout"."kind" ASC LIMIT ?"#));
         assert_eq!(values, Values(vec![1_u64.into()]));
     }
 
@@ -3589,6 +3676,834 @@ mod tests {
         assert!(progress.conversion.is_none());
         assert_eq!(progress.scope.family, 6);
         assert!(!progress.scope.step(&store).await.unwrap());
+    }
+
+    // Scope-only fixtures install the full schema and every production trigger.
+    // They contain incomplete captures / unsealed candidates, never malformed
+    // ready histories or disabled guards. FK OFF matches the writer contract.
+    async fn scope_page_fixture() -> CrudStore {
+        let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1).min_connections(1);
+        let db = Database::connect(options).await.unwrap();
+        db.execute_unprepared("PRAGMA foreign_keys=OFF")
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        for sql in [
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','scope pages',1,1)",
+            "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO compaction_context(owner,workspace_id,thread_id,format_version) VALUES('owner','ws','thread',1)",
+        ] {
+            db.execute_unprepared(sql).await.unwrap();
+        }
+        CrudStore::new(db).with_maintenance_access()
+    }
+
+    async fn scope_page_seed(store: &CrudStore, count: usize) {
+        let ids: Vec<_> = (0..count).map(|index| format!("key-{index:04}")).collect();
+        scope_page_seed_ids(store, &ids).await;
+    }
+
+    async fn scope_page_seed_ids(store: &CrudStore, ids: &[String]) {
+        for (index, id) in ids.iter().enumerate() {
+            let id = id.clone();
+            let descriptor = FrozenHistoryRef {
+                format: 1,
+                manifest_id: id.clone(),
+                messages: 200,
+                identity_sha256: hex::encode(Sha256::digest([])),
+            };
+            store
+                .compaction_begin_frozen_history_with_imports(
+                    "ws",
+                    "thread",
+                    &descriptor,
+                    200,
+                    &hex::encode(Sha256::digest([])),
+                )
+                .await
+                .unwrap();
+            // Offset the layout sequence by one: the 64th key is kind=0,
+            // and the next page starts with kind=1 of the SAME manifest.
+            for kind in 0..2_i64 {
+                if (index == 0 && kind == 0) || index * 2 + kind as usize > ids.len() {
+                    continue;
+                }
+                store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                    "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES(?1,?2,0,0)",
+                    [id.clone().into(), kind.into()])).await.unwrap();
+            }
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms) VALUES(?1,'owner',?1,'failed','{}',1)",
+                [id.clone().into()])).await.unwrap();
+            let checkpoint = Checkpoint {
+                id: id.clone(),
+                operation_id: id.clone(),
+                owner: "owner".into(),
+                previous: None,
+                summary: "summary".into(),
+                selection: ModelSelection {
+                    transport: Transport::Api,
+                    instance: "p".into(),
+                    model: "m".into(),
+                    effort: None,
+                },
+                coverage: vec![],
+                projection_version: 1,
+                format_version: 1,
+            };
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES(?1,?1,'owner',0,'summary',?2,?3,1,1,'candidate')",
+                [id.into(), compaction::checkpoint_identity(&checkpoint).unwrap().into(), serde_json::to_string(&checkpoint.selection).unwrap().into()])).await.unwrap();
+        }
+    }
+
+    // Independent copy of the old LIMIT 1 inventory walk, including physical
+    // group seek and the layout continuation. No scope decision is mocked.
+    async fn scope_single_key_inventory(store: &CrudStore, family: usize) -> Vec<(String, i64)> {
+        let (table, key) = match family {
+            0 => ("compaction_frozen_history", "id"),
+            1 => ("compaction_frozen_layout", "manifest_id"),
+            2 => ("compaction_frozen_message_data", "manifest_id"),
+            3 => ("compaction_frozen_import_data", "manifest_id"),
+            4 => ("compaction_operation", "id"),
+            _ => ("compaction_checkpoint", "id"),
+        };
+        let mut inventory: Vec<(String, i64)> = Vec::new();
+        loop {
+            let mut query = Query::select();
+            query
+                .from(Alias::new(table))
+                .expr_as(Expr::col(Alias::new(key)), Alias::new("id"));
+            if family == 1 {
+                query.column(Alias::new("kind"));
+            } else {
+                query.expr_as(Expr::val(i64::from(family == 3)), Alias::new("kind"));
+            }
+            if let Some((id, kind)) = inventory.last() {
+                let mut after = Expr::col(Alias::new(key)).gt(id);
+                if family == 1 {
+                    after = after.or(Expr::col(Alias::new(key))
+                        .eq(id)
+                        .and(Expr::col(Alias::new("kind")).gt(*kind)));
+                }
+                query.and_where(after);
+            }
+            query.order_by((Alias::new(table), Alias::new(key)), Order::Asc);
+            if family == 1 {
+                query.order_by(Alias::new("kind"), Order::Asc);
+            } else if matches!(family, 2 | 3) {
+                query.order_by(Alias::new("ordinal"), Order::Asc);
+            }
+            query.limit(1);
+            let Some(row) = store.connection.query_one(&query).await.unwrap() else {
+                break;
+            };
+            inventory.push((
+                row.try_get("", "id").unwrap(),
+                row.try_get("", "kind").unwrap(),
+            ));
+            assert!(inventory.len() <= 1024, "test inventory is finite");
+        }
+        inventory
+    }
+
+    #[tokio::test]
+    async fn scope_pages_match_single_key_inventory_and_require_checked_eof() {
+        for count in [0, 1, 63, 64, 65, 193] {
+            let store = scope_page_fixture().await;
+            scope_page_seed(&store, count).await;
+            for family in [0, 1, 4, 5] {
+                let expected = scope_single_key_inventory(&store, family).await;
+                assert_eq!(expected.len(), count);
+                let mut scope = ScopeDiscovery {
+                    family,
+                    ..Default::default()
+                };
+                for (index, key) in expected.iter().enumerate() {
+                    assert!(scope.step(&store).await.unwrap());
+                    assert_eq!((&scope.after, scope.kind), (&key.0, key.1));
+                    assert_eq!(scope.family, family, "last row is not EOF");
+                    assert!(!scope.done);
+                    assert_eq!(
+                        scope.pending.len(),
+                        (expected.len() - index - 1).min(63 - index % 64)
+                    );
+                    assert!(
+                        scope
+                            .pending
+                            .iter()
+                            .all(|(id, _)| id.as_ref().unwrap().len()
+                                <= SCOPE_PAGE_KEY_BYTES as usize)
+                    );
+                    if count == 65 && family == 1 && index == 63 {
+                        assert_eq!((&*scope.after, scope.kind), ("key-0032", 0));
+                        assert!(scope.pending.is_empty());
+                    }
+                    if count == 65 && family == 1 && index == 64 {
+                        assert_eq!((&*scope.after, scope.kind), ("key-0032", 1));
+                    }
+                }
+                assert!(scope.step(&store).await.unwrap());
+                assert_eq!(scope.family, family + 1);
+                assert!(!scope.started && scope.after.is_empty() && scope.kind == -1);
+                assert!(scope.pending.is_empty());
+                assert_eq!(scope.done, family == 5);
+                if scope.done {
+                    assert!(!scope.step(&store).await.unwrap());
+                }
+            }
+            let mut progress = FrozenStorageLifetimeProgress::default();
+            for _ in 0..2048 {
+                if progress.scope.done {
+                    break;
+                }
+                assert!(!progress.conversion_scope(&store).await.unwrap());
+            }
+            assert!(progress.scope.done);
+            assert!(progress.conversion_scope(&store).await.unwrap());
+            assert!(
+                progress.conversion_scope(&store).await.unwrap(),
+                "warm checked EOF"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scope_physical_groups_do_not_page_or_visit_ordinals() {
+        let store = scope_page_fixture().await;
+        scope_page_seed(&store, 3).await;
+        for (index, count) in [193, 1, 65].into_iter().enumerate() {
+            for ordinal in 0..count {
+                let id = format!("key-{index:04}");
+                store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                    "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES(?1,?2,'{}',2)",
+                    [id.clone().into(), (ordinal as i64).into()])).await.unwrap();
+                store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                    "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES(?1,?2,0,'event','event-'||?2,'v','thread','{}',2)",
+                    [id.into(), (ordinal as i64).into()])).await.unwrap();
+            }
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "UPDATE compaction_frozen_history SET next_ordinal=?2,next_import=?2 WHERE id=?1",
+                [format!("key-{index:04}").into(), (count as i64).into()])).await.unwrap();
+        }
+        for family in [2, 3] {
+            let expected = scope_single_key_inventory(&store, family).await;
+            assert_eq!(expected.len(), 3);
+            let mut scope = ScopeDiscovery {
+                family,
+                ..Default::default()
+            };
+            for (index, key) in expected.iter().enumerate() {
+                assert_eq!(scope.fetch_page(&store).await.unwrap().len(), 1);
+                scope.step(&store).await.unwrap();
+                assert_eq!((&scope.after, scope.kind), (&key.0, key.1));
+                assert_eq!(scope.after, format!("key-{index:04}"));
+                assert!(scope.pending.is_empty());
+            }
+            scope.step(&store).await.unwrap();
+            assert_eq!(scope.family, family + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn scope_page_db_error_and_unknown_scope_retry_the_unacknowledged_key() {
+        let store = scope_page_fixture().await;
+        scope_page_seed(&store, 65).await;
+        let mut scope = ScopeDiscovery {
+            family: 4,
+            ..Default::default()
+        };
+        for _ in 0..10 {
+            scope.step(&store).await.unwrap();
+        }
+        assert_eq!(scope.after, "key-0009");
+        assert!(!scope.pending.is_empty());
+        // Fail the real oracle SELECT while a decoded page is pending. DDL is
+        // confined to this disposable fixture; no trigger is removed/disabled.
+        store
+            .connection
+            .execute_unprepared(
+                "ALTER TABLE compaction_context RENAME TO scope_context_unavailable",
+            )
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let error = scope.step(&store).await.unwrap_err();
+            assert!(error.downcast_ref::<sea_orm::DbErr>().is_some());
+            assert_eq!(scope.after, "key-0009");
+            assert!(
+                scope.pending.is_empty(),
+                "retry refetches from acknowledged cursor"
+            );
+            assert!(!scope.done && scope.family == 4 && scope.started);
+        }
+        store
+            .connection
+            .execute_unprepared(
+                "ALTER TABLE scope_context_unavailable RENAME TO compaction_context",
+            )
+            .await
+            .unwrap();
+        scope.step(&store).await.unwrap();
+        assert_eq!(scope.after, "key-0010");
+        // Mutable scope must be checked when visited, not frozen at fetch.
+        store
+            .connection
+            .execute_unprepared(
+                "UPDATE compaction_operation SET owner='missing' WHERE id='key-0020'",
+            )
+            .await
+            .unwrap();
+        for _ in 11..20 {
+            scope.step(&store).await.unwrap();
+        }
+        assert!(!scope.pending.is_empty());
+        for _ in 0..2 {
+            assert!(scope.step(&store).await.is_err());
+            assert_eq!(scope.after, "key-0019");
+            assert!(
+                scope.pending.is_empty(),
+                "retry refetches from acknowledged cursor"
+            );
+            assert!(!scope.done && scope.family == 4);
+        }
+        store
+            .connection
+            .execute_unprepared("UPDATE compaction_operation SET owner='owner' WHERE id='key-0020'")
+            .await
+            .unwrap();
+        scope.step(&store).await.unwrap();
+        assert_eq!(scope.after, "key-0020");
+        for _ in 0..256 {
+            if scope.done {
+                break;
+            }
+            scope.step(&store).await.unwrap();
+        }
+        assert!(scope.done);
+    }
+
+    #[tokio::test]
+    async fn scope_pages_keep_operation_and_checkpoint_projection_scope_fallback() {
+        let (store, _) = fixture(false).await;
+        let store = store.with_maintenance_access();
+        // Legacy FK OFF metadata may lack context but retain its checked
+        // projection. Use the fixture's real ready origin, with no sealed proof.
+        store.connection.execute_unprepared("INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms) VALUES('zz-bound','missing','bound','failed','{}',1)").await.unwrap();
+        store.connection.execute_unprepared("INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) SELECT 'zz-bound',id,identity_sha256,imports_sha256,import_count FROM compaction_frozen_history WHERE id='origin'").await.unwrap();
+        let mut operations = ScopeDiscovery {
+            family: 4,
+            ..Default::default()
+        };
+        operations.step(&store).await.unwrap();
+        assert_eq!(operations.after, "op");
+        assert_eq!(
+            operations.pending.front().unwrap().0.as_deref(),
+            Some("zz-bound")
+        );
+        operations.step(&store).await.unwrap();
+        assert_eq!(operations.after, "zz-bound");
+        // A checkpoint with unknown owner uses its operation's projection.
+        let checkpoint = Checkpoint {
+            id: "zz-bound".into(),
+            operation_id: "zz-bound".into(),
+            owner: "missing".into(),
+            previous: None,
+            summary: "legacy bound candidate".into(),
+            selection: ModelSelection {
+                transport: Transport::Api,
+                instance: "p".into(),
+                model: "m".into(),
+                effort: None,
+            },
+            coverage: vec![],
+            projection_version: 1,
+            format_version: 1,
+        };
+        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES('zz-bound','zz-bound','missing',0,?1,?2,?3,1,1,'candidate')",
+            [checkpoint.summary.clone().into(), compaction::checkpoint_identity(&checkpoint).unwrap().into(), serde_json::to_string(&checkpoint.selection).unwrap().into()])).await.unwrap();
+        let mut checkpoints = ScopeDiscovery {
+            family: 5,
+            ..Default::default()
+        };
+        checkpoints.step(&store).await.unwrap();
+        checkpoints.step(&store).await.unwrap();
+        assert_eq!(checkpoints.after, "cp-1");
+        store
+            .connection
+            .execute_unprepared(
+                "DELETE FROM compaction_operation_projection WHERE operation_id='zz-bound'",
+            )
+            .await
+            .unwrap();
+        assert!(checkpoints.step(&store).await.is_err());
+        assert_eq!(checkpoints.after, "cp-1");
+        assert!(!checkpoints.done);
+        store.connection.execute_unprepared("INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) SELECT 'zz-bound',id,identity_sha256,imports_sha256,import_count FROM compaction_frozen_history WHERE id='origin'").await.unwrap();
+        checkpoints.step(&store).await.unwrap();
+        assert_eq!(checkpoints.after, "zz-bound");
+        assert!(!checkpoints.done);
+        checkpoints.step(&store).await.unwrap();
+        assert!(checkpoints.done);
+    }
+
+    #[tokio::test]
+    async fn scope_page_decode_failure_refetches_after_the_confirmed_tuple() {
+        let store = scope_page_fixture().await;
+        scope_page_seed(&store, 129).await;
+        let mut scope = ScopeDiscovery {
+            family: 1,
+            ..Default::default()
+        };
+        for _ in 0..64 {
+            scope.step(&store).await.unwrap();
+        }
+        assert_eq!((&*scope.after, scope.kind), ("key-0032", 0));
+        assert!(scope.pending.is_empty());
+        // SQLite INTEGER affinity permits malformed legacy TEXT. Installed
+        // layout dependency guards still see an available logical header.
+        store.connection.execute_unprepared("UPDATE compaction_frozen_layout SET kind='bad-kind' WHERE manifest_id='key-0033' AND kind=1").await.unwrap();
+        for _ in 0..2 {
+            assert!(scope.step(&store).await.is_err());
+            assert_eq!((&*scope.after, scope.kind), ("key-0032", 0));
+            assert!(scope.pending.is_empty() && !scope.done);
+            assert_eq!(scope.family, 1);
+        }
+        store.connection.execute_unprepared("UPDATE compaction_frozen_layout SET kind=1 WHERE manifest_id='key-0033' AND kind='bad-kind'").await.unwrap();
+        scope.step(&store).await.unwrap();
+        assert_eq!((&*scope.after, scope.kind), ("key-0032", 1));
+        scope.step(&store).await.unwrap();
+        assert_eq!((&*scope.after, scope.kind), ("key-0033", 0));
+        scope.step(&store).await.unwrap();
+        assert_eq!((&*scope.after, scope.kind), ("key-0033", 1));
+    }
+
+    #[tokio::test]
+    async fn scope_page_deleted_pending_key_refetches_without_skipping_existing_keys() {
+        let store = scope_page_fixture().await;
+        scope_page_seed(&store, 3).await;
+        let mut scope = ScopeDiscovery {
+            family: 4,
+            ..Default::default()
+        };
+        scope.step(&store).await.unwrap();
+        assert_eq!(
+            scope.pending.front().unwrap().0.as_deref(),
+            Some("key-0001")
+        );
+        // No sealed evidence exists; all installed guards remain enabled.
+        store
+            .connection
+            .execute_unprepared("DELETE FROM compaction_operation WHERE id='key-0001'")
+            .await
+            .unwrap();
+        assert!(scope.step(&store).await.is_err());
+        assert_eq!(scope.after, "key-0000");
+        assert!(scope.pending.is_empty() && !scope.done);
+        scope.step(&store).await.unwrap();
+        assert_eq!(scope.after, "key-0002");
+        scope.step(&store).await.unwrap();
+        assert_eq!(scope.family, 5);
+    }
+
+    #[tokio::test]
+    async fn scope_page_cancel_retry_and_recreate_preserve_the_barrier() {
+        let store = scope_page_fixture().await;
+        scope_page_seed(&store, 65).await;
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        progress.scope.step(&store).await.unwrap();
+        assert_eq!(progress.scope.after, "key-0000");
+        assert_eq!(progress.scope.pending.len(), 63);
+        let pending = progress.scope.pending.clone();
+        // Occupy the existing Maintenance read permit. The pending oracle can
+        // be polled and dropped deterministically while waiting for admission.
+        let holder = store.connection.begin_read().await.unwrap();
+        let mut attempt = Box::pin(progress.scope.step(&store));
+        assert!(futures_util::poll!(attempt.as_mut()).is_pending());
+        drop(attempt);
+        assert_eq!(progress.scope.after, "key-0000");
+        assert_eq!(progress.scope.pending, pending);
+        assert!(!progress.scope.done);
+        holder.rollback().await.unwrap();
+        progress.scope.step(&store).await.unwrap();
+        assert_eq!(progress.scope.after, "key-0001");
+        // An unconfirmed page fetch is cancellable by the same permit barrier.
+        let mut unfetched = ScopeDiscovery::default();
+        let holder = store.connection.begin_read().await.unwrap();
+        let mut attempt = Box::pin(unfetched.step(&store));
+        assert!(futures_util::poll!(attempt.as_mut()).is_pending());
+        drop(attempt);
+        assert!(!unfetched.started && unfetched.pending.is_empty() && !unfetched.done);
+        holder.rollback().await.unwrap();
+        drop(progress);
+        let mut restart = FrozenStorageLifetimeProgress::default();
+        assert!(!restart.conversion_scope(&store).await.unwrap());
+        assert_eq!(restart.scope.after, "key-0000");
+        assert!(restart.expiry.is_none() && restart.sweep.is_none() && restart.discard.is_none());
+        for _ in 0..512 {
+            if restart.scope.done {
+                break;
+            }
+            assert!(!restart.conversion_scope(&store).await.unwrap());
+        }
+        assert!(restart.scope.done && restart.conversion_scope(&store).await.unwrap());
+        assert_eq!(
+            store.connection.read_class(),
+            pioneer_sqlite::SqliteReadClass::Maintenance
+        );
+        assert_eq!(
+            store.connection.write_class(),
+            pioneer_sqlite::SqliteWriteClass::Maintenance
+        );
+        // If a page retained the connection/permit, even this snapshot could
+        // not be admitted on the one-connection fixture after a completed step.
+        store
+            .connection
+            .begin_read()
+            .await
+            .unwrap()
+            .rollback()
+            .await
+            .unwrap();
+    }
+
+    // Uses multibyte text so SQL character count would not enforce the policy.
+    fn scope_page_sized_id(index: usize, bytes: usize) -> String {
+        let prefix = format!("key-{index:04}");
+        let remaining = bytes - prefix.len();
+        format!(
+            "{prefix}{}{}",
+            "я".repeat(remaining / 2),
+            "x".repeat(remaining % 2)
+        )
+    }
+
+    #[tokio::test]
+    async fn scope_page_long_keys_keep_full_inventory_without_repair() {
+        for long_index in [0, 17, 32, 64] {
+            let store = scope_page_fixture().await;
+            let mut ids: Vec<_> = (0..129).map(|index| format!("key-{index:04}")).collect();
+            ids[10] = scope_page_sized_id(10, SCOPE_PAGE_KEY_BYTES as usize - 1);
+            ids[11] = scope_page_sized_id(11, SCOPE_PAGE_KEY_BYTES as usize);
+            // First / inside / layout-kind split / exact page boundary, plus
+            // consecutive long IDs. No identity is ever shortened or repaired.
+            for index in [long_index, long_index + 1] {
+                ids[index] = scope_page_sized_id(index, SCOPE_PAGE_KEY_BYTES as usize + 2);
+                assert!(ids[index].chars().count() < SCOPE_PAGE_KEY_BYTES as usize);
+            }
+            scope_page_seed_ids(&store, &ids).await;
+            for family in [0, 1, 4, 5] {
+                let expected = scope_single_key_inventory(&store, family).await;
+                let mut scope = ScopeDiscovery {
+                    family,
+                    ..Default::default()
+                };
+                for (id, kind) in &expected {
+                    scope.step(&store).await.unwrap();
+                    assert_eq!((&scope.after, scope.kind), (id, *kind));
+                    assert_eq!(scope.family, family, "last fetched row is not EOF");
+                    assert!(!scope.done);
+                    assert!(scope.pending.len() <= META_ROWS as usize);
+                    let page_bytes: usize = scope
+                        .pending
+                        .iter()
+                        .filter_map(|(id, _)| id.as_ref())
+                        .map(String::len)
+                        .sum();
+                    assert!(page_bytes <= META_ROWS as usize * SCOPE_PAGE_KEY_BYTES as usize);
+                    assert!(scope.pending.iter().all(|(id, _)| {
+                        id.as_ref()
+                            .is_none_or(|id| id.len() <= SCOPE_PAGE_KEY_BYTES as usize)
+                    }));
+                    if id.len() > SCOPE_PAGE_KEY_BYTES as usize {
+                        assert!(
+                            scope.pending.is_empty(),
+                            "full legacy key is local, tail discarded"
+                        );
+                    }
+                }
+                scope.step(&store).await.unwrap();
+                assert_eq!(scope.family, family + 1);
+                assert!(scope.pending.is_empty() && !scope.started && scope.after.is_empty());
+                assert_eq!(scope.kind, -1);
+                assert_eq!(scope.done, family == 5);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scope_long_physical_keys_still_visit_each_container_once() {
+        let store = scope_page_fixture().await;
+        let ids = [
+            "key-0000".into(),
+            scope_page_sized_id(1, SCOPE_PAGE_KEY_BYTES as usize + 2),
+            "key-0002".into(),
+        ];
+        scope_page_seed_ids(&store, &ids).await;
+        for id in &ids {
+            for ordinal in 0..3_i64 {
+                store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                    "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES(?1,?2,'{}',2)",
+                    [id.clone().into(), ordinal.into()])).await.unwrap();
+                store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                    "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES(?1,?2,0,'event','event-'||?2,'v','thread','{}',2)",
+                    [id.clone().into(), ordinal.into()])).await.unwrap();
+            }
+            store
+                .connection
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE compaction_frozen_history SET next_ordinal=3,next_import=3 WHERE id=?1",
+                    [id.clone().into()],
+                ))
+                .await
+                .unwrap();
+        }
+        for family in [2, 3] {
+            let expected = scope_single_key_inventory(&store, family).await;
+            assert_eq!(expected.len(), ids.len());
+            let mut scope = ScopeDiscovery {
+                family,
+                ..Default::default()
+            };
+            for (id, kind) in expected {
+                scope.step(&store).await.unwrap();
+                assert_eq!((&scope.after, scope.kind), (&id, kind));
+                assert!(scope.pending.is_empty());
+                assert_eq!(scope.family, family);
+            }
+            scope.step(&store).await.unwrap();
+            assert_eq!(scope.family, family + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn scope_long_key_unknown_error_cancel_and_retry_keep_the_barrier() {
+        let store = scope_page_fixture().await;
+        let long = scope_page_sized_id(1, SCOPE_PAGE_KEY_BYTES as usize + 2);
+        scope_page_seed_ids(
+            &store,
+            &["key-0000".into(), long.clone(), "key-0002".into()],
+        )
+        .await;
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        progress.scope.family = 4;
+        progress.scope.step(&store).await.unwrap();
+        assert_eq!(progress.scope.after, "key-0000");
+        assert_eq!(progress.scope.pending.front(), Some(&(None, 0)));
+
+        let holder = store.connection.begin_read().await.unwrap();
+        let mut attempt = Box::pin(progress.scope.step(&store));
+        assert!(futures_util::poll!(attempt.as_mut()).is_pending());
+        drop(attempt);
+        assert!(
+            progress.scope.pending.is_empty(),
+            "cancelled single fetch discarded tail"
+        );
+        assert_eq!(progress.scope.after, "key-0000");
+        assert!(!progress.scope.done);
+        holder.rollback().await.unwrap();
+
+        // Stage the actual sentinel again, then fail first the full-key seek,
+        // then its oracle. No production test hook or query replacement.
+        for table in ["compaction_operation", "compaction_context"] {
+            progress.scope.pending = progress.scope.fetch_page(&store).await.unwrap();
+            assert_eq!(progress.scope.pending.front(), Some(&(None, 0)));
+            store
+                .connection
+                .execute_unprepared(&format!("ALTER TABLE {table} RENAME TO scope_unavailable"))
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                let error = progress.conversion_scope(&store).await.unwrap_err();
+                assert!(error.downcast_ref::<sea_orm::DbErr>().is_some());
+                assert_eq!(progress.scope.after, "key-0000");
+                assert!(progress.scope.pending.is_empty() && !progress.scope.done);
+                assert_eq!(progress.scope.family, 4);
+            }
+            store
+                .connection
+                .execute_unprepared(&format!("ALTER TABLE scope_unavailable RENAME TO {table}"))
+                .await
+                .unwrap();
+        }
+        store
+            .connection
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE compaction_operation SET owner='missing' WHERE id=?1",
+                [long.clone().into()],
+            ))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert!(progress.conversion_scope(&store).await.is_err());
+            assert_eq!(progress.scope.after, "key-0000");
+            assert!(progress.scope.pending.is_empty() && !progress.scope.done);
+            assert!(
+                progress.expiry.is_none() && progress.sweep.is_none() && progress.discard.is_none()
+            );
+        }
+        // Restore scope only. Keep the complete long ID unchanged.
+        store
+            .connection
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE compaction_operation SET owner='owner' WHERE id=?1",
+                [long.clone().into()],
+            ))
+            .await
+            .unwrap();
+        assert!(!progress.conversion_scope(&store).await.unwrap());
+        assert_eq!(progress.scope.after, long);
+        assert!(progress.scope.pending.is_empty());
+        assert!(!progress.conversion_scope(&store).await.unwrap());
+        assert_eq!(progress.scope.after, "key-0002");
+        for _ in 0..16 {
+            if progress.scope.done {
+                break;
+            }
+            assert!(!progress.conversion_scope(&store).await.unwrap());
+        }
+        assert!(progress.scope.done && progress.conversion_scope(&store).await.unwrap());
+        drop(progress);
+        // The frozen dependency oracle must also retain unknown long keys.
+        // Header is incomplete: its scope can be repaired without weakening
+        // the complete-identity trigger or changing the ID.
+        store
+            .connection
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE compaction_frozen_history SET workspace_id='' WHERE id=?1",
+                [long.clone().into()],
+            ))
+            .await
+            .unwrap();
+        let mut restart = FrozenStorageLifetimeProgress::default();
+        assert!(!restart.conversion_scope(&store).await.unwrap());
+        assert_eq!(restart.scope.after, "key-0000");
+        for _ in 0..2 {
+            assert!(restart.conversion_scope(&store).await.is_err());
+            assert_eq!(restart.scope.after, "key-0000");
+            assert!(!restart.scope.done && restart.scope.pending.is_empty());
+            assert_eq!(restart.scope.family, 0);
+        }
+        store
+            .connection
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE compaction_frozen_history SET workspace_id='ws' WHERE id=?1",
+                [long.clone().into()],
+            ))
+            .await
+            .unwrap();
+        assert!(!restart.conversion_scope(&store).await.unwrap());
+        assert_eq!(restart.scope.after, long);
+        for _ in 0..32 {
+            if restart.scope.done {
+                break;
+            }
+            assert!(!restart.conversion_scope(&store).await.unwrap());
+        }
+        assert!(restart.scope.done && restart.conversion_scope(&store).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn scope_long_layout_fallback_keeps_invalid_kind_errors() {
+        let store = scope_page_fixture().await;
+        let long = scope_page_sized_id(1, SCOPE_PAGE_KEY_BYTES as usize + 2);
+        scope_page_seed_ids(
+            &store,
+            &["key-0000".into(), long.clone(), "key-0002".into()],
+        )
+        .await;
+        let mut scope = ScopeDiscovery {
+            family: 1,
+            ..Default::default()
+        };
+        scope.step(&store).await.unwrap();
+        assert_eq!((&*scope.after, scope.kind), ("key-0000", 1));
+        assert_eq!(scope.pending.front(), Some(&(None, 0)));
+        // Corrupt BOTH kinds after page capture. The raw fallback must retain
+        // the old decode failure rather than coercing bad legacy TEXT to zero.
+        store
+            .connection
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE compaction_frozen_layout SET kind='bad-'||kind WHERE manifest_id=?1",
+                [long.clone().into()],
+            ))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert!(scope.step(&store).await.is_err());
+            assert_eq!((&*scope.after, scope.kind), ("key-0000", 1));
+            assert!(scope.pending.is_empty() && !scope.done);
+            assert_eq!(scope.family, 1);
+        }
+        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "UPDATE compaction_frozen_layout SET kind=CASE kind WHEN 'bad-0' THEN 0 ELSE 1 END WHERE manifest_id=?1", [long.clone().into()])).await.unwrap();
+        for kind in [0, 1] {
+            scope.step(&store).await.unwrap();
+            assert_eq!((&scope.after, scope.kind), (&long, kind));
+            assert!(scope.pending.is_empty());
+        }
+        scope.step(&store).await.unwrap();
+        assert_eq!(scope.family, 2);
+    }
+
+    #[tokio::test]
+    async fn scope_long_key_deleted_before_single_seek_refetches_or_confirms_eof() {
+        for family in [4, 5] {
+            for delete_tail in [false, true] {
+                let store = scope_page_fixture().await;
+                let long = scope_page_sized_id(1, SCOPE_PAGE_KEY_BYTES as usize + 2);
+                scope_page_seed_ids(
+                    &store,
+                    &["key-0000".into(), long.clone(), "key-0002".into()],
+                )
+                .await;
+                let mut scope = ScopeDiscovery {
+                    family,
+                    ..Default::default()
+                };
+                scope.step(&store).await.unwrap();
+                assert_eq!(scope.pending.front(), Some(&(None, 0)));
+                let table = if family == 4 {
+                    "compaction_operation"
+                } else {
+                    "compaction_checkpoint"
+                };
+                store
+                    .connection
+                    .execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        format!("DELETE FROM {table} WHERE id=?1"),
+                        [long.into()],
+                    ))
+                    .await
+                    .unwrap();
+                if delete_tail {
+                    store
+                        .connection
+                        .execute_unprepared(&format!("DELETE FROM {table} WHERE id='key-0002'"))
+                        .await
+                        .unwrap();
+                }
+                scope.step(&store).await.unwrap();
+                assert!(scope.pending.is_empty());
+                if !delete_tail {
+                    assert_eq!(scope.after, "key-0002");
+                    assert_eq!(scope.family, family);
+                    scope.step(&store).await.unwrap();
+                }
+                assert_eq!(scope.family, family + 1);
+                assert_eq!(scope.done, family == 5);
+                assert!(!scope.started && scope.after.is_empty() && scope.kind == -1);
+            }
+        }
     }
 
     #[tokio::test]
