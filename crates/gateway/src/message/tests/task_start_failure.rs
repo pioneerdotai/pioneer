@@ -1998,7 +1998,7 @@ fn terminal_child_pending_parent_receipt_retains_capsule_until_replayed_cleanup(
         );
         // A quarantined projection remains visible and cannot authorize ACK.
         use sea_orm::{ConnectionTrait, DbBackend, Statement};
-        store.database_connection().execute(Statement::from_sql_and_values(
+        store.database_connection().execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "UPDATE turn_event_projection_stream_state SET status = 'quarantined' WHERE turn_id = ?",
             [parent_turn.into()],
@@ -2026,7 +2026,7 @@ fn terminal_child_pending_parent_receipt_retains_capsule_until_replayed_cleanup(
                 .unwrap()
                 .is_some()
         );
-        store.database_connection().execute(Statement::from_sql_and_values(
+        store.database_connection().execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "UPDATE turn_event_projection_stream_state SET status = 'healthy' WHERE turn_id = ?",
             [parent_turn.into()],
@@ -2115,7 +2115,7 @@ async fn change_cleanup_fixture(
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     store
         .database_connection()
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             sql,
             values,
