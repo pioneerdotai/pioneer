@@ -378,6 +378,34 @@ struct OpenAiFileUploadResponse {
     id: String,
 }
 
+/// Embedding HTTP status must survive the intentionally discarded error body.
+#[derive(Debug)]
+struct OpenAiEmbeddingHttpFailure(ProviderFailureClassification);
+impl OpenAiEmbeddingHttpFailure {
+    fn new(status: u16, retry_after_ms: Option<u64>) -> Self {
+        let class = if matches!(status, 408 | 425) {
+            ProviderFailureClass::NetworkTransient
+        } else {
+            crate::failure::classify_provider_failure_class(
+                "",
+                ProviderFailureStage::Connect,
+                Some(status),
+                None,
+            )
+        };
+        let mut classification = ProviderFailureClassification::new(class);
+        classification.http_status = Some(status);
+        classification.retry_after_ms = retry_after_ms;
+        Self(classification)
+    }
+}
+impl std::fmt::Display for OpenAiEmbeddingHttpFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OpenAI embedding request failed")
+    }
+}
+impl std::error::Error for OpenAiEmbeddingHttpFailure {}
+
 /// Upload failures enter attachment observability before the registry can
 /// redact an endpoint override. Keep only classified, safe data here.
 #[derive(Debug)]
@@ -1235,6 +1263,11 @@ impl crate::traits::Provider for OpenAiProvider {
         error
             .downcast_ref::<OpenAiFileUploadError>()
             .map(|upload| upload.classification.clone())
+            .or_else(|| {
+                error
+                    .downcast_ref::<OpenAiEmbeddingHttpFailure>()
+                    .map(|failure| failure.0.clone())
+            })
             .or_else(|| crate::failure::classify_stream_error(error))
     }
 
@@ -1441,7 +1474,37 @@ impl crate::traits::Provider for OpenAiProvider {
             .await?;
 
         if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
+            let retry_after_ms = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|seconds| seconds.saturating_mul(1000));
+            let status = response.status().as_u16();
+            let mut failure = OpenAiEmbeddingHttpFailure::new(status, retry_after_ms);
+            if status == 400 {
+                // A generic bad request can carry a context-limit rejection.
+                // Classify the bounded body here, then discard it before the
+                // error crosses observability or endpoint-redaction boundaries.
+                if let Ok(body) = crate::http::read_response_text_bounded(
+                    response,
+                    16 * 1024,
+                    "provider_error_body",
+                )
+                .await
+                {
+                    let class = crate::failure::classify_provider_failure_class(
+                        &body.to_ascii_lowercase(),
+                        ProviderFailureStage::Connect,
+                        Some(status),
+                        None,
+                    );
+                    if class == ProviderFailureClass::ContextTooLarge {
+                        failure.0.class = class;
+                    }
+                }
+            }
+            return Err(failure.into());
         }
 
         let response = crate::http::read_response_json_bounded::<ApiEmbeddingResponse>(
@@ -1772,6 +1835,28 @@ mod tests {
         assert!(OpenAiProvider::build_chat_request(&request, vec![], false).is_err());
     }
     use super::*;
+
+    #[test]
+    fn embedding_http_failure_survives_provider_classifier_without_error_body() {
+        use crate::Provider;
+        let provider = OpenAiProvider::new("unused-fixture-key");
+        for (status, class) in [
+            (403, ProviderFailureClass::AuthOrPermission),
+            (429, ProviderFailureClass::RateLimit),
+            (503, ProviderFailureClass::Provider5xx),
+            (408, ProviderFailureClass::NetworkTransient),
+        ] {
+            let error = anyhow::Error::new(OpenAiEmbeddingHttpFailure::new(status, Some(2000)))
+                .context("embedding request");
+            let failure = provider
+                .classify_failure(&error)
+                .expect("typed embedding status");
+            assert_eq!(failure.class, class);
+            assert_eq!(failure.http_status, Some(status));
+            assert_eq!(failure.retry_after_ms, Some(2000));
+            assert!(!format!("{error:?}").contains("unused-fixture-key"));
+        }
+    }
 
     #[tokio::test]
     async fn g09_direct_embedding_adapter_rejects_invalid_batch_before_network() {
