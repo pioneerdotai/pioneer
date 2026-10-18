@@ -77,7 +77,7 @@ pub const SUBAGENTS_POLICY_PROMPT: &str = subagents_policy!(
     "Before creating attached subagents, waiting for them, reviewing candidates, revising, accepting, cancelling, detaching, or synthesizing child results, find `pioneer/subagents` in Internal Skill References, call `read_skill` with that exact reference, and follow that skill."
 );
 pub const CLI_SUBAGENTS_POLICY_PROMPT: &str = subagents_policy!(
-    "Load the exported `subagents` skill using the CLI runtime skill mechanism or its SKILL.md file. Resolve system:pioneer/subagents to that skill and references/ relative to its directory."
+    "Load the exported `pioneer-system-subagents` skill using the CLI runtime skill mechanism or its SKILL.md file. Resolve system:pioneer/subagents to that skill and references/ relative to its directory."
 );
 
 // Keep the orchestration rules shared; only the runtime loading binding differs.
@@ -97,7 +97,7 @@ pub const TASKS_POLICY_PROMPT: &str = tasks_policy!(
     "Before creating, listing, inspecting, updating, rescheduling, pausing, resuming, or troubleshooting durable tasks, find `pioneer/tasks` in Internal Skill References, call `read_skill` with that exact reference, and follow that skill."
 );
 pub const CLI_TASKS_POLICY_PROMPT: &str = tasks_policy!(
-    "Load the exported `tasks` skill using the CLI runtime skill mechanism or its SKILL.md file. Resolve system:pioneer/tasks to that skill and references/ relative to its directory. Only use the authorized task operations listed for this turn; skills do not grant permissions. The CLI MCP catalog is fixed for this turn; request_tools and read_skill are not required. A task_wait timeout ends only the observation window; it does not cancel or diagnose child work."
+    "Load the exported `pioneer-system-tasks` skill using the CLI runtime skill mechanism or its SKILL.md file. Resolve system:pioneer/tasks to that skill and references/ relative to its directory. Only use the authorized task operations listed for this turn; skills do not grant permissions. The CLI MCP catalog is fixed for this turn; request_tools and read_skill are not required. A task_wait timeout ends only the observation window; it does not cancel or diagnose child work."
 );
 
 pub const RECOVERY_CONTINUATION_PROMPT: &str = "Previous attempt was interrupted by output limits. Continue from where it stopped without repeating prior text.";

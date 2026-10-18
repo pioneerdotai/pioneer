@@ -3,7 +3,7 @@ name: tasks
 slug: tasks
 owner: pioneer
 description: "Use this skill when Pioneer should create, inspect, update, reschedule, pause, resume, troubleshoot, or configure delivery for durable tasks, scheduled tasks, recurring tasks, interval tasks, cron jobs, background work, or existing task state."
-version: "0.1.1"
+version: "0.1.2"
 user-invocable: true
 disable-model-invocation: false
 implicit-invocation: required
@@ -56,7 +56,7 @@ For current-turn attached child agents, read `system:pioneer/subagents`.
 
 When Pioneer provides these operations through its CLI MCP facade, use the callable names in the current CLI tool catalog. The turn instructions bind the canonical task names to those callables. The catalog is fixed for that turn; use only the operations it contains. No `request_tools` call is needed in this environment.
 
-In CLI runtimes, `system:pioneer/tasks` means the exported `tasks` skill and `system:pioneer/subagents` means the exported `subagents` skill. Load them using the runtime's skill mechanism or read their exported `SKILL.md` files. Resolve `references/` relative to the loaded skill directory. Other system skill references do not imply that a CLI export or tool is available. Use artifact tools only when the current catalog provides them.
+In CLI runtimes, `system:pioneer/tasks` means the exported `pioneer-system-tasks` skill and `system:pioneer/subagents` means the exported `pioneer-system-subagents` skill. Load them using the runtime's skill mechanism or read their exported `SKILL.md` files. Resolve `references/` relative to the loaded skill directory. Other system skill references do not imply that a CLI export or tool is available. Use artifact tools only when the current catalog provides them.
 
 ## Tool Visibility
 

@@ -2435,7 +2435,10 @@ async fn capability_persistence_order_impl() {
                 .iter()
                 .filter(|item| {
                     item["type"] == "skill"
-                        && !matches!(item["name"].as_str(), Some("tasks" | "subagents"))
+                        && !matches!(
+                            item["name"].as_str(),
+                            Some("pioneer-system-tasks" | "pioneer-system-subagents")
+                        )
                 })
                 .cloned()
                 .collect::<Vec<_>>();

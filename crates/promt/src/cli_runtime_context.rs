@@ -555,7 +555,10 @@ mod tests {
             input.runtime_id = runtime.to_owned();
             input.selected_skills = Some(CliRuntimeSelectedSkillsInput {
                 runtime_kind: kind,
-                skill_names: vec!["tasks".to_owned(), "subagents".to_owned()],
+                skill_names: vec![
+                    "pioneer-system-tasks".to_owned(),
+                    "pioneer-system-subagents".to_owned(),
+                ],
             });
             input.selected_capabilities = Some(CliRuntimeSelectedCapabilitiesInput {
                 native_task_tools: vec!["task_get".to_owned(), "task_wait".to_owned()],
@@ -575,6 +578,9 @@ mod tests {
                     .text
                     .contains("system:pioneer/tasks")
             );
+            for name in ["pioneer-system-tasks", "pioneer-system-subagents"] {
+                assert!(plan.provider_instructions.text.contains(name));
+            }
             assert!(
                 plan.provider_instructions
                     .text

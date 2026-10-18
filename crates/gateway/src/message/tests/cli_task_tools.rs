@@ -88,6 +88,128 @@ async fn invoke_task(
 }
 
 #[test]
+fn cli_automatic_orchestration_skills_coexist_with_selected_user_names() {
+    run_standard_stack_message_test("CLI orchestration skill name isolation", async {
+        for kind in [
+            CLIAgentRuntimeKind::Codex,
+            CLIAgentRuntimeKind::Claude,
+            CLIAgentRuntimeKind::OpenCode,
+        ] {
+            for user_name in ["tasks", "subagents"] {
+                let harness = setup_cli_runtime_skill_preflight_harness(kind, false).await;
+                *harness.cli_session.projected_mcp_store.lock().await =
+                    Some(harness.crud_store.clone());
+                let user_path =
+                    write_test_skill(&harness.user_root, user_name, "", "# user skill\n");
+                std::fs::create_dir_all(user_path.join("references")).unwrap();
+                std::fs::write(user_path.join("references/sentinel"), b"user reference").unwrap();
+                let user_id = seed_cli_runtime_skill_installation(
+                    &harness,
+                    &format!("tests/{user_name}"),
+                    "user",
+                    &user_path,
+                )
+                .await;
+                let thread_id = format!("cli_skill_names_{kind:?}_{user_name}").to_lowercase();
+                let turn_id = format!("cli_skill_names_turn_{kind:?}_{user_name}").to_lowercase();
+                seed_cli_runtime_skill_preflight_thread(&harness, &thread_id).await;
+                let processor = Arc::new(harness.processor.clone());
+                processor.bind_agent_tool_bridges().await;
+                let request = cli_runtime_turn_start_request_with_capabilities(
+                    &generate_test_request_id("cli-skill-names", &format!("{kind:?}-{user_name}")),
+                    &thread_id,
+                    &turn_id,
+                    &harness.runtime_id,
+                    kind,
+                    vec![cli_runtime_skill_capability(
+                        &format!("tests/{user_name}"),
+                        "user",
+                    )],
+                );
+                processor
+                    .process_request_for_connection(harness.connection_id, &request)
+                    .await;
+                wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
+                wait_for_task_cli_activation(&processor, &turn_id).await;
+                let bindings = processor
+                    .crud_store
+                    .find_turn_skill_bindings(&turn_id)
+                    .await
+                    .unwrap();
+                assert_eq!(bindings.len(), 3);
+                assert!(bindings.iter().any(|binding| binding.skill_id == user_id && binding.source_kind == "user"));
+                for slug in ["tasks", "subagents"] {
+                    assert!(
+                        bindings
+                            .iter()
+                            .any(|binding| binding.source_kind == "system"
+                                && binding.skill_owner.as_deref() == Some("pioneer")
+                                && binding.skill_slug == slug
+                                && binding.resolved_reason == "implicit")
+                    );
+                    let exported = harness
+                        .native_home
+                        .join("skills")
+                        .join(format!("pioneer-system-{slug}"));
+                    assert!(
+                        std::fs::read_to_string(exported.join("SKILL.md"))
+                            .unwrap()
+                            .starts_with(&format!("---\nname: pioneer-system-{slug}\n"))
+                    );
+                    let canonical = Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../resources/skills/pioneer")
+                        .join(slug);
+                    for reference in std::fs::read_dir(canonical.join("references")).unwrap() {
+                        let reference = reference.unwrap();
+                        assert_eq!(
+                            std::fs::read(exported.join("references").join(reference.file_name()))
+                                .unwrap(),
+                            std::fs::read(reference.path()).unwrap()
+                        );
+                    }
+                }
+                let exported_user = harness.native_home.join("skills").join(user_name);
+                assert_eq!(
+                    std::fs::read(exported_user.join("SKILL.md")).unwrap(),
+                    std::fs::read(user_path.join("SKILL.md")).unwrap()
+                );
+                assert_eq!(
+                    std::fs::read(exported_user.join("references/sentinel")).unwrap(),
+                    b"user reference"
+                );
+                let starts = harness.cli_session.turn_starts.lock().await;
+                let start = &starts[0];
+                let instructions = start.elevated_instructions.text();
+                for name in [
+                    "pioneer-system-tasks",
+                    "pioneer-system-subagents",
+                    user_name,
+                ] {
+                    assert!(instructions.contains(name), "{kind:?}: {name}");
+                    if kind != CLIAgentRuntimeKind::Claude {
+                        assert!(start.input.as_array().unwrap().iter().any(|item| {
+                            item["type"] == "skill"
+                                && item["name"] == name
+                                && item["path"]
+                                    == harness
+                                        .native_home
+                                        .join("skills")
+                                        .join(name)
+                                        .join("SKILL.md")
+                                        .display()
+                                        .to_string()
+                        }));
+                    }
+                }
+                // Claude receives the same selected names/paths through the
+                // existing managed plugin snapshot builder (covered in claude_session tests).
+                drop(starts);
+            }
+        }
+    });
+}
+
+#[test]
 fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_providers() {
     run_standard_stack_message_test("CLI task MCP contract", async {
         for kind in [
@@ -125,13 +247,23 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
                         .any(|skill| skill.skill_owner.as_deref() == Some("pioneer")
                             && skill.skill_slug == slug)
                 );
-                let exported = harness.native_home.join("skills").join(slug);
+                let exported = harness
+                    .native_home
+                    .join("skills")
+                    .join(format!("pioneer-system-{slug}"));
                 let canonical = Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("../../resources/skills/pioneer")
                     .join(slug);
                 assert_eq!(
                     std::fs::read(exported.join("SKILL.md")).unwrap(),
-                    std::fs::read(canonical.join("SKILL.md")).unwrap()
+                    std::fs::read_to_string(canonical.join("SKILL.md"))
+                        .unwrap()
+                        .replacen(
+                            &format!("---\nname: {slug}\n"),
+                            &format!("---\nname: pioneer-system-{slug}\n"),
+                            1
+                        )
+                        .into_bytes()
                 );
                 for reference in std::fs::read_dir(canonical.join("references")).unwrap() {
                     let reference = reference.unwrap();

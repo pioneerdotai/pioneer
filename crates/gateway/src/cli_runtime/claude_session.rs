@@ -5587,6 +5587,67 @@ done
     }
 
     #[test]
+    fn claude_selected_skill_plugins_keep_orchestration_aliases_separate_from_user_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let instance = claude_instance(temp.path().join("home").display().to_string());
+        let mut selected = Vec::new();
+        for name in [
+            "tasks",
+            "subagents",
+            "pioneer-system-tasks",
+            "pioneer-system-subagents",
+        ] {
+            let path = temp.path().join("exports").join(name);
+            std::fs::create_dir_all(path.join("references")).unwrap();
+            std::fs::write(
+                path.join("SKILL.md"),
+                format!("---\nname: {name}\n---\n# {name}\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                path.join("references/guide.txt"),
+                format!("reference for {name}"),
+            )
+            .unwrap();
+            selected.push(selected_skill_fixture(&path, name));
+        }
+        let config = claude_process_config_from_instance(
+            &instance,
+            &CLIAgentRuntimeSessionStartOptions {
+                selected_skills: selected.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let plugins = arg_values_after(&config.args, "--plugin-dir");
+        assert_eq!(plugins.len(), 4);
+        for (plugin, skill) in plugins.iter().zip(&selected) {
+            let manifest: JsonValue = serde_json::from_slice(
+                &std::fs::read(plugin.join(".claude-plugin/plugin.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                manifest["skills"],
+                json!([format!("./skills/{}", skill.install_name)])
+            );
+            let snapshot = plugin.join("skills").join(&skill.install_name);
+            assert_eq!(
+                compute_skill_folder_hash(&snapshot).unwrap(),
+                skill.source_folder_hash
+            );
+            assert_eq!(
+                std::fs::read(snapshot.join("SKILL.md")).unwrap(),
+                std::fs::read(skill.installed_path.join("SKILL.md")).unwrap()
+            );
+            assert_eq!(
+                std::fs::read(snapshot.join("references/guide.txt")).unwrap(),
+                format!("reference for {}", skill.install_name).as_bytes()
+            );
+            assert_eq!(std::fs::read_dir(plugin.join("skills")).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
     fn claude_process_config_projects_only_exact_selected_skill_plugins() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config_dir = temp_dir.path().join("effective-config");

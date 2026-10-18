@@ -130,3 +130,72 @@ cargo test -p pioneer-tasks
 - The 39 changed source files remained unchanged throughout the final successful compilation (verified by a content hash); the report was completed afterward.
 - Final self-review traced admission → frozen provider projection → invocation/current authorization → Task mutation/wait/review → parent continuation/finalization → saved-outcome and completed-attempt recovery. No known required implementation item remains deferred. Execution validation awaits explicit external acceptance as instructed.
 - The local review commit includes code, unexecuted regression tests and these notes. Git hooks/signing are disabled only for that commit command to prevent indirect test execution or interactive signing; repository/global configuration is not changed. No merge/push was performed.
+
+## External review follow-up (base 3ac302022955e0766df5d31b6b770c12830f10d7)
+
+Requirement → current implementation → minimal correction:
+
+- P1: automatic canonical skills use ordinary names and unconditional replacement → reserve CLI export names for pioneer/tasks and pioneer/subagents, bind frontmatter/inputs/plugins/instructions to those names, require exact receipt ownership and unchanged managed content before replacement. Leave legacy ordinary-name destinations untouched.
+- P1 regression coverage → extend existing temporary-home fixtures for foreign ordinary/reserved destinations, explicit same-name user skills, repeat installation and frozen-binding restoration across all three providers.
+- P2: bundled subagents export assertion still rejects a supported required skill → correct the existing bundled contract test for tasks/subagents, preserving required policy and rejection of unsupported required skills.
+
+Branch/worktree and original base remain as recorded above. Follow-up began from the reviewed commit with a clean working tree; only root AGENTS.md applies. No test execution is authorized.
+
+### P1 — safe automatic orchestration delivery
+
+Cause: canonical `name: tasks` / `name: subagents` flowed directly into a shared native destination; the general explicit-skill installer replaced that destination without proving ownership. Auto-selection therefore made a destructive operation possible during an ordinary turn.
+
+Correction:
+
+- `cli_runtime/skills.rs` gives only canonical system `pioneer/tasks` and `pioneer/subagents` stable CLI aliases `pioneer-system-tasks` / `pioneer-system-subagents`. Ordinary user/registry names and native skill identities/policies remain unchanged. Both implicit and explicitly selected canonical skills use the same aliases.
+- A small export-binding step uses the existing copier into a private temporary export, changes exactly the validated canonical frontmatter `name`, and hashes the resulting export. Supporting files remain byte-for-byte copies. Receipt hashes and Claude plugin snapshots refer to these exported bytes; canonical fingerprints/versions still describe the single source. The conditional CLI section in each canonical source and mandatory CLI policy name the actual aliases. Skill inputs, selected-skill instructions and Claude plugin paths consume the existing `install_name` binding.
+- Before automatic replacement or a Current shortcut, validate the full receipt identity (skill ID, owner, slug, source kind, runtime ID/kind, normalized root/path and install name), reject symlink destinations/root/receipt/state directory and symlinks inside the installed tree, and compare actual content against its managed receipt. Unhashed `.git`/`node_modules` trees and special files are rejected. Unreceipted, conflicting or locally modified destinations fail closed without deleting content or changing their receipts.
+- Retain a managed receipt until the replacement receipt is committed. An owned update interrupted after copying its exact new export can retry against the old receipt; arbitrary modified content cannot. Initial unreceipted directories are never adopted.
+- `external_runtime_receipt.rs` exposes preparation of the **existing** v1 conversion before persistence. This narrow extraction is necessary because the old eager conversion could rewrite a foreign receipt even when destination validation subsequently failed. The existing `ensure_external_runtime_receipt_v2` behavior remains available to other callers. For an automatic export, an unmapped/ambiguous legacy entry at its protected destination is rejected rather than discarded, including when the directory is missing. Both reserved destinations are protected even when an explicit user plan precedes the automatic plans in the same turn. No receipt format or separate migration mechanism was introduced.
+- Restore selects the reserved canonical destination by binding identity, so an ordinary-name legacy receipt cannot make the new projection ambiguous or redirect it to a user skill. Legacy directories/entries are left untouched; there is no name-based cleanup or migration.
+
+Regression changes (not executed):
+
+- `cli_runtime/skills.rs`: all-provider automatic export matrix preserves foreign ordinary-name directories and sentinels, verifies every reference, repeats installation with unchanged receipts, and restores exact bindings in the presence of a stale ordinary-name receipt. Separate regressions cover conflicting/missing/stale/legacy receipts, modified managed content, hash exclusions, symlink destinations/receipts/root/nested content, ordinary updates and restart after copy without receipt commit.
+- `message/tests/cli_task_tools.rs`: all-provider real preflight/automatic-selection matrix with explicit user `tasks` and `subagents`, exact three-skill composition, actual Skill inputs/instructions and intact references. Existing two-skill automatic delivery assertions keep their exact counts and compare the whole exported document with only its frontmatter binding adapted.
+- `cli_runtime/claude_session.rs`: managed plugin snapshots keep both ordinary user names and both orchestration aliases distinct, with exact manifest paths/content hashes/reference bytes.
+- `message/tests.rs` and `promt/cli_runtime_context.rs`: adapt existing fixtures to actual exported names, preserving composition and mandatory-policy checks.
+- `skills/external_runtime_receipt.rs`: extend the existing conversion/idempotency regression to prove preparation leaves original bytes untouched and produces the same committed receipt.
+
+Intermediate self-audit: corrected the eager legacy-receipt write before ownership validation and protected both reserved legacy claims across the whole CLI installation sequence; checked the Current shortcut and stale receipts as well as replacement; checked symlinks and hash-excluded directories; preserved native loading names, visibility/request_tools and all task authorization/execution paths. Filesystem preparation/verification holds no SQLite handle, transaction or scheduling permit. The existing destination and receipt locks remain the concurrency mechanism.
+
+### P2 — bundled required skill export contract
+
+Cause: the existing bundled-skill test still expected canonical subagents export to fail, contradicting the narrow CLI support allowlist.
+
+Correction in `system_skills.rs::tests::materializes_bundled_browser_subagents_tasks_and_memory_skills`: canonical subagents and tasks export successfully; both retain Required and non-editable implicit invocation. Memory export is explicitly rejected, and any other unsupported Required bundled skills remain rejected. Existing browser export eligibility, policy, hidden catalog, native prompt/read_skill index and asset-root assertions remain in place. Neighboring export assertions were inspected: the noncanonical owner fixture must still fail and is unchanged.
+
+Intermediate self-audit: this block changes assertions only. It grants no additional runtime export support and changes no global skill policy or native behavior.
+
+### Follow-up validation and limits
+
+- `git diff --check` and formatting of all changed Rust files have passed during implementation. Final verification results follow below.
+- No unit/integration/e2e/doctest, app, provider process or CLI scenario has been executed. Added test bodies only describe future validation in isolated temporary directories. No real CLI home or user skill installation was touched.
+- Collision recovery is deliberately non-destructive: foreign/unreceipted/modified reserved destinations require explicit resolution outside this automatic installer. A legacy-only canonical receipt is not silently reinterpreted as the new reserved export during frozen projection restoration; missing exact bindings fail closed through the existing invalid-binding path. Old ordinary-name directories/receipts are not migrated or removed. Broader installer crash-atomicity/multi-process filesystem hardening is outside this patch; existing per-destination/receipt coordination is retained.
+- Memory and other unsupported required skills remain outside CLI export support. Native agent visibility, tools, request_tools and skill loading are unchanged. The original task/MCP/provider implementation is otherwise unchanged.
+
+Future focused commands — **only after external review, fixes and explicit acceptance**:
+
+```sh
+cargo test -p pioneer-skills external_runtime_receipt::tests
+cargo test -p pioneer-gateway cli_runtime::skills::tests
+cargo test -p pioneer-gateway cli_runtime::claude_session::tests::claude_selected_skill_plugins_keep_orchestration_aliases_separate_from_user_names
+cargo test -p pioneer-gateway message::tests::cli_task_tools
+cargo test -p pioneer-gateway capability_persistence_order_materializes_before_skill_install_and_native_start
+cargo test -p pioneer-gateway system_skills::tests::materializes_bundled_browser_subagents_tasks_and_memory_skills
+cargo test -p pioneer-promt cli_runtime_context::tests::cli_task_policy_is_mandatory_only_for_real_task_operations
+```
+
+### Final follow-up verification
+
+- Reviewed the complete additional diff against `3ac302022955e0766df5d31b6b770c12830f10d7`, including callers, export bytes, installed names/paths, receipt preparation/ownership/update/replay, provider bindings, required policy and unchanged native tool/skill paths. Both review findings are addressed in code; no required follow-up item is knowingly deferred. External acceptance remains pending.
+- `git diff --check` — passed, exit 0. `rustfmt --edition 2024 --config skip_children=true --check` on all nine changed Rust files — passed, exit 0.
+- `CARGO_INCREMENTAL=0 cargo check --tests -p pioneer-gateway -p pioneer-promt -p pioneer-skills` — passed, exit 0, **10m 09s**. This compiled test targets without executing them. The source snapshot stayed unchanged throughout the final check: `ea7ec14d2cb0f6dca475a93b769e650f7e09dcd433639bdc36d4189cd426f262` (changed source files, excluding these notes).
+- An intermediate Gateway/prompt test-target compilation passed (22m 32s); it is superseded by the final check. A subsequent check was intentionally interrupted after the final legacy-sequence audit refinement, targeting only the Cargo process whose working directory was verified as this worktree. It is not counted as successful validation.
+- Only existing unrelated warnings in CRUD artifact helpers, Gateway voice code and an episodic-workspace test helper were emitted. They were left unchanged.
+- No tests, test scripts, doctests, application/provider/CLI scenarios were run. No merge/rebase/push, changes to another worktree, real CLI homes, user skills or Pioneer runtime data. The follow-up commit disables hooks and signing only for that Git command; no persistent configuration is changed.
