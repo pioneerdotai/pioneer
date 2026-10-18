@@ -13,9 +13,10 @@ use std::collections::BTreeSet;
 
 pub(super) fn completed_history_request_projection(
     request: ChatRequest,
+    media: Vec<pioneer_provider::attachments::MediaInputEstimate>,
     budget: ModelBudget,
 ) -> Result<pioneer_agent::compaction::request::EvaluatedRequest> {
-    NativeRequestProjection::full(request, vec![], budget, false)
+    NativeRequestProjection::full(request, media, budget, false)
 }
 
 #[cfg(test)]
@@ -158,6 +159,7 @@ pub(crate) async fn prepare_completed_history(
         None,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
+        None,
         &mut diagnostic,
     )
     .await?;
@@ -187,6 +189,7 @@ pub(crate) async fn prepare_completed_history_owned(
     codex_history_budget: Option<crate::cli_runtime::context::CodexTransferHistoryBudget>,
     suspending: Arc<std::sync::atomic::AtomicBool>,
     accepted_projection: Option<super::frozen::PreparedHistory>,
+    cli_cwd: Option<&str>,
     diagnostic: &mut HistoryCheckDiagnostic,
 ) -> Result<HistoryCheckOutcome> {
     // The owner chooses the database class: foreground transfer is part of
@@ -387,8 +390,49 @@ pub(crate) async fn prepare_completed_history_owned(
                 ..request
             }
         };
+        diagnostic.stage = "media_materialization".into();
+        let mut request = request;
+        request.messages = processor
+            .materialize_historical_artifacts(workspace, request.messages)
+            .await?;
+        let cli = match current.transport {
+            Transport::Api => None,
+            Transport::Acp => Some(pioneer_protocol::CLIAgentRuntimeKind::Acp),
+            Transport::Codex => Some(pioneer_protocol::CLIAgentRuntimeKind::Codex),
+            Transport::Claude => Some(pioneer_protocol::CLIAgentRuntimeKind::Claude),
+            Transport::OpenCode => Some(pioneer_protocol::CLIAgentRuntimeKind::OpenCode),
+        };
+        let cwd = if let Some(cwd) = cli_cwd {
+            Some(cwd.to_owned())
+        } else if cli.is_some() {
+            store
+                .get_cli_runtime_thread_binding(thread)
+                .await?
+                .and_then(|binding| binding.native_cwd)
+        } else {
+            None
+        };
+        let (request, media) = if let Some(runtime) = cli {
+            let (_, _, media) = crate::cli_runtime::context::completed_cli_history_budget(
+                &request.messages,
+                workspace,
+                cwd.as_deref(),
+                runtime,
+            )?;
+            (request, media)
+        } else {
+            let provider = processor
+                .provider_registry()
+                .get_or_create_for_workspace(workspace, &current.instance)?;
+            let prepared = provider.prepare_input_budget(request).await?;
+            (prepared.request, prepared.media)
+        };
         diagnostic.stage = "budget".into();
-        let full = completed_history_request_projection(request, budget.clone())?;
+        let mut full =
+            completed_history_request_projection(request, media.clone(), budget.clone())?;
+        if let Some(runtime) = cli {
+            apply_cli_budget(&mut full, workspace, cwd.as_deref(), runtime, &budget)?;
+        }
         let fixed_input_tokens = if current.transport == Transport::Codex {
             codex_history_budget
                 .as_ref()
@@ -559,10 +603,11 @@ pub(crate) async fn prepare_completed_history_owned(
             projection: NativeRequestProjection::new(
                 full.request,
                 indexes,
-                vec![],
+                media,
                 budget.clone(),
                 false,
             )?,
+            cli: cli.map(|runtime| (workspace.to_owned(), cwd, runtime)),
             budget,
             fixed_input_tokens,
         };
@@ -667,15 +712,49 @@ pub(crate) async fn prepare_completed_history_owned(
     }
 }
 
+fn apply_cli_budget(
+    evaluated: &mut pioneer_agent::compaction::request::EvaluatedRequest,
+    workspace: &str,
+    cwd: Option<&str>,
+    runtime: pioneer_protocol::CLIAgentRuntimeKind,
+    budget: &ModelBudget,
+) -> Result<()> {
+    let (total, messages, _) = crate::cli_runtime::context::completed_cli_history_budget(
+        &evaluated.request.messages,
+        workspace,
+        cwd,
+        runtime,
+    )?;
+    evaluated.estimated_input_tokens = total;
+    evaluated.message_input_tokens = messages;
+    evaluated.fixed_input_tokens = 0;
+    evaluated.fits = budget.fits(total, evaluated.output_reserve, false);
+    Ok(())
+}
+
 struct BackgroundHistoryTarget {
     projection: NativeRequestProjection,
+    cli: Option<(
+        String,
+        Option<String>,
+        pioneer_protocol::CLIAgentRuntimeKind,
+    )>,
     budget: ModelBudget,
     fixed_input_tokens: u64,
 }
 #[async_trait::async_trait]
 impl CompactionTarget for BackgroundHistoryTarget {
     async fn fits(&self, summary: &str) -> Result<bool> {
-        let evaluated = self.projection.evaluate(summary)?;
+        let mut evaluated = self.projection.evaluate(summary)?;
+        if let Some((workspace, cwd, runtime)) = &self.cli {
+            apply_cli_budget(
+                &mut evaluated,
+                workspace,
+                cwd.as_deref(),
+                *runtime,
+                &self.budget,
+            )?;
+        }
         Ok(self.budget.fits(
             evaluated
                 .estimated_input_tokens

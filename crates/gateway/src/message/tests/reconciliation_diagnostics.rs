@@ -10,6 +10,8 @@ fn cantopen(code: i32) -> Diagnostic {
     Diagnostic {
         operation: OP,
         cause: Cause::SqliteCantOpen,
+        phase: None,
+        reason: None,
         sqlite_primary_code: Some(14),
         sqlite_code: Some(code),
     }
@@ -186,6 +188,8 @@ fn typed_pool_sources_and_non_storage_errors() {
     let other = Diagnostic {
         operation: OP,
         cause: Cause::SqliteOther,
+        phase: None,
+        reason: None,
         sqlite_primary_code: Some(19),
         sqlite_code: Some(2067),
     };
@@ -364,4 +368,35 @@ fn production_mapper_captures_periodic_errors_recovery_and_safe_canaries() {
     for canary in CANARY.split_whitespace() {
         assert!(!serialized.contains(canary));
     }
+}
+
+#[test]
+fn occurrence_repair_phase_and_reason_survive_storage_source_classification() {
+    let error = pool_error()
+        .context(pioneer_crud::TaskRunOccurrenceRepairReason::TerminalEventPreparation)
+        .context(pioneer_crud::TaskRunOccurrenceRepairPhase::Preparation)
+        .context(CANARY);
+    let diagnostic = Diagnostic::extract(Operation::TaskRunOccurrence, &error);
+    assert_eq!(diagnostic.cause, Cause::PoolTimeout);
+    assert_eq!(diagnostic.phase, Some("repair_preparation"));
+    assert_eq!(diagnostic.reason, Some("terminal_event_preparation"));
+    let events = capture(|| {
+        Reporter::new(Operation::TaskRunOccurrence).observe::<usize>(&Err(error), Instant::now())
+    });
+    assert_eq!(fields(&events[0])["phase"], "repair_preparation");
+    assert_eq!(fields(&events[0])["reason"], "terminal_event_preparation");
+    assert!(!serde_json::to_string(&events).unwrap().contains("canary"));
+}
+
+#[test]
+fn finalization_operation_survives_typed_sqlite_or_pool_cause() {
+    let error = pool_error()
+        .context(pioneer_crud::NativeFinalizationPhase::WriterBegin)
+        .context(CANARY);
+    let diagnostic = Diagnostic::extract(Operation::NativeFinalization, &error);
+    assert_eq!(diagnostic.cause, Cause::PoolTimeout);
+    assert_eq!(diagnostic.phase, Some("finalization_writer_begin"));
+    let events = capture(|| Reporter::new(OP).observe::<usize>(&Err(error), Instant::now()));
+    assert_eq!(fields(&events[0])["phase"], "finalization_writer_begin");
+    assert!(!serde_json::to_string(&events).unwrap().contains("canary"));
 }

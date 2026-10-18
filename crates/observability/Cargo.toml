@@ -13,6 +13,9 @@ qualification-diagnostics = []
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
+opentelemetry-http = { version = "0.32", default-features = false }
+reqwest.workspace = true
 dotenvy.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true

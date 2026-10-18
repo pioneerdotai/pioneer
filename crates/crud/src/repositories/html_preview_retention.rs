@@ -19,7 +19,7 @@ pub(super) mod queries;
 use queries::{bytes, col, json as json_field, revision};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
 // Used by every user list, before identity pagination. A separate real binding
 // adopts the artifact; an ordinary screenshot from another tool never matches.
@@ -35,6 +35,13 @@ async fn index_quantum(
     after: &mut String,
     imports: &mut Option<PreviewImportIndex>,
 ) -> Result<bool> {
+    if let Some(state) = imports.as_ref() {
+        let manifest = state.header.manifest.clone();
+        if index_import_quantum(store, imports).await? {
+            *after = manifest;
+        }
+        return Ok(true);
+    }
     let previous_after = after.clone();
     let query = Query::select()
         .columns([
@@ -48,6 +55,7 @@ async fn index_quantum(
             ("h", history::Column::Ready),
             ("h", history::Column::Expired),
         ])
+        .expr_as(col("i", frozen_index::Column::ManifestId), "marker_id")
         .expr_as(
             Func::coalesce([col("i", frozen_index::Column::NextOrdinal), Expr::val(0)]),
             "next_ordinal",
@@ -90,46 +98,48 @@ async fn index_quantum(
         return Ok(false);
     };
     let discovered_id: String = row.try_get("", "id")?;
-    store
-        .run_serialized_write(|| async {
-            store
-                .connection
-                .execute(
-                    &Query::insert()
-                        .into_table(frozen_index::Entity)
-                        .columns([
-                            frozen_index::Column::ManifestId,
-                            frozen_index::Column::WorkspaceId,
-                            frozen_index::Column::IdentitySha256,
-                            frozen_index::Column::MessageCount,
-                            frozen_index::Column::Ready,
-                            frozen_index::Column::Expired,
-                        ])
-                        .select_from(
-                            history::Entity::find()
-                                .select_only()
-                                .columns([
-                                    history::Column::Id,
-                                    history::Column::WorkspaceId,
-                                    history::Column::IdentitySha256,
-                                    history::Column::MessageCount,
-                                    history::Column::Ready,
-                                    history::Column::Expired,
-                                ])
-                                .filter(history::Column::Id.eq(&discovered_id))
-                                .into_query(),
-                        )?
-                        .on_conflict(
-                            OnConflict::column(frozen_index::Column::ManifestId)
-                                .do_nothing()
-                                .to_owned(),
-                        )
-                        .to_owned(),
-                )
-                .await?;
-            Ok(())
-        })
-        .await?;
+    if row.try_get::<Option<String>>("", "marker_id")?.is_none() {
+        store
+            .run_serialized_write(|| async {
+                store
+                    .connection
+                    .execute(
+                        &Query::insert()
+                            .into_table(frozen_index::Entity)
+                            .columns([
+                                frozen_index::Column::ManifestId,
+                                frozen_index::Column::WorkspaceId,
+                                frozen_index::Column::IdentitySha256,
+                                frozen_index::Column::MessageCount,
+                                frozen_index::Column::Ready,
+                                frozen_index::Column::Expired,
+                            ])
+                            .select_from(
+                                history::Entity::find()
+                                    .select_only()
+                                    .columns([
+                                        history::Column::Id,
+                                        history::Column::WorkspaceId,
+                                        history::Column::IdentitySha256,
+                                        history::Column::MessageCount,
+                                        history::Column::Ready,
+                                        history::Column::Expired,
+                                    ])
+                                    .filter(history::Column::Id.eq(&discovered_id))
+                                    .into_query(),
+                            )?
+                            .on_conflict(
+                                OnConflict::column(frozen_index::Column::ManifestId)
+                                    .do_nothing()
+                                    .to_owned(),
+                            )
+                            .to_owned(),
+                    )
+                    .await?;
+                Ok(())
+            })
+            .await?;
+    }
     *after = row.try_get("", "id")?;
     // Older derived markers treated every import stream as opaque. Revisit
     // these metadata-only markers; they remain unsafe until fully verified.
@@ -170,8 +180,26 @@ async fn index_quantum(
     let identity: String = row.try_get("", "identity_sha256")?;
     let next: i64 = row.try_get("", "next_ordinal")?;
     if next == count && row.try_get::<i64>("", "import_count")? > 0 {
-        if !index_import_quantum(store, &row, imports).await? {
-            *after = previous_after;
+        *imports = Some(PreviewImportIndex {
+            header: PreviewImportHeader {
+                manifest: id.clone(),
+                workspace,
+                owner,
+                identity,
+                messages: count,
+                count: u64::try_from(row.try_get::<i64>("", "import_count")?)?,
+                expected: row.try_get("", "imports_sha256")?,
+            },
+            next: 0,
+            digest: Sha256::new(),
+            page: VecDeque::new(),
+            pending: None,
+        });
+        // Keep discovery before this manifest until verification or its guarded
+        // terminal write returns. An error/cancellation must replay from zero.
+        *after = previous_after;
+        if index_import_quantum(store, imports).await? {
+            *after = id;
         }
         return Ok(true);
     }
@@ -344,10 +372,24 @@ async fn index_quantum(
 // Existing progress owns one streaming digest, never a second graph/cache.
 // A restart resumes message indexing and replays import verification from zero;
 // only a complete matching digest publishes a safe marker.
-struct PreviewImportIndex {
+// Ready identity/counts are protected by frozen_complete_identity. Expiry,
+// source availability and the derived marker are still mutable. Publication
+// rechecks the header and expected marker (ready=1, expired=0, next=messages,
+// complete=unknown=0); this snapshot only owns bounded preparation.
+struct PreviewImportHeader {
     manifest: String,
+    workspace: String,
+    owner: String,
+    identity: String,
+    messages: i64,
+    count: u64,
+    expected: String,
+}
+struct PreviewImportIndex {
+    header: PreviewImportHeader,
     next: u64,
     digest: Sha256,
+    page: VecDeque<super::compaction::FrozenImportRecord>,
     pending: Option<(
         super::compaction::FrozenImportRecord,
         super::checkpoint_proofs::HistoricalMember,
@@ -355,25 +397,20 @@ struct PreviewImportIndex {
 }
 async fn index_import_quantum(
     store: &CrudStore,
-    row: &sea_orm::QueryResult,
     progress: &mut Option<PreviewImportIndex>,
 ) -> Result<bool> {
-    let id: String = row.try_get("", "id")?;
-    let workspace: String = row.try_get("", "workspace_id")?;
-    let owner: String = row.try_get("", "owner_thread")?;
-    let count = u64::try_from(row.try_get::<i64>("", "import_count")?)?;
-    let expected: String = row.try_get("", "imports_sha256")?;
-    let identity: String = row.try_get("", "identity_sha256")?;
-    let messages: i64 = row.try_get("", "message_count")?;
-    if progress.as_ref().is_none_or(|p| p.manifest != id) {
-        *progress = Some(PreviewImportIndex {
-            manifest: id.clone(),
-            next: 0,
-            digest: Sha256::new(),
-            pending: None,
-        });
-    }
-    let state = progress.as_mut().expect("initialized import progress");
+    // HistoricalMember can mutate before a fallible await. Keeping this state
+    // local also drops it on cancellation, not just on a returned DB error.
+    let mut state = progress.take().expect("initialized import progress");
+    let PreviewImportHeader {
+        manifest: id,
+        workspace,
+        owner,
+        identity,
+        messages,
+        count,
+        expected,
+    } = &state.header;
     let verified = async {
         // Reuse the checkpoint proof's bounded historical membership walker;
         // a checkpoint summary cannot authorize arbitrary original raw leaves.
@@ -388,20 +425,27 @@ async fn index_import_quantum(
             );
             state.pending.take().expect("completed member").0
         } else {
-            let page = super::compaction_frozen_import::compaction_frozen_import_page(
-                &store.connection,
-                &workspace,
-                &owner,
-                &id,
-                state.next,
-            )
-            .await?;
-            let proof = page
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("preview dependency import page is missing"))?
-                .clone();
+            if state.page.is_empty() {
+                state.page = super::compaction_frozen_import::compaction_frozen_import_page(
+                    &store.connection,
+                    workspace,
+                    owner,
+                    id,
+                    state.next,
+                )
+                .await?
+                .into();
+                ensure!(
+                    state.page.len() as u64 <= *count - state.next,
+                    "preview dependency import count mismatch"
+                );
+            }
+            let proof = state
+                .page
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("preview dependency import page is missing"))?;
             let target =
-                super::checkpoint_proofs::target_reference(store, &id, proof.message_ordinal)
+                super::checkpoint_proofs::target_reference(store, id, proof.message_ordinal)
                     .await?;
             let checkpoint = match target.sources.as_slice() {
                 [s] if s.scope.starts_with("checkpoint:") => Some(s),
@@ -415,17 +459,17 @@ async fn index_import_quantum(
                         .context_thread
                         .as_deref()
                         .unwrap_or(&target.source_thread)
-                        == owner
+                        == owner.as_str()
                     && (proof.matches_render_target(&target) || checkpoint.is_some()),
                 "preview dependency import target is unknown"
             );
             // Imports convey authority for an existing message, never extra
             // media. Logical message/replay references carry its dependencies.
-            super::checkpoint_proofs::original_binding(store, &workspace, &proof, true).await?;
+            super::checkpoint_proofs::original_binding(store, workspace, &proof, true).await?;
             if let Some(checkpoint) = checkpoint {
                 let member = super::checkpoint_proofs::HistoricalMember::new(
                     store,
-                    &workspace,
+                    workspace,
                     &target.source_thread,
                     checkpoint,
                     &proof.source_thread,
@@ -442,12 +486,12 @@ async fn index_import_quantum(
         state.digest.update(bytes);
         state.next += 1;
         ensure!(
-            state.next <= count,
+            state.next <= *count,
             "preview dependency import count mismatch"
         );
-        if state.next == count {
+        if state.next == *count {
             ensure!(
-                hex::encode(state.digest.clone().finalize()) == expected,
+                hex::encode(state.digest.clone().finalize()) == *expected,
                 "preview dependency import digest mismatch"
             );
         }
@@ -459,7 +503,6 @@ async fn index_import_quantum(
         Err(error) if error.downcast_ref::<sea_orm::DbErr>().is_some() => {
             // A failed graph read may have advanced its local walker. Restart
             // the existing stream verification; never seal a partial closure.
-            *progress = None;
             return Err(error);
         }
         Err(error) => {
@@ -469,23 +512,27 @@ async fn index_import_quantum(
             true
         }
     };
-    let done = state.next == count || unknown;
+    let done = state.next == *count || unknown;
+    if !done {
+        *progress = Some(state);
+        return Ok(false);
+    }
     let header = history::Entity::find()
         .select_only()
         .column(history::Column::Id)
-        .filter(history::Column::Id.eq(&id))
-        .filter(history::Column::WorkspaceId.eq(&workspace))
-        .filter(history::Column::OwnerThread.eq(&owner))
+        .filter(history::Column::Id.eq(id))
+        .filter(history::Column::WorkspaceId.eq(workspace))
+        .filter(history::Column::OwnerThread.eq(owner))
         .filter(history::Column::Ready.eq(1))
         .filter(history::Column::Expired.eq(0))
-        .filter(history::Column::IdentitySha256.eq(&identity))
-        .filter(history::Column::MessageCount.eq(messages))
+        .filter(history::Column::IdentitySha256.eq(identity))
+        .filter(history::Column::MessageCount.eq(*messages))
         .filter(
             Expr::col(history::Column::NextOrdinal).eq(Expr::col(history::Column::MessageCount)),
         )
-        .filter(history::Column::ImportCount.eq(i64::try_from(count)?))
+        .filter(history::Column::ImportCount.eq(i64::try_from(*count)?))
         .filter(Expr::col(history::Column::NextImport).eq(Expr::col(history::Column::ImportCount)))
-        .filter(history::Column::ImportsSha256.eq(&expected))
+        .filter(history::Column::ImportsSha256.eq(expected))
         .into_query();
     store
         .run_serialized_write(|| async {
@@ -495,12 +542,13 @@ async fn index_import_quantum(
                     Expr::val(i64::from(done && !unknown)),
                 )
                 .col_expr(frozen_index::Column::Unknown, Expr::val(i64::from(unknown)))
-                .filter(frozen_index::Column::ManifestId.eq(&id))
+                .filter(frozen_index::Column::ManifestId.eq(id))
                 .filter(frozen_index::Column::Complete.eq(0))
                 .filter(frozen_index::Column::Unknown.eq(0))
-                .filter(frozen_index::Column::NextOrdinal.eq(messages))
-                .filter(frozen_index::Column::IdentitySha256.eq(&identity))
-                .filter(frozen_index::Column::WorkspaceId.eq(&workspace))
+                .filter(frozen_index::Column::NextOrdinal.eq(*messages))
+                .filter(frozen_index::Column::MessageCount.eq(*messages))
+                .filter(frozen_index::Column::IdentitySha256.eq(identity))
+                .filter(frozen_index::Column::WorkspaceId.eq(workspace))
                 .filter(frozen_index::Column::Ready.eq(1))
                 .filter(frozen_index::Column::Expired.eq(0))
                 .filter(Expr::exists(header.clone()))
@@ -509,10 +557,9 @@ async fn index_import_quantum(
             Ok(())
         })
         .await?;
-    if done {
-        *progress = None;
-    }
-    Ok(done)
+    // A zero-row guard rejection is terminal for this pass too. The marker
+    // remains retaining and a later pass/restart can prepare fresh progress.
+    Ok(true)
 }
 
 /// Existing ownership is authoritative. No age or terminal status alone is a
@@ -1695,3 +1742,7 @@ impl CrudStore {
         .transpose()
     }
 }
+
+#[cfg(test)]
+#[path = "html_preview_retention_tests.rs"]
+mod tests;

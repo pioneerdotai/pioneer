@@ -270,7 +270,10 @@ fn install_reports_failure_json_keeps_schema_pretty_format_and_newline_with_shor
             "phase": "failed", "command": if name == "install" { "install" } else { "update" },
             "installed_version": env!("CARGO_PKG_VERSION"), "service_active": false,
             "gateway_reachable": false, "command_link_created": false, "path_updated": false,
-            "rollback_performed": true, "error_code": "health_check_failed",
+            // Display text alone does not prove a completed rollback.
+            "rollback_performed": false, "rollback_outcome": null,
+            "gateway_health_failure": null, "rollback_healthy": false,
+            "error_code": "health_check_failed",
             "warnings": [], "stage_timings": [],
             "error": "installation failed: health check failed; rolled back"
         });

@@ -1,15 +1,12 @@
 use super::*;
-use crate::voice::session_store::{GatewayVoiceSession, GatewayVoiceSessionState};
-use crate::voice::transcription::{
-    PreparedSpeechBuffer, VoiceTranscript, VoiceTranscriptionNoSpeech, VoiceTranscriptionOutcome,
-    transcribe_prepared_speech_buffer,
+use crate::voice::incremental::{
+    self, GatewayVoiceSessionPipelineOutcome, SessionSpeechTranscriber, VoiceSignalStats,
 };
-use crate::voice::vad::{EnergyVoiceActivityDetector, SmoothedVoiceVad, VoiceVadConfig};
+use crate::voice::session_store::{GatewayVoiceSession, GatewayVoiceSessionState};
+use crate::voice::transcription::{VoiceTranscript, VoiceTranscriptionNoSpeech};
 use pioneer_protocol::{
     AgentExecutionBackend, ThreadMode, VoiceSessionOutcome, VoiceSessionResultNotification,
 };
-
-const GATEWAY_VOICE_ENERGY_VAD_THRESHOLD_FLOOR: f32 = 0.02;
 
 impl MessageProcessor {
     pub(super) async fn voice_status(
@@ -192,10 +189,68 @@ impl MessageProcessor {
             }
         };
 
-        if let Err(error) = self
-            .voice_session_buffers
-            .start_session(session_id.clone(), session.audio_format)
-        {
+        let Some(lease) = self.voice_finalizations.reserve(connection_id) else {
+            let _ = self
+                .voice_sessions
+                .remove_authenticated_session(&session_id, &owner);
+            self.send_voice_error(
+                connection_id,
+                request_id,
+                INVALID_REQUEST_CODE,
+                methods::VOICE_SESSION_START,
+                VoiceError {
+                    kind: VoiceErrorKind::GatewayBusy,
+                    message: "voice processing is busy or shutting down".to_owned(),
+                    public_error: None,
+                },
+            )
+            .await;
+            return;
+        };
+        // Readiness was checked under the settings lock. Pin the current model
+        // generation; each native call validates it again under the engine lock.
+        let supervisor = self
+            .voice_input_supervisor
+            .as_ref()
+            .expect("Ready voice supervisor")
+            .clone();
+        let Some(generation) = supervisor.try_session_generation() else {
+            let _ = self
+                .voice_sessions
+                .remove_authenticated_session(&session_id, &owner);
+            self.send_voice_error(
+                connection_id,
+                request_id,
+                INVALID_REQUEST_CODE,
+                methods::VOICE_SESSION_START,
+                VoiceError {
+                    kind: VoiceErrorKind::GatewayBusy,
+                    message: "voice engine is busy or no longer Ready".to_owned(),
+                    public_error: None,
+                },
+            )
+            .await;
+            return;
+        };
+        let transcriber = SessionSpeechTranscriber {
+            generation,
+            is_moonshine_base: settings
+                .model
+                .as_deref()
+                .is_some_and(|model| model.trim() == "moonshine-base"),
+            supervisor,
+            cancellation: self.voice_finalizations.shutdown.child_token(),
+            #[cfg(test)]
+            fake: self.voice_test_transcriber.clone(),
+        };
+        if let Err(error) = incremental::start(
+            self.voice_session_buffers.clone(),
+            session_id.clone(),
+            session.audio_format,
+            &self.voice_finalizations,
+            lease,
+            transcriber,
+        ) {
             let _ = self
                 .voice_sessions
                 .remove_authenticated_session(&session_id, &owner);
@@ -215,6 +270,9 @@ impl MessageProcessor {
             .mark_recording_authenticated(&session_id, &owner)
         {
             let _ = self.voice_session_buffers.remove_session(&session_id);
+            let _ = self
+                .voice_sessions
+                .remove_authenticated_session(&session_id, &owner);
             self.send_voice_error(
                 connection_id,
                 request_id,
@@ -359,6 +417,14 @@ impl MessageProcessor {
                 }
             };
 
+            let completion = {
+                let _finish = pioneer_observability::turn_startup::stage(
+                    &session.turn_id,
+                    pioneer_observability::turn_startup::Stage::VoiceFinish,
+                );
+                self.voice_session_buffers
+                    .finish_processing(&session.session_id)
+            };
             self.send_voice_result(
                 connection_id,
                 request_id.clone(),
@@ -370,7 +436,27 @@ impl MessageProcessor {
             .await;
 
             crate::voice::finalization::acknowledge();
-            let pipeline_outcome = self.finalize_voice_session_audio(&session).await;
+            let completion = {
+                let _startup_stage = pioneer_observability::turn_startup::stage(
+                    &session.turn_id,
+                    pioneer_observability::turn_startup::Stage::VoiceFinalize,
+                );
+                match completion {
+                    Ok(receiver) => receiver.await.map_err(|_| VoiceError {
+                        kind: VoiceErrorKind::TranscriptionFailed,
+                        message: "voice processing worker did not return a result".to_owned(),
+                        public_error: None,
+                    }),
+                    Err(error) => Err(error.into_voice_error()),
+                }
+            };
+            let (pipeline_outcome, _lease) = match completion {
+                Ok(completion) => (completion.outcome, Some(completion.lease)),
+                Err(error) => (Err(error), None),
+            };
+            let _ = self
+                .voice_session_buffers
+                .remove_session(&session.session_id);
             if self.voice_finalizations.shutdown.is_cancelled() {
                 return;
             }
@@ -1046,145 +1132,6 @@ impl MessageProcessor {
         Ok(())
     }
 
-    async fn finalize_voice_session_audio(
-        &self,
-        session: &GatewayVoiceSession,
-    ) -> Result<GatewayVoiceSessionPipelineOutcome, VoiceError> {
-        let _startup_stage = pioneer_observability::turn_startup::stage(
-            &session.turn_id,
-            pioneer_observability::turn_startup::Stage::VoiceFinalize,
-        );
-        let audio = {
-            let _startup_part = pioneer_observability::turn_startup::stage(
-                &session.turn_id,
-                pioneer_observability::turn_startup::Stage::VoiceFinish,
-            );
-            self.voice_session_buffers
-                .take_session_audio(session.session_id.as_str())
-                .map_err(|error| error.into_voice_error())?
-        };
-        let supervisor = self.voice_input_supervisor.clone();
-        let session_id = session.session_id.clone();
-        let thread_id = session.thread_id.clone();
-        let turn_id = session.turn_id.clone();
-        #[cfg(test)]
-        let test_transcriber = self.voice_test_transcriber.clone();
-        // The owned finalization task awaits this call, retaining its slot and
-        // audio/engine ownership even when cancel removes terminal authority.
-        // Capture while the request's async dispatcher scope is installed. The
-        // blocking thread has independent thread-local state; keep None intact.
-        let startup_key = pioneer_observability::turn_startup::current_key();
-        let startup_queued_at = std::time::Instant::now();
-        tokio::task::spawn_blocking(move || {
-            pioneer_observability::turn_startup::scope_sync(startup_key, || {
-                pioneer_observability::turn_startup::record_current_duration(
-                    pioneer_observability::turn_startup::Stage::VoiceWorkerWait,
-                    startup_queued_at.elapsed(),
-                );
-                let signal_stats = VoiceSignalStats::from_samples(audio.normalized_samples.as_slice());
-                debug!(
-                    session_id = %session_id,
-                    thread_id = %thread_id,
-                    turn_id = %turn_id,
-                    sample_rate_hz = audio.audio_format.sample_rate_hz,
-                    buffered_chunks = audio.chunks.len(),
-                    buffered_bytes = audio.buffered_bytes,
-                    total_samples = signal_stats.total_samples,
-                    signal_rms = signal_stats.rms,
-                    signal_peak = signal_stats.peak,
-                    non_zero_samples = signal_stats.non_zero_samples,
-                    "voice session audio signal stats"
-                );
-                let speech_outcome = {
-                    let _startup_part = pioneer_observability::turn_startup::stage(
-                        &turn_id,
-                        pioneer_observability::turn_startup::Stage::VoiceVad,
-                    );
-                    if audio.normalized_samples.is_empty() {
-                        VoiceTranscriptionOutcome::NoSpeech(VoiceTranscriptionNoSpeech {
-                        reason:
-                            crate::voice::transcription::VoiceTranscriptionNoSpeechReason::EmptyBuffer,
-                        total_samples: 0,
-                    })
-                    } else {
-                        let detector =
-                            EnergyVoiceActivityDetector::new(GATEWAY_VOICE_ENERGY_VAD_THRESHOLD_FLOOR)
-                                .map_err(|error| VoiceError {
-                                    kind: VoiceErrorKind::TranscriptionFailed,
-                                    message: format!(
-                                        "failed to initialize gateway voice VAD: {error:#}"
-                                    ),
-                                    public_error: None,
-                                })?;
-                        let mut vad = SmoothedVoiceVad::new(detector, VoiceVadConfig::default())
-                            .map_err(|error| VoiceError {
-                                kind: VoiceErrorKind::TranscriptionFailed,
-                                message: format!("failed to initialize gateway voice VAD: {error:#}"),
-                                public_error: None,
-                            })?;
-                        let vad_outcome = vad
-                            .segment_samples(audio.normalized_samples.as_slice())
-                            .map_err(|error| VoiceError {
-                                kind: VoiceErrorKind::TranscriptionFailed,
-                                message: format!("failed to segment voice audio: {error:#}"),
-                                public_error: None,
-                            })?;
-                        PreparedSpeechBuffer::from_vad_outcome(
-                            audio.audio_format.sample_rate_hz,
-                            vad_outcome,
-                        )
-                    }
-                };
-
-                let buffer = match speech_outcome {
-                    VoiceTranscriptionOutcome::Ready(buffer) => buffer,
-                    VoiceTranscriptionOutcome::NoSpeech(no_speech) => {
-                        return Ok(GatewayVoiceSessionPipelineOutcome::NoSpeech {
-                            no_speech,
-                            signal_stats,
-                        });
-                    }
-                };
-
-                let Some(supervisor) = supervisor.as_ref() else {
-                    return Err(VoiceError {
-                        kind: VoiceErrorKind::ModelUnavailable,
-                        message: "Voice Input is not configured".to_owned(),
-                        public_error: None,
-                    });
-                };
-                #[cfg(test)]
-                let outcome = if let Some(fake) = test_transcriber {
-                    transcribe_prepared_speech_buffer(
-                        &crate::voice::transcription::TestSpeechTranscriber(fake),
-                        buffer,
-                    )
-                } else {
-                    transcribe_prepared_speech_buffer(supervisor.as_ref(), buffer)
-                };
-                #[cfg(not(test))]
-                let outcome = transcribe_prepared_speech_buffer(supervisor.as_ref(), buffer);
-                match outcome {
-                    Ok(Ok(transcript)) => Ok(GatewayVoiceSessionPipelineOutcome::Transcript {
-                        transcript,
-                        signal_stats,
-                    }),
-                    Ok(Err(no_speech)) => Ok(GatewayVoiceSessionPipelineOutcome::NoSpeech {
-                        no_speech,
-                        signal_stats,
-                    }),
-                    Err(error) => Err(error.into_voice_error()),
-                }
-            })
-        })
-        .await
-        .map_err(|error| VoiceError {
-            kind: VoiceErrorKind::TranscriptionFailed,
-            message: format!("voice finalization worker failed: {error}"),
-            public_error: None,
-        })?
-    }
-
     async fn send_voice_result<T>(
         &self,
         connection_id: ConnectionId,
@@ -1341,57 +1288,6 @@ fn voice_runtime_error(
         message: message.clone(),
         public_error: None,
     })
-}
-
-enum GatewayVoiceSessionPipelineOutcome {
-    Transcript {
-        transcript: VoiceTranscript,
-        signal_stats: VoiceSignalStats,
-    },
-    NoSpeech {
-        no_speech: VoiceTranscriptionNoSpeech,
-        signal_stats: VoiceSignalStats,
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct VoiceSignalStats {
-    total_samples: usize,
-    non_zero_samples: usize,
-    rms: f32,
-    peak: f32,
-}
-
-impl VoiceSignalStats {
-    fn from_samples(samples: &[f32]) -> Self {
-        if samples.is_empty() {
-            return Self {
-                total_samples: 0,
-                non_zero_samples: 0,
-                rms: 0.0,
-                peak: 0.0,
-            };
-        }
-
-        let mut sum_squares = 0.0_f32;
-        let mut peak = 0.0_f32;
-        let mut non_zero_samples = 0_usize;
-        for sample in samples {
-            let abs = sample.abs();
-            if abs > f32::EPSILON {
-                non_zero_samples = non_zero_samples.saturating_add(1);
-            }
-            peak = peak.max(abs);
-            sum_squares += sample * sample;
-        }
-
-        Self {
-            total_samples: samples.len(),
-            non_zero_samples,
-            rms: (sum_squares / samples.len() as f32).sqrt(),
-            peak,
-        }
-    }
 }
 
 fn voice_turn_start_params_from_transcript(

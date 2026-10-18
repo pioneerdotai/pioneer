@@ -6754,6 +6754,16 @@ impl MessageProcessor {
                             let http_status = root_error.as_ref().and_then(|error| {
                                 hook_error_metadata_i64(error, "http_status")
                             });
+                            // Revalidate at the reporting boundary too: hook metadata is
+                            // a general string map, never authority for raw diagnostics.
+                            let provider_error_reason = root_error.as_ref().and_then(|error| {
+                                hook_error_metadata_text(error, "provider_error_reason")
+                                    .filter(|reason| pioneer_protocol::ProviderErrorReason::from_openrouter_code(reason).is_some())
+                            });
+                            let provider_request_id = root_error.as_ref().and_then(|error| {
+                                hook_error_metadata_text(error, "provider_request_id")
+                                    .filter(|id| pioneer_protocol::ProviderRequestId::try_from((*id).to_owned()).is_ok())
+                            });
                             let fact_index = root_error
                                 .as_ref()
                                 .and_then(|error| hook_error_metadata_i64(error, "fact_index"))
@@ -6770,6 +6780,8 @@ impl MessageProcessor {
                                     sqlite_primary_code = sqlite_primary_code,
                                     sqlite_extended_code = sqlite_extended_code,
                                     http_status = ?http_status,
+                                    provider_error_reason,
+                                    provider_request_id,
                                     termination = ?termination,
                                     parse_category = ?parse_category,
                                     parse_line = ?parse_line,
@@ -6794,6 +6806,8 @@ impl MessageProcessor {
                                     sqlite_primary_code = sqlite_primary_code,
                                     sqlite_extended_code = sqlite_extended_code,
                                     http_status = ?http_status,
+                                    provider_error_reason,
+                                    provider_request_id,
                                     termination = ?termination,
                                     parse_category = ?parse_category,
                                     parse_line = ?parse_line,

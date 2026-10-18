@@ -481,7 +481,14 @@ fn print_install_failure_json(
     writer: &mut impl Write,
 ) -> Result<()> {
     let error_text = format!("{error:#}");
-    let rolled_back = error_text.contains("rolled back");
+    let rollback = error
+        .chain()
+        .find_map(|source| source.downcast_ref::<installer::InstallRecoveryFailure>())
+        .map(|failure| &failure.rollback);
+    let rolled_back = rollback.is_some_and(|outcome| outcome.performed());
+    let health_failure = error
+        .chain()
+        .find_map(|source| source.downcast_ref::<installer::GatewayHealthFailure>());
     let error_code = install_error_code(command, error_text.as_str());
     let payload = json!({
         "phase": "failed",
@@ -490,11 +497,14 @@ fn print_install_failure_json(
             installer::InstallCommand::Update => "update",
         },
         "installed_version": env!("CARGO_PKG_VERSION"),
-        "service_active": false,
-        "gateway_reachable": false,
+        "service_active": rollback.is_some_and(|outcome| outcome.healthy()),
+        "gateway_reachable": rollback.is_some_and(|outcome| outcome.healthy()),
         "command_link_created": false,
         "path_updated": false,
         "rollback_performed": rolled_back,
+        "rollback_outcome": rollback,
+        "gateway_health_failure": health_failure,
+        "rollback_healthy": rollback.is_some_and(|outcome| outcome.healthy()),
         "error_code": error_code,
         "warnings": [],
         "stage_timings": [],
@@ -555,7 +565,8 @@ fn print_version(json_output: bool) -> Result<()> {
                 "name": binary_display_name(),
                 "version": env!("CARGO_PKG_VERSION"),
                 "os": std::env::consts::OS,
-                "arch": std::env::consts::ARCH
+                "arch": std::env::consts::ARCH,
+                "compiled_database_migrations": pioneer_gateway::compiled_database_migration_names()
             }))?
         );
     } else {
