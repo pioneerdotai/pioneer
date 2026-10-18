@@ -109,6 +109,7 @@ struct Fake {
     deny_mcp: AtomicUsize,
     resources: AtomicBool,
     stateful: AtomicBool,
+    authorized_deletes: AtomicUsize,
     expected_refresh: Mutex<String>,
     requests: Mutex<Vec<(HeaderMap, HashMap<String, String>)>>,
     dcr: Mutex<Vec<Value>>,
@@ -144,6 +145,7 @@ impl Server {
             deny_mcp: AtomicUsize::new(0),
             resources: AtomicBool::new(false),
             stateful: AtomicBool::new(false),
+            authorized_deletes: AtomicUsize::new(0),
             expected_refresh: Mutex::new("refresh-0".into()),
             requests: Mutex::new(vec![]),
             dcr: Mutex::new(vec![]),
@@ -160,7 +162,7 @@ impl Server {
             .route("/.well-known/oauth-authorization-server", get(as_metadata))
             .route("/register", post(register))
             .route("/token", post(token))
-            .route("/mcp", post(mcp).get(mcp_stream))
+            .route("/mcp", post(mcp).get(mcp_stream).delete(delete_mcp_session))
             .route(
                 "/alias",
                 post(|| async { axum::response::Redirect::temporary("/mcp") }),
@@ -307,6 +309,14 @@ async fn token(
     }
     Json(result).into_response()
 }
+async fn delete_mcp_session(State(s): State<Arc<Fake>>, headers: HeaderMap) -> StatusCode {
+    if headers.get("authorization").is_none() {
+        return StatusCode::UNAUTHORIZED;
+    }
+    s.authorized_deletes.fetch_add(1, Ordering::SeqCst);
+    StatusCode::NO_CONTENT
+}
+
 async fn mcp(State(s): State<Arc<Fake>>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
     let deny = s.deny_mcp.load(Ordering::SeqCst);
     if deny == 6 && body["method"] == "resources/list" {
@@ -3069,13 +3079,22 @@ async fn terminal_decision_after_successful_put_linearizes_cancel_timeout_and_su
                 serde_json::to_value(h.persistence.read("installation").await.unwrap().unwrap())
                     .unwrap();
             if let Some(reader) = earlier_reader {
-                let token = reader.await.unwrap().unwrap();
-                let expected = if decision == OAuthState::Authorized {
-                    &written["pending_consent"]["candidate"]["token_response"]["access_token"]
+                let result = reader.await.unwrap();
+                if decision == OAuthState::Cancelled {
+                    // Cancel retires this generation, including readers that
+                    // were waiting for the exchange's refresh lease.
+                    assert!(matches!(
+                        result,
+                        Err(rmcp::transport::auth::AuthError::AuthorizationRequired)
+                    ));
                 } else {
-                    &previous["credentials"]["token_response"]["access_token"]
-                };
-                assert_eq!(token, expected.as_str().unwrap());
+                    let expected = if decision == OAuthState::Authorized {
+                        &written["pending_consent"]["candidate"]["token_response"]["access_token"]
+                    } else {
+                        &previous["credentials"]["token_response"]["access_token"]
+                    };
+                    assert_eq!(result.unwrap(), expected.as_str().unwrap());
+                }
             }
             if decision == OAuthState::Authorized {
                 let mut committed = written.clone();
@@ -3102,6 +3121,21 @@ async fn terminal_decision_after_successful_put_linearizes_cancel_timeout_and_su
                     "cancel/expiry must preserve the pre-consent atomic record"
                 );
                 if let Some(client) = &prior_client {
+                    let client = if decision == OAuthState::Cancelled {
+                        assert!(matches!(
+                            client.get_access_token().await,
+                            Err(rmcp::transport::auth::AuthError::AuthorizationRequired)
+                        ));
+                        // The prior grant survives; only a fresh generation
+                        // may use it after the cancelled exchange drains.
+                        service
+                            .client("installation", &h.server.installation())
+                            .await
+                            .unwrap()
+                            .unwrap()
+                    } else {
+                        client.clone()
+                    };
                     assert_eq!(
                         client.get_access_token().await.unwrap(),
                         previous["credentials"]["token_response"]["access_token"]
@@ -3670,8 +3704,8 @@ async fn shutdown_waits_for_admitted_bind_cleanup_before_final_mutation_drain() 
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn uncertain_promotion_is_manageable_and_retired_without_false_terminal_outcome() {
-    // Successful reconciliation, deadline, initiator loss, clear, replacement, shutdown.
-    for retirement in 0..6 {
+    // Reconciliation, deadline, initiator loss, clear, replacement, shutdown, quiesce.
+    for retirement in 0..7 {
         let h = Harness::new(true).await;
         h.login().await;
         h.service.shutdown().await;
@@ -3768,6 +3802,13 @@ async fn uncertain_promotion_is_manageable_and_retired_without_false_terminal_ou
         }
         if retirement == 5 {
             tokio::time::timeout(Duration::from_secs(3), service.shutdown())
+                .await
+                .unwrap();
+        }
+        if retirement == 6 {
+            // Draining flows must complete before credential cancellation,
+            // which remains deferred until established MCP sessions close.
+            tokio::time::timeout(Duration::from_secs(3), service.quiesce())
                 .await
                 .unwrap();
         }
@@ -4127,5 +4168,21 @@ async fn cleanup_synchronization_and_suspend_preserve_management_without_restori
     );
     assert_eq!(h.server.data.exchanges.load(Ordering::SeqCst), exchanges);
     assert_eq!(h.sink.browsers(), 0);
+    h.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn quiesced_oauth_retains_authorized_delete_but_rejects_new_connects() {
+    let h = Harness::new(true).await;
+    h.server.data.stateful.store(true, Ordering::SeqCst);
+    h.login().await;
+    let mut session = h.connect().await.unwrap();
+    h.service.quiesce().await;
+    assert!(h.connect().await.is_err());
+    tokio::time::timeout(Duration::from_secs(3), session.shutdown())
+        .await
+        .unwrap();
+    assert_eq!(h.server.data.authorized_deletes.load(Ordering::SeqCst), 1);
+    h.service.shutdown().await;
     h.service.shutdown().await;
 }

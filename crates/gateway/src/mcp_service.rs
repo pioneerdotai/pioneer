@@ -84,6 +84,8 @@ pub(crate) struct McpServiceInner {
     auth_service: RwLock<Option<Arc<GatewayAuthService>>>,
     oauth: pioneer_mcp_oauth::McpOAuthService,
     oauth_events: std::sync::Mutex<Option<JoinHandle<()>>>,
+    shutdown_gate: Mutex<()>,
+    stopping: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     oauth_recovery_ack_timeout: std::sync::Mutex<Duration>,
     #[cfg(test)]
@@ -393,6 +395,8 @@ impl McpService {
                 html_processor: RwLock::new(std::sync::Weak::new()),
                 oauth: oauth.clone(),
                 oauth_events: std::sync::Mutex::new(None),
+                shutdown_gate: Mutex::new(()),
+                stopping: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
                 oauth_effect_barrier: std::sync::Mutex::new(None),
                 #[cfg(test)]
@@ -650,7 +654,10 @@ impl McpService {
         .await;
     }
     pub(crate) async fn shutdown(&self) {
-        self.inner.oauth.shutdown().await;
+        let _owner = self.inner.shutdown_gate.lock().await;
+        // Actor registration checks this under the task registry lock too.
+        self.inner.stopping.store(true, Ordering::SeqCst);
+        self.inner.oauth.quiesce().await;
         if let Some(worker) = self
             .inner
             .oauth_events
@@ -673,6 +680,7 @@ impl McpService {
             self.stop_task(installation_id.as_str(), DomainRuntimeState::Stopped)
                 .await;
         }
+        self.inner.oauth.shutdown().await;
     }
 
     pub(crate) async fn reload_workspace(&self, workspace_id: &str) -> Result<()> {
@@ -1883,6 +1891,11 @@ impl McpService {
         let actor_failure_revision = oauth_failure_revision.clone();
         let recovery = Arc::new(OAuthRecoveryMailbox::default());
         let actor_recovery = recovery.clone();
+        let mut tasks = self.inner.tasks.lock().await;
+        anyhow::ensure!(
+            !self.inner.stopping.load(Ordering::SeqCst),
+            "MCP service is shutting down"
+        );
         let join = tokio::spawn(async move {
             service
                 .run_server_task(
@@ -1898,7 +1911,7 @@ impl McpService {
                 .await;
         });
 
-        self.inner.tasks.lock().await.insert(
+        tasks.insert(
             installation_id,
             McpServerTaskHandle {
                 name,
