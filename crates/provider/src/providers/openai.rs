@@ -1480,11 +1480,31 @@ impl crate::traits::Provider for OpenAiProvider {
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u64>().ok())
                 .map(|seconds| seconds.saturating_mul(1000));
-            return Err(OpenAiEmbeddingHttpFailure::new(
-                response.status().as_u16(),
-                retry_after_ms,
-            )
-            .into());
+            let status = response.status().as_u16();
+            let mut failure = OpenAiEmbeddingHttpFailure::new(status, retry_after_ms);
+            if status == 400 {
+                // A generic bad request can carry a context-limit rejection.
+                // Classify the bounded body here, then discard it before the
+                // error crosses observability or endpoint-redaction boundaries.
+                if let Ok(body) = crate::http::read_response_text_bounded(
+                    response,
+                    16 * 1024,
+                    "provider_error_body",
+                )
+                .await
+                {
+                    let class = crate::failure::classify_provider_failure_class(
+                        &body.to_ascii_lowercase(),
+                        ProviderFailureStage::Connect,
+                        Some(status),
+                        None,
+                    );
+                    if class == ProviderFailureClass::ContextTooLarge {
+                        failure.0.class = class;
+                    }
+                }
+            }
+            return Err(failure.into());
         }
 
         let response = crate::http::read_response_json_bounded::<ApiEmbeddingResponse>(
