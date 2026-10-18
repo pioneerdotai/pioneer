@@ -65,6 +65,8 @@ impl Cause {
 struct Diagnostic {
     operation: Operation,
     cause: Cause,
+    phase: Option<&'static str>,
+    reason: Option<&'static str>,
     sqlite_primary_code: Option<i32>,
     sqlite_code: Option<i32>,
 }
@@ -73,6 +75,8 @@ impl Diagnostic {
         Self {
             operation,
             cause,
+            phase: None,
+            reason: None,
             sqlite_primary_code: None,
             sqlite_code: None,
         }
@@ -98,6 +102,8 @@ impl Diagnostic {
         Self {
             operation,
             cause,
+            phase: None,
+            reason: None,
             sqlite_primary_code: primary,
             sqlite_code: code,
         }
@@ -113,6 +119,17 @@ impl Diagnostic {
         }
     }
     fn extract(operation: Operation, error: &anyhow::Error) -> Self {
+        let mut diagnostic = Self::extract_cause(operation, error);
+        diagnostic.phase = error
+            .downcast_ref::<pioneer_crud::TaskRunOccurrenceRepairPhase>()
+            .map(|phase| phase.label());
+        diagnostic.reason = error
+            .downcast_ref::<pioneer_crud::TaskRunOccurrenceRepairReason>()
+            .map(|reason| reason.label());
+        diagnostic
+    }
+
+    fn extract_cause(operation: Operation, error: &anyhow::Error) -> Self {
         for source in error.chain() {
             // Pinned SeaORM RuntimeErr wraps an Arc without exposing it as source.
             if let Some(RuntimeErr::SqlxError(error)) = source.downcast_ref::<RuntimeErr>()
@@ -281,6 +298,8 @@ impl Snapshot {
                 tracing::$level!(
                     operation = diagnostic.operation.as_str(),
                     cause = diagnostic.cause.as_str(),
+                    phase = diagnostic.phase,
+                    reason = diagnostic.reason,
                     sqlite_primary_code = diagnostic.sqlite_primary_code,
                     sqlite_code = diagnostic.sqlite_code,
                     final_failures = self.failures,

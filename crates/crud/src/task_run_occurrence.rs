@@ -4,6 +4,54 @@
 use super::*;
 use crate::repositories::task_run_occurrence_reconcile as queue;
 
+#[derive(Debug, Clone, Copy)]
+pub enum TaskRunOccurrenceRepairPhase {
+    Ownership,
+    Preparation,
+    Commit,
+    QueueCleanup,
+}
+impl TaskRunOccurrenceRepairPhase {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Ownership => "repair_ownership",
+            Self::Preparation => "repair_preparation",
+            Self::Commit => "repair_commit",
+            Self::QueueCleanup => "repair_queue_cleanup",
+        }
+    }
+}
+impl fmt::Display for TaskRunOccurrenceRepairPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum TaskRunOccurrenceRepairReason {
+    RunStatus,
+    RunErrorDecode,
+    TurnStatus,
+    TurnDecode,
+    TerminalEventPreparation,
+}
+impl TaskRunOccurrenceRepairReason {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::RunStatus => "run_status_invalid",
+            Self::RunErrorDecode => "run_error_decode",
+            Self::TurnStatus => "turn_status_invalid",
+            Self::TurnDecode => "turn_decode",
+            Self::TerminalEventPreparation => "terminal_event_preparation",
+        }
+    }
+}
+impl fmt::Display for TaskRunOccurrenceRepairReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 pub(crate) enum Preparation {
     Unchanged(TaskRunOccurrenceTerminalizationOutcome),
     Ready(Box<PreparedOccurrence>),
@@ -79,7 +127,10 @@ impl CrudStore {
         now: i64,
     ) -> Result<TaskRunOccurrenceTerminalizationOutcome> {
         let repair = self.with_maintenance_reads_and_critical_writes();
-        if !queue::owns(&repair.connection, claim).await? {
+        if !queue::owns(&repair.connection, claim)
+            .await
+            .context(TaskRunOccurrenceRepairPhase::Ownership)?
+        {
             return Ok(TaskRunOccurrenceTerminalizationOutcome::StaleClaim);
         }
         let prepared = match repair
@@ -91,10 +142,13 @@ impl CrudStore {
                 // A concurrent source write may invalidate the claim even
                 // before decoding finishes. Supersession is a normal outcome,
                 // including when the new state is deliberately not repairable.
-                if !queue::owns(&repair.connection, claim).await? {
+                if !queue::owns(&repair.connection, claim)
+                    .await
+                    .context(TaskRunOccurrenceRepairPhase::Ownership)?
+                {
                     return Ok(TaskRunOccurrenceTerminalizationOutcome::StaleClaim);
                 }
-                return Err(error);
+                return Err(error.context(TaskRunOccurrenceRepairPhase::Preparation));
             }
         };
         let outcome = match prepared {
@@ -104,7 +158,8 @@ impl CrudStore {
                     .run_serialized_write(|| {
                         repair.commit_task_run_occurrence(*prepared.clone(), Some(claim.clone()))
                     })
-                    .await?
+                    .await
+                    .context(TaskRunOccurrenceRepairPhase::Commit)?
             }
             Preparation::Unchanged(outcome) => outcome,
         };
@@ -117,12 +172,22 @@ impl CrudStore {
         }
         // A no-op has no domain write-set; conditional cleanup is Maintenance.
         let maintenance = self.with_maintenance_access();
-        let tx = maintenance.connection.begin().await?;
-        let current = queue::owns(&tx, claim).await?;
+        let tx = maintenance
+            .connection
+            .begin()
+            .await
+            .context(TaskRunOccurrenceRepairPhase::QueueCleanup)?;
+        let current = queue::owns(&tx, claim)
+            .await
+            .context(TaskRunOccurrenceRepairPhase::QueueCleanup)?;
         if current {
-            queue::remove_if_consistent(&tx, claim).await?;
+            queue::remove_if_consistent(&tx, claim)
+                .await
+                .context(TaskRunOccurrenceRepairPhase::QueueCleanup)?;
         }
-        tx.commit().await?;
+        tx.commit()
+            .await
+            .context(TaskRunOccurrenceRepairPhase::QueueCleanup)?;
         Ok(if current {
             outcome
         } else {
@@ -164,7 +229,7 @@ impl CrudStore {
             ));
         };
         let run_status = task_run_status_from_db(&prepared_run_model.status)
-            .context("unknown TaskRun status")?;
+            .context(TaskRunOccurrenceRepairReason::RunStatus)?;
         let desired_error = if matches!(
             run_status,
             TaskRunStatus::Failed
@@ -174,7 +239,8 @@ impl CrudStore {
         ) {
             optional_typed_json_from_db::<pioneer_protocol::TaskError>(
                 prepared_run_model.error_json.clone(),
-            )?
+            )
+            .context(TaskRunOccurrenceRepairReason::RunErrorDecode)?
             .map(|error| error.message)
         } else {
             None
@@ -212,7 +278,7 @@ impl CrudStore {
             ));
         }
         let current_status = turn_status_from_db(prepared_turn_model.status.as_str())
-            .with_context(|| format!("occurrence Turn `{}` has an unknown status", run_id))?;
+            .context(TaskRunOccurrenceRepairReason::TurnStatus)?;
         if current_status == desired_status {
             return Ok(Preparation::Unchanged(
                 TaskRunOccurrenceTerminalizationOutcome::AlreadyConsistent,
@@ -231,7 +297,9 @@ impl CrudStore {
                 TaskRunOccurrenceTerminalizationOutcome::NotFound,
             ));
         }
-        let Some(mut terminal_turn) = turn_from_db_model(prepared_turn_model.clone())? else {
+        let Some(mut terminal_turn) = turn_from_db_model(prepared_turn_model.clone())
+            .context(TaskRunOccurrenceRepairReason::TurnDecode)?
+        else {
             bail!("occurrence Turn `{}` has an unknown status", run_id);
         };
         terminal_turn.status = desired_status;
@@ -273,7 +341,8 @@ impl CrudStore {
             terminal_event,
             created_at,
         )
-        .await?;
+        .await
+        .context(TaskRunOccurrenceRepairReason::TerminalEventPreparation)?;
 
         Ok(Preparation::Ready(Box::new(PreparedOccurrence {
             run_id,
