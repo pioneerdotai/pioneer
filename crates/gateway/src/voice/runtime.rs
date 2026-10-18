@@ -1,7 +1,8 @@
 use super::model_catalog::{VoiceModelCatalogEntry, VoiceModelInstallLayout};
 use super::model_install::is_voice_model_installed_and_verified;
 use super::transcription::{
-    PreparedSpeechBuffer, VoiceTranscriptionError, VoiceTranscriptionErrorKind, transcription_error,
+    PreparedSpeechBuffer, VoiceSpeechHypothesis, VoiceTranscriptionError,
+    VoiceTranscriptionErrorKind, transcription_error,
 };
 use pioneer_protocol::VOICE_AUDIO_TARGET_SAMPLE_RATE_HZ;
 use pioneer_provider::providers::LocalTranscriptionEngine;
@@ -31,6 +32,8 @@ pub(crate) enum LoadedVoiceEngine {
     Cohere(CohereModel),
     #[cfg(test)]
     TestStub(String),
+    #[cfg(test)]
+    TestHypothesis(VoiceSpeechHypothesis),
 }
 
 impl LoadedVoiceEngine {
@@ -76,10 +79,10 @@ impl LoadedVoiceEngine {
         }
     }
 
-    pub(crate) fn transcribe(
+    pub(crate) fn transcribe_hypothesis(
         &mut self,
         buffer: &PreparedSpeechBuffer,
-    ) -> Result<String, VoiceTranscriptionError> {
+    ) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
         let input = PreparedVoiceEngineInput::from_buffer(buffer)?;
         match self {
             Self::Whisper(model) => transcribe_whisper(model, &input),
@@ -91,7 +94,9 @@ impl LoadedVoiceEngine {
             Self::Canary(model) => transcribe_canary(model, &input),
             Self::Cohere(model) => transcribe_cohere(model, &input),
             #[cfg(test)]
-            Self::TestStub(text) => Ok(text.clone()),
+            Self::TestStub(text) => Ok(VoiceSpeechHypothesis::text_only(text.clone())),
+            #[cfg(test)]
+            Self::TestHypothesis(hypothesis) => Ok(hypothesis.clone()),
         }
     }
 
@@ -189,11 +194,11 @@ fn load_whisper(
 fn transcribe_whisper(
     model: &mut WhisperEngine,
     input: &PreparedVoiceEngineInput,
-) -> Result<String, VoiceTranscriptionError> {
+) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
     match catch_unwind(AssertUnwindSafe(|| {
         model.transcribe_with(input.samples.as_slice(), &whisper_inference_params())
     })) {
-        Ok(Ok(result)) => Ok(result.text),
+        Ok(Ok(result)) => Ok(result.into()),
         Ok(Err(error)) => Err(transcription_error(
             VoiceTranscriptionErrorKind::RuntimeFailure,
             format!("local Whisper transcription failed: {error}"),
@@ -246,11 +251,11 @@ fn load_cohere(
 fn transcribe_cohere(
     model: &mut CohereModel,
     input: &PreparedVoiceEngineInput,
-) -> Result<String, VoiceTranscriptionError> {
+) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
     match catch_unwind(AssertUnwindSafe(|| {
         model.transcribe_with(input.samples.as_slice(), &cohere_params())
     })) {
-        Ok(Ok(result)) => Ok(result.text),
+        Ok(Ok(result)) => Ok(result.into()),
         Ok(Err(error)) => Err(transcription_error(
             VoiceTranscriptionErrorKind::RuntimeFailure,
             format!("local Cohere transcription failed: {error}"),
@@ -309,11 +314,11 @@ fn load_canary(
 fn transcribe_canary(
     model: &mut CanaryModel,
     input: &PreparedVoiceEngineInput,
-) -> Result<String, VoiceTranscriptionError> {
+) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
     match catch_unwind(AssertUnwindSafe(|| {
         model.transcribe_with(input.samples.as_slice(), &canary_params())
     })) {
-        Ok(Ok(result)) => Ok(result.text),
+        Ok(Ok(result)) => Ok(result.into()),
         Ok(Err(error)) => Err(transcription_error(
             VoiceTranscriptionErrorKind::RuntimeFailure,
             format!("local Canary transcription failed: {error}"),
@@ -358,11 +363,11 @@ fn load_gigaam(
 fn transcribe_gigaam(
     model: &mut GigaAMModel,
     input: &PreparedVoiceEngineInput,
-) -> Result<String, VoiceTranscriptionError> {
+) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
     match catch_unwind(AssertUnwindSafe(|| {
         model.transcribe_with(input.samples.as_slice(), &GigaAMParams::default())
     })) {
-        Ok(Ok(result)) => Ok(result.text),
+        Ok(Ok(result)) => Ok(result.into()),
         Ok(Err(error)) => Err(transcription_error(
             VoiceTranscriptionErrorKind::RuntimeFailure,
             format!("local GigaAM transcription failed: {error}"),
@@ -413,11 +418,11 @@ fn load_sense_voice(
 fn transcribe_sense_voice(
     model: &mut SenseVoiceModel,
     input: &PreparedVoiceEngineInput,
-) -> Result<String, VoiceTranscriptionError> {
+) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
     match catch_unwind(AssertUnwindSafe(|| {
         model.transcribe_with(input.samples.as_slice(), &sense_voice_params())
     })) {
-        Ok(Ok(result)) => Ok(result.text),
+        Ok(Ok(result)) => Ok(result.into()),
         Ok(Err(error)) => Err(transcription_error(
             VoiceTranscriptionErrorKind::RuntimeFailure,
             format!("local SenseVoice transcription failed: {error}"),
@@ -473,14 +478,14 @@ fn load_moonshine_streaming(
 fn transcribe_moonshine_streaming(
     model: &mut StreamingModel,
     input: &PreparedVoiceEngineInput,
-) -> Result<String, VoiceTranscriptionError> {
+) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
     match catch_unwind(AssertUnwindSafe(|| {
         model.transcribe_with(
             input.samples.as_slice(),
             &MoonshineStreamingParams::default(),
         )
     })) {
-        Ok(Ok(result)) => Ok(result.text),
+        Ok(Ok(result)) => Ok(result.into()),
         Ok(Err(error)) => Err(transcription_error(
             VoiceTranscriptionErrorKind::RuntimeFailure,
             format!("local Moonshine streaming transcription failed: {error}"),
@@ -528,11 +533,11 @@ fn load_moonshine_base(
 fn transcribe_moonshine_base(
     model: &mut MoonshineModel,
     input: &PreparedVoiceEngineInput,
-) -> Result<String, VoiceTranscriptionError> {
+) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
     match catch_unwind(AssertUnwindSafe(|| {
         model.transcribe_with(input.samples.as_slice(), &MoonshineParams::default())
     })) {
-        Ok(Ok(result)) => Ok(result.text),
+        Ok(Ok(result)) => Ok(result.into()),
         Ok(Err(error)) => Err(transcription_error(
             VoiceTranscriptionErrorKind::RuntimeFailure,
             format!("local Moonshine Base transcription failed: {error}"),
@@ -587,15 +592,15 @@ fn load_parakeet(
 fn transcribe_parakeet(
     model: &mut ParakeetModel,
     input: &PreparedVoiceEngineInput,
-) -> Result<String, VoiceTranscriptionError> {
+) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
     let params = ParakeetParams {
-        timestamp_granularity: Some(TimestampGranularity::Segment),
+        timestamp_granularity: Some(TimestampGranularity::Word),
         ..Default::default()
     };
     match catch_unwind(AssertUnwindSafe(|| {
         model.transcribe_with(input.samples.as_slice(), &params)
     })) {
-        Ok(Ok(result)) => Ok(result.text),
+        Ok(Ok(result)) => Ok(result.into()),
         Ok(Err(error)) => Err(transcription_error(
             VoiceTranscriptionErrorKind::RuntimeFailure,
             format!("local Parakeet transcription failed: {error}"),

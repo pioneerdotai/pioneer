@@ -10,7 +10,9 @@ use super::model_install::{
     remove_all_voice_model_installs, remove_non_selected_voice_model_installs,
 };
 use super::runtime::LoadedVoiceEngine;
-use super::transcription::{PreparedSpeechBuffer, VoiceSpeechTranscriber, VoiceTranscriptionError};
+use super::transcription::{
+    PreparedSpeechBuffer, VoiceSpeechHypothesis, VoiceSpeechTranscriber, VoiceTranscriptionError,
+};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use pioneer_config::{AppConfig, GatewayVoiceConfig, GatewayVoiceInputProviderConfig};
@@ -481,6 +483,7 @@ impl VoiceInputSupervisor {
         buffer: &super::transcription::PreparedSpeechBuffer,
     ) -> std::result::Result<String, VoiceTranscriptionError> {
         self.transcribe_inner(buffer, None)
+            .map(|result| result.text)
     }
 
     pub(crate) fn transcribe_for_session(
@@ -488,7 +491,7 @@ impl VoiceInputSupervisor {
         buffer: &PreparedSpeechBuffer,
         generation: u64,
         cancellation: &CancellationToken,
-    ) -> std::result::Result<String, VoiceTranscriptionError> {
+    ) -> std::result::Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
         self.transcribe_inner(buffer, Some((generation, cancellation)))
     }
 
@@ -496,7 +499,7 @@ impl VoiceInputSupervisor {
         &self,
         buffer: &PreparedSpeechBuffer,
         session: Option<(u64, &CancellationToken)>,
-    ) -> std::result::Result<String, VoiceTranscriptionError> {
+    ) -> std::result::Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
         let startup_wait = pioneer_observability::turn_startup::current_stage(
             pioneer_observability::turn_startup::Stage::VoiceTranscriberWait,
         );
@@ -531,7 +534,7 @@ impl VoiceInputSupervisor {
         let startup_transcribe = pioneer_observability::turn_startup::current_stage(
             pioneer_observability::turn_startup::Stage::VoiceTranscribe,
         );
-        let result = catch_unwind(AssertUnwindSafe(|| engine.transcribe(buffer)));
+        let result = catch_unwind(AssertUnwindSafe(|| engine.transcribe_hypothesis(buffer)));
         drop(startup_transcribe);
         match result {
             Ok(Ok(transcript)) => Ok(transcript),
@@ -743,6 +746,13 @@ impl VoiceSpeechTranscriber for VoiceInputSupervisor {
         buffer: &PreparedSpeechBuffer,
     ) -> std::result::Result<String, VoiceTranscriptionError> {
         self.transcribe(buffer)
+    }
+
+    fn transcribe_hypothesis(
+        &self,
+        buffer: &PreparedSpeechBuffer,
+    ) -> std::result::Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
+        self.transcribe_inner(buffer, None)
     }
 }
 
@@ -1916,6 +1926,57 @@ mod tests {
     }
 
     #[test]
+    fn voice_supervisor_preserves_native_timing_and_fences_contextual_entry() {
+        let (supervisor, _, _) = supervisor();
+        let applied = supervisor.apply_desired(selected("small"), false).unwrap();
+        supervisor.mark_loading(applied.generation).unwrap();
+        supervisor
+            .mark_ready(
+                applied.generation,
+                selected("small").selected_identity().unwrap(),
+                LoadedVoiceEngine::TestHypothesis(VoiceSpeechHypothesis {
+                    text: "да, да".to_owned(),
+                    segments: Some(vec![transcribe_rs::TranscriptionSegment {
+                        start: 0.01,
+                        end: 0.05,
+                        text: "да, да".to_owned(),
+                    }]),
+                }),
+            )
+            .unwrap();
+        let buffer = PreparedSpeechBuffer {
+            sample_rate_hz: 16000,
+            total_samples: 960,
+            segments: vec![super::super::vad::VoiceSpeechSegment {
+                start_sample: 0,
+                end_sample: 960,
+                samples: vec![0.5; 960],
+            }],
+        };
+        let token = CancellationToken::new();
+        assert!(
+            supervisor
+                .transcribe_for_session(&buffer, applied.generation + 1, &token)
+                .is_err()
+        );
+        let result = supervisor
+            .transcribe_for_session(&buffer, applied.generation, &token)
+            .unwrap();
+        assert_eq!(result.text, "да, да");
+        let segments = result.segments.unwrap();
+        assert_eq!(segments[0].start, 0.01);
+        assert_eq!(segments[0].end, 0.05);
+        assert_eq!(segments[0].text, "да, да");
+        token.cancel();
+        assert!(
+            supervisor
+                .transcribe_for_session(&buffer, applied.generation, &token)
+                .is_err()
+        );
+        assert!(supervisor.has_loaded_engine());
+    }
+
+    #[test]
     fn voice_supervisor_session_generation_and_cancellation_fence_native_entry() {
         let (supervisor, _, _) = supervisor();
         let applied = supervisor.apply_desired(selected("small"), false).unwrap();
@@ -1971,7 +2032,8 @@ mod tests {
         assert_eq!(
             supervisor
                 .transcribe_for_session(&buffer, applied.generation, &CancellationToken::new())
-                .unwrap(),
+                .unwrap()
+                .text,
             "accepted"
         );
     }
