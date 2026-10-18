@@ -2146,8 +2146,11 @@ impl FrozenStorageLifetimeProgress {
                 work.finish(store, None).await?;
                 return Ok(true);
             }
-            let mut sweep =
-                SweepPreparation::new(work.manifest.clone(), work.kind, until.min(i64::MAX - 1));
+            let mut sweep = SweepPreparation::new(
+                work.manifest.clone(),
+                work.kind,
+                std::cmp::min(until, i64::MAX - 1),
+            );
             sweep.poison = until == i64::MAX;
             sweep.work = Some(work);
             if self.sweep.is_none() {
