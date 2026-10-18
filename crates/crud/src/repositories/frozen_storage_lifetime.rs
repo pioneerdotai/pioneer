@@ -1,6 +1,6 @@
-//! Private progress for the existing frozen-storage worker. No durable queue,
-//! global registry, connection, or capacity permit is retained between quanta.
-use super::{checkpoint_proofs, compaction};
+//! Bounded progress for the existing frozen-storage worker. Physical eligibility
+//! is durable; no connection or capacity permit is retained between quanta.
+use super::{checkpoint_proofs, compaction, frozen_sweep_work};
 use crate::{CrudStore, frozen_lifetime::PreparedFrozenRoot};
 use anyhow::{Result, ensure};
 use pioneer_compaction::runner::{RunnerPhase, RunnerState};
@@ -44,7 +44,6 @@ pub struct FrozenStorageLifetimeProgress {
     // continuations and of the worker's separate conversion discovery EOF.
     cleanup_revisit_at: Option<Instant>,
     locator_done: [bool; 4],
-    physical_done: [bool; 2],
     scope: ScopeDiscovery,
     locators: [String; 4],
     locator_kind: usize,
@@ -55,13 +54,12 @@ pub struct FrozenStorageLifetimeProgress {
     proof: Option<checkpoint_proofs::GraphPreparation>,
     expiry_after: String,
     expiry: Option<ExpiryPreparation>,
-    physical_after: [Option<String>; 2],
-    physical_until: [Option<String>; 2],
-    physical_started: [bool; 2],
-    physical_kind: usize,
     sweep: Option<SweepPreparation>,
     sweep_pending: VecDeque<SweepPreparation>,
     sweep_discover: bool,
+    sweep_kind: i64,
+    sweep_fanout: bool,
+    sweep_round: [frozen_sweep_work::ServiceRound; 2],
     accounting: SweepAccounting,
     discard_after: String,
     discard: Option<DiscardPreparation>,
@@ -1009,7 +1007,16 @@ struct CheckedGeometry {
     h: history::Model,
     l: Option<layout::Model>,
 }
+#[derive(Debug, PartialEq, Eq)]
+enum SweepStep {
+    Continue,
+    Complete,
+    Retry,
+}
+
 struct SweepPreparation {
+    work: Option<frozen_sweep_work::Work>,
+    poison: bool,
     manifest: String,
     kind: i64,
     until: i64,
@@ -1029,6 +1036,8 @@ struct SweepPreparation {
 impl SweepPreparation {
     fn new(manifest: String, kind: i64, until: i64) -> Self {
         Self {
+            work: None,
+            poison: false,
             checks: VecDeque::from([manifest.clone()]),
             manifest,
             kind,
@@ -1181,16 +1190,20 @@ impl SweepPreparation {
         self.reverse = Vec::new();
         Ok(true)
     }
-    async fn step(&mut self, store: &CrudStore, accounting: &mut SweepAccounting) -> Result<bool> {
+    async fn step(
+        &mut self,
+        store: &CrudStore,
+        accounting: &mut SweepAccounting,
+    ) -> Result<SweepStep> {
         if self.prepared.is_none() {
             if self.prepare(store).await? && self.free.is_empty() {
                 accounting.held += 1;
-                return Ok(true);
+                return Ok(self.completed_step());
             }
-            return Ok(false);
+            return Ok(SweepStep::Continue);
         }
         let Some(&(start, end)) = self.free.front() else {
-            return Ok(true);
+            return Ok(self.completed_step());
         };
         let (data, payload) = physical_table(self.kind);
         let import_key = if self.kind == 1 {
@@ -1214,6 +1227,7 @@ impl SweepPreparation {
                 || row.try_get::<i64>("", "target")? < 0
             {
                 accounting.poison += 1;
+                self.poison = true;
                 next = ordinal.saturating_add(1);
                 continue;
             }
@@ -1227,7 +1241,7 @@ impl SweepPreparation {
         if page.is_empty() {
             self.free.pop_front();
             self.next = end;
-            return Ok(self.free.is_empty());
+            return Ok(self.completed_step());
         }
         if !keys.is_empty() {
             // Build SQL/parameters before opening the transaction.
@@ -1239,11 +1253,18 @@ impl SweepPreparation {
                 keys.last().expect("keys").0,
             );
             let delete = physical_delete(&self.manifest, self.kind, &keys)?;
+            let fence = self.work.as_ref().map(frozen_sweep_work::Work::fence);
             let committed = store
                 .run_serialized_write(|| async {
                     let guard = guard.clone();
                     let delete = delete.clone();
                     let tx = store.connection.begin().await?;
+                    if let Some(fence) = &fence {
+                        if tx.query_one_raw(fence.clone()).await?.is_none() {
+                            tx.commit().await?;
+                            return Ok(None);
+                        }
+                    }
                     if tx.query_one_raw(guard).await?.is_none() {
                         tx.commit().await?;
                         return Ok(None);
@@ -1258,8 +1279,8 @@ impl SweepPreparation {
                 accounting
                     .acknowledge(self.kind, PhysicalDeleteResult::refused())
                     .await;
-                // Another container gets its turn; the next epoch re-prepares.
-                return Ok(true);
+                // Refusal is never successful completion of a generation.
+                return Ok(SweepStep::Retry);
             };
             accounting.acknowledge(self.kind, deleted).await;
         }
@@ -1267,7 +1288,25 @@ impl SweepPreparation {
         if self.next >= end {
             self.free.pop_front();
         }
-        Ok(self.free.is_empty())
+        Ok(self.completed_step())
+    }
+    fn completed_step(&self) -> SweepStep {
+        if !self.free.is_empty() {
+            SweepStep::Continue
+        } else if self.poison {
+            SweepStep::Retry
+        } else {
+            SweepStep::Complete
+        }
+    }
+
+    fn completion_guard(&self) -> Statement {
+        sweep_validation(
+            &self.manifest,
+            self.kind,
+            self.prepared.as_deref().expect("prepared"),
+            None,
+        )
     }
 }
 fn kind_bound(h: &history::Model, kind: i64) -> i64 {
@@ -1278,7 +1317,7 @@ fn kind_bound(h: &history::Model, kind: i64) -> i64 {
         _ => h.next_import,
     }
 }
-fn physical_table(kind: i64) -> (&'static str, &'static str) {
+pub(super) fn physical_table(kind: i64) -> (&'static str, &'static str) {
     if kind == 0 {
         ("compaction_frozen_message_data", "reference_json")
     } else {
@@ -1380,6 +1419,19 @@ fn geometry_values<'a>(geometries: impl IntoIterator<Item = &'a CheckedGeometry>
 // One common guard for the whole selected free interval, never a predicate
 // repeated for each physical row. Missing FK parents explicitly fail closed.
 fn sweep_guard(manifest: &str, kind: i64, prepared: &str, first: i64, last: i64) -> Statement {
+    sweep_validation(manifest, kind, prepared, Some((first, last)))
+}
+
+// Held completion needs the same current geometry and unknown-scope checks,
+// without the interval predicates which intentionally reject retained rows.
+fn sweep_validation(
+    manifest: &str,
+    kind: i64,
+    prepared: &str,
+    interval: Option<(i64, i64)>,
+) -> Statement {
+    let (first, last) = interval.unwrap_or((0, 0));
+    let deleting = if interval.is_some() { "1" } else { "0" };
     let h_fields = GEOMETRY_HEADER_FIELDS;
     let l_fields = GEOMETRY_LAYOUT_FIELDS;
     let same_h = h_fields
@@ -1415,9 +1467,9 @@ SELECT 1 WHERE
 NOT EXISTS(SELECT 1 FROM checked e LEFT JOIN compaction_frozen_history h ON h.id=e.h_id LEFT JOIN compaction_frozen_layout l ON l.manifest_id=e.h_id AND l.kind=?2 WHERE h.id IS NULL OR NOT ({same_h}) OR (l.manifest_id IS NOT NULL AND (l.cleanup_next<0 OR l.cleanup_next>l.cleanup_to)) OR NOT ((e.l_manifest_id IS NULL AND l.manifest_id IS NULL) OR (e.l_manifest_id IS NOT NULL AND l.manifest_id IS NOT NULL AND {same_l})))
 AND EXISTS(SELECT 1 FROM compaction_frozen_history p WHERE p.id=?1)
 AND NOT EXISTS(SELECT 1 FROM compaction_frozen_history p WHERE p.id=?1 AND ({unknown}))
-AND NOT EXISTS(SELECT 1 FROM compaction_frozen_history h WHERE h.id=?1 AND (NOT ({health}) OR (h.expired=0 AND ?3<CASE h.ready WHEN 1 THEN h.{hk} ELSE h.{nk} END AND NOT EXISTS(SELECT 1 FROM compaction_frozen_layout l WHERE l.manifest_id=h.id AND l.kind=?2 AND l.active=1))))
-AND NOT EXISTS(SELECT 1 FROM compaction_frozen_span s LEFT JOIN checked e ON e.h_id=s.manifest_id LEFT JOIN compaction_frozen_history h ON h.id=s.manifest_id LEFT JOIN compaction_frozen_layout l ON l.manifest_id=s.manifest_id AND l.kind=s.kind WHERE s.source_manifest=?1 AND s.kind=?2 AND (e.h_id IS NULL OR h.id IS NULL OR NOT ({health}) OR l.manifest_id IS NULL OR l.failed<>0 OR l.active<>1 OR l.copy_next<COALESCE(l.copy_to,0) OR (h.storage_registered<>0 AND l.manifest_id IS NULL) OR (h.expired=0 AND s.start<=?4 AND ?3<s.end AND ?3<CASE h.ready WHEN 1 THEN h.{hk} ELSE h.{nk} END)))
-AND NOT EXISTS(SELECT 1 FROM compaction_frozen_layout l WHERE l.kind=?2 AND (l.manifest_id=?1 OR l.candidate=?1) AND (l.failed<>0 OR l.active<>1 OR l.copy_next<COALESCE(l.copy_to,0)))
+AND NOT EXISTS(SELECT 1 FROM compaction_frozen_history h WHERE h.id=?1 AND (NOT ({health}) OR ({deleting}=1 AND h.expired=0 AND ?3<CASE h.ready WHEN 1 THEN h.{hk} ELSE h.{nk} END AND NOT EXISTS(SELECT 1 FROM compaction_frozen_layout l WHERE l.manifest_id=h.id AND l.kind=?2 AND l.active=1))))
+AND NOT EXISTS(SELECT 1 FROM compaction_frozen_span s LEFT JOIN checked e ON e.h_id=s.manifest_id LEFT JOIN compaction_frozen_history h ON h.id=s.manifest_id LEFT JOIN compaction_frozen_layout l ON l.manifest_id=s.manifest_id AND l.kind=s.kind WHERE s.source_manifest=?1 AND s.kind=?2 AND (e.h_id IS NULL OR h.id IS NULL OR NOT ({health}) OR l.manifest_id IS NULL OR l.failed<>0 OR l.active<>1 OR l.copy_next<COALESCE(l.copy_to,0) OR (h.storage_registered<>0 AND l.manifest_id IS NULL) OR ({deleting}=1 AND h.expired=0 AND s.start<=?4 AND ?3<s.end AND ?3<CASE h.ready WHEN 1 THEN h.{hk} ELSE h.{nk} END)))
+AND NOT EXISTS(SELECT 1 FROM compaction_frozen_layout l WHERE l.kind=?2 AND (l.manifest_id=?1 OR l.candidate=?1) AND (l.failed<>0 OR (({deleting}=1 OR l.manifest_id<>?1) AND l.active<>1) OR l.copy_next<COALESCE(l.copy_to,0)))
 AND NOT EXISTS(SELECT 1 FROM compaction_frozen_history h WHERE h.id=?1 AND h.storage_registered<>0 AND NOT EXISTS(SELECT 1 FROM compaction_frozen_layout l WHERE l.manifest_id=h.id AND l.kind=?2))
 "#
         ),
@@ -1649,10 +1701,6 @@ impl FrozenStorageLifetimeProgress {
         if self.pass_done.iter().all(|done| *done) {
             self.pass_done = [false; 6];
             self.locator_done = [false; 4];
-            self.physical_done = [false; 2];
-            self.physical_started = [false; 2];
-            self.physical_after = [None, None];
-            self.physical_until = [None, None];
             tracing::debug!(
                 message_rows = self.accounting.rows[0],
                 message_bytes = self.accounting.bytes[0],
@@ -1693,12 +1741,6 @@ impl FrozenStorageLifetimeProgress {
         for phase in [2, 3, 4] {
             if self.pass_done[phase] {
                 self.pass_done[phase] = false;
-                if phase == 3 {
-                    self.physical_done = [false; 2];
-                    self.physical_started = [false; 2];
-                    self.physical_after = [None, None];
-                    self.physical_until = [None, None];
-                }
             }
         }
     }
@@ -1967,22 +2009,30 @@ impl FrozenStorageLifetimeProgress {
     }
     async fn sweep_quantum(&mut self, store: &CrudStore) -> Result<bool> {
         let active = self.sweep_pending.len() + usize::from(self.sweep.is_some());
-        if active > 0
-            && (!self.sweep_discover
-                || active >= ACTIVE_CONTAINERS
-                || self.physical_done.iter().all(|done| *done))
-        {
+        if active > 0 && (!self.sweep_discover || active >= ACTIVE_CONTAINERS) {
             let mut sweep = self
                 .sweep
                 .take()
                 .or_else(|| self.sweep_pending.pop_front())
                 .expect("active sweep");
             let result = sweep.step(store, &mut self.accounting).await;
-            if matches!(result, Ok(false))
-                || result
-                    .as_ref()
-                    .is_err_and(|error| error.downcast_ref::<sea_orm::DbErr>().is_some())
-            {
+            // Keep ownership until the durable finish succeeds. DB errors and
+            // cancellation cannot turn a dropped continuation into a clean key.
+            let finish = match &result {
+                Ok(SweepStep::Complete) => Some(Some(sweep.completion_guard())),
+                Ok(SweepStep::Retry) => Some(None),
+                Err(_) => Some(None),
+                _ => None,
+            };
+            if let Some(validation) = finish {
+                if let Some(work) = &sweep.work {
+                    if let Err(error) = work.finish(store, validation).await {
+                        self.sweep_pending.push_back(sweep);
+                        self.sweep = self.sweep_pending.pop_front();
+                        return Err(error);
+                    }
+                }
+            } else {
                 self.sweep_pending.push_back(sweep);
             }
             self.sweep = self.sweep_pending.pop_front();
@@ -1991,95 +2041,95 @@ impl FrozenStorageLifetimeProgress {
             return Ok(true);
         }
         self.sweep_discover = false;
-        let mut selected = None;
-        for _ in 0..2 {
-            let kind = self.physical_kind;
-            self.physical_kind = (kind + 1) % 2;
-            if !self.physical_done[kind] {
-                selected = Some(kind);
-                break;
+        // Neither unfinished bootstrap nor pending fanout is physical EOF.
+        // One durable continuation per quantum, with no retained DB capacity.
+        if frozen_sweep_work::bootstrap_step(store).await? {
+            return Ok(true);
+        }
+        // One fanout turn alternates with one physical admission turn. Active
+        // preparations keep their existing rotation; fanout need not drain.
+        let fanout_checked = self.sweep_fanout;
+        if fanout_checked {
+            self.sweep_fanout = false;
+            if frozen_sweep_work::fanout_step(store).await? {
+                return Ok(true);
             }
         }
-        let Some(kind) = selected else {
-            return Ok(active > 0);
-        };
-        let (data, _) = physical_table(kind as i64);
-        if !self.physical_started[kind] {
-            let row = store
-                .connection
-                .query_one(
-                    &Query::select()
-                        .from(Alias::new(data))
-                        .column(Alias::new("manifest_id"))
-                        .order_by(Alias::new("manifest_id"), Order::Desc)
-                        .limit(1)
-                        .to_owned(),
+        self.sweep_fanout = true;
+        let active_keys = self
+            .sweep
+            .iter()
+            .chain(self.sweep_pending.iter())
+            .map(|s| (s.manifest.as_str(), s.kind))
+            .collect::<Vec<_>>();
+        let kind = self.sweep_kind;
+        self.sweep_kind = 1 - kind;
+        let selected = frozen_sweep_work::discover(
+            store,
+            &active_keys,
+            kind,
+            &mut self.sweep_round[kind as usize],
+        )
+        .await?;
+        let selected = match selected {
+            frozen_sweep_work::Admission::Idle => {
+                frozen_sweep_work::discover(
+                    store,
+                    &active_keys,
+                    1 - kind,
+                    &mut self.sweep_round[(1 - kind) as usize],
                 )
-                .await?;
-            self.physical_until[kind] = row
-                .map(|r| r.try_get::<String>("", "manifest_id"))
-                .transpose()?;
-            self.physical_started[kind] = true;
-        }
-        let Some(upper) = &self.physical_until[kind] else {
-            self.physical_done[kind] = true;
-            return Ok(active > 0 || !self.physical_done.iter().all(|done| *done));
-        };
-        let mut query = Query::select();
-        query
-            .from(Alias::new(data))
-            .column(Alias::new("manifest_id"))
-            .and_where(Expr::col(Alias::new("manifest_id")).lte(upper))
-            .order_by(Alias::new("manifest_id"), Order::Asc)
-            .limit(1);
-        if let Some(after) = &self.physical_after[kind] {
-            query.and_where(Expr::col(Alias::new("manifest_id")).gt(after));
-        }
-        let row = store.connection.query_one(&query).await?;
-        if let Some(row) = row {
-            let manifest: String = row.try_get("", "manifest_id")?;
-            let last = store
-                .connection
-                .query_one(
-                    &Query::select()
-                        .from(Alias::new(data))
-                        .column(Alias::new("ordinal"))
-                        .and_where(Expr::col(Alias::new("manifest_id")).eq(&manifest))
-                        .order_by(Alias::new("ordinal"), Order::Desc)
-                        .limit(1)
-                        .to_owned(),
-                )
-                .await?;
-            if let Some(last) = last {
-                let until: i64 = last.try_get("", "ordinal")?;
-                // An unrepresentable half-open end must not block the normal
-                // keys preceding that poison row in the same container.
-                if until >= 0 {
-                    if until == i64::MAX {
-                        self.accounting.poison += 1;
-                    }
-                    let sweep = SweepPreparation::new(
-                        manifest.clone(),
-                        kind as i64,
-                        std::cmp::min(until, i64::MAX - 1),
-                    );
-                    if self.sweep.is_none() {
-                        self.sweep = Some(sweep);
-                    } else {
-                        self.sweep_pending.push_back(sweep);
-                    }
-                } else {
-                    self.accounting.poison += 1;
-                }
+                .await?
             }
-            // A DB failure before the bound/visit is ready acknowledges no
-            // discovery item. Successful disappearance/poison may advance it.
-            self.physical_after[kind] = Some(manifest);
-            Ok(true)
+            other => other,
+        };
+        let work = match selected {
+            frozen_sweep_work::Admission::Selected(work) => work,
+            frozen_sweep_work::Admission::Continue => return Ok(true),
+            frozen_sweep_work::Admission::Idle => {
+                // Empty physical admission is not EOF while propagation continues.
+                return Ok(
+                    (!fanout_checked && frozen_sweep_work::fanout_step(store).await?) || active > 0,
+                );
+            }
+        };
+        let (data, _) = physical_table(work.kind);
+        let last = store.connection.query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            format!("SELECT ordinal,typeof(ordinal) AS ordinal_type FROM {data} WHERE manifest_id=?1 ORDER BY ordinal DESC LIMIT 1"),
+            [work.manifest.clone().into()],
+        )).await?;
+        if let Some(last) = last {
+            if last.try_get::<String>("", "ordinal_type")? != "integer" {
+                self.accounting.poison += 1;
+                work.finish(store, None).await?;
+                return Ok(true);
+            }
+            let until: i64 = last.try_get("", "ordinal")?;
+            if until < 0 {
+                self.accounting.poison += 1;
+                work.finish(store, None).await?;
+                return Ok(true);
+            }
+            let mut sweep =
+                SweepPreparation::new(work.manifest.clone(), work.kind, until.min(i64::MAX - 1));
+            sweep.poison = until == i64::MAX;
+            sweep.work = Some(work);
+            if self.sweep.is_none() {
+                self.sweep = Some(sweep);
+            } else {
+                self.sweep_pending.push_back(sweep);
+            }
         } else {
-            self.physical_done[kind] = true;
-            Ok(active > 0 || !self.physical_done.iter().all(|done| *done))
+            // No rows is a completed generation. The same CAS/fanout barrier
+            // protects a concurrent append after the inventory read.
+            work.finish(
+                store,
+                Some(Statement::from_string(DbBackend::Sqlite, "SELECT 1")),
+            )
+            .await?;
         }
+        Ok(true)
     }
     async fn discard_quantum(&mut self, store: &CrudStore) -> Result<bool> {
         if let Some(discard) = self.discard.as_mut() {
@@ -2398,11 +2448,21 @@ impl ScopeDiscovery {
         if self.done {
             return Ok(false);
         }
+        // Physical families retain the original global startup prerequisite.
+        // Bootstrap persists the checked oracle outcome with each cursor/work
+        // commit; completed families do not inventory again on restart.
+        if matches!(self.family, 2 | 3) {
+            if frozen_sweep_work::bootstrap_step(store).await? {
+                return Ok(true);
+            }
+            self.family = 4;
+            self.after.clear();
+            self.kind = -1;
+            self.started = false;
+        }
         let (table, key) = match self.family {
             0 => ("compaction_frozen_history", "id"),
             1 => ("compaction_frozen_layout", "manifest_id"),
-            2 => ("compaction_frozen_message_data", "manifest_id"),
-            3 => ("compaction_frozen_import_data", "manifest_id"),
             4 => ("compaction_operation", "id"),
             _ => ("compaction_checkpoint", "id"),
         };
@@ -2413,7 +2473,7 @@ impl ScopeDiscovery {
         if self.family == 1 {
             query.column(Alias::new("kind"));
         } else {
-            query.expr_as(Expr::val(i64::from(self.family == 3)), Alias::new("kind"));
+            query.expr_as(Expr::val(0), Alias::new("kind"));
         }
         if self.started {
             let mut after = Expr::col(Alias::new(key)).gt(&self.after);
@@ -2427,9 +2487,6 @@ impl ScopeDiscovery {
         query.order_by(Alias::new(key), Order::Asc);
         if self.family == 1 {
             query.order_by(Alias::new("kind"), Order::Asc);
-        }
-        if matches!(self.family, 2 | 3) {
-            query.order_by(Alias::new("ordinal"), Order::Asc);
         }
         query.limit(1);
         let row = store.connection.query_one(&query).await?;
@@ -2498,53 +2555,7 @@ impl ScopeDiscovery {
             self.started = true;
             return Ok(true);
         }
-        let mut known = Query::select();
-        known
-            .column((history::Entity, history::Column::WorkspaceId))
-            .from(history::Entity)
-            .and_where(history::Column::Id.eq(&id))
-            .and_where(history::Column::WorkspaceId.ne(""));
-        for reverse in [false, true] {
-            let (to, predicate) = if reverse {
-                (layout::Column::Candidate, layout::Column::ManifestId)
-            } else {
-                (layout::Column::ManifestId, layout::Column::Candidate)
-            };
-            let branch = Query::select()
-                .column((history::Entity, history::Column::WorkspaceId))
-                .from(layout::Entity)
-                .join(
-                    JoinType::InnerJoin,
-                    history::Entity,
-                    Expr::col((history::Entity, history::Column::Id))
-                        .eq(Expr::col((layout::Entity, to))),
-                )
-                .and_where(Expr::col((layout::Entity, predicate)).eq(&id))
-                .and_where(Expr::col((history::Entity, history::Column::WorkspaceId)).ne(""))
-                .to_owned();
-            known.union(UnionType::All, branch);
-        }
-        for reverse in [false, true] {
-            let (header, predicate) = if reverse {
-                (span::Column::SourceManifest, span::Column::ManifestId)
-            } else {
-                (span::Column::ManifestId, span::Column::SourceManifest)
-            };
-            let branch = Query::select()
-                .column((history::Entity, history::Column::WorkspaceId))
-                .from(span::Entity)
-                .join(
-                    JoinType::InnerJoin,
-                    history::Entity,
-                    Expr::col((history::Entity, history::Column::Id))
-                        .eq(Expr::col((span::Entity, header))),
-                )
-                .and_where(Expr::col((span::Entity, predicate)).eq(&id))
-                .and_where(Expr::col((history::Entity, history::Column::WorkspaceId)).ne(""))
-                .to_owned();
-            known.union(UnionType::All, branch);
-        }
-        known.limit(1);
+        let known = frozen_scope_query(&id);
         let known = store.connection.query_one(&known).await?;
         ensure!(
             known.is_some(),
@@ -2557,9 +2568,82 @@ impl ScopeDiscovery {
     }
 }
 
+// Original legacy frozen scope oracle, shared by logical startup checks and
+// durable physical bootstrap. Endpoint inference is independent of physical kind.
+pub(super) fn frozen_scope_query(id: &str) -> sea_orm::sea_query::SelectStatement {
+    let mut known = Query::select();
+    known
+        .column((history::Entity, history::Column::WorkspaceId))
+        .from(history::Entity)
+        .and_where(history::Column::Id.eq(id))
+        .and_where(history::Column::WorkspaceId.ne(""));
+    known
+        .expr_as(Expr::val(0), Alias::new("scope_via"))
+        .expr_as(Expr::val(0), Alias::new("scope_row"));
+    for reverse in [false, true] {
+        let (to, predicate) = if reverse {
+            (layout::Column::Candidate, layout::Column::ManifestId)
+        } else {
+            (layout::Column::ManifestId, layout::Column::Candidate)
+        };
+        let branch = Query::select()
+            .column((history::Entity, history::Column::WorkspaceId))
+            .expr_as(
+                Expr::val(if reverse { 2 } else { 1 }),
+                Alias::new("scope_via"),
+            )
+            .expr_as(
+                Expr::col((layout::Entity, Alias::new("rowid"))),
+                Alias::new("scope_row"),
+            )
+            .from(layout::Entity)
+            .join(
+                JoinType::InnerJoin,
+                history::Entity,
+                Expr::col((history::Entity, history::Column::Id))
+                    .eq(Expr::col((layout::Entity, to))),
+            )
+            .and_where(Expr::col((layout::Entity, predicate)).eq(id))
+            .and_where(Expr::col((history::Entity, history::Column::WorkspaceId)).ne(""))
+            .to_owned();
+        known.union(UnionType::All, branch);
+    }
+    for reverse in [false, true] {
+        let (header, predicate) = if reverse {
+            (span::Column::SourceManifest, span::Column::ManifestId)
+        } else {
+            (span::Column::ManifestId, span::Column::SourceManifest)
+        };
+        let branch = Query::select()
+            .column((history::Entity, history::Column::WorkspaceId))
+            .expr_as(
+                Expr::val(if reverse { 4 } else { 3 }),
+                Alias::new("scope_via"),
+            )
+            .expr_as(
+                Expr::col((span::Entity, Alias::new("rowid"))),
+                Alias::new("scope_row"),
+            )
+            .from(span::Entity)
+            .join(
+                JoinType::InnerJoin,
+                history::Entity,
+                Expr::col((history::Entity, history::Column::Id))
+                    .eq(Expr::col((span::Entity, header))),
+            )
+            .and_where(Expr::col((span::Entity, predicate)).eq(id))
+            .and_where(Expr::col((history::Entity, history::Column::WorkspaceId)).ne(""))
+            .to_owned();
+        known.union(UnionType::All, branch);
+    }
+    known.limit(1);
+    known
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("frozen_sweep_tests.rs");
     use migration::{Migrator, MigratorTrait};
     use pioneer_compaction::{
         Checkpoint, ModelSelection, SourceRef, Transport,
@@ -2687,7 +2771,7 @@ mod tests {
                     accounting.rows[kind as usize],
                     accounting.bytes[kind as usize],
                 );
-                done = sweep.step(&store, &mut accounting).await.unwrap();
+                done = sweep.step(&store, &mut accounting).await.unwrap() != SweepStep::Continue;
                 let rows = accounting.rows[kind as usize] - before.0;
                 let bytes = accounting.bytes[kind as usize] - before.1;
                 assert!(rows <= 256 && bytes <= 1024 * 1024);
@@ -2707,32 +2791,25 @@ mod tests {
                 batch_ordinals(&store, kind).await,
                 (0..65).chain([70, 601]).collect::<Vec<_>>()
             );
-            // Fresh discovery sees the committed remainder, including the new
-            // tail; poison neither loops nor prevents a later free row.
+            // Fresh durable discovery sees the committed remainder and the
+            // appended tail. A read failure cannot clean or drop durable work.
             let mut restart = FrozenStorageLifetimeProgress::default();
-            // Discovery succeeds, then bound decoding fails. No visit/cursor
-            // may be acknowledged until that second read succeeds.
-            restart.physical_kind = kind as usize;
-            let bad_bound = sql
-                .replace(",601,", ",'unreadable-bound',")
-                .replace("ordinal=600", "ordinal=601");
             store
                 .connection
-                .execute_unprepared(&bad_bound)
+                .execute_unprepared(
+                    "ALTER TABLE frozen_sweep_bootstrap RENAME TO unavailable_bootstrap",
+                )
                 .await
                 .unwrap();
-            let error = restart.sweep_quantum(&store).await.unwrap_err();
-            assert!(error.downcast_ref::<sea_orm::DbErr>().is_some());
-            assert!(restart.physical_after[kind as usize].is_none());
+            assert!(restart.sweep_quantum(&store).await.is_err());
             assert!(restart.sweep.is_none() && restart.sweep_pending.is_empty());
-            store.connection.execute_unprepared(&format!("DELETE FROM {data} WHERE manifest_id='batch-physical' AND ordinal='unreadable-bound'")).await.unwrap();
-            restart.physical_kind = kind as usize;
-            assert!(restart.sweep_quantum(&store).await.unwrap());
-            assert_eq!(
-                restart.physical_after[kind as usize].as_deref(),
-                Some("batch-physical")
-            );
-            assert_eq!(restart.sweep.as_ref().unwrap().manifest, "batch-physical");
+            store
+                .connection
+                .execute_unprepared(
+                    "ALTER TABLE unavailable_bootstrap RENAME TO frozen_sweep_bootstrap",
+                )
+                .await
+                .unwrap();
             let mut eof = false;
             for _ in 0..2000 {
                 if !restart.sweep_quantum(&store).await.unwrap() {
@@ -2756,7 +2833,10 @@ mod tests {
             let mut sweep = prepare_batch(&store, kind, 3).await;
             batch_consumer(&store, "new-consumer", kind, 1).await;
             let mut accounting = SweepAccounting::default();
-            assert!(sweep.step(&store, &mut accounting).await.unwrap());
+            assert_eq!(
+                sweep.step(&store, &mut accounting).await.unwrap(),
+                SweepStep::Retry
+            );
             assert_eq!(accounting.rows, [0, 0]);
             assert_eq!(accounting.refused, 1);
             assert_eq!(batch_ordinals(&store, kind).await, vec![0, 1, 2, 3]);
@@ -2764,7 +2844,10 @@ mod tests {
             let mut sweep = prepare_batch(&store, kind, 3).await;
             // Separate committed bounds: messages retain two rows, imports one.
             store.connection.execute_unprepared("UPDATE compaction_frozen_history SET ready=0,message_count=4,import_count=4,next_ordinal=2,next_import=1 WHERE id='batch-physical'").await.unwrap();
-            assert!(sweep.step(&store, &mut accounting).await.unwrap());
+            assert_eq!(
+                sweep.step(&store, &mut accounting).await.unwrap(),
+                SweepStep::Retry
+            );
             assert_eq!(accounting.rows, [0, 0]);
             assert_eq!(accounting.refused, 2);
             assert_eq!(batch_ordinals(&store, kind).await, vec![0, 1, 2, 3]);
@@ -2781,7 +2864,10 @@ mod tests {
                 .execute_unprepared("DROP TRIGGER refuse_batch")
                 .await
                 .unwrap();
-            assert!(sweep.step(&store, &mut accounting).await.unwrap());
+            assert_eq!(
+                sweep.step(&store, &mut accounting).await.unwrap(),
+                SweepStep::Complete
+            );
             let retained = if kind == 0 { 2 } else { 1 };
             assert_eq!(
                 batch_ordinals(&store, kind).await,
@@ -3377,16 +3463,19 @@ mod tests {
         }
         assert!(progress.scope.done);
 
-        // The fixture has two physical rows in ONE backing manifest. Preserve
-        // group discovery and the independent (manifest,kind) layout cursor.
-        let mut groups = ScopeDiscovery {
-            family: 2,
-            ..Default::default()
-        };
-        groups.step(&store).await.unwrap();
-        assert_eq!(groups.after, "origin");
-        groups.step(&store).await.unwrap();
-        assert_eq!(groups.family, 3);
+        // Physical scope and registration now finish atomically in durable
+        // bootstrap before scope.done, rather than a later sweep inventory.
+        assert!(!frozen_sweep_work::bootstrap_step(&store).await.unwrap());
+        let complete = store
+            .connection
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT count(*) AS n FROM frozen_sweep_bootstrap WHERE complete=1",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(complete.try_get::<i64>("", "n").unwrap(), 2);
         store
             .compact_frozen_storage_quantum(&mut progress)
             .await
@@ -3435,10 +3524,9 @@ mod tests {
         progress.locator_kind = 0;
         assert!(!progress.locator_quantum(&store).await.unwrap());
         assert!(progress.locator_done.iter().all(|done| *done));
-        progress.physical_done = [true, false];
-        progress.physical_kind = 0;
-        assert!(!progress.sweep_quantum(&store).await.unwrap());
-        assert!(progress.physical_done.iter().all(|done| *done));
+        // Bootstrap and invalidation continuations are real work even while
+        // physical discovery itself temporarily finds no eligible key.
+        assert!(progress.sweep_quantum(&store).await.unwrap());
 
         progress.pass_done = [true, true, false, false, false, false];
         progress.phase = 0;
@@ -4725,13 +4813,6 @@ mod tests {
         progress.proof = Some(checkpoint_proofs::GraphPreparation::new("cp-1"));
         progress.proof_pending.push_back("queued-proof".into());
         progress.proof_after = "proof-frontier".into();
-        progress.physical_after = [
-            Some("message-frontier".into()),
-            Some("import-frontier".into()),
-        ];
-        progress.physical_until = [Some("message-end".into()), Some("import-end".into())];
-        progress.physical_started = [true; 2];
-        progress.physical_done = [true, false];
         progress.sweep = Some(SweepPreparation::new("active".into(), 0, 42));
         progress
             .sweep_pending
@@ -4749,26 +4830,16 @@ mod tests {
         assert!(progress.proof.is_some());
         assert_eq!(progress.proof_after, "proof-frontier");
         assert_eq!(progress.proof_pending.front().unwrap(), "queued-proof");
-        assert_eq!(
-            progress.physical_after[0].as_deref(),
-            Some("message-frontier")
-        );
-        assert_eq!(progress.physical_until[1].as_deref(), Some("import-end"));
-        assert_eq!(progress.physical_started, [true; 2]);
-        assert_eq!(progress.physical_done, [true, false]);
         assert_eq!(progress.sweep.as_ref().unwrap().until, 42);
         assert_eq!(progress.sweep_pending.front().unwrap().manifest, "queued");
 
-        // A finished physical family starts a new finite keyset only when it
-        // has no active containers. Other families' continuations survive.
+        // Periodic admission reopens durable pending discovery only. No RAM
+        // inventory frontier exists to reset, and active visits survive above.
         progress.sweep = None;
         progress.sweep_pending.clear();
         progress.pass_done[3] = true;
         progress.revisit_completed_cleanup(now + interval * 2, interval);
-        assert_eq!(progress.physical_after, [None, None]);
-        assert_eq!(progress.physical_until, [None, None]);
-        assert_eq!(progress.physical_started, [false; 2]);
-        assert_eq!(progress.physical_done, [false; 2]);
+        assert!(!progress.pass_done[3]);
 
         progress.proof = None;
         progress.proof_pending.clear();

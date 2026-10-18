@@ -895,6 +895,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_sweep_restarts_quietly_without_writes_and_keeps_maintenance_routes() {
+        let (_directory, store, observer) = fixture_with_metadata(0).await;
+        let db = store.database_connection();
+        db.execute_unprepared("INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,imports_sha256,message_count,import_count,next_ordinal,next_import,ready) VALUES('held-physical','ws','thread','fixture','fixture',1,1,1,1,0)").await.unwrap();
+        db.execute_unprepared("INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES('held-physical',0,'{}',2)").await.unwrap();
+        db.execute_unprepared("INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES('held-physical',0,0,'event','e','v','thread','{}',2)").await.unwrap();
+        let before = observer.operations();
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        let mut idle = false;
+        for _ in 0..1000 {
+            if !progress.quantum(&store).await.unwrap() {
+                idle = true;
+                break;
+            }
+        }
+        assert!(idle);
+        let first_reads = observer.operations() - before;
+        let row = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM frozen_sweep_work WHERE manifest_id='held-physical' AND pending=0")).await.unwrap().unwrap();
+        assert_eq!(row.try_get::<i64>("", "n").unwrap(), 2);
+        let writes = observer.writes.lock().unwrap().len();
+        let before = observer.operations();
+        let mut restart = FrozenStorageLifetimeProgress::default();
+        let now = Instant::now();
+        restart.revisit_completed_cleanup(now, IDLE_INTERVAL);
+        restart.revisit_completed_cleanup(now + IDLE_INTERVAL, IDLE_INTERVAL);
+        let mut idle = false;
+        for _ in 0..1000 {
+            if !restart.quantum(&store).await.unwrap() {
+                idle = true;
+                break;
+            }
+        }
+        assert!(idle);
+        assert!(
+            observer.operations() - before < first_reads,
+            "restart skips completed physical preparations and fanout"
+        );
+        assert_eq!(
+            observer.writes.lock().unwrap().len(),
+            writes,
+            "quiet restart performs no sweep housekeeping writes"
+        );
+        assert!(
+            observer
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| match event {
+                    SqliteReadEvent::OperationFinished { class, .. } =>
+                        *class == SqliteReadClass::Maintenance,
+                    _ => true,
+                })
+        );
+        assert!(
+            observer
+                .writes
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| match event {
+                    SqliteWriteEvent::Acquired { class, .. } =>
+                        *class == SqliteWriteClass::Maintenance,
+                    _ => true,
+                })
+        );
+        assert!(db.reader_query_only_enabled().await.unwrap());
+    }
+
+    #[tokio::test]
     async fn html_preview_index_uses_scoped_readers_and_serial_writer_and_cancels_admission() {
         let (directory, store, observer) = fixture().await;
         use pioneer_entity::{
