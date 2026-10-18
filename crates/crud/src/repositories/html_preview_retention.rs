@@ -42,8 +42,14 @@ async fn index_quantum(
         }
         return Ok(true);
     }
+    // Missing state never proves that legacy headers have markers. Pending
+    // import continuation above must not rediscover work or reread this gate.
+    let backfill_complete = backfill::Entity::find_by_id(1_i64)
+        .one(&store.connection)
+        .await?
+        .is_some_and(|state| state.complete == 1);
     let previous_after = after.clone();
-    let query = Query::select()
+    let mut query = Query::select()
         .columns([
             ("h", history::Column::Id),
             ("h", history::Column::WorkspaceId),
@@ -68,32 +74,57 @@ async fn index_quantum(
             Func::coalesce([col("i", frozen_index::Column::Unknown), Expr::val(0)]),
             "unknown",
         )
-        .from_as(history::Entity, "h")
-        .join_as(
-            JoinType::LeftJoin,
-            frozen_index::Entity,
-            "i",
-            col("i", frozen_index::Column::ManifestId).eq(col("h", history::Column::Id)),
-        )
-        .and_where(col("h", history::Column::Id).gt(after.as_str()))
-        .order_by(("h", history::Column::Id), Order::Asc)
         .limit(1)
         .to_owned();
+    if backfill_complete {
+        // Keep literal predicate terms identical to html_preview_frozen_work.
+        // Bound parameters or COALESCE would obscure partial-index eligibility.
+        query
+            .from_as(frozen_index::Entity, "i")
+            .join_as(
+                JoinType::InnerJoin,
+                history::Entity,
+                "h",
+                col("h", history::Column::Id).eq(col("i", frozen_index::Column::ManifestId)),
+            )
+            .and_where(col("i", frozen_index::Column::Expired).eq(Expr::Constant(0.into())))
+            .and_where(col("i", frozen_index::Column::Ready).eq(Expr::Constant(1.into())))
+            .and_where(
+                col("i", frozen_index::Column::Complete)
+                    .ne(Expr::Constant(1.into()))
+                    .or(col("i", frozen_index::Column::Unknown).eq(Expr::Constant(1.into()))),
+            )
+            .and_where(col("i", frozen_index::Column::ManifestId).gt(after.as_str()))
+            .order_by(("i", frozen_index::Column::ManifestId), Order::Asc);
+    } else {
+        query
+            .from_as(history::Entity, "h")
+            .join_as(
+                JoinType::LeftJoin,
+                frozen_index::Entity,
+                "i",
+                col("i", frozen_index::Column::ManifestId).eq(col("h", history::Column::Id)),
+            )
+            .and_where(col("h", history::Column::Id).gt(after.as_str()))
+            .order_by(("h", history::Column::Id), Order::Asc);
+    }
     let row = store.connection.query_one(&query).await?;
     let Some(row) = row else {
         // Every old header was visited. Header triggers cover every insertion,
         // update, key change and deletion concurrent with this keyset traversal.
-        store
-            .run_serialized_write(|| async {
-                backfill::Entity::update_many()
-                    .col_expr(backfill::Column::Complete, Expr::val(1))
-                    .filter(backfill::Column::Singleton.eq(1))
-                    .filter(backfill::Column::Complete.eq(0))
-                    .exec(&store.connection)
-                    .await?;
-                Ok(())
-            })
-            .await?;
+        if !backfill_complete {
+            store
+                .run_serialized_write(|| async {
+                    backfill::Entity::update_many()
+                        .col_expr(backfill::Column::Complete, Expr::val(1))
+                        .filter(backfill::Column::Singleton.eq(1))
+                        .filter(backfill::Column::Complete.eq(0))
+                        .exec(&store.connection)
+                        .await?;
+                    Ok(())
+                })
+                .await?;
+        }
         after.clear();
         return Ok(false);
     };
@@ -1398,6 +1429,17 @@ pub(crate) async fn retain_preview_input<C: ConnectionTrait>(
 }
 
 async fn input_adoption_quantum(store: &CrudStore, after: &mut String) -> Result<bool> {
+    // Supported input projection writers retain previews in their atomic write
+    // set, including inputs inserted behind this legacy cursor after completion.
+    // Do not cache the gate: a legacy-data migration may need to reopen it.
+    if backfill::Entity::find_by_id(1_i64)
+        .one(&store.connection)
+        .await?
+        .is_some_and(|state| state.inputs_complete == 1)
+    {
+        after.clear();
+        return Ok(false);
+    }
     // Enumerate source IDs first: no request/commit scans all input payloads.
     let payload_bytes: Expr = Expr::case(
         Expr::col(turn_input::Column::InputType).eq("artifact"),
