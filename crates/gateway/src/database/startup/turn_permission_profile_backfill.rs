@@ -1213,6 +1213,8 @@ mod tests {
         .await
         .expect("workspace should insert");
         thread::Entity::insert(thread::ActiveModel {
+            inbox_workspace_after_sequence: Default::default(),
+            inbox_workspace_started_at: Default::default(),
             id: Set(thread_id.to_owned()),
             workspace_id: Set(workspace_id.to_owned()),
             name: Set(Some("Legacy thread".to_owned())),

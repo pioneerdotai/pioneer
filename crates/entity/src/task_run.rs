@@ -34,6 +34,7 @@ pub struct Model {
     pub error_json: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    pub inbox_sequence: Option<i64>,
     #[sea_orm(has_many)]
     pub compaction_task_outputs: HasMany<super::compaction_task_output::Entity>,
     #[sea_orm(has_many)]

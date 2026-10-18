@@ -753,6 +753,7 @@ mod tests {
             updated_at: Set(now),
             removed_at: Set(None),
             authorization_guard: Set(1),
+            ..Default::default()
         }
         .insert(&database)
         .await
@@ -771,6 +772,7 @@ mod tests {
                 updated_at: Set(now),
                 removed_at: Set(None),
                 authorization_guard: Set(1),
+                ..Default::default()
             }
             .insert(&database)
             .await
@@ -808,6 +810,7 @@ mod tests {
             updated_at: Set(now),
             created_by_actor_id: Set(Some(SUPERUSER_ID.to_owned())),
             created_by_actor_kind: Set(Some("principal".to_owned())),
+            ..Default::default()
         }
         .insert(&database)
         .await
@@ -860,6 +863,7 @@ mod tests {
             added_by_actor_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         }
         .insert(&database)
         .await
@@ -892,6 +896,7 @@ mod tests {
             granted_by_actor_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         }
         .insert(&database)
         .await
@@ -903,6 +908,7 @@ mod tests {
             added_by_actor_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()
         }
         .insert(&database)
         .await

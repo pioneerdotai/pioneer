@@ -15,6 +15,7 @@ pub struct Model {
     pub granted_by_actor_id: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    pub inbox_after_sequence: Option<i64>,
     #[sea_orm(
         belongs_to,
         from = "principal_id",

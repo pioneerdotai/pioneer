@@ -1,8 +1,7 @@
 mod m20261015_000001_html_preview_retention;
-mod m20261017_000001_task_inbox_activation;
 mod m20261018_000001_html_preview_work_selection;
 mod m20261018_000001_task_cancellation_actor;
-mod m20261018_000002_task_inbox_query_indexes;
+mod task_inbox;
 pub use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
@@ -100,7 +99,6 @@ mod m20261010_000001_frozen_lifetime;
 mod m20261012_000001_turn_event_delivery_unfinished_predecessor;
 mod m20261015_000001_compaction_invalid_completion_resume;
 mod m20261015_000002_terminal_task_input_roots;
-mod m20261016_000001_task_completion_inbox;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -195,12 +193,13 @@ impl MigratorTrait for Migrator {
             Box::new(m20261012_000001_turn_event_delivery_unfinished_predecessor::Migration),
             Box::new(m20261015_000001_compaction_invalid_completion_resume::Migration),
             Box::new(m20261015_000002_terminal_task_input_roots::Migration),
-            Box::new(m20261016_000001_task_completion_inbox::Migration),
+            Box::new(task_inbox::receipts::Migration),
             Box::new(m20261015_000001_html_preview_retention::Migration),
             Box::new(m20261018_000001_html_preview_work_selection::Migration),
-            Box::new(m20261017_000001_task_inbox_activation::Migration),
+            Box::new(task_inbox::activation::Migration),
             Box::new(m20261018_000001_task_cancellation_actor::Migration),
-            Box::new(m20261018_000002_task_inbox_query_indexes::Migration),
+            Box::new(task_inbox::indexes::Migration),
+            Box::new(task_inbox::access_start::Migration),
         ]
     }
 }

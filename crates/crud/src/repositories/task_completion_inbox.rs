@@ -2,8 +2,8 @@
 use super::authorization_scope::{TaskScopeAlias as S, task_scope_query};
 use anyhow::{Context, Result};
 use pioneer_entity::{
-    task, task_delivery, task_inbox_activation, task_result_candidate, task_run, task_run_read,
-    task_run_turn, thread, thread_membership, user_notification_outbox, workspace,
+    gateway_principal, task, task_delivery, task_inbox_activation, task_result_candidate, task_run,
+    task_run_read, task_run_turn, thread, thread_membership, user_notification_outbox, workspace,
     workspace_membership,
 };
 use sea_orm::sea_query::{
@@ -27,6 +27,7 @@ enum InboxAlias {
     #[sea_orm(iden = "p")]
     Page,
     ResultRun,
+    SequenceRun,
 }
 #[derive(Clone, Copy, DeriveIden)]
 enum InboxField {
@@ -103,7 +104,43 @@ impl TryFrom<InboxRow> for TaskCompletionInboxRow {
     }
 }
 
-fn access_condition(access: &TaskCompletionInboxAccess<'_>) -> Condition {
+/// Called only inside the grant/terminal writer transaction in production.
+/// The singleton is initialized by migration; missing state is an error.
+pub(crate) async fn current_completion_sequence<C: ConnectionTrait>(db: &C) -> Result<i64> {
+    let query = Query::select()
+        .column(task_inbox_activation::Column::CompletionSequence)
+        .from(task_inbox_activation::Entity)
+        .and_where(Expr::col(task_inbox_activation::Column::Id).eq(1))
+        .to_owned();
+    db.query_one(&query)
+        .await?
+        .context("missing inbox sequence")?
+        .try_get("", "completion_sequence")
+        .map_err(Into::into)
+}
+
+/// Allocate after transition validation, in the same transaction as the run
+/// projection. Rollback and replay retain the original order.
+pub(crate) async fn next_completion_sequence<C: ConnectionTrait>(db: &C) -> Result<i64> {
+    use task_inbox_activation::Column as F;
+    let query = Query::update()
+        .table(task_inbox_activation::Entity)
+        .value(
+            F::CompletionSequence,
+            Expr::col(F::CompletionSequence).add(1),
+        )
+        .and_where(Expr::col(F::Id).eq(1))
+        .and_where(Expr::col(F::CompletionSequence).lt(i64::MAX))
+        .returning(Query::returning().column(F::CompletionSequence).to_owned())
+        .to_owned();
+    db.query_one(&query)
+        .await?
+        .context("missing or exhausted inbox sequence")?
+        .try_get("", "completion_sequence")
+        .map_err(Into::into)
+}
+
+fn access_condition(access: &TaskCompletionInboxAccess<'_>, unread: bool) -> Condition {
     use InboxAlias as A;
     let workspace_member = Query::select()
         .expr(Expr::val(1))
@@ -123,7 +160,7 @@ fn access_condition(access: &TaskCompletionInboxAccess<'_>) -> Condition {
             .equals((S::Task, task::Column::WorkspaceId)),
         )
         .to_owned();
-    let thread_member = Query::select()
+    let mut thread_member = Query::select()
         .expr(Expr::val(1))
         .from_as(thread_membership::Entity, A::ThreadMember)
         .and_where(
@@ -135,13 +172,45 @@ fn access_condition(access: &TaskCompletionInboxAccess<'_>) -> Condition {
                 .equals((S::Thread, thread::Column::Id)),
         )
         .to_owned();
+    let mut public =
+        Condition::all().add(Expr::col((S::Thread, thread::Column::AccessClass)).eq("workspace"));
+    if unread {
+        // Fold the current interval into the existing exact membership probe;
+        // do not perform a second probe for each candidate run. Public threads
+        // still need no explicit membership. Retained private participants
+        // keep their earlier route when the thread is made public.
+        let completed = || unix_seconds(Expr::col((A::Run, task_run::Column::CompletedAt)));
+        thread_member
+            .and_where(completed().gte(unix_seconds(Expr::col((
+                A::ThreadMember,
+                thread_membership::Column::CreatedAt,
+            )))))
+            .cond_where(after_sequence(Expr::col((
+                A::ThreadMember,
+                thread_membership::Column::InboxAfterSequence,
+            ))));
+        public = public
+            .add(
+                completed().gte(unix_seconds(
+                    Func::coalesce([
+                        Expr::col((S::Thread, thread::Column::InboxWorkspaceStartedAt)),
+                        Expr::col((S::Thread, thread::Column::CreatedAt)),
+                    ])
+                    .into(),
+                )),
+            )
+            .add(after_sequence(Expr::col((
+                S::Thread,
+                thread::Column::InboxWorkspaceAfterSequence,
+            ))));
+    }
     Condition::any().add(Expr::val(access.absolute)).add(
         Condition::all()
             .add(Expr::col((S::Workspace, workspace::Column::IsActive)).eq(true))
             .add(Expr::exists(workspace_member))
             .add(
                 Condition::any()
-                    .add(Expr::col((S::Thread, thread::Column::AccessClass)).eq("workspace"))
+                    .add(public)
                     .add(Expr::exists(thread_member)),
             ),
     )
@@ -168,19 +237,78 @@ fn read_at(access: &TaskCompletionInboxAccess<'_>) -> Expr {
     .into()
 }
 
-fn unread_condition(access: &TaskCompletionInboxAccess<'_>) -> Condition {
-    // Activation suppresses historical notifications without manufacturing a
-    // personal read timestamp or one receipt per historical run. Include the
-    // complete activation second: the durable migration fact has second precision.
+/// NULL denotes pre-upgrade evidence: timestamps are the only recoverable
+/// order. New grants also require a later actual terminal commit, including
+/// within the same second. No read receipt is manufactured for excluded history.
+fn after_sequence(boundary: Expr) -> Condition {
+    // Do not make the main run scan fetch an uncovered column for every legacy
+    // result. NULL legacy boundaries short-circuit; only a new interval needs
+    // this exact PK probe. The existing epoch index remains covering for r.
+    let sequence = Query::select()
+        .expr(Expr::val(1))
+        .from_as(task_run::Entity, InboxAlias::SequenceRun)
+        .and_where(
+            Expr::col((InboxAlias::SequenceRun, task_run::Column::Id))
+                .equals((InboxAlias::Run, task_run::Column::Id)),
+        )
+        .and_where(
+            Expr::col((InboxAlias::SequenceRun, task_run::Column::InboxSequence))
+                .gt(boundary.clone()),
+        )
+        .to_owned();
+    Condition::any()
+        .add(boundary.is_null())
+        .add(Expr::exists(sequence))
+}
+
+fn access_start_query(access: &TaskCompletionInboxAccess<'_>, sequence: bool) -> SelectStatement {
+    let mut query = Query::select();
+    if access.absolute {
+        query.expr(if sequence {
+            Expr::col(gateway_principal::Column::InboxAfterSequence)
+        } else {
+            eligibility_epoch(Expr::col(gateway_principal::Column::CreatedAt))
+        });
+        query
+            .from(gateway_principal::Entity)
+            .and_where(Expr::col(gateway_principal::Column::Id).eq(access.principal_id));
+    } else {
+        query.expr(if sequence {
+            Expr::col(workspace_membership::Column::InboxAfterSequence)
+        } else {
+            eligibility_epoch(Expr::col(workspace_membership::Column::CreatedAt))
+        });
+        query
+            .from(workspace_membership::Entity)
+            .and_where(Expr::col(workspace_membership::Column::PrincipalId).eq(access.principal_id))
+            .and_where(
+                Expr::col(workspace_membership::Column::WorkspaceId).eq(access.workspace_id),
+            );
+    }
+    query.to_owned()
+}
+
+fn eligibility_epoch(start: Expr) -> Expr {
     let activation = Query::select()
         .column(task_inbox_activation::Column::StartedAt)
         .from(task_inbox_activation::Entity)
         .and_where(Expr::col(task_inbox_activation::Column::Id).eq(1))
         .to_owned();
-    Condition::all().add(read_at(access).is_null()).add(
-        unix_seconds(Expr::col((InboxAlias::Run, task_run::Column::CompletedAt)))
-            .gte(Expr::from(activation)),
-    )
+    // Project the complete bound inside the uncorrelated access subquery. SQLite
+    // computes this once per statement, rather than normalizing the same saved
+    // date again for each workspace task's index seek.
+    Func::cust(Alias::new("max"))
+        .args([Expr::from(activation), unix_seconds(start)])
+        .into()
+}
+
+fn unread_condition(access: &TaskCompletionInboxAccess<'_>) -> Condition {
+    use InboxAlias as A;
+    let completed = || unix_seconds(Expr::col((A::Run, task_run::Column::CompletedAt)));
+    Condition::all()
+        .add(read_at(access).is_null())
+        .add(completed().gte(Expr::from(access_start_query(access, false))))
+        .add(after_sequence(Expr::from(access_start_query(access, true))))
 }
 
 fn relation(access: &TaskCompletionInboxAccess<'_>, workspace_scan: bool) -> SelectStatement {
@@ -236,7 +364,7 @@ fn relation(access: &TaskCompletionInboxAccess<'_>, workspace_scan: bool) -> Sel
             ),
         )
         .and_where(Expr::col((S::Thread, thread::Column::Id)).is_not_null())
-        .cond_where(access_condition(access));
+        .cond_where(access_condition(access, workspace_scan));
     query
 }
 
@@ -451,6 +579,11 @@ pub async fn mark_all_task_completion_inbox_read<C: ConnectionTrait>(
     access: &TaskCompletionInboxAccess<'_>,
     at: &str,
 ) -> Result<()> {
+    db.execute_raw(read_all_statement(access, at)?).await?;
+    Ok(())
+}
+
+fn read_all_statement(access: &TaskCompletionInboxAccess<'_>, at: &str) -> Result<Statement> {
     let mut source = relation(access, true);
     source
         .expr(Expr::val(access.principal_id))
@@ -458,9 +591,7 @@ pub async fn mark_all_task_completion_inbox_read<C: ConnectionTrait>(
         .expr(Expr::val(at))
         .cond_where(unread_condition(access));
     let insert = receipt_insert(source)?;
-    db.execute_raw(workspace_index_hints(DbBackend::Sqlite.build(&insert))?)
-        .await?;
-    Ok(())
+    workspace_index_hints(DbBackend::Sqlite.build(&insert))
 }
 
 fn receipt_insert(source: SelectStatement) -> Result<sea_orm::sea_query::InsertStatement> {
@@ -1032,12 +1163,17 @@ mod tests {
             page_statement(&access, None, 31).unwrap(),
             page_statement(&access, Some(("2026-10-16 10:00:00 +00:00", "run")), 31).unwrap(),
             unread_count_statement(&access).unwrap(),
+            read_all_statement(&access, "2026-10-18T21:00:00Z").unwrap(),
         ] {
             // Inspect the exact final statement with its original bound Values,
             // including INDEXED BY, rather than an inlined Display SQL string.
             let values = statement.values.as_ref().expect("bound inbox values");
             assert!(values.0.contains(&access.workspace_id.into()));
             assert!(values.0.contains(&access.principal_id.into()));
+            assert!(
+                !values.0.contains(&"%s".into()),
+                "epoch format is structural, not a bind"
+            );
             statement.sql = format!("EXPLAIN QUERY PLAN {}", statement.sql);
             let plan = db
                 .query_all_raw(statement)
@@ -1059,6 +1195,7 @@ mod tests {
                 .position(|line| {
                     line.starts_with("SEARCH r ")
                         && line.contains("idx_task_run_inbox_epoch")
+                        && line.contains("COVERING INDEX")
                         && line.contains("task_id=?")
                         && line.contains("<expr>>?")
                 })
@@ -1067,6 +1204,7 @@ mod tests {
             assert!(
                 !plan.iter().any(|line| line.starts_with("SCAN t ")
                     || line.starts_with("SCAN r ")
+                    || line.starts_with("SCAN sequence_run ")
                     || line.contains("idx_task_run_inbox_terminal")),
                 "{plan:?}"
             );

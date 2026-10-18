@@ -8,7 +8,7 @@ use pioneer_crud::{
 use pioneer_sqlite::{SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor};
 use sea_orm::{
     ColumnTrait, ConnectOptions, ConnectionTrait, Database, DbBackend, EntityTrait, QueryFilter,
-    Statement,
+    Statement, TransactionTrait,
 };
 
 const A: &str = "P0000000000000000000A";
@@ -60,10 +60,12 @@ async fn fixture(before: bool) -> (tempfile::TempDir, CrudStore, SqliteWriteExec
     // ACL membership tables enforce 21-character alphanumeric IDs. Keep the
     // fixture relationships valid without relaxing the migrated schema.
     for sql in [
+        "INSERT INTO gateway_identity(id,singleton_key,identity_bootstrap_version,created_at,updated_at) VALUES('G00000000000000000001',1,1,'2026-10-01 00:00:00 +00:00','2026-10-01 00:00:00 +00:00')",
+        "INSERT INTO gateway_principal(id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,created_at,updated_at) VALUES('P0000000000000000000A','G00000000000000000001','user','member','active','A','a','a','2026-10-01 00:00:00 +00:00','2026-10-01 00:00:00 +00:00'),('P0000000000000000000B','G00000000000000000001','user','member','active','B','b','b','2026-10-01 00:00:00 +00:00','2026-10-01 00:00:00 +00:00')",
         "INSERT INTO workspace(id,name,is_active,is_current) VALUES('W0000000000000000000I','Inbox',1,1),('W0000000000000000000O','Other',1,0)",
-        "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('T0000000000000000000P','W0000000000000000000I','Public thread','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('T0000000000000000000V','W0000000000000000000I','Private thread','','agent','m','p','active','user','private',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('T0000000000000000000I','W0000000000000000000I',NULL,'','agent','m','p','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-        "INSERT INTO workspace_membership(principal_id,workspace_id,granted_by_actor_kind,created_at,updated_at) VALUES('P0000000000000000000A','W0000000000000000000I','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('P0000000000000000000B','W0000000000000000000I','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-        "INSERT INTO thread_membership(principal_id,thread_id,added_by_actor_kind,created_at,updated_at) VALUES('P0000000000000000000A','T0000000000000000000V','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('P0000000000000000000B','T0000000000000000000V','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('T0000000000000000000P','W0000000000000000000I','Public thread','','agent','m','p','active','user','workspace','2026-10-01 00:00:00 +00:00','2026-10-01 00:00:00 +00:00'),('T0000000000000000000V','W0000000000000000000I','Private thread','','agent','m','p','active','user','private','2026-10-01 00:00:00 +00:00','2026-10-01 00:00:00 +00:00'),('T0000000000000000000I','W0000000000000000000I',NULL,'','agent','m','p','active','task_run','internal','2026-10-01 00:00:00 +00:00','2026-10-01 00:00:00 +00:00')",
+        "INSERT INTO workspace_membership(principal_id,workspace_id,granted_by_actor_kind,created_at,updated_at) VALUES('P0000000000000000000A','W0000000000000000000I','system','2026-10-01 00:00:00 +00:00','2026-10-01 00:00:00 +00:00'),('P0000000000000000000B','W0000000000000000000I','system','2026-10-01 00:00:00 +00:00','2026-10-01 00:00:00 +00:00')",
+        "INSERT INTO thread_membership(principal_id,thread_id,added_by_actor_kind,created_at,updated_at) VALUES('P0000000000000000000A','T0000000000000000000V','system','2026-10-01 00:00:00 +00:00','2026-10-01 00:00:00 +00:00'),('P0000000000000000000B','T0000000000000000000V','system','2026-10-01 00:00:00 +00:00','2026-10-01 00:00:00 +00:00')",
     ] {
         db.execute_unprepared(sql).await.unwrap();
     }
@@ -1329,6 +1331,15 @@ async fn cancellation_receipt_tracks_actor_exact_transition_and_rolls_back_with_
         .unwrap()
         .unwrap();
     assert_eq!(row.status, "running");
+    let clock = pioneer_entity::task_inbox_activation::Entity::find_by_id(1)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        clock.completion_sequence, 3,
+        "failed Stop receipt rolls back its completion watermark"
+    );
     db.execute_unprepared("DROP TRIGGER reject_inbox_receipt")
         .await
         .unwrap();
@@ -1923,4 +1934,643 @@ async fn ordinary_negative_batches_keep_viewport_scope_checks_and_direct_run_evi
     );
     assert_eq!(unread(&store, A).await, 0);
     assert_eq!(unread(&store, B).await, 1);
+}
+
+/// The three released identities survive source consolidation. Upgrade each
+/// possible released prefix, including no inbox migration, without replaying it.
+#[tokio::test]
+async fn consolidated_inbox_migrations_preserve_released_prefixes_and_schema() {
+    const NAMES: [&str; 3] = [
+        "m20261016_000001_task_completion_inbox",
+        "m20261017_000001_task_inbox_activation",
+        "m20261018_000002_task_inbox_query_indexes",
+    ];
+    let names = Migrator::migrations()
+        .iter()
+        .map(|m| m.name().to_owned())
+        .collect::<Vec<_>>();
+    let positions = NAMES.map(|n| names.iter().position(|v| v == n).unwrap());
+    assert!(positions[0] < positions[1] && positions[1] < positions[2]);
+    assert_eq!(
+        names[positions[0] + 1],
+        "m20261015_000001_html_preview_retention"
+    );
+    assert_eq!(
+        names[positions[1] + 1],
+        "m20261018_000001_task_cancellation_actor"
+    );
+    let mut expected_schema = None;
+    for stage in 0..=3 {
+        let (_dir, store, writer) = fixture(true).await;
+        let db = store.database_connection();
+        task(
+            &store,
+            "compat",
+            Some("T0000000000000000000P"),
+            None,
+            "tool",
+            "none",
+            "detached",
+        )
+        .await;
+        run(&store, "compat-late", "compat", "succeeded", 1).await;
+        if stage > 0 {
+            writer
+                .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, Some(1))
+                .await
+                .unwrap();
+            db.execute_unprepared("UPDATE seaql_migrations SET applied_at=1792108800 WHERE version='m20261016_000001_task_completion_inbox'").await.unwrap();
+            // A receipt must survive, while a late legacy ack must NOT trigger
+            // re-execution of the already applied initial backfill.
+            db.execute_unprepared("INSERT INTO task_run_read(principal_id,run_id,read_at) VALUES('reader','retained','2026-10-16 12:34:56+00:00')").await.unwrap();
+            if stage >= 2 {
+                let end = positions[stage - 1];
+                writer
+                    .run_migrations::<Migrator>(
+                        SqliteWriteClass::Maintenance,
+                        Some((end - positions[0]) as u32),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        db.execute_unprepared("INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,target_user_id,status,attempt_count,max_attempts,created_at,updated_at) VALUES('compat-delivery','W0000000000000000000I','compat','compat-late','compat-key','user_notification','P0000000000000000000B','delivered',1,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+        db.execute_unprepared("INSERT INTO user_notification_outbox(id,task_delivery_id,workspace_id,recipient_principal_id,task_id,run_id,payload_json,status,created_at,acknowledged_at) VALUES('compat-legacy','compat-delivery','W0000000000000000000I','P0000000000000000000B','compat','compat-late','{}','acknowledged',CURRENT_TIMESTAMP,'2026-10-16T12:34:56Z')").await.unwrap();
+        let saved_activation = if stage >= 2 {
+            Some(
+                db.query_one_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "SELECT started_at FROM task_inbox_activation WHERE id=1",
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get::<i64>("", "started_at")
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        writer
+            .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
+            .await
+            .unwrap();
+        let row = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
+            "SELECT a.started_at,m.applied_at,a.completion_sequence FROM task_inbox_activation a JOIN seaql_migrations m ON m.version='m20261016_000001_task_completion_inbox' WHERE a.id=1")).await.unwrap().unwrap();
+        assert_eq!(
+            row.try_get::<i64>("", "started_at").unwrap(),
+            row.try_get::<i64>("", "applied_at").unwrap()
+        );
+        if let Some(at) = saved_activation {
+            assert_eq!(row.try_get::<i64>("", "started_at").unwrap(), at);
+        }
+        assert_eq!(row.try_get::<i64>("", "completion_sequence").unwrap(), 0);
+        if stage > 0 {
+            let receipt = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT read_at FROM task_run_read WHERE principal_id='reader' AND run_id='retained'")).await.unwrap().unwrap();
+            assert_eq!(
+                receipt.try_get::<String>("", "read_at").unwrap(),
+                "2026-10-16 12:34:56+00:00"
+            );
+        }
+        let late_receipt = pioneer_entity::task_run_read::Entity::find_by_id((
+            B.to_owned(),
+            "compat-late".to_owned(),
+        ))
+        .one(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            late_receipt.is_some(),
+            stage == 0,
+            "initial backfill runs exactly once, before a later acknowledgement"
+        );
+        let schema = db
+            .query_all_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.try_get::<String>("", "name").unwrap(),
+                    row.try_get::<Option<String>>("", "sql").unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if let Some(expected) = &expected_schema {
+            assert_eq!(&schema, expected);
+        } else {
+            expected_schema = Some(schema);
+        }
+        // Running the chain again is a no-op, including activation and receipts.
+        writer
+            .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
+            .await
+            .unwrap();
+    }
+}
+
+const ACCESS_SECOND: i64 = 1792144800;
+fn grant_time() -> chrono::DateTime<chrono::FixedOffset> {
+    chrono::DateTime::parse_from_rfc3339("2026-10-16T10:00:00.999999999Z").unwrap()
+}
+async fn grant_workspace(store: &CrudStore) -> pioneer_entity::workspace_membership::Model {
+    let db = store.database_connection();
+    let tx = db.begin().await.unwrap();
+    let grant = pioneer_crud::insert_workspace_membership(
+        &tx,
+        &pioneer_crud::NewWorkspaceMembership {
+            gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000001").unwrap(),
+            principal_id: pioneer_protocol::PrincipalId::new(A).unwrap(),
+            workspace_id: access(A).workspace_id.into(),
+            granted_by: pioneer_protocol::PersistedActorRef::System,
+            now: grant_time(),
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    grant
+}
+async fn revoke_workspace(store: &CrudStore) {
+    let db = store.database_connection();
+    let tx = db.begin().await.unwrap();
+    pioneer_crud::delete_workspace_membership(
+        &tx,
+        &pioneer_protocol::GatewayId::new("G00000000000000000001").unwrap(),
+        &pioneer_protocol::PrincipalId::new(A).unwrap(),
+        access(A).workspace_id,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+async fn complete_for_access(store: &CrudStore, id: &str, task_id: &str, at: i64) {
+    store
+        .append_task_event(
+            pioneer_protocol::TaskEventPayload::RunCompleted {
+                task_id: task_id.into(),
+                run_id: id.into(),
+                result: None,
+                completed_at: at,
+            },
+            at,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn current_workspace_grant_orders_same_second_completions_and_survives_devices_regrant() {
+    let (dir, store, writer) = fixture(false).await;
+    task(
+        &store,
+        "access",
+        Some("T0000000000000000000P"),
+        None,
+        "tool",
+        "none",
+        "detached",
+    )
+    .await;
+    let db = store.database_connection();
+    db.execute_unprepared("UPDATE task SET status='running' WHERE id='access'")
+        .await
+        .unwrap();
+    run(&store, "before", "access", "running", 1).await;
+    complete_for_access(&store, "before", "access", ACCESS_SECOND).await;
+    // It was running before grant; only the later terminal commit matters.
+    run(&store, "was-running", "access", "running", 2).await;
+    revoke_workspace(&store).await;
+    let grant = grant_workspace(&store).await;
+    assert_eq!(grant.inbox_after_sequence, Some(1));
+    assert_eq!(unread(&store, A).await, 0);
+    complete_for_access(&store, "was-running", "access", ACCESS_SECOND).await;
+    run(&store, "after", "access", "running", 3).await;
+    complete_for_access(&store, "after", "access", ACCESS_SECOND + 5).await;
+    assert_eq!(
+        unread(&store, A).await,
+        2,
+        "no first-open baseline; retain completion in the grant second"
+    );
+    assert_eq!(
+        grant_workspace(&store).await,
+        grant,
+        "idempotent grant must retain its interval"
+    );
+    assert!(
+        find_task_completion_inbox_entry(&db, &access(A), "before")
+            .await
+            .unwrap()
+            .is_some(),
+        "history TaskRead remains available"
+    );
+    assert!(
+        pioneer_entity::task_run_read::Entity::find()
+            .all(&db)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(db);
+    drop(store);
+    drop(writer);
+    let (store, _writer) = open(&dir.path().join("inbox.sqlite")).await;
+    assert_eq!(
+        unread(&store, A).await,
+        2,
+        "restart / another device uses persisted grant"
+    );
+    revoke_workspace(&store).await;
+    assert_eq!(unread(&store, A).await, 0);
+    grant_workspace(&store).await;
+    assert_eq!(
+        unread(&store, A).await,
+        0,
+        "regrant cannot resurrect the prior interval"
+    );
+    run(&store, "repeat", "access", "running", 4).await;
+    complete_for_access(&store, "repeat", "access", ACCESS_SECOND + 6).await;
+    assert_eq!(unread(&store, A).await, 1);
+    assert_eq!(unread(&store, B).await, 4, "other participant is unchanged");
+}
+
+#[tokio::test]
+async fn private_grant_visibility_routes_and_absolute_start_are_personal() {
+    let (_dir, store, _writer) = fixture(false).await;
+    task(
+        &store,
+        "private-access",
+        Some("T0000000000000000000V"),
+        None,
+        "system",
+        "webhook",
+        "attached",
+    )
+    .await;
+    let db = store.database_connection();
+    db.execute_unprepared("UPDATE task SET status='running' WHERE id='private-access'")
+        .await
+        .unwrap();
+    run(&store, "private-old", "private-access", "running", 1).await;
+    complete_for_access(&store, "private-old", "private-access", ACCESS_SECOND).await;
+    let gateway = pioneer_protocol::GatewayId::new("G00000000000000000001").unwrap();
+    let principal = pioneer_protocol::PrincipalId::new(A).unwrap();
+    let tx = db.begin().await.unwrap();
+    pioneer_crud::delete_thread_membership(
+        &tx,
+        &gateway,
+        access(A).workspace_id,
+        "T0000000000000000000V",
+        &principal,
+    )
+    .await
+    .unwrap();
+    let grant = pioneer_crud::insert_thread_membership(
+        &tx,
+        &pioneer_crud::NewThreadMembership {
+            gateway_id: gateway,
+            principal_id: principal,
+            workspace_id: access(A).workspace_id.into(),
+            thread_id: "T0000000000000000000V".into(),
+            added_by: pioneer_protocol::PersistedActorRef::System,
+            now: grant_time(),
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(grant.inbox_after_sequence, Some(1));
+    run(&store, "private-new", "private-access", "running", 2).await;
+    complete_for_access(&store, "private-new", "private-access", ACCESS_SECOND).await;
+    assert_eq!(unread(&store, A).await, 1);
+    assert_eq!(unread(&store, B).await, 2);
+    // Public route starts now; B's continuous private route retains both runs.
+    store
+        .update_user_thread_management(
+            access(A).workspace_id,
+            "T0000000000000000000V",
+            None,
+            None,
+            Some(pioneer_crud::PersistedThreadAccessClass::Workspace),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(unread(&store, A).await, 1);
+    assert_eq!(unread(&store, B).await, 2);
+    db.execute_unprepared(
+        "DELETE FROM thread_membership WHERE principal_id='P0000000000000000000A'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(unread(&store, A).await, 0);
+    // An actual absolute principal needs no membership, and its creation time
+    // does not move when profiles/sessions change.
+    let tx = db.begin().await.unwrap();
+    let owner = pioneer_protocol::PrincipalId::new("P0000000000000000000O").unwrap();
+    pioneer_crud::create_superuser(
+        &tx,
+        &owner,
+        &pioneer_protocol::GatewayId::new("G00000000000000000001").unwrap(),
+        "Owner",
+        "owner",
+        "owner",
+        grant_time(),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let absolute = TaskCompletionInboxAccess {
+        absolute: true,
+        principal_id: owner.as_str(),
+        ..access(A)
+    };
+    assert_eq!(
+        count_unread_task_completion_inbox(&db, &absolute)
+            .await
+            .unwrap(),
+        0
+    );
+    run(&store, "owner-new", "private-access", "running", 3).await;
+    complete_for_access(&store, "owner-new", "private-access", ACCESS_SECOND).await;
+    assert_eq!(
+        count_unread_task_completion_inbox(&db, &absolute)
+            .await
+            .unwrap(),
+        1
+    );
+    let missing = TaskCompletionInboxAccess {
+        principal_id: "missing",
+        ..absolute
+    };
+    assert_eq!(
+        count_unread_task_completion_inbox(&db, &missing)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn access_start_list_count_keyset_and_read_all_share_unloaded_eligibility() {
+    let (_dir, store, _writer) = fixture(false).await;
+    task(
+        &store,
+        "access-pages",
+        Some("T0000000000000000000P"),
+        None,
+        "workflow",
+        "none",
+        "detached",
+    )
+    .await;
+    let db = store.database_connection();
+    db.execute_unprepared("UPDATE task SET status='running' WHERE id='access-pages'")
+        .await
+        .unwrap();
+    for ix in 0..8 {
+        run(
+            &store,
+            &format!("pre-{ix}"),
+            "access-pages",
+            "succeeded",
+            ix + 1,
+        )
+        .await;
+    }
+    revoke_workspace(&store).await;
+    grant_workspace(&store).await;
+    // The timestamp alone cannot distinguish these legacy pre-grant commits.
+    for ix in 0..35 {
+        let id = format!("post-{ix:03}");
+        run(&store, &id, "access-pages", "running", ix + 9).await;
+        complete_for_access(&store, &id, "access-pages", ACCESS_SECOND).await;
+    }
+    assert_eq!(unread(&store, A).await, 35);
+    let first = list_task_completion_inbox(&db, &access(A), None, 30)
+        .await
+        .unwrap();
+    let end = first.last().unwrap();
+    let next =
+        list_task_completion_inbox(&db, &access(A), Some((&end.completed_key, &end.run_id)), 30)
+            .await
+            .unwrap();
+    assert_eq!(first.len(), 30);
+    assert_eq!(next.len(), 5);
+    assert!(
+        first
+            .iter()
+            .chain(&next)
+            .all(|v| v.run_id.starts_with("post-"))
+    );
+    pioneer_crud::mark_all_task_completion_inbox_read(&db, &access(A), "2026-10-16T10:00:00Z")
+        .await
+        .unwrap();
+    assert_eq!(unread(&store, A).await, 0);
+    assert_eq!(
+        pioneer_entity::task_run_read::Entity::find()
+            .all(&db)
+            .await
+            .unwrap()
+            .len(),
+        35
+    );
+    run(&store, "later-same-time", "access-pages", "running", 44).await;
+    complete_for_access(&store, "later-same-time", "access-pages", ACCESS_SECOND).await;
+    assert_eq!(
+        unread(&store, A).await,
+        1,
+        "later terminal commit escapes read-all despite equal timestamp"
+    );
+}
+
+#[tokio::test]
+async fn grant_and_completion_race_uses_durable_writer_order_not_request_clock() {
+    let (_dir, store, _writer) = fixture(false).await;
+    task(
+        &store,
+        "racing-access",
+        Some("T0000000000000000000P"),
+        None,
+        "tool",
+        "none",
+        "detached",
+    )
+    .await;
+    let db = store.database_connection();
+    db.execute_unprepared("UPDATE task SET status='running' WHERE id='racing-access'")
+        .await
+        .unwrap();
+    run(&store, "racing-access-run", "racing-access", "running", 1).await;
+    revoke_workspace(&store).await;
+    let (grant, ()) = tokio::join!(
+        grant_workspace(&store),
+        complete_for_access(&store, "racing-access-run", "racing-access", ACCESS_SECOND)
+    );
+    let run = pioneer_entity::task_run::Entity::find_by_id("racing-access-run")
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let expected = u64::from(run.inbox_sequence.unwrap() > grant.inbox_after_sequence.unwrap());
+    assert_eq!(unread(&store, A).await, expected);
+    assert_eq!(unread(&store, B).await, 1);
+    // A rolled-back regrant never becomes the start of a different interval.
+    let tx = db.begin().await.unwrap();
+    pioneer_crud::delete_workspace_membership(
+        &tx,
+        &pioneer_protocol::GatewayId::new("G00000000000000000001").unwrap(),
+        &pioneer_protocol::PrincipalId::new(A).unwrap(),
+        access(A).workspace_id,
+    )
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
+    assert_eq!(grant_workspace(&store).await, grant);
+    assert_eq!(unread(&store, A).await, expected);
+}
+
+#[tokio::test]
+async fn publication_intervals_use_operation_time_and_preserve_continuous_participants() {
+    let (_dir, store, _writer) = fixture(false).await;
+    task(
+        &store,
+        "publication",
+        Some("T0000000000000000000V"),
+        None,
+        "tool",
+        "none",
+        "detached",
+    )
+    .await;
+    let db = store.database_connection();
+    db.execute_unprepared("UPDATE task SET status='running' WHERE id='publication'")
+        .await
+        .unwrap();
+    db.execute_unprepared(
+        "UPDATE thread SET updated_at='2099-01-01T00:00:00Z' WHERE id='T0000000000000000000V'",
+    )
+    .await
+    .unwrap();
+    db.execute_unprepared(
+        "DELETE FROM thread_membership WHERE principal_id='P0000000000000000000A'",
+    )
+    .await
+    .unwrap();
+    run(&store, "published-before", "publication", "running", 1).await;
+    let now = chrono::Utc::now().timestamp();
+    complete_for_access(&store, "published-before", "publication", now).await;
+    let patch = |class| {
+        store.update_user_thread_management(
+            access(A).workspace_id,
+            "T0000000000000000000V",
+            None,
+            None,
+            Some(class),
+            None,
+        )
+    };
+    patch(pioneer_crud::PersistedThreadAccessClass::Workspace)
+        .await
+        .unwrap();
+    run(&store, "published-after", "publication", "running", 2).await;
+    complete_for_access(
+        &store,
+        "published-after",
+        "publication",
+        chrono::Utc::now().timestamp(),
+    )
+    .await;
+    assert_eq!(
+        unread(&store, A).await,
+        1,
+        "new public interval excludes an earlier commit even in the same second"
+    );
+    assert_eq!(
+        unread(&store, B).await,
+        2,
+        "existing private participant has continuous access"
+    );
+    let saved = pioneer_entity::thread::Entity::find_by_id("T0000000000000000000V")
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        saved.inbox_workspace_started_at.unwrap().timestamp() <= chrono::Utc::now().timestamp()
+    );
+    let watermark = saved.inbox_workspace_after_sequence;
+    patch(pioneer_crud::PersistedThreadAccessClass::Workspace)
+        .await
+        .unwrap();
+    assert_eq!(
+        pioneer_entity::thread::Entity::find_by_id("T0000000000000000000V")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .inbox_workspace_after_sequence,
+        watermark,
+        "same visibility does not reset its interval"
+    );
+    patch(pioneer_crud::PersistedThreadAccessClass::Private)
+        .await
+        .unwrap();
+    assert_eq!(unread(&store, A).await, 0);
+    patch(pioneer_crud::PersistedThreadAccessClass::Workspace)
+        .await
+        .unwrap();
+    assert_eq!(
+        unread(&store, A).await,
+        0,
+        "republication cannot resurrect an earlier public interval"
+    );
+    assert_eq!(unread(&store, B).await, 2);
+}
+
+#[tokio::test]
+async fn legacy_grant_uses_epoch_and_retains_the_ambiguous_second_without_receipts() {
+    let (_dir, store, _writer) = fixture(false).await;
+    task(
+        &store,
+        "legacy-access",
+        Some("T0000000000000000000P"),
+        None,
+        "webhook",
+        "none",
+        "detached",
+    )
+    .await;
+    let db = store.database_connection();
+    db.execute_unprepared("UPDATE workspace_membership SET created_at='2026-10-16 13:00:00.999999999 +03:00' WHERE principal_id='P0000000000000000000A'").await.unwrap();
+    for (i, id, at) in [
+        (1, "legacy-pre", "2026-10-16T09:59:59Z"),
+        (2, "legacy-tie", "2026-10-16 10:00:00 +00:00"),
+        (3, "legacy-post", "2026-10-16T12:00:01+02:00"),
+    ] {
+        run(&store, id, "legacy-access", "succeeded", i).await;
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE task_run SET completed_at=? WHERE id=?",
+            [at.into(), id.into()],
+        ))
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        unread(&store, A).await,
+        2,
+        "legacy completion seconds cannot prove subsecond order; do not discard legitimate tied completions"
+    );
+    assert!(
+        pioneer_entity::task_run_read::Entity::find()
+            .all(&db)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(unread(&store, B).await, 3);
 }
