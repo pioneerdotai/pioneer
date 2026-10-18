@@ -199,3 +199,45 @@ cargo test -p pioneer-promt cli_runtime_context::tests::cli_task_policy_is_manda
 - An intermediate Gateway/prompt test-target compilation passed (22m 32s); it is superseded by the final check. A subsequent check was intentionally interrupted after the final legacy-sequence audit refinement, targeting only the Cargo process whose working directory was verified as this worktree. It is not counted as successful validation.
 - Only existing unrelated warnings in CRUD artifact helpers, Gateway voice code and an episodic-workspace test helper were emitted. They were left unchanged.
 - No tests, test scripts, doctests, application/provider/CLI scenarios were run. No merge/rebase/push, changes to another worktree, real CLI homes, user skills or Pioneer runtime data. The follow-up commit disables hooks and signing only for that Git command; no persistent configuration is changed.
+
+## Second external review follow-up (base 27a5cf6e5fd78aa477340410827986e5581f6741)
+
+Cause / minimal map: initial Claude selected_skills follows attachment order, restored selected_skills sorts by install_name, and plugin namespaces use list indices. The manager correctly treats the resulting different vectors as different process bindings. Normalize the existing process projection at initial construction, restoration and plugin snapshot materialization, while leaving the ordered installed-skill list used for instructions/Skill inputs intact. Keep ordered equality, restart checks, checkpoint barriers, exact identity/content checks and duplicate-name rejection.
+
+The branch/worktree are unchanged, HEAD matched the reviewed commit and the working tree was clean before this follow-up. Applicable root AGENTS.md was read; no nested instructions apply. Regression tests may be changed but never executed before external acceptance.
+
+### Correction and invariants
+
+- `cli_runtime/skills.rs::normalize_cli_runtime_selected_skills` is the single lexicographic install-name ordering and duplicate-name validation for process skill projections. Restore delegates to it without changing receipt identity/path/hash or ownership checks.
+- Initial admission in `message/turn_handlers.rs` uses that helper only for Claude session options and reports invalid projections through the existing Blocked/start-failure path. The original `installed_skills`, selected-skill instruction names, Skill input items and persisted bindings keep their original application order. Codex/OpenCode initial behavior is unchanged; their restore order is identical to the previous implementation.
+- `cli_runtime/claude_session.rs` normalizes before assigning index-based plugin namespaces and before touching snapshots. Equivalent selections therefore have the same namespace-to-skill mapping. Duplicate names remain errors, including at the snapshot boundary.
+- `requires_restart`, ordered vector equality, current skill fields, authorization, provider continuation identity and replacement checkpoint barriers are unchanged. A changed composition, path or source_folder_hash still changes process identity. No persistence, migration, Task business logic, native visibility/request_tools, memory or canonical skill source changes.
+
+Regression coverage (written/updated, not executed):
+
+- Existing `automatic_orchestration_exports_preserve_foreign_names_and_restore_exact_bindings` now compares the entire normalized initial projection with the restored vector, including order, path and hash. Exact automatic export names/counts and foreign directory/sentinel/receipt/reference assertions remain intact. For Claude it also verifies that otherwise identical new/resume launch specs do not require restart.
+- `claude_explicit_and_automatic_skill_projection_restores_exactly` covers an explicit user skill preceding both automatic skills, exact restored process projection and no restart. It verifies that the separate application-order list remains user, tasks, subagents. `selected_skill_projection_rejects_duplicate_export_names` preserves collision rejection even when paths/hashes differ.
+- Existing Claude plugin regression compares ordered namespace/manifest bindings across different input orders, verifies exact skill snapshots/hashes/references and rejects duplicate names. It retains all four distinct ordinary/reserved skill exports.
+- `manager::tests::claude_skill_projection_reuses_session_and_restarts_for_real_changes` checks process instance reuse, factory/close counts, no unnecessary checkpoint, and actual replacements with prepare → close → confirm for composition, path and hash changes.
+- Existing `message::tests::cli_task_tools::cli_parent_native_completion_continues_with_existing_attached_work` now checks that the Claude parent's real initial → persisted bindings → restore → manager continuation retains its process generation and does not call the factory again. A test-only factory counter records actual start attempts; the existing child starts before the baseline count is captured. Existing selected-user-skill integration coverage asserts that Claude's application instructions retain user order.
+
+Self-audit: traced initial admission, immutable skill/instruction projections, restored launch options, manager reuse comparison and plugin materialization. Normalization does not mutate the application-order list or compare vectors as sets. Existing content validation and previous directory/receipt ownership fixes remain in place. No database scheduling scope or transaction/await boundary changes. Additional diff reviewed against the recorded repeat-review base; execution validation still requires external acceptance.
+
+Future focused commands — **only after external acceptance**:
+
+```sh
+cargo test -p pioneer-gateway cli_runtime::skills::tests
+cargo test -p pioneer-gateway cli_runtime::manager::tests::claude_skill_projection_reuses_session_and_restarts_for_real_changes
+cargo test -p pioneer-gateway cli_runtime::claude_session::tests::claude_selected_skill_plugins_keep_orchestration_aliases_separate_from_user_names
+cargo test -p pioneer-gateway message::tests::cli_task_tools::cli_parent_native_completion_continues_with_existing_attached_work
+cargo test -p pioneer-gateway message::tests::cli_task_tools::cli_automatic_orchestration_skills_coexist_with_selected_user_names
+```
+
+### Second follow-up verification and remaining limits
+
+- Full additional diff against `27a5cf6e5fd78aa477340410827986e5581f6741` reviewed, including initial options construction, persisted skill/instruction bindings, restore, ordered requires_restart comparison, reuse/replace checkpoints and indexed plugin snapshots. No known required correction is deferred; self-review is not external acceptance.
+- `git diff --check` — passed, exit 0. `rustfmt --edition 2024 --config skip_children=true --check` on all six changed Rust files — passed, exit 0.
+- `CARGO_INCREMENTAL=0 cargo check --tests -p pioneer-gateway` — passed, exit 0 (**9m 15s**). This compiled library/test targets and did not execute tests. Changed-source hash (excluding these notes) remained `ebebbf7597536e10c1eaaf2377f651471151e9d77fbd8a53b50ca614649e4839` throughout verification.
+- Only existing unrelated CRUD artifact, Gateway voice and episodic-workspace test-helper warnings appeared; those files were left unchanged.
+- No tests, doctests, test scripts, applications, provider processes or CLI scenarios were executed. No merge/rebase/push, changes to other worktrees, CLI homes, user skills or working Pioneer data. The review commit disables hooks/signing only for that Git invocation to preserve the test-execution prohibition.
+- Runtime behavior awaits the authorized post-acceptance test run. Existing directory/receipt/recovery limitations recorded above are unchanged. No new persistence or migration is needed for this ordering correction.

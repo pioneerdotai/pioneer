@@ -222,6 +222,22 @@ pub(crate) fn build_cli_runtime_skill_install_plans(
     Ok(plans)
 }
 
+/// Process identity and indexed Claude plugin bindings use this canonical order.
+/// Keep attachment/application order separately in turn instructions and inputs.
+pub(crate) fn normalize_cli_runtime_selected_skills(
+    selected: impl IntoIterator<Item = CliRuntimeSelectedSkill>,
+) -> Result<Vec<CliRuntimeSelectedSkill>> {
+    let mut selected = selected.into_iter().collect::<Vec<_>>();
+    selected.sort_by(|left, right| left.install_name.cmp(&right.install_name));
+    if selected
+        .windows(2)
+        .any(|pair| pair[0].install_name == pair[1].install_name)
+    {
+        anyhow::bail!("CLI runtime selected skill installation names collide");
+    }
+    Ok(selected)
+}
+
 pub(crate) fn restore_cli_runtime_selected_skills(
     runtime: &pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig,
     runtime_kind: pioneer_protocol::CLIAgentRuntimeKind,
@@ -324,14 +340,7 @@ pub(crate) fn restore_cli_runtime_selected_skills(
             source_folder_hash: entry.source_folder_hash.clone(),
         });
     }
-    selected.sort_by(|left, right| left.install_name.cmp(&right.install_name));
-    if selected
-        .windows(2)
-        .any(|pair| pair[0].install_name == pair[1].install_name)
-    {
-        anyhow::bail!("CLI runtime selected skill installation names collide");
-    }
-    Ok(selected)
+    normalize_cli_runtime_selected_skills(selected)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1212,8 +1221,20 @@ mod tests {
             )
             .unwrap();
             assert_eq!(restored.len(), 2);
-            for first in &installed {
-                assert!(restored.contains(&CliRuntimeSelectedSkill::from(first)));
+            let initial = normalize_cli_runtime_selected_skills(
+                installed.iter().map(CliRuntimeSelectedSkill::from),
+            )
+            .unwrap();
+            assert_eq!(restored, initial);
+            assert_eq!(
+                restored
+                    .iter()
+                    .map(|skill| skill.install_name.as_str())
+                    .collect::<Vec<_>>(),
+                ["pioneer-system-subagents", "pioneer-system-tasks"]
+            );
+            if kind == pioneer_protocol::CLIAgentRuntimeKind::Claude {
+                assert_claude_skill_projection_reuses_process(initial, restored);
             }
             for name in ["tasks", "subagents"] {
                 let foreign = home.join("skills").join(name);
@@ -1224,6 +1245,108 @@ mod tests {
                 assert_eq!(fs::read(foreign.join("sentinel")).unwrap(), b"do not touch");
             }
         }
+    }
+
+    fn assert_claude_skill_projection_reuses_process(
+        initial: Vec<CliRuntimeSelectedSkill>,
+        restored: Vec<CliRuntimeSelectedSkill>,
+    ) {
+        use crate::cli_runtime::continuation::{
+            CliMcpSessionLaunch, CliSessionLaunchSpec, requires_restart,
+        };
+        use crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions;
+        let provider_session_id = uuid::Uuid::new_v4();
+        let initial = CliSessionLaunchSpec::claude_new(
+            CLIAgentRuntimeSessionStartOptions {
+                selected_skills: initial,
+                ..Default::default()
+            },
+            CliMcpSessionLaunch::Disabled,
+            provider_session_id,
+        );
+        let resumed = CliSessionLaunchSpec::claude_resume(
+            CLIAgentRuntimeSessionStartOptions {
+                selected_skills: restored,
+                ..Default::default()
+            },
+            CliMcpSessionLaunch::Disabled,
+            provider_session_id,
+        );
+        assert!(!requires_restart(&initial, &resumed));
+    }
+
+    #[tokio::test]
+    async fn claude_explicit_and_automatic_skill_projection_restores_exactly() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime_instance(
+            pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude,
+            temp.path().join("native").display().to_string(),
+            None,
+        );
+        let mut user = resolved_skill("z-user", SkillSourceKind::User);
+        user.definition.identity.skill_dir = install_plan(temp.path(), "z-user")
+            .source
+            .display()
+            .to_string();
+        let mut resolved = vec![user];
+        resolved.extend(canonical_orchestration_skills());
+        let receipt_path = temp.path().join("state/receipt.json");
+        let plans = build_cli_runtime_skill_install_plans(
+            &runtime,
+            pioneer_protocol::CLIAgentRuntimeKind::Claude,
+            &resolved,
+            &receipt_path,
+        )
+        .unwrap();
+        let candidates = plans.iter().map(receipt_candidate).collect::<Vec<_>>();
+        let locks = new_cli_runtime_skill_destination_locks();
+        let receipt_lock = Arc::new(Mutex::new(()));
+        let mut installed = Vec::new();
+        for plan in &plans {
+            installed.push(
+                install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, plan)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let initial = normalize_cli_runtime_selected_skills(
+            installed.iter().map(CliRuntimeSelectedSkill::from),
+        )
+        .unwrap();
+        let restored = restore_cli_runtime_selected_skills(
+            &runtime,
+            pioneer_protocol::CLIAgentRuntimeKind::Claude,
+            &cli_runtime_turn_skill_bindings(&resolved),
+            &receipt_path,
+        )
+        .unwrap();
+        assert_eq!(initial, restored);
+        assert_eq!(
+            initial
+                .iter()
+                .map(|skill| skill.install_name.as_str())
+                .collect::<Vec<_>>(),
+            ["pioneer-system-subagents", "pioneer-system-tasks", "z-user"]
+        );
+        // The separate application-order list is not reordered for instructions.
+        assert_eq!(
+            installed
+                .iter()
+                .map(|skill| skill.install_name.as_str())
+                .collect::<Vec<_>>(),
+            ["z-user", "pioneer-system-tasks", "pioneer-system-subagents"]
+        );
+        assert_claude_skill_projection_reuses_process(initial, restored);
+    }
+
+    #[test]
+    fn selected_skill_projection_rejects_duplicate_export_names() {
+        let first = CliRuntimeSelectedSkill::from(&installed_skill("same", "/native/first"));
+        let mut second = first.clone();
+        second.installed_path = PathBuf::from("/native/second");
+        second.source_folder_hash = "other-content".to_owned();
+        let error = normalize_cli_runtime_selected_skills([first, second]).unwrap_err();
+        assert!(error.to_string().contains("installation names collide"));
     }
 
     #[tokio::test]

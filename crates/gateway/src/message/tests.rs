@@ -730,6 +730,7 @@ struct RecordingCliRuntimeSession {
     fail_next_goal_reset: TokioMutex<bool>,
     goal_clears: TokioMutex<Vec<String>>,
     closes: AtomicUsize,
+    factory_starts: AtomicUsize,
     event_log: TokioMutex<Option<Arc<TokioMutex<Vec<String>>>>>,
 }
 
@@ -1219,6 +1220,7 @@ impl CLIAgentRuntimeSessionFactory for StaticCliRuntimeSessionFactory {
         instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
         launch_spec: &CliSessionLaunchSpec,
     ) -> anyhow::Result<Arc<dyn CLIAgentRuntimeSession>> {
+        self.session.factory_starts.fetch_add(1, Ordering::SeqCst);
         if let crate::cli_runtime::continuation::CliProviderContinuation::ClaudeFork {
             source_session_id,
             boundary_message_uuid,

@@ -180,6 +180,10 @@ fn cli_automatic_orchestration_skills_coexist_with_selected_user_names() {
                 let starts = harness.cli_session.turn_starts.lock().await;
                 let start = &starts[0];
                 let instructions = start.elevated_instructions.text();
+                if kind == CLIAgentRuntimeKind::Claude {
+                    assert!(instructions.contains(&format!("Selected skills:\n- {user_name}\n- pioneer-system-tasks\n- pioneer-system-subagents")),
+                        "application order must retain the user's selected skill before automatic tasks/subagents");
+                }
                 for name in [
                     "pioneer-system-tasks",
                     "pioneer-system-subagents",
@@ -439,6 +443,7 @@ fn cli_parent_native_completion_continues_with_existing_attached_work() {
                 .as_str()
                 .unwrap()
                 .to_owned();
+            wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 2).await;
             let binding = processor
                 .crud_store
                 .get_cli_runtime_turn_binding(&turn_id)
@@ -452,6 +457,8 @@ fn cli_parent_native_completion_continues_with_existing_attached_work() {
             )
             .unwrap();
             let handle = harness.cli_manager.existing_session(&key).await.unwrap();
+            let factory_starts_before = harness.cli_session.factory_starts.load(Ordering::SeqCst);
+
             *harness.cli_session.next_native_turn_id.lock().await =
                 Some(format!("continued_parent_{kind:?}"));
             let terminal = RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
@@ -465,6 +472,20 @@ fn cli_parent_native_completion_continues_with_existing_attached_work() {
                 .await;
             wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 3).await;
             wait_for_task_cli_activation(&processor, &turn_id).await;
+            if kind == CLIAgentRuntimeKind::Claude {
+                let continued = harness.cli_manager.existing_session(&key).await.unwrap();
+                assert_eq!(
+                    continued.instance(),
+                    handle.instance(),
+                    "skill restoration must preserve the parent process generation"
+                );
+                assert_eq!(
+                    harness.cli_session.factory_starts.load(Ordering::SeqCst),
+                    factory_starts_before,
+                    "parent continuation must not invoke the factory again for identical skills"
+                );
+            }
+
             assert_eq!(
                 processor
                     .crud_store

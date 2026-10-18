@@ -6547,10 +6547,21 @@ impl MessageProcessor {
                 authorization_scope_fingerprint: Some(authorization_scope_fingerprint),
                 env: proxy_env,
                 selected_skills: if matches!(runtime_kind, CLIAgentRuntimeKind::Claude) {
-                    installed_skills
-                        .iter()
-                        .map(crate::cli_runtime::skills::CliRuntimeSelectedSkill::from)
-                        .collect()
+                    match crate::cli_runtime::skills::normalize_cli_runtime_selected_skills(
+                        installed_skills.iter().map(crate::cli_runtime::skills::CliRuntimeSelectedSkill::from),
+                    ) {
+                        Ok(selected) => selected,
+                        Err(error) => {
+                            let message = format!("failed to build CLI runtime skill projection: {error:#}");
+                            self.mark_turn_blocked(
+                                outcome.started_notification.thread_id.clone(),
+                                outcome.started_notification.turn.id.clone(),
+                                message.clone(),
+                            ).await;
+                            send_turn_start_failure!(message);
+                            return;
+                        }
+                    }
                 } else {
                     Vec::new()
                 },
