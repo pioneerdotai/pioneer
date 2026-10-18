@@ -1007,22 +1007,6 @@ mod tests {
                     .unwrap(),
                 )
                 .unwrap();
-                crate::test_support::install_thread_timeline(&client, "a", "original message");
-                client.apply_thread_timeline_page(
-                serde_json::from_value(json!({
-                    "workspaceId": "workspace", "threadId": "a", "projectionVersion": 2,
-                    "blocks": [{"workspaceId": "workspace", "threadId": "a", "blockId": "message",
-                        "turnId": "turn", "sortKey": "1", "kind": {
-                            "kind": "user_message", "itemId": "item", "text": "original message",
-                            "mode": "Message", "revision": 1,
-                            "author": {"actor": {"kind": "principal", "id": "P00000000000000000001"},
-                                "display_name": "Alice", "nickname": "alice"}
-                        }}],
-                    "page": {"hasMoreBefore": false, "hasMoreAfter": false}
-                }))
-                .unwrap(),
-                TopLevelPageMergeMode::Reset,
-            );
                 let mut capabilities = workspace_capabilities("workspace");
                 capabilities.thread = Some(serde_json::from_value(json!({
                 "workspace_id": "workspace", "thread_id": "a", "capabilities": {
@@ -1047,6 +1031,24 @@ mod tests {
                     ),
                     pioneer_client::authorization::AuthorizationProjectionAcceptance::Accepted
                 );
+                // The first authorization revision fences protected thread data.
+                // Load this fixture's thread and timeline in the accepted epoch.
+                crate::test_support::install_thread_timeline(&client, "a", "original message");
+                client.apply_thread_timeline_page(
+                serde_json::from_value(json!({
+                    "workspaceId": "workspace", "threadId": "a", "projectionVersion": 2,
+                    "blocks": [{"workspaceId": "workspace", "threadId": "a", "blockId": "message",
+                        "turnId": "turn", "sortKey": "1", "kind": {
+                            "kind": "user_message", "itemId": "item", "text": "original message",
+                            "mode": "Message", "revision": 1,
+                            "author": {"actor": {"kind": "principal", "id": "P00000000000000000001"},
+                                "display_name": "Alice", "nickname": "alice"}
+                        }}],
+                    "page": {"hasMoreBefore": false, "hasMoreAfter": false}
+                }))
+                .unwrap(),
+                TopLevelPageMergeMode::Reset,
+            );
                 authority.accept_thread_capabilities_for_test(&client, capabilities);
                 client.composer_intent(ComposerIntent::Open {
                     thread_id: "a".into(),
@@ -1056,6 +1058,14 @@ mod tests {
                         ..Default::default()
                     },
                 });
+                assert_eq!(
+                    client
+                        .composer_snapshot("a")
+                        .unwrap()
+                        .authorization_fingerprint(),
+                    Some("synthetic-policy"),
+                    "fixture thread must be loaded after the authorization fence"
+                );
                 publish_connection(&client, GatewayConnectionState::Connected);
                 let (registrar, deliver) = crate::test_support::binding_router(client.clone());
                 let screen_binding = ThreadBindings::new(registrar.clone(), "a", vec![]);
@@ -1615,13 +1625,31 @@ mod tests {
             );
             fixture.synchronize();
             let draft = fixture.client.composer_snapshot("a").unwrap();
-            fixture.client.composer_intent(ComposerIntent::Domain {
-                thread_id: "a".into(),
-                draft_id: draft.draft_id(),
-                action: ComposerDomainAction::SetModeFromUser {
+            // Message has no execution selection; configure the Agent fixture
+            // explicitly instead of relying on history in a semantic-only page.
+            for action in [
+                ComposerDomainAction::SetModeFromUser {
                     mode: ThreadMode::Agent,
                 },
-            });
+                ComposerDomainAction::SetModelSelectionFromUser {
+                    provider: Some("synthetic-provider".into()),
+                    model: Some("synthetic-model".into()),
+                    capability_target: None,
+                },
+            ] {
+                fixture.client.composer_intent(ComposerIntent::Domain {
+                    thread_id: "a".into(),
+                    draft_id: draft.draft_id(),
+                    action,
+                });
+            }
+            assert!(
+                fixture
+                    .client
+                    .composer_snapshot("a")
+                    .unwrap()
+                    .has_complete_model_selection()
+            );
             fixture.composer.read_with(fixture.cx, |view, _| {
                 assert_eq!(
                     view.startup_outcome(),
