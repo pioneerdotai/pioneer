@@ -164,13 +164,9 @@ impl ComposerView {
         .capabilities
     }
     pub(super) fn has_complete_composer_model_selection(&self) -> bool {
-        pioneer_client::composer::model_selection::has_complete_composer_model_selection(
-            self.composer_domain().selected_provider.as_deref(),
-            self.composer_domain().selected_model.as_deref(),
-        ) && self
-            .composer_input
+        self.composer_input
             .as_ref()
-            .is_some_and(|input| input.selected_provider_ready())
+            .is_some_and(|input| input.has_complete_model_selection())
     }
     pub(super) fn composer_upload_in_progress(&self) -> bool {
         use pioneer_client::composer::store::ComposerOperationStatus;
@@ -254,7 +250,7 @@ impl ComposerView {
             .unwrap_or(ProviderModelDisplayState::Missing)
     }
 
-    fn composer_model_selection_pending(&self) -> bool {
+    pub(super) fn composer_model_selection_pending(&self) -> bool {
         !self.composer_domain().model_manually_selected
             && (self.connection_state.is_transitioning()
                 || thread_creation_pending(

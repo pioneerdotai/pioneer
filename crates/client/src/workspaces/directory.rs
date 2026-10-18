@@ -1805,3 +1805,25 @@ fn directory_action_node(key: &str) -> Option<SidebarNodeId> {
                 .map(|id| SidebarNodeId::Folder(id.to_owned()))
         })
 }
+
+#[cfg(feature = "test-support")]
+impl ClientMutationAuthority {
+    /// Publish a controlled read state through the existing directory projection.
+    pub fn publish_workspace_tree_for_test(
+        &self,
+        core: &ClientCore,
+        workspace: &str,
+        loading: bool,
+        error: Option<String>,
+    ) {
+        let mut registry = core.thread_registry.lock().unwrap();
+        let draft = registry.navigation.draft(workspace).map(str::to_owned);
+        if let Some(publication) =
+            registry
+                .directory
+                .project(workspace, draft.as_deref(), loading, error)
+        {
+            core.publish_workspace_tree(publication);
+        }
+    }
+}
