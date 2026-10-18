@@ -1,5 +1,6 @@
 mod m20261015_000001_html_preview_retention;
 mod m20261018_000001_frozen_sweep_work;
+mod m20261018_000001_html_preview_work_selection;
 pub use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
@@ -194,6 +195,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261015_000002_terminal_task_input_roots::Migration),
             Box::new(m20261016_000001_task_completion_inbox::Migration),
             Box::new(m20261015_000001_html_preview_retention::Migration),
+            Box::new(m20261018_000001_html_preview_work_selection::Migration),
             Box::new(m20261018_000001_frozen_sweep_work::Migration),
         ]
     }

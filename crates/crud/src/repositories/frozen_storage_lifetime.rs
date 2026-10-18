@@ -487,6 +487,7 @@ fn pre_runner_failure(header: &history::Model) -> SimpleExpr {
 }
 struct ExpiryPreparation {
     header: history::Model,
+    roots_checked: bool,
     operations_after: String,
     operations_done: bool,
     checkpoint_after: String,
@@ -499,6 +500,7 @@ impl ExpiryPreparation {
     fn new(header: history::Model) -> Self {
         Self {
             header,
+            roots_checked: false,
             operations_after: String::new(),
             operations_done: false,
             checkpoint_after: String::new(),
@@ -509,6 +511,28 @@ impl ExpiryPreparation {
         }
     }
     async fn step(&mut self, store: &CrudStore, accounting: &mut SweepAccounting) -> Result<bool> {
+        if !self.roots_checked {
+            // Advisory positive hold only, once per attempt. Release the reader
+            // before any preparation; a negative result leaves every final
+            // writer guard in place. Ordinary passes revisit released roots.
+            let held = store.connection.query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                r#"SELECT 1 WHERE
+EXISTS(SELECT 1 FROM task_run_conversation_snapshot s LEFT JOIN task t ON t.id=s.task_id WHERE s.frozen_manifest_id=?1 AND (t.id IS NULL OR t.status NOT IN ('completed','failed','cancelled')))
+OR EXISTS(SELECT 1 FROM turn_runtime_snapshot s WHERE s.frozen_manifest_id=?1)
+OR EXISTS(SELECT 1 FROM thread_cli_runtime_binding s WHERE s.frozen_manifest_id=?1)
+OR EXISTS(SELECT 1 FROM turn_cli_runtime_binding s WHERE s.frozen_manifest_id=?1)
+OR EXISTS(SELECT 1 FROM compaction_task_output s WHERE s.manifest_id=?1)
+LIMIT 1"#,
+                [self.header.id.clone().into()],
+            )).await?.is_some();
+            self.roots_checked = true;
+            if held {
+                accounting.held += 1;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
         if self.layout_kind < 2 {
             if let Some(layout) = self.layout.as_mut() {
                 layout.step(store).await?;
@@ -2455,22 +2479,7 @@ struct ScopeDiscovery {
     done: bool,
 }
 impl ScopeDiscovery {
-    async fn step(&mut self, store: &CrudStore) -> Result<bool> {
-        if self.done {
-            return Ok(false);
-        }
-        // Physical families retain the original global startup prerequisite.
-        // Bootstrap persists the checked oracle outcome with each cursor/work
-        // commit; completed families do not inventory again on restart.
-        if matches!(self.family, 2 | 3) {
-            if frozen_sweep_work::bootstrap_step(store).await? {
-                return Ok(true);
-            }
-            self.family = 4;
-            self.after.clear();
-            self.kind = -1;
-            self.started = false;
-        }
+    fn next_query(&self) -> sea_orm::sea_query::SelectStatement {
         let (table, key) = match self.family {
             0 => ("compaction_frozen_history", "id"),
             1 => ("compaction_frozen_layout", "manifest_id"),
@@ -2489,9 +2498,8 @@ impl ScopeDiscovery {
         if self.started {
             let mut after = Expr::col(Alias::new(key)).gt(&self.after);
             if self.family == 1 {
-                after = after.or(Expr::col(Alias::new(key))
-                    .eq(&self.after)
-                    .and(Expr::col(Alias::new("kind")).gt(self.kind)));
+                after = Expr::tuple([Expr::col(Alias::new(key)), Expr::col(Alias::new("kind"))])
+                    .gt(Expr::tuple([Expr::val(&self.after), Expr::val(self.kind)]));
             }
             query.and_where(after);
         }
@@ -2500,6 +2508,26 @@ impl ScopeDiscovery {
             query.order_by(Alias::new("kind"), Order::Asc);
         }
         query.limit(1);
+        query
+    }
+
+    async fn step(&mut self, store: &CrudStore) -> Result<bool> {
+        if self.done {
+            return Ok(false);
+        }
+        // Physical families retain the original global startup prerequisite.
+        // Bootstrap persists the checked oracle outcome with each cursor/work
+        // commit; completed families do not inventory again on restart.
+        if matches!(self.family, 2 | 3) {
+            if frozen_sweep_work::bootstrap_step(store).await? {
+                return Ok(true);
+            }
+            self.family = 4;
+            self.after.clear();
+            self.kind = -1;
+            self.started = false;
+        }
+        let query = self.next_query();
         let row = store.connection.query_one(&query).await?;
         let Some(row) = row else {
             self.family += 1;
@@ -2655,6 +2683,9 @@ pub(super) fn frozen_scope_query(id: &str) -> sea_orm::sea_query::SelectStatemen
 mod tests {
     use super::*;
     include!("frozen_sweep_tests.rs");
+    mod expiry_preflight {
+        include!("frozen_storage_lifetime_expiry_tests.rs");
+    }
     use migration::{Migrator, MigratorTrait};
     use pioneer_compaction::{
         Checkpoint, ModelSelection, SourceRef, Transport,
@@ -3017,11 +3048,12 @@ mod tests {
             // The >256 KiB healthy row belongs to lifetime sweep. It can still
             // delete it after duplicate cleanup, preserving both poison rows.
             let mut sweep = prepare_batch(&duplicate, kind, 5).await;
-            assert!(
+            assert_eq!(
                 sweep
                     .step(&duplicate, &mut progress.accounting)
                     .await
-                    .unwrap()
+                    .unwrap(),
+                SweepStep::Retry
             );
             assert_eq!(batch_ordinals(&duplicate, kind).await, vec![0, 5]);
             assert_eq!(progress.accounting.rows[kind as usize], 4);
@@ -3433,6 +3465,260 @@ mod tests {
             Some("")
         );
         assert!(store.frozen_readers.lock().unwrap().is_empty());
+    }
+
+    async fn scope_layout_fixture() -> CrudStore {
+        let (store, _) = fixture(true).await;
+        let store = store.with_maintenance_access();
+        // Deliberately insert out of order. Headers are incomplete and layouts
+        // have no candidate, matching the registration trigger prerequisites.
+        for id in ["layout-002", "layout-000", "layout-001"] {
+            let descriptor = FrozenHistoryRef {
+                format: 1,
+                manifest_id: id.into(),
+                messages: 0,
+                identity_sha256: hex::encode(Sha256::digest([])),
+            };
+            store
+                .compaction_begin_frozen_history("ws", "thread", &descriptor)
+                .await
+                .unwrap();
+            for kind in [1_i64, 0] {
+                store
+                    .connection
+                    .execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        "INSERT INTO compaction_frozen_layout(manifest_id,kind) VALUES(?1,?2)",
+                        [id.into(), kind.into()],
+                    ))
+                    .await
+                    .unwrap();
+            }
+        }
+        store
+    }
+
+    #[test]
+    fn startup_layout_tuple_sql_keeps_bindings_order_and_limit() {
+        use sea_orm::sea_query::{SqliteQueryBuilder, Values};
+        let mut scope = ScopeDiscovery {
+            family: 1,
+            started: true,
+            after: "cursor'?)".into(),
+            kind: 0,
+            ..Default::default()
+        };
+        let (sql, values) = scope.next_query().build(SqliteQueryBuilder);
+        assert!(sql.contains(r#"WHERE ("manifest_id", "kind") > (?, ?)"#));
+        assert!(sql.ends_with(r#"ORDER BY "manifest_id" ASC, "kind" ASC LIMIT ?"#));
+        assert!(!sql.contains(" OR ") && !sql.contains(&scope.after));
+        assert_eq!(
+            values,
+            Values(vec![scope.after.clone().into(), 0_i64.into(), 1_u64.into()])
+        );
+        scope.started = false;
+        let (sql, values) = scope.next_query().build(SqliteQueryBuilder);
+        assert!(!sql.contains("WHERE"));
+        assert!(sql.ends_with(r#"ORDER BY "manifest_id" ASC, "kind" ASC LIMIT ?"#));
+        assert_eq!(values, Values(vec![1_u64.into()]));
+    }
+
+    #[tokio::test]
+    async fn startup_layout_tuple_cursor_matches_ordered_inventory() {
+        let store = scope_layout_fixture().await;
+        let expected = ["layout-000", "layout-001", "layout-002"]
+            .into_iter()
+            .flat_map(|id| [0, 1].map(|kind| (id.to_owned(), kind)))
+            .collect::<Vec<_>>();
+        let inventory = layout::Entity::find()
+            .order_by_asc(layout::Column::ManifestId)
+            .order_by_asc(layout::Column::Kind)
+            .all(&store.connection)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.manifest_id, row.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(inventory, expected);
+        for (started, after, kind) in [
+            (false, "zz-ignored", 99),
+            (true, "", -1),
+            (true, "layout-000", 0),
+            (true, "layout-001", 1),
+            (true, "layout-001-between", 0),
+            (true, "layout-002", 1),
+            (true, "zz-after-last", 0),
+        ] {
+            let mut scope = ScopeDiscovery {
+                family: 1,
+                started,
+                after: after.into(),
+                kind,
+                ..Default::default()
+            };
+            let mut actual = Vec::new();
+            // One acknowledged key per step, plus the family's EOF step.
+            for _ in 0..=expected.len() {
+                assert!(scope.step(&store).await.unwrap());
+                if scope.family != 1 {
+                    break;
+                }
+                assert!(scope.started && !scope.done);
+                actual.push((scope.after.clone(), scope.kind));
+            }
+            let remaining = expected
+                .iter()
+                .filter(|(id, k)| !started || (id.as_str(), *k) > (after, kind))
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(actual, remaining, "cursor {started}/{after}/{kind}");
+            assert_eq!(scope.family, 2);
+            assert!(!scope.started && !scope.done && scope.after.is_empty());
+            assert_eq!(scope.kind, -1);
+            // Reset must include the earlier physical group through checked
+            // durable bootstrap, independent of the layout tuple cursor. A new
+            // ScopeDiscovery can reuse completion from a preceding iteration.
+            for _ in 0..16 {
+                assert!(scope.step(&store).await.unwrap());
+                if scope.family >= 4 {
+                    break;
+                }
+            }
+            assert!(scope.family >= 4);
+            let checked = store
+                .connection
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "SELECT count(*) AS n FROM frozen_sweep_bootstrap WHERE complete=1",
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(checked.try_get::<i64>("", "n").unwrap(), 2);
+            let message_upper = store
+                .connection
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "SELECT upper_manifest FROM frozen_sweep_bootstrap WHERE kind=0",
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                message_upper
+                    .try_get::<String>("", "upper_manifest")
+                    .unwrap(),
+                "origin"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_layout_empty_inventory_advances_family_for_both_start_states() {
+        let (store, _) = fixture(true).await;
+        let store = store.with_maintenance_access();
+        assert_eq!(
+            layout::Entity::find()
+                .all(&store.connection)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        for started in [false, true] {
+            let mut scope = ScopeDiscovery {
+                family: 1,
+                started,
+                after: "unused".into(),
+                kind: 1,
+                ..Default::default()
+            };
+            assert!(scope.step(&store).await.unwrap());
+            assert_eq!(scope.family, 2);
+            assert!(!scope.started && !scope.done && scope.after.is_empty());
+            assert_eq!(scope.kind, -1);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_layout_scope_error_retries_same_kind_until_repair() {
+        let store = scope_layout_fixture().await;
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        progress.scope = ScopeDiscovery {
+            family: 1,
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            assert!(!progress.conversion_scope(&store).await.unwrap());
+        }
+        assert_eq!(
+            (&*progress.scope.after, progress.scope.kind),
+            ("layout-001", 0)
+        );
+        // FK OFF models legacy corruption without bypassing installed triggers.
+        // This newly begun header has no sealed checkpoint or published layout.
+        store
+            .connection
+            .execute_unprepared("DELETE FROM compaction_frozen_history WHERE id='layout-001'")
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let error = progress.conversion_scope(&store).await.unwrap_err();
+            assert!(error.to_string().contains("scope unknown"));
+            assert_eq!(progress.scope.family, 1);
+            assert_eq!(
+                (&*progress.scope.after, progress.scope.kind),
+                ("layout-001", 0)
+            );
+            assert!(progress.scope.started && !progress.scope.done);
+            assert!(progress.conversion.is_none());
+        }
+        // A fresh worker also fails closed on the orphan rather than seeing EOF.
+        let mut restart = ScopeDiscovery::default();
+        let mut refused = false;
+        for _ in 0..32 {
+            match restart.step(&store).await {
+                Ok(_) => assert!(!restart.done),
+                Err(error) => {
+                    assert!(error.to_string().contains("scope unknown"));
+                    refused = true;
+                    break;
+                }
+            }
+        }
+        assert!(refused);
+        assert_eq!(restart.family, 1);
+        assert_eq!((&*restart.after, restart.kind), ("layout-000", 1));
+        assert!(!restart.done);
+        let repair = FrozenHistoryRef {
+            format: 1,
+            manifest_id: "layout-001".into(),
+            messages: 0,
+            identity_sha256: hex::encode(Sha256::digest([])),
+        };
+        store
+            .compaction_begin_frozen_history("ws", "thread", &repair)
+            .await
+            .unwrap();
+        assert!(!progress.conversion_scope(&store).await.unwrap());
+        assert_eq!(
+            (&*progress.scope.after, progress.scope.kind),
+            ("layout-001", 1)
+        );
+        assert!(!progress.scope.done);
+        assert!(restart.step(&store).await.unwrap());
+        assert_eq!((&*restart.after, restart.kind), ("layout-001", 0));
+        for _ in 0..32 {
+            if progress.scope.done {
+                break;
+            }
+            assert!(!progress.conversion_scope(&store).await.unwrap());
+        }
+        assert!(progress.scope.done);
+        assert!(progress.conversion_scope(&store).await.unwrap());
+        assert!(progress.conversion.is_none());
+        assert_eq!(progress.scope.family, 6);
+        assert!(!progress.scope.step(&store).await.unwrap());
     }
 
     #[tokio::test]
@@ -4561,6 +4847,7 @@ mod tests {
         assert!(error.downcast_ref::<sea_orm::DbErr>().is_some());
         let retry = progress.expiry.as_ref().unwrap();
         assert_eq!(retry.header.id, "origin");
+        assert!(!retry.roots_checked);
         assert_eq!(retry.layout_kind, 0);
         assert!(!retry.operations_done && !retry.checkpoints_done && retry.reverse.is_none());
         assert_eq!(progress.accounting.expired, 0);
