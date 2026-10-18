@@ -78,6 +78,112 @@ pub struct TimelineReadRequest {
     pub generation: u64,
 }
 
+fn task_inbox_view_is_renewed(previous: Option<&TimelineDemand>, next: &TimelineDemand) -> bool {
+    previous.is_none_or(|previous| {
+        previous.generation != next.generation
+            || previous.viewed_row_ids.iter().collect::<HashSet<_>>()
+                != next.viewed_row_ids.iter().collect::<HashSet<_>>()
+    })
+}
+
+fn viewed_task_inbox_params(
+    workspace: &str,
+    demand: &TimelineDemand,
+    rows: &semantic::SemanticTimelineRows,
+    ids: &HashMap<String, semantic::SemanticTimelineRowId>,
+) -> Option<pioneer_protocol::TaskCompletionInboxViewedParams> {
+    use pioneer_protocol::{TimelineBlockKind as B, TurnItem, TurnWorkItemStatus as Status};
+    use semantic::SemanticTimelineRowKind as K;
+    let viewed = demand
+        .viewed_row_ids
+        .iter()
+        .filter_map(|id| ids.get(id))
+        .collect::<HashSet<_>>();
+    let mut runs = std::collections::BTreeSet::new();
+    let mut turns = std::collections::BTreeSet::new();
+    let mut result_items = std::collections::BTreeSet::new();
+    for row in rows.rows.iter().filter(|row| viewed.contains(&row.id)) {
+        let task = match &row.kind {
+            K::DetachedTaskRun { block } => match &block.kind {
+                B::DetachedTaskRun { task, .. } => Some(task),
+                _ => None,
+            },
+            K::WorkItem { item } => match &item.item {
+                TurnItem::Task { item } => Some(item),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(task) = task.filter(|task| task.status.is_terminal()) {
+            if let Some(run) = &task.run_id {
+                runs.insert(run.clone());
+            }
+        }
+        match &row.kind {
+            K::WorkItem { item } if item.status == Status::Completed => {
+                if let TurnItem::AgentMessage {
+                    id,
+                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                    ..
+                } = &item.item
+                {
+                    result_items.insert((item.turn_id.clone(), id.clone()));
+                }
+            }
+            K::AssistantMessage { block } => {
+                if let B::AssistantMessage {
+                    item_id,
+                    status: Status::Completed,
+                    ..
+                } = &block.kind
+                {
+                    if let Some(turn) = &block.turn_id {
+                        result_items.insert((turn.clone(), item_id.clone()));
+                    }
+                }
+            }
+            K::TurnState { block }
+                if matches!(
+                    &block.kind,
+                    B::TurnState {
+                        state: pioneer_protocol::TurnWorkState::Completed
+                            | pioneer_protocol::TurnWorkState::Blocked
+                            | pioneer_protocol::TurnWorkState::Failed
+                            | pioneer_protocol::TurnWorkState::Interrupted,
+                        ..
+                    }
+                ) =>
+            {
+                if let Some(turn) = &block.turn_id {
+                    turns.insert(turn.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    if runs.is_empty() && turns.is_empty() && result_items.is_empty() {
+        return None;
+    }
+    let run_ids = runs.into_iter().collect::<Vec<_>>();
+    let result_items = result_items
+        .into_iter()
+        .map(
+            |(turn_id, item_id)| pioneer_protocol::TaskCompletionInboxViewedResult {
+                turn_id,
+                item_id,
+            },
+        )
+        .collect::<Vec<_>>();
+    let result_turn_ids = turns.into_iter().collect();
+    Some(pioneer_protocol::TaskCompletionInboxViewedParams {
+        workspace_id: workspace.into(),
+        thread_id: demand.thread_id.clone(),
+        run_ids,
+        result_turn_ids,
+        result_items,
+    })
+}
+
 impl TimelineDemand {
     fn read_key(&self) -> Option<String> {
         self.viewed_through_block
@@ -111,6 +217,7 @@ pub struct TimelineEffectPlan {
     pub pages: Vec<TimelinePageRequest>,
     pub reads: Vec<TimelineReadRequest>,
     pub cancelled: Vec<PageKey>,
+    pub inbox_viewed: Option<pioneer_protocol::TaskCompletionInboxViewedParams>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -770,6 +877,116 @@ mod tests {
     }
 
     #[test]
+    fn inbox_error_renewal_requires_real_visibility_or_consumer_generation_change() {
+        let mut previous = demand("desktop-or-mobile");
+        previous.viewed_row_ids = vec!["answer".into(), "status".into()];
+        let mut next = previous.clone();
+        next.source_revision += 1;
+        next.viewed_row_ids.reverse();
+        assert!(
+            !task_inbox_view_is_renewed(Some(&previous), &next),
+            "streaming/reorder is not a fresh view"
+        );
+        next.viewed_row_ids = vec!["other".into()];
+        assert!(task_inbox_view_is_renewed(Some(&previous), &next));
+        next.viewed_row_ids = previous.viewed_row_ids.clone();
+        next.generation += 1;
+        assert!(task_inbox_view_is_renewed(Some(&previous), &next));
+        assert!(task_inbox_view_is_renewed(None, &previous));
+    }
+
+    #[test]
+    fn visible_task_evidence_uses_only_viewed_semantic_rows_and_exact_terminal_run() {
+        use super::semantic::{
+            SemanticTimelineRow, SemanticTimelineRowId as Id, SemanticTimelineRowKind as K,
+            SemanticTimelineRows,
+        };
+        let mut input = demand("desktop-or-mobile");
+        let mut task: pioneer_protocol::TaskTurnItem = serde_json::from_value(serde_json::json!({
+            "id":"task-row", "taskId":"task", "runId":"old-run", "title":"Same title",
+            "status":"completed", "attachment":"detached", "triggerKind":"immediate", "executorKind":"tool",
+            "depth":0, "maxDepth":1, "createdAt":1, "updatedAt":2
+        })).unwrap();
+        let block = |task| pioneer_protocol::TimelineBlock {
+            workspace_id: "workspace".into(),
+            thread_id: "a".into(),
+            block_id: "block".into(),
+            turn_id: Some("parent-turn".into()),
+            sort_key: "key".into(),
+            started_at_unix_ms: None,
+            updated_at_unix_ms: None,
+            kind: pioneer_protocol::TimelineBlockKind::DetachedTaskRun { task, author: None },
+        };
+        let id = Id::TopLevelBlock {
+            block_id: "block".into(),
+        };
+        let mut rows = SemanticTimelineRows {
+            thread_id: "a".into(),
+            rows: vec![SemanticTimelineRow {
+                id: id.clone(),
+                author: None,
+                kind: K::DetachedTaskRun {
+                    block: block(task.clone()),
+                },
+            }],
+            request_hints: vec![],
+        };
+        let ids = HashMap::from([("row".into(), id)]);
+        // Opening, prefetch and loading a row into the store provide no evidence.
+        assert!(viewed_task_inbox_params("workspace", &input, &rows, &ids).is_none());
+        input.viewed_row_ids = vec!["row".into(), "unknown".into()];
+        let proof = viewed_task_inbox_params("workspace", &input, &rows, &ids).unwrap();
+        assert_eq!(proof.run_ids, ["old-run"]);
+        assert!(
+            proof.result_turn_ids.is_empty(),
+            "never use the containing turn as a run"
+        );
+        task.run_id = Some("repeat-run".into());
+        rows.rows[0].kind = K::DetachedTaskRun {
+            block: block(task.clone()),
+        };
+        assert_eq!(
+            viewed_task_inbox_params("workspace", &input, &rows, &ids)
+                .unwrap()
+                .run_ids,
+            ["repeat-run"]
+        );
+        task.status = pioneer_protocol::TaskStatus::Running;
+        rows.rows[0].kind = K::DetachedTaskRun { block: block(task) };
+        assert!(viewed_task_inbox_params("workspace", &input, &rows, &ids).is_none());
+        let K::DetachedTaskRun { block } = &rows.rows[0].kind else {
+            unreachable!()
+        };
+        let mut answer = block.clone();
+        answer.turn_id = Some("exact-result-turn".into());
+        answer.kind = pioneer_protocol::TimelineBlockKind::AssistantMessage {
+            html_publications: vec![],
+            item_id: "answer".into(),
+            text: "Result".into(),
+            status: pioneer_protocol::TurnWorkItemStatus::Completed,
+            markdown: None,
+            author: None,
+            route: None,
+        };
+        rows.rows[0].kind = K::AssistantMessage { block: answer };
+        let proof = viewed_task_inbox_params("workspace", &input, &rows, &ids).unwrap();
+        assert!(proof.run_ids.is_empty());
+        assert!(proof.result_turn_ids.is_empty());
+        assert_eq!(
+            proof.result_items,
+            [pioneer_protocol::TaskCompletionInboxViewedResult {
+                turn_id: "exact-result-turn".into(),
+                item_id: "answer".into()
+            }]
+        );
+        input.viewed_row_ids.clear();
+        assert!(
+            viewed_task_inbox_params("workspace", &input, &rows, &ids).is_none(),
+            "a stored final answer is not proof of viewing"
+        );
+    }
+
+    #[test]
     fn canonical_position_can_retry_after_a_speculative_live_position_failed() {
         let mut policy = ThreadTimelineController::default();
         let mut input = demand("mobile");
@@ -1123,6 +1340,13 @@ impl crate::core::ClientCore {
     pub fn timeline_intent(&self, intent: TimelineIntent) -> TimelineEffectPlan {
         let plan = self.plan_timeline_intent(intent, self.timeline_now_ms());
         self.publish_timeline_cancellation(&plan.cancelled);
+        if let Some(params) = &plan.inbox_viewed {
+            self.task_notification_intent(
+                crate::tasks::notifications::TaskNotificationIntent::Viewed {
+                    params: params.clone(),
+                },
+            );
+        }
         for page in &plan.pages {
             self.schedule_planned_timeline_request(page.clone());
         }
@@ -1224,6 +1448,10 @@ impl crate::core::ClientCore {
         if snapshot.timeline().source_revision() != demand.source_revision {
             return TimelineEffectPlan::default();
         }
+        let Some(source) = self.thread_snapshot(&demand.thread_id) else {
+            return TimelineEffectPlan::default();
+        };
+        let workspace = source.coordinator().workspace_id.clone();
         let actions = self.plan_thread_timeline_demand(
             &demand.thread_id,
             demand.source_revision,
@@ -1238,7 +1466,9 @@ impl crate::core::ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
-        if !registry.timeline_revision_matches(&demand.thread_id, demand.source_revision) {
+        if !registry.timeline_revision_matches(&demand.thread_id, demand.source_revision)
+            || !registry.timeline_workspace_matches(&demand.thread_id, &workspace)
+        {
             return TimelineEffectPlan::default();
         }
         demand.viewed_through_block = None;
@@ -1304,7 +1534,33 @@ impl crate::core::ClientCore {
                 .map(|row| row.id().as_str().to_owned())
                 .collect(),
         );
+        let current_demand = demand.clone();
+        let renewed_view = task_inbox_view_is_renewed(
+            registry
+                .timeline
+                .demands
+                .get(&(demand.thread_id.clone(), demand.consumer_id.clone())),
+            &demand,
+        );
+        let changed_demand = registry
+            .timeline
+            .demands
+            .get(&(demand.thread_id.clone(), demand.consumer_id.clone()))
+            != Some(&demand);
         let mut plan = registry.timeline.update(demand, actions, now_ms);
+        if changed_demand
+            && registry.timeline.demands.get(&(
+                current_demand.thread_id.clone(),
+                current_demand.consumer_id.clone(),
+            )) == Some(&current_demand)
+        {
+            plan.inbox_viewed = viewed_task_inbox_params(
+                &workspace,
+                &current_demand,
+                &semantic_rows,
+                &semantic_ids,
+            );
+        }
         if let Some(action) = retry_refresh {
             let key = semantic::semantic_timeline_request_key(&action).clone();
             registry.timeline.reset_page_retry(&key);
@@ -1316,7 +1572,51 @@ impl crate::core::ClientCore {
                 });
             }
         }
+        // Keep the registry -> notifications and navigation -> registry paths
+        // from owning the two stores in opposite orders.
+        drop(registry);
+        if renewed_view && let Some(params) = &plan.inbox_viewed {
+            self.renew_task_inbox_view(params);
+        }
         plan
+    }
+
+    pub(crate) fn refresh_viewed_task_inbox(&self, workspace: &str) {
+        let demands = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned")
+            .timeline
+            .demands
+            .values()
+            .filter(|demand| !demand.viewed_row_ids.is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        for demand in demands {
+            let Some(source) = self.thread_snapshot(&demand.thread_id) else {
+                continue;
+            };
+            if source.coordinator().workspace_id.as_str() != workspace {
+                continue;
+            }
+            let Some(snapshot) = self.thread_presentation_snapshot(&demand.thread_id) else {
+                continue;
+            };
+            let timeline = snapshot.timeline();
+            if timeline.source_revision() != demand.source_revision {
+                continue;
+            }
+            if let Some(params) = viewed_task_inbox_params(
+                workspace,
+                &demand,
+                &timeline.semantic_rows(),
+                &timeline.semantic_row_ids(),
+            ) {
+                self.task_notification_intent(
+                    crate::tasks::notifications::TaskNotificationIntent::Viewed { params },
+                );
+            }
+        }
     }
 
     pub(crate) fn next_timeline_request_delay(&self) -> Option<std::time::Duration> {

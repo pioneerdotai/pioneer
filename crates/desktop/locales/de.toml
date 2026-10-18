@@ -1696,9 +1696,10 @@ add_confirm = "Diesen Teilnehmer hinzufügen?"
 remove_confirm = "Diesen Teilnehmer entfernen?"
 
 [tasks.notifications]
+mark_all_read = "Alle als gelesen markieren"
 title = "Aufgabenergebnisse"
 loading = "Ergebnisse werden geladen…"
-empty = "Keine Aufgabenergebnisse"
+empty = "Keine ungelesenen Aufgabenergebnisse"
 task = "Aufgabe"
 mark_read = "Als gelesen markieren"
 completed = "Aufgabe abgeschlossen"
@@ -1708,7 +1709,7 @@ more = "Mehr laden"
 read = "Gelesen"
 unread = "Ungelesen"
 retry = "Erneut versuchen"
-loading_failed = "Aufgabenergebnisse konnten nicht geladen werden"
+loading_failed = "Aufgabenergebnisse konnten nicht aktualisiert werden"
 timed_out = "Zeitüberschreitung"
 
 [settings.self_improvement.status]

@@ -134,6 +134,7 @@ pub use super::task_event_fanout_cursor::Entity as TaskEventFanoutCursor;
 pub use super::task_event_fanout_pending::Entity as TaskEventFanoutPending;
 pub use super::task_event_fanout_sequence::Entity as TaskEventFanoutSequence;
 pub use super::task_execution_admission::Entity as TaskExecutionAdmission;
+pub use super::task_inbox_activation::Entity as TaskInboxActivation;
 pub use super::task_occurrence_contract::Entity as TaskOccurrenceContract;
 pub use super::task_occurrence_reconcile_pending::Entity as TaskOccurrenceReconcilePending;
 pub use super::task_occurrence_reconcile_scope::Entity as TaskOccurrenceReconcileScope;
@@ -142,6 +143,7 @@ pub use super::task_occurrence_reconcile_sequence::Entity as TaskOccurrenceRecon
 pub use super::task_result_candidate::Entity as TaskResultCandidate;
 pub use super::task_result_review_event::Entity as TaskResultReviewEvent;
 pub use super::task_run::Entity as TaskRun;
+pub use super::task_run_cancellation_actor::Entity as TaskRunCancellationActor;
 pub use super::task_run_conversation_snapshot::Entity as TaskRunConversationSnapshot;
 pub use super::task_run_execution::Entity as TaskRunExecution;
 pub use super::task_run_occurrence_reconcile_pending::Entity as TaskRunOccurrenceReconcilePending;

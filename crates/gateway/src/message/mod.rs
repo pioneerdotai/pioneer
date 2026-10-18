@@ -550,6 +550,13 @@ impl ThreadTitleJobState {
 }
 
 #[derive(Clone)]
+struct UserTurnCancellationIntent {
+    pending_requests: usize,
+    reason: String,
+    actor_id: Option<String>,
+}
+
+#[derive(Clone)]
 pub struct MessageProcessor {
     thread_manager: Arc<ThreadManager>,
     agent_manager: Arc<AgentManager>,
@@ -625,7 +632,7 @@ pub struct MessageProcessor {
     agent_action_bindings:
         Arc<Mutex<HashMap<String, agent_action_tools::AgentActionRuntimeBinding>>>,
     parent_timeline_targets: Arc<Mutex<HashMap<String, agent_runtime::ParentTimelineTarget>>>,
-    user_turn_cancel_intents: Arc<Mutex<HashMap<(String, String), String>>>,
+    user_turn_cancel_intents: Arc<Mutex<HashMap<(String, String), UserTurnCancellationIntent>>>,
     cli_runtime_pending_turn_events:
         Arc<Mutex<HashMap<CLIRuntimePendingTurnEventKey, Vec<CLIRuntimePendingTurnEvent>>>>,
     cli_runtime_pending_turn_server_requests:

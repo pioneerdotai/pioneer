@@ -10072,19 +10072,26 @@ impl MessageProcessor {
         }
 
         let cancel_intent_key = (thread_id.clone(), turn_id.clone());
-        self.user_turn_cancel_intents
+        let reason = self
+            .user_turn_cancel_intents
             .lock()
             .await
-            .insert(cancel_intent_key.clone(), reason.clone());
+            .entry(cancel_intent_key.clone())
+            .and_modify(|intent| intent.pending_requests += 1)
+            .or_insert_with(|| super::UserTurnCancellationIntent {
+                pending_requests: 1,
+                reason: reason.clone(),
+                actor_id: Some(request_context.principal().principal_id.to_string()),
+            })
+            .reason
+            .clone();
 
         if let Err(error) = self
             .cancel_root_agent_work_graph_for_turn(thread_id.as_str(), &turn, reason.as_str())
             .await
         {
-            self.user_turn_cancel_intents
-                .lock()
-                .await
-                .remove(&cancel_intent_key);
+            self.release_user_turn_cancel_intent(&cancel_intent_key)
+                .await;
             warn!(
                 thread_id,
                 turn_id,
@@ -10108,10 +10115,8 @@ impl MessageProcessor {
         let cli_transition = match self.cli_runtime_turn_resume_transition(&turn_id).await {
             Ok(transition) => transition.map(Arc::new),
             Err(error) => {
-                self.user_turn_cancel_intents
-                    .lock()
-                    .await
-                    .remove(&cancel_intent_key);
+                self.release_user_turn_cancel_intent(&cancel_intent_key)
+                    .await;
                 self.send_error(
                     connection_id,
                     public_turn_error(
@@ -10135,10 +10140,8 @@ impl MessageProcessor {
         {
             Ok(binding) => binding,
             Err(error) => {
-                self.user_turn_cancel_intents
-                    .lock()
-                    .await
-                    .remove(&cancel_intent_key);
+                self.release_user_turn_cancel_intent(&cancel_intent_key)
+                    .await;
                 self.send_error(
                     connection_id,
                     public_turn_error(
@@ -10165,10 +10168,8 @@ impl MessageProcessor {
                     .await
                     .filter(|(_, turn)| turn.status != TurnStatus::InProgress)
                 {
-                    self.user_turn_cancel_intents
-                        .lock()
-                        .await
-                        .remove(&cancel_intent_key);
+                    self.release_user_turn_cancel_intent(&cancel_intent_key)
+                        .await;
                     self.send_turn_cancel_response(
                         connection_id,
                         request_id,
@@ -10181,10 +10182,8 @@ impl MessageProcessor {
                     .await;
                     return;
                 }
-                self.user_turn_cancel_intents
-                    .lock()
-                    .await
-                    .remove(&cancel_intent_key);
+                self.release_user_turn_cancel_intent(&cancel_intent_key)
+                    .await;
                 self.send_error(
                     connection_id,
                     public_turn_error(
@@ -10204,10 +10203,8 @@ impl MessageProcessor {
                 cli_transition.as_ref(),
             )
             .await;
-            self.user_turn_cancel_intents
-                .lock()
-                .await
-                .remove(&cancel_intent_key);
+            self.release_user_turn_cancel_intent(&cancel_intent_key)
+                .await;
 
             let Some((workspace_id, turn)) = self
                 .thread_manager
@@ -10244,10 +10241,8 @@ impl MessageProcessor {
             .mark_turn_interrupted(thread_id.clone(), turn_id.clone(), reason.clone())
             .await;
         if !interrupted {
-            self.user_turn_cancel_intents
-                .lock()
-                .await
-                .remove(&cancel_intent_key);
+            self.release_user_turn_cancel_intent(&cancel_intent_key)
+                .await;
             // Cancellation races with fail-closed admission/runtime paths.
             // If that path already committed a terminal state, cancellation
             // has reached its intended durable outcome and is idempotently
@@ -10308,10 +10303,8 @@ impl MessageProcessor {
                 "durable cancellation committed but runtime signalling failed"
             ),
         }
-        self.user_turn_cancel_intents
-            .lock()
-            .await
-            .remove(&cancel_intent_key);
+        self.release_user_turn_cancel_intent(&cancel_intent_key)
+            .await;
 
         let Some((workspace_id, turn)) = self
             .thread_manager

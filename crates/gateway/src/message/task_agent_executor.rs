@@ -4798,7 +4798,9 @@ impl TaskAgentExecutor {
         }
         if !matches!(
             child_runtime.task_run_turn.status,
-            TaskRunTurnStatus::InProgress | TaskRunTurnStatus::CandidateCreated
+            TaskRunTurnStatus::InProgress
+                | TaskRunTurnStatus::CandidateCreated
+                | TaskRunTurnStatus::Cancelled
         ) {
             return Ok(true);
         }
@@ -6224,14 +6226,16 @@ impl TaskAgentExecutor {
             TaskErrorClass::Cancelled,
             Some(child_runtime.task_run_turn.run_id.clone()),
         );
-        record_task_run_turn_failure(
-            &handle,
-            &child_runtime.task_run_turn,
-            TaskRunTurnStatus::Cancelled,
-            Some(error),
-            cancelled_at,
-        )
-        .await?;
+        if child_runtime.task_run_turn.status != TaskRunTurnStatus::Cancelled {
+            record_task_run_turn_failure(
+                &handle,
+                &child_runtime.task_run_turn,
+                TaskRunTurnStatus::Cancelled,
+                Some(error),
+                cancelled_at,
+            )
+            .await?;
+        }
         handle
             .cancel_run(Some(reason.to_owned()), cancelled_at)
             .await?;

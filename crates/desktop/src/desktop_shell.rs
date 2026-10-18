@@ -399,7 +399,7 @@ impl DesktopShellView {
             )
             .history(
                 t!("tasks.notifications.open").to_string(),
-                t!("tasks.notifications.more").to_string(),
+                t!("tasks.notifications.mark_all_read").to_string(),
                 t!("tasks.notifications.read").to_string(),
                 t!("tasks.notifications.unread").to_string(),
                 t!("tasks.notifications.retry").to_string(),

@@ -172,6 +172,19 @@ fn keyboard_navigation_reaches_virtualized_history_without_reading_it(cx: &mut T
         let focus = view.read(cx).inbox_focus.clone();
         focus.focus(window, cx);
     });
+    let popup = cx.debug_bounds("task-inbox-popup").unwrap();
+    let viewport = cx.debug_bounds("task-inbox-viewport").unwrap();
+    let header = cx.debug_bounds("task-inbox-header").unwrap();
+    let footer = cx.debug_bounds("task-inbox-footer").unwrap();
+    assert_eq!(popup.left(), viewport.left());
+    assert_eq!(
+        popup.right(),
+        viewport.right(),
+        "scroll viewport reaches popup edge"
+    );
+    assert!(header.bottom() <= viewport.top());
+    assert!(viewport.bottom() <= footer.top());
+    assert!(cx.debug_bounds("task-inbox-read-all").is_some());
     for _ in 0..32 {
         cx.simulate_keystrokes("down");
         cx.run_until_parked();
@@ -189,7 +202,63 @@ fn keyboard_navigation_reaches_virtualized_history_without_reading_it(cx: &mut T
                 .all(|item| item.is_actionable())
         );
     });
+    assert_eq!(cx.debug_bounds("task-inbox-header").unwrap(), header);
+    assert_eq!(
+        cx.debug_bounds("task-inbox-footer").unwrap(),
+        footer,
+        "footer stays outside the scrolling list"
+    );
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
     view.read_with(cx, |view, _| assert!(!view.inbox_open));
+}
+
+#[test]
+fn lazy_demand_dedupes_cursor_blocks_errors_and_bounds_underfilled_pages() {
+    let mut gate = super::LazyInboxDemand::default();
+    assert!(gate.demand(10, 30, Some("a"), false, false).is_none());
+    assert_eq!(
+        gate.demand(28, 30, Some("a"), false, false).as_deref(),
+        Some("a")
+    );
+    assert!(gate.demand(30, 30, Some("a"), false, false).is_none());
+    assert!(gate.demand(59, 60, Some("b"), true, false).is_none());
+    assert!(gate.demand(59, 60, Some("b"), false, true).is_none());
+    // An explicit Retry resets this cursor; ordinary renders never do.
+    gate.retry();
+    assert!(gate.demand(59, 60, Some("b"), false, false).is_some());
+    assert!(gate.demand(60, 60, None, false, false).is_none());
+    let mut fill = super::LazyInboxDemand::default();
+    for ix in 1..=3 {
+        assert!(
+            fill.demand(ix, ix, Some(&ix.to_string()), false, false)
+                .is_some()
+        );
+    }
+    assert!(fill.demand(4, 4, Some("4"), false, false).is_none());
+    let mut workspace = super::LazyInboxDemand::default();
+    assert!(
+        workspace.demand(30, 30, Some("a"), false, false).is_some(),
+        "workspace/session reset permits its own cursor"
+    );
+}
+
+#[test]
+fn failed_lazy_cursor_keeps_retry_visible_across_unrelated_successful_refresh() {
+    let mut gate = super::LazyInboxDemand::default();
+    assert!(gate.demand(30, 30, Some("a"), false, false).is_some());
+    gate.observe(Some("a"), true);
+    assert!(gate.failed);
+    gate.observe(Some("a"), false);
+    assert!(
+        gate.failed,
+        "an unrelated refresh did not retry the failed page"
+    );
+    assert!(gate.demand(30, 30, Some("a"), false, false).is_none());
+    gate.retry();
+    assert!(!gate.failed);
+    assert!(gate.demand(30, 30, Some("a"), false, false).is_some());
+    gate.observe(Some("b"), false);
+    assert!(!gate.failed);
+    assert!(gate.demand(60, 60, Some("b"), false, false).is_some());
 }

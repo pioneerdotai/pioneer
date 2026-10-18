@@ -797,6 +797,20 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         Read,
     ),
     method_entry(
+        TASK_COMPLETION_INBOX_READ_ALL,
+        NotificationAcknowledgeOwn,
+        Workspace,
+        NotFound,
+        Mutation,
+    ),
+    method_entry(
+        TASK_COMPLETION_INBOX_VIEWED,
+        NotificationAcknowledgeOwn,
+        Workspace,
+        NotFound,
+        Mutation,
+    ),
+    method_entry(
         TASK_COMPLETION_INBOX_READ,
         NotificationAcknowledgeOwn,
         Workspace,

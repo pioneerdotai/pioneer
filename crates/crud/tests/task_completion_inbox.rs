@@ -52,6 +52,11 @@ async fn fixture(before: bool) -> (tempfile::TempDir, CrudStore, SqliteWriteExec
         .await
         .unwrap();
     let db = store.with_maintenance_access().database_connection();
+    if !before {
+        db.execute_unprepared("UPDATE task_inbox_activation SET started_at=1792108800 WHERE id=1")
+            .await
+            .unwrap();
+    }
     // ACL membership tables enforce 21-character alphanumeric IDs. Keep the
     // fixture relationships valid without relaxing the migrated schema.
     for sql in [
@@ -462,6 +467,11 @@ async fn migration_preserves_legacy_acknowledgement_only_for_its_exact_recipient
             [id.into(),workspace_id.into(),B.into(),task_id.into(),run_id.into()])).await.unwrap();
     }
     writer
+        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, Some(1))
+        .await
+        .unwrap();
+    db.execute_unprepared("UPDATE seaql_migrations SET applied_at=1792108800 WHERE version='m20261016_000001_task_completion_inbox'").await.unwrap();
+    writer
         .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
         .await
         .unwrap();
@@ -487,7 +497,7 @@ async fn migration_preserves_legacy_acknowledgement_only_for_its_exact_recipient
             .await
             .unwrap()
             .len(),
-        1
+        0
     );
     let legacy=db.query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT n.payload_json,d.status FROM user_notification_outbox n JOIN task_delivery d ON d.id=n.task_delivery_id WHERE n.id='legacy'")).await.unwrap().unwrap();
     assert_eq!(legacy.try_get::<String>("", "payload_json").unwrap(), "{}");
@@ -671,10 +681,13 @@ async fn same_run_updates_preserve_personal_read_and_list_projection_is_bounded(
     let rows = list_task_completion_inbox(&db, &access(A), None, 30)
         .await
         .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].run_id, "run");
-    assert!(rows[0].read_at.is_some());
-    assert_eq!(rows[0].summary.as_ref().unwrap().chars().count(), 1024);
+    assert!(rows.is_empty());
+    let row = find_task_completion_inbox_entry(&db, &access(A), "run")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.read_at.is_some());
+    assert_eq!(row.summary.as_ref().unwrap().chars().count(), 1024);
     assert_eq!(unread(&store, A).await, 0);
     let failure=serde_json::json!({"code":"provider-error","message":"m".repeat(4096),"class":"provider","details":{"secret":"not for the list"}}).to_string();
     db.execute_raw(Statement::from_sql_and_values(
@@ -842,9 +855,9 @@ async fn empty_and_small_workspaces_page_independently_of_large_foreign_history(
         page.iter()
             .map(|row| row.run_id.as_str())
             .collect::<Vec<_>>(),
-        ["local-4", "local-2", "local-1"]
+        ["local-4", "local-1", "local-0"]
     );
-    assert!(page[1].read_at.is_some());
+    assert!(page.iter().all(|row| row.read_at.is_none()));
     assert_eq!(
         count_unread_task_completion_inbox(&db, &access(A))
             .await
@@ -864,7 +877,7 @@ async fn empty_and_small_workspaces_page_independently_of_large_foreign_history(
         next.iter()
             .map(|row| row.run_id.as_str())
             .collect::<Vec<_>>(),
-        ["local-0"]
+        Vec::<&str>::new()
     );
 }
 
@@ -946,8 +959,10 @@ async fn read_entity_preserves_personal_keys_and_orphans_do_not_create_cards_wit
         let page = list_task_completion_inbox(&db, &access(principal), None, 30)
             .await
             .unwrap();
-        assert_eq!(page.len(), 1);
-        assert_eq!(page[0].run_id, "second");
+        assert_eq!(page.len() as u64, expected_unread);
+        if expected_unread > 0 {
+            assert_eq!(page[0].run_id, "second");
+        }
         assert_eq!(unread(&store, principal).await, expected_unread);
         assert!(
             find_task_completion_inbox_entry(&db, &access(principal), "first")
@@ -1019,4 +1034,893 @@ async fn read_requires_an_existing_authorized_terminal_run_with_fk_off() {
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0].principal_id, A);
     assert_eq!(receipts[0].run_id, "private-run");
+}
+
+#[tokio::test]
+async fn released_upgrade_uses_original_activation_and_survives_reopen_without_receipt_backfill() {
+    let (dir, store, writer) = fixture(true).await;
+    task(
+        &store,
+        "upgrade",
+        Some("T0000000000000000000P"),
+        None,
+        "tool",
+        "none",
+        "detached",
+    )
+    .await;
+    for (id, number) in [("old", 1), ("activation-second", 2), ("new", 3)] {
+        run(&store, id, "upgrade", "succeeded", number).await;
+    }
+    let db = store.database_connection();
+    db.execute_unprepared(
+        "UPDATE task_run SET completed_at='2026-10-16 09:59:59 +00:00' WHERE id='old'",
+    )
+    .await
+    .unwrap();
+    db.execute_unprepared(
+        "UPDATE task_run SET completed_at='2026-10-16 10:01:00 +00:00' WHERE id='new'",
+    )
+    .await
+    .unwrap();
+    writer
+        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, Some(1))
+        .await
+        .unwrap();
+    db.execute_unprepared("UPDATE seaql_migrations SET applied_at=1792144800 WHERE version='m20261016_000001_task_completion_inbox'").await.unwrap();
+    writer
+        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        unread(&store, A).await,
+        2,
+        "retain the entire activation second and later results"
+    );
+    let page = list_task_completion_inbox(&db, &access(A), None, 30)
+        .await
+        .unwrap();
+    assert!(page.iter().all(|row| row.run_id != "old"));
+    assert!(
+        find_task_completion_inbox_entry(&db, &access(A), "old")
+            .await
+            .unwrap()
+            .unwrap()
+            .read_at
+            .is_none(),
+        "activation is not a fabricated personal viewing date"
+    );
+    assert!(
+        pioneer_entity::task_run_read::Entity::find()
+            .all(&db)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let baseline = pioneer_entity::task_inbox_activation::Entity::find_by_id(1)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(baseline.started_at, 1792144800);
+    drop(db);
+    drop(store);
+    drop(writer);
+    let (reopened, writer) = open(&dir.path().join("inbox.sqlite")).await;
+    writer
+        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
+        .await
+        .unwrap();
+    assert_eq!(unread(&reopened, A).await, 2);
+    assert_eq!(unread(&reopened, B).await, 2);
+}
+
+#[tokio::test]
+async fn read_all_covers_unloaded_pages_and_leaves_later_commits_at_the_same_time_unread() {
+    use pioneer_crud::mark_all_task_completion_inbox_read;
+    let (_dir, store, _writer) = fixture(false).await;
+    task(
+        &store,
+        "bulk",
+        Some("T0000000000000000000P"),
+        None,
+        "tool",
+        "none",
+        "detached",
+    )
+    .await;
+    task(
+        &store,
+        "hidden-bulk",
+        Some("T0000000000000000000V"),
+        None,
+        "tool",
+        "none",
+        "detached",
+    )
+    .await;
+    for ix in 0..65 {
+        run(
+            &store,
+            &format!("bulk-{ix:03}"),
+            "bulk",
+            "succeeded",
+            ix + 1,
+        )
+        .await;
+    }
+    run(&store, "hidden-bulk-run", "hidden-bulk", "failed", 1).await;
+    let db = store.database_connection();
+    db.execute_unprepared("DELETE FROM thread_membership WHERE principal_id='P0000000000000000000A' AND thread_id='T0000000000000000000V'").await.unwrap();
+    assert_eq!(
+        list_task_completion_inbox(&db, &access(A), None, 30)
+            .await
+            .unwrap()
+            .len(),
+        30
+    );
+    mark_all_task_completion_inbox_read(&db, &access(A), "2026-10-16 10:00:00 +00:00")
+        .await
+        .unwrap();
+    assert_eq!(unread(&store, A).await, 0);
+    assert_eq!(unread(&store, B).await, 66);
+    assert!(
+        list_task_completion_inbox(&db, &access(A), None, 30)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        pioneer_entity::task_run_read::Entity::find()
+            .all(&db)
+            .await
+            .unwrap()
+            .len(),
+        65
+    );
+    // Writer order, not a lossy time watermark or lexicographic run ID, defines inclusion.
+    run(&store, "aaa-later", "bulk", "succeeded", 66).await;
+    assert_eq!(unread(&store, A).await, 1);
+    assert_eq!(
+        list_task_completion_inbox(&db, &access(A), None, 30)
+            .await
+            .unwrap()[0]
+            .run_id,
+        "aaa-later"
+    );
+    let foreign = TaskCompletionInboxAccess {
+        workspace_id: "W0000000000000000000O",
+        ..access(A)
+    };
+    mark_all_task_completion_inbox_read(&db, &foreign, "2026-10-16 10:00:00 +00:00")
+        .await
+        .unwrap();
+    assert_eq!(unread(&store, A).await, 1);
+    let principal_access = access(A);
+    let (bulk_result, ()) = tokio::join!(
+        mark_all_task_completion_inbox_read(&db, &principal_access, "2026-10-16 10:00:00 +00:00"),
+        run(&store, "racing-completion", "bulk", "succeeded", 67),
+    );
+    bulk_result.unwrap();
+    let included = pioneer_entity::task_run_read::Entity::find_by_id((
+        A.to_owned(),
+        "racing-completion".to_owned(),
+    ))
+    .one(&db)
+    .await
+    .unwrap()
+    .is_some();
+    let remaining = u64::from(!included);
+    assert_eq!(
+        unread(&store, A).await,
+        remaining,
+        "the serialized writer defines which concurrent commit belongs to the operation"
+    );
+    run(&store, "strictly-after-race", "bulk", "succeeded", 68).await;
+    assert_eq!(unread(&store, A).await, remaining + 1);
+}
+
+#[tokio::test]
+async fn unread_filter_precedes_limit_and_keyset_cursor() {
+    let (_dir, store, _writer) = fixture(false).await;
+    task(
+        &store,
+        "pages",
+        Some("T0000000000000000000P"),
+        None,
+        "tool",
+        "none",
+        "detached",
+    )
+    .await;
+    for ix in 0..80 {
+        let id = format!("page-{ix:03}");
+        run(&store, &id, "pages", "succeeded", ix + 1).await;
+        if ix >= 35 {
+            read(&store, A, &id).await;
+        }
+    }
+    let db = store.database_connection();
+    let first = list_task_completion_inbox(&db, &access(A), None, 30)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 30);
+    assert_eq!(first[0].run_id, "page-034");
+    let anchor = first.last().unwrap();
+    let next = list_task_completion_inbox(
+        &db,
+        &access(A),
+        Some((&anchor.completed_key, &anchor.run_id)),
+        30,
+    )
+    .await
+    .unwrap();
+    assert_eq!(next.len(), 5);
+    assert_eq!(unread(&store, A).await, 35);
+}
+
+#[tokio::test]
+async fn cancellation_receipt_tracks_actor_exact_transition_and_rolls_back_with_projection() {
+    use pioneer_protocol::TaskEventPayload;
+    let (_dir, store, _writer) = fixture(false).await;
+    task(
+        &store,
+        "cancel",
+        Some("T0000000000000000000P"),
+        None,
+        "tool",
+        "none",
+        "detached",
+    )
+    .await;
+    store
+        .database_connection()
+        .execute_unprepared("UPDATE task SET status='running' WHERE id='cancel'")
+        .await
+        .unwrap();
+    run(&store, "previous", "cancel", "succeeded", 1).await;
+    let cancel = |id: &str| TaskEventPayload::RunCancelled {
+        task_id: "cancel".into(),
+        run_id: id.into(),
+        reason: None,
+        cancelled_at: 1792144800,
+    };
+    for (id, number, actor) in [
+        ("own", 2, Some(A)),
+        ("other", 3, Some(B)),
+        ("system", 4, None),
+    ] {
+        run(&store, id, "cancel", "running", number).await;
+        store
+            .append_task_cancellation_events_as(
+                vec![cancel(id)],
+                1792144800,
+                None,
+                actor.map(str::to_owned),
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(unread(&store, A).await, 3);
+    assert_eq!(unread(&store, B).await, 3);
+    // Replaying another actor's cancellation must not suppress it for A.
+    store
+        .append_task_cancellation_events_as(vec![cancel("other")], 1792144800, None, Some(A.into()))
+        .await
+        .unwrap();
+    assert_eq!(unread(&store, A).await, 3);
+    run(&store, "rollback", "cancel", "running", 5).await;
+    let db = store.database_connection();
+    db.execute_unprepared("CREATE TRIGGER reject_inbox_receipt BEFORE INSERT ON task_run_read BEGIN SELECT RAISE(ABORT, 'fixture receipt failure'); END").await.unwrap();
+    assert!(
+        store
+            .append_task_cancellation_events_as(
+                vec![cancel("rollback")],
+                1792144800,
+                None,
+                Some(A.into())
+            )
+            .await
+            .is_err()
+    );
+    let row = pioneer_entity::task_run::Entity::find_by_id("rollback")
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, "running");
+    db.execute_unprepared("DROP TRIGGER reject_inbox_receipt")
+        .await
+        .unwrap();
+    store
+        .append_task_cancellation_events_as(
+            vec![cancel("rollback")],
+            1792144800,
+            None,
+            Some(A.into()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unread(&store, A).await, 3);
+    assert_eq!(unread(&store, B).await, 4);
+    run(&store, "future-repeat", "cancel", "succeeded", 6).await;
+    assert_eq!(
+        unread(&store, A).await,
+        4,
+        "cancellation cannot pre-read future repeats"
+    );
+}
+
+async fn saved_result_item(store: &CrudStore, turn: &str, item: &str) {
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,active_attempt_number,created_at,updated_at) VALUES(?1,?2,?3,'agent_message','completed','{}',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        [format!("saved-{turn}-{item}").into(), turn.into(), item.into()])).await.unwrap();
+}
+
+#[tokio::test]
+async fn visible_results_resolve_exact_occurrence_and_delivery_with_personal_cross_device_receipts()
+{
+    use pioneer_crud::mark_viewed_task_completion_inbox_read;
+    use pioneer_protocol::TaskCompletionInboxViewedParams;
+    let (_dir, store, _writer) = fixture(false).await;
+    task(
+        &store,
+        "visible",
+        Some("T0000000000000000000P"),
+        None,
+        "tool",
+        "thread",
+        "detached",
+    )
+    .await;
+    for (id, number) in [
+        ("first-visible", 1),
+        ("second-visible", 2),
+        ("third-visible", 3),
+    ] {
+        run(&store, id, "visible", "succeeded", number).await;
+    }
+    let db = store.database_connection();
+    db.execute_unprepared("INSERT INTO turn(id,thread_id,status,prompt_manifest_json,turn_kind,origin,created_at,updated_at) VALUES('child-answer','T0000000000000000000I','completed','{}','task_run','attached_task',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('delivered-answer','T0000000000000000000P','completed','{}','task_run','attached_task',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    db.execute_unprepared("INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES('binding','visible','first-visible','T0000000000000000000I','child-answer','initial',1,1,'candidate_created',CURRENT_TIMESTAMP)").await.unwrap();
+    db.execute_unprepared("INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id,created_at,updated_at) VALUES('visible-delivery','W0000000000000000000I','visible','second-visible','visible-key','thread','T0000000000000000000P','delivered',1,1,'delivered-answer',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    saved_result_item(
+        &store,
+        "delivered-answer",
+        &pioneer_protocol::task_delivery_result_item_id("visible-delivery"),
+    )
+    .await;
+    // Two child deliveries share the same occurrence Turn. Only the viewed
+    // canonical result item may acknowledge its own run.
+    db.execute_unprepared("INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id,created_at,updated_at) VALUES('neighbour-delivery','W0000000000000000000I','visible','third-visible','neighbour-key','thread','T0000000000000000000P','delivered',1,1,'delivered-answer',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    let mut params = TaskCompletionInboxViewedParams {
+        workspace_id: access(A).workspace_id.into(),
+        thread_id: "T0000000000000000000I".into(),
+        run_ids: vec![],
+        result_turn_ids: vec!["child-answer".into()],
+        result_items: vec![],
+    };
+    let at = "2026-10-16 10:00:00 +00:00";
+    assert_eq!(
+        mark_viewed_task_completion_inbox_read(&db, &access(A), &params, at)
+            .await
+            .unwrap(),
+        ["turn:child-answer"]
+    );
+    assert_eq!(unread(&store, A).await, 2);
+    assert_eq!(unread(&store, B).await, 3);
+    // Same receipt is visible through a second independent reader and idempotent.
+    mark_viewed_task_completion_inbox_read(&db, &access(A), &params, at)
+        .await
+        .unwrap();
+    params.thread_id = "T0000000000000000000P".into();
+    params.result_turn_ids = vec!["child-answer".into()];
+    assert!(
+        mark_viewed_task_completion_inbox_read(&db, &access(A), &params, at)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    params.result_turn_ids = vec!["delivered-answer".into()];
+    assert!(
+        mark_viewed_task_completion_inbox_read(&db, &access(A), &params, at)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a whole parent Turn cannot read its child deliveries"
+    );
+    params.result_turn_ids.clear();
+    params.result_items = vec![pioneer_protocol::TaskCompletionInboxViewedResult {
+        turn_id: "delivered-answer".into(),
+        item_id: "unrelated-parent-answer".into(),
+    }];
+    assert!(
+        mark_viewed_task_completion_inbox_read(&db, &access(A), &params, at)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    params.result_items = vec![pioneer_protocol::TaskCompletionInboxViewedResult {
+        turn_id: "delivered-answer".into(),
+        item_id: pioneer_protocol::task_delivery_result_item_id("visible-delivery"),
+    }];
+    mark_viewed_task_completion_inbox_read(&db, &access(A), &params, at)
+        .await
+        .unwrap();
+    assert_eq!(
+        unread(&store, A).await,
+        1,
+        "another repeat of the same task stays unread"
+    );
+    assert_eq!(unread(&store, B).await, 3);
+    let receipts = pioneer_entity::task_run_read::Entity::find()
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(receipts.len(), 2);
+    assert!(
+        receipts
+            .iter()
+            .all(|receipt| receipt.run_id != "third-visible")
+    );
+}
+
+#[tokio::test]
+async fn own_cancellation_receipt_remains_personal_when_a_presentation_root_is_added_later() {
+    let (_dir, store, _writer) = fixture(false).await;
+    task(
+        &store,
+        "no-root-cancel",
+        None,
+        None,
+        "system",
+        "none",
+        "detached",
+    )
+    .await;
+    store
+        .database_connection()
+        .execute_unprepared("UPDATE task SET status='running' WHERE id='no-root-cancel'")
+        .await
+        .unwrap();
+    run(&store, "no-root-run", "no-root-cancel", "running", 1).await;
+    store
+        .append_task_cancellation_events_as(
+            vec![pioneer_protocol::TaskEventPayload::RunCancelled {
+                task_id: "no-root-cancel".into(),
+                run_id: "no-root-run".into(),
+                reason: None,
+                cancelled_at: 1792144800,
+            }],
+            1792144800,
+            None,
+            Some(A.into()),
+        )
+        .await
+        .unwrap();
+    let db = store.database_connection();
+    assert!(
+        pioneer_entity::task_run_read::Entity::find_by_id((A.to_owned(), "no-root-run".to_owned()))
+            .one(&db)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    db.execute_unprepared(
+        "UPDATE task SET created_by_thread_id='T0000000000000000000P' WHERE id='no-root-cancel'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(unread(&store, A).await, 0);
+    assert_eq!(unread(&store, B).await, 1);
+}
+
+#[tokio::test]
+async fn failed_dedicated_delivery_status_uses_its_exact_canonical_turn_link() {
+    use pioneer_crud::mark_viewed_task_completion_inbox_read;
+    let (_dir, store, _writer) = fixture(false).await;
+    task(
+        &store,
+        "failure-result",
+        Some("T0000000000000000000P"),
+        None,
+        "system",
+        "thread",
+        "detached",
+    )
+    .await;
+    run(&store, "failure-result-run", "failure-result", "failed", 1).await;
+    let turn_id =
+        pioneer_crud::canonical_agent_id('T', "task-delivery-turn\0failure-result-delivery");
+    let db = store.database_connection();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO turn(id,thread_id,status,prompt_manifest_json,turn_kind,origin,created_at,updated_at) VALUES(?,'T0000000000000000000P','failed','{}','conversation','task_delivery',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        [turn_id.clone().into()])).await.unwrap();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id,created_at,updated_at) VALUES('failure-result-delivery','W0000000000000000000I','failure-result','failure-result-run','failure-result-key','thread','T0000000000000000000P','delivered',1,1,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        [turn_id.clone().into()])).await.unwrap();
+    let params = pioneer_protocol::TaskCompletionInboxViewedParams {
+        workspace_id: access(A).workspace_id.into(),
+        thread_id: "T0000000000000000000P".into(),
+        run_ids: vec![],
+        result_turn_ids: vec![turn_id],
+        result_items: vec![],
+    };
+    assert_eq!(
+        mark_viewed_task_completion_inbox_read(
+            &db,
+            &access(A),
+            &params,
+            "2026-10-16 10:00:00 +00:00"
+        )
+        .await
+        .unwrap()
+        .len(),
+        1
+    );
+    assert_eq!(unread(&store, A).await, 0);
+    assert_eq!(unread(&store, B).await, 1);
+}
+
+#[tokio::test]
+async fn child_delivery_item_does_not_read_the_parent_execution_run_sharing_its_turn() {
+    use pioneer_crud::mark_viewed_task_completion_inbox_read;
+    let (_dir, store, _writer) = fixture(false).await;
+    task(
+        &store,
+        "parent-visible-task",
+        Some("T0000000000000000000P"),
+        None,
+        "agent",
+        "none",
+        "attached",
+    )
+    .await;
+    task(
+        &store,
+        "child-visible-task",
+        Some("T0000000000000000000I"),
+        Some("parent-visible-task"),
+        "tool",
+        "thread",
+        "attached",
+    )
+    .await;
+    run(
+        &store,
+        "parent-visible-run",
+        "parent-visible-task",
+        "succeeded",
+        1,
+    )
+    .await;
+    run(
+        &store,
+        "child-visible-run",
+        "child-visible-task",
+        "succeeded",
+        1,
+    )
+    .await;
+    let db = store.database_connection();
+    db.execute_unprepared("INSERT INTO turn(id,thread_id,status,prompt_manifest_json,turn_kind,origin,created_at,updated_at) VALUES('shared-execution-turn','T0000000000000000000I','completed','{}','task_run','attached_task',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    db.execute_unprepared("INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES('parent-visible-binding','parent-visible-task','parent-visible-run','T0000000000000000000I','shared-execution-turn','initial',1,1,'candidate_created',CURRENT_TIMESTAMP)").await.unwrap();
+    db.execute_unprepared("INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id,created_at,updated_at) VALUES('exact-child-delivery','W0000000000000000000I','child-visible-task','child-visible-run','exact-child-key','thread','T0000000000000000000I','delivered',1,1,'shared-execution-turn',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    // Both children have finished; their parent is still working. Looking at
+    // one result cannot acknowledge its neighbour or the parent's own run.
+    db.execute_unprepared("UPDATE turn SET status='in_progress' WHERE id='shared-execution-turn'")
+        .await
+        .unwrap();
+    run(
+        &store,
+        "second-child-run",
+        "child-visible-task",
+        "succeeded",
+        2,
+    )
+    .await;
+    db.execute_unprepared("INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id,created_at,updated_at) VALUES('second-child-delivery','W0000000000000000000I','child-visible-task','second-child-run','second-child-key','thread','T0000000000000000000I','delivered',1,1,'shared-execution-turn',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    saved_result_item(
+        &store,
+        "shared-execution-turn",
+        &pioneer_protocol::task_delivery_result_item_id("exact-child-delivery"),
+    )
+    .await;
+    saved_result_item(
+        &store,
+        "shared-execution-turn",
+        &pioneer_protocol::task_delivery_result_item_id("second-child-delivery"),
+    )
+    .await;
+    let params = pioneer_protocol::TaskCompletionInboxViewedParams {
+        workspace_id: access(A).workspace_id.into(),
+        thread_id: "T0000000000000000000I".into(),
+        run_ids: vec![],
+        result_turn_ids: vec![],
+        result_items: vec![pioneer_protocol::TaskCompletionInboxViewedResult {
+            turn_id: "shared-execution-turn".into(),
+            item_id: pioneer_protocol::task_delivery_result_item_id("exact-child-delivery"),
+        }],
+    };
+    mark_viewed_task_completion_inbox_read(&db, &access(A), &params, "2026-10-16 10:00:00 +00:00")
+        .await
+        .unwrap();
+    assert_eq!(unread(&store, A).await, 2);
+    assert_eq!(unread(&store, B).await, 3);
+    assert!(
+        find_task_completion_inbox_entry(&db, &access(A), "parent-visible-run")
+            .await
+            .unwrap()
+            .unwrap()
+            .read_at
+            .is_none()
+    );
+    assert!(
+        find_task_completion_inbox_entry(&db, &access(A), "child-visible-run")
+            .await
+            .unwrap()
+            .unwrap()
+            .read_at
+            .is_some()
+    );
+    // Leaving the viewport performs no undo. Finishing the containing parent
+    // later cannot revoke the already persisted child's personal receipt.
+    db.execute_unprepared("UPDATE turn SET status='completed' WHERE id='shared-execution-turn'")
+        .await
+        .unwrap();
+    assert_eq!(unread(&store, A).await, 2);
+    assert!(
+        find_task_completion_inbox_entry(&db, &access(A), "second-child-run")
+            .await
+            .unwrap()
+            .unwrap()
+            .read_at
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn reviewed_run_requires_accepted_candidate_not_old_answer_or_reviewer() {
+    use pioneer_crud::mark_viewed_task_completion_inbox_read as viewed;
+    let (_dir, store, _writer) = fixture(false).await;
+    task(
+        &store,
+        "reviewed",
+        Some("T0000000000000000000P"),
+        None,
+        "agent",
+        "none",
+        "detached",
+    )
+    .await;
+    run(&store, "reviewed-run", "reviewed", "waiting_review", 1).await;
+    let db = store.database_connection();
+    for (turn, binding, kind, status, sequence) in [
+        (
+            "old-answer",
+            "old-binding",
+            "initial",
+            "candidate_created",
+            1,
+        ),
+        (
+            "accepted-answer",
+            "accepted-binding",
+            "revision",
+            "candidate_created",
+            2,
+        ),
+        (
+            "reviewer-answer",
+            "reviewer-binding",
+            "review",
+            "review_recorded",
+            3,
+        ),
+    ] {
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO turn(id,thread_id,status,prompt_manifest_json,turn_kind,origin,created_at,updated_at) VALUES(?,'T0000000000000000000I','completed','{}','task_run','attached_task',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",[turn.into()])).await.unwrap();
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES(?,'reviewed','reviewed-run','T0000000000000000000I',?,?,?, ?,?,CURRENT_TIMESTAMP)",
+            [binding.into(),turn.into(),kind.into(),sequence.into(),sequence.into(),status.into()])).await.unwrap();
+        saved_result_item(&store, turn, "final-answer").await;
+    }
+    for (candidate, binding, turn, round, status) in [
+        (
+            "old-candidate",
+            "old-binding",
+            "old-answer",
+            1i64,
+            "superseded",
+        ),
+        (
+            "accepted-candidate",
+            "accepted-binding",
+            "accepted-answer",
+            2,
+            "accepted",
+        ),
+    ] {
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO task_result_candidate(id,task_id,run_id,task_run_turn_id,thread_id,turn_id,round,status,created_at,updated_at) VALUES(?,'reviewed','reviewed-run',?,'T0000000000000000000I',?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            [candidate.into(),binding.into(),turn.into(),round.into(),status.into()])).await.unwrap();
+    }
+    let proof = |turn: &str, status_only: bool| pioneer_protocol::TaskCompletionInboxViewedParams {
+        workspace_id: access(A).workspace_id.into(),
+        thread_id: "T0000000000000000000I".into(),
+        run_ids: vec![],
+        result_turn_ids: if status_only {
+            vec![turn.into()]
+        } else {
+            vec![]
+        },
+        result_items: if status_only {
+            vec![]
+        } else {
+            vec![pioneer_protocol::TaskCompletionInboxViewedResult {
+                turn_id: turn.into(),
+                item_id: "final-answer".into(),
+            }]
+        },
+    };
+    let at = "2026-10-16 10:00:00 +00:00";
+    assert!(
+        viewed(&db, &access(A), &proof("old-answer", false), at)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    db.execute_unprepared("UPDATE task_run SET status='succeeded' WHERE id='reviewed-run'")
+        .await
+        .unwrap();
+    for candidate_state in ["rejected", "superseded"] {
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE task_result_candidate SET status=? WHERE id='old-candidate'",
+            [candidate_state.into()],
+        ))
+        .await
+        .unwrap();
+        // Re-evaluation after completion invalidation, with the old row still
+        // visible, must not acknowledge the subsequently accepted result.
+        for old in ["old-answer", "reviewer-answer"] {
+            for status_only in [false, true] {
+                assert!(
+                    viewed(&db, &access(A), &proof(old, status_only), at)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+        assert_eq!(unread(&store, A).await, 1);
+    }
+    assert!(
+        !viewed(&db, &access(A), &proof("accepted-answer", false), at)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(unread(&store, A).await, 0);
+    assert_eq!(unread(&store, B).await, 1);
+}
+
+#[tokio::test]
+async fn terminal_errors_without_candidates_require_the_matching_work_frontier() {
+    use pioneer_crud::mark_viewed_task_completion_inbox_read as viewed;
+    let (_dir, store, _writer) = fixture(false).await;
+    task(
+        &store,
+        "errors",
+        Some("T0000000000000000000P"),
+        None,
+        "agent",
+        "none",
+        "detached",
+    )
+    .await;
+    let db = store.database_connection();
+    for (ix, (run_status, turn_status, work_status)) in [
+        ("failed", "failed", "failed"),
+        ("blocked", "blocked", "blocked"),
+        ("cancelled", "interrupted", "cancelled"),
+        ("timed_out", "failed", "failed"),
+        ("failed", "interrupted", "interrupted"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let run_id = format!("error-run-{ix}");
+        let turn_id = format!("error-turn-{ix}");
+        run(&store, &run_id, "errors", run_status, ix as i64 + 1).await;
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO turn(id,thread_id,status,prompt_manifest_json,turn_kind,origin,created_at,updated_at) VALUES(?,'T0000000000000000000I',?,'{}','task_run','attached_task',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", [turn_id.clone().into(), turn_status.into()])).await.unwrap();
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES(?,'errors',?,'T0000000000000000000I',?,'recovery',1,1,?,CURRENT_TIMESTAMP)",
+            [format!("error-binding-{ix}").into(),run_id.into(),turn_id.clone().into(),work_status.into()])).await.unwrap();
+        let params = pioneer_protocol::TaskCompletionInboxViewedParams {
+            workspace_id: access(A).workspace_id.into(),
+            thread_id: "T0000000000000000000I".into(),
+            run_ids: vec![],
+            result_turn_ids: vec![turn_id],
+            result_items: vec![],
+        };
+        assert!(
+            !viewed(&db, &access(A), &params, "2026-10-16 10:00:00 +00:00")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    assert_eq!(unread(&store, A).await, 0);
+    assert_eq!(unread(&store, B).await, 5);
+}
+
+#[tokio::test]
+async fn ordinary_negative_batches_keep_viewport_scope_checks_and_direct_run_evidence() {
+    use pioneer_crud::mark_viewed_task_completion_inbox_read as viewed;
+    let (_dir, store, _writer) = fixture(false).await;
+    task(
+        &store,
+        "batch",
+        Some("T0000000000000000000P"),
+        None,
+        "system",
+        "none",
+        "detached",
+    )
+    .await;
+    run(&store, "batch-run", "batch", "succeeded", 1).await;
+    let db = store.database_connection();
+    for ix in 0..100 {
+        let turn = format!("ordinary-{ix}");
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO turn(id,thread_id,status,prompt_manifest_json,turn_kind,origin,created_at,updated_at) VALUES(?,'T0000000000000000000P','completed','{}','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            [turn.clone().into()])).await.unwrap();
+        saved_result_item(&store, &turn, "final").await;
+    }
+    let mut params = pioneer_protocol::TaskCompletionInboxViewedParams {
+        workspace_id: access(A).workspace_id.into(),
+        thread_id: "T0000000000000000000P".into(),
+        run_ids: vec![],
+        result_turn_ids: vec![],
+        result_items: (0..100)
+            .map(|i| pioneer_protocol::TaskCompletionInboxViewedResult {
+                turn_id: format!("ordinary-{i}"),
+                item_id: "final".into(),
+            })
+            .collect(),
+    };
+    let at = "2026-10-18T12:00:00+00:00";
+    assert!(
+        viewed(&db, &access(A), &params, at)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    params.result_turn_ids = params
+        .result_items
+        .drain(..)
+        .map(|item| item.turn_id)
+        .collect();
+    assert!(
+        viewed(&db, &access(A), &params, at)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    params.thread_id = "nonexistent".into();
+    assert!(
+        viewed(&db, &access(A), &params, at).await.is_err(),
+        "negative prefilter cannot bypass real viewport-thread validation"
+    );
+    params.thread_id = "T0000000000000000000P".into();
+    params.result_turn_ids.pop();
+    params.run_ids.push("batch-run".into());
+    assert_eq!(
+        viewed(&db, &access(A), &params, at).await.unwrap(),
+        ["run:batch-run"]
+    );
+    assert_eq!(unread(&store, A).await, 0);
+    assert_eq!(unread(&store, B).await, 1);
 }
