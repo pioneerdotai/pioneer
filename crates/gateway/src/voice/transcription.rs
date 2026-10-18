@@ -8,6 +8,32 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
 
+// Private one-shot result, retaining only timing actually supplied by the SDK.
+// No confidence, fabricated word times, or persistent decoder state.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct VoiceSpeechHypothesis {
+    pub(crate) text: String,
+    pub(crate) segments: Option<Vec<transcribe_rs::TranscriptionSegment>>,
+}
+
+impl VoiceSpeechHypothesis {
+    pub(crate) fn text_only(text: String) -> Self {
+        Self {
+            text,
+            segments: None,
+        }
+    }
+}
+
+impl From<transcribe_rs::TranscriptionResult> for VoiceSpeechHypothesis {
+    fn from(result: transcribe_rs::TranscriptionResult) -> Self {
+        Self {
+            text: result.text,
+            segments: result.segments,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PreparedSpeechBuffer {
     pub(crate) sample_rate_hz: u32,
@@ -213,6 +239,14 @@ pub(crate) trait VoiceSpeechTranscriber: Send {
         &self,
         buffer: &PreparedSpeechBuffer,
     ) -> Result<String, VoiceTranscriptionError>;
+
+    fn transcribe_hypothesis(
+        &self,
+        buffer: &PreparedSpeechBuffer,
+    ) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
+        self.transcribe_speech(buffer)
+            .map(VoiceSpeechHypothesis::text_only)
+    }
 }
 
 impl VoiceSpeechTranscriber for Box<dyn VoiceSpeechTranscriber> {
@@ -221,6 +255,13 @@ impl VoiceSpeechTranscriber for Box<dyn VoiceSpeechTranscriber> {
         buffer: &PreparedSpeechBuffer,
     ) -> Result<String, VoiceTranscriptionError> {
         self.as_ref().transcribe_speech(buffer)
+    }
+
+    fn transcribe_hypothesis(
+        &self,
+        buffer: &PreparedSpeechBuffer,
+    ) -> Result<VoiceSpeechHypothesis, VoiceTranscriptionError> {
+        self.as_ref().transcribe_hypothesis(buffer)
     }
 }
 
