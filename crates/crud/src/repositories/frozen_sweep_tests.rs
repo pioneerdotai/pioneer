@@ -107,7 +107,7 @@ mod durable_sweep {
             .connection
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "SELECT revision FROM frozen_sweep_work WHERE manifest_id=?1 AND kind=?2",
+                "SELECT revision FROM compaction_frozen_sweep_work WHERE manifest_id=?1 AND kind=?2",
                 [id.into(), kind.into()],
             ))
             .await
@@ -124,7 +124,7 @@ mod durable_sweep {
             .connection
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "SELECT pending AS n FROM frozen_sweep_work WHERE manifest_id=?1 AND kind=?2",
+                "SELECT pending AS n FROM compaction_frozen_sweep_work WHERE manifest_id=?1 AND kind=?2",
                 [id.into(), kind.into()],
             ))
             .await
@@ -162,16 +162,20 @@ mod durable_sweep {
         }
         Migrator::up(&db, None).await.unwrap();
         assert_eq!(
-            query(&store, "SELECT count(*) AS n FROM frozen_sweep_work").await,
+            query(
+                &store,
+                "SELECT count(*) AS n FROM compaction_frozen_sweep_work"
+            )
+            .await,
             0
         );
         assert!(frozen_sweep_work::bootstrap_step(&store).await.unwrap()); // capture upper
-        exec(&store,"CREATE TRIGGER fixture_enqueue_fault BEFORE INSERT ON frozen_sweep_work BEGIN SELECT RAISE(ABORT,'enqueue fault'); END").await;
+        exec(&store,"CREATE TRIGGER fixture_enqueue_fault BEFORE INSERT ON compaction_frozen_sweep_work BEGIN SELECT RAISE(ABORT,'enqueue fault'); END").await;
         assert!(frozen_sweep_work::bootstrap_step(&store).await.is_err());
         assert_eq!(
             query(
                 &store,
-                "SELECT count(*) AS n FROM frozen_sweep_bootstrap WHERE after_manifest IS NOT NULL"
+                "SELECT count(*) AS n FROM compaction_frozen_sweep_bootstrap WHERE after_manifest IS NOT NULL"
             )
             .await,
             0
@@ -179,13 +183,17 @@ mod durable_sweep {
         exec(&store, "DROP TRIGGER fixture_enqueue_fault").await;
         assert!(frozen_sweep_work::bootstrap_step(&store).await.unwrap());
         assert_eq!(
-            query(&store, "SELECT count(*) AS n FROM frozen_sweep_work").await,
+            query(
+                &store,
+                "SELECT count(*) AS n FROM compaction_frozen_sweep_work"
+            )
+            .await,
             1
         );
         // No RAM cursor is needed to resume, including between the two kinds.
         while query(
             &store,
-            "SELECT complete AS n FROM frozen_sweep_bootstrap WHERE kind=0",
+            "SELECT complete AS n FROM compaction_frozen_sweep_bootstrap WHERE kind=0",
         )
         .await
             == 0
@@ -195,24 +203,28 @@ mod durable_sweep {
         assert_eq!(
             query(
                 &store,
-                "SELECT started AS n FROM frozen_sweep_bootstrap WHERE kind=1"
+                "SELECT started AS n FROM compaction_frozen_sweep_bootstrap WHERE kind=1"
             )
             .await,
             0
         );
         drain_metadata(&store).await;
         assert_eq!(
-            query(&store, "SELECT count(*) AS n FROM frozen_sweep_work").await,
+            query(
+                &store,
+                "SELECT count(*) AS n FROM compaction_frozen_sweep_work"
+            )
+            .await,
             6
         );
         assert!(!frozen_sweep_work::bootstrap_step(&store).await.unwrap());
         let mut restarted = FrozenStorageLifetimeProgress::default();
         drain(&store, &mut restarted).await;
-        assert_eq!(query(&store,"SELECT count(*) AS n FROM frozen_sweep_work WHERE pending=1 AND retry_at>unixepoch()").await,6);
+        assert_eq!(query(&store,"SELECT count(*) AS n FROM compaction_frozen_sweep_work WHERE pending=1 AND retry_at>unixepoch()").await,6);
         assert_eq!(
             query(
                 &store,
-                "SELECT count(*) AS n FROM frozen_sweep_bootstrap WHERE complete=1"
+                "SELECT count(*) AS n FROM compaction_frozen_sweep_bootstrap WHERE complete=1"
             )
             .await,
             2
@@ -245,7 +257,7 @@ mod durable_sweep {
         assert_eq!(
             query(
                 &store,
-                "SELECT count(*) AS n FROM frozen_sweep_work WHERE manifest_id='m'"
+                "SELECT count(*) AS n FROM compaction_frozen_sweep_work WHERE manifest_id='m'"
             )
             .await,
             1
@@ -325,7 +337,7 @@ mod durable_sweep {
         assert!(
             query(
                 &store,
-                "SELECT count(*) AS n FROM frozen_sweep_consumer WHERE pending=1"
+                "SELECT count(*) AS n FROM compaction_frozen_sweep_consumer WHERE pending=1"
             )
             .await
                 > 0
@@ -345,7 +357,7 @@ mod durable_sweep {
         assert_eq!(
             query(
                 &store,
-                "SELECT count(*) AS n FROM frozen_sweep_work WHERE manifest_id='a' AND kind=0"
+                "SELECT count(*) AS n FROM compaction_frozen_sweep_work WHERE manifest_id='a' AND kind=0"
             )
             .await,
             1
@@ -357,7 +369,7 @@ mod durable_sweep {
         assert_eq!(
             query(
                 &store,
-                "SELECT count(*) AS n FROM frozen_sweep_work WHERE manifest_id='a' AND kind=0"
+                "SELECT count(*) AS n FROM compaction_frozen_sweep_work WHERE manifest_id='a' AND kind=0"
             )
             .await,
             1
@@ -498,12 +510,14 @@ mod durable_sweep {
         assert!(
             store
                 .connection
-                .execute_unprepared("DELETE FROM frozen_sweep_work WHERE manifest_id='key'")
+                .execute_unprepared(
+                    "DELETE FROM compaction_frozen_sweep_work WHERE manifest_id='key'"
+                )
                 .await
                 .is_err()
         );
-        assert!(store.connection.execute_unprepared("UPDATE frozen_sweep_consumer SET consumer_row=consumer_row+100 WHERE manifest_id='key'").await.is_err(),"durable service identity cannot be reassigned");
-        exec(&store,"UPDATE frozen_sweep_work SET revision=9223372036854775807 WHERE manifest_id='key' AND kind=0").await;
+        assert!(store.connection.execute_unprepared("UPDATE compaction_frozen_sweep_consumer SET consumer_row=consumer_row+100 WHERE manifest_id='key'").await.is_err(),"durable service identity cannot be reassigned");
+        exec(&store,"UPDATE compaction_frozen_sweep_work SET revision=9223372036854775807 WHERE manifest_id='key' AND kind=0").await;
         // Overflow must abort the entire domain mutation, never reset/reuse.
         assert!(
             store
@@ -594,7 +608,7 @@ mod durable_sweep {
             .await,
             0
         );
-        assert_eq!(query(&store,"SELECT count(*) AS n FROM frozen_sweep_work WHERE manifest_id='a-orphan' AND pending=1 AND retry_at>unixepoch()").await,1);
+        assert_eq!(query(&store,"SELECT count(*) AS n FROM compaction_frozen_sweep_work WHERE manifest_id='a-orphan' AND pending=1 AND retry_at>unixepoch()").await,1);
         assert!(!progress.sweep_quantum(&store).await.unwrap());
         header(&store, "a-orphan", 0, 0, 0).await;
         drain(&store, &mut FrozenStorageLifetimeProgress::default()).await;
@@ -628,7 +642,7 @@ mod durable_sweep {
         // retains its retry. Simulate its next admission without sleeping.
         exec(
             &store,
-            "UPDATE frozen_sweep_work SET retry_at=0 WHERE manifest_id='a-poison'",
+            "UPDATE compaction_frozen_sweep_work SET retry_at=0 WHERE manifest_id='a-poison'",
         )
         .await;
         drain(&store, &mut FrozenStorageLifetimeProgress::default()).await;
@@ -703,7 +717,7 @@ mod durable_sweep {
             .await,
             1
         );
-        assert_eq!(query(&store,"SELECT count(*) AS n FROM frozen_sweep_work WHERE manifest_id='free' AND kind=0 AND pending=1 AND retry_at>unixepoch()").await,1);
+        assert_eq!(query(&store,"SELECT count(*) AS n FROM compaction_frozen_sweep_work WHERE manifest_id='free' AND kind=0 AND pending=1 AND retry_at>unixepoch()").await,1);
         let revision = work(&store, "free", 0).await.revision;
         exec(
             &store,
@@ -721,7 +735,7 @@ mod durable_sweep {
         // Geometry, readiness, and all production safety triggers remain intact.
         exec(
             &store,
-            "UPDATE frozen_sweep_work SET retry_at=0 WHERE manifest_id='free'",
+            "UPDATE compaction_frozen_sweep_work SET retry_at=0 WHERE manifest_id='free'",
         )
         .await;
         drain(&store, &mut FrozenStorageLifetimeProgress::default()).await;
@@ -863,7 +877,7 @@ mod durable_sweep {
         assert_eq!(
             query(
                 &store,
-                "SELECT sum(started) AS n FROM frozen_sweep_bootstrap"
+                "SELECT sum(started) AS n FROM compaction_frozen_sweep_bootstrap"
             )
             .await,
             0
@@ -892,7 +906,7 @@ mod durable_sweep {
             let error = future.await.unwrap_err();
             assert!(error.to_string().contains("scope unknown"));
         }
-        assert_eq!(query(&store,"SELECT count(*) AS n FROM frozen_sweep_bootstrap WHERE kind=0 AND started=1 AND after_manifest IS NULL AND complete=0").await,1);
+        assert_eq!(query(&store,"SELECT count(*) AS n FROM compaction_frozen_sweep_bootstrap WHERE kind=0 AND started=1 AND after_manifest IS NULL AND complete=0").await,1);
         exec(
             &store,
             "UPDATE compaction_frozen_history SET workspace_id='ws' WHERE id='scope-race'",
@@ -901,7 +915,7 @@ mod durable_sweep {
         header(&store, "held", 1, 1, 0).await;
         row(&store, "held", 0, 0).await;
         drain_metadata(&store).await;
-        exec(&store,"CREATE TRIGGER fixture_ack_fault BEFORE UPDATE ON frozen_sweep_work WHEN NEW.pending=0 BEGIN SELECT RAISE(ABORT,'ack rollback'); END").await;
+        exec(&store,"CREATE TRIGGER fixture_ack_fault BEFORE UPDATE ON compaction_frozen_sweep_work WHEN NEW.pending=0 BEGIN SELECT RAISE(ABORT,'ack rollback'); END").await;
         let mut progress = FrozenStorageLifetimeProgress::default();
         let mut failed = false;
         for _ in 0..1000 {
@@ -967,19 +981,19 @@ mod durable_sweep {
         let before = work(&store, "b", 0).await.revision;
         assert!(frozen_sweep_work::fanout_step(&store).await.unwrap());
         // A failed cursor commit rolls back its enqueue as well.
-        exec(&store,"CREATE TRIGGER fixture_fanout_fault BEFORE UPDATE ON frozen_sweep_consumer WHEN NEW.after_source='b' BEGIN SELECT RAISE(ABORT,'fanout cursor fault'); END").await;
+        exec(&store,"CREATE TRIGGER fixture_fanout_fault BEFORE UPDATE ON compaction_frozen_sweep_consumer WHEN NEW.after_source='b' BEGIN SELECT RAISE(ABORT,'fanout cursor fault'); END").await;
         let mut failed = false;
         for _ in 0..8 {
             let turn = query(
                 &store,
-                "SELECT revision AS n FROM frozen_sweep_fanout WHERE id=1",
+                "SELECT revision AS n FROM compaction_frozen_sweep_fanout WHERE id=1",
             )
             .await;
             if frozen_sweep_work::fanout_step(&store).await.is_err() {
                 assert_eq!(
                     query(
                         &store,
-                        "SELECT revision AS n FROM frozen_sweep_fanout WHERE id=1"
+                        "SELECT revision AS n FROM compaction_frozen_sweep_fanout WHERE id=1"
                     )
                     .await,
                     turn,

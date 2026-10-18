@@ -5,8 +5,9 @@ use crate::CrudStore;
 use anyhow::{Result, ensure};
 use pioneer_entity::{
     compaction_frozen_history as history, compaction_frozen_layout as layout,
-    compaction_frozen_span as span, frozen_sweep_bootstrap as bootstrap,
-    frozen_sweep_consumer as consumer, frozen_sweep_fanout as fanout, frozen_sweep_work as work,
+    compaction_frozen_span as span, compaction_frozen_sweep_bootstrap as bootstrap,
+    compaction_frozen_sweep_consumer as consumer, compaction_frozen_sweep_fanout as fanout,
+    compaction_frozen_sweep_work as work,
 };
 use sea_orm::sea_query::{
     Alias, BinOper, Expr, ExprTrait, Func, IntoIden, IntoTableRef, JoinType, OnConflict, Order,
@@ -409,12 +410,15 @@ pub(super) async fn discover(
     // all projections/predicates/limits/values remain typed and bound.
     let mut due = DbBackend::Sqlite.build(&due);
     ensure!(
-        due.sql.matches("FROM \"frozen_sweep_work\"").count() == 1,
+        due.sql
+            .matches("FROM \"compaction_frozen_sweep_work\"")
+            .count()
+            == 1,
         "unexpected sweep due table"
     );
     due.sql = due.sql.replacen(
-        "FROM \"frozen_sweep_work\"",
-        "FROM \"frozen_sweep_work\" INDEXED BY \"frozen_sweep_pending\"",
+        "FROM \"compaction_frozen_sweep_work\"",
+        "FROM \"compaction_frozen_sweep_work\" INDEXED BY \"compaction_frozen_sweep_work_pending\"",
         1,
     );
     // No due non-active work means idle without walking future-retry pages.
@@ -461,12 +465,15 @@ pub(super) async fn discover(
         .to_owned();
     let mut page = DbBackend::Sqlite.build(&page);
     ensure!(
-        page.sql.matches("FROM \"frozen_sweep_work\"").count() == 1,
+        page.sql
+            .matches("FROM \"compaction_frozen_sweep_work\"")
+            .count()
+            == 1,
         "unexpected sweep service table"
     );
     page.sql = page.sql.replacen(
-        "FROM \"frozen_sweep_work\"",
-        "FROM \"frozen_sweep_work\" INDEXED BY \"frozen_sweep_service\"",
+        "FROM \"compaction_frozen_sweep_work\"",
+        "FROM \"compaction_frozen_sweep_work\" INDEXED BY \"compaction_frozen_sweep_work_service\"",
         1,
     );
     let rows = store.connection.query_all_raw(page).await?;

@@ -2842,7 +2842,7 @@ mod tests {
             store
                 .connection
                 .execute_unprepared(
-                    "ALTER TABLE frozen_sweep_bootstrap RENAME TO unavailable_bootstrap",
+                    "ALTER TABLE compaction_frozen_sweep_bootstrap RENAME TO unavailable_bootstrap",
                 )
                 .await
                 .unwrap();
@@ -2851,7 +2851,7 @@ mod tests {
             store
                 .connection
                 .execute_unprepared(
-                    "ALTER TABLE unavailable_bootstrap RENAME TO frozen_sweep_bootstrap",
+                    "ALTER TABLE unavailable_bootstrap RENAME TO compaction_frozen_sweep_bootstrap",
                 )
                 .await
                 .unwrap();
@@ -3592,7 +3592,7 @@ mod tests {
                 .connection
                 .query_one_raw(Statement::from_string(
                     DbBackend::Sqlite,
-                    "SELECT count(*) AS n FROM frozen_sweep_bootstrap WHERE complete=1",
+                    "SELECT count(*) AS n FROM compaction_frozen_sweep_bootstrap WHERE complete=1",
                 ))
                 .await
                 .unwrap()
@@ -3602,7 +3602,7 @@ mod tests {
                 .connection
                 .query_one_raw(Statement::from_string(
                     DbBackend::Sqlite,
-                    "SELECT upper_manifest FROM frozen_sweep_bootstrap WHERE kind=0",
+                    "SELECT upper_manifest FROM compaction_frozen_sweep_bootstrap WHERE kind=0",
                 ))
                 .await
                 .unwrap()
@@ -3770,7 +3770,7 @@ mod tests {
             .connection
             .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
-                "SELECT count(*) AS n FROM frozen_sweep_bootstrap WHERE complete=1",
+                "SELECT count(*) AS n FROM compaction_frozen_sweep_bootstrap WHERE complete=1",
             ))
             .await
             .unwrap()

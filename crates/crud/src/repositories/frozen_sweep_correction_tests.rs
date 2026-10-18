@@ -26,7 +26,7 @@ async fn unrelated_continuous_fanout_allows_physical_admission_delete_and_clean_
                 .await
                 .unwrap();
             // A is pending at every entry, including B's preparation/delete/ack.
-            assert_eq!(query(&store,"SELECT count(*) AS n FROM frozen_sweep_consumer WHERE manifest_id='a-hot' AND pending=1").await,2);
+            assert_eq!(query(&store,"SELECT count(*) AS n FROM compaction_frozen_sweep_consumer WHERE manifest_id='a-hot' AND pending=1").await,2);
             assert!(progress.quantum(&store).await.unwrap());
             assert!(
                 progress.sweep_pending.len() + usize::from(progress.sweep.is_some())
@@ -113,7 +113,7 @@ async fn resetting_low_consumer_cannot_starve_later_sources_or_other_kind() {
             progress = FrozenStorageLifetimeProgress::default();
         }
     }
-    assert_eq!(query(&store,"SELECT count(*) AS n FROM frozen_sweep_consumer WHERE manifest_id='z-consumer' AND pending=1").await,0);
+    assert_eq!(query(&store,"SELECT count(*) AS n FROM compaction_frozen_sweep_consumer WHERE manifest_id='z-consumer' AND pending=1").await,0);
     for kind in [0, 1] {
         assert!(work(&store, "z-backing", kind).await.revision > old[kind as usize]);
     }
@@ -121,7 +121,7 @@ async fn resetting_low_consumer_cannot_starve_later_sources_or_other_kind() {
     // after propagation, still without stopping unrelated A or draining metadata.
     exec(
         &store,
-        "UPDATE frozen_sweep_work SET retry_at=0 WHERE manifest_id='z-backing'",
+        "UPDATE compaction_frozen_sweep_work SET retry_at=0 WHERE manifest_id='z-backing'",
     )
     .await;
     for step in 0..160 {
@@ -252,9 +252,9 @@ async fn initial_physical_scope_refusal_survives_restart_and_repairs_each_kind_b
     Migrator::up(&db, None).await.unwrap();
     let mut progress = FrozenStorageLifetimeProgress::default();
     assert_initial_scope_refusal(&store, &mut progress).await;
-    assert_eq!(query(&store,"SELECT count(*) AS n FROM frozen_sweep_bootstrap WHERE kind=0 AND after_manifest='a-known' AND complete=0").await,1);
+    assert_eq!(query(&store,"SELECT count(*) AS n FROM compaction_frozen_sweep_bootstrap WHERE kind=0 AND after_manifest='a-known' AND complete=0").await,1);
     // Already checked scope must not be re-inventoried after restart.
-    exec(&store,"CREATE TRIGGER fixture_checked_cursor BEFORE UPDATE ON frozen_sweep_bootstrap WHEN NEW.kind=0 AND NEW.after_manifest='a-known' BEGIN SELECT RAISE(ABORT,'checked group repeated'); END").await;
+    exec(&store,"CREATE TRIGGER fixture_checked_cursor BEFORE UPDATE ON compaction_frozen_sweep_bootstrap WHEN NEW.kind=0 AND NEW.after_manifest='a-known' BEGIN SELECT RAISE(ABORT,'checked group repeated'); END").await;
     let mut restart = FrozenStorageLifetimeProgress::default();
     assert_initial_scope_refusal(&store, &mut restart).await;
     header(&store, "m-orphan-message", 0, 0, 0).await;
@@ -262,7 +262,7 @@ async fn initial_physical_scope_refusal_survives_restart_and_repairs_each_kind_b
     assert_eq!(
         query(
             &store,
-            "SELECT complete AS n FROM frozen_sweep_bootstrap WHERE kind=0"
+            "SELECT complete AS n FROM compaction_frozen_sweep_bootstrap WHERE kind=0"
         )
         .await,
         1
@@ -270,7 +270,7 @@ async fn initial_physical_scope_refusal_survives_restart_and_repairs_each_kind_b
     assert_eq!(
         query(
             &store,
-            "SELECT complete AS n FROM frozen_sweep_bootstrap WHERE kind=1"
+            "SELECT complete AS n FROM compaction_frozen_sweep_bootstrap WHERE kind=1"
         )
         .await,
         0
@@ -290,7 +290,7 @@ async fn initial_physical_scope_refusal_survives_restart_and_repairs_each_kind_b
     assert_eq!(
         query(
             &store,
-            "SELECT count(*) AS n FROM frozen_sweep_bootstrap WHERE complete=1"
+            "SELECT count(*) AS n FROM compaction_frozen_sweep_bootstrap WHERE complete=1"
         )
         .await,
         2
@@ -311,7 +311,7 @@ async fn initial_physical_scope_refusal_survives_restart_and_repairs_each_kind_b
         .await,
         0
     );
-    exec(&store,"CREATE TRIGGER fixture_no_bootstrap_restart BEFORE UPDATE ON frozen_sweep_bootstrap BEGIN SELECT RAISE(ABORT,'bootstrap restarted'); END").await;
+    exec(&store,"CREATE TRIGGER fixture_no_bootstrap_restart BEFORE UPDATE ON compaction_frozen_sweep_bootstrap BEGIN SELECT RAISE(ABORT,'bootstrap restarted'); END").await;
     drive_lifetime_to_idle(&store, &mut FrozenStorageLifetimeProgress::default()).await;
 }
 
@@ -370,7 +370,7 @@ async fn initial_physical_scope_uses_both_candidate_and_span_endpoint_directions
         assert_eq!(
             query(
                 &store,
-                "SELECT count(*) AS n FROM frozen_sweep_bootstrap WHERE complete=1"
+                "SELECT count(*) AS n FROM compaction_frozen_sweep_bootstrap WHERE complete=1"
             )
             .await,
             2
@@ -429,7 +429,7 @@ async fn physical_round_serves_behind_cursor_despite_continuous_arrivals_and_red
         if kind == 1 {
             exec(
                 &store,
-                "UPDATE frozen_sweep_work SET retry_at=1 WHERE manifest_id='a-behind' AND kind=1",
+                "UPDATE compaction_frozen_sweep_work SET retry_at=1 WHERE manifest_id='a-behind' AND kind=1",
             )
             .await;
         }
@@ -499,7 +499,7 @@ async fn physical_round_serves_behind_cursor_despite_continuous_arrivals_and_red
         assert!(
             query(
                 &store,
-                "SELECT work_row AS n FROM frozen_sweep_work WHERE manifest_id='n0000' AND kind=0"
+                "SELECT work_row AS n FROM compaction_frozen_sweep_work WHERE manifest_id='n0000' AND kind=0"
             )
             .await
                 > frontier
@@ -507,10 +507,10 @@ async fn physical_round_serves_behind_cursor_despite_continuous_arrivals_and_red
         assert!(progress.accounting.rows[kind as usize] >= 3);
         // Service identity survives invalidation and cannot be moved behind a
         // frontier. Explicit backwards allocation fails atomically as well.
-        assert!(store.connection.execute_unprepared("UPDATE frozen_sweep_work SET work_row=work_row+100000 WHERE manifest_id='a-behind'").await.is_err());
-        assert!(store.connection.execute_unprepared("INSERT INTO frozen_sweep_work(work_row,manifest_id,kind) VALUES(-1,'backwards',0)").await.is_err());
-        exec(&store,"INSERT INTO frozen_sweep_work(work_row,manifest_id,kind) VALUES(9223372036854775807,'service-exhausted',0)").await;
-        assert!(store.connection.execute_unprepared("INSERT INTO frozen_sweep_work(work_row,manifest_id,kind) VALUES(9223372036854775806,'behind-frontier',0)").await.is_err());
+        assert!(store.connection.execute_unprepared("UPDATE compaction_frozen_sweep_work SET work_row=work_row+100000 WHERE manifest_id='a-behind'").await.is_err());
+        assert!(store.connection.execute_unprepared("INSERT INTO compaction_frozen_sweep_work(work_row,manifest_id,kind) VALUES(-1,'backwards',0)").await.is_err());
+        exec(&store,"INSERT INTO compaction_frozen_sweep_work(work_row,manifest_id,kind) VALUES(9223372036854775807,'service-exhausted',0)").await;
+        assert!(store.connection.execute_unprepared("INSERT INTO compaction_frozen_sweep_work(work_row,manifest_id,kind) VALUES(9223372036854775806,'behind-frontier',0)").await.is_err());
         // Random fallback IDs at exhaustion must abort the physical mutation,
         // rather than registering its new key behind an existing frontier.
         assert!(store.connection.execute_unprepared("INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES('allocation-refused',0,'{}',2)").await.is_err());
@@ -518,7 +518,7 @@ async fn physical_round_serves_behind_cursor_despite_continuous_arrivals_and_red
         assert_eq!(
             query(
                 &store,
-                "SELECT count(*) AS n FROM frozen_sweep_work WHERE manifest_id='allocation-refused'"
+                "SELECT count(*) AS n FROM compaction_frozen_sweep_work WHERE manifest_id='allocation-refused'"
             )
             .await,
             0
@@ -554,7 +554,7 @@ async fn physical_round_pages_future_retries_without_false_eof_or_idle_loop() {
             .connection
             .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "UPDATE frozen_sweep_work SET retry_at=1 WHERE manifest_id='z-due' AND kind=?1",
+                "UPDATE compaction_frozen_sweep_work SET retry_at=1 WHERE manifest_id='z-due' AND kind=?1",
                 [kind.into()],
             ))
             .await
@@ -675,10 +675,118 @@ async fn losing_physical_round_keeps_generation_and_relevant_prefanout_fence() {
 }
 
 #[tokio::test]
+async fn fresh_sweep_schema_uses_compaction_names_and_generated_entities() {
+    use pioneer_entity::prelude::{
+        CompactionFrozenSweepBootstrap, CompactionFrozenSweepConsumer, CompactionFrozenSweepFanout,
+        CompactionFrozenSweepWork,
+    };
+    use sea_orm::EntityName;
+
+    let store = blank(false).await;
+    let tables = [
+        (
+            CompactionFrozenSweepBootstrap.table_name().to_owned(),
+            "compaction_frozen_sweep_bootstrap",
+        ),
+        (
+            CompactionFrozenSweepConsumer.table_name().to_owned(),
+            "compaction_frozen_sweep_consumer",
+        ),
+        (
+            CompactionFrozenSweepFanout.table_name().to_owned(),
+            "compaction_frozen_sweep_fanout",
+        ),
+        (
+            CompactionFrozenSweepWork.table_name().to_owned(),
+            "compaction_frozen_sweep_work",
+        ),
+    ];
+    for (generated, expected) in &tables {
+        assert_eq!(generated.as_str(), *expected);
+    }
+    let mut expected = tables
+        .into_iter()
+        .map(|(_, name)| ("table".to_owned(), name.to_owned()))
+        .collect::<BTreeSet<_>>();
+    for name in [
+        "compaction_frozen_sweep_work_pending",
+        "compaction_frozen_sweep_work_service",
+        "compaction_frozen_sweep_consumer_pending",
+        "compaction_frozen_sweep_consumer_sources",
+        "compaction_frozen_sweep_source_consumers",
+        "compaction_frozen_sweep_bootstrap_pending",
+    ] {
+        expected.insert(("index".to_owned(), name.to_owned()));
+    }
+    for name in [
+        "compaction_frozen_sweep_work_retain",
+        "compaction_frozen_sweep_work_identity",
+        "compaction_frozen_sweep_consumer_retain",
+        "compaction_frozen_sweep_consumer_identity",
+        "compaction_frozen_sweep_consumer_row_identity",
+        "compaction_frozen_sweep_work_row_insert",
+        "compaction_frozen_sweep_work_row_identity",
+        "compaction_frozen_sweep_message_data_insert",
+        "compaction_frozen_sweep_message_data_update",
+        "compaction_frozen_sweep_import_data_insert",
+        "compaction_frozen_sweep_import_data_update",
+        "compaction_frozen_sweep_history_insert",
+        "compaction_frozen_sweep_history_delete",
+        "compaction_frozen_sweep_history_update",
+        "compaction_frozen_sweep_layout_insert",
+        "compaction_frozen_sweep_layout_delete",
+        "compaction_frozen_sweep_layout_update",
+        "compaction_frozen_sweep_span_insert",
+        "compaction_frozen_sweep_span_delete",
+        "compaction_frozen_sweep_span_update",
+        "compaction_frozen_sweep_cleanup_bounds",
+    ] {
+        expected.insert(("trigger".to_owned(), name.to_owned()));
+    }
+    let catalog = store
+        .connection
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT type,name FROM sqlite_schema WHERE name GLOB 'compaction_frozen_sweep_*'",
+        ))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row.try_get::<String>("", "type").unwrap(),
+                row.try_get::<String>("", "name").unwrap(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(catalog, expected);
+    // Historical prefixes are negative catalog assertions, never fallback tables.
+    assert_eq!(query(&store, "SELECT count(*) AS n FROM sqlite_schema WHERE name GLOB 'frozen_sweep_*' OR name GLOB 'sweep_compaction_frozen_*' OR name='sweep_cleanup_bounds'").await, 0);
+
+    // Fresh installed triggers must deliver physical writes to the same tables
+    // the generated entities and the real sweep admission queries now address.
+    header(&store, "naming-consumer", 1, 1, 0).await;
+    let before = [
+        work(&store, "naming-consumer", 0).await.revision,
+        work(&store, "naming-consumer", 1).await.revision,
+    ];
+    for kind in [0, 1] {
+        row(&store, "naming-consumer", kind, 0).await;
+        assert!(work(&store, "naming-consumer", kind).await.revision > before[kind as usize]);
+    }
+    let mut progress = FrozenStorageLifetimeProgress::default();
+    drain(&store, &mut progress).await;
+    for kind in [0, 1] {
+        assert_eq!(pending(&store, "naming-consumer", kind).await, 0);
+    }
+}
+
+#[tokio::test]
 async fn generated_sweep_entities_preserve_defaults_conflicts_and_null_cursor_delivery() {
     use pioneer_entity::{
-        frozen_sweep_bootstrap as bootstrap, frozen_sweep_consumer as consumer,
-        frozen_sweep_fanout as fanout, frozen_sweep_work as queued,
+        compaction_frozen_sweep_bootstrap as bootstrap,
+        compaction_frozen_sweep_consumer as consumer, compaction_frozen_sweep_fanout as fanout,
+        compaction_frozen_sweep_work as queued,
     };
     use sea_orm::sea_query::OnConflict;
     let store = blank(false).await;

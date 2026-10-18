@@ -5,16 +5,16 @@ use serde::{Deserialize, Serialize};
 
 #[sea_orm::model]
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
-#[sea_orm(table_name = "frozen_sweep_work")]
+#[sea_orm(table_name = "compaction_frozen_sweep_bootstrap")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
-    pub work_row: i64,
-    #[sea_orm(column_type = "Text")]
-    pub manifest_id: String,
     pub kind: i64,
-    pub revision: i64,
-    pub pending: i64,
-    pub retry_at: i64,
+    pub started: i64,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub upper_manifest: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub after_manifest: Option<String>,
+    pub complete: i64,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

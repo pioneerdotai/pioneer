@@ -9,7 +9,7 @@ pub struct Migration;
 fn enqueue(table: &str, id: &str, kind: &str) -> String {
     format!(
         "INSERT INTO {table}(manifest_id,kind) SELECT {id},{kind} WHERE {id} IS NOT NULL AND {kind} IN (0,1) ON CONFLICT(manifest_id,kind) DO UPDATE SET revision=revision+1,pending=1{};",
-        if table == "frozen_sweep_work" {
+        if table == "compaction_frozen_sweep_work" {
             ",retry_at=0"
         } else {
             ",after_source=NULL"
@@ -20,8 +20,8 @@ fn enqueue(table: &str, id: &str, kind: &str) -> String {
 fn consumer(id: &str, kind: &str) -> String {
     format!(
         "{}{}",
-        enqueue("frozen_sweep_work", id, kind),
-        enqueue("frozen_sweep_consumer", id, kind)
+        enqueue("compaction_frozen_sweep_work", id, kind),
+        enqueue("compaction_frozen_sweep_consumer", id, kind)
     )
 }
 
@@ -36,8 +36,8 @@ impl MigrationTrait for Migration {
         // INTEGER PRIMARY KEY deliberately aliases rowid, without AUTOINCREMENT
         // or an explicit NOT NULL column flag. These are service identities.
         for (table, key) in [
-            ("frozen_sweep_work", "work_row"),
-            ("frozen_sweep_consumer", "consumer_row"),
+            ("compaction_frozen_sweep_work", "work_row"),
+            ("compaction_frozen_sweep_consumer", "consumer_row"),
         ] {
             let mut create = Table::create();
             create
@@ -73,7 +73,7 @@ impl MigrationTrait for Migration {
                         .default(1)
                         .check(Expr::col("pending").is_in([0, 1])),
                 );
-            if table == "frozen_sweep_work" {
+            if table == "compaction_frozen_sweep_work" {
                 create.col(ColumnDef::new("retry_at").integer().not_null().default(0));
             } else {
                 create.col(ColumnDef::new("after_source").text());
@@ -83,7 +83,7 @@ impl MigrationTrait for Migration {
         }
         m.create_table(
             Table::create()
-                .table("frozen_sweep_fanout")
+                .table("compaction_frozen_sweep_fanout")
                 .col(
                     ColumnDef::new("id")
                         .integer()
@@ -108,7 +108,7 @@ impl MigrationTrait for Migration {
         .await?;
         m.create_table(
             Table::create()
-                .table("frozen_sweep_bootstrap")
+                .table("compaction_frozen_sweep_bootstrap")
                 .col(
                     ColumnDef::new("kind")
                         .integer()
@@ -136,33 +136,33 @@ impl MigrationTrait for Migration {
         .await?;
         for (name, table, columns) in [
             (
-                "frozen_sweep_pending",
-                "frozen_sweep_work",
+                "compaction_frozen_sweep_work_pending",
+                "compaction_frozen_sweep_work",
                 vec!["pending", "kind", "retry_at", "manifest_id"],
             ),
             (
-                "frozen_sweep_service",
-                "frozen_sweep_work",
+                "compaction_frozen_sweep_work_service",
+                "compaction_frozen_sweep_work",
                 vec!["pending", "kind", "work_row"],
             ),
             (
-                "frozen_sweep_consumer_pending",
-                "frozen_sweep_consumer",
+                "compaction_frozen_sweep_consumer_pending",
+                "compaction_frozen_sweep_consumer",
                 vec!["pending"],
             ),
             (
-                "frozen_sweep_consumer_sources",
+                "compaction_frozen_sweep_consumer_sources",
                 "compaction_frozen_span",
                 vec!["manifest_id", "kind", "source_manifest"],
             ),
             (
-                "frozen_sweep_source_consumers",
+                "compaction_frozen_sweep_source_consumers",
                 "compaction_frozen_span",
                 vec!["source_manifest", "kind", "manifest_id"],
             ),
             (
-                "frozen_sweep_bootstrap_pending",
-                "frozen_sweep_bootstrap",
+                "compaction_frozen_sweep_bootstrap_pending",
+                "compaction_frozen_sweep_bootstrap",
                 vec!["complete", "kind"],
             ),
         ] {
@@ -175,7 +175,7 @@ impl MigrationTrait for Migration {
         }
         db.execute(
             &Query::insert()
-                .into_table("frozen_sweep_fanout")
+                .into_table("compaction_frozen_sweep_fanout")
                 .columns(["id"])
                 .values_panic([1_i64.into()])
                 .to_owned(),
@@ -183,7 +183,7 @@ impl MigrationTrait for Migration {
         .await?;
         db.execute(
             &Query::insert()
-                .into_table("frozen_sweep_bootstrap")
+                .into_table("compaction_frozen_sweep_bootstrap")
                 .columns(["kind"])
                 .values_panic([0_i64.into()])
                 .values_panic([1_i64.into()])
@@ -193,20 +193,23 @@ impl MigrationTrait for Migration {
         // Permanent tokens prevent ABA across domain delete/recreate. Integer
         // overflow fails CHECK (SQLite promotes overflowing arithmetic to REAL),
         // rolling back the domain mutation rather than resetting a generation.
-        for table in ["frozen_sweep_work", "frozen_sweep_consumer"] {
+        for table in [
+            "compaction_frozen_sweep_work",
+            "compaction_frozen_sweep_consumer",
+        ] {
             db.execute_unprepared(&format!("CREATE TRIGGER {table}_retain BEFORE DELETE ON {table} BEGIN SELECT RAISE(ABORT,'sweep generations are retained'); END")).await?;
             db.execute_unprepared(&format!("CREATE TRIGGER {table}_identity BEFORE UPDATE OF manifest_id,kind ON {table} WHEN NEW.manifest_id IS NOT OLD.manifest_id OR NEW.kind IS NOT OLD.kind BEGIN SELECT RAISE(ABORT,'sweep generation identity immutable'); END")).await?;
         }
-        db.execute_unprepared("CREATE TRIGGER frozen_sweep_consumer_row_identity BEFORE UPDATE OF consumer_row ON frozen_sweep_consumer WHEN NEW.consumer_row IS NOT OLD.consumer_row BEGIN SELECT RAISE(ABORT,'consumer service identity immutable'); END").await?;
+        db.execute_unprepared("CREATE TRIGGER compaction_frozen_sweep_consumer_row_identity BEFORE UPDATE OF consumer_row ON compaction_frozen_sweep_consumer WHEN NEW.consumer_row IS NOT OLD.consumer_row BEGIN SELECT RAISE(ABORT,'consumer service identity immutable'); END").await?;
         // Retention plus SQLite's automatic rowid allocation gives insertion
         // order. Reject random rowid fallback at i64 exhaustion; never insert
         // behind a captured frontier. This runs only on actual new work rows,
         // not the UPDATE branch of a coalesced UPSERT.
-        db.execute_unprepared("CREATE TRIGGER frozen_sweep_work_row_insert AFTER INSERT ON frozen_sweep_work WHEN NEW.work_row<>(SELECT MAX(work_row) FROM frozen_sweep_work) BEGIN SELECT RAISE(ABORT,'work service identity exhausted'); END").await?;
-        db.execute_unprepared("CREATE TRIGGER frozen_sweep_work_row_identity BEFORE UPDATE OF work_row ON frozen_sweep_work WHEN NEW.work_row IS NOT OLD.work_row BEGIN SELECT RAISE(ABORT,'work service identity immutable'); END").await?;
-        for (table, kind) in [
-            ("compaction_frozen_message_data", "0"),
-            ("compaction_frozen_import_data", "1"),
+        db.execute_unprepared("CREATE TRIGGER compaction_frozen_sweep_work_row_insert AFTER INSERT ON compaction_frozen_sweep_work WHEN NEW.work_row<>(SELECT MAX(work_row) FROM compaction_frozen_sweep_work) BEGIN SELECT RAISE(ABORT,'work service identity exhausted'); END").await?;
+        db.execute_unprepared("CREATE TRIGGER compaction_frozen_sweep_work_row_identity BEFORE UPDATE OF work_row ON compaction_frozen_sweep_work WHEN NEW.work_row IS NOT OLD.work_row BEGIN SELECT RAISE(ABORT,'work service identity immutable'); END").await?;
+        for (table, family, kind) in [
+            ("compaction_frozen_message_data", "message_data", "0"),
+            ("compaction_frozen_import_data", "import_data", "1"),
         ] {
             let fields = if kind == "0" {
                 "manifest_id,ordinal,reference_json,bytes"
@@ -219,14 +222,14 @@ impl MigrationTrait for Migration {
                 .collect::<Vec<_>>()
                 .join(" OR ");
             db.execute_unprepared(&format!(
-                "CREATE TRIGGER sweep_{table}_insert AFTER INSERT ON {table} BEGIN {} END",
-                enqueue("frozen_sweep_work", "NEW.manifest_id", kind)
+                "CREATE TRIGGER compaction_frozen_sweep_{family}_insert AFTER INSERT ON {table} BEGIN {} END",
+                enqueue("compaction_frozen_sweep_work", "NEW.manifest_id", kind)
             ))
             .await?;
             db.execute_unprepared(&format!(
-                "CREATE TRIGGER sweep_{table}_update AFTER UPDATE ON {table} WHEN {changed} BEGIN {}{} END",
-                enqueue("frozen_sweep_work", "OLD.manifest_id", kind),
-                enqueue("frozen_sweep_work", "NEW.manifest_id", kind)
+                "CREATE TRIGGER compaction_frozen_sweep_{family}_update AFTER UPDATE ON {table} WHEN {changed} BEGIN {}{} END",
+                enqueue("compaction_frozen_sweep_work", "OLD.manifest_id", kind),
+                enqueue("compaction_frozen_sweep_work", "NEW.manifest_id", kind)
             ))
             .await?;
             // DELETE cannot add physical work. In particular our own bounded
@@ -234,11 +237,12 @@ impl MigrationTrait for Migration {
         }
         let header_fields = "id,workspace_id,owner_thread,identity_sha256,imports_sha256,message_count,import_count,next_ordinal,next_import,ready,expired,storage_registered";
         let layout_fields = "manifest_id,kind,active,pending,candidate,compared,copy_to,copy_next,cleanup_to,failed";
-        for (table, fields) in [
-            ("compaction_frozen_history", header_fields),
-            ("compaction_frozen_layout", layout_fields),
+        for (table, family, fields) in [
+            ("compaction_frozen_history", "history", header_fields),
+            ("compaction_frozen_layout", "layout", layout_fields),
             (
                 "compaction_frozen_span",
+                "span",
                 "manifest_id,kind,start,end,source_manifest",
             ),
         ] {
@@ -273,18 +277,18 @@ impl MigrationTrait for Migration {
                             "source_manifest"
                         };
                         body += &enqueue(
-                            "frozen_sweep_work",
+                            "compaction_frozen_sweep_work",
                             &format!("{side}.{target}"),
                             &format!("{side}.kind"),
                         );
                     }
                 }
-                db.execute_unprepared(&format!("CREATE TRIGGER sweep_{table}_{} AFTER {event} ON {table} {when} BEGIN {body} END", event.to_lowercase())).await?;
+                db.execute_unprepared(&format!("CREATE TRIGGER compaction_frozen_sweep_{family}_{} AFTER {event} ON {table} {when} BEGIN {body} END", event.to_lowercase())).await?;
             }
         }
         // Valid cleanup cursor advancement does not affect geometry or holds.
         // Crossing from/to invalid bounds does affect LayoutScan's refusal.
-        db.execute_unprepared(&format!("CREATE TRIGGER sweep_cleanup_bounds AFTER UPDATE OF cleanup_next ON compaction_frozen_layout WHEN (OLD.cleanup_next<0 OR OLD.cleanup_next>OLD.cleanup_to OR NEW.cleanup_next<0 OR NEW.cleanup_next>NEW.cleanup_to) AND OLD.cleanup_next IS NOT NEW.cleanup_next BEGIN {} END", consumer("NEW.manifest_id", "NEW.kind"))).await?;
+        db.execute_unprepared(&format!("CREATE TRIGGER compaction_frozen_sweep_cleanup_bounds AFTER UPDATE OF cleanup_next ON compaction_frozen_layout WHEN (OLD.cleanup_next<0 OR OLD.cleanup_next>OLD.cleanup_to OR NEW.cleanup_next<0 OR NEW.cleanup_next>NEW.cleanup_to) AND OLD.cleanup_next IS NOT NEW.cleanup_next BEGIN {} END", consumer("NEW.manifest_id", "NEW.kind"))).await?;
         Ok(())
     }
 

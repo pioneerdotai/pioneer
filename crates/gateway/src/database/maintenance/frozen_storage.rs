@@ -913,7 +913,7 @@ mod tests {
         assert!(idle);
         let first_reads = observer.operations() - before;
         let row = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
-            "SELECT count(*) AS n FROM frozen_sweep_work WHERE manifest_id='held-physical' AND pending=0")).await.unwrap().unwrap();
+            "SELECT count(*) AS n FROM compaction_frozen_sweep_work WHERE manifest_id='held-physical' AND pending=0")).await.unwrap().unwrap();
         assert_eq!(row.try_get::<i64>("", "n").unwrap(), 2);
         let writes = observer.writes.lock().unwrap().len();
         let before = observer.operations();
