@@ -489,6 +489,7 @@ fn pre_runner_failure(header: &history::Model) -> SimpleExpr {
 }
 struct ExpiryPreparation {
     header: history::Model,
+    roots_checked: bool,
     operations_after: String,
     operations_done: bool,
     checkpoint_after: String,
@@ -501,6 +502,7 @@ impl ExpiryPreparation {
     fn new(header: history::Model) -> Self {
         Self {
             header,
+            roots_checked: false,
             operations_after: String::new(),
             operations_done: false,
             checkpoint_after: String::new(),
@@ -511,6 +513,28 @@ impl ExpiryPreparation {
         }
     }
     async fn step(&mut self, store: &CrudStore, accounting: &mut SweepAccounting) -> Result<bool> {
+        if !self.roots_checked {
+            // Advisory positive hold only, once per attempt. Release the reader
+            // before any preparation; a negative result leaves every final
+            // writer guard in place. Ordinary passes revisit released roots.
+            let held = store.connection.query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                r#"SELECT 1 WHERE
+EXISTS(SELECT 1 FROM task_run_conversation_snapshot s LEFT JOIN task t ON t.id=s.task_id WHERE s.frozen_manifest_id=?1 AND (t.id IS NULL OR t.status NOT IN ('completed','failed','cancelled')))
+OR EXISTS(SELECT 1 FROM turn_runtime_snapshot s WHERE s.frozen_manifest_id=?1)
+OR EXISTS(SELECT 1 FROM thread_cli_runtime_binding s WHERE s.frozen_manifest_id=?1)
+OR EXISTS(SELECT 1 FROM turn_cli_runtime_binding s WHERE s.frozen_manifest_id=?1)
+OR EXISTS(SELECT 1 FROM compaction_task_output s WHERE s.manifest_id=?1)
+LIMIT 1"#,
+                [self.header.id.clone().into()],
+            )).await?.is_some();
+            self.roots_checked = true;
+            if held {
+                accounting.held += 1;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
         if self.layout_kind < 2 {
             if let Some(layout) = self.layout.as_mut() {
                 layout.step(store).await?;
@@ -2560,6 +2584,9 @@ impl ScopeDiscovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod expiry_preflight {
+        include!("frozen_storage_lifetime_expiry_tests.rs");
+    }
     use migration::{Migrator, MigratorTrait};
     use pioneer_compaction::{
         Checkpoint, ModelSelection, SourceRef, Transport,
@@ -4462,6 +4489,7 @@ mod tests {
         assert!(error.downcast_ref::<sea_orm::DbErr>().is_some());
         let retry = progress.expiry.as_ref().unwrap();
         assert_eq!(retry.header.id, "origin");
+        assert!(!retry.roots_checked);
         assert_eq!(retry.layout_kind, 0);
         assert!(!retry.operations_done && !retry.checkpoints_done && retry.reverse.is_none());
         assert_eq!(progress.accounting.expired, 0);
