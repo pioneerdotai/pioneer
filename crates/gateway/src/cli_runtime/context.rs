@@ -310,6 +310,80 @@ fn historical_attachment_inputs(
     .map_err(Into::into)
 }
 
+/// Budget the same portable history and attachment items used by CLI delivery.
+/// These are frame estimates, not API model media estimates or hidden context.
+pub(crate) fn completed_cli_history_budget(
+    history: &[ChatMessage],
+    workspace: &str,
+    cwd: Option<&str>,
+    runtime_kind: pioneer_protocol::CLIAgentRuntimeKind,
+) -> Result<(
+    u64,
+    Vec<u64>,
+    Vec<pioneer_provider::attachments::MediaInputEstimate>,
+)> {
+    let label = match runtime_kind {
+        pioneer_protocol::CLIAgentRuntimeKind::Codex => "Codex CLI",
+        pioneer_protocol::CLIAgentRuntimeKind::Claude => "Claude CLI",
+        pioneer_protocol::CLIAgentRuntimeKind::OpenCode => "OpenCode CLI",
+    };
+    let mapping = historical_attachment_inputs(history, workspace, cwd, label)?;
+    let mut input = vec![CLIRuntimeTurnInputItem::Text {
+        text: thread_context_from_history(history)?.text,
+    }];
+    input.extend(mapping.input);
+    let mut visual = 0_u64;
+    let mut media = Vec::new();
+    let mut per_message = Vec::with_capacity(history.len());
+    for (message_index, message) in history.iter().enumerate() {
+        let mut tokens = 0_u64;
+        for (part_index, part) in message.content_parts.iter().enumerate() {
+            let attachment = match part {
+                MessageContentPart::Image { image } => image,
+                MessageContentPart::File { file } => file,
+                MessageContentPart::Text { .. } => continue,
+                _ => anyhow::bail!("unsupported CLI historical media"),
+            };
+            // Claude materializes local images; other CLI media stay references
+            // in this frame and must not inherit API model image assumptions.
+            let image_tokens = if runtime_kind == pioneer_protocol::CLIAgentRuntimeKind::Claude
+                && matches!(part, MessageContentPart::Image { .. })
+                && let AttachmentDataSource::Path { path } = &attachment.source
+            {
+                let (width, height) = image::image_dimensions(path)?;
+                pioneer_provider::attachments::image_tokens("anthropic", "claude", width, height)?
+            } else {
+                0
+            };
+            visual = visual.saturating_add(image_tokens);
+            // NativeRequestProjection uses this only to validate retained part
+            // identities; final token totals below come from the CLI frame.
+            let estimate = pioneer_compaction::text_tokens(&serde_json::to_string(attachment)?)
+                .saturating_add(image_tokens)
+                .max(1);
+            media.push(pioneer_provider::attachments::MediaInputEstimate {
+                message: message_index,
+                part: part_index,
+                input_tokens: estimate,
+            });
+            tokens = tokens.saturating_add(image_tokens);
+        }
+        let singleton = [message.clone()];
+        let mut items = vec![CLIRuntimeTurnInputItem::Text {
+            text: thread_context_from_history(&singleton)?.text,
+        }];
+        items.extend(historical_attachment_inputs(&singleton, workspace, cwd, label)?.input);
+        per_message.push(
+            pioneer_compaction::text_tokens(&serde_json::to_string(&items)?).saturating_add(tokens),
+        );
+    }
+    Ok((
+        pioneer_compaction::text_tokens(&serde_json::to_string(&input)?).saturating_add(visual),
+        per_message,
+        media,
+    ))
+}
+
 pub(crate) fn cli_runtime_mcp_capabilities_input(
     projection: Option<&crate::turn_mcp::ResolvedMcpTurnProjection>,
 ) -> Option<CliRuntimeSelectedCapabilitiesInput> {
@@ -546,8 +620,9 @@ mod tests {
     use super::{
         CLIRuntimeContextBuildInput, cli_runtime_mcp_capabilities_input,
         cli_runtime_prompt_manifest_from_plan, compile_cli_runtime_delivery_plan,
+        completed_cli_history_budget, historical_attachment_inputs,
         prepend_cli_turn_context_and_history_input, prepend_cli_turn_context_input,
-        validate_cli_runtime_turn_input_frame,
+        thread_context_from_history, validate_cli_runtime_turn_input_frame,
     };
     use pioneer_cli_agent_runtime::input::{CLIRuntimeTurnInputItem, CLIRuntimeTurnInputMapping};
     use pioneer_protocol::{CLIAgentRuntimeKind, PromptManifestProfile};
@@ -1175,6 +1250,42 @@ mod tests {
             CLIAgentRuntimeKind::Claude,
         )
         .expect("visual token estimate should admit an ordinary image below the byte cap");
+    }
+
+    #[test]
+    fn completed_cli_history_counts_the_actual_media_frame_once() {
+        let mut message = ChatMessage::user("accepted history");
+        message.content_parts.push(MessageContentPart::image(
+            pioneer_provider::MessageAttachment::from_url(
+                "https://fixture.invalid/image.png",
+                "image/png",
+            ),
+        ));
+        let history = vec![message];
+        let mapping =
+            historical_attachment_inputs(&history, "workspace", None, "Codex CLI").unwrap();
+        let mut input = vec![CLIRuntimeTurnInputItem::Text {
+            text: thread_context_from_history(&history).unwrap().text,
+        }];
+        input.extend(mapping.input);
+        let (tokens, per_message, media) = completed_cli_history_budget(
+            &history,
+            "workspace",
+            None,
+            pioneer_protocol::CLIAgentRuntimeKind::Codex,
+        )
+        .unwrap();
+        assert_eq!(
+            tokens,
+            pioneer_compaction::text_tokens(&serde_json::to_string(&input).unwrap())
+        );
+        assert_eq!(per_message, vec![tokens]);
+        assert_eq!((media[0].message, media[0].part), (0, 0));
+        assert!(media[0].input_tokens > 0);
+        assert!(matches!(
+            history[0].content_parts[0],
+            MessageContentPart::Image { .. }
+        ));
     }
 
     #[test]
