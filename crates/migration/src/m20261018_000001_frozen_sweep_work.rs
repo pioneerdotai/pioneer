@@ -1,6 +1,7 @@
 //! Schema only. Physical inventory and consumer fanout run in bounded maintenance
 //! quanta, never in this migration or a foreground startup transaction.
 use sea_orm_migration::prelude::*;
+use sea_orm_migration::sea_query::{Expr, ExprTrait, Func, Query};
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
@@ -32,43 +33,163 @@ impl MigrationTrait for Migration {
 
     async fn up(&self, m: &SchemaManager) -> Result<(), DbErr> {
         let db = m.get_connection();
-        db.execute_unprepared(r#"
-CREATE TABLE frozen_sweep_work (
- work_row INTEGER PRIMARY KEY CHECK(work_row>0),
- manifest_id TEXT NOT NULL, kind INTEGER NOT NULL CHECK(kind IN (0,1)),
- revision INTEGER NOT NULL DEFAULT 1 CHECK(typeof(revision)='integer' AND revision>0),
- pending INTEGER NOT NULL DEFAULT 1 CHECK(pending IN (0,1)),
- retry_at INTEGER NOT NULL DEFAULT 0,
- UNIQUE(manifest_id,kind)
-);
-CREATE INDEX frozen_sweep_pending ON frozen_sweep_work(pending,kind,retry_at,manifest_id);
-CREATE INDEX frozen_sweep_service ON frozen_sweep_work(pending,kind,work_row);
-CREATE TABLE frozen_sweep_consumer (
- consumer_row INTEGER PRIMARY KEY CHECK(consumer_row>0),
- manifest_id TEXT NOT NULL, kind INTEGER NOT NULL CHECK(kind IN (0,1)),
- revision INTEGER NOT NULL DEFAULT 1 CHECK(typeof(revision)='integer' AND revision>0),
- pending INTEGER NOT NULL DEFAULT 1 CHECK(pending IN (0,1)),
- after_source TEXT,
- UNIQUE(manifest_id,kind)
-);
-CREATE INDEX frozen_sweep_consumer_pending ON frozen_sweep_consumer(pending);
-CREATE INDEX frozen_sweep_consumer_sources ON compaction_frozen_span(manifest_id,kind,source_manifest);
-CREATE INDEX frozen_sweep_source_consumers ON compaction_frozen_span(source_manifest,kind,manifest_id);
-CREATE TABLE frozen_sweep_fanout (
- id INTEGER PRIMARY KEY CHECK(id=1),
- revision INTEGER NOT NULL DEFAULT 1 CHECK(typeof(revision)='integer' AND revision>0),
- after_row INTEGER NOT NULL DEFAULT 0, until_row INTEGER NOT NULL DEFAULT 0
-);
-INSERT INTO frozen_sweep_fanout(id) VALUES(1);
-CREATE TABLE frozen_sweep_bootstrap (
- kind INTEGER PRIMARY KEY CHECK(kind IN (0,1)),
- started INTEGER NOT NULL DEFAULT 0 CHECK(started IN (0,1)),
- upper_manifest TEXT, after_manifest TEXT,
- complete INTEGER NOT NULL DEFAULT 0 CHECK(complete IN (0,1))
-);
-INSERT INTO frozen_sweep_bootstrap(kind) VALUES(0),(1);
-CREATE INDEX frozen_sweep_bootstrap_pending ON frozen_sweep_bootstrap(complete,kind);
-"#).await?;
+        // INTEGER PRIMARY KEY deliberately aliases rowid, without AUTOINCREMENT
+        // or an explicit NOT NULL column flag. These are service identities.
+        for (table, key) in [
+            ("frozen_sweep_work", "work_row"),
+            ("frozen_sweep_consumer", "consumer_row"),
+        ] {
+            let mut create = Table::create();
+            create
+                .table(table)
+                .col(
+                    ColumnDef::new(key)
+                        .integer()
+                        .primary_key()
+                        .check(Expr::col(key).gt(0)),
+                )
+                .col(ColumnDef::new("manifest_id").text().not_null())
+                .col(
+                    ColumnDef::new("kind")
+                        .integer()
+                        .not_null()
+                        .check(Expr::col("kind").is_in([0, 1])),
+                )
+                .col(
+                    ColumnDef::new("revision")
+                        .integer()
+                        .not_null()
+                        .default(1)
+                        .check(
+                            Expr::expr(Func::cust(Alias::new("typeof")).arg(Expr::col("revision")))
+                                .eq("integer")
+                                .and(Expr::col("revision").gt(0)),
+                        ),
+                )
+                .col(
+                    ColumnDef::new("pending")
+                        .integer()
+                        .not_null()
+                        .default(1)
+                        .check(Expr::col("pending").is_in([0, 1])),
+                );
+            if table == "frozen_sweep_work" {
+                create.col(ColumnDef::new("retry_at").integer().not_null().default(0));
+            } else {
+                create.col(ColumnDef::new("after_source").text());
+            }
+            create.index(Index::create().unique().col("manifest_id").col("kind"));
+            m.create_table(create.to_owned()).await?;
+        }
+        m.create_table(
+            Table::create()
+                .table("frozen_sweep_fanout")
+                .col(
+                    ColumnDef::new("id")
+                        .integer()
+                        .primary_key()
+                        .check(Expr::col("id").eq(1)),
+                )
+                .col(
+                    ColumnDef::new("revision")
+                        .integer()
+                        .not_null()
+                        .default(1)
+                        .check(
+                            Expr::expr(Func::cust(Alias::new("typeof")).arg(Expr::col("revision")))
+                                .eq("integer")
+                                .and(Expr::col("revision").gt(0)),
+                        ),
+                )
+                .col(ColumnDef::new("after_row").integer().not_null().default(0))
+                .col(ColumnDef::new("until_row").integer().not_null().default(0))
+                .to_owned(),
+        )
+        .await?;
+        m.create_table(
+            Table::create()
+                .table("frozen_sweep_bootstrap")
+                .col(
+                    ColumnDef::new("kind")
+                        .integer()
+                        .primary_key()
+                        .check(Expr::col("kind").is_in([0, 1])),
+                )
+                .col(
+                    ColumnDef::new("started")
+                        .integer()
+                        .not_null()
+                        .default(0)
+                        .check(Expr::col("started").is_in([0, 1])),
+                )
+                .col(ColumnDef::new("upper_manifest").text())
+                .col(ColumnDef::new("after_manifest").text())
+                .col(
+                    ColumnDef::new("complete")
+                        .integer()
+                        .not_null()
+                        .default(0)
+                        .check(Expr::col("complete").is_in([0, 1])),
+                )
+                .to_owned(),
+        )
+        .await?;
+        for (name, table, columns) in [
+            (
+                "frozen_sweep_pending",
+                "frozen_sweep_work",
+                vec!["pending", "kind", "retry_at", "manifest_id"],
+            ),
+            (
+                "frozen_sweep_service",
+                "frozen_sweep_work",
+                vec!["pending", "kind", "work_row"],
+            ),
+            (
+                "frozen_sweep_consumer_pending",
+                "frozen_sweep_consumer",
+                vec!["pending"],
+            ),
+            (
+                "frozen_sweep_consumer_sources",
+                "compaction_frozen_span",
+                vec!["manifest_id", "kind", "source_manifest"],
+            ),
+            (
+                "frozen_sweep_source_consumers",
+                "compaction_frozen_span",
+                vec!["source_manifest", "kind", "manifest_id"],
+            ),
+            (
+                "frozen_sweep_bootstrap_pending",
+                "frozen_sweep_bootstrap",
+                vec!["complete", "kind"],
+            ),
+        ] {
+            let mut index = Index::create();
+            index.name(name).table(table);
+            for column in columns {
+                index.col(column);
+            }
+            m.create_index(index.to_owned()).await?;
+        }
+        db.execute(
+            &Query::insert()
+                .into_table("frozen_sweep_fanout")
+                .columns(["id"])
+                .values_panic([1_i64.into()])
+                .to_owned(),
+        )
+        .await?;
+        db.execute(
+            &Query::insert()
+                .into_table("frozen_sweep_bootstrap")
+                .columns(["kind"])
+                .values_panic([0_i64.into()])
+                .values_panic([1_i64.into()])
+                .to_owned(),
+        )
+        .await?;
         // Permanent tokens prevent ABA across domain delete/recreate. Integer
         // overflow fails CHECK (SQLite promotes overflowing arithmetic to REAL),
         // rolling back the domain mutation rather than resetting a generation.

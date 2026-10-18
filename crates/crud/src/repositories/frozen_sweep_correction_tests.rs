@@ -673,3 +673,143 @@ async fn losing_physical_round_keeps_generation_and_relevant_prefanout_fence() {
         assert_eq!(restarted.accounting.rows[kind as usize], 3);
     }
 }
+
+#[tokio::test]
+async fn generated_sweep_entities_preserve_defaults_conflicts_and_null_cursor_delivery() {
+    use pioneer_entity::{
+        frozen_sweep_bootstrap as bootstrap, frozen_sweep_consumer as consumer,
+        frozen_sweep_fanout as fanout, frozen_sweep_work as queued,
+    };
+    use sea_orm::sea_query::OnConflict;
+    let store = blank(false).await;
+    for kind in [0_i64, 1] {
+        let row = bootstrap::Entity::find_by_id(kind)
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((row.started, row.complete), (0, 0));
+        assert_eq!((row.upper_manifest, row.after_manifest), (None, None));
+    }
+    let service = fanout::Entity::find_by_id(1_i64)
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (service.revision, service.after_row, service.until_row),
+        (1, 0, 0)
+    );
+    let insert = Query::insert()
+        .into_table(queued::Entity)
+        .columns([queued::Column::ManifestId, queued::Column::Kind])
+        .values_panic(["source".into(), 0_i64.into()])
+        .on_conflict(
+            OnConflict::columns([queued::Column::ManifestId, queued::Column::Kind])
+                .do_nothing()
+                .to_owned(),
+        )
+        .to_owned();
+    // Explicitly omit INTEGER PK/default columns. Generated PK annotations do
+    // not turn these into AUTOINCREMENT or require ORM insert readback.
+    assert_eq!(
+        store
+            .connection
+            .execute(&insert)
+            .await
+            .unwrap()
+            .rows_affected(),
+        1
+    );
+    let first = queued::Entity::find()
+        .filter(queued::Column::ManifestId.eq("source"))
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(first.work_row > 0);
+    assert_eq!(
+        (first.kind, first.revision, first.pending, first.retry_at),
+        (0, 1, 1, 0)
+    );
+    assert_eq!(
+        store
+            .connection
+            .execute(&insert)
+            .await
+            .unwrap()
+            .rows_affected(),
+        0
+    );
+    assert_eq!(
+        queued::Entity::find_by_id(first.work_row)
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap(),
+        first
+    );
+    let tx = store.connection.begin().await.unwrap();
+    assert_eq!(
+        tx.execute(
+            &Query::insert()
+                .into_table(queued::Entity)
+                .columns([queued::Column::ManifestId, queued::Column::Kind])
+                .values_panic(["rolled-back".into(), 1_i64.into()])
+                .to_owned()
+        )
+        .await
+        .unwrap()
+        .rows_affected(),
+        1
+    );
+    tx.rollback().await.unwrap();
+    assert!(
+        queued::Entity::find()
+            .filter(queued::Column::ManifestId.eq("rolled-back"))
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    header(&store, "null-cursor-consumer", 1, 1, 0).await;
+    exec(&store,"INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('null-cursor-consumer',0,0,1,'source')").await;
+    let initial = consumer::Entity::find()
+        .filter(consumer::Column::ManifestId.eq("null-cursor-consumer"))
+        .filter(consumer::Column::Kind.eq(0))
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(initial.consumer_row > 0);
+    assert_eq!((initial.pending, initial.after_source), (1, None));
+    let revision = work(&store, "source", 0).await.revision;
+    let mut finished = false;
+    for _ in 0..32 {
+        frozen_sweep_work::fanout_step(&store).await.unwrap();
+        let cursor = consumer::Entity::find_by_id(initial.consumer_row)
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        if cursor.pending == 0 {
+            assert_eq!(cursor.after_source, None);
+            finished = true;
+            break;
+        }
+    }
+    assert!(
+        finished,
+        "NULL/NULL source CAS must deliver, then reach EOF"
+    );
+    assert!(work(&store, "source", 0).await.revision > revision);
+    assert_eq!(
+        queued::Entity::find_by_id(first.work_row)
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap()
+            .work_row,
+        first.work_row
+    );
+}

@@ -2094,11 +2094,22 @@ impl FrozenStorageLifetimeProgress {
             }
         };
         let (data, _) = physical_table(work.kind);
-        let last = store.connection.query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            format!("SELECT ordinal,typeof(ordinal) AS ordinal_type FROM {data} WHERE manifest_id=?1 ORDER BY ordinal DESC LIMIT 1"),
-            [work.manifest.clone().into()],
-        )).await?;
+        let last = store
+            .connection
+            .query_one(
+                &Query::select()
+                    .column(Alias::new("ordinal"))
+                    .expr_as(
+                        Func::cust(Alias::new("typeof")).arg(Expr::col(Alias::new("ordinal"))),
+                        Alias::new("ordinal_type"),
+                    )
+                    .from(Alias::new(data))
+                    .and_where(Expr::col(Alias::new("manifest_id")).eq(&work.manifest))
+                    .order_by(Alias::new("ordinal"), Order::Desc)
+                    .limit(1)
+                    .to_owned(),
+            )
+            .await?;
         if let Some(last) = last {
             if last.try_get::<String>("", "ordinal_type")? != "integer" {
                 self.accounting.poison += 1;
@@ -2125,7 +2136,7 @@ impl FrozenStorageLifetimeProgress {
             // protects a concurrent append after the inventory read.
             work.finish(
                 store,
-                Some(Statement::from_string(DbBackend::Sqlite, "SELECT 1")),
+                Some(DbBackend::Sqlite.build(&Query::select().expr(Expr::val(1)).to_owned())),
             )
             .await?;
         }
