@@ -91,9 +91,16 @@ pub(crate) async fn project_semantic_timeline_live_turn_event<C: ConnectionTrait
     Ok(())
 }
 
+fn completed_message_marker(metadata_json: &str) -> Option<bool> {
+    serde_json::from_str::<serde_json::Value>(metadata_json)
+        .ok()
+        .and_then(|value| value.get("messageCompleted").and_then(|v| v.as_bool()))
+}
+
 async fn user_message_sort_key<C: ConnectionTrait>(
     db: &C,
     turn: &turn_entity::Model,
+    published_at: i64,
 ) -> Result<String> {
     if let Some(existing) =
         timeline_repository::find_user_message_block_by_turn_id(db, &turn.thread_id, &turn.id)
@@ -104,7 +111,10 @@ async fn user_message_sort_key<C: ConnectionTrait>(
     timeline_repository::new_message_sort_key(
         db,
         &turn.thread_id,
+        &crate::timeline_projection_model::user_block_id(&turn.id),
+        &turn.id,
         turn_block_sort_key(turn, 0, "user"),
+        published_at,
     )
     .await
 }
@@ -156,7 +166,7 @@ async fn project_turn_message_mutation<C: ConnectionTrait>(
             thread_id: thread_model.id,
             turn_id: Some(turn_model.id.clone()),
             block_kind: timeline_repository::BLOCK_KIND_USER_MESSAGE.to_owned(),
-            sort_key: user_message_sort_key(db, &turn_model).await?,
+            sort_key: user_message_sort_key(db, &turn_model, event.created_at.timestamp()).await?,
             source_kind: Some("turn_input".to_owned()),
             source_key: Some(turn_model.id),
             started_at: Some(turn_model.created_at),
@@ -298,7 +308,8 @@ async fn project_turn_started<C: ConnectionTrait>(
                 thread_id: thread_model.id.clone(),
                 turn_id: Some(turn_model.id.clone()),
                 block_kind: timeline_repository::BLOCK_KIND_USER_MESSAGE.to_owned(),
-                sort_key: user_message_sort_key(db, &turn_model).await?,
+                sort_key: user_message_sort_key(db, &turn_model, event.created_at.timestamp())
+                    .await?,
                 source_kind: Some("turn_input".to_owned()),
                 source_key: Some(turn_model.id.clone()),
                 started_at: Some(turn_model.created_at),
@@ -611,9 +622,7 @@ async fn project_turn_item_row<C: ConnectionTrait>(
                 .as_deref()
                 .is_some_and(|status| status == "completed");
             let was_completed = existing.as_ref().is_some_and(|block| {
-                serde_json::from_str::<serde_json::Value>(&block.metadata_json)
-                    .ok()
-                    .and_then(|value| value.get("messageCompleted").and_then(|v| v.as_bool()))
+                completed_message_marker(&block.metadata_json)
                     // Legacy completed rows have no marker. Content updates
                     // must adopt them without moving history; an actual first
                     // completion still promotes a pre-upgrade running row.
@@ -634,14 +643,21 @@ async fn project_turn_item_row<C: ConnectionTrait>(
             timeline_repository::upsert_thread_timeline_block(
                 db,
                 ThreadTimelineBlockRecord {
-                    block_id,
+                    block_id: block_id.clone(),
                     workspace_id: thread_model.workspace_id.clone(),
                     thread_id: thread_model.id.clone(),
                     turn_id: Some(turn_model.id.clone()),
                     block_kind: timeline_repository::BLOCK_KIND_ASSISTANT_MESSAGE.to_owned(),
                     sort_key: if completed && !was_completed {
-                        timeline_repository::new_message_sort_key(db, &thread_model.id, candidate)
-                            .await?
+                        timeline_repository::new_message_sort_key(
+                            db,
+                            &thread_model.id,
+                            &block_id,
+                            &turn_model.id,
+                            candidate,
+                            event.created_at.timestamp(),
+                        )
+                        .await?
                     } else {
                         existing
                             .as_ref()
@@ -767,6 +783,43 @@ async fn project_snapshot_turn_item_row<C: ConnectionTrait>(
                 .status
                 .as_deref()
                 .is_some_and(|status| status == "completed");
+            let was_completed = existing
+                .as_ref()
+                .is_some_and(|block| completed_message_marker(&block.metadata_json) == Some(true));
+            let sort_key = if let Some(block) = &existing
+                && (!completed || was_completed)
+            {
+                // A completion marker and its durable position are committed
+                // together (or adopted by migration). Ordinary snapshots need
+                // neither a ledger lookup nor a new candidate position.
+                block.sort_key.clone()
+            } else {
+                let candidate = if let Some(block) = &existing {
+                    block.sort_key.clone()
+                } else if turn_has_detached_task_run_block(db, turn_model.id.as_str()).await? {
+                    timeline_event_block_sort_key(
+                        item_model.created_at,
+                        turn_model.id.as_str(),
+                        200,
+                        order_key.as_str(),
+                    )
+                } else {
+                    projected_turn_block_sort_key(db, turn_model, 200, order_key.as_str()).await?
+                };
+                if completed {
+                    timeline_repository::new_message_sort_key(
+                        db,
+                        &thread_model.id,
+                        &block_id,
+                        &turn_model.id,
+                        candidate,
+                        refreshed_at.timestamp(),
+                    )
+                    .await?
+                } else {
+                    candidate
+                }
+            };
             timeline_repository::upsert_thread_timeline_block(
                 db,
                 ThreadTimelineBlockRecord {
@@ -775,21 +828,7 @@ async fn project_snapshot_turn_item_row<C: ConnectionTrait>(
                     thread_id: thread_model.id.clone(),
                     turn_id: Some(turn_model.id.clone()),
                     block_kind: timeline_repository::BLOCK_KIND_ASSISTANT_MESSAGE.to_owned(),
-                    sort_key: if let Some(existing) = &existing {
-                        existing.sort_key.clone()
-                    } else {
-                        if turn_has_detached_task_run_block(db, turn_model.id.as_str()).await? {
-                            timeline_event_block_sort_key(
-                                item_model.created_at,
-                                turn_model.id.as_str(),
-                                200,
-                                order_key.as_str(),
-                            )
-                        } else {
-                            projected_turn_block_sort_key(db, turn_model, 200, order_key.as_str())
-                                .await?
-                        }
-                    },
+                    sort_key,
                     source_kind: Some("turn_item".to_owned()),
                     source_key: Some(item_model.item_id.clone()),
                     started_at: Some(item_model.created_at),
@@ -798,12 +837,7 @@ async fn project_snapshot_turn_item_row<C: ConnectionTrait>(
                         "turnId": turn_model.id,
                         "itemId": item_model.item_id,
                         "classification": classification.classification_str(),
-                        "messageCompleted": completed || existing.as_ref().is_some_and(|block| {
-                            serde_json::from_str::<serde_json::Value>(&block.metadata_json)
-                                .ok()
-                                .and_then(|value| value.get("messageCompleted").and_then(|v| v.as_bool()))
-                                .unwrap_or(false)
-                        }),
+                        "messageCompleted": completed || was_completed,
                     })
                     .to_string(),
                     created_at: item_model.created_at,

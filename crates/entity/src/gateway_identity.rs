@@ -16,6 +16,7 @@ pub struct Model {
     pub updated_at: DateTimeWithTimeZone,
     pub auth_schema_version: i64,
     pub auth_ready_at: Option<DateTimeWithTimeZone>,
+    pub unread_started_at: i64,
     #[sea_orm(has_many)]
     pub audit_events: HasMany<super::audit_event::Entity>,
     #[sea_orm(has_many)]

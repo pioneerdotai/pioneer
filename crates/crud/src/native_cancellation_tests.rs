@@ -1429,6 +1429,7 @@ async fn seed_main_schema_history(db: &pioneer_sqlite::SqliteDatabase) -> Histor
     .await
     .unwrap();
     let thread = pioneer_entity::thread::ActiveModel {
+        workspace_unread_started_at: sea_orm::NotSet,
         id: Set(thread_id.to_owned()),
         workspace_id: Set(workspace_id.to_owned()),
         preview: Set(String::new()),

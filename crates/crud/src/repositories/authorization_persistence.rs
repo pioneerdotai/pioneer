@@ -729,6 +729,7 @@ mod tests {
         Migrator::up(&database, None).await.unwrap();
         let now = chrono::Utc::now().fixed_offset();
         gateway_identity::ActiveModel {
+            unread_started_at: sea_orm::NotSet,
             id: Set(GATEWAY_ID.to_owned()),
             singleton_key: Set(1),
             identity_bootstrap_version: Set(1),
@@ -788,6 +789,7 @@ mod tests {
         .await
         .unwrap();
         thread::ActiveModel {
+            workspace_unread_started_at: sea_orm::NotSet,
             id: Set(THREAD_ID.to_owned()),
             workspace_id: Set(WORKSPACE_ID.to_owned()),
             name: Set(Some("Private legacy thread".to_owned())),

@@ -311,6 +311,7 @@ pub async fn insert_user_thread_with_creator<C: ConnectionTrait>(
     let (created_by_actor_kind, created_by_actor_id) = actor_ref_to_db(creator);
     let preview_author_json = prepare_preview_author_json(thread_model.preview_author.as_ref())?;
     thread::Entity::insert(thread::ActiveModel {
+        workspace_unread_started_at: sea_orm::NotSet,
         id: Set(thread_model.id.clone()),
         workspace_id: Set(thread_model.workspace_id.clone()),
         name: Set(thread_model.name.clone()),
@@ -378,6 +379,7 @@ async fn upsert_thread_with_actor_columns_prepared<C: ConnectionTrait>(
     updated_at: DateTimeWithTimeZone,
 ) -> Result<()> {
     thread::Entity::insert(thread::ActiveModel {
+        workspace_unread_started_at: sea_orm::NotSet,
         id: Set(thread_model.id.clone()),
         workspace_id: Set(thread_model.workspace_id.clone()),
         name: Set(thread_model.name.clone()),
@@ -574,6 +576,9 @@ pub async fn update_user_thread_management(
     {
         active.access_class =
             Set(super::membership::persisted_thread_access_class_to_db(access_class).to_owned());
+        if access_class == super::membership::PersistedThreadAccessClass::Workspace {
+            active.workspace_unread_started_at = Set(updated_at.timestamp());
+        }
         changed = true;
     }
     if let Some(archived) = archived {

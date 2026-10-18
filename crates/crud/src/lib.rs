@@ -34114,6 +34114,7 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 
 #[cfg(test)]
 mod tests {
+    mod unread_start;
     use crate::{
         NewThreadEpisodicExclusionRecord, PROJECTION_META_STATUS_PENDING,
         ProjectionMetaConfigRecord, ProjectionMetaRecord, THREAD_EPISODIC_PROJECTION_CHANGED_ERROR,
@@ -40978,6 +40979,17 @@ mod tests {
         actor_id: Option<&str>,
         deleted: bool,
     ) {
+        // This fixture's synthetic event times predate wall-clock migration.
+        // Set its rollout explicitly; never manufacture a read receipt.
+        pioneer_entity::gateway_identity::Entity::update_many()
+            .col_expr(
+                pioneer_entity::gateway_identity::Column::UnreadStartedAt,
+                Expr::val(0),
+            )
+            .filter(pioneer_entity::gateway_identity::Column::SingletonKey.eq(1))
+            .exec(&store.connection)
+            .await
+            .unwrap();
         let created_at = unix_to_datetime(1_700_000_100);
         pioneer_entity::turn::Entity::insert(pioneer_entity::turn::ActiveModel {
             id: Set(turn_id.to_owned()),
@@ -41026,6 +41038,26 @@ mod tests {
         .exec(&store.connection)
         .await
         .expect("unread test Turn should persist");
+        pioneer_entity::unread_message_position::Entity::insert(
+            pioneer_entity::unread_message_position::ActiveModel {
+                thread_id: Set(thread_id.into()),
+                block_id: Set(format!("user:{turn_id}")),
+                turn_id: Set(turn_id.into()),
+                sort_key: Set(sort_key.into()),
+                published_at: Set(created_at.timestamp()),
+            },
+        )
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::columns([
+                pioneer_entity::unread_message_position::Column::ThreadId,
+                pioneer_entity::unread_message_position::Column::BlockId,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec_without_returning(&store.connection)
+        .await
+        .unwrap();
         upsert_thread_timeline_block(
             &store.connection,
             ThreadTimelineBlockRecord {
@@ -59274,7 +59306,10 @@ mod tests {
         let agent_key = super::repositories::thread_timeline_projection::new_message_sort_key(
             &store.connection,
             thread_id,
+            &format!("user:{agent_turn}"),
+            agent_turn,
             format!("00000001700000101000:{agent_turn}:000:user"),
+            1_700_000_205,
         )
         .await
         .unwrap();
@@ -59341,11 +59376,45 @@ mod tests {
         Migrator::up(&connection, None).await.unwrap();
         let store = CrudStore::new(connection);
         let reader = PrincipalId::new("P00000000000000000001").unwrap();
+        let gateway = GatewayId::new("G00000000000000000001").unwrap();
+        let now = unix_to_datetime(1_700_000_000);
+        super::create_gateway_singleton(&store.connection, &gateway, 0, now)
+            .await
+            .unwrap();
+        super::create_superuser(
+            &store.connection,
+            &reader,
+            &gateway,
+            "Reader",
+            "reader",
+            "reader",
+            now,
+        )
+        .await
+        .unwrap();
+        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+            id: Set("batch-unread".into()),
+            name: Set("Batch".into()),
+            is_active: Set(true),
+            is_current: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+        })
+        .exec(&store.connection)
+        .await
+        .unwrap();
         let mut ids = Vec::new();
-        // Span more than one bounded SQL batch. FK OFF intentionally permits
-        // missing Thread parents; Turn/block ownership still has to match.
+        // Span more than one bounded SQL batch. Runtime FK OFF must not turn
+        // orphan blocks or missing access parents into unread history.
         for index in 0..130 {
             let id = format!("batch-{index:03}");
+            store
+                .upsert_thread_model(
+                    &sample_thread("batch-unread", &id, 1_700_000_000),
+                    PersistedActorRef::Principal(reader.clone()),
+                )
+                .await
+                .unwrap();
             for key in ["001", "002"] {
                 insert_unread_test_turn(
                     &store,
@@ -59403,6 +59472,13 @@ mod tests {
                 .is_empty()
         );
         // An orphan/mismatched block must not become unread, even without FKs.
+        store
+            .upsert_thread_model(
+                &sample_thread("batch-unread", "mismatch", 1_700_000_000),
+                PersistedActorRef::Principal(reader.clone()),
+            )
+            .await
+            .unwrap();
         pioneer_entity::thread_timeline_block::Entity::update_many()
             .col_expr(
                 pioneer_entity::thread_timeline_block::Column::ThreadId,
@@ -59431,6 +59507,46 @@ mod tests {
         assert!(
             store
                 .unread_counts_for_threads(&reader, &["batch-001".into()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Parent checks may be deferred until after the range seek, but
+        // FK OFF must never expose orphan or hidden message counts to owners.
+        pioneer_entity::thread::Entity::delete_by_id("batch-002")
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .unread_counts_for_threads(&reader, &["batch-002".into()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        pioneer_entity::thread::Entity::update_many()
+            .col_expr(
+                pioneer_entity::thread::Column::SidebarVisibility,
+                Expr::val("hidden"),
+            )
+            .filter(pioneer_entity::thread::Column::Id.eq("batch-004"))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .unread_counts_for_threads(&reader, &["batch-004".into()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        pioneer_entity::workspace::Entity::delete_by_id("batch-unread")
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .unread_counts_for_threads(&reader, &["batch-003".into()])
                 .await
                 .unwrap()
                 .is_empty()

@@ -1015,6 +1015,7 @@ mod tests {
 
         let private_thread_id = generate_id(AUTH_DOMAIN_ID_LEN);
         thread::ActiveModel {
+            workspace_unread_started_at: sea_orm::NotSet,
             id: Set(private_thread_id.clone()),
             workspace_id: Set(red_workspace_id.clone()),
             name: Set(Some("Private".to_owned())),
@@ -2177,6 +2178,7 @@ mod tests {
             ),
         ] {
             thread::ActiveModel {
+                workspace_unread_started_at: sea_orm::NotSet,
                 id: Set(thread_id.to_owned()),
                 workspace_id: Set(workspace_id.to_owned()),
                 name: Set(None),

@@ -199,6 +199,7 @@ pub use super::turn_skill_binding::Entity as TurnSkillBinding;
 pub use super::turn_status_history::Entity as TurnStatusHistory;
 pub use super::turn_work_item_projection::Entity as TurnWorkItemProjection;
 pub use super::turn_work_projection::Entity as TurnWorkProjection;
+pub use super::unread_message_position::Entity as UnreadMessagePosition;
 pub use super::user_notification_outbox::Entity as UserNotificationOutbox;
 pub use super::workspace::Entity as Workspace;
 pub use super::workspace_membership::Entity as WorkspaceMembership;
