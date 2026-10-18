@@ -236,6 +236,7 @@ impl MessageProcessor {
                     if turn.status != TurnStatus::Blocked {
                         match self
                             .crud_store
+                            .with_maintenance_access()
                             .cleanup_terminal_task_child_capsule(&turn.thread_id, &turn.turn_id)
                             .await
                         {

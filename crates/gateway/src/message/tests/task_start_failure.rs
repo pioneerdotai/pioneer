@@ -928,6 +928,25 @@ async fn create_review_cli_child(
     review: bool,
     reviewer: bool,
 ) -> (pioneer_protocol::TaskCreateResponse, TestChildRuntimeAnchor) {
+    create_cli_child_with_attachment(
+        harness,
+        processor,
+        label,
+        review,
+        reviewer,
+        TaskAttachmentMode::Detached,
+    )
+    .await
+}
+
+async fn create_cli_child_with_attachment(
+    harness: &CliRuntimeSkillPreflightHarness,
+    processor: &Arc<MessageProcessor>,
+    label: &str,
+    review: bool,
+    reviewer: bool,
+    attachment: TaskAttachmentMode,
+) -> (pioneer_protocol::TaskCreateResponse, TestChildRuntimeAnchor) {
     let mut params = detached_cli_task_create_params(
         &harness.workspace_id,
         &format!("parent-{label}"),
@@ -937,6 +956,14 @@ async fn create_review_cli_child(
         "gpt-5",
         "safe task input",
     );
+    if attachment == TaskAttachmentMode::Attached {
+        params.lifecycle_policy = Some(TaskLifecyclePolicy {
+            attachment,
+            on_parent_cancel: TaskParentTerminalAction::Cancel,
+            on_parent_failure: TaskParentTerminalAction::Cancel,
+            completion: TaskCompletionBehavior::CompleteOnTerminalRun,
+        });
+    }
     if review {
         params.agent_spec.as_mut().unwrap().review_policy = Some(TaskAgentReviewPolicy {
             mode: TaskAgentReviewMode::UserApproval,
@@ -2054,5 +2081,509 @@ fn terminal_child_pending_parent_receipt_retains_capsule_until_replayed_cleanup(
             candidate,
             "no repeated extraction or new result"
         );
+    });
+}
+
+async fn retain_cleanup_fixture_context(store: &pioneer_crud::CrudStore, turn_id: &str) {
+    for (sequence, source) in [
+        (998, "cleanup_obligation_fixture"),
+        (999, "assistant_round"),
+    ] {
+        store
+            .insert_turn_llm_context(pioneer_crud::NewTurnLlmContextEntry {
+                turn_id: turn_id.to_owned(),
+                item_id: None,
+                attempt_id: None,
+                sequence,
+                source: source.to_owned(),
+                tool_name: None,
+                payload: "{}".to_owned(),
+                output_policy_snapshot: "{}".to_owned(),
+                created_at: chrono::Utc::now().fixed_offset(),
+                expires_at: Some(chrono::Utc::now().fixed_offset()),
+            })
+            .await
+            .unwrap();
+    }
+}
+
+async fn change_cleanup_fixture(
+    store: &pioneer_crud::CrudStore,
+    sql: &str,
+    values: Vec<sea_orm::Value>,
+) {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    store
+        .database_connection()
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            sql,
+            values,
+        ))
+        .await
+        .unwrap();
+}
+
+async fn assert_cleanup_fixture_retained(
+    store: &pioneer_crud::CrudStore,
+    child: &TestChildRuntimeAnchor,
+) {
+    assert!(
+        store
+            .get_turn_runtime_snapshot(&child.child_turn_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .list_turn_llm_context(&child.child_turn_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|entry| entry.source == "cleanup_obligation_fixture")
+    );
+}
+
+async fn assert_terminal_cleanup_fixture_denied(
+    processor: &Arc<MessageProcessor>,
+    child: &TestChildRuntimeAnchor,
+) {
+    let store = &processor.crud_store;
+    assert_eq!(
+        store
+            .terminal_task_child_cleanup_ready(&child.child_thread_id, &child.child_turn_id)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    assert!(
+        !store
+            .list_unreconciled_terminal_task_child_turns(64)
+            .await
+            .unwrap()
+            .iter()
+            .any(|turn| turn.turn_id == child.child_turn_id)
+    );
+    assert!(
+        !matches!(
+            processor
+                .task_agent_executor
+                .reconcile_child_turn_completed(
+                    &child.child_thread_id,
+                    &child.child_turn_id,
+                    super::super::TaskChildReconciliationOrigin::DurableBackground,
+                )
+                .await,
+            Ok(true)
+        ),
+        "missing/invalid required lineage must not authorize an ACK"
+    );
+    assert_eq!(
+        store
+            .cleanup_terminal_task_child_capsule(&child.child_thread_id, &child.child_turn_id)
+            .await
+            .unwrap(),
+        Some(false),
+        "writer must reject a stale discovery or ACK"
+    );
+    assert_cleanup_fixture_retained(store, child).await;
+}
+
+#[test]
+fn immediate_attached_terminal_child_cleanup_survives_lost_local_continuation() {
+    for (detach_after_launch, context_only) in [(false, false), (true, false), (false, true)] {
+        capture_task_start(async move {
+            let (harness, processor) = review_cli_fixture().await;
+            let (task, child) = create_cli_child_with_attachment(
+                &harness,
+                &processor,
+                "attached-cleanup",
+                false,
+                false,
+                TaskAttachmentMode::Attached,
+            )
+            .await;
+            let store = &harness.crud_store;
+            let run_id = &task.run.as_ref().unwrap().id;
+            let parent_thread = child.created_by_thread_id.as_deref().unwrap();
+            let parent_turn = child.created_by_turn_id.as_deref().unwrap();
+            let parent_before = store
+                .get_turn(parent_thread, parent_turn)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(parent_before.1.turn_kind, TurnKind::Conversation);
+            assert_eq!(parent_before.1.status, TurnStatus::InProgress);
+            assert!(
+                store
+                    .get_turn(parent_thread, run_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            if detach_after_launch {
+                detach_task_for_test(
+                    &processor,
+                    pioneer_protocol::TaskDetachParams {
+                        task_id: task.task.id.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            persist_completed_child(&harness, &child, now_timestamp_secs()).await;
+            // Complete the real aggregate/extraction, but omit the caller's
+            // capsule deletion, as on cancellation/process loss at this boundary.
+            assert!(
+                processor
+                    .task_agent_executor
+                    .reconcile_child_turn_completed(
+                        &child.child_thread_id,
+                        &child.child_turn_id,
+                        super::super::TaskChildReconciliationOrigin::Live,
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                store.get_task_run(run_id).await.unwrap().unwrap().status,
+                TaskRunStatus::Succeeded
+            );
+            let candidate = store
+                .get_accepted_task_result_candidate(run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let activations = harness.cli_session.turn_starts.lock().await.len();
+            processor
+                .task_output_capture_failures
+                .lock()
+                .unwrap()
+                .insert(
+                    child.child_turn_id.clone(),
+                    anyhow::anyhow!("terminal cleanup must not re-enter output capture/extraction"),
+                );
+            // Add the retained/non-retained rows after extraction so the model
+            // history canary does not fabricate an input to the extractor.
+            retain_cleanup_fixture_context(store, &child.child_turn_id).await;
+            store
+                .delete_turn_llm_context_for_terminal_turns()
+                .await
+                .unwrap();
+            store.delete_expired_turn_llm_context().await.unwrap();
+            store
+                .delete_turn_runtime_snapshots_for_closed_turns()
+                .await
+                .unwrap();
+            assert_cleanup_fixture_retained(store, &child).await;
+            if context_only {
+                store
+                    .delete_turn_runtime_snapshot(&child.child_turn_id)
+                    .await
+                    .unwrap();
+            }
+            let background = processor.for_background_reconciliation();
+            assert_eq!(
+                background
+                    .reconcile_terminal_task_child_turns(64)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert!(
+                store
+                    .get_turn_runtime_snapshot(&child.child_turn_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let contexts = store
+                .list_turn_llm_context(&child.child_turn_id)
+                .await
+                .unwrap();
+            assert!(
+                !contexts
+                    .iter()
+                    .any(|entry| entry.source == "cleanup_obligation_fixture")
+            );
+            assert!(
+                contexts
+                    .iter()
+                    .any(|entry| entry.source == "assistant_round")
+            );
+            assert_eq!(
+                processor
+                    .for_background_reconciliation()
+                    .reconcile_terminal_task_child_turns(64)
+                    .await
+                    .unwrap(),
+                0,
+                "retained model history must not keep selecting the cleaned child"
+            );
+            assert_eq!(
+                store
+                    .get_turn(parent_thread, parent_turn)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                parent_before
+            );
+            assert!(
+                store
+                    .get_turn(parent_thread, run_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                harness.cli_session.turn_starts.lock().await.len(),
+                activations
+            );
+            assert!(
+                processor
+                    .task_output_capture_failures
+                    .lock()
+                    .unwrap()
+                    .contains_key(&child.child_turn_id)
+            );
+            assert_eq!(
+                store
+                    .get_accepted_task_result_candidate(run_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                candidate
+            );
+        });
+    }
+}
+
+#[test]
+fn terminal_child_cleanup_revalidates_required_lineage_and_resumable_fence() {
+    for attachment in [TaskAttachmentMode::Attached, TaskAttachmentMode::Detached] {
+        capture_task_start(async move {
+            let (harness, processor) = review_cli_fixture().await;
+            let (task, child) = create_cli_child_with_attachment(
+                &harness,
+                &processor,
+                "cleanup-lineage",
+                false,
+                false,
+                attachment,
+            )
+            .await;
+            let store = &harness.crud_store;
+            persist_completed_child(&harness, &child, now_timestamp_secs()).await;
+            processor
+                .task_agent_executor
+                .reconcile_child_turn_completed(
+                    &child.child_thread_id,
+                    &child.child_turn_id,
+                    super::super::TaskChildReconciliationOrigin::Live,
+                )
+                .await
+                .unwrap();
+            retain_cleanup_fixture_context(store, &child.child_turn_id).await;
+            let lineage = store
+                .get_task_thread_lineage(&child.child_thread_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                store
+                    .list_unreconciled_terminal_task_child_turns(64)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|turn| turn.turn_id == child.child_turn_id)
+            );
+            // Discovery and ACK can become stale before writer cleanup.
+            assert_eq!(
+                store
+                    .terminal_task_child_cleanup_ready(&child.child_thread_id, &child.child_turn_id)
+                    .await
+                    .unwrap(),
+                Some(true)
+            );
+            for missing_parent in [None, Some("unrelated-missing-parent")] {
+                change_cleanup_fixture(
+                    store,
+                    "UPDATE thread_lineage SET created_by_turn_id = ? WHERE child_thread_id = ?",
+                    vec![
+                        missing_parent.map(str::to_owned).into(),
+                        child.child_thread_id.clone().into(),
+                    ],
+                )
+                .await;
+                assert_terminal_cleanup_fixture_denied(&processor, &child).await;
+            }
+            change_cleanup_fixture(store,
+                "UPDATE thread_lineage SET created_by_turn_id = ?, root_thread_id = child_thread_id WHERE child_thread_id = ?",
+                vec![lineage.created_by_turn_id.clone().into(), child.child_thread_id.clone().into()],
+            ).await;
+            assert_terminal_cleanup_fixture_denied(&processor, &child).await;
+            change_cleanup_fixture(
+                store,
+                "UPDATE thread_lineage SET root_thread_id = ? WHERE child_thread_id = ?",
+                vec![
+                    lineage.root_thread_id.into(),
+                    child.child_thread_id.clone().into(),
+                ],
+            )
+            .await;
+            if attachment == TaskAttachmentMode::Attached {
+                let scope = store
+                    .get_task_run_conversation_snapshot(&task.run.as_ref().unwrap().id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                for source in [None, Some("unrelated-accepted-source")] {
+                    change_cleanup_fixture(
+                        store,
+                        "UPDATE task_run_conversation_snapshot SET source_turn_id = ? WHERE run_id = ?",
+                        vec![source.map(str::to_owned).into(), task.run.as_ref().unwrap().id.clone().into()],
+                    )
+                    .await;
+                    assert_terminal_cleanup_fixture_denied(&processor, &child).await;
+                }
+                change_cleanup_fixture(
+                    store,
+                    "UPDATE task_run_conversation_snapshot SET source_turn_id = ? WHERE run_id = ?",
+                    vec![
+                        scope.source_turn_id.into(),
+                        task.run.as_ref().unwrap().id.clone().into(),
+                    ],
+                )
+                .await;
+                let occurrence = store
+                    .get_task_occurrence_contract_by_run(&task.run.as_ref().unwrap().id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                change_cleanup_fixture(
+                    store,
+                    "UPDATE task_occurrence_contract SET occurrence_key = 'scheduled:unrelated' WHERE run_id = ?",
+                    vec![task.run.as_ref().unwrap().id.clone().into()],
+                )
+                .await;
+                assert_terminal_cleanup_fixture_denied(&processor, &child).await;
+                change_cleanup_fixture(
+                    store,
+                    "UPDATE task_occurrence_contract SET occurrence_key = ? WHERE run_id = ?",
+                    vec![
+                        occurrence.occurrence_key.into(),
+                        task.run.as_ref().unwrap().id.clone().into(),
+                    ],
+                )
+                .await;
+            }
+            change_cleanup_fixture(
+                store,
+                "UPDATE task_run_turn SET status = 'blocked' WHERE turn_id = ?",
+                vec![child.child_turn_id.clone().into()],
+            )
+            .await;
+            assert_terminal_cleanup_fixture_denied(&processor, &child).await;
+            // Even after a terminal aggregate a resumable child keeps its capsule.
+        });
+    }
+}
+
+#[test]
+fn detached_child_cannot_replace_required_occurrence_with_conversation_lineage() {
+    capture_task_start(async {
+        let (harness, processor) = review_cli_fixture().await;
+        let (task, child) =
+            create_review_cli_child(&harness, &processor, "required-occurrence", false, false)
+                .await;
+        let store = &harness.crud_store;
+        persist_completed_child(&harness, &child, now_timestamp_secs()).await;
+        processor
+            .task_agent_executor
+            .reconcile_child_turn_completed(
+                &child.child_thread_id,
+                &child.child_turn_id,
+                super::super::TaskChildReconciliationOrigin::Live,
+            )
+            .await
+            .unwrap();
+        retain_cleanup_fixture_context(store, &child.child_turn_id).await;
+        change_cleanup_fixture(store,
+            "UPDATE thread_lineage SET created_by_turn_id = ?, created_by_thread_id = ? WHERE child_thread_id = ?",
+            vec![task.task.created_by_turn_id.clone().into(), task.task.created_by_thread_id.clone().into(), child.child_thread_id.clone().into()],
+        ).await;
+        assert_terminal_cleanup_fixture_denied(&processor, &child).await;
+        change_cleanup_fixture(
+            store,
+            "DELETE FROM thread_lineage WHERE child_thread_id = ?",
+            vec![child.child_thread_id.clone().into()],
+        )
+        .await;
+        assert_terminal_cleanup_fixture_denied(&processor, &child).await;
+    });
+}
+
+#[test]
+fn blocked_attached_child_keeps_capsule_for_explicit_resume() {
+    capture_task_start(async {
+        let (harness, processor) = review_cli_fixture().await;
+        let (task, child) = create_cli_child_with_attachment(
+            &harness,
+            &processor,
+            "blocked-attached-cleanup",
+            false,
+            false,
+            TaskAttachmentMode::Attached,
+        )
+        .await;
+        let store = &harness.crud_store;
+        assert!(
+            processor
+                .mark_turn_blocked(
+                    child.child_thread_id.clone(),
+                    child.child_turn_id.clone(),
+                    "explicit resume required".to_owned(),
+                )
+                .await
+        );
+        retain_cleanup_fixture_context(store, &child.child_turn_id).await;
+        assert_eq!(
+            store
+                .get_task_run(&task.run.as_ref().unwrap().id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskRunStatus::Blocked
+        );
+        assert!(
+            !processor
+                .task_agent_executor
+                .reconcile_child_turn_completed(
+                    &child.child_thread_id,
+                    &child.child_turn_id,
+                    super::super::TaskChildReconciliationOrigin::DurableBackground,
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            processor
+                .for_background_reconciliation()
+                .reconcile_terminal_task_child_turns(64)
+                .await
+                .unwrap(),
+            0
+        );
+        store
+            .delete_turn_runtime_snapshots_for_closed_turns()
+            .await
+            .unwrap();
+        store
+            .delete_turn_llm_context_for_terminal_turns()
+            .await
+            .unwrap();
+        assert_cleanup_fixture_retained(store, &child).await;
     });
 }
