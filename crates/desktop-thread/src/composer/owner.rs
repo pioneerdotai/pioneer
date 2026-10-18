@@ -1281,7 +1281,21 @@ mod tests {
                     if let Some(state) = catalog {
                         session.startup.stages.insert(StartupStage::Provider, state);
                     }
-                    publish_session(&fixture.client, session);
+                    // The initial absent-catalog case already matches the fixture.
+                    // ClientCore deduplicates equal payloads even at a new revision.
+                    if session != *fixture.client.gateway_session() {
+                        publish_session(&fixture.client, session);
+                    }
+                    assert_eq!(
+                        fixture
+                            .client
+                            .gateway_session()
+                            .startup
+                            .stages
+                            .get(&StartupStage::Provider)
+                            .copied(),
+                        catalog
+                    );
                     fixture.synchronize();
                     fixture.composer.read_with(fixture.cx, |view, _| {
                         assert_eq!(view.startup_outcome(), Some(DesktopStartupOutcome::Ready))
