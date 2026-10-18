@@ -705,13 +705,16 @@ async fn mutation_invalidates_derived_terminal_generation_before_resume_or_state
         },
     )
     .await;
-    store
-        .upsert_cli_runtime_thread_binding(binding(cursor(&h)))
+    // A direct root skips terminal preparation. A reader hold lets preparation
+    // derive the marker, then prevents expiry at the final writer guard.
+    let hold = store
+        .compaction_acquire_frozen_history("ws", &h)
         .await
         .unwrap();
     let mut p = FrozenStorageLifetimeProgress::default();
     drive(&store, &mut p, 1500).await;
     assert_eq!(n(&store,"SELECT terminal_generation AS n FROM compaction_operation_projection WHERE operation_id=?1","op").await,0);
+    assert_eq!(expired(&store, "origin").await, 0);
     sql(
         &store,
         "UPDATE compaction_runner_state SET generation=1 WHERE operation_id='op'",
@@ -719,10 +722,7 @@ async fn mutation_invalidates_derived_terminal_generation_before_resume_or_state
     )
     .await;
     assert_eq!(n(&store,"SELECT count(*) AS n FROM compaction_operation_projection WHERE operation_id=?1 AND terminal_generation IS NULL","op").await,1);
-    store
-        .upsert_cli_runtime_thread_binding(binding("{}".into()))
-        .await
-        .unwrap();
+    drop(hold);
     drive(&store, &mut p, 1500).await;
     assert_eq!(
         expired(&store, "origin").await,
