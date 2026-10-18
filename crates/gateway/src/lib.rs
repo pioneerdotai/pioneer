@@ -2067,3 +2067,20 @@ pub(crate) mod media_test_fixtures;
 
 #[cfg(test)]
 mod provider_media_regression_tests;
+
+/// Migration names compiled into this binary, from the existing migration owner.
+pub fn compiled_database_migration_names() -> Vec<String> {
+    use migration::MigratorTrait;
+    migration::Migrator::migrations()
+        .into_iter()
+        .map(|migration| migration.name().to_owned())
+        .collect()
+}
+
+/// Read-only installer inspection; does not start Gateway or migrate its DB.
+pub async fn inspect_applied_database_migrations(
+    runtime_home: &std::path::Path,
+    config: &pioneer_config::AppConfig,
+) -> anyhow::Result<Option<Vec<String>>> {
+    database::inspect_applied_migration_names(runtime_home, config).await
+}
