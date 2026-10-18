@@ -25891,12 +25891,23 @@ fn composer_cli_skill_pack_matches_individual_members_and_preserves_presentation
                 let run = &task.runs[0];
                 let lineage =
                     wait_for_child_lineage_for_run(harness.crud_store.clone(), &run.id).await;
-                let mut bound_ids = harness
+                let bindings = harness
                     .crud_store
                     .list_turn_skill_bindings(&lineage.child_turn_id)
                     .await
-                    .unwrap()
+                    .unwrap();
+                assert_eq!(bindings.len(), skill_ids.len() + 2);
+                for slug in ["tasks", "subagents"] {
+                    assert!(bindings.iter().any(|binding| {
+                        binding.source_kind == "system"
+                            && binding.skill_owner.as_deref() == Some("pioneer")
+                            && binding.skill_slug == slug
+                            && binding.resolved_reason == "implicit"
+                    }));
+                }
+                let mut bound_ids = bindings
                     .into_iter()
+                    .filter(|binding| binding.resolved_reason == "explicit_composer_capability")
                     .map(|binding| binding.skill_id)
                     .collect::<Vec<_>>();
                 bound_ids.sort();

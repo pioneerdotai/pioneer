@@ -2262,6 +2262,18 @@ impl TaskAgentExecutor {
         .await?;
 
         if let Some((runtime_id, runtime_kind)) = cli_runtime_backend {
+            // CLI task-tool projection needs the exact admitted child adapter
+            // before provider activation, just as the native path does.
+            processor
+                .register_agent_action_binding(
+                    child_turn_id.clone(),
+                    crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+                        action_adapter,
+                        action_options,
+                        action_capabilities,
+                    ),
+                )
+                .await;
             let action_author = input_author;
             let cli_presentation_capabilities = normalized_composer_capabilities
                 .as_ref()
@@ -2491,19 +2503,6 @@ impl TaskAgentExecutor {
                 })
                 .await;
                 if matches!(activation_result, Ok(Ok(()))) {
-                    let action_binding = processor
-                        .prepare_agent_action_binding(
-                            child_turn_id.clone(),
-                            crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
-                                action_adapter,
-                                action_options,
-                                action_capabilities,
-                            ),
-                        )
-                        .await?;
-                    processor
-                        .register_agent_action_binding(child_turn_id.clone(), action_binding)
-                        .await;
                     spawn_execution_heartbeat(
                         processor,
                         execution.id,
@@ -3134,6 +3133,16 @@ impl TaskAgentExecutor {
                 .await
                 .context("failed to prepare revision Task conversation history")?;
             }
+            processor
+                .register_agent_action_binding(
+                    child_turn_id.clone(),
+                    crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+                        action_adapter,
+                        action_options,
+                        action_capabilities,
+                    ),
+                )
+                .await;
             let prepared = processor
                 .prepare_task_cli_runtime_turn(
                     TurnStartParams {
@@ -3174,19 +3183,6 @@ impl TaskAgentExecutor {
                 .activate_prepared_task_cli_runtime_turn(prepared)
                 .await
                 .context("failed to activate revision CLI runtime turn")?;
-            let action_binding = processor
-                .prepare_agent_action_binding(
-                    child_turn_id.clone(),
-                    crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
-                        action_adapter,
-                        action_options,
-                        action_capabilities,
-                    ),
-                )
-                .await?;
-            processor
-                .register_agent_action_binding(child_turn_id.clone(), action_binding)
-                .await;
             let started_at = now_timestamp_secs();
             processor
                 .crud_store
@@ -5571,6 +5567,16 @@ impl TaskAgentExecutor {
                     .as_str(),
             )
             .await?;
+            processor
+                .register_agent_action_binding(
+                    task_run_turn.turn_id.clone(),
+                    crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+                        action_adapter,
+                        action_options,
+                        action_capabilities,
+                    ),
+                )
+                .await;
             let prepared = processor
                 .prepare_task_cli_runtime_turn(
                     TurnStartParams {
@@ -5621,19 +5627,6 @@ impl TaskAgentExecutor {
                 .activate_prepared_task_cli_runtime_turn(prepared)
                 .await
                 .context("failed to activate reviewer CLI runtime turn")?;
-            let action_binding = processor
-                .prepare_agent_action_binding(
-                    task_run_turn.turn_id.clone(),
-                    crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
-                        action_adapter,
-                        action_options,
-                        action_capabilities,
-                    ),
-                )
-                .await?;
-            processor
-                .register_agent_action_binding(task_run_turn.turn_id.clone(), action_binding)
-                .await;
             return Ok(());
         }
         if !matches!(

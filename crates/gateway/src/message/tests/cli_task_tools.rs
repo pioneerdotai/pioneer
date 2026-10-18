@@ -136,6 +136,28 @@ fn cli_automatic_orchestration_skills_coexist_with_selected_user_names() {
                     .find_turn_skill_bindings(&turn_id)
                     .await
                     .unwrap();
+                let snapshot = processor
+                    .crud_store
+                    .get_turn_runtime_snapshot(&turn_id)
+                    .await
+                    .unwrap()
+                    .expect("CLI task capabilities must be durable before provider start");
+                assert_eq!(snapshot.workspace_id, harness.workspace_id);
+                assert_eq!(snapshot.thread_id, thread_id);
+                assert_eq!(
+                    crate::turn_runtime_snapshot::restored_execution_capabilities(
+                        &snapshot.capabilities_json,
+                    )
+                    .unwrap(),
+                    vec![pioneer_protocol::TurnCapability {
+                        id: pioneer_protocol::skill_capability_key(&user_id),
+                        kind: pioneer_protocol::TurnCapabilityKind::Skill {
+                            skill_id: user_id.clone(),
+                            pack_id: None,
+                        },
+                        label: Some(format!("tests/{user_name}")),
+                    }]
+                );
                 assert_eq!(bindings.len(), 3);
                 assert!(bindings.iter().any(|binding| binding.skill_id == user_id && binding.source_kind == "user"));
                 for slug in ["tasks", "subagents"] {
@@ -209,6 +231,111 @@ fn cli_automatic_orchestration_skills_coexist_with_selected_user_names() {
                 // existing managed plugin snapshot builder (covered in claude_session tests).
                 drop(starts);
             }
+        }
+    });
+}
+
+#[test]
+fn cli_attached_tasks_inherit_the_exact_selected_mcp_tool() {
+    run_standard_stack_message_test("CLI task capability inheritance", async {
+        for kind in [
+            CLIAgentRuntimeKind::Codex,
+            CLIAgentRuntimeKind::Claude,
+            CLIAgentRuntimeKind::OpenCode,
+        ] {
+            let harness = setup_cli_runtime_skill_preflight_harness(kind, false).await;
+            harness
+                .cli_session
+                .enable_projected_mcp_metadata(harness.crud_store.clone())
+                .await;
+            let processor = Arc::new(harness.processor.clone());
+            processor.bind_agent_tool_bridges().await;
+            seed_ready_fake_mcp_server(&processor, &harness.crud_store, &harness.workspace_id)
+                .await;
+            let thread_id = format!("cli_exact_capability_{kind:?}");
+            let turn_id = format!("cli_exact_capability_turn_{kind:?}");
+            seed_cli_runtime_skill_preflight_thread(&harness, &thread_id).await;
+            let selected = pioneer_protocol::TurnCapability {
+                id: "mcp-tool:workspace:resend:send".to_owned(),
+                kind: pioneer_protocol::TurnCapabilityKind::McpTool {
+                    server_name: "resend".to_owned(),
+                    raw_tool_name: "send".to_owned(),
+                    scope_kind: pioneer_protocol::McpScopeKind::Workspace,
+                },
+                label: Some("Selected tool".to_owned()),
+            };
+            let request = cli_runtime_turn_start_request_with_capabilities(
+                &generate_test_request_id("exact-cap", &format!("{kind:?}")),
+                &thread_id,
+                &turn_id,
+                &harness.runtime_id,
+                kind,
+                vec![serde_json::to_value(&selected).unwrap()],
+            );
+            processor
+                .process_request_for_connection(harness.connection_id, &request)
+                .await;
+            wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
+            wait_for_task_cli_activation(&processor, &turn_id).await;
+            let snapshot = processor
+                .crud_store
+                .get_turn_runtime_snapshot(&turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                crate::turn_runtime_snapshot::restored_execution_capabilities(
+                    &snapshot.capabilities_json
+                )
+                .unwrap(),
+                vec![selected.clone()]
+            );
+            let child = invoke_task(&processor, &turn_id, "exact-child", "task_create", json!({
+                "title":"Inspect with the selected tool", "goal":"Inspect the available context",
+                "outputInstructions":"Return a concise report."
+            })).await.unwrap();
+            assert!(!child.is_error, "{kind:?}: {child:?}");
+            let task_id = child.structured_content.as_ref().unwrap()["taskId"]
+                .as_str()
+                .unwrap();
+            let actor = processor
+                .crud_store
+                .get_task_actor_contract(task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                actor.launch.unwrap().execution.selected_capabilities,
+                vec![selected],
+                "inherit the selected tool, not the broader admitted server ceiling"
+            );
+            wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 2).await;
+            let child_turn_id = child.structured_content.as_ref().unwrap()["childTurnId"]
+                .as_str()
+                .unwrap();
+            let child_bindings = processor
+                .crud_store
+                .list_turn_mcp_bindings(child_turn_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                child_bindings
+                    .iter()
+                    .filter(|binding| binding.server_name == "resend")
+                    .map(|binding| binding.raw_tool_name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["send"]
+            );
+            let cancelled = invoke_task(
+                &processor,
+                &turn_id,
+                "cancel-exact-child",
+                "task_cancel",
+                json!({"taskId":task_id}),
+            )
+            .await
+            .unwrap();
+            assert!(!cancelled.is_error, "{cancelled:?}");
         }
     });
 }
@@ -444,6 +571,38 @@ fn cli_parent_native_completion_continues_with_existing_attached_work() {
                 .unwrap()
                 .to_owned();
             wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 2).await;
+            let child_turn_id = child.structured_content.as_ref().unwrap()["childTurnId"]
+                .as_str()
+                .unwrap();
+            let parent_snapshot = processor
+                .crud_store
+                .get_turn_runtime_snapshot(&turn_id)
+                .await
+                .unwrap()
+                .expect("admitted CLI parent runtime snapshot");
+            assert!(
+                crate::turn_runtime_snapshot::restored_execution_capabilities(
+                    &parent_snapshot.capabilities_json,
+                )
+                .unwrap()
+                .is_empty(),
+                "implicit system skills must not widen inherited capabilities"
+            );
+            let child_adapter = processor
+                .agent_action_binding(child_turn_id)
+                .await
+                .expect("CLI child adapter must be bound before provider activation");
+            let child_response = pioneer_crud::load_agent_turn_response(
+                &processor.crud_store.database_connection(),
+                child_turn_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                child_adapter.adapter.lock().await.execution_id().as_str(),
+                child_response.execution_id
+            );
             let binding = processor
                 .crud_store
                 .get_cli_runtime_turn_binding(&turn_id)

@@ -8289,18 +8289,26 @@ impl MessageProcessor {
             .replay_cli_runtime_terminal_event(&expected, turn_transition)
             .await?
         {
-            let (_, current) = self
+            let current = self
                 .crud_store
-                .get_turn(&binding.thread_id, &binding.turn_id)
-                .await?
-                .context("CLI Turn disappeared after accepted outcome replay")?;
-            return Ok(if current.status == TurnStatus::InProgress {
-                // A successfully consumed native completion can prepare Task
-                // continuation. Keep logical-Turn supervision alive in that case.
-                CLIRuntimeAuthoritativeTurnState::Deferred
-            } else {
-                CLIRuntimeAuthoritativeTurnState::Terminal
-            });
+                .latest_cli_runtime_turn_attempt(&binding.turn_id)
+                .await?;
+            return Ok(
+                if current.as_ref().is_some_and(|current| {
+                    expected
+                        .attempt
+                        .as_ref()
+                        .is_some_and(|previous| current.id != previous.id)
+                        && current.status.is_active()
+                }) {
+                    // Only a newly prepared continuation leaves native work owed.
+                    // A consumed failure may keep the logical Turn InProgress while
+                    // handing ownership to recovery; that outcome is still terminal.
+                    CLIRuntimeAuthoritativeTurnState::Deferred
+                } else {
+                    CLIRuntimeAuthoritativeTurnState::Terminal
+                },
+            );
         }
         if let Some(attempt) = self
             .crud_store

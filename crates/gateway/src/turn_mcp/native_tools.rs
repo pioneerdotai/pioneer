@@ -71,7 +71,10 @@ impl NativeToolFamily {
     pub(crate) fn action(self, name: &str) -> Result<ResourceAction, pioneer_tools::ToolError> {
         match self {
             Self::Html => Ok(ResourceAction::McpUse),
-            Self::Tasks if name == "threads_start_options" => Ok(ResourceAction::ChildStart),
+            // Reading the already capability-filtered launch catalog is not a
+            // child-start mutation. ChildStart belongs to the Agent action
+            // envelope, not the Turn execution's resource-action grant.
+            Self::Tasks if name == "threads_start_options" => Ok(ResourceAction::ThreadRead),
             Self::Tasks => crate::task_tools::task_tool_resource_action(name),
         }
     }

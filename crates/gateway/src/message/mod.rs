@@ -1754,11 +1754,10 @@ impl MessageProcessor {
 
     #[cfg(test)]
     pub(crate) fn with_cli_runtime_manager_for_tests(
-        mut self,
+        self,
         manager: Arc<CLIAgentRuntimeManager>,
     ) -> Self {
-        self.cli_runtime_manager = Some(manager);
-        self
+        self.with_cli_runtime_manager(manager)
     }
 
     #[cfg(test)]

@@ -3750,6 +3750,91 @@ impl MessageProcessor {
             .await;
     }
 
+    // Task creation inherits the exact normalized selection from the existing
+    // runtime snapshot. CLI turns need that same durable input before any tool
+    // call; reconstructing it from grants could widen a selected MCP tool into
+    // its entire server. Keep history, artifacts and scope in the shared format.
+    async fn persist_cli_task_runtime_snapshot(
+        &self,
+        outcome: &crate::thread::TurnStartOutcome,
+        reasoning_effort: Option<&str>,
+        context_thread_id: &str,
+    ) -> anyhow::Result<()> {
+        let materialization = &outcome.materialization;
+        let workspace_id = materialization.thread.workspace_id.as_str();
+        let thread_id = materialization.thread.id.as_str();
+        let turn_id = materialization.turn.id.as_str();
+        let processor =
+            self.scoped_with_crud_store(Arc::new(ordinary_history_store(self.crud_store.as_ref())));
+        let prepared = processor
+            .load_prepared_conversation_history_for_workspace(workspace_id, thread_id, turn_id)
+            .await?;
+        let policies = processor
+            .crud_store
+            .list_workspace_skill_policies(workspace_id)
+            .await?
+            .into_iter()
+            .map(|record| {
+                (
+                    pioneer_skills::SkillPolicyKey::new(record.skill_id),
+                    pioneer_agent::WorkspaceSkillPolicy {
+                        enabled: record.enabled,
+                        allow_implicit_invocation: record.allow_implicit_invocation,
+                    },
+                )
+            })
+            .collect();
+        let artifacts = processor
+            .resolve_provider_artifact_inputs(workspace_id, &materialization.input)
+            .await?;
+        let environment = processor
+            .create_artifact_output_environment(workspace_id, thread_id, turn_id)
+            .await?
+            .into_iter()
+            .collect();
+        let mut hook_context = pioneer_agent::AgentTurnHookRuntimeContext::default();
+        if let Some(run_turn) = processor
+            .crud_store
+            .get_task_run_turn_by_turn(thread_id, turn_id)
+            .await?
+        {
+            let task = processor
+                .crud_store
+                .get_task_record(&run_turn.task_id)
+                .await?
+                .context("CLI Task runtime snapshot has no Task")?;
+            hook_context = pioneer_agent::AgentTurnHookRuntimeContext::for_task_turn(
+                &task.id,
+                task.lifecycle_policy
+                    .as_ref()
+                    .map(|policy| policy.attachment)
+                    .unwrap_or(pioneer_protocol::TaskAttachmentMode::Detached),
+                run_turn.kind,
+                context_thread_id,
+            );
+        }
+        processor
+            .persist_turn_runtime_snapshot(
+                thread_id,
+                workspace_id,
+                turn_id,
+                materialization.turn.mode,
+                &hook_context,
+                &materialization.thread.model,
+                &materialization.thread.model_provider,
+                reasoning_effort,
+                &policies,
+                &materialization.input,
+                &materialization.capabilities,
+                &artifacts,
+                &environment,
+                &prepared.messages,
+                &[],
+                Some(&prepared),
+            )
+            .await
+    }
+
     async fn cli_native_tool_definitions(
         &self,
         authority: &TurnExecutionAuthority,
@@ -6026,6 +6111,24 @@ impl MessageProcessor {
                 send_turn_start_failure!(TurnStartFailure::internal(message));
                 return None;
             }
+            if success_response.is_task() {
+                let processor = Arc::new(self.clone());
+                let prepared_binding = async {
+                    let binding = self.agent_action_binding(&outcome.materialization.turn.id).await
+                        .context("admitted CLI Task has no child action binding")?;
+                    processor.prepare_agent_action_binding(outcome.materialization.turn.id.clone(), binding).await
+                }.await;
+                match prepared_binding {
+                    Ok(binding) => self.register_agent_action_binding(outcome.materialization.turn.id.clone(), binding).await,
+                    Err(error) => {
+                        let message = format!("failed to prepare CLI Task launch options: {error:#}");
+                        self.mark_turn_blocked(outcome.started_notification.thread_id.clone(),
+                            outcome.started_notification.turn.id.clone(), message.clone()).await;
+                        send_turn_start_failure!(TurnStartFailure::internal(message));
+                        return None;
+                    }
+                }
+            }
             let native_event_budget = match execution_authority
                 .source()
                 .effective_native_event_resource_budget()
@@ -6455,6 +6558,24 @@ impl MessageProcessor {
                         }
                         return;
                     }
+                }
+            }
+            if combined_preflight.mcp_projection.as_ref().is_some_and(|projection| {
+                projection.tools.iter().any(|tool| {
+                    crate::turn_mcp::native_tools::is_task_operation(tool)
+                        && tool.raw_tool_name == "task_create"
+                })
+            }) {
+                if let Err(error) = self.persist_cli_task_runtime_snapshot(
+                    &outcome,
+                    effective_cli_runtime_effort.as_deref(),
+                    success_response.context_thread_id(outcome.materialization.thread.id.as_str()),
+                ).await {
+                    let message = format!("failed to persist CLI task runtime snapshot: {error:#}");
+                    self.mark_turn_blocked(outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(), message.clone()).await;
+                    send_turn_start_failure!(TurnStartFailure::internal(message));
+                    return;
                 }
             }
             let elevated_instructions = match pioneer_cli_agent_runtime::instructions::CLIRuntimeElevatedInstructions::try_new(
