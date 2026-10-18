@@ -876,12 +876,8 @@ impl TaskScheduler {
 
         if run.executor_kind == TaskExecutorKind::Agent {
             tokio::spawn(async move {
-                if let Err(_error) = dispatch_run_to_executor(executor, context, run, handle).await
-                {
-                    error!(
-                        failure_class = "agent_task_dispatch_failed",
-                        "agent task dispatch failed"
-                    );
+                if let Err(error) = dispatch_run_to_executor(executor, context, run, handle).await {
+                    report_dispatch_terminal_failure(&error);
                 }
             });
             return Ok(true);
@@ -890,6 +886,43 @@ impl TaskScheduler {
         dispatch_run_to_executor(executor, context, run, handle).await?;
         Ok(true)
     }
+}
+
+#[derive(Debug)]
+struct DispatchStartDiagnostic(Option<crate::TaskStartFailureDescriptor>);
+impl std::fmt::Display for DispatchStartDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("terminalization after executor start failure/rejection failed")
+    }
+}
+
+fn report_dispatch_terminal_failure(error: &anyhow::Error) {
+    let failure =
+        crate::TaskStartFailure::from_borrowed_error(crate::TaskStartStage::ExecutorStart, error);
+    let diagnostic = failure.descriptor();
+    let original = error
+        .downcast_ref::<DispatchStartDiagnostic>()
+        .and_then(|value| value.0.as_ref());
+    error!(
+        failure_class = "agent_task_dispatch_failed",
+        failure_phase = error
+            .downcast_ref::<crate::executor::TerminalCommitPhase>()
+            .map(|phase| phase.label()),
+        cause = if error
+            .downcast_ref::<pioneer_crud::TaskTerminalConflict>()
+            .is_some()
+        {
+            "domain_conflict"
+        } else {
+            diagnostic.cause.label()
+        },
+        sqlite_primary_code = diagnostic.sqlite_primary_code,
+        sqlite_extended_code = diagnostic.sqlite_extended_code,
+        original_start_stage = original.map(|value| value.stage.label()),
+        original_start_cause = original.map(|value| value.cause.label()),
+        correlation_id = original.and_then(|value| value.correlation_id.as_deref()),
+        "agent task dispatch failed"
+    );
 }
 
 async fn dispatch_run_to_executor(
@@ -912,13 +945,19 @@ async fn dispatch_run_to_executor(
                 TaskErrorClass::Internal,
                 Some(run.id.clone()),
             );
-            handle.fail_run(Some(error), now).await?;
+            handle
+                .fail_run(Some(error), now)
+                .await
+                .context(DispatchStartDiagnostic(None))?;
         }
         Err(mut error) => {
             let descriptor = crate::TaskStartFailure::report_for_scheduler(&mut error);
             let now = now_timestamp_secs();
             let task_error = descriptor.task_error(Some(run.id.clone()));
-            handle.fail_run(Some(task_error), now).await?;
+            handle
+                .fail_run(Some(task_error), now)
+                .await
+                .context(DispatchStartDiagnostic(Some(descriptor)))?;
         }
     }
     Ok(())
