@@ -2588,16 +2588,50 @@ fn blocked_attached_child_keeps_capsule_for_explicit_resume() {
         )
         .await;
         let store = &harness.crud_store;
+        retain_cleanup_fixture_context(store, &child.child_turn_id).await;
+        // Activation ACK can precede release of the launch transition. Wait
+        // for it, then capture the native source under the same gate that the
+        // guarded Blocked commit and terminal cleanup will hold.
+        let transition = tokio::time::timeout(
+            Duration::from_secs(30),
+            processor.cli_runtime_turn_resume_transition(&child.child_turn_id),
+        )
+        .await
+        .expect("initial CLI launch must release its transition within 30 seconds")
+        .unwrap()
+        .expect("activated CLI child must have a transition gate");
+        let binding = store
+            .get_cli_runtime_turn_binding(&child.child_turn_id)
+            .await
+            .unwrap()
+            .expect("activated CLI child binding");
+        let guard = store
+            .cli_runtime_blocked_turn_guard(&binding, binding.native_turn_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .expect("Blocked fixture must target the active native attempt");
         assert!(
             processor
-                .mark_turn_blocked(
+                .mark_turn_blocked_with_recovery(
                     child.child_thread_id.clone(),
                     child.child_turn_id.clone(),
                     "explicit resume required".to_owned(),
+                    None,
+                    Some(guard),
+                    Some(Arc::new(transition)),
                 )
                 .await
         );
-        retain_cleanup_fixture_context(store, &child.child_turn_id).await;
+        assert_eq!(
+            store
+                .get_turn(&child.child_thread_id, &child.child_turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .status,
+            TurnStatus::Blocked
+        );
         assert_eq!(
             store
                 .get_task_run(&task.run.as_ref().unwrap().id)
