@@ -1,5 +1,8 @@
 //! Workspace request lifecycle, independent from shell transport delivery.
-use super::intents::WorkspaceIntent;
+use super::{
+    directory::{InitialDirectoryRestore, ThreadTreeLoadState},
+    intents::WorkspaceIntent,
+};
 use crate::core::{ClientCore, ClientMutationAuthority, ClientTransition};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -222,7 +225,10 @@ impl ClientCore {
                             }) if core.gateway_http_generation() == connection
                                 && core.workspace_refresh_is_demanded(&workspace) =>
                             {
-                                let _ = core.refresh_workspace_tree(&workspace);
+                                core.refresh_workspace_directory_with_transport(
+                                    &workspace,
+                                    &core.transport_runtime().ws_command_sender(),
+                                );
                             }
                             Some(WorkspaceRequest::Command { intent, connection })
                                 if core.gateway_http_generation() == connection =>
@@ -297,19 +303,77 @@ impl ClientCore {
         self.queue_directory_refresh(workspace);
     }
     pub(crate) fn load_selected_workspace_directory(&self, workspace: &str) {
-        let Ok(directory) = self.refresh_workspace_tree(workspace) else {
-            return;
-        };
-        if directory.error().is_some() {
-            return;
+        self.load_selected_workspace_directory_with_transport(
+            workspace,
+            &self.transport_runtime().ws_command_sender(),
+        );
+    }
+    fn load_selected_workspace_directory_with_transport(
+        &self,
+        workspace: &str,
+        transport: &impl crate::rpc::JsonRpcRequestTransport,
+    ) {
+        {
+            let mut registry = self
+                .thread_registry
+                .lock()
+                .expect("thread registry poisoned");
+            if !self.is_stopped() && registry.navigation.workspace_id() == Some(workspace) {
+                registry.directory.initial_restore = Some(InitialDirectoryRestore {
+                    workspace: workspace.to_owned(),
+                    connection: self.gateway_http_generation(),
+                    navigation_revision: registry.navigation_revision,
+                });
+            }
         }
-        self.restore_selected_workspace_thread(workspace);
+        self.refresh_workspace_directory_with_transport(workspace, transport);
+    }
+    fn refresh_workspace_directory_with_transport(
+        &self,
+        workspace: &str,
+        transport: &impl crate::rpc::JsonRpcRequestTransport,
+    ) {
+        let _ = self.refresh_workspace_tree_with_transport(workspace, transport);
+        let mut registry = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned");
+        let directory = registry.directory.snapshot(workspace);
+        let state = directory
+            .as_ref()
+            .filter(|p| p.error().is_none())
+            .and_then(|p| p.load())
+            .map(|load| load.state);
+        let ready = state == Some(ThreadTreeLoadState::Ready);
+        let mut continue_initial = false;
+        if let Some(initial) = &registry.directory.initial_restore
+            && initial.workspace == workspace
+        {
+            let current = !self.is_stopped()
+                && initial.connection == self.gateway_http_generation()
+                && initial.navigation_revision == registry.navigation_revision
+                && registry.navigation.workspace_id() == Some(workspace);
+            if !current || state != Some(ThreadTreeLoadState::Pending) {
+                // Consume before restore can mutate navigation or start a draft.
+                continue_initial = current && ready;
+                registry.directory.initial_restore = None;
+            }
+        }
+        let remembered = registry.navigation.last_active(workspace).is_some()
+            || registry.navigation.draft(workspace).is_some();
+        drop(registry);
+        if ready && (continue_initial || remembered) {
+            self.restore_selected_workspace_thread(workspace);
+        }
     }
     fn restore_selected_workspace_thread(&self, workspace: &str) {
-        if self
-            .workspace_tree(workspace)
-            .is_none_or(|directory| directory.is_loading() || directory.error().is_some())
-        {
+        if self.workspace_tree(workspace).is_none_or(|directory| {
+            directory.is_loading()
+                || directory.error().is_some()
+                || directory
+                    .load()
+                    .is_some_and(|load| load.state != ThreadTreeLoadState::Ready)
+        }) {
             return;
         }
         let navigation = self.navigation_snapshot();
@@ -323,9 +387,20 @@ impl ClientCore {
             |id, workspace| {
                 self.thread_snapshot(id)
                     .is_some_and(|snapshot| snapshot.coordinator().workspace_id == workspace)
+                    || self
+                        .thread_registry
+                        .lock()
+                        .expect("thread registry poisoned")
+                        .directory
+                        .threads
+                        .get(id)
+                        .is_some_and(|thread| thread.workspace_id == workspace)
             },
         );
         if let Some(thread_id) = restored.active_thread_id {
+            // Directory loading no longer creates every coordinator. Restore
+            // the selected one through the existing registry owner only.
+            drop(self.thread_mutation(&thread_id, workspace));
             self.navigate(
                 crate::navigation::NavigationIntent::SelectThread {
                     workspace_id: Some(workspace.to_owned()),
@@ -369,6 +444,20 @@ impl ClientCore {
             .commands
             .retain(|(intent, _)| intent.workspace_id() != Some(workspace));
         drop(owner);
+        {
+            let mut registry = self
+                .thread_registry
+                .lock()
+                .expect("thread registry poisoned");
+            if registry
+                .directory
+                .initial_restore
+                .as_ref()
+                .is_some_and(|initial| initial.workspace == workspace)
+            {
+                registry.directory.cancel_initial_restore();
+            }
+        }
         if let Some(retry) = retry {
             self.retire_thread_draft_retry(&retry);
         }
@@ -862,6 +951,11 @@ mod tests {
                     .contains("existing")
             );
             assert!(loaded.snapshot().running_task_folder_ids.contains("parent"));
+            assert!(
+                core.thread_snapshot("existing").is_none(),
+                "directory refresh must not hydrate unopened threads"
+            );
+            drop(core.thread_mutation("existing", "ws"));
             let coordinator = core.thread_snapshot("existing").unwrap().coordinator();
             assert!(
                 !coordinator.history_loaded,
@@ -946,6 +1040,265 @@ mod tests {
         drop(subscription);
         assert!(!core.workspace_refresh_is_demanded("ws"));
         assert!(core.workspace_controller.lock().unwrap().refresh.is_empty());
+    }
+
+    #[test]
+    fn initial_read_reconciliation_continues_draft_bootstrap_once_without_new_auth_events() {
+        use pioneer_protocol::*;
+
+        struct TreeReply<'a> {
+            core: &'a ClientCore,
+            read_during_request: bool,
+        }
+        impl crate::rpc::JsonRpcRequestTransport for TreeReply<'_> {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                payload: String,
+                tx: crate::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                assert_eq!(request["method"], "thread/tree");
+                if self.read_during_request {
+                    assert!(self.core.observe_workspace_notification(
+                        &GatewayNotification::ThreadReadCursorChanged(
+                            ThreadReadCursorChangedNotification {
+                                workspace_id: "ws".into(),
+                                thread_id: "existing".into(),
+                                cursor: ThreadReadCursor {
+                                    sort_key: "002".into(),
+                                    through_turn_id: "turn".into()
+                                },
+                                unread_count: 0,
+                            }
+                        )
+                    ));
+                }
+                tx.send(Ok(serde_json::json!({
+                    "workspace_id":"ws", "threads":[{"id":"existing","workspace_id":"ws","preview":"history","mode":"Chat","model":"model","model_provider":"provider","created_at":1,"updated_at":1,"status":"Idle","turns":[]}],
+                    "running_task_thread_ids":["existing"], "unread":[{"thread_id":"existing","unread_count":1}], "folders":[], "placements":[], "agents_docs":[]
+                }))).unwrap();
+                Ok(())
+            }
+        }
+        let core = Arc::new(ClientCore::new());
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        core.workspace_controller.lock().unwrap().sender = Some(sender);
+        core.activate_thread(None, Some("ws"));
+        let mut authorization = crate::catalog_test_support::client()
+            .authorization_snapshot(None, None)
+            .unwrap();
+        let resources = AuthorizationOperationalResourceProjection {
+            fingerprint: "synthetic".into(),
+            ..Default::default()
+        };
+        authorization.workspace = Some(AuthorizationWorkspaceCapabilitySnapshot {
+            workspace_id: "ws".into(),
+            capabilities: AuthorizationWorkspaceCapabilities {
+                can_create_thread: true,
+                thread_visibility_options: vec![ThreadVisibility::Private],
+                ..Default::default()
+            },
+            operational_resources: resources.clone(),
+            execution_draft_policy: AuthorizationExecutionDraftPolicyProjection {
+                fingerprint: "synthetic".into(),
+                resources,
+                permission_options: vec![],
+                can_attach_artifacts: false,
+                mcp_invocation_limits: Default::default(),
+            },
+        });
+        assert_eq!(
+            core.accept_authorization_projection(0, None, authorization),
+            crate::authorization::AuthorizationProjectionAcceptance::Accepted
+        );
+        // The one earlier capability wake has already been handled. No further
+        // authorization or Administration event rescues the pending load.
+        assert!(matches!(
+            core.workspace_controller
+                .lock()
+                .unwrap()
+                .next(Instant::now()),
+            Some(WorkspaceRequest::ReconcileDraft)
+        ));
+        let steady = TreeReply {
+            core: &core,
+            read_during_request: false,
+        };
+        core.refresh_workspace_directory_with_transport("ws", &steady);
+        assert!(core.navigation_snapshot().active_thread_id().is_none());
+        assert!(core.navigation_snapshot().last_active("ws").is_none());
+        assert!(core.navigation_snapshot().draft("ws").is_none());
+        assert!(
+            core.thread_start_snapshot().pending_thread_id.is_none(),
+            "an ordinary hint cannot start a draft"
+        );
+
+        core.load_selected_workspace_directory_with_transport(
+            "ws",
+            &TreeReply {
+                core: &core,
+                read_during_request: true,
+            },
+        );
+        assert_eq!(
+            core.workspace_tree("ws").unwrap().load().unwrap().state,
+            ThreadTreeLoadState::Pending
+        );
+        assert!(
+            core.thread_registry
+                .lock()
+                .unwrap()
+                .directory
+                .initial_restore
+                .is_some()
+        );
+        assert!(core.thread_start_snapshot().pending_thread_id.is_none());
+        let Some(WorkspaceRequest::Refresh {
+            workspace,
+            connection,
+        }) = core
+            .workspace_controller
+            .lock()
+            .unwrap()
+            .next(Instant::now())
+        else {
+            panic!("read conflict must queue one follow-up")
+        };
+        assert_eq!(workspace, "ws");
+        assert_eq!(connection, core.gateway_http_generation());
+        core.refresh_workspace_directory_with_transport(&workspace, &steady);
+        assert_eq!(
+            core.workspace_tree("ws").unwrap().load().unwrap().state,
+            ThreadTreeLoadState::Ready
+        );
+        assert!(
+            core.thread_registry
+                .lock()
+                .unwrap()
+                .directory
+                .initial_restore
+                .is_none()
+        );
+        // The unchanged restore/create rule reaches thread/start. Without a
+        // configured endpoint it prepares one identity and the existing retry.
+        let start = core.thread_start_snapshot();
+        let id = start.pending_thread_id.unwrap();
+        assert_eq!(start.retry_attempt, 1);
+        assert!(
+            core.workspace_controller
+                .lock()
+                .unwrap()
+                .draft_retry
+                .is_some()
+        );
+        for _ in 0..2 {
+            core.queue_directory_refresh("ws");
+        }
+        assert_eq!(core.workspace_controller.lock().unwrap().refresh.len(), 1);
+        core.workspace_controller
+            .lock()
+            .unwrap()
+            .refresh
+            .remove("ws");
+        core.refresh_workspace_directory_with_transport("ws", &steady);
+        assert_eq!(
+            core.thread_start_snapshot().pending_thread_id.as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(
+            core.thread_start_snapshot().retry_attempt,
+            1,
+            "hints must not restart the bootstrap"
+        );
+        core.cancel_workspace_requests("ws");
+    }
+
+    #[test]
+    fn initial_restore_cancels_with_navigation_suspend_and_invalidation() {
+        let core = ClientCore::new();
+        core.activate_thread(None, Some("ws"));
+        for teardown in 0..3 {
+            {
+                let mut registry = core.thread_registry.lock().unwrap();
+                registry.directory.initial_restore = Some(InitialDirectoryRestore {
+                    workspace: "ws".into(),
+                    connection: core.gateway_http_generation(),
+                    navigation_revision: registry.navigation_revision,
+                });
+            }
+            match teardown {
+                0 => {
+                    core.activate_thread(None, Some("other"));
+                    core.activate_thread(None, Some("ws"));
+                }
+                1 => core.workspace_demand_changed(
+                    &crate::core::ClientScope::WorkspaceTree {
+                        workspace_id: Some("ws".into()),
+                    },
+                    crate::core::ClientDemand::Suspended,
+                ),
+                _ => core.thread_registry.lock().unwrap().directory.invalidate(),
+            }
+            assert!(
+                core.thread_registry
+                    .lock()
+                    .unwrap()
+                    .directory
+                    .initial_restore
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn last_active_thread_restores_from_directory_without_creating_other_stores() {
+        let core = crate::catalog_test_support::client();
+        core.navigate(
+            crate::navigation::NavigationIntent::SelectWorkspace {
+                workspace_id: Some("ws".into()),
+            },
+            None,
+        );
+        core.navigate(
+            crate::navigation::NavigationIntent::RememberLast {
+                workspace_id: "ws".into(),
+                thread_id: Some("last".into()),
+            },
+            None,
+        );
+        {
+            let mut registry = core.thread_registry.lock().unwrap();
+            for id in ["last", "unopened"] {
+                let t = serde_json::from_value::<pioneer_protocol::Thread>(serde_json::json!({"id":id,"workspace_id":"ws","preview":"","mode":"Chat","model":"model","model_provider":"provider","created_at":1,"updated_at":1,"status":"Idle","turns":[]})).unwrap();
+                registry.directory.threads.insert(id.into(), t);
+            }
+            registry.directory.project("ws", None, false, None);
+        }
+        assert!(core.thread_snapshots().is_empty());
+        core.restore_selected_workspace_thread("ws");
+        assert_eq!(core.navigation_snapshot().active_thread_id(), Some("last"));
+        assert!(core.thread_snapshot("last").is_some());
+        assert!(core.thread_snapshot("unopened").is_none());
+    }
+
+    #[test]
+    fn read_reconciliation_uses_one_existing_queue_slot_and_suspension_cancels_it() {
+        let core = crate::catalog_test_support::client();
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        core.workspace_controller.lock().unwrap().sender = Some(sender);
+        let scope = crate::core::ClientScope::WorkspaceTree {
+            workspace_id: Some("ws".into()),
+        };
+        let _subscription = core.subscribe(scope.clone(), std::num::NonZeroUsize::new(8).unwrap());
+        for _ in 0..1000 {
+            core.queue_directory_refresh("ws");
+        }
+        assert_eq!(core.workspace_controller.lock().unwrap().refresh.len(), 1);
+        core.workspace_demand_changed(&scope, crate::core::ClientDemand::Suspended);
+        assert!(core.workspace_controller.lock().unwrap().refresh.is_empty());
+        core.workspace_demand_changed(&scope, crate::core::ClientDemand::Visible);
+        assert_eq!(core.workspace_controller.lock().unwrap().refresh.len(), 1);
     }
 
     #[test]

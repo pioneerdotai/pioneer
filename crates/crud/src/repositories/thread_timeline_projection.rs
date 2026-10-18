@@ -511,60 +511,104 @@ pub async fn count_unread_message_blocks<C: ConnectionTrait>(
     u64::try_from(count).context("unread message count is negative")
 }
 
+// Bound bind parameters even for callers outside the workspace tree RPC. Dedup
+// before batching: the old IN query counted every input thread only once.
+const UNREAD_THREAD_BATCH_SIZE: usize = 128;
+
+fn unread_thread_batch_statement(thread_ids: &[&String], principal_id: &str) -> Statement {
+    use sea_orm::sea_query::{Asterisk, Expr, ExprTrait, JoinType, Query, SqliteQueryBuilder};
+
+    let count = |after: Expr, kind_index: bool| {
+        let mut query = Query::select();
+        query
+            .expr(Expr::col(Asterisk).count())
+            .from_as("thread_timeline_block", "block")
+            .join(
+                JoinType::InnerJoin,
+                "turn",
+                Condition::all()
+                    .add(Expr::col(("turn", "id")).eq(Expr::col(("block", "turn_id"))))
+                    .add(Expr::col(("turn", "thread_id")).eq(Expr::col(("block", "thread_id")))),
+            )
+            .and_where(Expr::col(("block", "thread_id")).eq(Expr::col(("selected", "column1"))))
+            .and_where(Expr::col(("block", "sort_key")).gt(after))
+            .and_where(Expr::cust_with_values(
+                UNREAD_MESSAGE_PREDICATE.trim_start_matches("AND "),
+                [principal_id],
+            ));
+        if kind_index {
+            query.and_where(
+                Expr::col(("block", "block_kind"))
+                    .is_in([BLOCK_KIND_USER_MESSAGE, BLOCK_KIND_ASSISTANT_MESSAGE]),
+            );
+        }
+        let (mut sql, values) = query.build(SqliteQueryBuilder);
+        if kind_index {
+            // SeaQuery 1.0 has no SQLite INDEXED BY API. Only the no-position
+            // branch needs this fixed hint: sort_key > '' otherwise encourages
+            // a scan of all kinds. Saved positions use the existing sort range.
+            sql = sql.replacen(
+                "FROM \"thread_timeline_block\" AS \"block\"",
+                "FROM \"thread_timeline_block\" AS \"block\" INDEXED BY idx_thread_timeline_block_thread_kind",
+                1,
+            );
+        }
+        Expr::cust_with_values(format!("({sql})"), values.0)
+    };
+    let (sql, values) = Query::select()
+        .expr_as(Expr::col(("selected", "column1")), "thread_id")
+        .expr_as(
+            Expr::case(
+                Expr::col(("cursor", "last_read_sort_key"))
+                    .is_null()
+                    .or(Expr::col(("cursor", "last_read_sort_key")).eq("")),
+                count(Expr::val(""), true),
+            )
+            .finally(count(Expr::col(("cursor", "last_read_sort_key")), false)),
+            "unread_count",
+        )
+        .from_values(thread_ids.iter().map(|id| id.as_str()), "selected")
+        .join_as(
+            JoinType::LeftJoin,
+            "thread_read_cursor",
+            "cursor",
+            Condition::all()
+                .add(Expr::col(("cursor", "thread_id")).eq(Expr::col(("selected", "column1"))))
+                .add(Expr::col(("cursor", "principal_id")).eq(principal_id)),
+        )
+        .build(SqliteQueryBuilder);
+    Statement::from_sql_and_values(DatabaseBackend::Sqlite, sql, values)
+}
+
 pub async fn count_unread_message_blocks_for_threads<C: ConnectionTrait>(
     db: &C,
     thread_ids: &[String],
     principal_id: &str,
 ) -> Result<HashMap<String, u64>> {
-    if thread_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let placeholders = std::iter::repeat("?")
-        .take(thread_ids.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        r#"
-            SELECT block.thread_id, COUNT(*) AS unread_count
-            FROM thread_timeline_block AS block
-            INNER JOIN turn
-                ON turn.id = block.turn_id
-                AND turn.thread_id = block.thread_id
-            LEFT JOIN thread_read_cursor AS cursor
-                ON cursor.thread_id = block.thread_id
-                AND cursor.principal_id = ?
-            WHERE block.thread_id IN ({placeholders})
-                AND block.sort_key > COALESCE(cursor.last_read_sort_key, '')
-                {UNREAD_MESSAGE_PREDICATE}
-            GROUP BY block.thread_id
-        "#
-    );
-    let mut values = Vec::with_capacity(thread_ids.len() + 2);
-    values.push(principal_id.to_owned().into());
-    values.extend(thread_ids.iter().cloned().map(Into::into));
-    values.push(principal_id.to_owned().into());
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            sql,
-            values,
-        ))
-        .await
-        .context("failed to count unread message blocks for thread batch")?;
-    rows.into_iter()
-        .map(|row| {
-            let thread_id = row
-                .try_get::<String>("", "thread_id")
-                .context("failed to decode unread thread id")?;
+    let selected = thread_ids.iter().collect::<std::collections::BTreeSet<_>>();
+    let selected = selected.into_iter().collect::<Vec<_>>();
+    let mut counts = HashMap::new();
+    for batch in selected.chunks(UNREAD_THREAD_BATCH_SIZE) {
+        let statement = unread_thread_batch_statement(batch, principal_id);
+        let rows = db
+            .query_all_raw(statement)
+            .await
+            .context("failed to count unread message blocks for thread batch")?;
+        for row in rows {
             let count = row
                 .try_get::<i64>("", "unread_count")
                 .context("failed to decode unread thread count")?;
-            Ok((
-                thread_id,
-                u64::try_from(count).context("unread thread count is negative")?,
-            ))
-        })
-        .collect()
+            let count = u64::try_from(count).context("unread thread count is negative")?;
+            // Preserve the sparse-map contract of the former GROUP BY query.
+            if count > 0 {
+                let id = row
+                    .try_get::<String>("", "thread_id")
+                    .context("failed to decode unread thread id")?;
+                counts.insert(id, count);
+            }
+        }
+    }
+    Ok(counts)
 }
 
 fn thread_timeline_approval_visibility(approval_scope: &ThreadTimelineApprovalScope) -> Condition {

@@ -30,8 +30,29 @@ impl MessageProcessor {
         if classification.placement == ProjectionPlacement::TopLevelAssistantMessage
             && db_status == Some("completed")
         {
-            self.notify_thread_tree_changed(workspace_id.to_owned())
-                .await;
+            // Hidden execution replies never enter sidebar unread. Their root
+            // activity is invalidated by durable RunStarting/Started/terminal
+            // events (tasks.rs); visible root delivery invalidates independently
+            // (task_delivery.rs). Keep the fallback on missing/error lineage.
+            let hidden_execution = self
+                .thread_manager
+                .is_loaded_hidden_task_thread(thread_id)
+                .await
+                && self
+                    .crud_store
+                    .get_task_thread_lineage(thread_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|lineage| {
+                        lineage.child_thread_id == thread_id
+                            && lineage.root_thread_id != thread_id
+                            && lineage.origin_kind.as_deref() == Some("task_run")
+                    });
+            if !hidden_execution {
+                self.notify_thread_tree_changed(workspace_id.to_owned())
+                    .await;
+            }
         }
         let item_id = item.item_id();
         let detached_task_run = self.is_detached_task_run_turn(thread_id, turn_id).await;

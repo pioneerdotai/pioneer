@@ -59330,6 +59330,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unread_batch_seeks_positions_and_preserves_sparse_distinct_membership() {
+        // This isolated fixture must match the runtime's FK OFF semantics;
+        // the ordinary test helper uses SQLx defaults instead.
+        let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
+        options
+            .max_connections(1)
+            .map_sqlx_sqlite_opts(|options| options.pragma("foreign_keys", "OFF"));
+        let connection = Database::connect(options).await.unwrap();
+        Migrator::up(&connection, None).await.unwrap();
+        let store = CrudStore::new(connection);
+        let reader = PrincipalId::new("P00000000000000000001").unwrap();
+        let mut ids = Vec::new();
+        // Span more than one bounded SQL batch. FK OFF intentionally permits
+        // missing Thread parents; Turn/block ownership still has to match.
+        for index in 0..130 {
+            let id = format!("batch-{index:03}");
+            for key in ["001", "002"] {
+                insert_unread_test_turn(
+                    &store,
+                    "batch-unread",
+                    &id,
+                    &format!("{id}-{key}"),
+                    key,
+                    "message",
+                    Some("P00000000000000000002"),
+                    false,
+                )
+                .await;
+            }
+            if index % 3 != 0 {
+                pioneer_entity::thread_read_cursor::Entity::insert(
+                    pioneer_entity::thread_read_cursor::ActiveModel {
+                        principal_id: Set(reader.to_string()),
+                        thread_id: Set(id.clone()),
+                        last_read_sort_key: Set(if index % 3 == 1 { "001" } else { "" }.into()),
+                        last_read_turn_id: Set(format!("{id}-001")),
+                        updated_at: Set(unix_to_datetime(1_700_000_200)),
+                    },
+                )
+                .exec(&store.connection)
+                .await
+                .unwrap();
+            }
+            ids.push(id);
+        }
+        let counts = store
+            .unread_counts_for_threads(&reader, &ids)
+            .await
+            .unwrap();
+        for (index, id) in ids.iter().enumerate() {
+            assert_eq!(counts.get(id), Some(&(if index % 3 == 1 { 1 } else { 2 })));
+        }
+        ids.extend([
+            ids[0].clone(),
+            ids[129].clone(),
+            ids[0].clone(),
+            "no-blocks".into(),
+        ]);
+        assert_eq!(
+            store
+                .unread_counts_for_threads(&reader, &ids)
+                .await
+                .unwrap(),
+            counts
+        );
+        assert!(
+            store
+                .unread_counts_for_threads(&reader, &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // An orphan/mismatched block must not become unread, even without FKs.
+        pioneer_entity::thread_timeline_block::Entity::update_many()
+            .col_expr(
+                pioneer_entity::thread_timeline_block::Column::ThreadId,
+                Expr::value("mismatch"),
+            )
+            .filter(pioneer_entity::thread_timeline_block::Column::BlockId.eq("user:batch-000-001"))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .unread_counts_for_threads(&reader, &["mismatch".into()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        pioneer_entity::thread_read_cursor::Entity::update_many()
+            .col_expr(
+                pioneer_entity::thread_read_cursor::Column::LastReadSortKey,
+                Expr::value("999"),
+            )
+            .filter(pioneer_entity::thread_read_cursor::Column::ThreadId.eq("batch-001"))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .unread_counts_for_threads(&reader, &["batch-001".into()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn thread_read_cursor_is_monotonic_and_unread_is_authoritative() {
         let workspace_id = "ws_unread_authoritative";
         let thread_id = "T00000000000000000001";
