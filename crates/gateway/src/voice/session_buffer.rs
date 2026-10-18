@@ -252,6 +252,20 @@ impl GatewayVoiceSessionBufferStore {
             .clone()
     }
 
+    // Only a hint for skipping superseded preview inference, never for audio
+    // ownership or Commit. Append/close and the actual drain stay serialized.
+    pub(super) fn processing_skip_preview(&self, session_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| {
+                sessions
+                    .get(session_id)
+                    .map(|buffer| buffer.closed || !buffer.chunks.is_empty())
+            })
+            .unwrap_or(true)
+    }
+
     pub(super) fn processing_finished(&self, session_id: &str) {
         if let Ok(mut sessions) = self.sessions.lock() {
             if let Some(buffer) = sessions.get_mut(session_id) {
