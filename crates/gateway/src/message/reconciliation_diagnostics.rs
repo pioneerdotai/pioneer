@@ -123,6 +123,9 @@ impl Diagnostic {
         diagnostic.phase = error
             .downcast_ref::<pioneer_crud::TaskRunOccurrenceRepairPhase>()
             .map(|phase| phase.label());
+        if let Some(phase) = error.downcast_ref::<pioneer_crud::NativeFinalizationPhase>() {
+            diagnostic.phase = Some(phase.label());
+        }
         diagnostic.reason = error
             .downcast_ref::<pioneer_crud::TaskRunOccurrenceRepairReason>()
             .map(|reason| reason.label());

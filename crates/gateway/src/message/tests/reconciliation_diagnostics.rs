@@ -387,3 +387,16 @@ fn occurrence_repair_phase_and_reason_survive_storage_source_classification() {
     assert_eq!(fields(&events[0])["reason"], "terminal_event_preparation");
     assert!(!serde_json::to_string(&events).unwrap().contains("canary"));
 }
+
+#[test]
+fn finalization_operation_survives_typed_sqlite_or_pool_cause() {
+    let error = pool_error()
+        .context(pioneer_crud::NativeFinalizationPhase::WriterBegin)
+        .context(CANARY);
+    let diagnostic = Diagnostic::extract(Operation::NativeFinalization, &error);
+    assert_eq!(diagnostic.cause, Cause::PoolTimeout);
+    assert_eq!(diagnostic.phase, Some("finalization_writer_begin"));
+    let events = capture(|| Reporter::new(OP).observe::<usize>(&Err(error), Instant::now()));
+    assert_eq!(fields(&events[0])["phase"], "finalization_writer_begin");
+    assert!(!serde_json::to_string(&events).unwrap().contains("canary"));
+}

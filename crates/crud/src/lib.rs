@@ -303,6 +303,32 @@ use crate::events::{TurnEventPayload, TurnStartedEventPayload};
 use crate::projector::TurnProjector;
 use crate::repositories::cli_runtime_binding::NewCliRuntimeTurnAttempt;
 
+/// Safe operation boundary; SQLite does not identify main/WAL/temp file here.
+#[derive(Debug, Clone, Copy)]
+pub enum NativeFinalizationPhase {
+    Scan,
+    Preparation,
+    WriterBegin,
+    WriterApply,
+    WriterCommit,
+}
+impl NativeFinalizationPhase {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Scan => "finalization_scan",
+            Self::Preparation => "finalization_preparation",
+            Self::WriterBegin => "finalization_writer_begin",
+            Self::WriterApply => "finalization_writer_apply",
+            Self::WriterCommit => "finalization_writer_commit",
+        }
+    }
+}
+impl fmt::Display for NativeFinalizationPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 #[derive(Debug)]
 pub struct TurnEventProjectionAfterAppendError {
     event_id: String,
@@ -14288,7 +14314,10 @@ impl CrudStore {
         limit: u64,
         event_timestamp_secs: i64,
     ) -> Result<TurnFinalizationReconciliationSummary> {
-        let turn_ids = self.list_prepared_turn_finalization_ids(limit).await?;
+        let turn_ids = self
+            .list_prepared_turn_finalization_ids(limit)
+            .await
+            .context(NativeFinalizationPhase::Scan)?;
         let mut summary = TurnFinalizationReconciliationSummary::default();
         for turn_id in turn_ids {
             summary.scanned = summary.scanned.saturating_add(1);
@@ -14328,7 +14357,8 @@ impl CrudStore {
             // revalidates their durable identities before committing them.
             let prepared_intent =
                 turn_finalization::find_by_turn_id(&self.connection, turn_id.as_str())
-                    .await?
+                    .await
+                    .context(NativeFinalizationPhase::Preparation)?
                     .with_context(|| format!("turn `{turn_id}` has no finalization intent"))?;
             let final_item = turn_finalization::notification_from_model(&prepared_intent)?;
             let prepared_turn = turn::find_turn_by_thread_and_id(
@@ -14336,11 +14366,13 @@ impl CrudStore {
                 prepared_intent.thread_id.as_str(),
                 turn_id.as_str(),
             )
-            .await?
+            .await
+            .context(NativeFinalizationPhase::Preparation)?
             .with_context(|| format!("turn `{turn_id}` disappeared during finalization"))?;
             let prepared_thread =
                 thread::find_thread_by_id(&self.connection, prepared_intent.thread_id.as_str())
-                    .await?
+                    .await
+                    .context(NativeFinalizationPhase::Preparation)?
                     .with_context(|| {
                         format!(
                             "thread `{}` disappeared during finalization",
@@ -14378,19 +14410,21 @@ impl CrudStore {
                 TurnEventPayload::ItemCompleted(final_item.clone()),
                 unix_to_datetime(event_timestamp_secs),
             )
-            .await?;
+            .await
+            .context(NativeFinalizationPhase::Preparation)?;
             let prepared_completed_event = prepare_projected_turn_event_for_permanent_storage(
                 &self.connection,
                 TurnEventPayload::TurnCompleted(turn_completed.clone()),
                 unix_to_datetime(event_timestamp_secs),
             )
-            .await?;
+            .await
+            .context(NativeFinalizationPhase::Preparation)?;
 
             let transaction = self
                 .connection
                 .begin()
                 .await
-                .context("failed to begin turn finalization transaction")?;
+                .context(NativeFinalizationPhase::WriterBegin)?;
             let result = async {
                 let intent = turn_finalization::find_by_turn_id(&transaction, turn_id.as_str())
                     .await?
@@ -14544,7 +14578,8 @@ impl CrudStore {
                     },
                 ))
             }
-            .await;
+            .await
+            .context(NativeFinalizationPhase::WriterApply);
             match result {
                 Ok(TurnFinalizationCommitOutcome::DeferredByPredecessor) => {
                     let _ = transaction.rollback().await;
@@ -14554,7 +14589,7 @@ impl CrudStore {
                     transaction
                         .commit()
                         .await
-                        .context("failed to commit turn finalization transaction")?;
+                        .context(NativeFinalizationPhase::WriterCommit)?;
                     Ok(outcome)
                 }
                 Err(error) => {
@@ -39037,12 +39072,15 @@ mod tests {
             )
             .await
             .expect("fault trigger should install");
-        assert!(
-            store
-                .commit_prepared_turn_finalization("turn_native_fault", 1_700_000_101)
-                .await
-                .is_err()
-        );
+        let error = store
+            .commit_prepared_turn_finalization("turn_native_fault", 1_700_000_101)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<super::NativeFinalizationPhase>(),
+            Some(super::NativeFinalizationPhase::WriterApply)
+        ));
+
         assert!(
             turn::find_turn_item(
                 &store.connection,
