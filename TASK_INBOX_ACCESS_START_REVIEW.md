@@ -491,3 +491,22 @@ Only fixture code and this report changed. Local `cargo check` and functional
 tests were not run, as requested. Formatting, diff checks and source-contract
 validation are the available local checks; runtime confirmation belongs to the
 new GitHub CI run after publication.
+
+
+## CI compaction legacy-summary follow-up
+
+Run `39199100814` on `9bb64667` passed all 702 CRUD library tests, including the
+six historical fixtures above. The next failure was
+`compaction_migration_resumes_partial_ddl_and_preserves_legacy_data_on_reapply`:
+it called current Thread summary CRUD before installing later inbox columns.
+
+The partial-DDL fixture now seeds and reads only the historical `summary` and
+`summary_turn_count` columns with typed SeaQuery statements. It still re-executes
+the actual compaction migration twice and checks the retained metadata after each
+application. After the full production migration chain, it additionally verifies
+the same summary through the current CRUD. Production code, migration registration
+and the historical schema boundary are unchanged.
+
+Local `cargo check` and tests were not run, as requested. Validation for this
+follow-up consists of source review, formatting and diff checks; the next GitHub
+CI run will compile and execute it.
