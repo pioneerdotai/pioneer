@@ -10,7 +10,22 @@ async fn start_task_cli_fixture(
     Arc<MessageProcessor>,
     String,
 ) {
-    let harness = setup_cli_runtime_skill_preflight_harness(kind, false).await;
+    start_task_cli_fixture_with_task_config(kind, pioneer_tasks::TaskRuntimeConfig::default()).await
+}
+
+async fn start_task_cli_fixture_with_task_config(
+    kind: CLIAgentRuntimeKind,
+    task_config: pioneer_tasks::TaskRuntimeConfig,
+) -> (
+    CliRuntimeSkillPreflightHarness,
+    Arc<MessageProcessor>,
+    String,
+) {
+    let mut harness = setup_cli_runtime_skill_preflight_harness(kind, false).await;
+    harness.processor.task_runtime = Arc::new(pioneer_tasks::TaskRuntime::new_with_config(
+        harness.crud_store.clone(),
+        task_config,
+    ));
     *harness.cli_session.projected_mcp_store.lock().await = Some(harness.crud_store.clone());
     let thread_id = format!("cli_tasks_{kind:?}").to_lowercase();
     let turn_id = format!("cli_tasks_turn_{kind:?}").to_lowercase();
@@ -51,6 +66,40 @@ async fn wait_for_task_cli_activation(processor: &MessageProcessor, turn_id: &st
     })
     .await
     .expect("CLI task fixture activation");
+}
+
+// Creation returns a durable TaskRun before its asynchronously admitted child
+// necessarily exists. Observe that run's authoritative binding, rather than
+// assuming nullable child ids in a creation response are already populated.
+async fn wait_for_task_cli_child(
+    processor: &MessageProcessor,
+    run_id: &str,
+    previous_turn_id: Option<&str>,
+) -> pioneer_crud::CliRuntimeTurnBindingRecord {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(child) = processor
+                .crud_store
+                .get_latest_task_run_turn(run_id)
+                .await
+                .unwrap()
+                && Some(child.turn_id.as_str()) != previous_turn_id
+                && let Some(binding) = processor
+                    .crud_store
+                    .get_cli_runtime_turn_binding(&child.turn_id)
+                    .await
+                    .unwrap()
+                && binding.status == "running"
+                && binding.native_turn_id.is_some()
+                && binding.mcp.is_some()
+            {
+                return binding;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Task run must activate its exact CLI child")
 }
 
 async fn invoke_task(
@@ -290,6 +339,10 @@ fn cli_attached_tasks_inherit_the_exact_selected_mcp_tool() {
                 .unwrap(),
                 vec![selected.clone()]
             );
+            harness
+                .cli_session
+                .set_next_native_turn_id(format!("exact_child_{kind:?}"))
+                .await;
             let child = invoke_task(&processor, &turn_id, "exact-child", "task_create", json!({
                 "title":"Inspect with the selected tool", "goal":"Inspect the available context",
                 "outputInstructions":"Return a concise report."
@@ -310,9 +363,15 @@ fn cli_attached_tasks_inherit_the_exact_selected_mcp_tool() {
                 "inherit the selected tool, not the broader admitted server ceiling"
             );
             wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 2).await;
-            let child_turn_id = child.structured_content.as_ref().unwrap()["childTurnId"]
-                .as_str()
-                .unwrap();
+            let child_binding = wait_for_task_cli_child(
+                &processor,
+                child.structured_content.as_ref().unwrap()["runId"]
+                    .as_str()
+                    .unwrap(),
+                None,
+            )
+            .await;
+            let child_turn_id = child_binding.turn_id.as_str();
             let child_bindings = processor
                 .crud_store
                 .list_turn_mcp_bindings(child_turn_id)
@@ -517,7 +576,7 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
                     json!({"taskId":task_id, "trigger":{"kind":"cron", "cronExpr":"0 8 * * *", "timezone":"Europe/Moscow"}}),
                 ),
                 ("task_resume", json!({"taskId":task_id})),
-                ("task_wait", json!({"taskIds":[task_id], "timeoutMs":0})),
+                ("task_wait", json!({"taskIds":[task_id], "timeoutMs":1})),
                 ("task_get", json!({"taskId":task_id})),
                 ("task_cancel", json!({"taskId":task_id})),
             ] {
@@ -571,9 +630,15 @@ fn cli_parent_native_completion_continues_with_existing_attached_work() {
                 .unwrap()
                 .to_owned();
             wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 2).await;
-            let child_turn_id = child.structured_content.as_ref().unwrap()["childTurnId"]
-                .as_str()
-                .unwrap();
+            let child_binding = wait_for_task_cli_child(
+                &processor,
+                child.structured_content.as_ref().unwrap()["runId"]
+                    .as_str()
+                    .unwrap(),
+                None,
+            )
+            .await;
+            let child_turn_id = child_binding.turn_id.as_str();
             let parent_snapshot = processor
                 .crud_store
                 .get_turn_runtime_snapshot(&turn_id)
@@ -724,6 +789,14 @@ fn completed_native_attempt_recovery_continues_unfinished_attached_tasks() {
                 "title":"Recoverable attached work", "goal":"Inspect the project", "outputInstructions":"Return findings."
             })).await.unwrap();
             assert!(!created.is_error, "{created:?}");
+            wait_for_task_cli_child(
+                &processor,
+                created.structured_content.as_ref().unwrap()["runId"]
+                    .as_str()
+                    .unwrap(),
+                None,
+            )
+            .await;
             let task_id = created.structured_content.unwrap()["taskId"]
                 .as_str()
                 .unwrap()
@@ -1005,6 +1078,14 @@ fn repeated_cli_completion_without_task_actions_is_bounded() {
                 "title":"Attached work", "goal":"Inspect the project", "outputInstructions":"Return findings."
             })).await.unwrap();
             assert!(!created.is_error, "{created:?}");
+            wait_for_task_cli_child(
+                &processor,
+                created.structured_content.as_ref().unwrap()["runId"]
+                    .as_str()
+                    .unwrap(),
+                None,
+            )
+            .await;
             for index in 0..4 {
                 wait_for_task_cli_activation(&processor, &turn_id).await;
                 let binding = processor
@@ -1063,6 +1144,14 @@ fn a_lost_wait_response_does_not_count_as_empty_orchestration_or_cancel_child_wo
             "title":"Long attached work", "goal":"Inspect the project", "outputInstructions":"Return findings."
         })).await.unwrap();
         assert!(!created.is_error);
+        wait_for_task_cli_child(
+            &processor,
+            created.structured_content.as_ref().unwrap()["runId"]
+                .as_str()
+                .unwrap(),
+            None,
+        )
+        .await;
         let task_id = created.structured_content.unwrap()["taskId"]
             .as_str()
             .unwrap()
@@ -1090,7 +1179,7 @@ fn a_lost_wait_response_does_not_count_as_empty_orchestration_or_cancel_child_wo
                     &turn_id,
                     "lost-wait",
                     "task_wait",
-                    json!({"taskIds":[task_id], "timeoutMs":0}),
+                    json!({"taskIds":[task_id], "timeoutMs":1}),
                 )
                 .await
                 .unwrap();
@@ -1101,7 +1190,7 @@ fn a_lost_wait_response_does_not_count_as_empty_orchestration_or_cancel_child_wo
                     native_item_id: "lost-wait".to_owned(), item_kind: "mcpToolCall".to_owned(), text: None,
                     summary: Vec::new(), content: Vec::new(), phase: RuntimeAgentMessagePhase::FinalAnswer,
                     metadata: Some(json!({"canonicalCallableName":"task_wait", "rawToolName":"task_wait", "serverName":"pioneer_tasks",
-                        "serverInstallationId":"pioneer-task-tools-v1", "arguments":{"taskIds":[task_id],"timeoutMs":0}, "success":false})),
+                        "serverInstallationId":"pioneer-task-tools-v1", "arguments":{"taskIds":[task_id],"timeoutMs":1}, "success":false})),
                     native_item_redacted: None, native: None,
                 })).await;
                 let items = processor
@@ -1193,7 +1282,12 @@ fn cli_task_wait_review_revise_accept_and_detach_use_the_existing_task_contract(
             CLIAgentRuntimeKind::Claude,
             CLIAgentRuntimeKind::OpenCode,
         ] {
-            let (harness, processor, turn_id) = start_task_cli_fixture(kind).await;
+            let mut task_config = review_enabled_task_runtime_config();
+            task_config
+                .review
+                .default_parent_review_for_immediate_attached_agent_tasks = true;
+            let (harness, processor, turn_id) =
+                start_task_cli_fixture_with_task_config(kind, task_config).await;
             *harness.cli_session.next_native_turn_id.lock().await =
                 Some(format!("review_child_{kind:?}"));
             let created = invoke_task(&processor, &turn_id, "review-create", "task_create", json!({
@@ -1203,16 +1297,35 @@ fn cli_task_wait_review_revise_accept_and_detach_use_the_existing_task_contract(
             let created = created.structured_content.unwrap();
             let task_id = created["taskId"].as_str().unwrap().to_owned();
             let run_id = created["runId"].as_str().unwrap().to_owned();
+            let persisted = processor
+                .crud_store
+                .get_task(&task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                persisted.agent_specs.iter().any(|spec| spec
+                    .review_policy
+                    .as_ref()
+                    .is_some_and(|policy| policy.require_explicit_acceptance)),
+                "fixture must admit a task that actually requires review"
+            );
+            let child_binding = wait_for_task_cli_child(&processor, &run_id, None).await;
             let first_wait = invoke_task(
                 &processor,
                 &turn_id,
                 "wait-window",
                 "task_wait",
-                json!({"runIds":[run_id], "timeoutMs":0}),
+                json!({"runIds":[run_id], "timeoutMs":1}),
             )
             .await
             .unwrap();
             assert!(!first_wait.is_error);
+            assert_eq!(
+                first_wait.structured_content.as_ref().unwrap()["timedOut"],
+                true,
+                "a valid wait window ends while the explicitly unfinished child keeps running"
+            );
             let current = processor
                 .crud_store
                 .get_task(&task_id)
@@ -1227,7 +1340,7 @@ fn cli_task_wait_review_revise_accept_and_detach_use_the_existing_task_contract(
             finish_task_cli_child(
                 &harness,
                 &processor,
-                created["childTurnId"].as_str().unwrap(),
+                &child_binding.turn_id,
                 "<task_result>{\"summary\":\"First report needs a detail.\"}</task_result>",
             )
             .await;
@@ -1278,9 +1391,9 @@ fn cli_task_wait_review_revise_accept_and_detach_use_the_existing_task_contract(
                 "taskId":task_id, "runId":run_id, "candidateId":candidate, "feedback":"Include the missing concrete detail."
             })).await.unwrap();
             assert!(!revised.is_error, "{revised:?}");
-            let revised_turn = revised.structured_content.as_ref().unwrap()["childTurnId"]
-                .as_str()
-                .unwrap();
+            let revised_binding =
+                wait_for_task_cli_child(&processor, &run_id, Some(&child_binding.turn_id)).await;
+            let revised_turn = revised_binding.turn_id.as_str();
             finish_task_cli_child(&harness, &processor, revised_turn,
                 "<task_result>{\"summary\":\"Revised report includes the concrete detail.\"}</task_result>").await;
             let review = invoke_task(

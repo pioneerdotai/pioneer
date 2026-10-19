@@ -1347,8 +1347,16 @@ fn with_enabled_test_cli_runtime_catalog(processor: MessageProcessor) -> Message
         settings_name.as_str(),
     )
     .expect("test Gateway settings should load");
+    let mut runtimes = pioneer_protocol::GatewayCliRuntimeSettings::default();
+    for runtime in &mut runtimes.instances {
+        runtime.home_path = runtime_home
+            .join("native-homes")
+            .join(&runtime.id)
+            .to_string_lossy()
+            .into_owned();
+    }
     settings
-        .set_cli_runtime_settings_for_tests(pioneer_protocol::GatewayCliRuntimeSettings::default())
+        .set_cli_runtime_settings_for_tests(runtimes)
         .expect("test CLI runtime catalog should be accepted");
     crate::settings::save_gateway_settings(settings_path.as_path(), &settings)
         .expect("test CLI runtime catalog should persist");
@@ -26806,11 +26814,12 @@ async fn a_child_first_continued_by_another_provider_or_after_source_edit_transf
                 })
                 .await
                 .unwrap();
-            // The provider fixture is durable across this simulated Gateway
-            // restart; the manager and its process/session caches are not.
+            // Keep the configured provider homes and ownership receipts across
+            // this simulated Gateway restart; only process/session caches reset.
+            let runtime_home = processor.artifact_runtime_home.clone();
             processor.shutdown_cli_runtime_manager().await;
             manager = test_cli_runtime_manager(cli.clone());
-            processor = Arc::new(with_enabled_test_cli_runtime_catalog(
+            processor = Arc::new(
                 MessageProcessor::new(
                     Arc::new(ThreadManager::new("test-model", "openai")),
                     test_provider(),
@@ -26822,10 +26831,11 @@ async fn a_child_first_continued_by_another_provider_or_after_source_edit_transf
                     test_tool_loop_config(),
                 )
                 .with_cli_runtime_manager_for_tests(manager.clone())
-                .with_cli_mcp_readiness_override_for_tests(
-                    supported_test_cli_mcp_readiness(CLIAgentRuntimeKind::Codex),
-                ),
-            ));
+                .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(
+                    CLIAgentRuntimeKind::Codex,
+                ))
+                .with_runtime_home_for_tests(runtime_home),
+            );
             processor
                 .mark_cli_runtimes_ready_for_tests(&workspace)
                 .await
