@@ -464,3 +464,30 @@ check with `PIONEER_RUST_ROOT` pointing to the publication worktree passed.
 Static normalized comparison confirmed unchanged migration bodies and transaction
 settings. The existing compatibility regression also checks uniqueness of all
 five historical names. Functional tests were not executed for this follow-up.
+
+
+## CI historical-fixture follow-up
+
+Run `39190635852` on `20536da5` failed six CRUD library tests. All six reported
+`no such column: thread.inbox_workspace_after_sequence`; Windows and macOS jobs
+passed. These failures came from current Entity/projector use against deliberately
+older test migration prefixes, before the inbox access columns exist.
+
+The native-cancellation production upgrade fixture still uses its exact historical
+schema. Its preservation query now selects all historical thread columns and
+projects NULL for the two later optional fields, following the existing stream
+marker projection in the same test. An explicit schema assertion protects this
+fixture from accidentally receiving the runtime compatibility fields.
+
+Three cancellation rollback-guard tests and two occurrence-tracker migration tests
+need today's projector on their older, reversible prefixes. Like the existing CLI
+locator compatibility column, a test-only helper provides the nullable thread/run
+fields and the sequence singleton required by that projector. It does not record
+inbox migration versions, add grants/receipts, change the production migration
+registry, or run on the pure production-upgrade fixture. Existing rollback,
+marker preservation, trigger-installation and repair assertions remain in place.
+
+Only fixture code and this report changed. Local `cargo check` and functional
+tests were not run, as requested. Formatting, diff checks and source-contract
+validation are the available local checks; runtime confirmation belongs to the
+new GitHub CI run after publication.

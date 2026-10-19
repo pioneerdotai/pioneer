@@ -34522,6 +34522,65 @@ mod tests {
         }
     }
 
+    // Some rollback guards exercise today's projector on a deliberately older
+    // migration prefix. Add only its unrelated inbox runtime dependencies, not
+    // migration records or historical grants. Pure upgrade fixtures must not
+    // call this helper: they retain the exact historical schema under test.
+    async fn add_inbox_runtime_fields_to_legacy_projector_fixture(store: &CrudStore) {
+        use migration::{ColumnDef, SchemaManager, Table};
+        use sea_orm::sea_query::Alias;
+
+        let transaction = store.connection.begin().await.unwrap();
+        let schema = SchemaManager::new(&*transaction);
+        for (table, column) in [
+            ("thread", "inbox_workspace_after_sequence"),
+            ("task_run", "inbox_sequence"),
+        ] {
+            schema
+                .alter_table(
+                    Table::alter()
+                        .table(Alias::new(table))
+                        .add_column(ColumnDef::new(Alias::new(column)).big_integer().null())
+                        .to_owned(),
+                )
+                .await
+                .unwrap();
+        }
+        schema
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("thread"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("inbox_workspace_started_at"))
+                            .timestamp_with_time_zone()
+                            .null(),
+                    )
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+        // Real current terminal commits allocate a sequence, even though these
+        // tests do not exercise inbox eligibility or notification history.
+        schema
+            .create_table(
+                sea_orm::Schema::new(DatabaseBackend::Sqlite)
+                    .create_table_from_entity(pioneer_entity::task_inbox_activation::Entity),
+            )
+            .await
+            .unwrap();
+        pioneer_entity::task_inbox_activation::Entity::insert(
+            pioneer_entity::task_inbox_activation::ActiveModel {
+                id: Set(1),
+                started_at: Set(0),
+                completion_sequence: Set(0),
+            },
+        )
+        .exec(&transaction)
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+    }
+
     async fn test_store_with_workspace(workspace_id: &str) -> CrudStore {
         test_store_with_workspace_migrator::<Migrator>(workspace_id).await
     }

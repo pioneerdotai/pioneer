@@ -1266,6 +1266,7 @@ async fn cancellation_schema_store(workspace_id: &str) -> CrudStore {
         "the compatibility column must not reclassify existing CLI roots"
     );
     transaction.commit().await.unwrap();
+    add_inbox_runtime_fields_to_legacy_projector_fixture(&store).await;
     store
 }
 
@@ -1417,6 +1418,13 @@ async fn seed_main_schema_history(db: &pioneer_sqlite::SqliteDatabase) -> Histor
     let stream = DatabaseBackend::Sqlite.build(&stream);
     // All JSON, hashing and statement preparation above precede the writer.
     let transaction = db.begin().await.unwrap();
+    assert!(
+        !migration::SchemaManager::new(&*transaction)
+            .has_column("thread", "inbox_workspace_after_sequence")
+            .await
+            .unwrap(),
+        "the production upgrade fixture must retain its historical schema"
+    );
     let workspace = pioneer_entity::workspace::ActiveModel {
         id: Set(workspace_id.to_owned()),
         name: Set("upgrade fixture".to_owned()),
@@ -1546,6 +1554,7 @@ async fn seed_main_schema_history(db: &pioneer_sqlite::SqliteDatabase) -> Histor
 impl HistoricalMigrationRows {
     async fn assert_preserved(&self, db: &pioneer_sqlite::SqliteDatabase) {
         use sea_orm::sea_query::{Alias, Query};
+        use sea_orm::{Iterable, QuerySelect};
         assert_eq!(
             pioneer_entity::workspace::Entity::find_by_id(self.workspace.id.clone())
                 .one(db)
@@ -1554,7 +1563,25 @@ impl HistoricalMigrationRows {
             Some(self.workspace.clone())
         );
         assert_eq!(
+            // The historical thread has no later inbox columns. Compare every
+            // legacy field, supplying NULL only for the absent optional fields.
             pioneer_entity::thread::Entity::find_by_id(self.thread.id.clone())
+                .select_only()
+                .columns(pioneer_entity::thread::Column::iter().filter(|column| {
+                    !matches!(
+                        column,
+                        pioneer_entity::thread::Column::InboxWorkspaceAfterSequence
+                            | pioneer_entity::thread::Column::InboxWorkspaceStartedAt
+                    )
+                }))
+                .column_as(
+                    Expr::val(None::<i64>),
+                    pioneer_entity::thread::Column::InboxWorkspaceAfterSequence,
+                )
+                .column_as(
+                    Expr::val(None::<sea_orm::prelude::DateTimeWithTimeZone>),
+                    pioneer_entity::thread::Column::InboxWorkspaceStartedAt,
+                )
                 .one(db)
                 .await
                 .unwrap(),
