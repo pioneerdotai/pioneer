@@ -1287,6 +1287,13 @@ mod tests {
         let core = crate::catalog_test_support::client();
         let (sender, _receiver) = mpsc::sync_channel(1);
         core.workspace_controller.lock().unwrap().sender = Some(sender);
+        // Reconciliation follows a tree load; hints for an unknown directory
+        // deliberately do not enqueue work.
+        core.thread_registry
+            .lock()
+            .unwrap()
+            .directory
+            .project("ws", None, false, None);
         let scope = crate::core::ClientScope::WorkspaceTree {
             workspace_id: Some("ws".into()),
         };
