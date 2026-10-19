@@ -14734,6 +14734,42 @@ owned_voice_ingress_test!(
     early
 );
 owned_voice_ingress_test!(
+    owned_voice_context_commit_during_preview_thirteen_seconds,
+    "closed_13",
+    "winner",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_context_commit_during_preview_seventeen_seconds,
+    "closed_17",
+    "winner",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_context_long_backlog_with_rephrased_probes,
+    "long_context",
+    "winner",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_context_final_error_after_window_advance_has_no_partial_turn,
+    "long_tail_error",
+    "winner",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_context_final_error_discards_confirmed_prefix,
+    "sealed_tail_error",
+    "winner",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_context_generation_change_fences_tail,
+    "generation_change",
+    "winner",
+    early
+);
+owned_voice_ingress_test!(
     owned_voice_incremental_engine_panic,
     "panic",
     "winner",
@@ -14883,17 +14919,49 @@ fn owned_voice_ingress_case(
                 flag = condition.wait(flag).unwrap();
             }
             drop(flag);
+            if matches!(terminal, "long_context" | "long_tail_error") {
+                if terminal == "long_tail_error" && call_count == 6 {
+                    return Err(transcription_error(
+                        VoiceTranscriptionErrorKind::RuntimeFailure,
+                        "controlled final failure after window advance",
+                    ));
+                }
+                let samples = buffer.flattened_samples();
+                return Ok(if samples.len() <= 48000 && samples[0] > 0.3 {
+                    "incorrect early boundary"
+                } else if samples[0] > 0.3 && samples.len() == 18 * 16000 {
+                    "Привет, мир. Да, да. Ещё раз, ещё раз."
+                } else if samples[0] > 0.3 {
+                    "Привет. Мир. ДА, ДА!"
+                } else if samples.len() <= 24000 {
+                    "да, да."
+                } else if samples.len() > 9 * 16000 {
+                    "Да, да. Ещё раз, ещё раз. Конец."
+                } else {
+                    "Ещё раз. ЕЩЁ РАЗ!"
+                }
+                .to_owned());
+            }
             match terminal {
                 "panic" => panic!("controlled fake panic"),
-                "tail_error" if call_count == 3 => Err(transcription_error(
+                "tail_error" if call_count == 2 => Err(transcription_error(
                     VoiceTranscriptionErrorKind::RuntimeFailure,
                     "controlled native tail failure",
+                )),
+                "sealed_tail_error" if call_count == 3 => Err(transcription_error(
+                    VoiceTranscriptionErrorKind::RuntimeFailure,
+                    "controlled failure after confirmed VAD span",
                 )),
                 "runtime_error" => Err(transcription_error(
                     VoiceTranscriptionErrorKind::RuntimeFailure,
                     "controlled fake failure",
                 )),
                 "no_speech" => Ok("  ".to_owned()),
+                // Context changes the hypothesis across the old 3 s cut. The
+                // final assertion must observe the correction, never append it.
+                _ if early && buffer.speech_samples() <= 48000 => {
+                    Ok("incorrect early boundary".to_owned())
+                }
                 _ => Ok("controlled transcript".to_owned()),
             }
         }));
@@ -15008,13 +15076,27 @@ fn owned_voice_ingress_case(
                 crate::voice::session_store::GatewayVoiceSessionState::Recording
             );
             // Duplicate accepted sequence is ACKed without replay. Keep a full
-            // second window and a seven-sample tail queued behind native work.
-            for sequence in 29..=60 {
-                let samples = if sequence == 60 { 7 } else { 1600 };
+            // second source span and a seven-sample tail behind native work.
+            let last_sequence = match terminal {
+                "long_context" | "long_tail_error" => 200,
+                "closed_13" => 129,
+                "closed_17" => 169,
+                _ => 60,
+            };
+            for sequence in 29..=last_sequence {
+                let samples = if sequence == last_sequence
+                    && !matches!(terminal, "closed_13" | "closed_17")
+                {
+                    7
+                } else {
+                    1600
+                };
                 let amplitude = if sequence == 29 {
                     12000
-                } else if sequence == 60 {
+                } else if sequence == last_sequence {
                     3000
+                } else if terminal == "sealed_tail_error" {
+                    0
                 } else {
                     6000
                 };
@@ -15203,6 +15285,23 @@ fn owned_voice_ingress_case(
             assert!(processor.voice_finalizations.has_active_work());
             assert!(!processor.voice_finalizations.tasks.is_empty());
         }
+        if terminal == "generation_change" {
+            // The next contextual call must use the recording's admitted
+            // generation; a successful old preview cannot authorize a new one.
+            processor
+                .voice_input_supervisor
+                .as_ref()
+                .unwrap()
+                .apply_desired(
+                    crate::voice::supervisor::VoiceInputDesiredState {
+                        enabled: false,
+                        provider: Some(pioneer_protocol::GatewayVoiceInputProvider::Local),
+                        model: Some("moonshine-base".to_owned()),
+                    },
+                    false,
+                )
+                .unwrap();
+        }
         release.release();
         // Closing the tracker enables waiting for completion; it does
         // not cancel the pipeline or forbid spawning by itself. Await exact worker completion, no sleeps.
@@ -15228,22 +15327,55 @@ fn owned_voice_ingress_case(
             {
                 assert_eq!(
                     calls.iter().map(Vec::len).collect::<Vec<_>>(),
-                    vec![48000, 48000, 1600]
+                    vec![48000, 96007],
+                    "Commit coalesces superseded previews into one contextual tail"
                 );
-                for ((call, amplitude), source_count) in calls
-                    .iter()
-                    .zip([12000_i16, 6000, 3000])
-                    .zip([48000, 48000, 7])
-                {
-                    assert_eq!(
-                        &call[..source_count],
-                        vec![f32::from(amplitude) / 32768.0; source_count]
-                    );
-                    assert!(
-                        call[source_count..].iter().all(|sample| *sample == 0.0),
-                        "only synthetic silence may follow the exact source prefix"
-                    );
-                }
+                assert_eq!(calls[0], vec![12000.0 / 32768.0; 48000]);
+                let mut source = vec![12000.0 / 32768.0; 48000];
+                source.extend(vec![6000.0 / 32768.0; 48000]);
+                source.extend([3000.0 / 32768.0; 7]);
+                assert_eq!(calls[1], source, "overlap must preserve source PCM order");
+            } else if terminal == "sealed_tail_error" {
+                assert_eq!(
+                    calls.iter().map(Vec::len).collect::<Vec<_>>(),
+                    vec![48000, 55200, 7687]
+                );
+                let mut confirmed_source = vec![12000.0 / 32768.0; 48000];
+                confirmed_source.extend([0.0; 7200]);
+                assert_eq!(calls[1], confirmed_source);
+                let mut tail = vec![0.0; 7680];
+                tail.extend([3000.0 / 32768.0; 7]);
+                assert_eq!(calls[2], tail);
+            } else if matches!(terminal, "closed_13" | "closed_17") {
+                let count = if terminal == "closed_13" {
+                    13 * 16000
+                } else {
+                    17 * 16000
+                };
+                assert_eq!(
+                    calls.iter().map(Vec::len).collect::<Vec<_>>(),
+                    vec![48000, count]
+                );
+                assert_eq!(calls.iter().map(Vec::len).sum::<usize>(), 48000 + count);
+                let mut source = vec![12000.0 / 32768.0; 48000];
+                source.extend(vec![6000.0 / 32768.0; count - 48000 - 1600]);
+                source.extend([3000.0 / 32768.0; 1600]);
+                assert_eq!(calls[1], source);
+            } else if matches!(terminal, "long_context" | "long_tail_error") {
+                assert_eq!(
+                    calls.iter().map(Vec::len).collect::<Vec<_>>(),
+                    vec![48000, 288000, 168000, 120000, 24000, 176007]
+                );
+                assert_eq!(calls.iter().map(Vec::len).sum::<usize>(), 824007);
+                assert!(calls.iter().all(|call| call.len() <= 18 * 16000));
+                let mut source = vec![12000.0 / 32768.0; 48000];
+                source.extend(vec![6000.0 / 32768.0; 272000]);
+                source.extend([3000.0 / 32768.0; 7]);
+                assert_eq!(calls[1], source[..288000]);
+                assert_eq!(calls[2], source[..168000]);
+                assert_eq!(calls[3], source[168000..288000]);
+                assert_eq!(calls[4], source[144000..168000]);
+                assert_eq!(calls[5], source[144000..]);
             } else {
                 assert_eq!(
                     calls.len(),
@@ -15257,27 +15389,41 @@ fn owned_voice_ingress_case(
             let result: VoiceSessionResultNotification =
                 serde_json::from_value(event.params.unwrap()).unwrap();
             let expected = match terminal {
-                "transcript" => VoiceSessionOutcome::TurnStarted,
+                "transcript" | "long_context" | "closed_13" | "closed_17" => {
+                    VoiceSessionOutcome::TurnStarted
+                }
                 "no_speech" => VoiceSessionOutcome::NoSpeech,
                 _ => VoiceSessionOutcome::Failed,
             };
             assert_eq!(result.outcome, expected);
             assert_eq!(
                 crud.get_turn(thread_id, turn_id).await.unwrap().is_some(),
-                terminal == "transcript"
+                matches!(
+                    terminal,
+                    "transcript" | "long_context" | "closed_13" | "closed_17"
+                )
             );
-            if early && terminal == "transcript" {
+            if early && matches!(terminal, "transcript" | "closed_13" | "closed_17") {
                 let history = crud
                     .get_thread_history(thread_id, Some(64))
                     .await
                     .unwrap()
                     .unwrap();
-                assert!(
-                    serde_json::to_string(&history.events).unwrap().contains(
-                        "controlled transcript controlled transcript controlled transcript"
-                    ),
-                    "Commit must concatenate each completed fragment exactly once"
-                );
+                let history = serde_json::to_string(&history.events).unwrap();
+                assert!(history.contains("controlled transcript"));
+                assert!(!history.contains("incorrect early boundary"));
+                assert!(!history.contains("controlled transcript controlled transcript"));
+            }
+            if terminal == "long_context" {
+                let history = crud
+                    .get_thread_history(thread_id, Some(64))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let history = serde_json::to_string(&history.events).unwrap();
+                assert!(history.contains("Привет, мир. Да, да. Ещё раз, ещё раз. Конец."));
+                assert!(!history.contains("incorrect early boundary"));
+                assert!(!history.contains("Да, да. Да, да."));
             }
             cancel["id"] = json!(late_cancel_id);
             processor
@@ -81440,6 +81586,17 @@ async fn recovery_failure_task_consumers_impl(
         "Recovery task",
         3,
     );
+    if parent_is_task_run {
+        // Let the executor create the real occurrence, including its run ID,
+        // lineage and terminal projection receipt. Changing a conversation's
+        // turn_kind alone does not establish those cleanup prerequisites.
+        params.lifecycle_policy = Some(TaskLifecyclePolicy {
+            attachment: TaskAttachmentMode::Detached,
+            on_parent_cancel: TaskParentTerminalAction::KeepRunning,
+            on_parent_failure: TaskParentTerminalAction::KeepRunning,
+            completion: TaskCompletionBehavior::CompleteOnTerminalRun,
+        });
+    }
     params.delivery_policy = Some(TaskDeliveryPolicy {
         mode: TaskDeliveryMode::Thread,
         thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
@@ -81450,19 +81607,18 @@ async fn recovery_failure_task_consumers_impl(
     });
     let created = create_task_for_test(&processor, params).await.unwrap();
     let run = created.run.unwrap();
-    if parent_is_task_run {
-        // A visible Task occurrence closes with its child; a delegating Agent Turn stays active.
-        store
-            .database_connection()
-            .execute_unprepared(&format!(
-                "UPDATE turn SET turn_kind = 'task_run' WHERE id = '{}'",
-                parent_turn
-            ))
-            .await
-            .unwrap();
-    }
+    let parent_turn = if parent_is_task_run {
+        run.id.clone()
+    } else {
+        parent_turn
+    };
     let lineage = wait_for_child_lineage_for_run(store.clone(), &run.id).await;
     // Lineage registration precedes the child's remaining preflight work.
+    assert_eq!(
+        lineage.created_by_turn_id.as_deref(),
+        Some(parent_turn.as_str()),
+        "recovery must exercise the actual conversation or occurrence parent"
+    );
     // Wait for the actual provider entry before injecting its failure; a fixed
     // 2.5-second poll window races that preparation in the parallel suite.
     timeout(Duration::from_secs(30), async {

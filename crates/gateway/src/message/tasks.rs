@@ -18,11 +18,18 @@ use serde_json::json;
 pub(super) struct TaskChildReconciliationFailures {
     reported: Vec<pioneer_tasks::TaskStartFailureDescriptor>,
     independent: Vec<String>,
+    pending_projection: usize,
 }
 
 impl TaskChildReconciliationFailures {
     fn push(&mut self, thread_id: &str, turn_id: &str, mut error: anyhow::Error) {
-        if let Some(failure) = error.downcast_mut::<pioneer_tasks::TaskStartFailure>() {
+        if error.chain().any(|cause| {
+            cause
+                .downcast_ref::<pioneer_crud::TurnEventProjectionAfterAppendError>()
+                .is_some_and(|error| error.is_pending())
+        }) {
+            self.pending_projection += 1;
+        } else if let Some(failure) = error.downcast_mut::<pioneer_tasks::TaskStartFailure>() {
             failure.report_in_place();
             self.reported.push(failure.descriptor().clone());
         } else {
@@ -38,6 +45,14 @@ impl TaskChildReconciliationFailures {
     }
 
     pub(super) fn report_worker_failure(&self) {
+        if self.pending_projection > 0 {
+            // No child ACK or capsule deletion: the canonical projection owner
+            // retains its durable obligation and reports failed/stuck streams.
+            debug!(
+                pending_projection = self.pending_projection,
+                "task child reconciliation awaits authoritative projection receipt"
+            );
+        }
         if !self.independent.is_empty() {
             error!(
                 error = %self.independent.join("; "),
@@ -51,8 +66,8 @@ impl std::fmt::Display for TaskChildReconciliationFailures {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "terminal task child reconciliation failed: reported={:?}",
-            self.reported
+            "terminal task child reconciliation deferred/failed: pending_projection={}, reported={:?}",
+            self.pending_projection, self.reported
         )?;
         if !self.independent.is_empty() {
             write!(f, "; {}", self.independent.join("; "))?;
@@ -219,6 +234,23 @@ impl MessageProcessor {
             match result {
                 Ok(true) => {
                     if turn.status != TurnStatus::Blocked {
+                        match self
+                            .crud_store
+                            .with_maintenance_access()
+                            .cleanup_terminal_task_child_capsule(&turn.thread_id, &turn.turn_id)
+                            .await
+                        {
+                            Ok(Some(true)) => {
+                                reconciled = reconciled.saturating_add(1);
+                                continue;
+                            }
+                            Ok(Some(false)) => continue,
+                            Ok(None) => {} // Active aggregate: existing cleanup below.
+                            Err(error) => {
+                                errors.push(&turn.thread_id, &turn.turn_id, error);
+                                continue;
+                            }
+                        }
                         if let Err(error) = self
                             .crud_store
                             .delete_turn_llm_context_for_turn(turn.turn_id.as_str())
@@ -244,7 +276,10 @@ impl MessageProcessor {
                 Err(error) => errors.push(&turn.thread_id, &turn.turn_id, error),
             }
         }
-        if !errors.reported.is_empty() || !errors.independent.is_empty() {
+        if errors.pending_projection > 0
+            || !errors.reported.is_empty()
+            || !errors.independent.is_empty()
+        {
             return Err(anyhow::Error::new(errors));
         }
         Ok(reconciled)

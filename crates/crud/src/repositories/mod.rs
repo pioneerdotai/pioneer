@@ -129,7 +129,9 @@ pub(crate) mod task_run_occurrence_reconcile;
 pub(crate) mod task_occurrence_reconcile;
 
 pub(crate) mod frozen_storage_lifetime;
+mod frozen_sweep_work;
 
 pub(crate) mod html_preview_retention;
+pub(crate) mod task_child_cleanup;
 
 pub(crate) mod unread_start;

@@ -7,6 +7,9 @@ use sea_orm::{
 };
 
 async fn db_fixture(legacy: bool) -> sea_orm::DatabaseConnection {
+    db_fixture_before(legacy.then_some("m20261010_000001_frozen_lifetime")).await
+}
+async fn db_fixture_before(before: Option<&str>) -> sea_orm::DatabaseConnection {
     let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
     options.max_connections(1).min_connections(1);
     let db = sea_orm::Database::connect(options).await.unwrap();
@@ -24,22 +27,15 @@ async fn db_fixture(legacy: bool) -> sea_orm::DatabaseConnection {
         .try_get("", "foreign_keys")
         .unwrap();
     assert_eq!(pragma, 0, "production single writer uses FK OFF");
-    // Legacy fixtures need the schema before frozen lifetime, regardless of
-    // how many migrations have been appended since that cutover.
-    let before_frozen_lifetime = Migrator::migrations()
-        .iter()
-        .position(|migration| migration.name() == "m20261010_000001_frozen_lifetime")
-        .expect("frozen lifetime migration must remain registered");
-    Migrator::up(
-        &db,
-        if legacy {
-            Some(before_frozen_lifetime as u32)
-        } else {
-            None
-        },
-    )
-    .await
-    .unwrap();
+    // Select an exact historical schema boundary. Later, irreversible
+    // migrations must not turn upgrade fixtures into rollback attempts.
+    let steps = before.map(|name| {
+        Migrator::migrations()
+            .iter()
+            .position(|migration| migration.name() == name)
+            .expect("fixture migration boundary must remain registered") as u32
+    });
+    Migrator::up(&db, steps).await.unwrap();
     db.execute_unprepared("INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',1,1),('other','other',1,0)").await.unwrap();
     db.execute_unprepared("INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('other-thread','other','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
     db
@@ -705,13 +701,16 @@ async fn mutation_invalidates_derived_terminal_generation_before_resume_or_state
         },
     )
     .await;
-    store
-        .upsert_cli_runtime_thread_binding(binding(cursor(&h)))
+    // A direct root skips terminal preparation. A reader hold lets preparation
+    // derive the marker, then prevents expiry at the final writer guard.
+    let hold = store
+        .compaction_acquire_frozen_history("ws", &h)
         .await
         .unwrap();
     let mut p = FrozenStorageLifetimeProgress::default();
     drive(&store, &mut p, 1500).await;
     assert_eq!(n(&store,"SELECT terminal_generation AS n FROM compaction_operation_projection WHERE operation_id=?1","op").await,0);
+    assert_eq!(expired(&store, "origin").await, 0);
     sql(
         &store,
         "UPDATE compaction_runner_state SET generation=1 WHERE operation_id='op'",
@@ -719,10 +718,7 @@ async fn mutation_invalidates_derived_terminal_generation_before_resume_or_state
     )
     .await;
     assert_eq!(n(&store,"SELECT count(*) AS n FROM compaction_operation_projection WHERE operation_id=?1 AND terminal_generation IS NULL","op").await,1);
-    store
-        .upsert_cli_runtime_thread_binding(binding("{}".into()))
-        .await
-        .unwrap();
+    drop(hold);
     drive(&store, &mut p, 1500).await;
     assert_eq!(
         expired(&store, "origin").await,
@@ -1210,9 +1206,19 @@ async fn terminal_task_legacy_scope_mismatch_is_not_an_independent_input_root() 
 #[tokio::test]
 async fn released_schema_upgrade_matches_fresh_triggers_and_releases_existing_inputs() {
     let fresh = db_fixture(false).await;
-    let db = db_fixture(false).await;
-    Migrator::down(&db, Some(1)).await.unwrap();
+    let cutover = "m20261015_000002_terminal_task_input_roots";
+    let db = db_fixture_before(Some(cutover)).await;
     let store = CrudStore::new(db.clone());
+    assert_eq!(
+        n(
+            &store,
+            "SELECT count(*) AS n FROM seaql_migrations WHERE version=?1",
+            cutover
+        )
+        .await,
+        0,
+        "seed accepted inputs before the terminal-task root migration"
+    );
     for status in ["completed", "failed", "cancelled"] {
         task(&store, status, status).await;
         let h = header(&store, status, "ws", "thread", 1, 1).await;
@@ -1221,6 +1227,16 @@ async fn released_schema_upgrade_matches_fresh_triggers_and_releases_existing_in
     drop(store);
     Migrator::up(&db, None).await.unwrap();
     let store = CrudStore::new(db.clone());
+    assert_eq!(
+        n(
+            &store,
+            "SELECT count(*) AS n FROM seaql_migrations WHERE version=?1",
+            cutover
+        )
+        .await,
+        1,
+        "exercise the upgrade even when later migrations are appended"
+    );
     for name in ["task_frozen_roots_insert", "task_frozen_roots_update"] {
         let query = Statement::from_sql_and_values(
             DbBackend::Sqlite,

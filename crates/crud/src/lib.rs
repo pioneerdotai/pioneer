@@ -336,6 +336,7 @@ pub struct TurnEventProjectionAfterAppendError {
     sequence: i64,
     projection_error: String,
     projection_failure_record_error: Option<String>,
+    pending: bool,
 }
 
 impl TurnEventProjectionAfterAppendError {
@@ -352,7 +353,20 @@ impl TurnEventProjectionAfterAppendError {
             sequence,
             projection_error,
             projection_failure_record_error,
+            pending: false,
         }
+    }
+
+    fn pending(event_id: String, turn_id: String, sequence: i64, message: String) -> Self {
+        let mut error = Self::new(event_id, turn_id, sequence, message, None);
+        error.pending = true;
+        error
+    }
+
+    /// A durable append whose authoritative receipt is owned by projection replay.
+    /// This never acknowledges completion and never describes a failed projector.
+    pub fn is_pending(&self) -> bool {
+        self.pending
     }
 }
 
@@ -1611,7 +1625,8 @@ pub struct ClaimedTurnEventDeliveryRecord {
 }
 
 /// A terminal task-owned child Turn whose TaskRun aggregate has not yet
-/// consumed the terminal outcome. The row itself is the durable retry token:
+/// consumed the terminal outcome, or whose terminal aggregate has a received
+/// parent projection and a retained capsule. The rows are durable retry tokens:
 /// reconciliation can be repeated without depending on a process-local
 /// completion callback.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5007,21 +5022,25 @@ impl CrudStore {
             .connection
             .query_all_raw(Statement::from_sql_and_values(
                 self.connection.get_database_backend(),
-                "SELECT t.thread_id, t.id AS turn_id, t.status, t.error \
+                format!("SELECT t.thread_id, t.id AS turn_id, t.status, t.error \
                  FROM task_run r \
                  INNER JOIN task task_row ON task_row.id = r.task_id \
                  INNER JOIN task_run_turn trt ON trt.run_id = r.id \
                  INNER JOIN \"turn\" t \
                     ON t.id = trt.turn_id AND t.thread_id = trt.thread_id \
-                 WHERE r.status IN ('queued', 'starting', 'running', 'waiting', 'waiting_review') \
-                   AND task_row.status IN \
-                       ('draft', 'scheduled', 'queued', 'running', 'waiting', 'waiting_review') \
-                   AND (trt.status = 'in_progress' \
-                        OR (trt.status = 'candidate_created' AND r.status <> 'waiting_review')) \
-                   AND t.turn_kind = 'conversation' \
+                 WHERE t.turn_kind = 'conversation' \
                    AND t.status IN ('completed', 'failed', 'interrupted', 'blocked') \
-                 ORDER BY t.updated_at ASC, t.id ASC LIMIT ?"
-                    .to_owned(),
+                   AND ((r.status IN ('queued', 'starting', 'running', 'waiting', 'waiting_review') \
+                     AND task_row.status IN \
+                       ('draft', 'scheduled', 'queued', 'running', 'waiting', 'waiting_review') \
+                     AND (trt.status = 'in_progress' \
+                        OR (trt.status = 'candidate_created' AND r.status <> 'waiting_review'))) \
+                    OR (r.status IN ('succeeded', 'failed', 'cancelled', 'timed_out') \
+                      AND ({ready}) \
+                      AND (EXISTS (SELECT 1 FROM turn_runtime_snapshot c WHERE c.turn_id = t.id) \
+                        OR EXISTS (SELECT 1 FROM turn_llm_context c WHERE c.turn_id = t.id AND c.source NOT IN ('assistant_round', 'tool_result_v2'))))) \
+                 ORDER BY t.updated_at ASC, t.id ASC LIMIT ?",
+                    ready = repositories::task_child_cleanup::READY),
                 [i64::try_from(limit).unwrap_or(i64::MAX).into()],
             ))
             .await
@@ -5061,6 +5080,34 @@ impl CrudStore {
         rows.into_iter()
             .map(|row| row.try_get("", "version").map_err(Into::into))
             .collect()
+    }
+
+    pub async fn terminal_task_child_cleanup_ready(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<bool>> {
+        repositories::task_child_cleanup::ready(&self.connection, thread_id, turn_id).await
+    }
+
+    /// Revalidate under the serialized writer and delete both capsule parts
+    /// atomically. Until commit, their presence is the durable retry token.
+    pub async fn cleanup_terminal_task_child_capsule(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<bool>> {
+        self.run_serialized_write(|| async {
+            let tx = self.connection.begin().await?;
+            let ready = repositories::task_child_cleanup::ready(&tx, thread_id, turn_id).await?;
+            if ready == Some(true) {
+                turn_llm_context::delete_turn_llm_context_for_turn(&tx, turn_id).await?;
+                turn_runtime_snapshot::delete_turn_runtime_snapshot(&tx, turn_id).await?;
+            }
+            tx.commit().await?;
+            Ok(ready)
+        })
+        .await
     }
 
     pub async fn list_active_execution_authorities(
@@ -29643,6 +29690,31 @@ impl CrudStore {
         .await
     }
 
+    /// Pause the ordinary parent's projector after durable acceptance. The
+    /// production claim is retained, so duplicate materialization is pending.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn accept_turn_event_before_projection_for_test(
+        &self,
+        event: CanonicalTurnEventPayload,
+        timestamp: i64,
+    ) -> Result<()> {
+        self.append_claimed_turn_event_projection_once(
+            event,
+            unix_to_datetime(timestamp),
+            TurnEventProjectionContext {
+                item_started_deadlines: None,
+                enqueue_optional_deliveries: true,
+                native_cancellation: None,
+            },
+            generate_id(DB_ID_LEN),
+            unix_to_datetime(timestamp + 60),
+            None,
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Reproduce process loss after canonical acceptance and before projection,
     /// retaining the production owner fences and replay/delivery obligations.
     #[cfg(any(test, feature = "test-support"))]
@@ -29831,12 +29903,11 @@ impl CrudStore {
                         "failed to release deferred turn event projection claim; lease expiry will retry it"
                     ),
                 }
-                return Err(TurnEventProjectionAfterAppendError::new(
+                return Err(TurnEventProjectionAfterAppendError::pending(
                     appended_event.id,
                     appended_event.turn_id,
                     appended_event.sequence,
                     "authoritative projection is waiting for an earlier turn event".to_owned(),
-                    None,
                 )
                 .into());
             }
@@ -30543,12 +30614,11 @@ impl CrudStore {
             // and still be projecting it. Its durable append is just as
             // authoritative as our own: callers must not roll back local
             // terminal state while the original projection is in flight.
-            return Err(TurnEventProjectionAfterAppendError::new(
+            return Err(TurnEventProjectionAfterAppendError::pending(
                 appended_event.id,
                 appended_event.turn_id,
                 appended_event.sequence,
                 "idempotent canonical event is waiting for its authoritative projection".to_owned(),
-                None,
             )
             .into());
         }
@@ -48807,6 +48877,12 @@ mod tests {
             .materialize_native_agent_turn_event(event.clone(), timestamp + 2, None)
             .await
             .expect_err("projection remains pending behind the original producer");
+        assert!(
+            duplicate_error
+                .downcast_ref::<super::TurnEventProjectionAfterAppendError>()
+                .expect("typed after-append outcome")
+                .is_pending()
+        );
         assert!(
             super::turn_event_was_appended_before_error(&duplicate_error),
             "Gateway must preserve the terminal state and ACK the already committed event"

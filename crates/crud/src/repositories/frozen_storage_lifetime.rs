@@ -1,6 +1,6 @@
-//! Private progress for the existing frozen-storage worker. No durable queue,
-//! global registry, connection, or capacity permit is retained between quanta.
-use super::{checkpoint_proofs, compaction};
+//! Bounded progress for the existing frozen-storage worker. Physical eligibility
+//! is durable; no connection or capacity permit is retained between quanta.
+use super::{checkpoint_proofs, compaction, frozen_sweep_work};
 use crate::{CrudStore, frozen_lifetime::PreparedFrozenRoot};
 use anyhow::{Result, ensure};
 use pioneer_compaction::runner::{RunnerPhase, RunnerState};
@@ -26,6 +26,10 @@ use std::{
 
 const FRAGMENT_BYTES: i64 = 64 * 1024;
 const META_ROWS: u64 = 64;
+// Bound only the added multi-key page, not the legacy TEXT ID domain. A key
+// above this policy uses the original full-key single seek outside the page.
+// At most META_ROWS * SCOPE_PAGE_KEY_BYTES key bytes are retained in its page.
+const SCOPE_PAGE_KEY_BYTES: i64 = FRAGMENT_BYTES;
 // Legacy JSON has no producer byte cap. An oversized record remains unknown
 // (and blocks only its retaining scope), rather than allowing one worker job
 // to grow without bound. A normal authorized root replacement can verify it.
@@ -44,7 +48,6 @@ pub struct FrozenStorageLifetimeProgress {
     // continuations and of the worker's separate conversion discovery EOF.
     cleanup_revisit_at: Option<Instant>,
     locator_done: [bool; 4],
-    physical_done: [bool; 2],
     scope: ScopeDiscovery,
     locators: [String; 4],
     locator_kind: usize,
@@ -55,13 +58,12 @@ pub struct FrozenStorageLifetimeProgress {
     proof: Option<checkpoint_proofs::GraphPreparation>,
     expiry_after: String,
     expiry: Option<ExpiryPreparation>,
-    physical_after: [Option<String>; 2],
-    physical_until: [Option<String>; 2],
-    physical_started: [bool; 2],
-    physical_kind: usize,
     sweep: Option<SweepPreparation>,
     sweep_pending: VecDeque<SweepPreparation>,
     sweep_discover: bool,
+    sweep_kind: i64,
+    sweep_fanout: bool,
+    sweep_round: [frozen_sweep_work::ServiceRound; 2],
     accounting: SweepAccounting,
     discard_after: String,
     discard: Option<DiscardPreparation>,
@@ -489,6 +491,7 @@ fn pre_runner_failure(header: &history::Model) -> SimpleExpr {
 }
 struct ExpiryPreparation {
     header: history::Model,
+    roots_checked: bool,
     operations_after: String,
     operations_done: bool,
     checkpoint_after: String,
@@ -501,6 +504,7 @@ impl ExpiryPreparation {
     fn new(header: history::Model) -> Self {
         Self {
             header,
+            roots_checked: false,
             operations_after: String::new(),
             operations_done: false,
             checkpoint_after: String::new(),
@@ -511,6 +515,28 @@ impl ExpiryPreparation {
         }
     }
     async fn step(&mut self, store: &CrudStore, accounting: &mut SweepAccounting) -> Result<bool> {
+        if !self.roots_checked {
+            // Advisory positive hold only, once per attempt. Release the reader
+            // before any preparation; a negative result leaves every final
+            // writer guard in place. Ordinary passes revisit released roots.
+            let held = store.connection.query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                r#"SELECT 1 WHERE
+EXISTS(SELECT 1 FROM task_run_conversation_snapshot s LEFT JOIN task t ON t.id=s.task_id WHERE s.frozen_manifest_id=?1 AND (t.id IS NULL OR t.status NOT IN ('completed','failed','cancelled')))
+OR EXISTS(SELECT 1 FROM turn_runtime_snapshot s WHERE s.frozen_manifest_id=?1)
+OR EXISTS(SELECT 1 FROM thread_cli_runtime_binding s WHERE s.frozen_manifest_id=?1)
+OR EXISTS(SELECT 1 FROM turn_cli_runtime_binding s WHERE s.frozen_manifest_id=?1)
+OR EXISTS(SELECT 1 FROM compaction_task_output s WHERE s.manifest_id=?1)
+LIMIT 1"#,
+                [self.header.id.clone().into()],
+            )).await?.is_some();
+            self.roots_checked = true;
+            if held {
+                accounting.held += 1;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
         if self.layout_kind < 2 {
             if let Some(layout) = self.layout.as_mut() {
                 layout.step(store).await?;
@@ -1009,7 +1035,16 @@ struct CheckedGeometry {
     h: history::Model,
     l: Option<layout::Model>,
 }
+#[derive(Debug, PartialEq, Eq)]
+enum SweepStep {
+    Continue,
+    Complete,
+    Retry,
+}
+
 struct SweepPreparation {
+    work: Option<frozen_sweep_work::Work>,
+    poison: bool,
     manifest: String,
     kind: i64,
     until: i64,
@@ -1029,6 +1064,8 @@ struct SweepPreparation {
 impl SweepPreparation {
     fn new(manifest: String, kind: i64, until: i64) -> Self {
         Self {
+            work: None,
+            poison: false,
             checks: VecDeque::from([manifest.clone()]),
             manifest,
             kind,
@@ -1181,16 +1218,20 @@ impl SweepPreparation {
         self.reverse = Vec::new();
         Ok(true)
     }
-    async fn step(&mut self, store: &CrudStore, accounting: &mut SweepAccounting) -> Result<bool> {
+    async fn step(
+        &mut self,
+        store: &CrudStore,
+        accounting: &mut SweepAccounting,
+    ) -> Result<SweepStep> {
         if self.prepared.is_none() {
             if self.prepare(store).await? && self.free.is_empty() {
                 accounting.held += 1;
-                return Ok(true);
+                return Ok(self.completed_step());
             }
-            return Ok(false);
+            return Ok(SweepStep::Continue);
         }
         let Some(&(start, end)) = self.free.front() else {
-            return Ok(true);
+            return Ok(self.completed_step());
         };
         let (data, payload) = physical_table(self.kind);
         let import_key = if self.kind == 1 {
@@ -1214,6 +1255,7 @@ impl SweepPreparation {
                 || row.try_get::<i64>("", "target")? < 0
             {
                 accounting.poison += 1;
+                self.poison = true;
                 next = ordinal.saturating_add(1);
                 continue;
             }
@@ -1227,7 +1269,7 @@ impl SweepPreparation {
         if page.is_empty() {
             self.free.pop_front();
             self.next = end;
-            return Ok(self.free.is_empty());
+            return Ok(self.completed_step());
         }
         if !keys.is_empty() {
             // Build SQL/parameters before opening the transaction.
@@ -1239,11 +1281,18 @@ impl SweepPreparation {
                 keys.last().expect("keys").0,
             );
             let delete = physical_delete(&self.manifest, self.kind, &keys)?;
+            let fence = self.work.as_ref().map(frozen_sweep_work::Work::fence);
             let committed = store
                 .run_serialized_write(|| async {
                     let guard = guard.clone();
                     let delete = delete.clone();
                     let tx = store.connection.begin().await?;
+                    if let Some(fence) = &fence {
+                        if tx.query_one_raw(fence.clone()).await?.is_none() {
+                            tx.commit().await?;
+                            return Ok(None);
+                        }
+                    }
                     if tx.query_one_raw(guard).await?.is_none() {
                         tx.commit().await?;
                         return Ok(None);
@@ -1258,8 +1307,8 @@ impl SweepPreparation {
                 accounting
                     .acknowledge(self.kind, PhysicalDeleteResult::refused())
                     .await;
-                // Another container gets its turn; the next epoch re-prepares.
-                return Ok(true);
+                // Refusal is never successful completion of a generation.
+                return Ok(SweepStep::Retry);
             };
             accounting.acknowledge(self.kind, deleted).await;
         }
@@ -1267,7 +1316,25 @@ impl SweepPreparation {
         if self.next >= end {
             self.free.pop_front();
         }
-        Ok(self.free.is_empty())
+        Ok(self.completed_step())
+    }
+    fn completed_step(&self) -> SweepStep {
+        if !self.free.is_empty() {
+            SweepStep::Continue
+        } else if self.poison {
+            SweepStep::Retry
+        } else {
+            SweepStep::Complete
+        }
+    }
+
+    fn completion_guard(&self) -> Statement {
+        sweep_validation(
+            &self.manifest,
+            self.kind,
+            self.prepared.as_deref().expect("prepared"),
+            None,
+        )
     }
 }
 fn kind_bound(h: &history::Model, kind: i64) -> i64 {
@@ -1278,7 +1345,7 @@ fn kind_bound(h: &history::Model, kind: i64) -> i64 {
         _ => h.next_import,
     }
 }
-fn physical_table(kind: i64) -> (&'static str, &'static str) {
+pub(super) fn physical_table(kind: i64) -> (&'static str, &'static str) {
     if kind == 0 {
         ("compaction_frozen_message_data", "reference_json")
     } else {
@@ -1380,6 +1447,19 @@ fn geometry_values<'a>(geometries: impl IntoIterator<Item = &'a CheckedGeometry>
 // One common guard for the whole selected free interval, never a predicate
 // repeated for each physical row. Missing FK parents explicitly fail closed.
 fn sweep_guard(manifest: &str, kind: i64, prepared: &str, first: i64, last: i64) -> Statement {
+    sweep_validation(manifest, kind, prepared, Some((first, last)))
+}
+
+// Held completion needs the same current geometry and unknown-scope checks,
+// without the interval predicates which intentionally reject retained rows.
+fn sweep_validation(
+    manifest: &str,
+    kind: i64,
+    prepared: &str,
+    interval: Option<(i64, i64)>,
+) -> Statement {
+    let (first, last) = interval.unwrap_or((0, 0));
+    let deleting = if interval.is_some() { "1" } else { "0" };
     let h_fields = GEOMETRY_HEADER_FIELDS;
     let l_fields = GEOMETRY_LAYOUT_FIELDS;
     let same_h = h_fields
@@ -1415,9 +1495,9 @@ SELECT 1 WHERE
 NOT EXISTS(SELECT 1 FROM checked e LEFT JOIN compaction_frozen_history h ON h.id=e.h_id LEFT JOIN compaction_frozen_layout l ON l.manifest_id=e.h_id AND l.kind=?2 WHERE h.id IS NULL OR NOT ({same_h}) OR (l.manifest_id IS NOT NULL AND (l.cleanup_next<0 OR l.cleanup_next>l.cleanup_to)) OR NOT ((e.l_manifest_id IS NULL AND l.manifest_id IS NULL) OR (e.l_manifest_id IS NOT NULL AND l.manifest_id IS NOT NULL AND {same_l})))
 AND EXISTS(SELECT 1 FROM compaction_frozen_history p WHERE p.id=?1)
 AND NOT EXISTS(SELECT 1 FROM compaction_frozen_history p WHERE p.id=?1 AND ({unknown}))
-AND NOT EXISTS(SELECT 1 FROM compaction_frozen_history h WHERE h.id=?1 AND (NOT ({health}) OR (h.expired=0 AND ?3<CASE h.ready WHEN 1 THEN h.{hk} ELSE h.{nk} END AND NOT EXISTS(SELECT 1 FROM compaction_frozen_layout l WHERE l.manifest_id=h.id AND l.kind=?2 AND l.active=1))))
-AND NOT EXISTS(SELECT 1 FROM compaction_frozen_span s LEFT JOIN checked e ON e.h_id=s.manifest_id LEFT JOIN compaction_frozen_history h ON h.id=s.manifest_id LEFT JOIN compaction_frozen_layout l ON l.manifest_id=s.manifest_id AND l.kind=s.kind WHERE s.source_manifest=?1 AND s.kind=?2 AND (e.h_id IS NULL OR h.id IS NULL OR NOT ({health}) OR l.manifest_id IS NULL OR l.failed<>0 OR l.active<>1 OR l.copy_next<COALESCE(l.copy_to,0) OR (h.storage_registered<>0 AND l.manifest_id IS NULL) OR (h.expired=0 AND s.start<=?4 AND ?3<s.end AND ?3<CASE h.ready WHEN 1 THEN h.{hk} ELSE h.{nk} END)))
-AND NOT EXISTS(SELECT 1 FROM compaction_frozen_layout l WHERE l.kind=?2 AND (l.manifest_id=?1 OR l.candidate=?1) AND (l.failed<>0 OR l.active<>1 OR l.copy_next<COALESCE(l.copy_to,0)))
+AND NOT EXISTS(SELECT 1 FROM compaction_frozen_history h WHERE h.id=?1 AND (NOT ({health}) OR ({deleting}=1 AND h.expired=0 AND ?3<CASE h.ready WHEN 1 THEN h.{hk} ELSE h.{nk} END AND NOT EXISTS(SELECT 1 FROM compaction_frozen_layout l WHERE l.manifest_id=h.id AND l.kind=?2 AND l.active=1))))
+AND NOT EXISTS(SELECT 1 FROM compaction_frozen_span s LEFT JOIN checked e ON e.h_id=s.manifest_id LEFT JOIN compaction_frozen_history h ON h.id=s.manifest_id LEFT JOIN compaction_frozen_layout l ON l.manifest_id=s.manifest_id AND l.kind=s.kind WHERE s.source_manifest=?1 AND s.kind=?2 AND (e.h_id IS NULL OR h.id IS NULL OR NOT ({health}) OR l.manifest_id IS NULL OR l.failed<>0 OR l.active<>1 OR l.copy_next<COALESCE(l.copy_to,0) OR (h.storage_registered<>0 AND l.manifest_id IS NULL) OR ({deleting}=1 AND h.expired=0 AND s.start<=?4 AND ?3<s.end AND ?3<CASE h.ready WHEN 1 THEN h.{hk} ELSE h.{nk} END)))
+AND NOT EXISTS(SELECT 1 FROM compaction_frozen_layout l WHERE l.kind=?2 AND (l.manifest_id=?1 OR l.candidate=?1) AND (l.failed<>0 OR (({deleting}=1 OR l.manifest_id<>?1) AND l.active<>1) OR l.copy_next<COALESCE(l.copy_to,0)))
 AND NOT EXISTS(SELECT 1 FROM compaction_frozen_history h WHERE h.id=?1 AND h.storage_registered<>0 AND NOT EXISTS(SELECT 1 FROM compaction_frozen_layout l WHERE l.manifest_id=h.id AND l.kind=?2))
 "#
         ),
@@ -1649,10 +1729,6 @@ impl FrozenStorageLifetimeProgress {
         if self.pass_done.iter().all(|done| *done) {
             self.pass_done = [false; 6];
             self.locator_done = [false; 4];
-            self.physical_done = [false; 2];
-            self.physical_started = [false; 2];
-            self.physical_after = [None, None];
-            self.physical_until = [None, None];
             tracing::debug!(
                 message_rows = self.accounting.rows[0],
                 message_bytes = self.accounting.bytes[0],
@@ -1693,12 +1769,6 @@ impl FrozenStorageLifetimeProgress {
         for phase in [2, 3, 4] {
             if self.pass_done[phase] {
                 self.pass_done[phase] = false;
-                if phase == 3 {
-                    self.physical_done = [false; 2];
-                    self.physical_started = [false; 2];
-                    self.physical_after = [None, None];
-                    self.physical_until = [None, None];
-                }
             }
         }
     }
@@ -1967,22 +2037,30 @@ impl FrozenStorageLifetimeProgress {
     }
     async fn sweep_quantum(&mut self, store: &CrudStore) -> Result<bool> {
         let active = self.sweep_pending.len() + usize::from(self.sweep.is_some());
-        if active > 0
-            && (!self.sweep_discover
-                || active >= ACTIVE_CONTAINERS
-                || self.physical_done.iter().all(|done| *done))
-        {
+        if active > 0 && (!self.sweep_discover || active >= ACTIVE_CONTAINERS) {
             let mut sweep = self
                 .sweep
                 .take()
                 .or_else(|| self.sweep_pending.pop_front())
                 .expect("active sweep");
             let result = sweep.step(store, &mut self.accounting).await;
-            if matches!(result, Ok(false))
-                || result
-                    .as_ref()
-                    .is_err_and(|error| error.downcast_ref::<sea_orm::DbErr>().is_some())
-            {
+            // Keep ownership until the durable finish succeeds. DB errors and
+            // cancellation cannot turn a dropped continuation into a clean key.
+            let finish = match &result {
+                Ok(SweepStep::Complete) => Some(Some(sweep.completion_guard())),
+                Ok(SweepStep::Retry) => Some(None),
+                Err(_) => Some(None),
+                _ => None,
+            };
+            if let Some(validation) = finish {
+                if let Some(work) = &sweep.work {
+                    if let Err(error) = work.finish(store, validation).await {
+                        self.sweep_pending.push_back(sweep);
+                        self.sweep = self.sweep_pending.pop_front();
+                        return Err(error);
+                    }
+                }
+            } else {
                 self.sweep_pending.push_back(sweep);
             }
             self.sweep = self.sweep_pending.pop_front();
@@ -1991,95 +2069,109 @@ impl FrozenStorageLifetimeProgress {
             return Ok(true);
         }
         self.sweep_discover = false;
-        let mut selected = None;
-        for _ in 0..2 {
-            let kind = self.physical_kind;
-            self.physical_kind = (kind + 1) % 2;
-            if !self.physical_done[kind] {
-                selected = Some(kind);
-                break;
+        // Neither unfinished bootstrap nor pending fanout is physical EOF.
+        // One durable continuation per quantum, with no retained DB capacity.
+        if frozen_sweep_work::bootstrap_step(store).await? {
+            return Ok(true);
+        }
+        // One fanout turn alternates with one physical admission turn. Active
+        // preparations keep their existing rotation; fanout need not drain.
+        let fanout_checked = self.sweep_fanout;
+        if fanout_checked {
+            self.sweep_fanout = false;
+            if frozen_sweep_work::fanout_step(store).await? {
+                return Ok(true);
             }
         }
-        let Some(kind) = selected else {
-            return Ok(active > 0);
-        };
-        let (data, _) = physical_table(kind as i64);
-        if !self.physical_started[kind] {
-            let row = store
-                .connection
-                .query_one(
-                    &Query::select()
-                        .from(Alias::new(data))
-                        .column(Alias::new("manifest_id"))
-                        .order_by(Alias::new("manifest_id"), Order::Desc)
-                        .limit(1)
-                        .to_owned(),
+        self.sweep_fanout = true;
+        let active_keys = self
+            .sweep
+            .iter()
+            .chain(self.sweep_pending.iter())
+            .map(|s| (s.manifest.as_str(), s.kind))
+            .collect::<Vec<_>>();
+        let kind = self.sweep_kind;
+        self.sweep_kind = 1 - kind;
+        let selected = frozen_sweep_work::discover(
+            store,
+            &active_keys,
+            kind,
+            &mut self.sweep_round[kind as usize],
+        )
+        .await?;
+        let selected = match selected {
+            frozen_sweep_work::Admission::Idle => {
+                frozen_sweep_work::discover(
+                    store,
+                    &active_keys,
+                    1 - kind,
+                    &mut self.sweep_round[(1 - kind) as usize],
                 )
-                .await?;
-            self.physical_until[kind] = row
-                .map(|r| r.try_get::<String>("", "manifest_id"))
-                .transpose()?;
-            self.physical_started[kind] = true;
-        }
-        let Some(upper) = &self.physical_until[kind] else {
-            self.physical_done[kind] = true;
-            return Ok(active > 0 || !self.physical_done.iter().all(|done| *done));
-        };
-        let mut query = Query::select();
-        query
-            .from(Alias::new(data))
-            .column(Alias::new("manifest_id"))
-            .and_where(Expr::col(Alias::new("manifest_id")).lte(upper))
-            .order_by(Alias::new("manifest_id"), Order::Asc)
-            .limit(1);
-        if let Some(after) = &self.physical_after[kind] {
-            query.and_where(Expr::col(Alias::new("manifest_id")).gt(after));
-        }
-        let row = store.connection.query_one(&query).await?;
-        if let Some(row) = row {
-            let manifest: String = row.try_get("", "manifest_id")?;
-            let last = store
-                .connection
-                .query_one(
-                    &Query::select()
-                        .from(Alias::new(data))
-                        .column(Alias::new("ordinal"))
-                        .and_where(Expr::col(Alias::new("manifest_id")).eq(&manifest))
-                        .order_by(Alias::new("ordinal"), Order::Desc)
-                        .limit(1)
-                        .to_owned(),
-                )
-                .await?;
-            if let Some(last) = last {
-                let until: i64 = last.try_get("", "ordinal")?;
-                // An unrepresentable half-open end must not block the normal
-                // keys preceding that poison row in the same container.
-                if until >= 0 {
-                    if until == i64::MAX {
-                        self.accounting.poison += 1;
-                    }
-                    let sweep = SweepPreparation::new(
-                        manifest.clone(),
-                        kind as i64,
-                        std::cmp::min(until, i64::MAX - 1),
-                    );
-                    if self.sweep.is_none() {
-                        self.sweep = Some(sweep);
-                    } else {
-                        self.sweep_pending.push_back(sweep);
-                    }
-                } else {
-                    self.accounting.poison += 1;
-                }
+                .await?
             }
-            // A DB failure before the bound/visit is ready acknowledges no
-            // discovery item. Successful disappearance/poison may advance it.
-            self.physical_after[kind] = Some(manifest);
-            Ok(true)
+            other => other,
+        };
+        let work = match selected {
+            frozen_sweep_work::Admission::Selected(work) => work,
+            frozen_sweep_work::Admission::Continue => return Ok(true),
+            frozen_sweep_work::Admission::Idle => {
+                // Empty physical admission is not EOF while propagation continues.
+                return Ok(
+                    (!fanout_checked && frozen_sweep_work::fanout_step(store).await?) || active > 0,
+                );
+            }
+        };
+        let (data, _) = physical_table(work.kind);
+        let last = store
+            .connection
+            .query_one(
+                &Query::select()
+                    .column(Alias::new("ordinal"))
+                    .expr_as(
+                        Func::cust(Alias::new("typeof")).arg(Expr::col(Alias::new("ordinal"))),
+                        Alias::new("ordinal_type"),
+                    )
+                    .from(Alias::new(data))
+                    .and_where(Expr::col(Alias::new("manifest_id")).eq(&work.manifest))
+                    .order_by(Alias::new("ordinal"), Order::Desc)
+                    .limit(1)
+                    .to_owned(),
+            )
+            .await?;
+        if let Some(last) = last {
+            if last.try_get::<String>("", "ordinal_type")? != "integer" {
+                self.accounting.poison += 1;
+                work.finish(store, None).await?;
+                return Ok(true);
+            }
+            let until: i64 = last.try_get("", "ordinal")?;
+            if until < 0 {
+                self.accounting.poison += 1;
+                work.finish(store, None).await?;
+                return Ok(true);
+            }
+            let mut sweep = SweepPreparation::new(
+                work.manifest.clone(),
+                work.kind,
+                std::cmp::min(until, i64::MAX - 1),
+            );
+            sweep.poison = until == i64::MAX;
+            sweep.work = Some(work);
+            if self.sweep.is_none() {
+                self.sweep = Some(sweep);
+            } else {
+                self.sweep_pending.push_back(sweep);
+            }
         } else {
-            self.physical_done[kind] = true;
-            Ok(active > 0 || !self.physical_done.iter().all(|done| *done))
+            // No rows is a completed generation. The same CAS/fanout barrier
+            // protects a concurrent append after the inventory read.
+            work.finish(
+                store,
+                Some(DbBackend::Sqlite.build(&Query::select().expr(Expr::val(1)).to_owned())),
+            )
+            .await?;
         }
+        Ok(true)
     }
     async fn discard_quantum(&mut self, store: &CrudStore) -> Result<bool> {
         if let Some(discard) = self.discard.as_mut() {
@@ -2392,48 +2484,132 @@ struct ScopeDiscovery {
     after: String,
     kind: i64,
     done: bool,
+    pending: VecDeque<(Option<String>, i64)>,
 }
 impl ScopeDiscovery {
-    async fn step(&mut self, store: &CrudStore) -> Result<bool> {
-        if self.done {
-            return Ok(false);
-        }
+    fn discovery_query(&self, page: bool) -> sea_orm::sea_query::SelectStatement {
         let (table, key) = match self.family {
             0 => ("compaction_frozen_history", "id"),
             1 => ("compaction_frozen_layout", "manifest_id"),
-            2 => ("compaction_frozen_message_data", "manifest_id"),
-            3 => ("compaction_frozen_import_data", "manifest_id"),
             4 => ("compaction_operation", "id"),
             _ => ("compaction_checkpoint", "id"),
         };
         let mut query = Query::select();
-        query
-            .from(Alias::new(table))
-            .expr_as(Expr::col(Alias::new(key)), Alias::new("manifest_id"));
-        if self.family == 1 {
+        query.from(Alias::new(table));
+        if page {
+            query.expr_as(
+                Expr::case(
+                    Expr::cust(format!(
+                        "length(CAST({key} AS BLOB)) <= {SCOPE_PAGE_KEY_BYTES}"
+                    )),
+                    Expr::col(Alias::new(key)),
+                )
+                .finally(Expr::val(Option::<String>::None)),
+                Alias::new("manifest_id"),
+            );
+        } else {
+            query.expr_as(Expr::col(Alias::new(key)), Alias::new("manifest_id"));
+        }
+        if self.family == 1 && page {
+            // INTEGER affinity alone does not bound malformed legacy TEXT.
+            // Return NULL (decode error), never an unbounded kind value.
+            query.expr_as(
+                Expr::case(
+                    Expr::cust("typeof(kind) = 'integer'"),
+                    Expr::col(Alias::new("kind")),
+                )
+                .finally(Expr::val(Option::<i64>::None)),
+                Alias::new("kind"),
+            );
+        } else if self.family == 1 {
             query.column(Alias::new("kind"));
         } else {
-            query.expr_as(Expr::val(i64::from(self.family == 3)), Alias::new("kind"));
+            query.expr_as(Expr::val(0), Alias::new("kind"));
         }
         if self.started {
             let mut after = Expr::col(Alias::new(key)).gt(&self.after);
             if self.family == 1 {
-                after = after.or(Expr::col(Alias::new(key))
-                    .eq(&self.after)
-                    .and(Expr::col(Alias::new("kind")).gt(self.kind)));
+                after = Expr::tuple([Expr::col(Alias::new(key)), Expr::col(Alias::new("kind"))])
+                    .gt(Expr::tuple([Expr::val(&self.after), Expr::val(self.kind)]));
             }
             query.and_where(after);
         }
-        query.order_by(Alias::new(key), Order::Asc);
+        query.order_by((Alias::new(table), Alias::new(key)), Order::Asc);
         if self.family == 1 {
-            query.order_by(Alias::new("kind"), Order::Asc);
+            query.order_by((Alias::new(table), Alias::new("kind")), Order::Asc);
         }
+        // Physical families use checked durable bootstrap in step_pending;
+        // only logical metadata families retain a bounded RAM page here.
+        query.limit(if page { META_ROWS } else { 1 });
+        query
+    }
+
+    async fn fetch_page(&self, store: &CrudStore) -> Result<VecDeque<(Option<String>, i64)>> {
+        // Owned rows only: query_all releases reader/permit before decoding or
+        // any scope oracle. Publish the page only after all rows decode.
+        store
+            .connection
+            .query_all(&self.discovery_query(true))
+            .await?
+            .into_iter()
+            .map(|row| Ok((row.try_get("", "manifest_id")?, row.try_get("", "kind")?)))
+            .collect()
+    }
+
+    async fn step(&mut self, store: &CrudStore) -> Result<bool> {
+        let result = self.step_pending(store).await;
+        if result.is_err() {
+            // Re-seek from the acknowledged cursor on retry, just as the old
+            // single-key discovery did. A deleted/repaired pending identity
+            // must not become an eternal RAM-only poison entry.
+            self.pending.clear();
+        }
+        result
+    }
+
+    async fn step_pending(&mut self, store: &CrudStore) -> Result<bool> {
+        if self.done {
+            return Ok(false);
+        }
+        // Physical families retain the original global startup prerequisite.
+        // Bootstrap persists the checked oracle outcome with each cursor/work
+        // commit; completed families do not inventory again on restart.
         if matches!(self.family, 2 | 3) {
-            query.order_by(Alias::new("ordinal"), Order::Asc);
+            if frozen_sweep_work::bootstrap_step(store).await? {
+                return Ok(true);
+            }
+            self.pending.clear();
+            self.family = 4;
+            self.after.clear();
+            self.kind = -1;
+            self.started = false;
         }
-        query.limit(1);
-        let row = store.connection.query_one(&query).await?;
-        let Some(row) = row else {
+        if self.pending.is_empty() {
+            self.pending = self.fetch_page(store).await?;
+        }
+        let key = match self.pending.front() {
+            Some((Some(id), kind)) => Some((id.clone(), *kind)),
+            Some((None, _)) => {
+                // The sentinel carries no identity. Drop its entire unacked
+                // tail and re-seek from the confirmed cursor, so concurrent
+                // deletion/replacement cannot skip or duplicate a cached key.
+                // Full legacy-sized IDs stay local to this step, never in the
+                // multi-key page. Cancellation/error safely refetches on retry.
+                self.pending.clear();
+                store
+                    .connection
+                    .query_one(&self.discovery_query(false))
+                    .await?
+                    .map(|row| -> Result<(String, i64)> {
+                        Ok((row.try_get("", "manifest_id")?, row.try_get("", "kind")?))
+                    })
+                    .transpose()?
+            }
+            None => None,
+        };
+        let Some((id, kind)) = key else {
+            // Even a partial page needs a later empty probe after all keys
+            // pass. A sentinel's fresh single seek may also establish EOF.
             self.family += 1;
             self.after.clear();
             self.kind = -1;
@@ -2443,8 +2619,6 @@ impl ScopeDiscovery {
             }
             return Ok(true);
         };
-        let id: String = row.try_get("", "manifest_id")?;
-        let kind: i64 = row.try_get("", "kind")?;
         if self.family >= 4 {
             let node = Alias::new("node");
             let mut scoped = Query::select();
@@ -2493,63 +2667,19 @@ impl ScopeDiscovery {
                 store.connection.query_one(&scoped).await?.is_some(),
                 "legacy operation/checkpoint scope unknown; cleanup waits for repair"
             );
+            self.pending.pop_front();
             self.after = id;
             self.kind = kind;
             self.started = true;
             return Ok(true);
         }
-        let mut known = Query::select();
-        known
-            .column((history::Entity, history::Column::WorkspaceId))
-            .from(history::Entity)
-            .and_where(history::Column::Id.eq(&id))
-            .and_where(history::Column::WorkspaceId.ne(""));
-        for reverse in [false, true] {
-            let (to, predicate) = if reverse {
-                (layout::Column::Candidate, layout::Column::ManifestId)
-            } else {
-                (layout::Column::ManifestId, layout::Column::Candidate)
-            };
-            let branch = Query::select()
-                .column((history::Entity, history::Column::WorkspaceId))
-                .from(layout::Entity)
-                .join(
-                    JoinType::InnerJoin,
-                    history::Entity,
-                    Expr::col((history::Entity, history::Column::Id))
-                        .eq(Expr::col((layout::Entity, to))),
-                )
-                .and_where(Expr::col((layout::Entity, predicate)).eq(&id))
-                .and_where(Expr::col((history::Entity, history::Column::WorkspaceId)).ne(""))
-                .to_owned();
-            known.union(UnionType::All, branch);
-        }
-        for reverse in [false, true] {
-            let (header, predicate) = if reverse {
-                (span::Column::SourceManifest, span::Column::ManifestId)
-            } else {
-                (span::Column::ManifestId, span::Column::SourceManifest)
-            };
-            let branch = Query::select()
-                .column((history::Entity, history::Column::WorkspaceId))
-                .from(span::Entity)
-                .join(
-                    JoinType::InnerJoin,
-                    history::Entity,
-                    Expr::col((history::Entity, history::Column::Id))
-                        .eq(Expr::col((span::Entity, header))),
-                )
-                .and_where(Expr::col((span::Entity, predicate)).eq(&id))
-                .and_where(Expr::col((history::Entity, history::Column::WorkspaceId)).ne(""))
-                .to_owned();
-            known.union(UnionType::All, branch);
-        }
-        known.limit(1);
+        let known = frozen_scope_query(&id);
         let known = store.connection.query_one(&known).await?;
         ensure!(
             known.is_some(),
             "legacy frozen dependency scope unknown; cleanup waits for repair"
         );
+        self.pending.pop_front();
         self.after = id;
         self.kind = kind;
         self.started = true;
@@ -2557,9 +2687,85 @@ impl ScopeDiscovery {
     }
 }
 
+// Original legacy frozen scope oracle, shared by logical startup checks and
+// durable physical bootstrap. Endpoint inference is independent of physical kind.
+pub(super) fn frozen_scope_query(id: &str) -> sea_orm::sea_query::SelectStatement {
+    let mut known = Query::select();
+    known
+        .column((history::Entity, history::Column::WorkspaceId))
+        .from(history::Entity)
+        .and_where(history::Column::Id.eq(id))
+        .and_where(history::Column::WorkspaceId.ne(""));
+    known
+        .expr_as(Expr::val(0), Alias::new("scope_via"))
+        .expr_as(Expr::val(0), Alias::new("scope_row"));
+    for reverse in [false, true] {
+        let (to, predicate) = if reverse {
+            (layout::Column::Candidate, layout::Column::ManifestId)
+        } else {
+            (layout::Column::ManifestId, layout::Column::Candidate)
+        };
+        let branch = Query::select()
+            .column((history::Entity, history::Column::WorkspaceId))
+            .expr_as(
+                Expr::val(if reverse { 2 } else { 1 }),
+                Alias::new("scope_via"),
+            )
+            .expr_as(
+                Expr::col((layout::Entity, Alias::new("rowid"))),
+                Alias::new("scope_row"),
+            )
+            .from(layout::Entity)
+            .join(
+                JoinType::InnerJoin,
+                history::Entity,
+                Expr::col((history::Entity, history::Column::Id))
+                    .eq(Expr::col((layout::Entity, to))),
+            )
+            .and_where(Expr::col((layout::Entity, predicate)).eq(id))
+            .and_where(Expr::col((history::Entity, history::Column::WorkspaceId)).ne(""))
+            .to_owned();
+        known.union(UnionType::All, branch);
+    }
+    for reverse in [false, true] {
+        let (header, predicate) = if reverse {
+            (span::Column::SourceManifest, span::Column::ManifestId)
+        } else {
+            (span::Column::ManifestId, span::Column::SourceManifest)
+        };
+        let branch = Query::select()
+            .column((history::Entity, history::Column::WorkspaceId))
+            .expr_as(
+                Expr::val(if reverse { 4 } else { 3 }),
+                Alias::new("scope_via"),
+            )
+            .expr_as(
+                Expr::col((span::Entity, Alias::new("rowid"))),
+                Alias::new("scope_row"),
+            )
+            .from(span::Entity)
+            .join(
+                JoinType::InnerJoin,
+                history::Entity,
+                Expr::col((history::Entity, history::Column::Id))
+                    .eq(Expr::col((span::Entity, header))),
+            )
+            .and_where(Expr::col((span::Entity, predicate)).eq(id))
+            .and_where(Expr::col((history::Entity, history::Column::WorkspaceId)).ne(""))
+            .to_owned();
+        known.union(UnionType::All, branch);
+    }
+    known.limit(1);
+    known
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("frozen_sweep_tests.rs");
+    mod expiry_preflight {
+        include!("frozen_storage_lifetime_expiry_tests.rs");
+    }
     use migration::{Migrator, MigratorTrait};
     use pioneer_compaction::{
         Checkpoint, ModelSelection, SourceRef, Transport,
@@ -2687,7 +2893,7 @@ mod tests {
                     accounting.rows[kind as usize],
                     accounting.bytes[kind as usize],
                 );
-                done = sweep.step(&store, &mut accounting).await.unwrap();
+                done = sweep.step(&store, &mut accounting).await.unwrap() != SweepStep::Continue;
                 let rows = accounting.rows[kind as usize] - before.0;
                 let bytes = accounting.bytes[kind as usize] - before.1;
                 assert!(rows <= 256 && bytes <= 1024 * 1024);
@@ -2707,32 +2913,25 @@ mod tests {
                 batch_ordinals(&store, kind).await,
                 (0..65).chain([70, 601]).collect::<Vec<_>>()
             );
-            // Fresh discovery sees the committed remainder, including the new
-            // tail; poison neither loops nor prevents a later free row.
+            // Fresh durable discovery sees the committed remainder and the
+            // appended tail. A read failure cannot clean or drop durable work.
             let mut restart = FrozenStorageLifetimeProgress::default();
-            // Discovery succeeds, then bound decoding fails. No visit/cursor
-            // may be acknowledged until that second read succeeds.
-            restart.physical_kind = kind as usize;
-            let bad_bound = sql
-                .replace(",601,", ",'unreadable-bound',")
-                .replace("ordinal=600", "ordinal=601");
             store
                 .connection
-                .execute_unprepared(&bad_bound)
+                .execute_unprepared(
+                    "ALTER TABLE compaction_frozen_sweep_bootstrap RENAME TO unavailable_bootstrap",
+                )
                 .await
                 .unwrap();
-            let error = restart.sweep_quantum(&store).await.unwrap_err();
-            assert!(error.downcast_ref::<sea_orm::DbErr>().is_some());
-            assert!(restart.physical_after[kind as usize].is_none());
+            assert!(restart.sweep_quantum(&store).await.is_err());
             assert!(restart.sweep.is_none() && restart.sweep_pending.is_empty());
-            store.connection.execute_unprepared(&format!("DELETE FROM {data} WHERE manifest_id='batch-physical' AND ordinal='unreadable-bound'")).await.unwrap();
-            restart.physical_kind = kind as usize;
-            assert!(restart.sweep_quantum(&store).await.unwrap());
-            assert_eq!(
-                restart.physical_after[kind as usize].as_deref(),
-                Some("batch-physical")
-            );
-            assert_eq!(restart.sweep.as_ref().unwrap().manifest, "batch-physical");
+            store
+                .connection
+                .execute_unprepared(
+                    "ALTER TABLE unavailable_bootstrap RENAME TO compaction_frozen_sweep_bootstrap",
+                )
+                .await
+                .unwrap();
             let mut eof = false;
             for _ in 0..2000 {
                 if !restart.sweep_quantum(&store).await.unwrap() {
@@ -2756,7 +2955,10 @@ mod tests {
             let mut sweep = prepare_batch(&store, kind, 3).await;
             batch_consumer(&store, "new-consumer", kind, 1).await;
             let mut accounting = SweepAccounting::default();
-            assert!(sweep.step(&store, &mut accounting).await.unwrap());
+            assert_eq!(
+                sweep.step(&store, &mut accounting).await.unwrap(),
+                SweepStep::Retry
+            );
             assert_eq!(accounting.rows, [0, 0]);
             assert_eq!(accounting.refused, 1);
             assert_eq!(batch_ordinals(&store, kind).await, vec![0, 1, 2, 3]);
@@ -2764,7 +2966,10 @@ mod tests {
             let mut sweep = prepare_batch(&store, kind, 3).await;
             // Separate committed bounds: messages retain two rows, imports one.
             store.connection.execute_unprepared("UPDATE compaction_frozen_history SET ready=0,message_count=4,import_count=4,next_ordinal=2,next_import=1 WHERE id='batch-physical'").await.unwrap();
-            assert!(sweep.step(&store, &mut accounting).await.unwrap());
+            assert_eq!(
+                sweep.step(&store, &mut accounting).await.unwrap(),
+                SweepStep::Retry
+            );
             assert_eq!(accounting.rows, [0, 0]);
             assert_eq!(accounting.refused, 2);
             assert_eq!(batch_ordinals(&store, kind).await, vec![0, 1, 2, 3]);
@@ -2781,7 +2986,10 @@ mod tests {
                 .execute_unprepared("DROP TRIGGER refuse_batch")
                 .await
                 .unwrap();
-            assert!(sweep.step(&store, &mut accounting).await.unwrap());
+            assert_eq!(
+                sweep.step(&store, &mut accounting).await.unwrap(),
+                SweepStep::Complete
+            );
             let retained = if kind == 0 { 2 } else { 1 };
             assert_eq!(
                 batch_ordinals(&store, kind).await,
@@ -2920,11 +3128,12 @@ mod tests {
             // The >256 KiB healthy row belongs to lifetime sweep. It can still
             // delete it after duplicate cleanup, preserving both poison rows.
             let mut sweep = prepare_batch(&duplicate, kind, 5).await;
-            assert!(
+            assert_eq!(
                 sweep
                     .step(&duplicate, &mut progress.accounting)
                     .await
-                    .unwrap()
+                    .unwrap(),
+                SweepStep::Retry
             );
             assert_eq!(batch_ordinals(&duplicate, kind).await, vec![0, 5]);
             assert_eq!(progress.accounting.rows[kind as usize], 4);
@@ -3338,6 +3547,1132 @@ mod tests {
         assert!(store.frozen_readers.lock().unwrap().is_empty());
     }
 
+    async fn scope_layout_fixture() -> CrudStore {
+        let (store, _) = fixture(true).await;
+        let store = store.with_maintenance_access();
+        // Deliberately insert out of order. Headers are incomplete and layouts
+        // have no candidate, matching the registration trigger prerequisites.
+        for id in ["layout-002", "layout-000", "layout-001"] {
+            let descriptor = FrozenHistoryRef {
+                format: 1,
+                manifest_id: id.into(),
+                messages: 0,
+                identity_sha256: hex::encode(Sha256::digest([])),
+            };
+            store
+                .compaction_begin_frozen_history("ws", "thread", &descriptor)
+                .await
+                .unwrap();
+            for kind in [1_i64, 0] {
+                store
+                    .connection
+                    .execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        "INSERT INTO compaction_frozen_layout(manifest_id,kind) VALUES(?1,?2)",
+                        [id.into(), kind.into()],
+                    ))
+                    .await
+                    .unwrap();
+            }
+        }
+        store
+    }
+
+    #[test]
+    fn startup_layout_tuple_sql_keeps_bindings_order_and_limit() {
+        use sea_orm::sea_query::{SqliteQueryBuilder, Values};
+        let mut scope = ScopeDiscovery {
+            family: 1,
+            started: true,
+            after: "cursor'?)".into(),
+            kind: 0,
+            ..Default::default()
+        };
+        let (sql, values) = scope.discovery_query(false).build(SqliteQueryBuilder);
+        assert!(sql.contains(r#"WHERE ("manifest_id", "kind") > (?, ?)"#));
+        assert!(sql.ends_with(r#"ORDER BY "compaction_frozen_layout"."manifest_id" ASC, "compaction_frozen_layout"."kind" ASC LIMIT ?"#));
+        assert!(!sql.contains(" OR ") && !sql.contains(&scope.after));
+        assert_eq!(
+            values,
+            Values(vec![scope.after.clone().into(), 0_i64.into(), 1_u64.into()])
+        );
+        // Both page discovery and the full-key fallback use the tuple seek.
+        let (page_sql, page_values) = scope.discovery_query(true).build(SqliteQueryBuilder);
+        assert!(page_sql.contains(r#"WHERE ("manifest_id", "kind") > (?, ?)"#));
+        assert!(page_sql.ends_with(r#"ORDER BY "compaction_frozen_layout"."manifest_id" ASC, "compaction_frozen_layout"."kind" ASC LIMIT ?"#));
+        assert!(!page_sql.contains(" OR ") && !page_sql.contains(&scope.after));
+        assert_eq!(page_values.0.last(), Some(&META_ROWS.into()));
+        scope.started = false;
+        let (sql, values) = scope.discovery_query(false).build(SqliteQueryBuilder);
+        assert!(!sql.contains("WHERE"));
+        assert!(sql.ends_with(r#"ORDER BY "compaction_frozen_layout"."manifest_id" ASC, "compaction_frozen_layout"."kind" ASC LIMIT ?"#));
+        assert_eq!(values, Values(vec![1_u64.into()]));
+    }
+
+    #[tokio::test]
+    async fn startup_layout_tuple_cursor_matches_ordered_inventory() {
+        let store = scope_layout_fixture().await;
+        let expected = ["layout-000", "layout-001", "layout-002"]
+            .into_iter()
+            .flat_map(|id| [0, 1].map(|kind| (id.to_owned(), kind)))
+            .collect::<Vec<_>>();
+        let inventory = layout::Entity::find()
+            .order_by_asc(layout::Column::ManifestId)
+            .order_by_asc(layout::Column::Kind)
+            .all(&store.connection)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.manifest_id, row.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(inventory, expected);
+        for (started, after, kind) in [
+            (false, "zz-ignored", 99),
+            (true, "", -1),
+            (true, "layout-000", 0),
+            (true, "layout-001", 1),
+            (true, "layout-001-between", 0),
+            (true, "layout-002", 1),
+            (true, "zz-after-last", 0),
+        ] {
+            let mut scope = ScopeDiscovery {
+                family: 1,
+                started,
+                after: after.into(),
+                kind,
+                ..Default::default()
+            };
+            let mut actual = Vec::new();
+            // One acknowledged key per step, plus the family's EOF step.
+            for _ in 0..=expected.len() {
+                assert!(scope.step(&store).await.unwrap());
+                if scope.family != 1 {
+                    break;
+                }
+                assert!(scope.started && !scope.done);
+                actual.push((scope.after.clone(), scope.kind));
+            }
+            let remaining = expected
+                .iter()
+                .filter(|(id, k)| !started || (id.as_str(), *k) > (after, kind))
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(actual, remaining, "cursor {started}/{after}/{kind}");
+            assert_eq!(scope.family, 2);
+            assert!(!scope.started && !scope.done && scope.after.is_empty());
+            assert_eq!(scope.kind, -1);
+            // Reset must include the earlier physical group through checked
+            // durable bootstrap, independent of the layout tuple cursor. A new
+            // ScopeDiscovery can reuse completion from a preceding iteration.
+            for _ in 0..16 {
+                assert!(scope.step(&store).await.unwrap());
+                if scope.family >= 4 {
+                    break;
+                }
+            }
+            assert!(scope.family >= 4);
+            let checked = store
+                .connection
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "SELECT count(*) AS n FROM compaction_frozen_sweep_bootstrap WHERE complete=1",
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(checked.try_get::<i64>("", "n").unwrap(), 2);
+            let message_upper = store
+                .connection
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "SELECT upper_manifest FROM compaction_frozen_sweep_bootstrap WHERE kind=0",
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                message_upper
+                    .try_get::<String>("", "upper_manifest")
+                    .unwrap(),
+                "origin"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_layout_empty_inventory_advances_family_for_both_start_states() {
+        let (store, _) = fixture(true).await;
+        let store = store.with_maintenance_access();
+        assert_eq!(
+            layout::Entity::find()
+                .all(&store.connection)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        for started in [false, true] {
+            let mut scope = ScopeDiscovery {
+                family: 1,
+                started,
+                after: "unused".into(),
+                kind: 1,
+                ..Default::default()
+            };
+            assert!(scope.step(&store).await.unwrap());
+            assert_eq!(scope.family, 2);
+            assert!(!scope.started && !scope.done && scope.after.is_empty());
+            assert_eq!(scope.kind, -1);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_layout_scope_error_retries_same_kind_until_repair() {
+        let store = scope_layout_fixture().await;
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        progress.scope = ScopeDiscovery {
+            family: 1,
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            assert!(!progress.conversion_scope(&store).await.unwrap());
+        }
+        assert_eq!(
+            (&*progress.scope.after, progress.scope.kind),
+            ("layout-001", 0)
+        );
+        // FK OFF models legacy corruption without bypassing installed triggers.
+        // This newly begun header has no sealed checkpoint or published layout.
+        store
+            .connection
+            .execute_unprepared("DELETE FROM compaction_frozen_history WHERE id='layout-001'")
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let error = progress.conversion_scope(&store).await.unwrap_err();
+            assert!(error.to_string().contains("scope unknown"));
+            assert_eq!(progress.scope.family, 1);
+            assert_eq!(
+                (&*progress.scope.after, progress.scope.kind),
+                ("layout-001", 0)
+            );
+            assert!(progress.scope.started && !progress.scope.done);
+            assert!(progress.conversion.is_none());
+        }
+        // A fresh worker also fails closed on the orphan rather than seeing EOF.
+        let mut restart = ScopeDiscovery::default();
+        let mut refused = false;
+        for _ in 0..32 {
+            match restart.step(&store).await {
+                Ok(_) => assert!(!restart.done),
+                Err(error) => {
+                    assert!(error.to_string().contains("scope unknown"));
+                    refused = true;
+                    break;
+                }
+            }
+        }
+        assert!(refused);
+        assert_eq!(restart.family, 1);
+        assert_eq!((&*restart.after, restart.kind), ("layout-000", 1));
+        assert!(!restart.done);
+        let repair = FrozenHistoryRef {
+            format: 1,
+            manifest_id: "layout-001".into(),
+            messages: 0,
+            identity_sha256: hex::encode(Sha256::digest([])),
+        };
+        store
+            .compaction_begin_frozen_history("ws", "thread", &repair)
+            .await
+            .unwrap();
+        assert!(!progress.conversion_scope(&store).await.unwrap());
+        assert_eq!(
+            (&*progress.scope.after, progress.scope.kind),
+            ("layout-001", 1)
+        );
+        assert!(!progress.scope.done);
+        assert!(restart.step(&store).await.unwrap());
+        assert_eq!((&*restart.after, restart.kind), ("layout-001", 0));
+        for _ in 0..32 {
+            if progress.scope.done {
+                break;
+            }
+            assert!(!progress.conversion_scope(&store).await.unwrap());
+        }
+        assert!(progress.scope.done);
+        assert!(progress.conversion_scope(&store).await.unwrap());
+        assert!(progress.conversion.is_none());
+        assert_eq!(progress.scope.family, 6);
+        assert!(!progress.scope.step(&store).await.unwrap());
+    }
+
+    // Scope-only fixtures install the full schema and every production trigger.
+    // They contain incomplete captures / unsealed candidates, never malformed
+    // ready histories or disabled guards. FK OFF matches the writer contract.
+    async fn scope_page_fixture() -> CrudStore {
+        let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1).min_connections(1);
+        let db = Database::connect(options).await.unwrap();
+        db.execute_unprepared("PRAGMA foreign_keys=OFF")
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        for sql in [
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','scope pages',1,1)",
+            "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO compaction_context(owner,workspace_id,thread_id,format_version) VALUES('owner','ws','thread',1)",
+        ] {
+            db.execute_unprepared(sql).await.unwrap();
+        }
+        CrudStore::new(db).with_maintenance_access()
+    }
+
+    async fn scope_page_seed(store: &CrudStore, count: usize) {
+        let ids: Vec<_> = (0..count).map(|index| format!("key-{index:04}")).collect();
+        scope_page_seed_ids(store, &ids).await;
+    }
+
+    async fn scope_page_seed_ids(store: &CrudStore, ids: &[String]) {
+        for (index, id) in ids.iter().enumerate() {
+            let id = id.clone();
+            let descriptor = FrozenHistoryRef {
+                format: 1,
+                manifest_id: id.clone(),
+                messages: 200,
+                identity_sha256: hex::encode(Sha256::digest([])),
+            };
+            store
+                .compaction_begin_frozen_history_with_imports(
+                    "ws",
+                    "thread",
+                    &descriptor,
+                    200,
+                    &hex::encode(Sha256::digest([])),
+                )
+                .await
+                .unwrap();
+            // Offset the layout sequence by one: the 64th key is kind=0,
+            // and the next page starts with kind=1 of the SAME manifest.
+            for kind in 0..2_i64 {
+                if (index == 0 && kind == 0) || index * 2 + kind as usize > ids.len() {
+                    continue;
+                }
+                store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                    "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES(?1,?2,0,0)",
+                    [id.clone().into(), kind.into()])).await.unwrap();
+            }
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms) VALUES(?1,'owner',?1,'failed','{}',1)",
+                [id.clone().into()])).await.unwrap();
+            let checkpoint = Checkpoint {
+                id: id.clone(),
+                operation_id: id.clone(),
+                owner: "owner".into(),
+                previous: None,
+                summary: "summary".into(),
+                selection: ModelSelection {
+                    transport: Transport::Api,
+                    instance: "p".into(),
+                    model: "m".into(),
+                    effort: None,
+                },
+                coverage: vec![],
+                projection_version: 1,
+                format_version: 1,
+            };
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES(?1,?1,'owner',0,'summary',?2,?3,1,1,'candidate')",
+                [id.into(), compaction::checkpoint_identity(&checkpoint).unwrap().into(), serde_json::to_string(&checkpoint.selection).unwrap().into()])).await.unwrap();
+        }
+    }
+
+    // Independent copy of the old LIMIT 1 inventory walk, including physical
+    // group seek and the layout continuation. No scope decision is mocked.
+    async fn scope_single_key_inventory(store: &CrudStore, family: usize) -> Vec<(String, i64)> {
+        let (table, key) = match family {
+            0 => ("compaction_frozen_history", "id"),
+            1 => ("compaction_frozen_layout", "manifest_id"),
+            2 => ("compaction_frozen_message_data", "manifest_id"),
+            3 => ("compaction_frozen_import_data", "manifest_id"),
+            4 => ("compaction_operation", "id"),
+            _ => ("compaction_checkpoint", "id"),
+        };
+        let mut inventory: Vec<(String, i64)> = Vec::new();
+        loop {
+            let mut query = Query::select();
+            query
+                .from(Alias::new(table))
+                .expr_as(Expr::col(Alias::new(key)), Alias::new("id"));
+            if family == 1 {
+                query.column(Alias::new("kind"));
+            } else {
+                query.expr_as(Expr::val(i64::from(family == 3)), Alias::new("kind"));
+            }
+            if let Some((id, kind)) = inventory.last() {
+                let mut after = Expr::col(Alias::new(key)).gt(id);
+                if family == 1 {
+                    after = after.or(Expr::col(Alias::new(key))
+                        .eq(id)
+                        .and(Expr::col(Alias::new("kind")).gt(*kind)));
+                }
+                query.and_where(after);
+            }
+            query.order_by((Alias::new(table), Alias::new(key)), Order::Asc);
+            if family == 1 {
+                query.order_by(Alias::new("kind"), Order::Asc);
+            } else if matches!(family, 2 | 3) {
+                query.order_by(Alias::new("ordinal"), Order::Asc);
+            }
+            query.limit(1);
+            let Some(row) = store.connection.query_one(&query).await.unwrap() else {
+                break;
+            };
+            inventory.push((
+                row.try_get("", "id").unwrap(),
+                row.try_get("", "kind").unwrap(),
+            ));
+            assert!(inventory.len() <= 1024, "test inventory is finite");
+        }
+        inventory
+    }
+
+    #[tokio::test]
+    async fn scope_pages_match_single_key_inventory_and_require_checked_eof() {
+        for count in [0, 1, 63, 64, 65, 193] {
+            let store = scope_page_fixture().await;
+            scope_page_seed(&store, count).await;
+            for family in [0, 1, 4, 5] {
+                let expected = scope_single_key_inventory(&store, family).await;
+                assert_eq!(expected.len(), count);
+                let mut scope = ScopeDiscovery {
+                    family,
+                    ..Default::default()
+                };
+                for (index, key) in expected.iter().enumerate() {
+                    assert!(scope.step(&store).await.unwrap());
+                    assert_eq!((&scope.after, scope.kind), (&key.0, key.1));
+                    assert_eq!(scope.family, family, "last row is not EOF");
+                    assert!(!scope.done);
+                    assert_eq!(
+                        scope.pending.len(),
+                        (expected.len() - index - 1).min(63 - index % 64)
+                    );
+                    assert!(
+                        scope
+                            .pending
+                            .iter()
+                            .all(|(id, _)| id.as_ref().unwrap().len()
+                                <= SCOPE_PAGE_KEY_BYTES as usize)
+                    );
+                    if count == 65 && family == 1 && index == 63 {
+                        assert_eq!((&*scope.after, scope.kind), ("key-0032", 0));
+                        assert!(scope.pending.is_empty());
+                    }
+                    if count == 65 && family == 1 && index == 64 {
+                        assert_eq!((&*scope.after, scope.kind), ("key-0032", 1));
+                    }
+                }
+                assert!(scope.step(&store).await.unwrap());
+                assert_eq!(scope.family, family + 1);
+                assert!(!scope.started && scope.after.is_empty() && scope.kind == -1);
+                assert!(scope.pending.is_empty());
+                assert_eq!(scope.done, family == 5);
+                if scope.done {
+                    assert!(!scope.step(&store).await.unwrap());
+                }
+            }
+            let mut progress = FrozenStorageLifetimeProgress::default();
+            for _ in 0..2048 {
+                if progress.scope.done {
+                    break;
+                }
+                assert!(!progress.conversion_scope(&store).await.unwrap());
+            }
+            assert!(progress.scope.done);
+            assert!(progress.conversion_scope(&store).await.unwrap());
+            assert!(
+                progress.conversion_scope(&store).await.unwrap(),
+                "warm checked EOF"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scope_physical_groups_do_not_page_or_visit_ordinals() {
+        let store = scope_page_fixture().await;
+        scope_page_seed(&store, 3).await;
+        for (index, count) in [193, 1, 65].into_iter().enumerate() {
+            for ordinal in 0..count {
+                let id = format!("key-{index:04}");
+                store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                    "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES(?1,?2,'{}',2)",
+                    [id.clone().into(), (ordinal as i64).into()])).await.unwrap();
+                store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                    "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES(?1,?2,0,'event','event-'||?2,'v','thread','{}',2)",
+                    [id.into(), (ordinal as i64).into()])).await.unwrap();
+            }
+            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "UPDATE compaction_frozen_history SET next_ordinal=?2,next_import=?2 WHERE id=?1",
+                [format!("key-{index:04}").into(), (count as i64).into()])).await.unwrap();
+        }
+        assert_checked_physical_scope_groups(&store, 3).await;
+    }
+
+    // The physical scope prerequisite now advances durable, kind-specific
+    // bootstrap cursors rather than the logical metadata RAM page/cursor.
+    async fn assert_checked_physical_scope_groups(store: &CrudStore, groups: usize) {
+        use pioneer_entity::compaction_frozen_sweep_bootstrap as bootstrap;
+        let mut scope = ScopeDiscovery {
+            family: 2,
+            ..Default::default()
+        };
+        for kind in [0_i64, 1] {
+            let expected = scope_single_key_inventory(store, kind as usize + 2).await;
+            assert_eq!(expected.len(), groups);
+            assert!(scope.step(store).await.unwrap()); // capture this kind's upper
+            let captured = bootstrap::Entity::find_by_id(kind)
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!((captured.started, captured.complete), (1, 0));
+            assert_eq!(
+                captured.upper_manifest.as_ref(),
+                expected.last().map(|v| &v.0)
+            );
+            assert!(captured.after_manifest.is_none());
+            for (id, expected_kind) in expected {
+                assert_eq!(expected_kind, kind);
+                assert!(scope.step(store).await.unwrap());
+                let checked = bootstrap::Entity::find_by_id(kind)
+                    .one(&store.connection)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(checked.after_manifest.as_deref(), Some(id.as_str()));
+                assert_eq!(checked.complete, 0, "last group is not EOF");
+                assert_eq!(scope.family, 2, "both kinds must finish before admission");
+                assert!(scope.pending.is_empty() && !scope.done);
+            }
+            assert!(scope.step(store).await.unwrap()); // checked EOF for this kind
+            let complete = bootstrap::Entity::find_by_id(kind)
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(complete.complete, 1);
+            assert!(scope.pending.is_empty() && !scope.done);
+        }
+        let completed = bootstrap::Entity::find()
+            .order_by_asc(bootstrap::Column::Kind)
+            .all(&store.connection)
+            .await
+            .unwrap();
+        assert!(scope.step(store).await.unwrap());
+        assert_eq!(scope.family, 4);
+        let mut restart = ScopeDiscovery {
+            family: 2,
+            ..Default::default()
+        };
+        assert!(restart.step(store).await.unwrap());
+        assert_eq!(restart.family, 4);
+        assert_eq!(
+            bootstrap::Entity::find()
+                .order_by_asc(bootstrap::Column::Kind)
+                .all(&store.connection)
+                .await
+                .unwrap(),
+            completed,
+            "restart reuses checked physical progress"
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_page_db_error_and_unknown_scope_retry_the_unacknowledged_key() {
+        let store = scope_page_fixture().await;
+        scope_page_seed(&store, 65).await;
+        let mut scope = ScopeDiscovery {
+            family: 4,
+            ..Default::default()
+        };
+        for _ in 0..10 {
+            scope.step(&store).await.unwrap();
+        }
+        assert_eq!(scope.after, "key-0009");
+        assert!(!scope.pending.is_empty());
+        // Fail the real oracle SELECT while a decoded page is pending. DDL is
+        // confined to this disposable fixture; no trigger is removed/disabled.
+        store
+            .connection
+            .execute_unprepared(
+                "ALTER TABLE compaction_context RENAME TO scope_context_unavailable",
+            )
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let error = scope.step(&store).await.unwrap_err();
+            assert!(error.downcast_ref::<sea_orm::DbErr>().is_some());
+            assert_eq!(scope.after, "key-0009");
+            assert!(
+                scope.pending.is_empty(),
+                "retry refetches from acknowledged cursor"
+            );
+            assert!(!scope.done && scope.family == 4 && scope.started);
+        }
+        store
+            .connection
+            .execute_unprepared(
+                "ALTER TABLE scope_context_unavailable RENAME TO compaction_context",
+            )
+            .await
+            .unwrap();
+        scope.step(&store).await.unwrap();
+        assert_eq!(scope.after, "key-0010");
+        // Mutable scope must be checked when visited, not frozen at fetch.
+        store
+            .connection
+            .execute_unprepared(
+                "UPDATE compaction_operation SET owner='missing' WHERE id='key-0020'",
+            )
+            .await
+            .unwrap();
+        for _ in 11..20 {
+            scope.step(&store).await.unwrap();
+        }
+        assert!(!scope.pending.is_empty());
+        for _ in 0..2 {
+            assert!(scope.step(&store).await.is_err());
+            assert_eq!(scope.after, "key-0019");
+            assert!(
+                scope.pending.is_empty(),
+                "retry refetches from acknowledged cursor"
+            );
+            assert!(!scope.done && scope.family == 4);
+        }
+        store
+            .connection
+            .execute_unprepared("UPDATE compaction_operation SET owner='owner' WHERE id='key-0020'")
+            .await
+            .unwrap();
+        scope.step(&store).await.unwrap();
+        assert_eq!(scope.after, "key-0020");
+        for _ in 0..256 {
+            if scope.done {
+                break;
+            }
+            scope.step(&store).await.unwrap();
+        }
+        assert!(scope.done);
+    }
+
+    #[tokio::test]
+    async fn scope_pages_keep_operation_and_checkpoint_projection_scope_fallback() {
+        let (store, _) = fixture(false).await;
+        let store = store.with_maintenance_access();
+        // Legacy FK OFF metadata may lack context but retain its checked
+        // projection. Use the fixture's real ready origin, with no sealed proof.
+        store.connection.execute_unprepared("INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms) VALUES('zz-bound','missing','bound','failed','{}',1)").await.unwrap();
+        store.connection.execute_unprepared("INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) SELECT 'zz-bound',id,identity_sha256,imports_sha256,import_count FROM compaction_frozen_history WHERE id='origin'").await.unwrap();
+        let mut operations = ScopeDiscovery {
+            family: 4,
+            ..Default::default()
+        };
+        operations.step(&store).await.unwrap();
+        assert_eq!(operations.after, "op");
+        assert_eq!(
+            operations.pending.front().unwrap().0.as_deref(),
+            Some("zz-bound")
+        );
+        operations.step(&store).await.unwrap();
+        assert_eq!(operations.after, "zz-bound");
+        // A checkpoint with unknown owner uses its operation's projection.
+        let checkpoint = Checkpoint {
+            id: "zz-bound".into(),
+            operation_id: "zz-bound".into(),
+            owner: "missing".into(),
+            previous: None,
+            summary: "legacy bound candidate".into(),
+            selection: ModelSelection {
+                transport: Transport::Api,
+                instance: "p".into(),
+                model: "m".into(),
+                effort: None,
+            },
+            coverage: vec![],
+            projection_version: 1,
+            format_version: 1,
+        };
+        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES('zz-bound','zz-bound','missing',0,?1,?2,?3,1,1,'candidate')",
+            [checkpoint.summary.clone().into(), compaction::checkpoint_identity(&checkpoint).unwrap().into(), serde_json::to_string(&checkpoint.selection).unwrap().into()])).await.unwrap();
+        let mut checkpoints = ScopeDiscovery {
+            family: 5,
+            ..Default::default()
+        };
+        checkpoints.step(&store).await.unwrap();
+        checkpoints.step(&store).await.unwrap();
+        assert_eq!(checkpoints.after, "cp-1");
+        store
+            .connection
+            .execute_unprepared(
+                "DELETE FROM compaction_operation_projection WHERE operation_id='zz-bound'",
+            )
+            .await
+            .unwrap();
+        assert!(checkpoints.step(&store).await.is_err());
+        assert_eq!(checkpoints.after, "cp-1");
+        assert!(!checkpoints.done);
+        store.connection.execute_unprepared("INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) SELECT 'zz-bound',id,identity_sha256,imports_sha256,import_count FROM compaction_frozen_history WHERE id='origin'").await.unwrap();
+        checkpoints.step(&store).await.unwrap();
+        assert_eq!(checkpoints.after, "zz-bound");
+        assert!(!checkpoints.done);
+        checkpoints.step(&store).await.unwrap();
+        assert!(checkpoints.done);
+    }
+
+    #[tokio::test]
+    async fn scope_page_decode_failure_refetches_after_the_confirmed_tuple() {
+        let store = scope_page_fixture().await;
+        scope_page_seed(&store, 129).await;
+        let mut scope = ScopeDiscovery {
+            family: 1,
+            ..Default::default()
+        };
+        for _ in 0..64 {
+            scope.step(&store).await.unwrap();
+        }
+        assert_eq!((&*scope.after, scope.kind), ("key-0032", 0));
+        assert!(scope.pending.is_empty());
+        // SQLite INTEGER affinity permits malformed legacy TEXT. Installed
+        // layout dependency guards still see an available logical header.
+        store.connection.execute_unprepared("UPDATE compaction_frozen_layout SET kind='bad-kind' WHERE manifest_id='key-0033' AND kind=1").await.unwrap();
+        for _ in 0..2 {
+            assert!(scope.step(&store).await.is_err());
+            assert_eq!((&*scope.after, scope.kind), ("key-0032", 0));
+            assert!(scope.pending.is_empty() && !scope.done);
+            assert_eq!(scope.family, 1);
+        }
+        store.connection.execute_unprepared("UPDATE compaction_frozen_layout SET kind=1 WHERE manifest_id='key-0033' AND kind='bad-kind'").await.unwrap();
+        scope.step(&store).await.unwrap();
+        assert_eq!((&*scope.after, scope.kind), ("key-0032", 1));
+        scope.step(&store).await.unwrap();
+        assert_eq!((&*scope.after, scope.kind), ("key-0033", 0));
+        scope.step(&store).await.unwrap();
+        assert_eq!((&*scope.after, scope.kind), ("key-0033", 1));
+    }
+
+    #[tokio::test]
+    async fn scope_page_deleted_pending_key_refetches_without_skipping_existing_keys() {
+        let store = scope_page_fixture().await;
+        scope_page_seed(&store, 3).await;
+        let mut scope = ScopeDiscovery {
+            family: 4,
+            ..Default::default()
+        };
+        scope.step(&store).await.unwrap();
+        assert_eq!(
+            scope.pending.front().unwrap().0.as_deref(),
+            Some("key-0001")
+        );
+        // No sealed evidence exists; all installed guards remain enabled.
+        store
+            .connection
+            .execute_unprepared("DELETE FROM compaction_operation WHERE id='key-0001'")
+            .await
+            .unwrap();
+        assert!(scope.step(&store).await.is_err());
+        assert_eq!(scope.after, "key-0000");
+        assert!(scope.pending.is_empty() && !scope.done);
+        scope.step(&store).await.unwrap();
+        assert_eq!(scope.after, "key-0002");
+        scope.step(&store).await.unwrap();
+        assert_eq!(scope.family, 5);
+    }
+
+    #[tokio::test]
+    async fn scope_page_cancel_retry_and_recreate_preserve_the_barrier() {
+        let store = scope_page_fixture().await;
+        scope_page_seed(&store, 65).await;
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        progress.scope.step(&store).await.unwrap();
+        assert_eq!(progress.scope.after, "key-0000");
+        assert_eq!(progress.scope.pending.len(), 63);
+        let pending = progress.scope.pending.clone();
+        // Occupy the existing Maintenance read permit. The pending oracle can
+        // be polled and dropped deterministically while waiting for admission.
+        let holder = store.connection.begin_read().await.unwrap();
+        let mut attempt = Box::pin(progress.scope.step(&store));
+        assert!(futures_util::poll!(attempt.as_mut()).is_pending());
+        drop(attempt);
+        assert_eq!(progress.scope.after, "key-0000");
+        assert_eq!(progress.scope.pending, pending);
+        assert!(!progress.scope.done);
+        holder.rollback().await.unwrap();
+        progress.scope.step(&store).await.unwrap();
+        assert_eq!(progress.scope.after, "key-0001");
+        // An unconfirmed page fetch is cancellable by the same permit barrier.
+        let mut unfetched = ScopeDiscovery::default();
+        let holder = store.connection.begin_read().await.unwrap();
+        let mut attempt = Box::pin(unfetched.step(&store));
+        assert!(futures_util::poll!(attempt.as_mut()).is_pending());
+        drop(attempt);
+        assert!(!unfetched.started && unfetched.pending.is_empty() && !unfetched.done);
+        holder.rollback().await.unwrap();
+        drop(progress);
+        let mut restart = FrozenStorageLifetimeProgress::default();
+        assert!(!restart.conversion_scope(&store).await.unwrap());
+        assert_eq!(restart.scope.after, "key-0000");
+        assert!(restart.expiry.is_none() && restart.sweep.is_none() && restart.discard.is_none());
+        for _ in 0..512 {
+            if restart.scope.done {
+                break;
+            }
+            assert!(!restart.conversion_scope(&store).await.unwrap());
+        }
+        assert!(restart.scope.done && restart.conversion_scope(&store).await.unwrap());
+        assert_eq!(
+            store.connection.read_class(),
+            pioneer_sqlite::SqliteReadClass::Maintenance
+        );
+        assert_eq!(
+            store.connection.write_class(),
+            pioneer_sqlite::SqliteWriteClass::Maintenance
+        );
+        // If a page retained the connection/permit, even this snapshot could
+        // not be admitted on the one-connection fixture after a completed step.
+        store
+            .connection
+            .begin_read()
+            .await
+            .unwrap()
+            .rollback()
+            .await
+            .unwrap();
+    }
+
+    // Uses multibyte text so SQL character count would not enforce the policy.
+    fn scope_page_sized_id(index: usize, bytes: usize) -> String {
+        let prefix = format!("key-{index:04}");
+        let remaining = bytes - prefix.len();
+        format!(
+            "{prefix}{}{}",
+            "я".repeat(remaining / 2),
+            "x".repeat(remaining % 2)
+        )
+    }
+
+    #[tokio::test]
+    async fn scope_page_long_keys_keep_full_inventory_without_repair() {
+        for long_index in [0, 17, 32, 64] {
+            let store = scope_page_fixture().await;
+            let mut ids: Vec<_> = (0..129).map(|index| format!("key-{index:04}")).collect();
+            ids[10] = scope_page_sized_id(10, SCOPE_PAGE_KEY_BYTES as usize - 1);
+            ids[11] = scope_page_sized_id(11, SCOPE_PAGE_KEY_BYTES as usize);
+            // First / inside / layout-kind split / exact page boundary, plus
+            // consecutive long IDs. No identity is ever shortened or repaired.
+            for index in [long_index, long_index + 1] {
+                ids[index] = scope_page_sized_id(index, SCOPE_PAGE_KEY_BYTES as usize + 2);
+                assert!(ids[index].chars().count() < SCOPE_PAGE_KEY_BYTES as usize);
+            }
+            scope_page_seed_ids(&store, &ids).await;
+            for family in [0, 1, 4, 5] {
+                let expected = scope_single_key_inventory(&store, family).await;
+                let mut scope = ScopeDiscovery {
+                    family,
+                    ..Default::default()
+                };
+                for (id, kind) in &expected {
+                    scope.step(&store).await.unwrap();
+                    assert_eq!((&scope.after, scope.kind), (id, *kind));
+                    assert_eq!(scope.family, family, "last fetched row is not EOF");
+                    assert!(!scope.done);
+                    assert!(scope.pending.len() <= META_ROWS as usize);
+                    let page_bytes: usize = scope
+                        .pending
+                        .iter()
+                        .filter_map(|(id, _)| id.as_ref())
+                        .map(String::len)
+                        .sum();
+                    assert!(page_bytes <= META_ROWS as usize * SCOPE_PAGE_KEY_BYTES as usize);
+                    assert!(scope.pending.iter().all(|(id, _)| {
+                        id.as_ref()
+                            .is_none_or(|id| id.len() <= SCOPE_PAGE_KEY_BYTES as usize)
+                    }));
+                    if id.len() > SCOPE_PAGE_KEY_BYTES as usize {
+                        assert!(
+                            scope.pending.is_empty(),
+                            "full legacy key is local, tail discarded"
+                        );
+                    }
+                }
+                scope.step(&store).await.unwrap();
+                assert_eq!(scope.family, family + 1);
+                assert!(scope.pending.is_empty() && !scope.started && scope.after.is_empty());
+                assert_eq!(scope.kind, -1);
+                assert_eq!(scope.done, family == 5);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scope_long_physical_keys_still_visit_each_container_once() {
+        let store = scope_page_fixture().await;
+        let ids = [
+            "key-0000".into(),
+            scope_page_sized_id(1, SCOPE_PAGE_KEY_BYTES as usize + 2),
+            "key-0002".into(),
+        ];
+        scope_page_seed_ids(&store, &ids).await;
+        for id in &ids {
+            for ordinal in 0..3_i64 {
+                store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                    "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES(?1,?2,'{}',2)",
+                    [id.clone().into(), ordinal.into()])).await.unwrap();
+                store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                    "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES(?1,?2,0,'event','event-'||?2,'v','thread','{}',2)",
+                    [id.clone().into(), ordinal.into()])).await.unwrap();
+            }
+            store
+                .connection
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE compaction_frozen_history SET next_ordinal=3,next_import=3 WHERE id=?1",
+                    [id.clone().into()],
+                ))
+                .await
+                .unwrap();
+        }
+        assert_checked_physical_scope_groups(&store, ids.len()).await;
+    }
+
+    #[tokio::test]
+    async fn scope_long_key_unknown_error_cancel_and_retry_keep_the_barrier() {
+        let store = scope_page_fixture().await;
+        let long = scope_page_sized_id(1, SCOPE_PAGE_KEY_BYTES as usize + 2);
+        scope_page_seed_ids(
+            &store,
+            &["key-0000".into(), long.clone(), "key-0002".into()],
+        )
+        .await;
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        progress.scope.family = 4;
+        progress.scope.step(&store).await.unwrap();
+        assert_eq!(progress.scope.after, "key-0000");
+        assert_eq!(progress.scope.pending.front(), Some(&(None, 0)));
+
+        let holder = store.connection.begin_read().await.unwrap();
+        let mut attempt = Box::pin(progress.scope.step(&store));
+        assert!(futures_util::poll!(attempt.as_mut()).is_pending());
+        drop(attempt);
+        assert!(
+            progress.scope.pending.is_empty(),
+            "cancelled single fetch discarded tail"
+        );
+        assert_eq!(progress.scope.after, "key-0000");
+        assert!(!progress.scope.done);
+        holder.rollback().await.unwrap();
+
+        // Stage the actual sentinel again, then fail first the full-key seek,
+        // then its oracle. No production test hook or query replacement.
+        for table in ["compaction_operation", "compaction_context"] {
+            progress.scope.pending = progress.scope.fetch_page(&store).await.unwrap();
+            assert_eq!(progress.scope.pending.front(), Some(&(None, 0)));
+            store
+                .connection
+                .execute_unprepared(&format!("ALTER TABLE {table} RENAME TO scope_unavailable"))
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                let error = progress.conversion_scope(&store).await.unwrap_err();
+                assert!(error.downcast_ref::<sea_orm::DbErr>().is_some());
+                assert_eq!(progress.scope.after, "key-0000");
+                assert!(progress.scope.pending.is_empty() && !progress.scope.done);
+                assert_eq!(progress.scope.family, 4);
+            }
+            store
+                .connection
+                .execute_unprepared(&format!("ALTER TABLE scope_unavailable RENAME TO {table}"))
+                .await
+                .unwrap();
+        }
+        store
+            .connection
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE compaction_operation SET owner='missing' WHERE id=?1",
+                [long.clone().into()],
+            ))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert!(progress.conversion_scope(&store).await.is_err());
+            assert_eq!(progress.scope.after, "key-0000");
+            assert!(progress.scope.pending.is_empty() && !progress.scope.done);
+            assert!(
+                progress.expiry.is_none() && progress.sweep.is_none() && progress.discard.is_none()
+            );
+        }
+        // Restore scope only. Keep the complete long ID unchanged.
+        store
+            .connection
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE compaction_operation SET owner='owner' WHERE id=?1",
+                [long.clone().into()],
+            ))
+            .await
+            .unwrap();
+        assert!(!progress.conversion_scope(&store).await.unwrap());
+        assert_eq!(progress.scope.after, long);
+        assert!(progress.scope.pending.is_empty());
+        assert!(!progress.conversion_scope(&store).await.unwrap());
+        assert_eq!(progress.scope.after, "key-0002");
+        for _ in 0..16 {
+            if progress.scope.done {
+                break;
+            }
+            assert!(!progress.conversion_scope(&store).await.unwrap());
+        }
+        assert!(progress.scope.done && progress.conversion_scope(&store).await.unwrap());
+        drop(progress);
+        // The frozen dependency oracle must also retain unknown long keys.
+        // Header is incomplete: its scope can be repaired without weakening
+        // the complete-identity trigger or changing the ID.
+        store
+            .connection
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE compaction_frozen_history SET workspace_id='' WHERE id=?1",
+                [long.clone().into()],
+            ))
+            .await
+            .unwrap();
+        let mut restart = FrozenStorageLifetimeProgress::default();
+        assert!(!restart.conversion_scope(&store).await.unwrap());
+        assert_eq!(restart.scope.after, "key-0000");
+        for _ in 0..2 {
+            assert!(restart.conversion_scope(&store).await.is_err());
+            assert_eq!(restart.scope.after, "key-0000");
+            assert!(!restart.scope.done && restart.scope.pending.is_empty());
+            assert_eq!(restart.scope.family, 0);
+        }
+        store
+            .connection
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE compaction_frozen_history SET workspace_id='ws' WHERE id=?1",
+                [long.clone().into()],
+            ))
+            .await
+            .unwrap();
+        assert!(!restart.conversion_scope(&store).await.unwrap());
+        assert_eq!(restart.scope.after, long);
+        for _ in 0..32 {
+            if restart.scope.done {
+                break;
+            }
+            assert!(!restart.conversion_scope(&store).await.unwrap());
+        }
+        assert!(restart.scope.done && restart.conversion_scope(&store).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn scope_long_layout_fallback_keeps_invalid_kind_errors() {
+        let store = scope_page_fixture().await;
+        let long = scope_page_sized_id(1, SCOPE_PAGE_KEY_BYTES as usize + 2);
+        scope_page_seed_ids(
+            &store,
+            &["key-0000".into(), long.clone(), "key-0002".into()],
+        )
+        .await;
+        let mut scope = ScopeDiscovery {
+            family: 1,
+            ..Default::default()
+        };
+        scope.step(&store).await.unwrap();
+        assert_eq!((&*scope.after, scope.kind), ("key-0000", 1));
+        assert_eq!(scope.pending.front(), Some(&(None, 0)));
+        // Corrupt BOTH kinds after page capture. The raw fallback must retain
+        // the old decode failure rather than coercing bad legacy TEXT to zero.
+        store
+            .connection
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE compaction_frozen_layout SET kind='bad-'||kind WHERE manifest_id=?1",
+                [long.clone().into()],
+            ))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert!(scope.step(&store).await.is_err());
+            assert_eq!((&*scope.after, scope.kind), ("key-0000", 1));
+            assert!(scope.pending.is_empty() && !scope.done);
+            assert_eq!(scope.family, 1);
+        }
+        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "UPDATE compaction_frozen_layout SET kind=CASE kind WHEN 'bad-0' THEN 0 ELSE 1 END WHERE manifest_id=?1", [long.clone().into()])).await.unwrap();
+        for kind in [0, 1] {
+            scope.step(&store).await.unwrap();
+            assert_eq!((&scope.after, scope.kind), (&long, kind));
+            assert!(scope.pending.is_empty());
+        }
+        scope.step(&store).await.unwrap();
+        assert_eq!(scope.family, 2);
+    }
+
+    #[tokio::test]
+    async fn scope_long_key_deleted_before_single_seek_refetches_or_confirms_eof() {
+        for family in [4, 5] {
+            for delete_tail in [false, true] {
+                let store = scope_page_fixture().await;
+                let long = scope_page_sized_id(1, SCOPE_PAGE_KEY_BYTES as usize + 2);
+                scope_page_seed_ids(
+                    &store,
+                    &["key-0000".into(), long.clone(), "key-0002".into()],
+                )
+                .await;
+                let mut scope = ScopeDiscovery {
+                    family,
+                    ..Default::default()
+                };
+                scope.step(&store).await.unwrap();
+                assert_eq!(scope.pending.front(), Some(&(None, 0)));
+                let table = if family == 4 {
+                    "compaction_operation"
+                } else {
+                    "compaction_checkpoint"
+                };
+                store
+                    .connection
+                    .execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        format!("DELETE FROM {table} WHERE id=?1"),
+                        [long.into()],
+                    ))
+                    .await
+                    .unwrap();
+                if delete_tail {
+                    store
+                        .connection
+                        .execute_unprepared(&format!("DELETE FROM {table} WHERE id='key-0002'"))
+                        .await
+                        .unwrap();
+                }
+                scope.step(&store).await.unwrap();
+                assert!(scope.pending.is_empty());
+                if !delete_tail {
+                    assert_eq!(scope.after, "key-0002");
+                    assert_eq!(scope.family, family);
+                    scope.step(&store).await.unwrap();
+                }
+                assert_eq!(scope.family, family + 1);
+                assert_eq!(scope.done, family == 5);
+                assert!(!scope.started && scope.after.is_empty() && scope.kind == -1);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn bounded_startup_steps_keep_cursor_barrier_and_distinct_backing_groups() {
         let (store, _) = fixture(true).await;
@@ -3377,16 +4712,19 @@ mod tests {
         }
         assert!(progress.scope.done);
 
-        // The fixture has two physical rows in ONE backing manifest. Preserve
-        // group discovery and the independent (manifest,kind) layout cursor.
-        let mut groups = ScopeDiscovery {
-            family: 2,
-            ..Default::default()
-        };
-        groups.step(&store).await.unwrap();
-        assert_eq!(groups.after, "origin");
-        groups.step(&store).await.unwrap();
-        assert_eq!(groups.family, 3);
+        // Physical scope and registration now finish atomically in durable
+        // bootstrap before scope.done, rather than a later sweep inventory.
+        assert!(!frozen_sweep_work::bootstrap_step(&store).await.unwrap());
+        let complete = store
+            .connection
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT count(*) AS n FROM compaction_frozen_sweep_bootstrap WHERE complete=1",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(complete.try_get::<i64>("", "n").unwrap(), 2);
         store
             .compact_frozen_storage_quantum(&mut progress)
             .await
@@ -3435,10 +4773,9 @@ mod tests {
         progress.locator_kind = 0;
         assert!(!progress.locator_quantum(&store).await.unwrap());
         assert!(progress.locator_done.iter().all(|done| *done));
-        progress.physical_done = [true, false];
-        progress.physical_kind = 0;
-        assert!(!progress.sweep_quantum(&store).await.unwrap());
-        assert!(progress.physical_done.iter().all(|done| *done));
+        // Bootstrap and invalidation continuations are real work even while
+        // physical discovery itself temporarily finds no eligible key.
+        assert!(progress.sweep_quantum(&store).await.unwrap());
 
         progress.pass_done = [true, true, false, false, false, false];
         progress.phase = 0;
@@ -4462,6 +5799,7 @@ mod tests {
         assert!(error.downcast_ref::<sea_orm::DbErr>().is_some());
         let retry = progress.expiry.as_ref().unwrap();
         assert_eq!(retry.header.id, "origin");
+        assert!(!retry.roots_checked);
         assert_eq!(retry.layout_kind, 0);
         assert!(!retry.operations_done && !retry.checkpoints_done && retry.reverse.is_none());
         assert_eq!(progress.accounting.expired, 0);
@@ -4725,13 +6063,6 @@ mod tests {
         progress.proof = Some(checkpoint_proofs::GraphPreparation::new("cp-1"));
         progress.proof_pending.push_back("queued-proof".into());
         progress.proof_after = "proof-frontier".into();
-        progress.physical_after = [
-            Some("message-frontier".into()),
-            Some("import-frontier".into()),
-        ];
-        progress.physical_until = [Some("message-end".into()), Some("import-end".into())];
-        progress.physical_started = [true; 2];
-        progress.physical_done = [true, false];
         progress.sweep = Some(SweepPreparation::new("active".into(), 0, 42));
         progress
             .sweep_pending
@@ -4749,26 +6080,16 @@ mod tests {
         assert!(progress.proof.is_some());
         assert_eq!(progress.proof_after, "proof-frontier");
         assert_eq!(progress.proof_pending.front().unwrap(), "queued-proof");
-        assert_eq!(
-            progress.physical_after[0].as_deref(),
-            Some("message-frontier")
-        );
-        assert_eq!(progress.physical_until[1].as_deref(), Some("import-end"));
-        assert_eq!(progress.physical_started, [true; 2]);
-        assert_eq!(progress.physical_done, [true, false]);
         assert_eq!(progress.sweep.as_ref().unwrap().until, 42);
         assert_eq!(progress.sweep_pending.front().unwrap().manifest, "queued");
 
-        // A finished physical family starts a new finite keyset only when it
-        // has no active containers. Other families' continuations survive.
+        // Periodic admission reopens durable pending discovery only. No RAM
+        // inventory frontier exists to reset, and active visits survive above.
         progress.sweep = None;
         progress.sweep_pending.clear();
         progress.pass_done[3] = true;
         progress.revisit_completed_cleanup(now + interval * 2, interval);
-        assert_eq!(progress.physical_after, [None, None]);
-        assert_eq!(progress.physical_until, [None, None]);
-        assert_eq!(progress.physical_started, [false; 2]);
-        assert_eq!(progress.physical_done, [false; 2]);
+        assert!(!progress.pass_done[3]);
 
         progress.proof = None;
         progress.proof_pending.clear();
