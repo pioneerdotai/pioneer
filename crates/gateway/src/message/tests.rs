@@ -29154,6 +29154,40 @@ async fn attached_cli_task_starts_while_its_parent_provider_turn_is_active_impl(
         );
         processor.release_completed_history_preparation_barrier();
     }
+    // The child has finished, but its result has not yet been delivered to
+    // the parent model. Its first completion must continue the same Turn.
+    cli.set_next_native_turn_id("attached-parent-observed-provider-turn")
+        .await;
+    let parent_key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", parent).unwrap();
+    let parent_handle = manager.existing_session(&parent_key).await.unwrap();
+    processor
+        .handle_cli_runtime_timeline_event(
+            parent_handle.instance(),
+            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                native_thread_id: Some(parent_session.clone()),
+                native_turn_id: "attached-active-provider-turn".to_owned(),
+                status: "completed".to_owned(),
+                native: None,
+            }),
+        )
+        .await;
+    let starts = wait_for_cli_runtime_turn_starts(&cli, 3).await;
+    assert_eq!(starts.len(), 3);
+    assert_eq!(starts[2].native_thread_id, parent_session);
+    let continuation = starts[2].input.to_string();
+    assert!(continuation.contains("ATTACHED CHILD COMPLETE"));
+    assert!(!continuation.contains("PARENT WAITS FOR ATTACHED TASK"));
+    assert_eq!(
+        store
+            .get_turn(parent, parent_turn)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::InProgress,
+        "the child result must be integrated before the parent completes"
+    );
     complete_recorded_cli_task_turn(
         &processor,
         cli.as_ref(),
@@ -29162,7 +29196,7 @@ async fn attached_cli_task_starts_while_its_parent_provider_turn_is_active_impl(
         "codex",
         parent,
         &parent_session,
-        "attached-active-provider-turn",
+        "attached-parent-observed-provider-turn",
         "PARENT COMPLETES AFTER ATTACHED CHILD",
     )
     .await;
@@ -31251,15 +31285,28 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                     .expect("non-latest post-bootstrap input should be editable");
             }
         }
+        let manual_response = pioneer_crud::load_agent_turn_response(
+            &crud_store.database_connection(),
+            corrected_turn.as_str(),
+        )
+        .await
+        .expect("manual response association lookup should succeed")
+        .expect("the foreground CLI Agent turn has its own execution");
+        let manual_execution = pioneer_crud::load_agent_execution(
+            &crud_store.database_connection(),
+            &manual_response.execution_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(
-            pioneer_crud::load_agent_turn_response(
-                &crud_store.database_connection(),
-                corrected_turn.as_str(),
-            )
-            .await
-            .expect("manual response association lookup should succeed")
-            .is_none(),
+            manual_execution.parent_task_id.is_none()
+                && manual_execution.parent_execution_id.is_none(),
             "a foreground follow-up must not be falsely associated with the completed Task execution"
+        );
+        assert_eq!(
+            manual_execution.id,
+            super::agent_action_tools::root_agent_execution_id_for_turn(&corrected_turn)
         );
         let timeline_request_id =
             generate_test_request_id("manual-child-author", corrected_turn.as_str());
@@ -32891,7 +32938,24 @@ async fn cli_task_bootstrap_honors_empty_parent_context_policy_impl() {
     let provider_input = starts[0].input.to_string();
     assert!(provider_input.contains(current_marker));
     let adapter_messages = serde_json::to_value(&starts[0].input).unwrap();
-    let adapter_messages = adapter_messages.as_array().unwrap();
+    let adapter_input = adapter_messages.as_array().unwrap();
+    let skill_names = adapter_input
+        .iter()
+        .filter(|item| item["type"] == "skill")
+        .map(|item| item["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        skill_names,
+        vec!["pioneer-system-tasks", "pioneer-system-subagents"]
+    );
+    let adapter_messages = adapter_input
+        .iter()
+        .filter(|item| item["type"] == "text")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        adapter_input.len(),
+        adapter_messages.len() + skill_names.len()
+    );
     assert_eq!(adapter_messages.len(), 2);
     assert!(
         !adapter_messages[0].to_string().contains(current_marker),

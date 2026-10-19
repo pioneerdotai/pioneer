@@ -137,6 +137,93 @@ async fn invoke_task(
 }
 
 #[test]
+fn cli_task_runtime_snapshots_preserve_user_cancellation_for_all_providers() {
+    run_standard_stack_message_test("CLI task snapshot cancellation", async {
+        for kind in [
+            CLIAgentRuntimeKind::Codex,
+            CLIAgentRuntimeKind::Claude,
+            CLIAgentRuntimeKind::OpenCode,
+        ] {
+            let (mut harness, processor, turn_id) = start_task_cli_fixture(kind).await;
+            let binding = processor
+                .crud_store
+                .get_cli_runtime_turn_binding(&turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                processor
+                    .crud_store
+                    .get_turn_runtime_snapshot(&turn_id)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                processor
+                    .crud_store
+                    .get_turn_execution(&turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .executor_kind,
+                pioneer_crud::TurnExecutorKind::CliRuntime
+            );
+            assert!(
+                processor
+                    .crud_store
+                    .native_cancellation_context(&turn_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            for attempt in 0..2 {
+                let request_id = generate_test_request_id("cancel", &format!("{attempt}-{kind:?}"));
+                processor
+                    .process_request_for_connection(
+                        harness.connection_id,
+                        &json!({
+                            "jsonrpc":"2.0", "id":request_id, "method":"turn/cancel",
+                            "params":{"thread_id":binding.thread_id, "turn_id":turn_id,
+                                "reason":"Stop this CLI task parent"}
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                let response = recv_response_by_id(&mut harness.rx, &request_id).await;
+                let cancelled: TurnCancelResponse =
+                    serde_json::from_value(response.result).unwrap();
+                assert_eq!(cancelled.turn.status, TurnStatus::Interrupted);
+            }
+            assert!(
+                harness
+                    .cli_session
+                    .interrupts
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|(thread, turn)| {
+                        thread.as_deref() == Some(binding.native_thread_id.as_str())
+                            && turn == &binding.native_turn_id
+                    }),
+                "{kind:?}: cancellation must reach the original provider turn"
+            );
+            assert_eq!(
+                processor
+                    .crud_store
+                    .latest_cli_runtime_turn_attempt(&turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                pioneer_crud::CliRuntimeTurnAttemptStatus::Interrupted
+            );
+            assert_eq!(harness.cli_session.turn_starts.lock().await.len(), 1);
+        }
+    });
+}
+
+#[test]
 fn cli_automatic_orchestration_skills_coexist_with_selected_user_names() {
     run_standard_stack_message_test("CLI orchestration skill name isolation", async {
         for kind in [
