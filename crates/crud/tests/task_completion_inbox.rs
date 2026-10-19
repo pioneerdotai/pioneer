@@ -721,12 +721,21 @@ async fn same_run_updates_preserve_personal_read_and_list_projection_is_bounded(
     db.execute_unprepared("UPDATE task_run SET status='succeeded',error_json=NULL WHERE id='run'")
         .await
         .unwrap();
-    assert_eq!(
+    // Reopening the same run does not revoke its personal read receipt.
+    assert!(
         list_task_completion_inbox(&db, &access(A), None, 30)
             .await
             .unwrap()
-            .len(),
-        1
+            .is_empty()
+    );
+    assert_eq!(unread(&store, A).await, 0);
+    assert!(
+        find_task_completion_inbox_entry(&db, &access(A), "run")
+            .await
+            .unwrap()
+            .unwrap()
+            .read_at
+            .is_some()
     );
 }
 
