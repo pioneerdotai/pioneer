@@ -549,6 +549,9 @@ impl crate::threads::registry::ThreadRegistry {
                 self.directory.dirty_workspaces.insert(workspace.clone());
             }
         }
+        // An in-flight initial load must not resume an abandoned selection,
+        // including a navigation away and back to the same workspace.
+        self.directory.cancel_initial_restore();
         self.navigation_revision += 1;
         self.session_revision += 1;
         let snapshot = Arc::new(self.navigation.clone());

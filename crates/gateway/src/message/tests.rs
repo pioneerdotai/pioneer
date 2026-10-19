@@ -43595,6 +43595,52 @@ async fn message_attachment_requires_exact_version_and_current_thread_scope() {
     }
 }
 
+// These RPC regressions cover normal post-access unread behavior. Give their
+// isolated fixtures an earlier activation/grant, rather than depending on
+// whether setup and publication happen in the same excluded boundary second.
+async fn prepare_post_access_unread_fixture(store: &CrudStore, workspace_id: &str) {
+    let earlier = chrono::Utc::now().fixed_offset() - chrono::Duration::seconds(60);
+    // These fixtures seed updated_at with SQLite CURRENT_TIMESTAMP. Keep the
+    // same UTC text format: membership's timestamp CHECK compares stored text.
+    let earlier_sql = earlier.format("%Y-%m-%d %H:%M:%S").to_string();
+    let db = store.database_connection();
+    let tx = db.begin().await.unwrap();
+    pioneer_entity::gateway_identity::Entity::update_many()
+        .col_expr(
+            pioneer_entity::gateway_identity::Column::UnreadStartedAt,
+            Expr::val(earlier.timestamp()),
+        )
+        .filter(pioneer_entity::gateway_identity::Column::SingletonKey.eq(1))
+        .exec(&tx)
+        .await
+        .unwrap();
+    let ids = [
+        authenticated_test_superuser().principal_id.to_string(),
+        "P0000000000000000000A".into(),
+        "P0000000000000000000B".into(),
+    ];
+    pioneer_entity::gateway_principal::Entity::update_many()
+        .col_expr(
+            pioneer_entity::gateway_principal::Column::CreatedAt,
+            Expr::val(earlier_sql.clone()),
+        )
+        .filter(pioneer_entity::gateway_principal::Column::Id.is_in(ids.clone()))
+        .exec(&tx)
+        .await
+        .unwrap();
+    pioneer_entity::workspace_membership::Entity::update_many()
+        .col_expr(
+            pioneer_entity::workspace_membership::Column::CreatedAt,
+            Expr::val(earlier_sql),
+        )
+        .filter(pioneer_entity::workspace_membership::Column::WorkspaceId.eq(workspace_id))
+        .filter(pioneer_entity::workspace_membership::Column::PrincipalId.is_in(ids))
+        .exec(&tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn message_mutation_rpcs_enforce_author_moderation_revision_and_tombstone_policy() {
     const AUTHOR_ID: &str = "P0000000000000000000A";
@@ -43626,6 +43672,7 @@ async fn message_mutation_rpcs_enforce_author_moderation_revision_and_tombstone_
         )
         .await
         .expect("materialize Epic 6 mutation principals");
+    prepare_post_access_unread_fixture(crud_store.as_ref(), &workspace_id).await;
 
     let session_manager = Arc::new(SessionManager::new());
     let (author_tx, mut author_rx) = mpsc::channel(64);
@@ -44233,6 +44280,7 @@ async fn thread_read_rpc_is_monotonic_and_converges_all_principal_sessions() {
     let _secondary_connection_id =
         register_authenticated_test_connection(session_manager.as_ref(), secondary_tx).await;
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    prepare_post_access_unread_fixture(crud_store.as_ref(), &workspace_id).await;
     let processor = MessageProcessor::new(
         Arc::new(ThreadManager::new("o4-mini", "openai")),
         test_provider(),

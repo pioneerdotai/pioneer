@@ -11799,6 +11799,11 @@ mod tests {
     #[tokio::test]
     async fn html_response_artifacts_enter_existing_result_binding_without_model_handles() {
         let (processor, task, execution, lineage) = task_artifact_harness("html_response").await;
+        use crate::session::test_support::{
+            authenticated_test_superuser, ensure_test_superuser_execution_authority,
+        };
+        ensure_test_superuser_execution_authority(processor.crud_store.as_ref()).await;
+        let reader = authenticated_test_superuser().principal_id.clone();
         let db = processor.crud_store.database_connection();
         use sea_orm::{DbBackend, Statement};
         // Real task sources are internal children of the visible collaboration root.
@@ -12099,37 +12104,42 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let count = || pioneer_crud::count_unread_message_blocks(&db, &thread_id, "reader", "");
+            let count =
+                || pioneer_crud::count_unread_message_blocks(&db, &thread_id, reader.as_ref(), "");
             let before = count().await.unwrap();
-            pioneer_crud::upsert_thread_timeline_block(
-                &db,
-                pioneer_crud::ThreadTimelineBlockRecord {
-                    block_id: pioneer_crud::assistant_block_id(turn_id, &item_id),
-                    workspace_id: task.workspace_id.clone(),
-                    thread_id: thread_id.clone(),
-                    turn_id: Some(turn_id.clone()),
-                    block_kind: pioneer_crud::BLOCK_KIND_ASSISTANT_MESSAGE.into(),
-                    sort_key: "html-count-fixture".into(),
-                    source_kind: Some("turn_item".into()),
-                    source_key: Some(item_id),
-                    started_at: Some(now),
-                    completed_at: Some(now),
-                    metadata_json: "{}".into(),
-                    created_at: now,
-                    updated_at: now,
-                },
-            )
-            .await
-            .unwrap();
+            let completed = ItemCompletedNotification {
+                workspace_id: task.workspace_id.clone(),
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+                item: processor
+                    .crud_store
+                    .get_turn_item(turn_id, &item_id)
+                    .await
+                    .unwrap()
+                    .expect("canonical response"),
+            };
+            // Publish through the canonical path, including its durable unread
+            // position, after the reader's excluded activation second.
+            let published_at = now.timestamp() + 2;
+            processor
+                .crud_store
+                .materialize_item_completed(completed.clone(), published_at)
+                .await
+                .expect("publish completed response");
             assert_eq!(
                 count().await.unwrap(),
                 before + 1,
                 "HTML-only delivery and mixed source each count once despite multiple HTML publications"
             );
+            processor
+                .crud_store
+                .materialize_item_completed(completed, published_at + 1)
+                .await
+                .expect("replay completed response");
             assert_eq!(
                 count().await.unwrap(),
                 before + 1,
-                "repeated projections do not add unread units"
+                "replayed completion does not add unread units"
             );
         }
 

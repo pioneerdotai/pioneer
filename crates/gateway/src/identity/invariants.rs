@@ -300,6 +300,7 @@ mod tests {
         let now = Utc::now().fixed_offset();
         IdentityInvariantRows {
             gateways: vec![gateway_identity::Model {
+                unread_started_at: 0,
                 id: GATEWAY_ID.to_owned(),
                 singleton_key: 1,
                 identity_bootstrap_version: 0,

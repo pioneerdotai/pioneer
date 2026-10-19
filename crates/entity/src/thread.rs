@@ -31,6 +31,7 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub preview_author_json: Option<String>,
     pub created_by_actor_kind: Option<String>,
+    pub workspace_unread_started_at: i64,
     #[sea_orm(has_many)]
     pub compaction_contexts: HasMany<super::compaction_context::Entity>,
     #[sea_orm(has_many)]
