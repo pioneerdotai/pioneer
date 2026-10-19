@@ -418,7 +418,7 @@ mod tests {
             definition: subagents.clone(),
         }];
         assert!(
-            crate::cli_runtime::skills::ensure_cli_runtime_skills_exportable(&required).is_err()
+            crate::cli_runtime::skills::ensure_cli_runtime_skills_exportable(&required).is_ok()
         );
 
         let expected_subagents_asset_root = root
@@ -503,6 +503,13 @@ mod tests {
             reason: SkillResolvedReason::Implicit,
             definition: tasks.clone(),
         }];
+        assert!(
+            crate::cli_runtime::skills::ensure_cli_runtime_skills_exportable(&tasks_active).is_ok()
+        );
+        assert!(!pioneer_skills::skill_implicit_invocation_editable(tasks));
+        assert!(!pioneer_skills::skill_implicit_invocation_editable(
+            subagents
+        ));
         let tasks_prompt = build_skill_prompt(
             tasks_active.as_slice(),
             SkillPromptBudget {
@@ -570,6 +577,31 @@ mod tests {
             reason: SkillResolvedReason::Implicit,
             definition: memory.clone(),
         }];
+        assert!(
+            crate::cli_runtime::skills::ensure_cli_runtime_skills_exportable(&memory_active)
+                .is_err()
+        );
+        // Export support is an explicit allowlist, not a change to Required.
+        for skill in &catalog.skills {
+            if skill.policy_hints.implicit_invocation == SkillImplicitInvocationPolicy::Required
+                && !matches!(
+                    skill.identity.slug.as_str(),
+                    "tasks" | "subagents" | "memory"
+                )
+            {
+                let unsupported = [ResolvedSkill {
+                    skill_id: skill.identity.skill_id.clone(),
+                    slug: format!("pioneer/{}", skill.identity.slug),
+                    reason: SkillResolvedReason::Implicit,
+                    definition: skill.clone(),
+                }];
+                assert!(
+                    crate::cli_runtime::skills::ensure_cli_runtime_skills_exportable(&unsupported)
+                        .is_err()
+                );
+                assert!(!pioneer_skills::skill_implicit_invocation_editable(skill));
+            }
+        }
         let memory_prompt = build_skill_prompt(
             memory_active.as_slice(),
             SkillPromptBudget {

@@ -671,6 +671,7 @@ async fn ordinary_event_driven_repair_can_overtake_claimed_background_work() {
 async fn migration_accepts_history_tracks_later_old_updates_and_down_removes_objects() {
     let store = test_store_with_workspace_migrator::<TrackerFixtureMigrator>("ws_task").await;
     add_inbox_runtime_fields_to_legacy_projector_fixture(&store).await;
+    add_thread_unread_column_to_legacy_fixture(&store).await;
     let (store, _, run) =
         terminal_task_run_occurrence_fixture_with_store(store, Some(TurnKind::TaskRun)).await;
     let maintenance = store.with_maintenance_access();
@@ -1723,6 +1724,7 @@ async fn attempt_count_saturates_but_poison_row_stays_retryable_forever() {
 async fn recovery_completed_at_write_tracks_preinstall_run_without_history_discovery() {
     let store = test_store_with_workspace_migrator::<TrackerFixtureMigrator>("ws_task").await;
     add_inbox_runtime_fields_to_legacy_projector_fixture(&store).await;
+    add_thread_unread_column_to_legacy_fixture(&store).await;
     let (store, _, run) =
         terminal_task_run_occurrence_fixture_with_store(store, Some(TurnKind::TaskRun)).await;
     runs::Entity::update_many()

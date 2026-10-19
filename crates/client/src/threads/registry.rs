@@ -474,6 +474,10 @@ impl ThreadRegistry {
 }
 
 impl ThreadRegistry {
+    pub(crate) fn has_thread_store(&self, id: &str) -> bool {
+        self.stores.contains_key(id)
+    }
+
     fn require(&mut self, id: &str, workspace: &str) -> bool {
         if id.is_empty() || workspace.is_empty() {
             return false;
@@ -645,7 +649,7 @@ impl ThreadRegistry {
             self.directory.summaries.insert(id.to_owned(), summary);
         }
         if let Some(thread) = thread_summary {
-            self.directory.threads.insert(id.to_owned(), thread);
+            self.directory.upsert_thread_summary(thread);
         }
         self.retired.remove(id);
         self.revisions.insert(
@@ -842,6 +846,51 @@ impl ClientCore {
             registry,
             id: id.to_owned(),
         })
+    }
+
+    /// Directory refresh must never create coordinators. Inspect the owner,
+    /// including pending stores with no published snapshot, under the same lock
+    /// used for the update (an eviction between selection and update is valid).
+    pub(crate) fn upsert_existing_directory_thread(&self, mut thread: Thread) {
+        if self.is_stopped() {
+            return;
+        }
+        let registry = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned");
+        if registry.directory.threads.get(&thread.id) != Some(&thread) {
+            return; // A live metadata update won the race after selection.
+        }
+        let Some(store) = registry.stores.get(&thread.id) else {
+            return;
+        };
+        if store.coordinator.workspace_id != thread.workspace_id {
+            return;
+        }
+        if let Some(previous) = store.coordinator.thread() {
+            if previous.updated_at > thread.updated_at {
+                return;
+            }
+            // A compact directory prefix must not replace the detailed preview
+            // already loaded by Thread/get or live metadata.
+            if previous.preview.len() > thread.preview.len() {
+                let mut detailed = thread.clone();
+                detailed.preview = previous.preview.clone();
+                if detailed.into_directory_summary().preview == thread.preview {
+                    thread.preview = previous.preview.clone();
+                }
+            }
+        }
+        let id = thread.id.clone();
+        let mut mutation = ThreadMutation {
+            core: self,
+            registry,
+            id,
+        };
+        if mutation.thread() != Some(&thread) {
+            mutation.set_snapshot(thread);
+        }
     }
 
     pub fn upsert_thread(&self, thread: Thread) {
@@ -1241,13 +1290,7 @@ impl ClientCore {
                 *store = fresh;
             }
         }
-        if let Some(thread) = registry.directory.threads.remove(id) {
-            registry
-                .directory
-                .dirty_workspaces
-                .insert(thread.workspace_id);
-        }
-        registry.directory.placements.remove(id);
+        registry.directory.remove_thread(id);
         if remove_navigation {
             registry.navigation.remove_thread(id);
         }
@@ -2268,7 +2311,7 @@ impl ClientCore {
                             && placement.workspace_id == workspace
                             && mutation.registry.directory.placements.get(&id) != Some(&placement)
                         {
-                            mutation.registry.directory.placements.insert(id, placement);
+                            mutation.registry.directory.upsert_placement(placement);
                             mutation
                                 .registry
                                 .directory
@@ -2775,6 +2818,95 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn directory_refresh_preserves_detailed_preview_but_accepts_shorter_and_empty_edits() {
+        let core = ClientCore::new();
+        let mut full: Thread = serde_json::from_value(serde_json::json!({
+            "id":"preview", "workspace_id":"w", "name":"Named", "preview":"", "mode":"Chat", "model":"model", "model_provider":"provider", "created_at":1, "updated_at":1, "status":"Idle", "turns":[]
+        })).unwrap();
+        full.preview = "First 😀 message ".repeat(200);
+        core.upsert_thread(full.clone());
+        core.activate_thread(Some("preview"), Some("w"));
+        let compact = full.clone().into_directory_summary();
+        core.upsert_existing_directory_thread(compact.clone());
+        assert_eq!(
+            core.thread_snapshot("preview")
+                .unwrap()
+                .coordinator()
+                .thread()
+                .unwrap()
+                .preview,
+            full.preview
+        );
+        assert_eq!(
+            core.workspace_tree("w").unwrap().snapshot().threads_by_id["preview"],
+            compact
+        );
+        for text in ["First", ""] {
+            let mut edited = full.clone();
+            edited.preview = text.into();
+            edited.updated_at += 1;
+            core.thread_registry
+                .lock()
+                .unwrap()
+                .directory
+                .threads
+                .insert("preview".into(), edited.clone());
+            core.upsert_existing_directory_thread(edited);
+            assert_eq!(
+                core.thread_snapshot("preview")
+                    .unwrap()
+                    .coordinator()
+                    .thread()
+                    .unwrap()
+                    .preview,
+                text
+            );
+            assert_eq!(
+                core.workspace_tree("w").unwrap().snapshot().threads_by_id["preview"].preview,
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn directory_refresh_updates_pending_and_retained_stores_without_creating_others() {
+        let core = ClientCore::new();
+        let make_thread = |id: &str| {
+            serde_json::from_value::<Thread>(serde_json::json!({
+            "id": id, "workspace_id": "w", "preview": "", "mode": "Chat", "model": "new", "model_provider": "p", "created_at": 1, "updated_at": 2, "status": "Idle", "turns": []
+        })).unwrap()
+        };
+        {
+            let mut registry = core.thread_registry.lock().unwrap();
+            registry
+                .stores
+                .insert("pending".into(), ThreadDomainStore::new("pending", "w"));
+            for id in ["pending", "unopened"] {
+                registry
+                    .directory
+                    .threads
+                    .insert(id.into(), make_thread(id));
+            }
+            assert!(registry.stores["pending"].snapshot.is_none());
+        }
+        for id in ["pending", "unopened"] {
+            core.upsert_existing_directory_thread(make_thread(id));
+        }
+        let registry = core.thread_registry.lock().unwrap();
+        assert!(registry.stores["pending"].snapshot.is_some());
+        assert_eq!(
+            registry.stores["pending"]
+                .coordinator
+                .thread()
+                .unwrap()
+                .model,
+            "new"
+        );
+        assert_eq!(registry.stores.len(), 1);
+        assert_eq!(registry.directory.threads.len(), 2);
     }
 
     #[test]

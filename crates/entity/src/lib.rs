@@ -207,6 +207,7 @@ pub mod turn_skill_binding;
 pub mod turn_status_history;
 pub mod turn_work_item_projection;
 pub mod turn_work_projection;
+pub mod unread_message_position;
 pub mod user_notification_outbox;
 pub mod workspace;
 pub mod workspace_membership;

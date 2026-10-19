@@ -172,6 +172,7 @@ pub async fn create_gateway_singleton<C: ConnectionTrait>(
     now: DateTimeWithTimeZone,
 ) -> Result<GatewayIdentityRecord> {
     let model = gateway_identity::ActiveModel {
+        unread_started_at: Set(now.timestamp()),
         id: Set(id.to_string()),
         singleton_key: Set(GATEWAY_SINGLETON_KEY),
         identity_bootstrap_version: Set(identity_bootstrap_version),

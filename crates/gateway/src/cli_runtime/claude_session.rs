@@ -28,7 +28,7 @@ use crate::cli_runtime::permissions::{
     ClaudeMcpPermissionFallbackDecision, claude_mcp_permission_fallback_response,
 };
 use crate::cli_runtime::session_instance::{CliSessionGenerationAllocator, CliSessionInstanceId};
-use crate::cli_runtime::skills::CliRuntimeSelectedSkill;
+use crate::cli_runtime::skills::{CliRuntimeSelectedSkill, normalize_cli_runtime_selected_skills};
 use crate::turn_mcp::invoker::{
     TurnMcpInvocation, TurnMcpInvocationError, TurnMcpInvocationErrorCode, TurnMcpInvoker,
 };
@@ -958,6 +958,9 @@ fn materialize_claude_selected_skill_plugins(
     managed_mcp_config: &ClaudeManagedMcpConfigDescriptor,
     selected_skills: &[CliRuntimeSelectedSkill],
 ) -> Result<Vec<PathBuf>> {
+    // Normalize before assigning index-based namespaces (and before touching
+    // snapshots), even for callers outside the turn admission/restore paths.
+    let selected_skills = normalize_cli_runtime_selected_skills(selected_skills.iter().cloned())?;
     let plugins_root = managed_mcp_config
         .session_root_path
         .join("selected-skill-plugins");
@@ -1128,6 +1131,22 @@ fn claude_process_config_from_instance_with_managed_mcp(
         "pioneer".to_owned(),
     );
     env.extend_from(&options.env);
+    if allowed_tool_names
+        .iter()
+        .any(|name| name == "mcp__pioneer__task_wait")
+    {
+        // TaskService owns the durable observation/activity budget. Claude's
+        // stdio idle timer and automatic backgrounding must not reinterpret it.
+        env.insert_plain(
+            "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT".to_owned(),
+            "0".to_owned(),
+        );
+        env.insert_plain(
+            "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS".to_owned(),
+            "0".to_owned(),
+        );
+    }
+
     let permission_mode = options
         .approval_policy
         .as_deref()
@@ -5568,6 +5587,93 @@ done
                 "Pioneer must not replace Claude's provider-owned tool sandbox"
             );
         }
+    }
+
+    #[test]
+    fn claude_selected_skill_plugins_keep_orchestration_aliases_separate_from_user_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let instance = claude_instance(temp.path().join("home").display().to_string());
+        let mut selected = Vec::new();
+        for name in [
+            "tasks",
+            "subagents",
+            "pioneer-system-tasks",
+            "pioneer-system-subagents",
+        ] {
+            let path = temp.path().join("exports").join(name);
+            std::fs::create_dir_all(path.join("references")).unwrap();
+            std::fs::write(
+                path.join("SKILL.md"),
+                format!("---\nname: {name}\n---\n# {name}\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                path.join("references/guide.txt"),
+                format!("reference for {name}"),
+            )
+            .unwrap();
+            selected.push(selected_skill_fixture(&path, name));
+        }
+        let expected_names = [
+            "pioneer-system-subagents",
+            "pioneer-system-tasks",
+            "subagents",
+            "tasks",
+        ];
+        let mut previous_bindings = None;
+        for projection in [selected.clone(), selected.iter().rev().cloned().collect()] {
+            let config = claude_process_config_from_instance(
+                &instance,
+                &CLIAgentRuntimeSessionStartOptions {
+                    selected_skills: projection,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let plugins = arg_values_after(&config.args, "--plugin-dir");
+            assert_eq!(plugins.len(), 4);
+            let mut bindings = Vec::new();
+            for (index, (plugin, name)) in plugins.iter().zip(expected_names).enumerate() {
+                let skill = selected
+                    .iter()
+                    .find(|skill| skill.install_name == name)
+                    .unwrap();
+                let manifest: JsonValue = serde_json::from_slice(
+                    &std::fs::read(plugin.join(".claude-plugin/plugin.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(manifest["name"], format!("pioneer-selected-skill-{index}"));
+                assert_eq!(manifest["skills"], json!([format!("./skills/{name}")]));
+                bindings.push((manifest["name"].clone(), manifest["skills"].clone()));
+                let snapshot = plugin.join("skills").join(name);
+                assert_eq!(
+                    compute_skill_folder_hash(&snapshot).unwrap(),
+                    skill.source_folder_hash
+                );
+                assert_eq!(
+                    std::fs::read(snapshot.join("SKILL.md")).unwrap(),
+                    std::fs::read(skill.installed_path.join("SKILL.md")).unwrap()
+                );
+                assert_eq!(
+                    std::fs::read(snapshot.join("references/guide.txt")).unwrap(),
+                    format!("reference for {name}").as_bytes()
+                );
+                assert_eq!(std::fs::read_dir(plugin.join("skills")).unwrap().count(), 1);
+            }
+            if let Some(previous) = previous_bindings {
+                assert_eq!(bindings, previous);
+            }
+            previous_bindings = Some(bindings);
+        }
+        let duplicate = claude_process_config_from_instance(
+            &instance,
+            &CLIAgentRuntimeSessionStartOptions {
+                selected_skills: vec![selected[0].clone(), selected[0].clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(duplicate.to_string().contains("installation names collide"));
     }
 
     #[test]

@@ -1937,7 +1937,7 @@ impl TaskService {
 
     pub async fn create_task(
         &self,
-        context: TaskCreateContext,
+        mut context: TaskCreateContext,
         params: TaskCreateParams,
     ) -> TaskRuntimeResult<TaskCreateResponse> {
         validate_create_params(&params)?;
@@ -2202,6 +2202,20 @@ impl TaskService {
             occurrence.root_resource_scope_id = context.work_graph_root_execution_id.clone();
             occurrence
         });
+        // CLI replay references live in the canonical action receipt and commit
+        // atomically with creation. No CLI response or history ACK is required.
+        if let Some(action) = context.agent_action_commit.as_mut() {
+            let mut response: serde_json::Value =
+                serde_json::from_str(action.receipt_response_json.as_deref().unwrap_or("{}"))?;
+            if response.get("pioneerTaskToolCall").is_some() {
+                response["taskCreation"] = serde_json::json!({
+                    "taskId": task_id, "triggerId": trigger_id, "runId": immediate_run.as_ref().map(|run| &run.id),
+                });
+                let response = serde_json::to_string(&response)?;
+                action.action_response_json = Some(response.clone());
+                action.receipt_response_json = Some(response);
+            }
+        }
         let appended = self
             .projector
             .commit_task_creation(pioneer_crud::TaskCreationCommitInput {

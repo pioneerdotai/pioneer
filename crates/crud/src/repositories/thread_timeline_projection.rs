@@ -407,34 +407,20 @@ pub async fn find_thread_timeline_block_by_id<C: ConnectionTrait>(
 pub(crate) async fn new_message_sort_key<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,
+    block_id: &str,
+    turn_id: &str,
     candidate: String,
+    published_at: i64,
 ) -> Result<String> {
-    let latest = thread_timeline_block::Entity::find()
-        .filter(thread_timeline_block::Column::ThreadId.eq(thread_id.to_owned()))
-        .order_by_desc(thread_timeline_block::Column::SortKey)
-        .one(db)
-        .await
-        .context("failed to find latest timeline position")?;
-    if let Some(latest) = latest
-        && latest.sort_key >= candidate
-    {
-        // Preserve the existing key shape/Turn identity. Only new readable
-        // messages need a logical tick when their original Turn position is
-        // already behind published rows (including completions in one clock tick).
-        let (millis, _) = latest
-            .sort_key
-            .split_once(':')
-            .context("invalid latest message position")?;
-        let (_, suffix) = candidate
-            .split_once(':')
-            .context("invalid new message position")?;
-        let millis = millis
-            .parse::<u64>()?
-            .checked_add(1)
-            .context("message position overflow")?;
-        return Ok(format!("{millis:020}:{suffix}"));
-    }
-    Ok(candidate)
+    super::unread_start::publish_message_position(
+        db,
+        thread_id,
+        block_id,
+        turn_id,
+        candidate,
+        published_at,
+    )
+    .await
 }
 
 pub async fn find_user_message_block_by_turn_id<C: ConnectionTrait>(
@@ -481,34 +467,267 @@ pub async fn count_unread_message_blocks<C: ConnectionTrait>(
     principal_id: &str,
     after_sort_key: &str,
 ) -> Result<u64> {
+    let id = thread_id.to_owned();
     let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            format!(
-                r#"
-                SELECT COUNT(*) AS unread_count
-                FROM thread_timeline_block AS block
-                INNER JOIN turn
-                    ON turn.id = block.turn_id
-                    AND turn.thread_id = block.thread_id
-                WHERE block.thread_id = ?
-                    AND block.sort_key > ?
-                    {UNREAD_MESSAGE_PREDICATE}
-            "#
-            ),
-            vec![
-                thread_id.to_owned().into(),
-                after_sort_key.to_owned().into(),
-                principal_id.to_owned().into(),
-            ],
+        .query_one_raw(unread_thread_batch_statement(
+            &[&id],
+            principal_id,
+            Some(after_sort_key),
         ))
         .await
-        .context("failed to count unread message timeline blocks")?
-        .context("unread count query returned no row")?;
-    let count = row
-        .try_get::<i64>("", "unread_count")
-        .context("failed to decode unread message count")?;
-    u64::try_from(count).context("unread message count is negative")
+        .context("failed to count unread message timeline blocks")?;
+    let Some(row) = row else {
+        return Ok(0);
+    };
+    u64::try_from(row.try_get::<i64>("", "unread_count")?)
+        .context("unread message count is negative")
+}
+
+// Bound bind parameters even for callers outside the workspace tree RPC. Dedup
+// before batching: the old IN query counted every input thread only once.
+const UNREAD_THREAD_BATCH_SIZE: usize = 128;
+
+fn unread_thread_batch_statement(
+    thread_ids: &[&String],
+    principal_id: &str,
+    after_override: Option<&str>,
+) -> Statement {
+    use sea_orm::sea_query::{
+        Alias, Asterisk, CommonTableExpression, Expr, ExprTrait, Func, JoinType, Query, SimpleExpr,
+        SqliteQueryBuilder, WithClause,
+    };
+
+    // Rollout/access are second-resolution facts. Exclude the boundary second
+    // deliberately, as agreed; retain exact, monotonic confirmed read positions.
+    let count = |after: Expr| {
+        let mut query = Query::select();
+        query
+            .expr(Expr::col(Asterisk).count())
+            .from_as("thread_timeline_block", "block")
+            .join(
+                JoinType::InnerJoin,
+                "turn",
+                Condition::all()
+                    .add(Expr::col(("turn", "id")).eq(Expr::col(("block", "turn_id"))))
+                    .add(Expr::col(("turn", "thread_id")).eq(Expr::col(("block", "thread_id")))),
+            )
+            .and_where(Expr::col(("block", "thread_id")).eq(Expr::col(("bounds", "thread_id"))))
+            .and_where(Expr::col(("block", "sort_key")).gt(after))
+            // Validate parents only for messages in the indexed range. An
+            // already-read owner directory must not touch each potentially
+            // large Thread row just to discover an empty range.
+            .and_where(Expr::exists(
+                Query::select()
+                    .expr(1)
+                    .from_as("thread", "readable_thread")
+                    .join_as(
+                        JoinType::InnerJoin,
+                        "workspace",
+                        "readable_workspace",
+                        Expr::col(("readable_workspace", "id"))
+                            .eq(Expr::col(("readable_thread", "workspace_id"))),
+                    )
+                    .and_where(
+                        Expr::col(("readable_thread", "id")).eq(Expr::col(("block", "thread_id"))),
+                    )
+                    .and_where(
+                        Expr::col(("readable_thread", "workspace_id"))
+                            .eq(Expr::col(("block", "workspace_id"))),
+                    )
+                    .and_where(Expr::col(("readable_thread", "sidebar_visibility")).eq("visible"))
+                    .to_owned(),
+            ))
+            .and_where(Expr::exists(
+                Query::select()
+                    .expr(1)
+                    .from_as("unread_message_position", "publication")
+                    .and_where(
+                        Expr::col(("publication", "thread_id"))
+                            .eq(Expr::col(("block", "thread_id"))),
+                    )
+                    .and_where(
+                        Expr::col(("publication", "block_id")).eq(Expr::col(("block", "block_id"))),
+                    )
+                    .and_where(
+                        Expr::col(("publication", "turn_id")).eq(Expr::col(("block", "turn_id"))),
+                    )
+                    .and_where(
+                        Expr::col(("publication", "published_at"))
+                            .gt(Expr::col(("bounds", "started_at"))),
+                    )
+                    .to_owned(),
+            ))
+            .and_where(Expr::cust_with_values(
+                UNREAD_MESSAGE_PREDICATE.trim_start_matches("AND "),
+                [principal_id],
+            ));
+        Expr::from(query)
+    };
+    let scalar = |name: &str, args: Vec<SimpleExpr>| -> SimpleExpr {
+        Func::cust(Alias::new(name)).args(args).into()
+    };
+    let timestamp = |alias: &'static str| -> SimpleExpr {
+        Expr::from(scalar(
+            "strftime",
+            vec![
+                Expr::val("%s").into(),
+                Expr::col((alias, "created_at")).into(),
+            ],
+        ))
+        .cast_as(Alias::new("INTEGER"))
+        .if_null(0)
+        .into()
+    };
+    let public_start: SimpleExpr = Expr::col(("thread", "workspace_unread_started_at")).into();
+    let public_or_private = Expr::case(
+        Expr::col(("tm", "principal_id")).is_null(),
+        public_start.clone(),
+    )
+    .finally(scalar("MIN", vec![public_start, timestamp("tm")]));
+    let thread_access = Expr::case(
+        Expr::col(("thread", "access_class")).eq("workspace"),
+        public_or_private,
+    )
+    .finally(timestamp("tm"));
+    let access = Expr::case(
+        Expr::col(("principal", "kind")).eq("superuser"),
+        Expr::val(0),
+    )
+    .finally(scalar("MAX", vec![timestamp("wm"), thread_access.into()]));
+    let position = |start: SimpleExpr| {
+        scalar(
+            "printf",
+            vec![
+                Expr::val("%020d:").into(),
+                Expr::from(start).add(1).mul(1000).into(),
+            ],
+        )
+    };
+    let base_start = scalar(
+        "MAX",
+        vec![
+            Expr::col(("gateway", "unread_started_at")).into(),
+            timestamp("identity"),
+        ],
+    );
+    // This single current principal row belongs to this SELECT's snapshot.
+    // Materialize only its common boundary, so strftime/printf are not repeated
+    // for every owner thread. This is neither a cache nor an initialization write.
+    let principal = Query::select()
+        .column(("identity", "kind"))
+        .expr_as(base_start.clone(), "started_at")
+        .expr_as(position(base_start), "position")
+        .from_as("gateway_principal", "identity")
+        .join_as(
+            JoinType::InnerJoin,
+            "gateway_identity",
+            "gateway",
+            Expr::col(("gateway", "id")).eq(Expr::col(("identity", "gateway_id"))),
+        )
+        .and_where(Expr::col(("identity", "id")).eq(principal_id))
+        .and_where(Expr::col(("identity", "status")).eq("active"))
+        .and_where(Expr::col(("identity", "removed_at")).is_null())
+        .to_owned();
+    let with = WithClause::new()
+        .cte(
+            CommonTableExpression::new()
+                .table_name("unread_principal")
+                .query(principal)
+                .materialized(true)
+                .to_owned(),
+        )
+        .to_owned();
+    let started_at = scalar(
+        "MAX",
+        vec![Expr::col(("principal", "started_at")).into(), access.into()],
+    );
+    let position: SimpleExpr = Expr::case(
+        Expr::col(("principal", "kind")).eq("superuser"),
+        Expr::col(("principal", "position")),
+    )
+    .finally(position(started_at.clone()))
+    .into();
+    let lower = scalar(
+        "MAX",
+        vec![
+            position,
+            Expr::col(("cursor", "last_read_sort_key"))
+                .if_null("")
+                .into(),
+            Expr::val(after_override.unwrap_or("")).into(),
+        ],
+    );
+    let mut bounds = Query::select();
+    bounds
+        .expr_as(Expr::col(("selected", "column1")), "thread_id")
+        .expr_as(lower, "lower")
+        .expr_as(started_at, "started_at")
+        .from_values(thread_ids.iter().map(|id| id.as_str()), "selected")
+        .join_as(
+            JoinType::InnerJoin,
+            "unread_principal",
+            "principal",
+            Expr::val(true),
+        )
+        // Owners need no membership-derived boundary. Keep the current ACL
+        // joins for users, without reading every Thread row for owners.
+        .left_join(
+            "thread",
+            Expr::col(("thread", "id")).eq(Expr::case(
+                Expr::col(("principal", "kind")).eq("user"),
+                Expr::col(("selected", "column1")),
+            )
+            .finally(Expr::val(None::<String>))),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            "thread_read_cursor",
+            "cursor",
+            Condition::all()
+                .add(Expr::col(("cursor", "thread_id")).eq(Expr::col(("selected", "column1"))))
+                .add(Expr::col(("cursor", "principal_id")).eq(principal_id)),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            "workspace_membership",
+            "wm",
+            Condition::all()
+                .add(Expr::col(("wm", "workspace_id")).eq(Expr::col(("thread", "workspace_id"))))
+                .add(Expr::col(("wm", "principal_id")).eq(principal_id)),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            "thread_membership",
+            "tm",
+            Condition::all()
+                .add(Expr::col(("tm", "thread_id")).eq(Expr::col(("thread", "id"))))
+                .add(Expr::col(("tm", "principal_id")).eq(principal_id)),
+        )
+        .cond_where(
+            Condition::any()
+                .add(Expr::col(("principal", "kind")).eq("superuser"))
+                .add(
+                    Condition::all()
+                        .add(Expr::col(("principal", "kind")).eq("user"))
+                        .add(Expr::col(("wm", "principal_id")).is_not_null())
+                        .add(
+                            Condition::any()
+                                .add(Expr::col(("thread", "access_class")).eq("workspace"))
+                                .add(
+                                    Condition::all()
+                                        .add(Expr::col(("thread", "access_class")).eq("private"))
+                                        .add(Expr::col(("tm", "principal_id")).is_not_null()),
+                                ),
+                        ),
+                ),
+        );
+    let (sql, values) = Query::select()
+        .column(("bounds", "thread_id"))
+        .expr_as(count(Expr::col(("bounds", "lower"))), "unread_count")
+        .from_subquery(bounds.to_owned(), "bounds")
+        .with_cte(with)
+        .build(SqliteQueryBuilder);
+    Statement::from_sql_and_values(DatabaseBackend::Sqlite, sql, values)
 }
 
 pub async fn count_unread_message_blocks_for_threads<C: ConnectionTrait>(
@@ -516,55 +735,30 @@ pub async fn count_unread_message_blocks_for_threads<C: ConnectionTrait>(
     thread_ids: &[String],
     principal_id: &str,
 ) -> Result<HashMap<String, u64>> {
-    if thread_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let placeholders = std::iter::repeat("?")
-        .take(thread_ids.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        r#"
-            SELECT block.thread_id, COUNT(*) AS unread_count
-            FROM thread_timeline_block AS block
-            INNER JOIN turn
-                ON turn.id = block.turn_id
-                AND turn.thread_id = block.thread_id
-            LEFT JOIN thread_read_cursor AS cursor
-                ON cursor.thread_id = block.thread_id
-                AND cursor.principal_id = ?
-            WHERE block.thread_id IN ({placeholders})
-                AND block.sort_key > COALESCE(cursor.last_read_sort_key, '')
-                {UNREAD_MESSAGE_PREDICATE}
-            GROUP BY block.thread_id
-        "#
-    );
-    let mut values = Vec::with_capacity(thread_ids.len() + 2);
-    values.push(principal_id.to_owned().into());
-    values.extend(thread_ids.iter().cloned().map(Into::into));
-    values.push(principal_id.to_owned().into());
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            sql,
-            values,
-        ))
-        .await
-        .context("failed to count unread message blocks for thread batch")?;
-    rows.into_iter()
-        .map(|row| {
-            let thread_id = row
-                .try_get::<String>("", "thread_id")
-                .context("failed to decode unread thread id")?;
+    let selected = thread_ids.iter().collect::<std::collections::BTreeSet<_>>();
+    let selected = selected.into_iter().collect::<Vec<_>>();
+    let mut counts = HashMap::new();
+    for batch in selected.chunks(UNREAD_THREAD_BATCH_SIZE) {
+        let statement = unread_thread_batch_statement(batch, principal_id, None);
+        let rows = db
+            .query_all_raw(statement)
+            .await
+            .context("failed to count unread message blocks for thread batch")?;
+        for row in rows {
             let count = row
                 .try_get::<i64>("", "unread_count")
                 .context("failed to decode unread thread count")?;
-            Ok((
-                thread_id,
-                u64::try_from(count).context("unread thread count is negative")?,
-            ))
-        })
-        .collect()
+            let count = u64::try_from(count).context("unread thread count is negative")?;
+            // Preserve the sparse-map contract of the former GROUP BY query.
+            if count > 0 {
+                let id = row
+                    .try_get::<String>("", "thread_id")
+                    .context("failed to decode unread thread id")?;
+                counts.insert(id, count);
+            }
+        }
+    }
+    Ok(counts)
 }
 
 fn thread_timeline_approval_visibility(approval_scope: &ThreadTimelineApprovalScope) -> Condition {

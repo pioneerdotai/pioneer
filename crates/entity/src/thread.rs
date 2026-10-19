@@ -33,6 +33,7 @@ pub struct Model {
     pub created_by_actor_kind: Option<String>,
     pub inbox_workspace_after_sequence: Option<i64>,
     pub inbox_workspace_started_at: Option<DateTimeWithTimeZone>,
+    pub workspace_unread_started_at: i64,
     #[sea_orm(has_many)]
     pub compaction_contexts: HasMany<super::compaction_context::Entity>,
     #[sea_orm(has_many)]

@@ -730,7 +730,8 @@ impl MessageProcessor {
             folders,
             placements,
             agents_docs,
-        };
+        }
+        .into_directory_summary();
 
         let response_encode_stage =
             trace.stage(pioneer_observability::GatewayOperationStage::ThreadTreeResponseEncode);

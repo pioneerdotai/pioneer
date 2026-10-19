@@ -371,7 +371,7 @@ impl MessageProcessor {
         *self
             .mcp_service
             .inner
-            .html_processor
+            .native_tool_processor
             .write()
             .expect("HTML processor lock") = Arc::downgrade(self);
         self.agent_manager

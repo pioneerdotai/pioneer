@@ -619,3 +619,80 @@ same omissions. No production constraint, migration, timestamp normalization or
 assertion was relaxed. Only fixture data and explanatory comments changed.
 Local `cargo check`, builds, migrations and tests were not run; source review,
 formatting and diff checks are the local validation for this follow-up.
+
+## Merge of main after sidebar PR #142
+
+The merge uses PR #143 head `2c265b600da21e75f49c5a23f9156f0dc08e587a`
+and main `f6aa881dbbb3197db47cabb0a71b6988fdc10a1d`, including sidebar
+PR #142 (`afc7b381188607bd351a10bf4c7de62760eaf32c`). It also retains
+main's CLI task orchestration changes. Work was confined to the publication
+worktrees; this section describes the merge, not a new performance acceptance.
+
+Seven conflicting paths were reconciled:
+
+- The migration registry retains every accepted inbox name and its registration
+  order, adding main's thread-unread migration at the tail. The consolidated
+  inbox source and the sidebar migration are unchanged from their own parents.
+  No new migration, reordered released identity, or repeated backfill was added.
+- Thread Entity is generated from the complete merged migration chain. It has
+  both inbox access fields and sidebar `workspace_unread_started_at`.
+- The startup historical Thread insert leaves all three later fields `NotSet`.
+- The two occurrence-projector fixtures retain both branches' metadata helpers;
+  neither helper changes the historical migration ledger or rollback target.
+- Native cancellation's historical Thread query excludes all three later
+  columns, using decoding-only placeholders. Historical insertion avoids a
+  current-schema RETURNING read. Existing data-preservation assertions remain.
+- Compaction seeds and reads historical summary columns directly and retains
+  main's affected-row assertion. Current CRUD is used after the full upgrade.
+- Fanout cutover retains the complete current bootstrap schema and PR #143's
+  rollback-only registry. Its assertions still require only fanout to be pending
+  before upgrade and no pending migrations afterward; main's cutover, bounded
+  reads, routing and no-history assertions remain intact.
+
+Shared production paths were reviewed against both parents. Membership inserts
+retain their immutable creation dates and inbox sequence capture; duplicate
+grants still preserve existing rows. Private-to-workspace transitions retain
+both independently persisted access boundaries. Sidebar publication positions
+and thread read cursors remain separate from inbox eligibility and receipts.
+Authenticated Stop attribution, native/CLI reconciliation and atomic terminal
+receipt commits remain alongside main's CLI task continuation and action receipts.
+
+Preservation checks compare 94 paths changed by only one parent byte for byte
+with that parent. Additional comparisons protect the main sidebar controller,
+directory, coordinator registry, navigation, unread repository, timeline
+projection, thread summary, authorization and migration paths, and PR #143's
+inbox repository, worker, viewport, Gateway handler, consolidated migration and
+popup files. All 116 comparisons passed. The existing review is preserved with
+this section appended. The 24 paths changed by both parents
+were reviewed as diffs against both sides, including fixtures, generated modules,
+authorization, membership, cancellation and migration registration.
+
+In particular, no inbox query or index was rewritten: workspace-first bulk
+queries, bounded run-first seeks, structural `Expr::Constant("%s")`, negative
+batch probes, unloaded-page read-all, empty-viewed refresh suppression and
+source-connection hint exclusion remain byte-identical to the accepted PR.
+Main's compact sidebar summaries, bounded unread reads, directory baseline merge
+and existing-coordinator updates are likewise byte-identical. No cache, polling,
+scheduling change or additional hot-path query was introduced by conflict repair.
+
+Validation for this merge:
+
+- `rustfmt` on resolved Rust paths; staged and unstaged `git diff --check`.
+- Full stock migration CLI `up` on a newly created disposable SQLite database,
+  built offline with `-j 1`; stock `sea-orm-cli generate entity --entity-format
+  dense --with-serde both -l`. Only the conflicting generated Thread was copied
+  back; unrelated generator differences were excluded.
+- Static entity-literal review for combined fields and review of all merge
+  conflicts and shared production hunks. Parent comparisons are repeated before
+  commit and before publication.
+- Mobile main's sole divergent source-contract change is merged and regenerated
+  with the stock integrity script using explicit `PIONEER_RUST_ROOT` pointing to
+  this publication worktree; `check-source` passes. DTOs, generated types,
+  schemas, mobile code and lockfiles are unchanged by this merge.
+
+Private generation logs, generated entities and preservation manifests are in
+`/tmp/pioneer-inbox-merge-20261019.XNbLd6`. No user database or production backup
+was opened. Local `cargo check` and functional tests were not run, as instructed.
+There are no new CPU/RSS measurements: code equality supports preservation of
+the accepted optimization paths, not a claim of measured runtime equivalence.
+Compilation and execution of the combined code remain for GitHub CI.

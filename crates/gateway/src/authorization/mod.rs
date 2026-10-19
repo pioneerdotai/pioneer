@@ -54,7 +54,8 @@ pub(crate) use agent_route_service::{
 };
 pub(crate) use agent_runtime_adapter::{
     AgentExecutionPersistenceFacts, AgentToolAdapterError, BoundAgentActionAdapter,
-    derive_task_agent_authorization_grant_seed, materialize_child_agent_action_binding,
+    action_id_for_call, derive_task_agent_authorization_grant_seed,
+    materialize_child_agent_action_binding,
     materialize_persisted_selected_task_agent_action_binding,
     materialize_persisted_task_agent_action_binding,
     materialize_selected_task_agent_action_binding,

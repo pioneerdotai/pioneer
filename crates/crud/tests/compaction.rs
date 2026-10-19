@@ -7195,7 +7195,7 @@ async fn compaction_migration_resumes_partial_ddl_and_preserves_legacy_data_on_r
         .value(legacy_thread::Column::SummaryTurnCount, Expr::val(42_i64))
         .and_where(Expr::col(legacy_thread::Column::Id).eq("thread"))
         .to_owned();
-    db.execute(&summary).await.unwrap();
+    assert_eq!(db.execute(&summary).await.unwrap().rows_affected(), 1);
     let summary_query = Query::select()
         .columns([
             legacy_thread::Column::Summary,
