@@ -59,6 +59,10 @@ pub use super::compaction_frozen_import_data::Entity as CompactionFrozenImportDa
 pub use super::compaction_frozen_layout::Entity as CompactionFrozenLayout;
 pub use super::compaction_frozen_message_data::Entity as CompactionFrozenMessageData;
 pub use super::compaction_frozen_span::Entity as CompactionFrozenSpan;
+pub use super::compaction_frozen_sweep_bootstrap::Entity as CompactionFrozenSweepBootstrap;
+pub use super::compaction_frozen_sweep_consumer::Entity as CompactionFrozenSweepConsumer;
+pub use super::compaction_frozen_sweep_fanout::Entity as CompactionFrozenSweepFanout;
+pub use super::compaction_frozen_sweep_work::Entity as CompactionFrozenSweepWork;
 pub use super::compaction_history_check::Entity as CompactionHistoryCheck;
 pub use super::compaction_history_preparation::Entity as CompactionHistoryPreparation;
 pub use super::compaction_input_revision::Entity as CompactionInputRevision;
