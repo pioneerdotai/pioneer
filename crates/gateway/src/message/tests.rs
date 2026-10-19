@@ -43390,6 +43390,9 @@ async fn message_attachment_requires_exact_version_and_current_thread_scope() {
 // whether setup and publication happen in the same excluded boundary second.
 async fn prepare_post_access_unread_fixture(store: &CrudStore, workspace_id: &str) {
     let earlier = chrono::Utc::now().fixed_offset() - chrono::Duration::seconds(60);
+    // These fixtures seed updated_at with SQLite CURRENT_TIMESTAMP. Keep the
+    // same UTC text format: membership's timestamp CHECK compares stored text.
+    let earlier_sql = earlier.format("%Y-%m-%d %H:%M:%S").to_string();
     let db = store.database_connection();
     let tx = db.begin().await.unwrap();
     pioneer_entity::gateway_identity::Entity::update_many()
@@ -43409,7 +43412,7 @@ async fn prepare_post_access_unread_fixture(store: &CrudStore, workspace_id: &st
     pioneer_entity::gateway_principal::Entity::update_many()
         .col_expr(
             pioneer_entity::gateway_principal::Column::CreatedAt,
-            Expr::val(earlier),
+            Expr::val(earlier_sql.clone()),
         )
         .filter(pioneer_entity::gateway_principal::Column::Id.is_in(ids.clone()))
         .exec(&tx)
@@ -43418,7 +43421,7 @@ async fn prepare_post_access_unread_fixture(store: &CrudStore, workspace_id: &st
     pioneer_entity::workspace_membership::Entity::update_many()
         .col_expr(
             pioneer_entity::workspace_membership::Column::CreatedAt,
-            Expr::val(earlier),
+            Expr::val(earlier_sql),
         )
         .filter(pioneer_entity::workspace_membership::Column::WorkspaceId.eq(workspace_id))
         .filter(pioneer_entity::workspace_membership::Column::PrincipalId.is_in(ids))
