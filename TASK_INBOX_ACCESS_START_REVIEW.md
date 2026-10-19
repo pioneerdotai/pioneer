@@ -738,3 +738,45 @@ selected. The source contract is unchanged. Local `cargo check`, compilation and
 functional tests were not run, per the user's instruction. Runtime confirmation
 that the read cancellation also resolves each CI stall remains for the next run;
 these changes are not reported as a passing test result or performance measurement.
+
+## Stop intent mutex deadlock: follow-up to run 39264248928
+
+The captured workspace log for `68060f8e` contains three actual `FAILED` results:
+`cancelling_cli_history_transfer_stops_before_provider_start_and_releases_session`,
+`cancelling_cli_transfer_while_waiting_for_coordinator_releases_session`, and
+`cancelling_selected_turn_restore_releases_cli_session`. All time out inside the
+Stop RPC. The method-registry regression and the new pending-reader cancellation
+regression pass in that CI log. The reader fix therefore did not resolve the
+remaining RPC deadlock. The run was manually cancelled to retrieve its logs;
+the log ends at 15:06:30 UTC, before the pending-heartbeat test and the remaining
+Gateway tests. No results are inferred for that unexecuted remainder.
+
+The concrete lock cycle is in `mark_turn_blocked_with_task_start_failure`:
+the `if let` scrutinee acquires `user_turn_cancel_intents` and clones an intent,
+but its temporary `MutexGuard` lives through the successful branch. That branch
+awaits `mark_turn_interrupted_with_recovery_disposition`. The terminal path
+reaches `materialize_native_agent_turn_event_with_cli_blocked_guard`, which
+acquires the same mutex to obtain the authenticated actor before committing the
+Interrupted event. Cleanup waits for itself; the cancel handler also needs the
+same map or waits for the preparation's CLI transition gate.
+
+The fix clones the existing intent in an explicit block, then branches on the
+owned value after the guard is dropped. Every other production access to this
+map was checked: cloned values or booleans end their guard at a statement or
+expression block; the reference-count release helper performs no subsequent
+await while locked. No attribution, reference count, transition guard, database
+transaction, task/run scope, receipt or notification ordering was changed.
+The fix adds no query, cache, timer, task or allocation beyond the existing clone.
+
+The three existing bounded RPC scenarios and the pending-heartbeat scenario
+remain the regressions for the lock cycle. The selected-restore scenario now
+also requires the exact run to be Cancelled rather than any terminal status,
+and checks its persisted initiator and that principal's receipt before releasing
+the paused restore. Its later session-reuse assertions are retained.
+
+Validation: source audit of all intent-map uses, full change review, rustfmt,
+diff checks in both repositories and stock `check-source` against the explicit
+Rust publication worktree. The contract remains unchanged. Local `cargo check`,
+compilation and functional tests were not run. The next automatically triggered
+CI run must confirm the fix; no run is cancelled or manually restarted by this
+follow-up.

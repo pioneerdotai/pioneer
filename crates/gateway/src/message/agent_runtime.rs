@@ -8961,13 +8961,14 @@ impl MessageProcessor {
         transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
         start_failure: Option<&pioneer_tasks::TaskStartFailureDescriptor>,
     ) -> bool {
-        if let Some(user_cancellation_reason) = self
-            .user_turn_cancel_intents
-            .lock()
-            .await
-            .get(&(thread_id.clone(), turn_id.clone()))
-            .cloned()
-        {
+        // An if-let scrutinee keeps its temporary MutexGuard throughout the
+        // branch. The Interrupted commit reads this same map to persist the
+        // authenticated actor, so release the guard before any terminal work.
+        let user_cancellation_reason = {
+            let intents = self.user_turn_cancel_intents.lock().await;
+            intents.get(&(thread_id.clone(), turn_id.clone())).cloned()
+        };
+        if let Some(user_cancellation_reason) = user_cancellation_reason {
             // Cancellation wins over Blocked, but still cannot bypass a CLI
             // transition already performing terminal effects or admission.
             let _acquired = if transition.is_none() {

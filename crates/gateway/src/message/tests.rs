@@ -27820,6 +27820,29 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
             })
             .await
             .expect("cancelled Task run must reach a terminal state");
+            assert_eq!(
+                store.get_task_run(&run.id).await.unwrap().unwrap().status,
+                TaskRunStatus::Cancelled,
+                "Stop during restore must not become a preparation failure"
+            );
+            let actor = authenticated_test_superuser().principal_id.to_string();
+            let db = store.database_connection();
+            assert!(
+                pioneer_entity::task_run_read::Entity::find_by_id((actor.clone(), run.id.clone()))
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the exact cancelled run must retain the initiating user's receipt"
+            );
+            let attribution =
+                pioneer_entity::task_run_cancellation_actor::Entity::find_by_id(run.id.clone())
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(attribution.principal_id, actor);
+            assert_eq!(attribution.origin_turn_id, child.child_turn_id);
             pause.release();
             drop(selected_pause);
             let retry_launch = "accepted-large-task-after-restore-cancel";
