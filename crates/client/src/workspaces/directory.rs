@@ -1600,14 +1600,15 @@ mod tests {
         let partial = core.workspace_tree("a").unwrap();
         assert_eq!(partial.load().unwrap().state, ThreadTreeLoadState::Pending);
         assert!(partial.snapshot().running_task_thread_ids.contains("other"));
+        // Unread summaries are sparse: a missing row also represents zero.
         assert_eq!(
             partial
                 .snapshot()
                 .unread
                 .iter()
                 .find(|u| u.thread_id == "read")
-                .unwrap()
-                .unread_count,
+                .map(|u| u.unread_count)
+                .unwrap_or(0),
             0
         );
         assert_eq!(
