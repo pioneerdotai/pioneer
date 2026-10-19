@@ -531,7 +531,7 @@ reviewed for reads through current Entities or CRUD before the relevant upgrade.
 | Compaction partial-DDL and independent-summary upgrades | Raw historical seeds; full chain before current runtime reads | Legacy summary access repaired in `b2d7c4b1`; other paths upgrade before runtime access |
 | Compaction preparation, item schema and compression | Historical raw seeds and compression, then complete production chain | No additional affected reads before upgrade identified |
 | Compaction lifecycle rollback | Historical context/operation/runner metadata, explicit projection queries | No full current thread/run/principal access at the old boundary identified |
-| Frozen storage/lifetime and durable sweep upgrades | Historical Task/locator/header seeds; current runtime after upgrade | No additional affected Entity reads before upgrade identified |
+| Frozen storage/lifetime and durable sweep upgrades | Historical Task/locator/header seeds | Later CI exposed an indirect current TaskRun read inside the snapshot helper; corrected in the follow-up below |
 | Inbox upgrade compatibility | Raw historical Task/Run/ACL seeds, new DTO queries after full chain | Existing stage/activation/receipt checks remain applicable |
 | Gateway Epic 2 and refresh credential upgrades | Historical identity/session SQL, snapshot DTOs; current auth after full chain | No new principal-column reads before upgrade identified |
 | Gateway fanout cutover | Cancellation-era prefix followed by current Gateway bootstrap, task context and receiver authorization | Additional incompatible fixture found and repaired in this follow-up |
@@ -564,3 +564,36 @@ identified Gateway failure is inferred from source, not observed in a local run.
 The audit reduces this known risk; compilation and runtime correctness of the
 new fixture still require GitHub CI, including any suites blocked by an earlier
 failure.
+
+
+## CI frozen-storage historical snapshot follow-up
+
+Run `39206770994` on `6b016c02` passed all 702 CRUD library tests and all 76
+compaction tests. It then failed
+`released_schema_upgrade_matches_fresh_triggers_and_releases_existing_inputs`
+with `no such column: task_run.inbox_sequence`. The earlier static audit missed
+an indirect dependency: `task_input` inserts the run with SQL, then calls current
+`insert_task_run_conversation_snapshot_if_absent`. That repository validates the
+run through the complete current TaskRun Entity before inserting the snapshot.
+The earlier frozen-storage audit row above has been corrected accordingly.
+
+This upgrade fixture now seeds the run and accepted snapshot with typed SeaQuery
+inserts using only historical columns. It preserves the exact Task/run/workspace/
+thread link, frozen manifest locator and descriptor used by the prior helper.
+An assertion requires `inbox_sequence` to be absent before seeding, so the test
+continues to exercise the true historical schema. After the complete normal
+migration chain, the existing expiry/physical cleanup/retained-descriptor checks
+remain. Additional current-CRUD reads verify the retained snapshot's identity and
+manifest after cleanup.
+
+All other callers of the shared `task_input` helper were traced to the complete
+`fixture()` schema. The direct snapshot calls in the retry-conflict scenario
+also use that complete schema. The other historical `db_fixture(true)` paths
+seed SQL and complete migrations before current CRUD. The Gateway HTML-retention
+snapshot helper uses the ordinary fully migrated compaction fixture. No runtime
+validation, root verification, released migration or generated Entity was
+weakened or modified.
+
+Local `cargo check`, builds, migrations and tests were not run. Validation here
+is source review, formatting and diff checks. Compilation and execution of this
+fix remain for GitHub CI.
