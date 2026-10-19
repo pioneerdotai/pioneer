@@ -5943,9 +5943,12 @@ impl MessageProcessor {
             let root_agent_admission = match &execution_authority {
                 TurnExecutionAuthority::Fresh(admission)
                     if outcome.materialization.turn.mode
-                        != pioneer_protocol::ThreadMode::Message
-                        && outcome.materialization.thread.id == admission.root_thread_id() =>
+                        != pioneer_protocol::ThreadMode::Message =>
                 {
+                    // A user-started CLI turn in an internal child thread also
+                    // owns a fresh responding execution within the existing
+                    // capsule. Admit its selected backend/identity now, before
+                    // tool materialization can synthesize a default binding.
                     Some(admission)
                 }
                 _ => None,

@@ -224,6 +224,169 @@ fn cli_task_runtime_snapshots_preserve_user_cancellation_for_all_providers() {
 }
 
 #[test]
+fn cli_foreground_child_turn_admits_the_selected_runtime_before_tool_projection() {
+    run_standard_stack_message_test("CLI foreground child identity", async {
+        for kind in [
+            CLIAgentRuntimeKind::Codex,
+            CLIAgentRuntimeKind::Claude,
+            CLIAgentRuntimeKind::OpenCode,
+        ] {
+            let (mut harness, processor, parent_turn_id) = start_task_cli_fixture(kind).await;
+            harness
+                .cli_session
+                .set_next_native_turn_id(format!("identity_child_{kind:?}"))
+                .await;
+            let created = invoke_task(
+                &processor,
+                &parent_turn_id,
+                "identity-child",
+                "task_create",
+                json!({
+                    "title":"Inspect the child scope", "goal":"Inspect the available context",
+                    "outputInstructions":"Return findings."
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(!created.is_error, "{kind:?}: {created:?}");
+            let result = created.structured_content.as_ref().unwrap();
+            let child =
+                wait_for_task_cli_child(&processor, result["runId"].as_str().unwrap(), None).await;
+            let task_response = pioneer_crud::load_agent_turn_response(
+                &processor.crud_store.database_connection(),
+                &child.turn_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let cancelled = invoke_task(
+                &processor,
+                &parent_turn_id,
+                "cancel-identity-child",
+                "task_cancel",
+                json!({"taskId":result["taskId"]}),
+            )
+            .await
+            .unwrap();
+            assert!(!cancelled.is_error, "{kind:?}: {cancelled:?}");
+            assert_eq!(
+                wait_for_turn_status(
+                    processor.crud_store.clone(),
+                    &child.thread_id,
+                    &child.turn_id,
+                    TurnStatus::Interrupted
+                )
+                .await,
+                TurnStatus::Interrupted
+            );
+
+            // This is a new user-authored turn in the existing internal
+            // thread, not a continuation of the Task's AgentExecution.
+            open_persisted_child_for_test(
+                &processor,
+                harness.connection_id,
+                &mut harness.rx,
+                &harness.workspace_id,
+                &child.thread_id,
+                &format!("identity-open-{kind:?}"),
+            )
+            .await;
+            let turn_id = format!("foreground_child_identity_{kind:?}");
+            harness
+                .cli_session
+                .set_next_native_turn_id(format!("foreground_identity_{kind:?}"))
+                .await;
+            let request_id = generate_test_request_id("identity", &format!("{kind:?}"));
+            processor
+                .process_request_for_connection(
+                    harness.connection_id,
+                    &cli_runtime_turn_start_request_with_capabilities(
+                        &request_id,
+                        &child.thread_id,
+                        &turn_id,
+                        &harness.runtime_id,
+                        kind,
+                        Vec::new(),
+                    ),
+                )
+                .await;
+            let response = recv_response_by_id(&mut harness.rx, &request_id).await;
+            let accepted: TurnStartResponse = serde_json::from_value(response.result).unwrap();
+            assert_eq!(accepted.turn.id, turn_id);
+            wait_for_task_cli_activation(&processor, &turn_id).await;
+
+            let database = processor.crud_store.database_connection();
+            let response = pioneer_crud::load_agent_turn_response(&database, &turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let execution = pioneer_crud::load_agent_execution(&database, &response.execution_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let identity = pioneer_crud::load_active_agent_identity_by_source(
+                &database,
+                &harness.workspace_id,
+                pioneer_crud::SOURCE_CLI_RUNTIME_INSTANCE,
+                &harness.runtime_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(execution.agent_identity_id, identity.id);
+            assert_ne!(response.execution_id, task_response.execution_id);
+            assert_eq!(
+                response.execution_id,
+                crate::message::agent_action_tools::root_agent_execution_id_for_turn(&turn_id)
+            );
+            assert!(execution.parent_execution_id.is_none() && execution.parent_task_id.is_none());
+            assert_eq!(
+                execution.home_root_thread_id,
+                processor
+                    .crud_store
+                    .get_cli_runtime_turn_binding(&parent_turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .thread_id
+            );
+            let presentation = pioneer_crud::load_current_agent_presentation_snapshot(
+                &database,
+                &identity.id,
+                identity.source_revision,
+                &identity.source_fingerprint,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let author = processor
+                .timeline_agent_author_for_turn(&child.thread_id, &turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(author.nickname, presentation.nickname);
+            assert_eq!(author.cli_runtime_kind, Some(kind));
+            let snapshot = author.agent.unwrap();
+            assert_eq!(snapshot.agent_identity_id.as_str(), identity.id);
+            assert_eq!(snapshot.agent_execution_id.as_str(), execution.id);
+            assert_eq!(
+                snapshot.identity_source_kind,
+                pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance
+            );
+
+            let cancel_id = generate_test_request_id("identity-stop", &format!("{kind:?}"));
+            processor.process_request_for_connection(harness.connection_id, &json!({
+                "jsonrpc":"2.0", "id":cancel_id, "method":"turn/cancel",
+                "params":{"thread_id":child.thread_id,"turn_id":turn_id,"reason":"fixture complete"}
+            }).to_string()).await;
+            let response = recv_response_by_id(&mut harness.rx, &cancel_id).await;
+            let cancelled: TurnCancelResponse = serde_json::from_value(response.result).unwrap();
+            assert_eq!(cancelled.turn.status, TurnStatus::Interrupted);
+        }
+    });
+}
+
+#[test]
 fn cli_automatic_orchestration_skills_coexist_with_selected_user_names() {
     run_standard_stack_message_test("CLI orchestration skill name isolation", async {
         for kind in [

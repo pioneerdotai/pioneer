@@ -28917,6 +28917,7 @@ async fn attached_cli_task_starts_while_its_parent_provider_turn_is_active_impl(
         .set_connection_workspace(connection, Some(workspace.clone()))
         .await;
     let cli = Arc::new(RecordingCliRuntimeSession::default());
+    cli.enable_projected_mcp_metadata(store.clone()).await;
     let manager = test_cli_runtime_manager(cli.clone());
     let processor = Arc::new(with_enabled_test_cli_runtime_catalog(
         MessageProcessor::new(
@@ -28981,6 +28982,15 @@ async fn attached_cli_task_starts_while_its_parent_provider_turn_is_active_impl(
     assert_eq!(accepted.turn.id, parent_turn);
     let starts = wait_for_cli_runtime_turn_starts(&cli, 1).await;
     let parent_session = starts[0].native_thread_id.clone();
+    let parent_binding = store
+        .get_cli_runtime_turn_binding(parent_turn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        parent_binding.mcp.is_some(),
+        "task continuation requires the activated MCP contract"
+    );
     let mut task = detached_cli_task_create_params(
         &workspace,
         parent,
@@ -29156,6 +29166,16 @@ async fn attached_cli_task_starts_while_its_parent_provider_turn_is_active_impl(
     }
     // The child has finished, but its result has not yet been delivered to
     // the parent model. Its first completion must continue the same Turn.
+    match processor
+        .restore_cli_runtime_launch_spec(&parent_binding)
+        .await
+    {
+        super::turn_handlers::CliRuntimeLaunchSpecRestore::Ready(_) => {}
+        super::turn_handlers::CliRuntimeLaunchSpecRestore::Unavailable { diagnostic }
+        | super::turn_handlers::CliRuntimeLaunchSpecRestore::InvalidBinding { diagnostic } => {
+            panic!("attached parent must retain its exact restorable launch: {diagnostic}")
+        }
+    }
     cli.set_next_native_turn_id("attached-parent-observed-provider-turn")
         .await;
     let parent_key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", parent).unwrap();
@@ -30442,7 +30462,10 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                         .await,
                     "restart fixture must begin with an empty in-memory manager"
                 );
-                processor = Arc::new(with_enabled_test_cli_runtime_catalog(
+                // A Gateway restart keeps the runtime configuration, managed
+                // skill receipts and identity source fingerprints intact.
+                let runtime_home = processor.artifact_runtime_home.clone();
+                processor = Arc::new(
                     MessageProcessor::new(
                         cold_thread_manager.clone(),
                         provider_registry.clone(),
@@ -30456,8 +30479,9 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                     .with_cli_runtime_manager_for_tests(cli_manager.clone())
                     .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(
                         runtime_kind,
-                    )),
-                ));
+                    ))
+                    .with_runtime_home_for_tests(runtime_home),
+                );
                 processor
                     .mark_cli_runtimes_ready_for_tests(workspace_id.as_str())
                     .await
