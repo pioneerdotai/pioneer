@@ -510,3 +510,57 @@ and the historical schema boundary are unchanged.
 Local `cargo check` and tests were not run, as requested. Validation for this
 follow-up consists of source review, formatting and diff checks; the next GitHub
 CI run will compile and execute it.
+
+
+## Proactive audit of historical schema fixtures
+
+This audit follows the seven new fields across the six changed entities:
+`thread` (two fields), `task_run`, `gateway_principal`, `workspace_membership`,
+`thread_membership` and `task_inbox_activation`. It is a source audit, not an
+execution of fixtures. A repository-wide search found 335 migration-call/registry
+references in 104 Rust files; most install the complete production registry.
+Historical prefixes, selective registries, rollback helpers and direct DDL were
+reviewed for reads through current Entities or CRUD before the relevant upgrade.
+
+| Fixture family | Schema/use reviewed | Result |
+| --- | --- | --- |
+| CRUD cancellation upgrade snapshots | Production prefix before/through native cancellation; historical thread and stream projections | Retains historical fields and schema; prior repair applies |
+| CRUD cancellation and run-occurrence rollback guards | Current projector on a reversible old prefix | Explicit test-only runtime fields/counter added in prior repair; pure upgrade fixture is excluded |
+| CRUD native delivery, terminal effects, atomic terminalization, execution window and initial schema | Named prefix registries; actual up/down and historical table projections | No additional current inbox Entity reads identified; these library suites passed CI run `39199100814` |
+| CRUD action outbox, task occurrence and task event fanout cutovers | Prefixes seed outbox/Task/cursor data and use narrow repository projections | No additional affected thread/principal/full-run reads identified; library suites passed the same CI run |
+| Compaction partial-DDL and independent-summary upgrades | Raw historical seeds; full chain before current runtime reads | Legacy summary access repaired in `b2d7c4b1`; other paths upgrade before runtime access |
+| Compaction preparation, item schema and compression | Historical raw seeds and compression, then complete production chain | No additional affected reads before upgrade identified |
+| Compaction lifecycle rollback | Historical context/operation/runner metadata, explicit projection queries | No full current thread/run/principal access at the old boundary identified |
+| Frozen storage/lifetime and durable sweep upgrades | Historical Task/locator/header seeds; current runtime after upgrade | No additional affected Entity reads before upgrade identified |
+| Inbox upgrade compatibility | Raw historical Task/Run/ACL seeds, new DTO queries after full chain | Existing stage/activation/receipt checks remain applicable |
+| Gateway Epic 2 and refresh credential upgrades | Historical identity/session SQL, snapshot DTOs; current auth after full chain | No new principal-column reads before upgrade identified |
+| Gateway fanout cutover | Cancellation-era prefix followed by current Gateway bootstrap, task context and receiver authorization | Additional incompatible fixture found and repaired in this follow-up |
+| Task service and tools patch-history fixtures | Complete `Migrator::up(..., None)` before current CRUD | No historical-schema adaptation required |
+| Shared client/FFI/mobile boundary | DTO/store fixtures, no Gateway SQLite entity-schema initialization | No affected database fixture to migrate |
+
+The additional Gateway issue was in
+`cutover_quantum_never_reads_history_and_only_delivers_post_install_events`.
+Its old prefix omitted the inbox columns even though the test used current Task
+context and authorization paths, including full principal Entity reads. The
+fixture now starts with the complete production migration chain and current
+Gateway setup. A rollback-only test registry places the real fanout migration
+last so `down(1)` removes only fanout. An assertion using the actual production
+registry requires that fanout be the sole pending version. Reinstallation uses
+`Migrator::up`, then asserts that no version remains pending. The existing checks
+for no historical reads/delivery, post-install sequence bounds, maintenance
+routing and read-only readers remain unchanged.
+
+The generic partial-schema Gateway setup helper was removed: its remaining
+ordinary helper always applies the full production chain before current
+bootstrap/authorization. This prevents another call site from choosing an old
+prefix while silently using today's Gateway setup. Production migration names,
+registration order, DDL, ACL and runtime code are unchanged; no fixture shim or
+new notification framework was introduced for Gateway.
+
+Validation: full follow-up diff review, formatting, `git diff --check` and the
+mobile source-contract check with the publication Rust worktree. No local
+`cargo check`, builds, migrations or functional tests were executed. The
+identified Gateway failure is inferred from source, not observed in a local run.
+The audit reduces this known risk; compilation and runtime correctness of the
+new fixture still require GitHub CI, including any suites blocked by an earlier
+failure.

@@ -72028,14 +72028,10 @@ async fn setup_pooled_file_workspace_manager_with_observer(
 async fn setup_workspace_manager_with_connection(
     connection: sea_orm::DatabaseConnection,
 ) -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
-    setup_workspace_manager_with_connection_migrator::<Migrator>(connection).await
-}
-
-async fn setup_workspace_manager_with_connection_migrator<M: MigratorTrait>(
-    connection: sea_orm::DatabaseConnection,
-) -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
+    // This helper invokes current Gateway bootstrap and authorization, so it
+    // requires the complete schema rather than a historical migration prefix.
     crate::compaction::load_test_catalog();
-    M::up(&connection, None)
+    Migrator::up(&connection, None)
         .await
         .expect("migrations must succeed");
     bootstrap(&connection)
