@@ -469,3 +469,51 @@ pub(crate) mod access_start {
         }
     }
 }
+
+pub(crate) mod cancellation_actor {
+    //! Retain the authenticated initiator of accepted Turn/graph cancellation for
+    //! the exact still-active runs, until their later terminal reconciliation.
+    use sea_orm_migration::{prelude::*, schema::*};
+
+    #[derive(DeriveIden)]
+    enum TaskRunCancellationActor {
+        Table,
+        RunId,
+        TaskId,
+        WorkspaceId,
+        PrincipalId,
+        OriginTurnId,
+    }
+    pub struct Migration;
+    impl MigrationName for Migration {
+        fn name(&self) -> &str {
+            "m20261018_000001_task_cancellation_actor"
+        }
+    }
+    #[async_trait::async_trait]
+    impl MigrationTrait for Migration {
+        async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+            manager
+                .create_table(
+                    Table::create()
+                        .table(TaskRunCancellationActor::Table)
+                        .col(string(TaskRunCancellationActor::RunId).primary_key())
+                        .col(string(TaskRunCancellationActor::TaskId))
+                        .col(string(TaskRunCancellationActor::WorkspaceId))
+                        .col(string(TaskRunCancellationActor::PrincipalId))
+                        .col(string(TaskRunCancellationActor::OriginTurnId))
+                        .to_owned(),
+                )
+                .await
+        }
+        async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+            manager
+                .drop_table(
+                    Table::drop()
+                        .table(TaskRunCancellationActor::Table)
+                        .to_owned(),
+                )
+                .await
+        }
+    }
+}

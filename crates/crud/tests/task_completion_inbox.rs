@@ -1958,6 +1958,12 @@ async fn consolidated_inbox_migrations_preserve_released_prefixes_and_schema() {
         .iter()
         .map(|m| m.name().to_owned())
         .collect::<Vec<_>>();
+    for name in NAMES.into_iter().chain([
+        "m20261018_000001_task_cancellation_actor",
+        "m20261018_000003_task_inbox_access_start",
+    ]) {
+        assert_eq!(names.iter().filter(|n| n.as_str() == name).count(), 1);
+    }
     let positions = NAMES.map(|n| names.iter().position(|v| v == n).unwrap());
     assert!(positions[0] < positions[1] && positions[1] < positions[2]);
     assert_eq!(

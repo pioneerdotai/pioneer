@@ -1,8 +1,7 @@
 mod m20261015_000001_html_preview_retention;
+mod m20261016_000001_task_completion_inbox;
 mod m20261018_000001_frozen_sweep_work;
 mod m20261018_000001_html_preview_work_selection;
-mod m20261018_000001_task_cancellation_actor;
-mod task_inbox;
 pub use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
@@ -194,13 +193,13 @@ impl MigratorTrait for Migrator {
             Box::new(m20261012_000001_turn_event_delivery_unfinished_predecessor::Migration),
             Box::new(m20261015_000001_compaction_invalid_completion_resume::Migration),
             Box::new(m20261015_000002_terminal_task_input_roots::Migration),
-            Box::new(task_inbox::receipts::Migration),
+            Box::new(m20261016_000001_task_completion_inbox::receipts::Migration),
             Box::new(m20261015_000001_html_preview_retention::Migration),
             Box::new(m20261018_000001_html_preview_work_selection::Migration),
-            Box::new(task_inbox::activation::Migration),
-            Box::new(m20261018_000001_task_cancellation_actor::Migration),
-            Box::new(task_inbox::indexes::Migration),
-            Box::new(task_inbox::access_start::Migration),
+            Box::new(m20261016_000001_task_completion_inbox::activation::Migration),
+            Box::new(m20261016_000001_task_completion_inbox::cancellation_actor::Migration),
+            Box::new(m20261016_000001_task_completion_inbox::indexes::Migration),
+            Box::new(m20261016_000001_task_completion_inbox::access_start::Migration),
             Box::new(m20261018_000001_frozen_sweep_work::Migration),
         ]
     }

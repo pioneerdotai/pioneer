@@ -96,15 +96,19 @@ as a precise historical ordering against those lossy completion times.
 
 ## Migration compatibility and generated entities
 
-The unified source is `crates/migration/src/task_inbox.rs`; the three old files
-are removed. Explicit `MigrationName` implementations retain these registrations:
+The unified source is
+`crates/migration/src/m20261016_000001_task_completion_inbox.rs`; the other
+inbox source files are removed. Explicit `MigrationName` implementations retain
+all five inbox identities. The surrounding registrations remain in this order:
 
 1. `m20261016_000001_task_completion_inbox`
-2. existing `m20261015_000001_html_preview_retention` (unchanged interleaving)
-3. `m20261017_000001_task_inbox_activation`
-4. existing `m20261018_000001_task_cancellation_actor` (unchanged interleaving)
-5. `m20261018_000002_task_inbox_query_indexes`
-6. new `m20261018_000003_task_inbox_access_start`
+2. existing `m20261015_000001_html_preview_retention`
+3. existing `m20261018_000001_html_preview_work_selection`
+4. `m20261017_000001_task_inbox_activation`
+5. `m20261018_000001_task_cancellation_actor`
+6. `m20261018_000002_task_inbox_query_indexes`
+7. `m20261018_000003_task_inbox_access_start`
+8. existing `m20261018_000001_frozen_sweep_work`
 
 A static comparison against the exact base confirms that released up/down and
 transaction bodies differ only by module wrapping, explicit historical names and
@@ -442,3 +446,21 @@ cargo test --locked -j 1 -p pioneer-gateway --features pioneer-client/test-suppo
 ```
 
 Функциональные тесты не запускались. Реализация подготовлена к внешнему ревью.
+
+
+## Migration source naming follow-up
+
+All five inbox-related implementations, including cancellation attribution, now
+live in `crates/migration/src/m20261016_000001_task_completion_inbox.rs`.
+The filename follows the existing migration naming convention. Every implementation
+has an explicit `MigrationName`; the cancellation actor retains
+`m20261018_000001_task_cancellation_actor` despite its new module path.
+Registration order, up/down bodies, and transaction settings remain unchanged.
+This source-only move neither reapplies DDL nor changes existing migration records.
+
+Follow-up checks: `cargo check --locked --offline -j 1 -p pioneer-crud --lib
+--test task_completion_inbox --features test-support` passed. Source contract
+check with `PIONEER_RUST_ROOT` pointing to the publication worktree passed.
+Static normalized comparison confirmed unchanged migration bodies and transaction
+settings. The existing compatibility regression also checks uniqueness of all
+five historical names. Functional tests were not executed for this follow-up.
