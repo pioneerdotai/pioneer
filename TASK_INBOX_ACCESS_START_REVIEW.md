@@ -780,3 +780,35 @@ Rust publication worktree. The contract remains unchanged. Local `cargo check`,
 compilation and functional tests were not run. The next automatically triggered
 CI run must confirm the fix; no run is cancelled or manually restarted by this
 follow-up.
+
+## CI terminal replay fixture: run 39276004866
+
+The run for `9397b0ca` completed normally with a test failure, rather than
+stalling. Windows and macOS checks passed. The Gateway library reported 2913
+passed, zero failed and eight ignored; all three formerly stalled CLI Stop
+scenarios and `pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup`
+passed. This is GitHub CI evidence for the previous lock-lifetime fix, not a
+local execution or evidence that subsequent workspace targets ran.
+
+There is exactly one `FAILED` result in the full downloaded log:
+`tests::cancelled_terminal_commit_uses_saved_stop_actor_and_rolls_back_receipt_failure`
+in pioneer-tasks (227 passed, one failed). Its receipt-failure rollback and
+successful cancellation steps complete. It then calls the low-level terminal
+handle again with reason `replay` and a different timestamp, expecting success.
+The saved cancellation used reason `saved Stop`; the production terminal fence
+correctly rejects a different committed outcome. This is the same contract
+already covered in the adjacent terminal-delivery conflict regressions.
+
+The fixture now repeats the exact accepted reason and time for the idempotency
+check. It separately requires the changed-reason attempt to return the typed
+`TaskTerminalConflict`, checks that the exact replay created only one canonical
+cancellation event, and compares the journal before/after the rejected attempt.
+Its original rollback, retained initiator and one personal receipt assertions
+remain. No production terminal comparison, TaskService cancellation semantics,
+receipt logic, migration, query plan, client or scheduling code changed.
+
+Validation: full log scan for actual test results and failures; review against
+the terminal-commit predicate, handle implementation and neighboring regressions;
+rustfmt and diff checks. Local tests, compilation and `cargo check` were not run.
+The corrected fixture still needs execution in the next automatic CI run. No CI
+run was cancelled or manually restarted for this follow-up.

@@ -8722,9 +8722,49 @@ async fn cancelled_terminal_commit_uses_saved_stop_actor_and_rolls_back_receipt_
         .await
         .unwrap();
     handle
-        .cancel_run(Some("replay".into()), run.created_at + 2)
+        .cancel_run(Some("saved Stop".into()), run.created_at + 1)
         .await
         .unwrap();
+    let committed_events = runtime
+        .service()
+        .get_task_events(TaskEventsParams {
+            task_id: run.task_id.clone(),
+            after_sequence: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        committed_events
+            .events
+            .iter()
+            .filter(|event| matches!(event.payload, TaskEventPayload::RunCancelled { .. }))
+            .count(),
+        1,
+        "an exact replay must not append another cancellation"
+    );
+    // A different reason is a conflicting outcome, not an idempotent replay.
+    // Keep the production terminal fence, and require this rejected attempt
+    // to leave the original actor's receipt and canonical journal intact.
+    let conflict = handle
+        .cancel_run(Some("replay".into()), run.created_at + 2)
+        .await
+        .unwrap_err();
+    assert!(
+        conflict
+            .downcast_ref::<pioneer_crud::TaskTerminalConflict>()
+            .is_some()
+    );
+    let after_conflict = runtime
+        .service()
+        .get_task_events(TaskEventsParams {
+            task_id: run.task_id.clone(),
+            after_sequence: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(after_conflict.events, committed_events.events);
     let receipts = pioneer_entity::task_run_read::Entity::find()
         .all(&db)
         .await
