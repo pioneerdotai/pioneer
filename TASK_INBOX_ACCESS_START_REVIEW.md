@@ -597,3 +597,25 @@ weakened or modified.
 Local `cargo check`, builds, migrations and tests were not run. Validation here
 is source review, formatting and diff checks. Compilation and execution of this
 fix remain for GitHub CI.
+
+
+## CI inbox fixture constraint follow-up
+
+Run `39211958092` on `dbf678bb` passed the CRUD library (702), compaction (76)
+and frozen-storage lifetime (25) tests. The inbox suite then passed 27 tests and
+failed two while creating fixture rows, before their behavior assertions:
+
+- The consolidated-migration compatibility fixture omitted the required
+  `user_notification_outbox.delivered_at`. Its delivery/outbox rows now record
+  deterministic creation, delivery and acknowledgement times in causal order.
+  The acknowledgement value used by the receipt backfill is unchanged.
+- The legacy timezone fixture moved membership `created_at` past its existing
+  `updated_at`, violating `ck_workspace_membership_timestamps`. Both timestamps
+  now use the same intended grant value, retaining all nine fractional digits
+  and the `+03:00` offset. Expected tie/pre/post-grant unread counts are unchanged.
+
+Other raw outbox inserts and membership date rewrites were inspected for the
+same omissions. No production constraint, migration, timestamp normalization or
+assertion was relaxed. Only fixture data and explanatory comments changed.
+Local `cargo check`, builds, migrations and tests were not run; source review,
+formatting and diff checks are the local validation for this follow-up.

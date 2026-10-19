@@ -2009,8 +2009,10 @@ async fn consolidated_inbox_migrations_preserve_released_prefixes_and_schema() {
                     .unwrap();
             }
         }
-        db.execute_unprepared("INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,target_user_id,status,attempt_count,max_attempts,created_at,updated_at) VALUES('compat-delivery','W0000000000000000000I','compat','compat-late','compat-key','user_notification','P0000000000000000000B','delivered',1,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
-        db.execute_unprepared("INSERT INTO user_notification_outbox(id,task_delivery_id,workspace_id,recipient_principal_id,task_id,run_id,payload_json,status,created_at,acknowledged_at) VALUES('compat-legacy','compat-delivery','W0000000000000000000I','P0000000000000000000B','compat','compat-late','{}','acknowledged',CURRENT_TIMESTAMP,'2026-10-16T12:34:56Z')").await.unwrap();
+        // Acknowledged legacy notifications have a saved delivery timestamp;
+        // keep creation, delivery and acknowledgement in causal order.
+        db.execute_unprepared("INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,target_user_id,status,attempt_count,max_attempts,created_at,updated_at,delivered_at) VALUES('compat-delivery','W0000000000000000000I','compat','compat-late','compat-key','user_notification','P0000000000000000000B','delivered',1,1,'2026-10-16T12:34:54Z','2026-10-16T12:34:55Z','2026-10-16T12:34:55Z')").await.unwrap();
+        db.execute_unprepared("INSERT INTO user_notification_outbox(id,task_delivery_id,workspace_id,recipient_principal_id,task_id,run_id,payload_json,status,created_at,delivered_at,acknowledged_at) VALUES('compat-legacy','compat-delivery','W0000000000000000000I','P0000000000000000000B','compat','compat-late','{}','acknowledged','2026-10-16T12:34:54Z','2026-10-16T12:34:55Z','2026-10-16T12:34:56Z')").await.unwrap();
         let saved_activation = if stage >= 2 {
             Some(
                 db.query_one_raw(Statement::from_string(
@@ -2560,7 +2562,9 @@ async fn legacy_grant_uses_epoch_and_retains_the_ambiguous_second_without_receip
     )
     .await;
     let db = store.database_connection();
-    db.execute_unprepared("UPDATE workspace_membership SET created_at='2026-10-16 13:00:00.999999999 +03:00' WHERE principal_id='P0000000000000000000A'").await.unwrap();
+    // Preserve the membership timestamp invariant while exercising the legacy
+    // timezone/subsecond representation of the grant itself.
+    db.execute_unprepared("UPDATE workspace_membership SET created_at='2026-10-16 13:00:00.999999999 +03:00',updated_at='2026-10-16 13:00:00.999999999 +03:00' WHERE principal_id='P0000000000000000000A'").await.unwrap();
     for (i, id, at) in [
         (1, "legacy-pre", "2026-10-16T09:59:59Z"),
         (2, "legacy-tie", "2026-10-16 10:00:00 +00:00"),
