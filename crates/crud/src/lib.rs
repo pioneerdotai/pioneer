@@ -34417,6 +34417,37 @@ mod tests {
         test_store_with_workspace_migrator::<Migrator>(workspace_id).await
     }
 
+    // Empty-input projector fixtures exercise old migration boundaries with
+    // today's Thread Entity. Add only its later metadata column, without
+    // applying/registering unread or changing which migration down() tests.
+    async fn add_thread_unread_column_to_legacy_fixture(store: &CrudStore) {
+        use migration::{ColumnDef, SchemaManager, Table};
+
+        let transaction = store.connection.begin().await.unwrap();
+        let schema = SchemaManager::new(&*transaction);
+        assert!(
+            !schema
+                .has_column("thread", "workspace_unread_started_at")
+                .await
+                .unwrap()
+        );
+        schema
+            .alter_table(
+                Table::alter()
+                    .table(pioneer_entity::thread::Entity)
+                    .add_column(
+                        ColumnDef::new(pioneer_entity::thread::Column::WorkspaceUnreadStartedAt)
+                            .big_integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+    }
+
     async fn test_store_with_workspace_migrator<M: MigratorTrait>(workspace_id: &str) -> CrudStore {
         let connection = Database::connect("sqlite::memory:")
             .await
