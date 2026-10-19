@@ -7306,6 +7306,7 @@ mod policy_tests {
             ]}),
         ));
         let payload = serde_json::to_string(&pioneer_provider::CanonicalProviderRoundEnvelope {
+            ui_copies: None,
             version: 1,
             round_id: "failed".into(),
             termination: pioneer_provider::ProviderTermination::ProviderError,

@@ -1,3 +1,11 @@
+/// Safe identity of the operation selected before dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderUsageProfile {
+    pub api: String,
+    pub api_version: Option<String>,
+    pub route: Option<String>,
+}
+
 use pioneer_protocol::ProviderFailureClass;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -437,7 +445,7 @@ impl MessageContentPart {
 /// provider/model target. The payload remains provider-owned; the history
 /// projection may extract explicitly typed human-readable fields when a
 /// completed round is moved to an incompatible target.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderReplayState {
     pub provider: String,
     /// Exact model whose continuation contract produced this state. Legacy
@@ -447,6 +455,12 @@ pub struct ProviderReplayState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub payload: JsonValue,
+}
+
+impl std::fmt::Debug for ProviderReplayState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProviderReplayState { opaque: true }")
+    }
 }
 
 impl ProviderReplayState {
@@ -985,6 +999,8 @@ pub struct ProviderCallIdentity {
 /// identity of every requested operation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalProviderRoundEnvelope {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_copies: Option<Vec<crate::messages::ProviderRoundUiCopy>>,
     pub version: u8,
     pub round_id: String,
     pub termination: ProviderTermination,
@@ -1140,6 +1156,7 @@ impl TokenUsage {
 
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
+    pub messages: Vec<crate::messages::ProviderMessage>,
     pub text: String,
     pub usage: Option<TokenUsage>,
     pub termination: ProviderTermination,
@@ -1156,6 +1173,7 @@ pub struct ChatResponse {
 
 #[derive(Debug, Clone)]
 pub struct StreamChunk {
+    pub message: Option<crate::messages::ProviderMessageMetadata>,
     pub usage: Option<TokenUsage>,
     pub delta: String,
     pub reasoning_delta: Option<String>,
@@ -1170,6 +1188,7 @@ pub struct StreamChunk {
 impl StreamChunk {
     pub fn usage(usage: TokenUsage) -> Self {
         Self {
+            message: None,
             usage: Some(usage),
             ..Self::delta("")
         }
@@ -1182,6 +1201,7 @@ impl StreamChunk {
 
     pub fn delta(text: impl Into<String>) -> Self {
         Self {
+            message: None,
             usage: None,
             delta: text.into(),
             reasoning_delta: None,
@@ -1194,6 +1214,7 @@ impl StreamChunk {
 
     pub fn reasoning(text: impl Into<String>) -> Self {
         Self {
+            message: None,
             usage: None,
             delta: String::new(),
             reasoning_delta: Some(text.into()),
@@ -1206,6 +1227,7 @@ impl StreamChunk {
 
     pub fn tool_calls(tool_calls: Vec<ProviderToolCall>) -> Self {
         Self {
+            message: None,
             usage: None,
             delta: String::new(),
             reasoning_delta: None,
@@ -1218,6 +1240,7 @@ impl StreamChunk {
 
     pub fn provider_replay_state(state: ProviderReplayState) -> Self {
         Self {
+            message: None,
             usage: None,
             delta: String::new(),
             reasoning_delta: None,
@@ -1230,6 +1253,7 @@ impl StreamChunk {
 
     pub fn final_chunk_with(termination: ProviderTermination) -> Self {
         Self {
+            message: None,
             usage: None,
             delta: String::new(),
             reasoning_delta: None,
@@ -1274,6 +1298,30 @@ impl ProviderResponseLimits {
         &self,
         response: &ChatResponse,
     ) -> Result<(), ProviderResponseTooLarge> {
+        if response.messages.len() > crate::ProviderMessageCollector::MAX_MESSAGES {
+            return Err(ProviderResponseTooLarge::new(
+                "response_messages",
+                crate::ProviderMessageCollector::MAX_MESSAGES,
+                response.messages.len(),
+            ));
+        }
+        let bytes = crate::messages::message_bytes(&response.messages);
+        self.validate_text_bytes(
+            response.messages.iter().map(|m| m.text.len()).sum(),
+            "message_text",
+        )?;
+        self.validate_retained_bytes(
+            bytes
+                .saturating_add(response.text.len())
+                .saturating_add(response.reasoning_content.as_deref().map_or(0, str::len))
+                .saturating_add(tool_calls_bytes(&response.tool_calls))
+                .saturating_add(
+                    response
+                        .provider_replay_state
+                        .as_ref()
+                        .map_or(0, replay_state_bytes),
+                ),
+        )?;
         self.validate_accumulated(
             response.text.as_str(),
             response.reasoning_content.as_deref().unwrap_or_default(),
@@ -1636,6 +1684,7 @@ mod tests {
     #[test]
     fn chat_response_default_usage() {
         let resp = ChatResponse {
+            messages: Vec::new(),
             text: "Hello".into(),
             usage: None,
             reasoning_content: None,

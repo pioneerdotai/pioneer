@@ -1,8 +1,8 @@
 use crate::definition::{provider_definition, validate_provider_base_url};
 use crate::providers::{
-    AnthropicProvider, AuthStyle, AzureOpenAiProvider, BedrockProvider, CopilotProvider,
-    DeepSeekProvider, GeminiProvider, GlmProvider, LocalProvider, OllamaProvider,
-    OpenAiCompatibleProvider, OpenAiProvider, OpenRouterProvider, TelnyxProvider,
+    AnthropicProvider, AuthStyle, AzureOpenAiProvider, BedrockProvider,
+    ChatCompletionsApiCompatibleProvider, CopilotProvider, DeepSeekProvider, GeminiProvider,
+    GlmProvider, LocalProvider, OllamaProvider, OpenAiProvider, OpenRouterProvider, TelnyxProvider,
 };
 use crate::traits::Provider;
 use crate::types::{InputTypeSupport, ProviderInputCapabilities, ProviderTimeoutPolicy};
@@ -282,8 +282,12 @@ fn create_provider_with_timeout_policy_inner(
 }
 
 /// Shorthand to create an OpenAI-compatible provider with Bearer auth.
-fn compat_provider(name: &str, base_url: &str, api_key: &str) -> OpenAiCompatibleProvider {
-    OpenAiCompatibleProvider::new(name, base_url, api_key, AuthStyle::Bearer)
+fn compat_provider(
+    name: &str,
+    base_url: &str,
+    api_key: &str,
+) -> ChatCompletionsApiCompatibleProvider {
+    ChatCompletionsApiCompatibleProvider::new(name, base_url, api_key, AuthStyle::Bearer)
         .with_input_capabilities(compat_input_capabilities())
 }
 
@@ -874,6 +878,7 @@ mod tests {
         );
 
         for name in [
+            "openai",
             "ollama",
             "glm",
             "zai",
@@ -890,7 +895,13 @@ mod tests {
                 "http://{}/secret-gateway/api/",
                 listener.local_addr().unwrap()
             );
+            // Synthetic Responses snapshot, alongside the preserved Chat fixtures.
+            let responses_reply = r#"{"id":"resp-synthetic","status":"completed","output":[{"id":"m","type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"fixture reply"}]}]}"#;
+            let responses_stream = concat!(
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-synthetic\",\"status\":\"completed\",\"output\":[{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"final_answer\",\"content\":[{\"type\":\"output_text\",\"text\":\"fixture reply\"}]}]}}\n\n"
+            );
             let (chat_reply, stream_reply) = match name {
+                "openai" => (responses_reply, responses_stream),
                 "ollama" => (
                     r#"{"message":{"content":"fixture reply"},"done":true}"#,
                     concat!(
@@ -998,6 +1009,7 @@ mod tests {
 
             let requests = server.await.unwrap();
             let expected_path = match name {
+                "openai" => "/secret-gateway/api/responses".to_owned(),
                 "ollama" => "/secret-gateway/api/chat".to_owned(),
                 "gemini" => "/secret-gateway/api/models/fixture:generateContent?key=key".to_owned(),
                 "azure-openai" => "/secret-gateway/api/openai/v1/chat/completions".to_owned(),

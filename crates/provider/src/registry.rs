@@ -401,6 +401,9 @@ impl AuthorityBoundProvider {
 
 #[async_trait]
 impl Provider for AuthorityBoundProvider {
+    fn request_usage_profile(&self, request: &ChatRequest) -> Result<crate::ProviderUsageProfile> {
+        self.inner.request_usage_profile(request)
+    }
     fn usage_api(&self) -> &'static str {
         self.inner.usage_api()
     }
@@ -466,7 +469,7 @@ impl Provider for AuthorityBoundProvider {
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         self.ensure_not_revoked()?;
-        let context = crate::usage::UsageContext::capture(self.inner.as_ref(), &request.model);
+        let context = crate::usage::UsageContext::capture_request(self.inner.as_ref(), &request)?;
         let mut response = self
             .public_result(
                 crate::attachments::admission::scope(
@@ -491,6 +494,9 @@ impl Provider for AuthorityBoundProvider {
             .map_err(|error| context.enrich_error(error))?;
         let usage = response.usage.get_or_insert_with(Default::default);
         context.enrich(usage);
+        crate::ProviderMessageCollector::validate_response(&response).map_err(|error| {
+            crate::usage::with_error_usage(error, response.usage.as_ref().expect("usage enriched"))
+        })?;
         Ok(response)
     }
 
@@ -506,7 +512,7 @@ impl Provider for AuthorityBoundProvider {
         request: ChatRequest,
     ) -> Result<crate::ProviderStream> {
         self.ensure_not_revoked()?;
-        let context = crate::usage::UsageContext::capture(self.inner.as_ref(), &request.model);
+        let context = crate::usage::UsageContext::capture_request(self.inner.as_ref(), &request)?;
         let mut response = self
             .public_result(
                 crate::attachments::admission::scope(
@@ -1435,6 +1441,7 @@ mod tests {
             .await?;
             self.bodies.lock().unwrap().push(body);
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 termination: ProviderTermination::Complete,
@@ -1935,6 +1942,7 @@ mod tests {
                 Some(&self.catalog),
             )?;
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text: "local boundary".into(),
                 usage: None,
                 reasoning_content: None,
@@ -2297,6 +2305,7 @@ mod tests {
                 .expect("release semaphore should remain open")
                 .forget();
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text: "done".to_owned(),
                 reasoning_content: None,
                 tool_calls: Vec::new(),

@@ -590,3 +590,57 @@ fn usage_error_context_preserves_original_classification_source_and_typed_causes
         "safe endpoint failure"
     );
 }
+
+#[test]
+fn responses_snapshots_are_inclusive_bounded_and_never_double_charge_reasoning() {
+    let mut usage = decode::<4>(
+        json!({"input_tokens":100,"output_tokens":30,"total_tokens":130,"input_tokens_details":{"cached_tokens":60,"cache_write_tokens":5,"SECRET":"untrusted"},"output_tokens_details":{"reasoning_tokens":20,"audio_tokens":0},"SECRET":{"key":"ciphertext"}}),
+    );
+    assert_eq!(usage.input_tokens, Some(100));
+    assert_eq!(usage.output_tokens, Some(30));
+    assert_eq!(usage.cache_read_input_tokens, Some(60));
+    assert_eq!(usage.reasoning_tokens, Some(20));
+    assert_eq!(usage.uncached_input_tokens, Some(35));
+    let before = usage.clone();
+    usage.update(&before);
+    assert_eq!(usage, before);
+    usage.update(&decode::<4>(
+        json!({"output_tokens":35,"output_tokens_details":{"reasoning_tokens":22}}),
+    ));
+    assert_eq!(usage.input_tokens, Some(100));
+    assert_eq!(usage.output_tokens, Some(35));
+    assert_eq!(usage.reasoning_tokens, Some(22));
+    assert_eq!(usage.cache_read_input_tokens, Some(60));
+    assert!(!serde_json::to_string(&usage).unwrap().contains("SECRET"));
+    let missing = decode::<4>(json!({}));
+    assert_eq!(missing.input_tokens, None);
+    assert_eq!(missing.output_tokens, None);
+}
+
+#[test]
+fn responses_pricing_keeps_route_and_model_guards_for_both_catalog_api_names() {
+    for api in ["openai-responses", "openai-completions"] {
+        let catalog = billing_catalog_configured("openai", 2., |model| model["api"] = json!(api));
+        let mut context = billing_context("openai", "A", catalog);
+        context.api = "responses".into();
+        context.route = route("https://api.openai.com/v1", "/responses");
+        let mut usage = decode::<4>(json!({"input_tokens":100,"output_tokens":10,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}})).with_reported_model(Some("A"));
+        context.enrich(&mut usage);
+        assert_eq!(
+            usage.accounting.as_ref().unwrap()["pricing_eligibility"]["eligible"],
+            true
+        );
+        let mut wrong_model = usage.clone().with_reported_model(Some("B"));
+        context.enrich(&mut wrong_model);
+        assert_eq!(
+            wrong_model.accounting.unwrap()["pricing_eligibility"]["eligible"],
+            false
+        );
+        context.route = route("https://synthetic.invalid/private", "/responses");
+        context.enrich(&mut usage);
+        assert_eq!(
+            usage.accounting.unwrap()["pricing_eligibility"]["eligible"],
+            false
+        );
+    }
+}

@@ -52,6 +52,7 @@ impl crate::traits::Provider for EchoProvider {
         let tool_calls = Vec::new();
         let termination = crate::ProviderTermination::Complete;
         Ok(ChatResponse {
+            messages: Vec::new(),
             text,
             usage: None,
             reasoning_content,

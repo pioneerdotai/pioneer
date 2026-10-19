@@ -863,6 +863,7 @@ impl crate::traits::Provider for CopilotProvider {
         }
 
         Ok(ChatResponse {
+            messages: Vec::new(),
             text,
             usage,
             termination,

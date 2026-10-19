@@ -261,6 +261,39 @@ mod tests {
         assert_eq!(with_proof.request.messages, req.messages);
     }
 
+    #[test]
+    fn responses_ciphertext_is_bounded_and_contributes_to_local_budget() {
+        let mut req = request();
+        let mut assistant = ChatMessage::assistant("readable final");
+        assistant.provider_replay_state = Some(pioneer_provider::ProviderReplayState::for_model(
+            "openai",
+            "gpt-6.1-sol",
+            serde_json::json!({"schema_version":1,"wire_api":"responses","authority_scope":"synthetic","output":[{"type":"reasoning","id":"rs","summary":[],"encrypted_content":"synthetic"}]}),
+        ));
+        req.messages = vec![assistant];
+        let budget = ModelBudget::new(Some(1048576), None, None);
+        let small =
+            NativeRequestProjection::full(req.clone(), vec![], budget.clone(), false).unwrap();
+        let state = req.messages[0].provider_replay_state.as_mut().unwrap();
+        state.payload["output"][0]["encrypted_content"] = serde_json::json!("a".repeat(256 * 1024));
+        pioneer_provider::ProviderResponseLimits::default()
+            .validate_replay_state(state)
+            .unwrap();
+        let large = NativeRequestProjection::full(req.clone(), vec![], budget, false).unwrap();
+        assert!(large.estimated_input_tokens > small.estimated_input_tokens);
+        assert_eq!(large.request.messages, req.messages);
+        // This existing estimator is deliberately a local admission estimate;
+        // the test makes no claim that it counts actual Responses wire tokens.
+        let state = req.messages[0].provider_replay_state.as_mut().unwrap();
+        state.payload["output"][0]["encrypted_content"] =
+            serde_json::json!("a".repeat(2 * 1024 * 1024));
+        assert!(
+            pioneer_provider::ProviderResponseLimits::default()
+                .validate_replay_state(state)
+                .is_err()
+        );
+    }
+
     fn replay_round(id: &str) -> Vec<ChatMessage> {
         let state = pioneer_provider::ProviderReplayState::for_model(
             "deepseek",

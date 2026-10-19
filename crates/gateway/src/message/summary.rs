@@ -55,10 +55,11 @@ pub async fn generate_thread_title(
             registry.get_or_create_for_workspace(&thread.workspace_id, model_provider)?;
         let provider =
             crate::usage_journal::observe(provider, crud, &thread.workspace_id, "title", thread_id);
-        provider
+        let response = provider
             .chat(title_generation_chat_request(model, prompt))
-            .await?
-            .text
+            .await?;
+        pioneer_provider::ProviderMessageCollector::validate_response(&response)?;
+        response.text
     };
     let title = normalize_generated_title(&text);
     if title.is_empty() {

@@ -11,13 +11,212 @@ use pioneer_provider::failure::{
     extract_retry_after_ms,
 };
 use pioneer_provider::{
-    ChatRequest, Provider, ProviderFailureClassification, ProviderResponseLimits,
-    ProviderResponseTooLarge, ProviderTermination, ProviderTimeoutPolicy, ProviderToolCall,
-    StreamChunk, TokenUsage,
+    ChatRequest, Provider, ProviderFailureClassification, ProviderMessageBoundary,
+    ProviderMessageCollector, ProviderResponseLimits, ProviderResponseTooLarge,
+    ProviderRoundUiCopy, ProviderTermination, ProviderTimeoutPolicy, ProviderToolCall, StreamChunk,
+    TokenUsage,
 };
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::timeout;
+
+/// Request-local UI ownership. Only End creates a completed-copy relation.
+#[derive(Default)]
+struct CommentaryUi {
+    ids: Vec<(pioneer_provider::ProviderMessageId, String)>,
+    copies: Vec<ProviderRoundUiCopy>,
+}
+impl CommentaryUi {
+    async fn push(
+        &mut self,
+        chunk: &StreamChunk,
+        collector: &ProviderMessageCollector,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        events: &AgentEventHub,
+    ) -> Result<(), ChatTurnError> {
+        let Some(meta) = &chunk.message else {
+            return Ok(());
+        };
+        if meta.phase != Some(pioneer_protocol::AgentMessagePhase::Commentary) {
+            return Ok(());
+        }
+        let item = match meta.boundary {
+            ProviderMessageBoundary::Start => {
+                let id = super::generate_id(super::TURN_ITEM_ID_LEN);
+                self.ids.push((meta.id, id.clone()));
+                TurnItem::AgentMessage {
+                    id,
+                    text: String::new(),
+                    phase: pioneer_protocol::AgentMessagePhase::Commentary,
+                    markdown: None,
+                    markdown_version: None,
+                }
+            }
+            ProviderMessageBoundary::Delta => {
+                let id = &self
+                    .ids
+                    .iter()
+                    .find(|(id, _)| *id == meta.id)
+                    .expect("validated message start")
+                    .1;
+                super::emit_progress_event(
+                    events,
+                    AgentProgressEvent::ItemDelta {
+                        notification: ItemDeltaNotification {
+                            workspace_id: workspace.into(),
+                            thread_id: thread.into(),
+                            turn_id: turn.into(),
+                            item_id: id.clone(),
+                            delta: chunk.delta.clone(),
+                            stream: Some(pioneer_protocol::ItemDeltaStream::AgentMessage),
+                            payload: None,
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+            ProviderMessageBoundary::End => {
+                let id = self
+                    .ids
+                    .iter()
+                    .find(|(id, _)| *id == meta.id)
+                    .expect("validated message start")
+                    .1
+                    .clone();
+                let text = collector
+                    .messages()
+                    .iter()
+                    .find(|m| m.id == meta.id)
+                    .expect("validated message")
+                    .text
+                    .clone();
+                TurnItem::AgentMessage {
+                    id,
+                    text,
+                    phase: pioneer_protocol::AgentMessagePhase::Commentary,
+                    markdown: None,
+                    markdown_version: None,
+                }
+            }
+        };
+        if meta.boundary == ProviderMessageBoundary::Start {
+            super::emit_durable_event(
+                events,
+                AgentDurableEvent::ItemStarted {
+                    notification: ItemStartedNotification {
+                        workspace_id: workspace.into(),
+                        thread_id: thread.into(),
+                        turn_id: turn.into(),
+                        item,
+                    },
+                },
+            )
+            .await?;
+        } else {
+            let copy = ProviderRoundUiCopy::from_item(&item).expect("commentary item");
+            super::emit_durable_event(
+                events,
+                AgentDurableEvent::ItemCompleted {
+                    notification: ItemCompletedNotification {
+                        workspace_id: workspace.into(),
+                        thread_id: thread.into(),
+                        turn_id: turn.into(),
+                        item,
+                    },
+                },
+            )
+            .await?;
+            self.copies.push(copy);
+        }
+        Ok(())
+    }
+    async fn response(
+        &mut self,
+        response: &pioneer_provider::ChatResponse,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        events: &AgentEventHub,
+    ) -> Result<(), ChatTurnError> {
+        let mut collector = ProviderMessageCollector::default();
+        for message in &response.messages {
+            for boundary in [
+                ProviderMessageBoundary::Start,
+                ProviderMessageBoundary::Delta,
+                ProviderMessageBoundary::End,
+            ] {
+                let mut chunk = StreamChunk::delta(if boundary == ProviderMessageBoundary::Delta {
+                    message.text.as_str()
+                } else {
+                    ""
+                });
+                chunk.message = Some(pioneer_provider::ProviderMessageMetadata {
+                    id: message.id,
+                    phase: message.phase.clone(),
+                    boundary,
+                });
+                collector.push(&chunk).map_err(|_| {
+                    ChatTurnError::Terminal("invalid provider message lifecycle".into())
+                })?;
+                self.push(&chunk, &collector, workspace, thread, turn, events)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_messages(response: &pioneer_provider::ChatResponse) -> Result<(), ChatTurnError> {
+    ProviderMessageCollector::validate_response(response)
+        .map_err(|_| ChatTurnError::Terminal("invalid provider message projection".into()))
+}
+fn push_message(
+    collector: &mut ProviderMessageCollector,
+    chunk: &StreamChunk,
+) -> Result<(), ChatTurnError> {
+    collector.push(chunk).map_err(|_| {
+        ChatTurnError::Terminal("invalid or oversized provider message lifecycle".into())
+    })
+}
+fn validate_collected_retained(
+    collector: &ProviderMessageCollector,
+    text: &str,
+    reasoning: &str,
+    calls: &[ProviderToolCall],
+    replay: Option<&pioneer_provider::ProviderReplayState>,
+    copies: &[ProviderRoundUiCopy],
+) -> Result<(), ChatTurnError> {
+    let retained = collector
+        .retained_bytes()
+        .saturating_add(text.len())
+        .saturating_add(reasoning.len())
+        .saturating_add(
+            calls
+                .iter()
+                .map(|c| c.id.len() + c.name.len() + c.arguments.len())
+                .sum::<usize>(),
+        )
+        .saturating_add(replay.map_or(0, |s| s.payload.to_string().len()))
+        .saturating_add(
+            copies
+                .iter()
+                .map(|c| c.turn_item_id.len() + c.content_sha256.len() + 64)
+                .sum::<usize>(),
+        );
+    ProviderResponseLimits::default()
+        .validate_retained_bytes(retained)
+        .map_err(|_| ChatTurnError::Terminal("provider retained response limit exceeded".into()))
+}
+fn finish_messages(collector: &ProviderMessageCollector) -> Result<(), ChatTurnError> {
+    collector
+        .finish()
+        .map_err(|_| ChatTurnError::Terminal("unfinished provider message".into()))
+}
 
 struct NativeProviderRoundMetric {
     started: Instant,
@@ -82,39 +281,69 @@ fn bind_replay_to_response_target(
     }
 }
 
-/// A final no-tool response can contain native state absent from UI text.
-/// Keep it in the existing acknowledged history route before finalization.
-#[allow(clippy::too_many_arguments)]
+pub(super) fn history_text(text: &str, messages: &[pioneer_provider::ProviderMessage]) -> String {
+    if messages.is_empty() {
+        return text.to_owned();
+    }
+    messages
+        .iter()
+        .map(|message| {
+            if message.phase == Some(pioneer_protocol::AgentMessagePhase::Commentary) {
+                format!("[Assistant commentary]\n{}", message.text)
+            } else {
+                message.text.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+pub(super) fn reasoning_copy(id: &str, reasoning: &str) -> Option<ProviderRoundUiCopy> {
+    if reasoning.is_empty() {
+        return None;
+    }
+    ProviderRoundUiCopy::from_item(&TurnItem::Reasoning {
+        id: id.into(),
+        summary: Vec::new(),
+        content: vec![reasoning.into()],
+    })
+}
+pub(super) fn final_copy(id: &str, text: &str) -> ProviderRoundUiCopy {
+    ProviderRoundUiCopy::from_item(&TurnItem::AgentMessage {
+        id: id.into(),
+        text: text.into(),
+        phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+        markdown: None,
+        markdown_version: None,
+    })
+    .expect("final copy")
+}
 pub(super) async fn persist_completed_response(
     events: &AgentEventHub,
     thread: &str,
     turn: &str,
-    item: &str,
-    reasoning_item: &str,
-    text: &str,
+    envelope: &pioneer_provider::CanonicalProviderRoundEnvelope,
+) -> Result<(), ChatTurnError> {
+    super::persist_provider_history_message(events, thread, turn, &envelope.round_id, envelope)
+        .await
+}
+fn completed_envelope(
+    round_id: String,
+    text: String,
     reasoning: &str,
     replay: Option<&pioneer_provider::ProviderReplayState>,
-) -> Result<(), ChatTurnError> {
-    if replay.is_none() && reasoning.is_empty() {
-        return Ok(());
-    }
+    copies: Vec<ProviderRoundUiCopy>,
+) -> pioneer_provider::CanonicalProviderRoundEnvelope {
     let mut message = pioneer_provider::ChatMessage::assistant(text);
-    message.reasoning_content = (!reasoning.is_empty()).then(|| reasoning.to_owned());
+    message.reasoning_content = (!reasoning.is_empty()).then(|| reasoning.into());
     message.provider_replay_state = replay.cloned();
-    super::persist_provider_history_message(
-        events,
-        thread,
-        turn,
-        reasoning_item,
-        &pioneer_provider::CanonicalProviderRoundEnvelope {
-            version: 1,
-            round_id: item.into(),
-            termination: pioneer_provider::ProviderTermination::Complete,
-            message,
-            calls: Vec::new(),
-        },
-    )
-    .await
+    pioneer_provider::CanonicalProviderRoundEnvelope {
+        ui_copies: Some(copies),
+        version: 1,
+        round_id,
+        termination: ProviderTermination::Complete,
+        message,
+        calls: vec![],
+    }
 }
 
 /// Persist the provider accumulator, including opaque state absent from UI text.
@@ -130,11 +359,9 @@ async fn persist_failed_provider_observation(
     reasoning: &str,
     calls: &[ProviderToolCall],
     replay: Option<&pioneer_provider::ProviderReplayState>,
-    error: &ChatTurnError,
+    copies: &[ProviderRoundUiCopy],
 ) -> Result<(), ChatTurnError> {
-    if !matches!(error, ChatTurnError::ProviderFailure { .. })
-        || (text.is_empty() && reasoning.is_empty() && calls.is_empty() && replay.is_none())
-    {
+    if text.is_empty() && reasoning.is_empty() && calls.is_empty() && replay.is_none() {
         return Ok(());
     }
     let mut message = pioneer_provider::ChatMessage::assistant(text);
@@ -147,6 +374,7 @@ async fn persist_failed_provider_observation(
         turn,
         item,
         &pioneer_provider::CanonicalProviderRoundEnvelope {
+            ui_copies: Some(copies.to_vec()),
             version: 1,
             round_id: item.into(),
             termination: ProviderTermination::ProviderError,
@@ -202,18 +430,22 @@ async fn request_agent_round_observed(
         };
 
         let mut full_text = String::new();
+        let mut message_collector = ProviderMessageCollector::default();
+        let mut commentary_ui = CommentaryUi::default();
         let mut full_reasoning = String::new();
         let mut tool_calls = Vec::new();
         let mut provider_replay_state = None;
         let mut termination = None;
         let mut usage: Option<pioneer_provider::TokenUsage> = None;
         let mut seen_any_chunk = false;
+        let mut content_deadline = None;
         let response_limits = ProviderResponseLimits::default();
 
         let received = async {
             while let Some(mut chunk) = read_next_stream_chunk(
                 &mut stream,
                 &mut seen_any_chunk,
+                &mut content_deadline,
                 &diagnostics,
                 target,
                 provider,
@@ -224,6 +456,17 @@ async fn request_agent_round_observed(
             .await?
             {
                 observe_startup_chunk(turn_id, &chunk);
+                push_message(&mut message_collector, &chunk)?;
+                commentary_ui
+                    .push(
+                        &chunk,
+                        &message_collector,
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        event_tx,
+                    )
+                    .await?;
                 if let Err(error) = response_limits.validate_stream_chunk(&chunk) {
                     return Err(provider_response_limit_error(
                         target,
@@ -283,9 +526,7 @@ async fn request_agent_round_observed(
                     .await?;
                 }
 
-                if !chunk.delta.is_empty() {
-                    full_text.push_str(chunk.delta.as_str());
-                }
+                full_text.push_str(message_collector.result_delta());
 
                 validate_provider_tool_calls(
                     chunk.tool_calls.as_slice(),
@@ -311,12 +552,21 @@ async fn request_agent_round_observed(
                         error,
                     ));
                 }
+                validate_collected_retained(
+                    &message_collector,
+                    &full_text,
+                    &full_reasoning,
+                    &tool_calls,
+                    provider_replay_state.as_ref(),
+                    &commentary_ui.copies,
+                )?;
                 if chunk.is_final {
                     termination = chunk.termination;
                     break;
                 }
             }
 
+            finish_messages(&message_collector)?;
             require_round_termination(
                 termination,
                 tool_calls.as_slice(),
@@ -335,11 +585,11 @@ async fn request_agent_round_observed(
                     thread_id,
                     turn_id,
                     thinking_item_id,
-                    &full_text,
+                    &history_text(&full_text, message_collector.messages()),
                     &full_reasoning,
                     &tool_calls,
                     provider_replay_state.as_ref(),
-                    &error,
+                    &commentary_ui.copies,
                 )
                 .await?;
                 return Err(error);
@@ -347,6 +597,9 @@ async fn request_agent_round_observed(
         };
         lifecycle_metric.finish(pioneer_observability::NativeLifecycleOutcome::Succeeded);
         return Ok(AgentRoundResponse {
+            round_id: super::generate_id(super::TURN_ITEM_ID_LEN),
+            messages: message_collector.into_messages(),
+            ui_copies: commentary_ui.copies,
             text: full_text,
             reasoning: full_reasoning,
             tool_calls,
@@ -380,6 +633,11 @@ async fn request_agent_round_observed(
         model_name.as_str(),
     );
 
+    validate_messages(&response)?;
+    let mut commentary_ui = CommentaryUi::default();
+    commentary_ui
+        .response(&response, workspace_id, thread_id, turn_id, event_tx)
+        .await?;
     let startup_output = if !response.text.is_empty() {
         Some(pioneer_observability::turn_startup::Output::BufferedText)
     } else if response
@@ -431,16 +689,36 @@ async fn request_agent_round_observed(
         .await?;
     }
 
-    let termination = require_round_termination(
-        Some(response.termination),
+    let termination = match require_round_termination(
+        Some(response.termination.clone()),
         response.tool_calls.as_slice(),
         FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
         provider.name(),
-        model_name.as_str(),
+        &model_name,
         ProviderTransportKind::NonStream,
-    )?;
+    ) {
+        Ok(termination) => termination,
+        Err(error) => {
+            persist_failed_provider_observation(
+                event_tx,
+                thread_id,
+                turn_id,
+                thinking_item_id,
+                &history_text(&response.text, &response.messages),
+                &reasoning,
+                &response.tool_calls,
+                response.provider_replay_state.as_ref(),
+                &commentary_ui.copies,
+            )
+            .await?;
+            return Err(error);
+        }
+    };
     lifecycle_metric.finish(pioneer_observability::NativeLifecycleOutcome::Succeeded);
     Ok(AgentRoundResponse {
+        round_id: super::generate_id(super::TURN_ITEM_ID_LEN),
+        messages: response.messages,
+        ui_copies: commentary_ui.copies,
         text: response.text,
         reasoning,
         tool_calls: response.tool_calls,
@@ -495,12 +773,16 @@ async fn stream_provider_response_observed(
     };
 
     let mut full_text = String::new();
+    let mut message_collector = ProviderMessageCollector::default();
+    let mut commentary_ui = CommentaryUi::default();
     let mut reasoning_parts = String::new();
     let mut message_started = false;
+    let mut completed_reasoning_len = None;
     let mut stream_tool_calls = Vec::new();
     let mut termination = None;
     let mut usage: Option<pioneer_provider::TokenUsage> = None;
     let mut seen_any_chunk = false;
+    let mut content_deadline = None;
     let response_limits = ProviderResponseLimits::default();
 
     let mut provider_replay_state = None;
@@ -508,6 +790,7 @@ async fn stream_provider_response_observed(
         while let Some(chunk) = read_next_stream_chunk(
             &mut stream,
             &mut seen_any_chunk,
+            &mut content_deadline,
             &diagnostics,
             response_stream_target(message_started, thinking_item_id, message_item_id),
             provider,
@@ -527,9 +810,22 @@ async fn stream_provider_response_observed(
                     error,
                 ));
             }
+            push_message(&mut message_collector, &chunk)?;
+            commentary_ui
+                .push(
+                    &chunk,
+                    &message_collector,
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    event_tx,
+                )
+                .await?;
+            let result_delta = message_collector.result_delta().to_owned();
             let StreamChunk {
+                message: _,
                 usage: chunk_usage,
-                delta,
+                delta: _,
                 reasoning_delta,
                 tool_calls,
                 is_final,
@@ -550,6 +846,7 @@ async fn stream_provider_response_observed(
                 );
             }
 
+            let delta = result_delta;
             let target = response_stream_target(message_started, thinking_item_id, message_item_id);
             validate_stream_append_limits(
                 &response_limits,
@@ -623,6 +920,7 @@ async fn stream_provider_response_observed(
                         },
                     )
                     .await?;
+                    completed_reasoning_len = Some(reasoning_parts.len());
 
                     super::emit_durable_event(
                         event_tx,
@@ -678,12 +976,21 @@ async fn stream_provider_response_observed(
                     error,
                 ));
             }
+            validate_collected_retained(
+                &message_collector,
+                &full_text,
+                &reasoning_parts,
+                &stream_tool_calls,
+                provider_replay_state.as_ref(),
+                &commentary_ui.copies,
+            )?;
             if is_final {
                 termination = chunk_termination;
                 break;
             }
         }
 
+        finish_messages(&message_collector)?;
         require_round_termination(
             termination,
             stream_tool_calls.as_slice(),
@@ -701,27 +1008,45 @@ async fn stream_provider_response_observed(
             thread_id,
             turn_id,
             thinking_item_id,
-            &full_text,
+            &history_text(&full_text, message_collector.messages()),
             &reasoning_parts,
             &stream_tool_calls,
             provider_replay_state.as_ref(),
-            &error,
+            &commentary_ui.copies,
         )
         .await?;
         return Err(error);
     }
-    if stream_tool_calls.is_empty() {
-        persist_completed_response(
-            event_tx,
+    if completed_reasoning_len != Some(reasoning_parts.len()) {
+        super::send_reasoning_completed(
+            workspace_id,
             thread_id,
             turn_id,
-            message_item_id,
             thinking_item_id,
-            &full_text,
             &reasoning_parts,
-            provider_replay_state.as_ref(),
+            event_tx,
         )
         .await?;
+    }
+    let mut copies = commentary_ui.copies;
+    copies.extend(reasoning_copy(thinking_item_id, &reasoning_parts));
+    if !full_text.trim().is_empty() {
+        copies.push(final_copy(message_item_id, &full_text));
+    }
+    let envelope = completed_envelope(
+        super::generate_id(super::TURN_ITEM_ID_LEN),
+        history_text(&full_text, message_collector.messages()),
+        &reasoning_parts,
+        provider_replay_state.as_ref(),
+        copies,
+    );
+    if stream_tool_calls.is_empty() {
+        persist_completed_response(event_tx, thread_id, turn_id, &envelope).await?;
+    }
+    if full_text.trim().is_empty() {
+        return Err(ChatTurnError::Terminal(
+            "provider completed without a final message".into(),
+        ));
     }
     for tool_call in stream_tool_calls {
         super::emit_durable_event(
@@ -761,50 +1086,6 @@ async fn stream_provider_response_observed(
                         None,
                         None,
                     ),
-                },
-            },
-        )
-        .await?;
-    }
-
-    if !message_started {
-        let reasoning_text = reasoning_parts;
-
-        super::emit_durable_event(
-            event_tx,
-            AgentDurableEvent::ItemCompleted {
-                notification: ItemCompletedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: TurnItem::Reasoning {
-                        id: thinking_item_id.to_owned(),
-                        summary: Vec::new(),
-                        content: if reasoning_text.is_empty() {
-                            Vec::new()
-                        } else {
-                            vec![reasoning_text]
-                        },
-                    },
-                },
-            },
-        )
-        .await?;
-
-        super::emit_durable_event(
-            event_tx,
-            AgentDurableEvent::ItemStarted {
-                notification: ItemStartedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: TurnItem::AgentMessage {
-                        id: message_item_id.to_owned(),
-                        text: String::new(),
-                        phase: Default::default(),
-                        markdown: None,
-                        markdown_version: None,
-                    },
                 },
             },
         )
@@ -900,49 +1181,63 @@ async fn non_stream_provider_response_observed(
         ));
     }
 
-    require_round_termination(
+    validate_messages(&response)?;
+    let mut commentary_ui = CommentaryUi::default();
+    commentary_ui
+        .response(&response, workspace_id, thread_id, turn_id, event_tx)
+        .await?;
+    if let Err(error) = require_round_termination(
         Some(response.termination.clone()),
         response.tool_calls.as_slice(),
         FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
         provider.name(),
-        model_name.as_str(),
+        &model_name,
         ProviderTransportKind::NonStream,
-    )?;
-    if response.tool_calls.is_empty() {
-        persist_completed_response(
+    ) {
+        persist_failed_provider_observation(
             event_tx,
             thread_id,
             turn_id,
-            message_item_id,
             thinking_item_id,
-            &response.text,
+            &history_text(&response.text, &response.messages),
             response.reasoning_content.as_deref().unwrap_or_default(),
+            &response.tool_calls,
             response.provider_replay_state.as_ref(),
+            &commentary_ui.copies,
         )
         .await?;
+        return Err(error);
     }
-    let reasoning_content = match &response.reasoning_content {
-        Some(rc) if !rc.is_empty() => vec![rc.clone()],
-        _ => Vec::new(),
-    };
-
-    super::emit_durable_event(
+    let reasoning = response.reasoning_content.as_deref().unwrap_or_default();
+    super::send_reasoning_completed(
+        workspace_id,
+        thread_id,
+        turn_id,
+        thinking_item_id,
+        reasoning,
         event_tx,
-        AgentDurableEvent::ItemCompleted {
-            notification: ItemCompletedNotification {
-                workspace_id: workspace_id.to_owned(),
-                thread_id: thread_id.to_owned(),
-                turn_id: turn_id.to_owned(),
-                item: TurnItem::Reasoning {
-                    id: thinking_item_id.to_owned(),
-                    summary: Vec::new(),
-                    content: reasoning_content,
-                },
-            },
-        },
     )
     .await?;
-
+    let mut copies = commentary_ui.copies;
+    copies.extend(reasoning_copy(thinking_item_id, reasoning));
+    if !response.text.trim().is_empty() {
+        copies.push(final_copy(message_item_id, &response.text));
+    }
+    let envelope = completed_envelope(
+        super::generate_id(super::TURN_ITEM_ID_LEN),
+        history_text(&response.text, &response.messages),
+        reasoning,
+        response.provider_replay_state.as_ref(),
+        copies,
+    );
+    if response.tool_calls.is_empty() {
+        persist_completed_response(event_tx, thread_id, turn_id, &envelope).await?;
+    }
+    if response.text.trim().is_empty() {
+        return Err(ChatTurnError::Terminal(
+            "provider completed without a final message".into(),
+        ));
+    }
     super::emit_durable_event(
         event_tx,
         AgentDurableEvent::ItemStarted {
@@ -1030,7 +1325,7 @@ fn adapter_error_for_target(
     prefix: &str,
     error: &anyhow::Error,
 ) -> ChatTurnError {
-    let classification = if let Some(http_error) =
+    let mut classification = if let Some(http_error) =
         error.downcast_ref::<pioneer_provider::ProviderHttpErrorBodyTooLarge>()
     {
         Some(classify_http_error_body_too_large(http_error.status))
@@ -1041,6 +1336,16 @@ fn adapter_error_for_target(
     } else {
         provider.classify_failure(error)
     };
+    if let Some(id) = pioneer_provider::usage::error_usage(error)
+        .and_then(|usage| usage.request_id.clone())
+        .and_then(|id| pioneer_protocol::ProviderRequestId::try_from(id).ok())
+    {
+        classification
+            .get_or_insert_with(|| {
+                ProviderFailureClassification::new(ProviderFailureClass::Unknown)
+            })
+            .request_id = Some(id);
+    }
     // Usage context has a safe fixed Display. Classify the original cause
     // privately, then persist only the safe outer diagnostic and typed hints.
     let inferred = infer_failure_classification(
@@ -1275,6 +1580,7 @@ fn should_replace_tool_arguments(current: &str, next: &str) -> bool {
 async fn read_next_stream_chunk<S>(
     stream: &mut S,
     seen_any_chunk: &mut bool,
+    content_deadline: &mut Option<tokio::time::Instant>,
     diagnostics: &pioneer_provider::ProviderStreamDiagnostics,
     target: FailureTarget<'_>,
     provider: &Arc<dyn Provider>,
@@ -1297,11 +1603,13 @@ where
         provider_timeout_policy.first_chunk_timeout
     };
 
-    let next_chunk = timeout(wait, async {
+    let deadline = *content_deadline.get_or_insert_with(|| tokio::time::Instant::now() + wait);
+    let next_chunk = tokio::time::timeout_at(deadline, async {
         loop {
             let next = stream.next().await;
             if let Some(Ok(chunk)) = &next {
                 let identity_only = !chunk.is_final
+                    && chunk.message.is_none()
                     && chunk.delta.is_empty()
                     && chunk.reasoning_delta.is_none()
                     && chunk.tool_calls.is_empty()
@@ -1347,8 +1655,6 @@ where
         return Ok(None);
     };
 
-    *seen_any_chunk = true;
-
     let chunk = chunk_result.map_err(|error| {
         observation.observe_error(&error);
         adapter_error_for_target(
@@ -1362,6 +1668,17 @@ where
         )
     })?;
 
+    if !chunk.delta.is_empty()
+        || chunk
+            .reasoning_delta
+            .as_ref()
+            .is_some_and(|s| !s.is_empty())
+        || !chunk.tool_calls.is_empty()
+    {
+        *seen_any_chunk = true;
+        *content_deadline =
+            Some(tokio::time::Instant::now() + provider_timeout_policy.inter_chunk_idle_timeout);
+    }
     Ok(Some(chunk))
 }
 
@@ -2044,18 +2361,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_final_without_native_state_or_reasoning_does_not_expect_ui_aliases() {
-        let hub = AgentEventHub::new();
-        let mut receiver = hub.take_durable_receiver().await.unwrap();
-        persist_completed_response(
-            &hub, "thread", "turn", "final", "thinking", "answer", "", None,
-        )
-        .await
-        .unwrap();
-        assert!(futures_util::FutureExt::now_or_never(receiver.recv()).is_none());
-    }
-
-    #[tokio::test]
     async fn completed_native_response_waits_for_durable_history_acknowledgement() {
         let hub = AgentEventHub::new();
         let mut receiver = hub.take_durable_receiver().await.unwrap();
@@ -2064,16 +2369,14 @@ mod tests {
             "fixture",
             serde_json::json!({"schema_version":2,"parts":[{"text":"answer","thoughtSignature":"signed"}]}),
         );
-        let publish = persist_completed_response(
-            &hub,
-            "thread",
-            "turn",
-            "final",
-            "thinking",
-            "answer",
+        let envelope = completed_envelope(
+            "request-round".into(),
+            "answer".into(),
             "",
             Some(&state),
+            vec![final_copy("final", "answer")],
         );
+        let publish = persist_completed_response(&hub, "thread", "turn", &envelope);
         let receive = async {
             let AgentDurableEvent::TurnProviderHistoryAppended {
                 payload, item_id, ..
@@ -2081,7 +2384,7 @@ mod tests {
             else {
                 panic!("expected canonical history");
             };
-            assert_eq!(item_id, "thinking");
+            assert_eq!(item_id, "request-round");
             let envelope: pioneer_provider::CanonicalProviderRoundEnvelope =
                 serde_json::from_value(payload).unwrap();
             assert_eq!(
@@ -3319,6 +3622,18 @@ impl ProviderAttemptObservation {
             usage: std::sync::Mutex::new(TokenUsage::default()),
         }
     }
+    pub(super) fn for_request(
+        provider: &dyn Provider,
+        request: &ChatRequest,
+    ) -> Result<Self, ChatTurnError> {
+        let profile = provider
+            .request_usage_profile(request)
+            .map_err(|_| ChatTurnError::Terminal("provider usage profile unavailable".into()))?;
+        let mut observation = Self::new(provider, &request.model);
+        observation.api = profile.api;
+        observation.route = profile.route;
+        Ok(observation)
+    }
     pub(super) fn observe(&self, snapshot: &TokenUsage) {
         self.usage
             .lock()
@@ -3389,7 +3704,7 @@ pub(super) async fn request_agent_round(
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
 ) -> Result<AgentRoundResponse, ChatTurnError> {
-    let observation = ProviderAttemptObservation::new(provider.as_ref(), &request.model);
+    let observation = ProviderAttemptObservation::for_request(provider.as_ref(), &request)?;
     observation
         .publish(event_tx, workspace_id, thread_id, turn_id, None)
         .await?;
@@ -3429,7 +3744,7 @@ pub(super) async fn stream_provider_response(
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
 ) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
-    let observation = ProviderAttemptObservation::new(provider.as_ref(), &request.model);
+    let observation = ProviderAttemptObservation::for_request(provider.as_ref(), &request)?;
     observation
         .publish(event_tx, workspace_id, thread_id, turn_id, None)
         .await?;
@@ -3468,7 +3783,7 @@ pub(super) async fn non_stream_provider_response(
     message_item_id: &str,
     event_tx: &AgentEventHub,
 ) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
-    let observation = ProviderAttemptObservation::new(provider.as_ref(), &request.model);
+    let observation = ProviderAttemptObservation::for_request(provider.as_ref(), &request)?;
     observation
         .publish(event_tx, workspace_id, thread_id, turn_id, None)
         .await?;
@@ -3844,5 +4159,421 @@ mod native_decoder_gate_tests {
             )
             + &event(serde_json::json!({"type":"message_stop"}));
         check_gate(body, false, true).await;
+    }
+}
+
+#[cfg(test)]
+mod phased_message_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use pioneer_protocol::AgentMessagePhase;
+    use pioneer_provider::{
+        ProviderMessageBoundary as Boundary, ProviderMessageId, ProviderMessageMetadata,
+    };
+    fn message(id: u32, phase: Option<AgentMessagePhase>, text: &str) -> Vec<StreamChunk> {
+        [Boundary::Start, Boundary::Delta, Boundary::End]
+            .into_iter()
+            .map(|boundary| {
+                let mut chunk = StreamChunk::delta(if boundary == Boundary::Delta {
+                    text
+                } else {
+                    ""
+                });
+                chunk.message = Some(ProviderMessageMetadata {
+                    id: ProviderMessageId(id),
+                    phase,
+                    boundary,
+                });
+                chunk
+            })
+            .collect()
+    }
+    struct PhasedProvider {
+        release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        no_final: bool,
+        fail: bool,
+        multiple_commentary: bool,
+    }
+    #[async_trait]
+    impl Provider for PhasedProvider {
+        fn name(&self) -> &str {
+            "phased-fixture"
+        }
+        fn capabilities(&self) -> pioneer_provider::ProviderCapabilities {
+            pioneer_provider::ProviderCapabilities {
+                streaming: true,
+                ..Default::default()
+            }
+        }
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            anyhow::bail!("no implicit fallback")
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            let release = self.release.lock().unwrap().take();
+            let no_final = self.no_final;
+            let fail = self.fail;
+            let mut early_messages = message(0, Some(AgentMessagePhase::Commentary), "working");
+            if self.multiple_commentary {
+                early_messages.extend(message(
+                    1,
+                    Some(AgentMessagePhase::Commentary),
+                    "still working",
+                ));
+            }
+            let early = futures_util::stream::iter(early_messages.into_iter().map(Ok));
+            let rest = futures_util::stream::once(async move {
+                if let Some(release) = release {
+                    release.await.unwrap();
+                }
+                let mut chunks = Vec::new();
+                if fail {
+                    chunks.extend(message(2,Some(AgentMessagePhase::FinalAnswer),"partial").into_iter().take(2));
+                } else if !no_final {
+                    chunks.extend(message(2, Some(AgentMessagePhase::FinalAnswer), "one"));
+                    chunks.extend(message(3, None, "two"));
+                }
+                let mut chunks=chunks.into_iter().map(Ok).collect::<Vec<_>>();
+                if fail {chunks.push(Err(pioneer_provider::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into()));}
+                else {chunks.push(Ok(StreamChunk::final_chunk_with(ProviderTermination::Complete)));}
+                futures_util::stream::iter(chunks)
+            })
+            .flatten();
+            Ok(early.chain(rest).boxed())
+        }
+    }
+    fn request() -> ChatRequest {
+        ChatRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        }
+    }
+    #[tokio::test]
+    async fn commentary_precedes_terminal_and_multiple_results_share_one_gated_final() {
+        for agent in [false, true] {
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let provider: Arc<dyn Provider> = Arc::new(PhasedProvider {
+                release: std::sync::Mutex::new(Some(release_rx)),
+                no_final: false,
+                fail: false,
+                multiple_commentary: true,
+            });
+            let hub = AgentEventHub::new();
+            let mut receiver = hub.take_durable_receiver().await.unwrap();
+            let producer = async {
+                if agent {
+                    request_agent_round(
+                        &provider,
+                        request(),
+                        "ws",
+                        "thread",
+                        "turn",
+                        "thinking",
+                        false,
+                        ProviderTimeoutPolicy::default(),
+                        &hub,
+                    )
+                    .await
+                    .map(|round| round.text)
+                } else {
+                    stream_provider_response(
+                        &provider,
+                        request(),
+                        "ws",
+                        "thread",
+                        "turn",
+                        "thinking",
+                        "final",
+                        ProviderTimeoutPolicy::default(),
+                        &hub,
+                    )
+                    .await
+                    .map(|r| r.0)
+                }
+            };
+            let consume = async {
+                let mut release = Some(release_tx);
+                let mut copies = Vec::new();
+                let mut finals = 0;
+                let mut canonical = None;
+                loop {
+                    let event = receiver.recv().await.unwrap();
+                    match &event {
+                        AgentDurableEvent::ItemCompleted { notification } => {
+                            match &notification.item {
+                                TurnItem::AgentMessage {
+                                    phase: AgentMessagePhase::Commentary,
+                                    text,
+                                    ..
+                                } => {
+                                    assert_eq!(
+                                        text,
+                                        if copies.is_empty() {
+                                            "working"
+                                        } else {
+                                            "still working"
+                                        }
+                                    );
+                                    assert_eq!(finals, 0);
+                                    copies.push(
+                                        ProviderRoundUiCopy::from_item(&notification.item).unwrap(),
+                                    );
+                                    if let Some(release) = release.take() {
+                                        release.send(()).unwrap();
+                                    }
+                                }
+                                TurnItem::SystemEvent { code, .. }
+                                    if code.as_deref() == Some("provider_usage") =>
+                                {
+                                    receiver.acknowledge_last(Ok(()));
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } => {
+                            assert!(release.is_none());
+                            canonical = Some(
+                                serde_json::from_value::<
+                                    pioneer_provider::CanonicalProviderRoundEnvelope,
+                                >(payload.clone())
+                                .unwrap(),
+                            );
+                        }
+                        AgentDurableEvent::TurnFinalizationPrepared { notification, .. } => {
+                            finals += 1;
+                            let TurnItem::AgentMessage { text, phase, .. } = &notification.item
+                            else {
+                                panic!("final item")
+                            };
+                            assert_eq!(text, "one\n\ntwo");
+                            assert_eq!(*phase, AgentMessagePhase::FinalAnswer);
+                            assert!(
+                                canonical.is_some(),
+                                "durable canonical ACK must precede finalization"
+                            );
+                        }
+                        _ => {}
+                    }
+                    receiver.acknowledge_last(Ok(()));
+                }
+                assert_eq!(copies.len(), 2);
+                assert_ne!(copies[0].turn_item_id, copies[1].turn_item_id);
+                if agent {
+                    assert_eq!(finals, 0);
+                } else {
+                    assert_eq!(finals, 1);
+                    let envelope = canonical.unwrap();
+                    let declared = envelope.ui_copies.unwrap();
+                    assert!(copies.iter().all(|copy| declared.contains(copy)));
+                }
+            };
+            let (result, ()) = tokio::join!(producer, consume);
+            assert_eq!(result.unwrap(), "one\n\ntwo");
+        }
+    }
+    #[tokio::test]
+    async fn commentary_only_chat_persists_completed_candidate_without_empty_final_or_retry() {
+        let provider: Arc<dyn Provider> = Arc::new(PhasedProvider {
+            release: std::sync::Mutex::new(None),
+            no_final: true,
+            fail: false,
+            multiple_commentary: false,
+        });
+        let hub = AgentEventHub::new();
+        let mut receiver = hub.take_durable_receiver().await.unwrap();
+        let consume = async {
+            let mut saved = false;
+            loop {
+                let event = receiver.recv().await.unwrap();
+                assert!(!matches!(
+                    event,
+                    AgentDurableEvent::TurnFinalizationPrepared { .. }
+                ));
+                match &event {
+                    AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } => {
+                        saved = true;
+                        let envelope: pioneer_provider::CanonicalProviderRoundEnvelope =
+                            serde_json::from_value(payload.clone()).unwrap();
+                        assert_eq!(envelope.termination, ProviderTermination::Complete);
+                        assert_eq!(envelope.ui_copies.unwrap().len(), 1);
+                    }
+                    AgentDurableEvent::ItemCompleted { notification } if matches!(&notification.item,TurnItem::SystemEvent{code,..}if code.as_deref()==Some("provider_usage")) =>
+                    {
+                        receiver.acknowledge_last(Ok(()));
+                        break;
+                    }
+                    _ => {}
+                }
+                receiver.acknowledge_last(Ok(()));
+            }
+            assert!(saved);
+        };
+        let (result, ()) = tokio::join!(
+            stream_provider_response(
+                &provider,
+                request(),
+                "ws",
+                "thread",
+                "turn",
+                "thinking",
+                "final",
+                ProviderTimeoutPolicy::default(),
+                &hub
+            ),
+            consume
+        );
+        assert!(matches!(result, Err(ChatTurnError::Terminal(_))));
+    }
+    #[tokio::test]
+    async fn partial_typed_failure_keeps_only_completed_commentary_as_observation_copy() {
+        let provider: Arc<dyn Provider> = Arc::new(PhasedProvider {
+            release: std::sync::Mutex::new(None),
+            no_final: false,
+            fail: true,
+            multiple_commentary: false,
+        });
+        let hub = AgentEventHub::new();
+        let mut receiver = hub.take_durable_receiver().await.unwrap();
+        let consume = async {
+            let mut observation = None;
+            loop {
+                let event = receiver.recv().await.unwrap();
+                assert!(!matches!(
+                    event,
+                    AgentDurableEvent::TurnFinalizationPrepared { .. }
+                ));
+                let done = matches!(&event,AgentDurableEvent::ItemCompleted{notification}if matches!(&notification.item,TurnItem::SystemEvent{code,..}if code.as_deref()==Some("provider_usage")));
+                if let AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } = event {
+                    observation = Some(
+                        serde_json::from_value::<pioneer_provider::CanonicalProviderRoundEnvelope>(
+                            payload,
+                        )
+                        .unwrap(),
+                    );
+                }
+                receiver.acknowledge_last(Ok(()));
+                if done {
+                    break;
+                }
+            }
+            let observation = observation.unwrap();
+            assert_eq!(observation.termination, ProviderTermination::ProviderError);
+            assert!(observation.calls.is_empty());
+            assert!(observation.message.content.contains("partial"));
+            let copies = observation.ui_copies.unwrap();
+            assert_eq!(copies.len(), 1);
+            assert!(matches!(
+                copies[0].kind,
+                pioneer_provider::ProviderRoundUiCopyKind::AgentMessage {
+                    phase: AgentMessagePhase::Commentary
+                }
+            ));
+        };
+        let (result, ()) = tokio::join!(
+            request_agent_round(
+                &provider,
+                request(),
+                "ws",
+                "thread",
+                "turn",
+                "thinking",
+                false,
+                ProviderTimeoutPolicy::default(),
+                &hub
+            ),
+            consume
+        );
+        assert!(matches!(result, Err(ChatTurnError::ProviderFailure { .. })));
+    }
+}
+
+#[cfg(test)]
+mod control_deadline_tests {
+    use super::*;
+    use async_trait::async_trait;
+    struct Controls;
+    #[async_trait]
+    impl Provider for Controls {
+        fn name(&self) -> &str {
+            "control-fixture"
+        }
+        fn capabilities(&self) -> pioneer_provider::ProviderCapabilities {
+            pioneer_provider::ProviderCapabilities {
+                streaming: true,
+                ..Default::default()
+            }
+        }
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            anyhow::bail!("no fallback")
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            Ok(futures_util::stream::unfold(0u32, |id| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                let mut chunk = StreamChunk::delta("");
+                chunk.message = Some(pioneer_provider::ProviderMessageMetadata {
+                    id: pioneer_provider::ProviderMessageId(id),
+                    phase: None,
+                    boundary: pioneer_provider::ProviderMessageBoundary::Start,
+                });
+                Some((Ok(chunk), id + 1))
+            })
+            .boxed())
+        }
+    }
+    #[tokio::test]
+    async fn message_boundaries_without_content_do_not_extend_first_chunk_deadline() {
+        let provider: Arc<dyn Provider> = Arc::new(Controls);
+        let hub = AgentEventHub::new();
+        let mut events = hub.take_durable_receiver().await.unwrap();
+        let mut policy = ProviderTimeoutPolicy::default();
+        policy.first_chunk_timeout = std::time::Duration::from_millis(20);
+        policy.inter_chunk_idle_timeout = std::time::Duration::from_millis(20);
+        let request = ChatRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+        let consume = async {
+            loop {
+                let event = events.recv().await.unwrap();
+                let done = matches!(&event,AgentDurableEvent::ItemCompleted{notification}if matches!(&notification.item,TurnItem::SystemEvent{code,..}if code.as_deref()==Some("provider_usage")));
+                events.acknowledge_last(Ok(()));
+                if done {
+                    break;
+                }
+            }
+        };
+        let (result, ()) = tokio::join!(
+            request_agent_round(
+                &provider, request, "ws", "thread", "turn", "thinking", false, policy, &hub
+            ),
+            consume
+        );
+        let Err(ChatTurnError::ProviderFailure { failure, .. }) = result else {
+            panic!("content deadline must terminate control-only stream")
+        };
+        assert_eq!(failure.class, ProviderFailureClass::StreamStall);
+        assert_eq!(failure.stage, ProviderFailureStage::FirstChunk);
     }
 }

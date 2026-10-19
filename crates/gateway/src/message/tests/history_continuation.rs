@@ -156,7 +156,7 @@ async fn durable_final_response_aliases_survive_checkpoint_cleanup_and_frozen_re
             "",
         ),
     ] {
-        durable_final_case(provider, model, native, reasoning, ui_final, content).await;
+        durable_final_case(provider, model, native, reasoning, ui_final, content, false).await;
     }
 }
 
@@ -167,6 +167,7 @@ async fn durable_final_case(
     reasoning: &str,
     ui_final: &str,
     content: &str,
+    phased: bool,
 ) {
     let thread = "g05-final-thread";
     let turn = "g05-final-turn";
@@ -176,7 +177,53 @@ async fn durable_final_case(
     answer.provider_replay_state = Some(pioneer_provider::ProviderReplayState::for_model(
         provider, model, native,
     ));
+    let ui_copies = if phased {
+        let commentary = TurnItem::AgentMessage {
+            id: "commentary-item".into(),
+            text: "working".into(),
+            phase: pioneer_protocol::AgentMessagePhase::Commentary,
+            markdown: None,
+            markdown_version: None,
+        };
+        let mut copies = vec![
+            pioneer_provider::ProviderRoundUiCopy::from_item(&commentary).unwrap(),
+            pioneer_provider::ProviderRoundUiCopy::from_item(&TurnItem::AgentMessage {
+                id: "final-item".into(),
+                text: ui_final.into(),
+                phase: Default::default(),
+                markdown: None,
+                markdown_version: None,
+            })
+            .unwrap(),
+        ];
+        if !reasoning.is_empty() {
+            copies.push(
+                pioneer_provider::ProviderRoundUiCopy::from_item(&TurnItem::Reasoning {
+                    id: "reasoning-item".into(),
+                    summary: vec![],
+                    content: vec![reasoning.into()],
+                })
+                .unwrap(),
+            );
+        }
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: workspace.clone(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    item: commentary,
+                },
+                now_timestamp_secs(),
+            )
+            .await
+            .unwrap();
+        Some(copies)
+    } else {
+        None
+    };
     let envelope = CanonicalProviderRoundEnvelope {
+        ui_copies,
         version: 1,
         round_id: "final-item".into(),
         termination: ProviderTermination::Complete,
@@ -368,8 +415,25 @@ async fn durable_final_case(
     );
     assert_eq!(
         origin.source_aliases.len(),
-        usize::from(!reasoning.trim().is_empty()) + usize::from(!ui_final.trim().is_empty())
+        usize::from(!reasoning.trim().is_empty())
+            + usize::from(!ui_final.trim().is_empty())
+            + usize::from(phased)
     );
+    if phased {
+        assert_eq!(
+            pioneer_provider::history::portable_history_message(&canonical)
+                .content
+                .matches("working")
+                .count(),
+            1
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.provider_replay_state.is_none() && m.content.contains("working")),
+            "exact commentary UI copy must be represented only by canonical history"
+        );
+    }
     let source = SourceRef {
         scope: origin.sources[0].scope.clone(),
         id: origin.sources[0].id.clone(),
@@ -758,6 +822,7 @@ async fn unrelated_technical_completion_and_foreign_identity_do_not_discharge_fi
         item_id: "expected-reasoning".into(),
         sequence: 1,
         payload: serde_json::to_value(CanonicalProviderRoundEnvelope {
+            ui_copies: None,
             version: 1,
             round_id: "expected-final".into(),
             termination: ProviderTermination::Complete,
@@ -968,4 +1033,323 @@ async fn ordinary_ui_only_final_keeps_existing_cold_history_eligibility() {
     )
     .unwrap();
     assert!(layout.units.iter().all(|u| u.complete));
+}
+
+#[tokio::test]
+async fn responses_commentary_exact_copies_survive_hot_cold_recovery_frozen_checkpoint() {
+    // Synthetic native replay; portable generic aliases remain independent of wire schema.
+    durable_final_case("openai","gpt-6.1-sol",json!({"schema_version":1,"wire_api":"responses","authority_scope":"synthetic","output":[
+        {"id":"m-commentary","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working"}]},
+        {"id":"reasoning","type":"reasoning","summary":[{"type":"summary_text","text":"canonical reasoning"}],"encrypted_content":"SYNTHETIC_CIPHERTEXT"},
+        {"id":"m-final","type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"canonical final answer"}]}
+    ]}),"canonical reasoning","canonical final answer","[Assistant commentary]\nworking\n\ncanonical final answer",true).await;
+}
+
+#[tokio::test]
+async fn explicit_copies_require_named_completed_semantics_and_empty_does_not_wait_for_final() {
+    let thread = "p71-copy-thread";
+    let turn = "p71-copy-turn";
+    let (_processor, store, workspace) = setup_execution_window_terminal_turn(thread, turn).await;
+    let item = TurnItem::AgentMessage {
+        id: "copy".into(),
+        text: "working".into(),
+        phase: pioneer_protocol::AgentMessagePhase::Commentary,
+        markdown: None,
+        markdown_version: None,
+    };
+    let copy = pioneer_provider::ProviderRoundUiCopy::from_item(&item).unwrap();
+    let mut envelope = CanonicalProviderRoundEnvelope {
+        version: 1,
+        round_id: "request-identity".into(),
+        termination: ProviderTermination::Complete,
+        message: ChatMessage::assistant("[Assistant commentary]\nworking"),
+        calls: vec![],
+        ui_copies: Some(vec![copy]),
+    };
+    let raw = serde_json::to_string(&envelope).unwrap();
+    store
+        .append_turn_llm_context(
+            pioneer_crud::NewTurnLlmContextEntry {
+                turn_id: turn.into(),
+                item_id: Some("request-identity".into()),
+                attempt_id: None,
+                sequence: 1,
+                source: "assistant_round".into(),
+                tool_name: None,
+                payload: raw.clone(),
+                output_policy_snapshot: "{}".into(),
+                created_at: chrono::Utc::now().fixed_offset(),
+                expires_at: None,
+            },
+            "synthetic-request",
+        )
+        .await
+        .unwrap();
+    let source = store
+        .compaction_context_reference_for_item(
+            &workspace,
+            thread,
+            turn,
+            "request-identity",
+            "assistant_round",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .materialize_item_started(
+            ItemStartedNotification {
+                workspace_id: workspace.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: item.clone(),
+            },
+            now_timestamp_secs(),
+        )
+        .await
+        .unwrap();
+    let evidence = crate::compaction::provider_round_aliases(
+        &store, &workspace, thread, turn, &source, &envelope, None,
+    )
+    .await
+    .unwrap();
+    assert!(!evidence.ready);
+    assert!(evidence.aliases.is_empty());
+    // Same text and ID with a different phase has no alias authority.
+    let mut wrong = item.clone();
+    if let TurnItem::AgentMessage { phase, .. } = &mut wrong {
+        *phase = pioneer_protocol::AgentMessagePhase::FinalAnswer;
+    }
+    store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: workspace.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: wrong,
+            },
+            now_timestamp_secs(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !crate::compaction::provider_round_aliases(
+            &store, &workspace, thread, turn, &source, &envelope, None
+        )
+        .await
+        .unwrap()
+        .ready
+    );
+    store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: workspace.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: item.clone(),
+            },
+            now_timestamp_secs(),
+        )
+        .await
+        .unwrap();
+    let evidence = crate::compaction::provider_round_aliases(
+        &store, &workspace, thread, turn, &source, &envelope, None,
+    )
+    .await
+    .unwrap();
+    assert!(evidence.ready);
+    assert!(!evidence.aliases.is_empty());
+    let mut changed = item;
+    if let TurnItem::AgentMessage { text, .. } = &mut changed {
+        *text = "updated content with same ID".into();
+    }
+    store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: workspace.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: changed,
+            },
+            now_timestamp_secs(),
+        )
+        .await
+        .unwrap();
+    let messages = load_line_history(
+        &store,
+        &workspace,
+        thread,
+        None,
+        &store.compaction_history_read_fence().await.unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.content.contains("updated content with same ID"))
+    );
+    envelope.ui_copies = Some(vec![]);
+    assert!(
+        crate::compaction::provider_round_aliases(
+            &store, &workspace, thread, turn, &source, &envelope, None
+        )
+        .await
+        .unwrap()
+        .ready
+    );
+    envelope.ui_copies = None;
+    assert!(
+        !crate::compaction::provider_round_aliases(
+            &store, &workspace, thread, turn, &source, &envelope, None
+        )
+        .await
+        .unwrap()
+        .ready
+    );
+    assert_eq!(
+        store.list_turn_llm_context(turn).await.unwrap()[0].payload,
+        raw,
+        "old immutable bytes are never rewritten by hydration"
+    );
+}
+
+#[tokio::test]
+async fn tool_round_commentary_copies_are_exact_without_a_final_ui_item() {
+    let thread = "p71-tool-thread";
+    let turn = "p71-tool-turn";
+    let (_processor, store, workspace) = setup_execution_window_terminal_turn(thread, turn).await;
+    let commentary = TurnItem::AgentMessage {
+        id: "tool-commentary".into(),
+        text: "working".into(),
+        phase: pioneer_protocol::AgentMessagePhase::Commentary,
+        markdown: None,
+        markdown_version: None,
+    };
+    store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: workspace.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: commentary.clone(),
+            },
+            now_timestamp_secs(),
+        )
+        .await
+        .unwrap();
+    let mut assistant = ChatMessage::assistant_tool_calls(
+        Some("[Assistant commentary]\nworking"),
+        vec![ProviderToolCall {
+            id: "call_real".into(),
+            name: "echo".into(),
+            arguments: "{}".into(),
+        }],
+    );
+    assistant.provider_replay_state = Some(pioneer_provider::ProviderReplayState::for_model(
+        "openai",
+        "gpt-6.1-sol",
+        json!({"schema_version":1,"wire_api":"responses","authority_scope":"synthetic","output":[{"type":"message","id":"comment","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working"}]},{"type":"function_call","id":"fc","call_id":"call_real","name":"echo","arguments":"{}"}]}),
+    ));
+    let envelope = CanonicalProviderRoundEnvelope {
+        version: 1,
+        round_id: "tool-request".into(),
+        termination: ProviderTermination::ToolCalls,
+        message: assistant,
+        calls: vec![pioneer_provider::ProviderCallIdentity {
+            provider_call_id: "call_real".into(),
+            turn_item_id: "tool-ui".into(),
+            ordinal: 0,
+        }],
+        ui_copies: Some(vec![
+            pioneer_provider::ProviderRoundUiCopy::from_item(&commentary).unwrap(),
+        ]),
+    };
+    let result = ChatMessage::tool_result("call_real", "echo", "ok");
+    for (item, source, payload, key) in [
+        (
+            "tool-request",
+            "assistant_round",
+            serde_json::to_string(&envelope).unwrap(),
+            "synthetic-round",
+        ),
+        (
+            "tool-ui",
+            "tool_result_v2",
+            serde_json::to_string(&pioneer_tools::ToolResultView::Json {
+                value: serde_json::to_value(result).unwrap(),
+                truncated: false,
+            })
+            .unwrap(),
+            "synthetic-result",
+        ),
+    ] {
+        store
+            .append_turn_llm_context(
+                pioneer_crud::NewTurnLlmContextEntry {
+                    turn_id: turn.into(),
+                    item_id: Some(item.into()),
+                    attempt_id: None,
+                    sequence: 0,
+                    source: source.into(),
+                    tool_name: None,
+                    payload,
+                    output_policy_snapshot: "{}".into(),
+                    created_at: chrono::Utc::now().fixed_offset(),
+                    expires_at: None,
+                },
+                key,
+            )
+            .await
+            .unwrap();
+    }
+    let messages = load_line_history(
+        &store,
+        &workspace,
+        thread,
+        None,
+        &store.compaction_history_read_fence().await.unwrap(),
+    )
+    .await
+    .unwrap();
+    let native = messages
+        .iter()
+        .find(|m| m.provider_replay_state.is_some())
+        .unwrap();
+    let origin = native.provenance.as_ref().unwrap();
+    assert!(origin.complete);
+    assert_eq!(origin.source_aliases.len(), 1);
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m.content.contains("working"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m.role == pioneer_provider::Role::Tool)
+            .count(),
+        1
+    );
+    let source = SourceRef {
+        scope: origin.sources[0].scope.clone(),
+        id: origin.sources[0].id.clone(),
+        version: origin.sources[0].version.clone(),
+    };
+    let row = store
+        .list_turn_llm_context(turn)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.source == "assistant_round")
+        .unwrap();
+    let recovered = crate::resilience::recovered_final_origin_for_test(
+        &store, &workspace, thread, turn, &row, &source,
+    )
+    .await
+    .unwrap();
+    assert!(recovered.complete);
+    assert_eq!(recovered.source_aliases, origin.source_aliases);
 }

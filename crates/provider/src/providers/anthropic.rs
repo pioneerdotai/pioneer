@@ -466,6 +466,7 @@ impl AnthropicProvider {
         }
 
         Ok(ChatResponse {
+            messages: Vec::new(),
             text,
             usage,
             termination,

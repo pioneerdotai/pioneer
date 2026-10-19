@@ -915,6 +915,7 @@ impl crate::traits::Provider for GlmProvider {
         }
 
         Ok(ChatResponse {
+            messages: Vec::new(),
             text,
             usage,
             termination,

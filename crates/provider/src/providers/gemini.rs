@@ -1135,6 +1135,7 @@ impl crate::traits::Provider for GeminiProvider {
         }
 
         Ok(ChatResponse {
+            messages: Vec::new(),
             text,
             usage,
             termination,

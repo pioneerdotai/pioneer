@@ -164,6 +164,14 @@ impl Summarizer for NativeSummarizer {
                 },
             }
         })?;
+        pioneer_provider::ProviderMessageCollector::validate_response(&response).map_err(|_| {
+            SummaryFailure {
+                diagnostic: None,
+                kind: FailureKind::Permanent,
+                retry_after_ms: None,
+                code: "invalid_summary_messages",
+            }
+        })?;
         let kind = if !response.tool_calls.is_empty() {
             CompletionKind::ToolCall
         } else {
@@ -212,6 +220,7 @@ mod tests {
                 anyhow::bail!("synthetic failure")
             }
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text: HEADINGS
                     .iter()
                     .map(|h| format!("{h}\nНет сведений.\n"))

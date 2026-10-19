@@ -15,6 +15,11 @@ pub mod file_tools;
 mod generation;
 pub mod history;
 mod http;
+pub mod messages;
+pub use messages::{
+    ProviderMessage, ProviderMessageBoundary, ProviderMessageCollector, ProviderMessageId,
+    ProviderMessageMetadata, ProviderRoundUiCopy, ProviderRoundUiCopyKind,
+};
 pub mod providers;
 pub mod reasoning_registry;
 pub mod registry;
@@ -59,6 +64,6 @@ pub use types::{
     ProviderCallIdentity, ProviderCapabilities, ProviderFailureClassification,
     ProviderHttpErrorBodyTooLarge, ProviderInputCapabilities, ProviderReplayState,
     ProviderResponseLimits, ProviderResponseTooLarge, ProviderStream, ProviderStreamDiagnostics,
-    ProviderTermination, ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig, ReasoningEffort,
-    Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+    ProviderTermination, ProviderTimeoutPolicy, ProviderToolCall, ProviderUsageProfile,
+    ReasoningConfig, ReasoningEffort, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
 };

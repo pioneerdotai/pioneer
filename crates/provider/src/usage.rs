@@ -8,6 +8,10 @@ pub(crate) type ChatUsage = WireUsage<0>;
 pub(crate) type AnthropicUsage = WireUsage<1>;
 pub(crate) type BedrockUsage = WireUsage<2>;
 pub(crate) type GeminiUsage = WireUsage<3>;
+pub(crate) fn normalize_responses(value: &Value) -> anyhow::Result<TokenUsage> {
+    anyhow::ensure!(value.is_object(), "invalid Responses usage");
+    Ok(WireUsage::<4>(bounded_usage(value)).normalized())
+}
 
 #[derive(Debug)]
 pub(crate) struct WireUsage<const API: u8>(Value);
@@ -88,6 +92,8 @@ pub fn bounded_usage(value: &Value) -> Value {
                                 | "output_tokens"
                                 | "prompt_tokens_details"
                                 | "completion_tokens_details"
+                                | "input_tokens_details"
+                                | "output_tokens_details"
                                 | "cached_tokens"
                                 | "cache_write_tokens"
                                 | "cache_creation_input_tokens"
@@ -197,6 +203,14 @@ impl<const API: u8> WireUsage<API> {
                 None,
                 n("thoughtsTokenCount"),
                 "inclusive_cache_separate_thoughts",
+            ),
+            4 => (
+                n("input_tokens"),
+                n("output_tokens"),
+                raw["input_tokens_details"]["cached_tokens"].as_u64(),
+                raw["input_tokens_details"]["cache_write_tokens"].as_u64(),
+                raw["output_tokens_details"]["reasoning_tokens"].as_u64(),
+                "inclusive_cache_and_reasoning",
             ),
             _ => (
                 n("prompt_tokens"),
@@ -379,8 +393,12 @@ fn pricing_eligibility(
     // https://developers.openai.com/api/docs/pricing (APIs not priced separately).
     // This narrow API equivalence does not confer endpoint/model equivalence.
     let matching_api = (provider == "openai"
-        && usage.api.as_deref() == Some("chat_completions")
-        && entry.api == "openai-responses")
+        && ((usage.api.as_deref() == Some("chat_completions") && entry.api == "openai-responses")
+            || usage.api.as_deref() == Some("responses")
+                && matches!(
+                    entry.api.as_str(),
+                    "openai-responses" | "openai-completions"
+                )))
         || matches!(
             (usage.api.as_deref(), entry.api.as_str()),
             (Some("chat_completions"), "openai-completions")
@@ -654,6 +672,17 @@ impl UsageContext {
             attempt: pioneer_protocol::generate_id(21),
             catalog: crate::catalog::model_catalog().ok(),
         }
+    }
+    pub(crate) fn capture_request(
+        provider: &dyn crate::Provider,
+        request: &crate::ChatRequest,
+    ) -> anyhow::Result<Self> {
+        let profile = provider.request_usage_profile(request)?;
+        let mut context = Self::capture(provider, &request.model);
+        context.api = profile.api;
+        context.api_version = profile.api_version;
+        context.route = profile.route;
+        Ok(context)
     }
     pub(crate) fn enrich_error(&self, error: anyhow::Error) -> anyhow::Error {
         if let Some(mut usage) = error_usage(&error).cloned() {

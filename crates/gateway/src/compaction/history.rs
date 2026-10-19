@@ -512,6 +512,188 @@ pub(crate) async fn final_response_aliases(
     .await
 }
 
+/// Explicit producer-owned copies use exact completed event revisions. None
+/// retains historical alias rules; Some([]) deliberately requires no UI item.
+pub(crate) async fn provider_round_aliases(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    represented: &SourceRef,
+    envelope: &CanonicalProviderRoundEnvelope,
+    reasoning_id: Option<&str>,
+) -> Result<FinalResponseAliasEvidence> {
+    let Some(copies) = envelope.ui_copies.as_deref() else {
+        return if envelope.calls.is_empty() {
+            final_response_aliases(
+                store,
+                workspace,
+                thread,
+                turn,
+                represented,
+                &envelope.round_id,
+                reasoning_id,
+            )
+            .await
+        } else {
+            Ok(FinalResponseAliasEvidence {
+                aliases: vec![],
+                ready: true,
+            })
+        };
+    };
+    ensure!(
+        represented.scope == format!("context:{turn}") && !represented.version.is_empty(),
+        "provider copy source authority mismatch"
+    );
+    if copies.is_empty() {
+        return Ok(FinalResponseAliasEvidence {
+            aliases: vec![],
+            ready: true,
+        });
+    }
+    let fence = store.compaction_history_read_fence().await?;
+    let mut after = 0;
+    let mut aliases = Vec::new();
+    let mut seen = BTreeSet::new();
+    loop {
+        let page = store
+            .compaction_source_metadata_page_at_fence(
+                workspace,
+                thread,
+                turn,
+                PagedSource::Event,
+                after,
+                fence.event_order,
+            )
+            .await?;
+        record_work(Work::Pages, 1);
+        let evidence = ui_copy_evidence_at_fence(
+            store,
+            workspace,
+            thread,
+            turn,
+            represented,
+            copies,
+            &page.entries,
+        )
+        .await?;
+        aliases.extend(evidence.0);
+        seen.extend(evidence.1);
+        if page.next_sequence <= after {
+            break;
+        }
+        after = page.next_sequence;
+    }
+    Ok(FinalResponseAliasEvidence {
+        aliases,
+        ready: seen.len() == copies.len(),
+    })
+}
+
+async fn ui_copy_evidence_at_fence(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    represented: &SourceRef,
+    copies: &[pioneer_provider::ProviderRoundUiCopy],
+    events: &[SourceRecord],
+) -> Result<(Vec<MessageSourceAlias>, BTreeSet<String>)> {
+    ensure!(
+        represented.scope == format!("context:{turn}") && !represented.version.is_empty(),
+        "provider copy source authority mismatch"
+    );
+    ensure!(copies.len() <= 130, "provider UI copy count limit");
+    let mut ids = BTreeSet::new();
+    ensure!(
+        copies.iter().all(|copy| !copy.turn_item_id.is_empty()
+            && copy.turn_item_id.len() <= 256
+            && copy.content_sha256.len() == 64
+            && copy.content_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+            && ids.insert(copy.turn_item_id.as_str())),
+        "invalid provider UI copy relations"
+    );
+    let mut aliases = Vec::new();
+    let mut seen = BTreeSet::new();
+    for row in events {
+        if row.source_type != pioneer_protocol::constants::events::ITEM_COMPLETED
+            || row.reference.scope != format!("event:{turn}")
+            || row.reference.version.is_empty()
+        {
+            continue;
+        }
+        let Some(copy) = copies
+            .iter()
+            .find(|copy| row.item_id.as_deref() == Some(copy.turn_item_id.as_str()))
+        else {
+            continue;
+        };
+        let payload = reference_payload(store, workspace, thread, &row.reference).await?;
+        let event: Event = serde_json::from_str(&payload)?;
+        ensure!(
+            event.workspace_id() == workspace
+                && event.thread_id() == thread
+                && event.turn_id() == turn,
+            "provider UI copy scope mismatch"
+        );
+        let Event::ItemCompleted(completed) = &event else {
+            continue;
+        };
+        if !copy.matches(&completed.item) {
+            continue;
+        }
+        seen.insert(copy.turn_item_id.clone());
+        if !pioneer_crud::canonical_event_model_projection(&event).is_omitted() {
+            aliases.push(MessageSourceAlias {
+                represented_thread_id: thread.into(),
+                represented_source: runtime_source_ref(represented),
+                thread_id: thread.into(),
+                source: runtime_source_ref(&row.reference),
+            });
+        }
+    }
+    Ok((aliases, seen))
+}
+
+async fn provider_round_evidence_at_fence(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    represented: &SourceRef,
+    envelope: &CanonicalProviderRoundEnvelope,
+    reasoning_id: Option<&str>,
+    events: &[SourceRecord],
+) -> Result<FinalResponseAliasEvidence> {
+    if let Some(copies) = &envelope.ui_copies {
+        let (aliases, seen) =
+            ui_copy_evidence_at_fence(store, workspace, thread, turn, represented, copies, events)
+                .await?;
+        Ok(FinalResponseAliasEvidence {
+            aliases,
+            ready: seen.len() == copies.len(),
+        })
+    } else if envelope.calls.is_empty() {
+        final_response_evidence_at_fence(
+            store,
+            workspace,
+            thread,
+            turn,
+            represented,
+            &envelope.round_id,
+            reasoning_id,
+            events,
+        )
+        .await
+    } else {
+        Ok(FinalResponseAliasEvidence {
+            aliases: vec![],
+            ready: true,
+        })
+    }
+}
+
 /// Completion and model projection are separate facts. In particular, an empty
 /// completed Reasoning/AgentMessage is omitted, but still completes its exact UI
 /// identity. Read only matching completed revisions; never infer completion from
@@ -893,6 +1075,10 @@ fn finish_round(
         unit,
         vec![round.assistant_source],
     ));
+    if let Some(origin) = assistant.provenance.as_mut() {
+        origin.source_aliases = round.response_aliases;
+        origin.complete &= round.response_copies_ready;
+    }
     let mut messages = vec![assistant];
     for (call, identity) in calls.iter().zip(&round.envelope.calls) {
         if let Some((source, message)) = round.results.get(&identity.turn_item_id) {
@@ -2061,6 +2247,7 @@ async fn load_line_history_inner(
                 .flat_map(|items| items.iter().copied())
                 .map(str::to_owned)
                 .collect::<BTreeSet<_>>();
+            let mut exact_ui_aliases = BTreeSet::new();
             aliases.extend(context_aliases);
             aliases.extend(
                 contexts
@@ -2138,28 +2325,12 @@ async fn load_line_history_inner(
                                 );
                                 // Native content owns the model history. Suppress its
                                 // exact reasoning/final UI copies, keeping stored events.
-                                aliases.insert(envelope.round_id.clone());
-                                if let Some(item) = row.item_id.as_ref() {
-                                    aliases.insert(item.clone());
+                                if envelope.ui_copies.is_none() {
+                                    aliases.insert(envelope.round_id.clone());
+                                    if let Some(item)=row.item_id.as_ref(){aliases.insert(item.clone());}
                                 }
-                                let evidence = if envelope.calls.is_empty() {
-                                    final_response_evidence_at_fence(
-                                        store,
-                                        workspace,
-                                        thread,
-                                        &turn.id,
-                                        &row.reference,
-                                        &envelope.round_id,
-                                        row.item_id.as_deref(),
-                                        &alias_events,
-                                    )
-                                    .await?
-                                } else {
-                                    FinalResponseAliasEvidence {
-                                        aliases: Vec::new(),
-                                        ready: true,
-                                    }
-                                };
+                                let evidence=provider_round_evidence_at_fence(store,workspace,thread,&turn.id,&row.reference,&envelope,row.item_id.as_deref(),&alias_events).await?;
+                                exact_ui_aliases.extend(evidence.aliases.iter().map(|alias| SourceRef{scope:alias.source.scope.clone(),id:alias.source.id.clone(),version:alias.source.version.clone()}));
                                 pending = Some(Round {
                                     sequence: starts
                                         .get(&envelope.round_id)
@@ -2268,7 +2439,7 @@ async fn load_line_history_inner(
                             last_attachment_copies.get(item) != Some(&row.sequence)
                         }));
                 let metadata_only = matches!(kind, "start" | "technical")
-                    || row.item_id.as_ref().is_some_and(|id| aliases.contains(id));
+                    || exact_ui_aliases.contains(&row.reference) || row.item_id.as_ref().is_some_and(|id| aliases.contains(id));
                 let superseded_input = matches!(kind, "input" | "input_revision" | "input_deleted")
                     && (use_input_rows || Some(row.sequence) != latest_input);
                 !superseded_copy && !metadata_only && !superseded_input
@@ -2667,6 +2838,7 @@ mod tests {
         );
         message.provider_replay_state = Some(state.clone());
         let envelope = CanonicalProviderRoundEnvelope {
+            ui_copies: None,
             version: 1,
             round_id: "final-item".into(),
             termination: pioneer_provider::ProviderTermination::Complete,
@@ -2847,6 +3019,7 @@ mod tests {
     #[test]
     fn malformed_or_failed_round_cannot_become_completed_inherited_work() {
         let envelope = CanonicalProviderRoundEnvelope {
+            ui_copies: None,
             version: 1,
             round_id: "round".into(),
             termination: pioneer_provider::ProviderTermination::ToolCalls,
@@ -2904,6 +3077,7 @@ mod tests {
             ]}),
         ));
         let failed = CanonicalProviderRoundEnvelope {
+            ui_copies: None,
             version: 1,
             round_id: "failed".into(),
             termination: pioneer_provider::ProviderTermination::ProviderError,
@@ -2929,6 +3103,7 @@ mod tests {
         let round = Round {
             sequence: 1,
             envelope: CanonicalProviderRoundEnvelope {
+                ui_copies: None,
                 version: 1,
                 round_id: "interrupted".into(),
                 termination: pioneer_provider::ProviderTermination::ToolCalls,

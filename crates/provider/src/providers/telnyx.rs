@@ -851,6 +851,7 @@ impl crate::traits::Provider for TelnyxProvider {
         }
 
         Ok(ChatResponse {
+            messages: Vec::new(),
             text,
             usage,
             termination,

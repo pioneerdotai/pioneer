@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 async fn fixture(body: String) -> (String, tokio::task::JoinHandle<serde_json::Value>) {
     fixture_with_headers(body, String::new(), "200 OK").await
 }
-async fn fixture_with_headers(
+pub(super) async fn fixture_with_headers(
     body: String,
     headers: String,
     status: &'static str,
@@ -70,7 +70,7 @@ fn request(model: &str) -> ChatRequest {
 }
 
 #[tokio::test]
-async fn openai_usage_after_finish_is_read_before_terminal_without_cache_double_count() {
+async fn openai_audio_chat_usage_after_finish_preserves_legacy_usage_contract() {
     let body = concat!(
         "data: {\"choices\":[{\"delta\":{\"content\":\"Привет\"},\"finish_reason\":null}]}\n\n",
         "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
@@ -81,7 +81,7 @@ async fn openai_usage_after_finish_is_read_before_terminal_without_cache_double_
     let provider = OpenAiProvider::with_base_url("fixture-key", url);
     let mut stream = crate::attachments::runtime::with_async_authority_scope(
         "usage-fixture-authority".into(),
-        provider.stream_chat(request("gpt-4o")),
+        provider.stream_chat(request("gpt-audio")),
     )
     .await
     .unwrap();
@@ -149,7 +149,7 @@ async fn openrouter_ignores_repeated_empty_terminal_choice_and_preserves_usage()
 }
 
 #[tokio::test]
-async fn openai_rejects_real_payload_after_finish_reason() {
+async fn openai_audio_chat_rejects_real_payload_after_finish_reason() {
     let body = concat!(
         "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
         "data: {\"choices\":[{\"delta\":{\"content\":\"late\"},\"finish_reason\":null}]}\n\n",
@@ -160,7 +160,7 @@ async fn openai_rejects_real_payload_after_finish_reason() {
     let provider = OpenAiProvider::with_base_url("fixture-key", url);
     let chunks: Vec<_> = crate::attachments::runtime::with_async_authority_scope(
         "usage-fixture-authority".into(),
-        provider.stream_chat(request("gpt-4o")),
+        provider.stream_chat(request("gpt-audio")),
     )
     .await
     .unwrap()
@@ -208,7 +208,7 @@ async fn anthropic_stream_merges_start_cache_input_and_cumulative_output() {
 }
 
 #[tokio::test]
-async fn missing_usage_stays_unknown_and_missing_finish_is_error() {
+async fn audio_chat_missing_usage_stays_unknown_and_missing_finish_is_error() {
     for (body, succeeds) in [
         (
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
@@ -220,7 +220,7 @@ async fn missing_usage_stays_unknown_and_missing_finish_is_error() {
         let provider = OpenAiProvider::with_base_url("fixture-key", url);
         let chunks: Vec<_> = crate::attachments::runtime::with_async_authority_scope(
             "usage-fixture-authority".into(),
-            provider.stream_chat(request("gpt-4o")),
+            provider.stream_chat(request("gpt-audio")),
         )
         .await
         .unwrap()
@@ -235,7 +235,7 @@ async fn missing_usage_stays_unknown_and_missing_finish_is_error() {
 }
 
 #[tokio::test]
-async fn dropping_stream_closes_pending_http_transport() {
+async fn dropping_audio_chat_stream_closes_pending_http_transport() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -272,7 +272,7 @@ async fn dropping_stream_closes_pending_http_transport() {
     let provider = OpenAiProvider::with_base_url("fixture-key", format!("http://{address}"));
     let mut stream = crate::attachments::runtime::with_async_authority_scope(
         "usage-fixture-authority".into(),
-        provider.stream_chat(request("gpt-4o")),
+        provider.stream_chat(request("gpt-audio")),
     )
     .await
     .unwrap();
@@ -283,7 +283,7 @@ async fn dropping_stream_closes_pending_http_transport() {
 
 #[tokio::test]
 async fn compatible_stream_usage_opt_in_is_profile_specific_and_terminal_is_cumulative() {
-    use super::compatible::{AuthStyle, OpenAiCompatibleProvider};
+    use super::chat_completions_api_compatible::{AuthStyle, ChatCompletionsApiCompatibleProvider};
     for (profile, opt_in) in [
         ("groq", true),
         ("deepseek", true),
@@ -298,8 +298,12 @@ async fn compatible_stream_usage_opt_in_is_profile_specific_and_terminal_is_cumu
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":140,\"completion_tokens\":19}}\n\n",
             "data: [DONE]\n\n").to_owned();
         let (url, server) = fixture(body).await;
-        let provider =
-            OpenAiCompatibleProvider::new(profile, url, "fixture-key", AuthStyle::Bearer);
+        let provider = ChatCompletionsApiCompatibleProvider::new(
+            profile,
+            url,
+            "fixture-key",
+            AuthStyle::Bearer,
+        );
         let mut stream = crate::attachments::runtime::with_async_authority_scope(
             "usage-fixture-authority".into(),
             provider.stream_chat(request("fixture")),
@@ -327,11 +331,12 @@ async fn compatible_stream_usage_opt_in_is_profile_specific_and_terminal_is_cumu
 
 #[tokio::test]
 async fn groq_request_id_is_distinct_and_profile_specific() {
-    use super::compatible::{AuthStyle, OpenAiCompatibleProvider};
+    use super::chat_completions_api_compatible::{AuthStyle, ChatCompletionsApiCompatibleProvider};
     for profile in ["groq", "custom"] {
         let body = r#"{"id":"chatcmpl-completion","model":"actual","x_groq":{"id":"req-native","secret":"SECRET"},"choices":[{"message":{"content":"answer"},"finish_reason":"stop"}]}"#;
         let (url, server) = fixture(body.into()).await;
-        let provider = OpenAiCompatibleProvider::new(profile, url, "fixture", AuthStyle::Bearer);
+        let provider =
+            ChatCompletionsApiCompatibleProvider::new(profile, url, "fixture", AuthStyle::Bearer);
         let response = crate::attachments::runtime::with_async_authority_scope(
             "usage-fixture-authority".into(),
             provider.chat(request("fixture")),
