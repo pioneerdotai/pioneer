@@ -153,12 +153,9 @@ impl ResponsesApiCompatibleProvider {
             AuthStyle::XApiKey => "x-api-key".to_owned(),
             AuthStyle::Custom(header) => format!("custom:{header}"),
         };
-        let authority = format!(
-            "{:x}",
-            sha2::Sha256::digest(format!(
-                "responses-authority-v1\0{name}\0{root}\0{auth_identity}\0{credential}"
-            ))
-        );
+        let authority = hex::encode(sha2::Sha256::digest(format!(
+            "responses-authority-v1\0{name}\0{root}\0{auth_identity}\0{credential}"
+        )));
         let policy = ProviderTimeoutPolicy::default();
         Self {
             name,
@@ -366,7 +363,7 @@ impl ResponsesApiCompatibleProvider {
                     tokio::select! { biased; _=tx.closed()=>return, next=bytes.next()=>next };
                 let result: Result<bool> = async {
                     let Some(next) = next else {
-                        decoder.finish()?;
+                        std::mem::take(&mut decoder).finish()?;
                         return Err(
                             crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker
                                 .into(),

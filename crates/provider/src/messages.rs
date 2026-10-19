@@ -235,10 +235,7 @@ impl ProviderRoundUiCopy {
         Some(Self {
             turn_item_id: item.item_id().to_owned(),
             kind,
-            content_sha256: format!(
-                "{:x}",
-                sha2::Sha256::digest(serde_json::to_vec(&semantic).ok()?)
-            ),
+            content_sha256: hex::encode(sha2::Sha256::digest(serde_json::to_vec(&semantic).ok()?)),
         })
     }
     pub fn matches(&self, item: &pioneer_protocol::TurnItem) -> bool {
