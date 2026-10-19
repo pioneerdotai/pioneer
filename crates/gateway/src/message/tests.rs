@@ -27775,8 +27775,9 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
             .await;
             let cancel_id =
                 generate_test_request_id("cancel-selected-restore", &child.child_turn_id);
-            processor
-                .process_request_for_connection(
+            timeout(
+                Duration::from_secs(30),
+                processor.process_request_for_connection(
                     connection,
                     &json!({
                         "jsonrpc":"2.0", "id":cancel_id, "method":"turn/cancel",
@@ -27784,8 +27785,10 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
                             "reason":"stop during accepted selected-turn restore"}
                     })
                     .to_string(),
-                )
-                .await;
+                ),
+            )
+            .await
+            .expect("Stop must finish while the selected restore remains paused");
             let cancelled = recv_response_by_id(&mut rx, cancel_id.as_str()).await;
             let cancelled: TurnCancelResponse = serde_json::from_value(cancelled.result).unwrap();
             assert_eq!(cancelled.turn.status, TurnStatus::Interrupted);
@@ -28204,6 +28207,88 @@ fn cancelling_cli_history_transfer_stops_before_provider_start_and_releases_sess
             true, false,
         ),
     );
+}
+
+#[test]
+fn cli_history_stop_and_shutdown_drop_a_pending_state_read() {
+    run_standard_stack_message_test("CLI history cancellation with occupied readers", async {
+        for shutdown in [false, true] {
+            let (_directory, workspaces, store, workspace) =
+                setup_pooled_file_workspace_manager().await;
+            let processor = MessageProcessor::new(
+                Arc::new(ThreadManager::new("test-model", "openai")),
+                test_provider(),
+                Arc::new(SessionManager::new()),
+                workspaces,
+                store.clone(),
+                test_gateway_secrets(),
+                test_summary_config(),
+                test_tool_loop_config(),
+            );
+            // Exhaust the real read-only pool. Both capture and its state
+            // monitor must wait, rather than interpreting a missing Turn.
+            let db = store.database_connection();
+            let mut readers = Vec::new();
+            for _ in 0..4 {
+                readers.push(db.begin_read().await.unwrap());
+            }
+            let mut capture = Box::pin(processor.capture_cli_transfer_projection(
+                &workspace,
+                "pending-history-thread",
+                "pending-history-turn",
+                chrono::Utc::now().timestamp_millis() as u64 + 60_000,
+            ));
+            tokio::select! { biased;
+                result = &mut capture => panic!("capture must wait for its reader: {:?}", result.err()),
+                _ = tokio::task::yield_now() => {},
+            }
+            processor.user_turn_cancel_intents.lock().await.insert(
+                (
+                    "another-thread".to_owned(),
+                    "pending-history-turn".to_owned(),
+                ),
+                super::UserTurnCancellationIntent {
+                    pending_requests: 1,
+                    reason: "unrelated Stop".to_owned(),
+                    actor_id: Some(authenticated_test_superuser().principal_id.to_string()),
+                },
+            );
+            tokio::select! { biased;
+                result = &mut capture => panic!("another thread cannot cancel capture: {:?}", result.err()),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+            }
+            if shutdown {
+                processor.cli_history_shutdown.cancel();
+            } else {
+                processor.user_turn_cancel_intents.lock().await.insert(
+                    (
+                        "pending-history-thread".to_owned(),
+                        "pending-history-turn".to_owned(),
+                    ),
+                    super::UserTurnCancellationIntent {
+                        pending_requests: 1,
+                        reason: "Stop while the state read is pending".to_owned(),
+                        actor_id: Some(authenticated_test_superuser().principal_id.to_string()),
+                    },
+                );
+            }
+            let error = timeout(Duration::from_secs(5), capture)
+                .await
+                .expect("local Stop/shutdown must not need a free reader")
+                .err()
+                .expect("capture must be cancelled");
+            assert!(error.to_string().contains("cancelled with its turn"));
+            assert_eq!(readers.len(), 4, "the test did not unblock the read");
+            drop(readers);
+            timeout(Duration::from_secs(5), db.begin_read())
+                .await
+                .expect("cancelled queries must release their pool waiters")
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+        }
+    });
 }
 
 #[derive(Default)]
@@ -29000,10 +29085,10 @@ async fn cancelling_cli_history_transfer_stops_before_provider_start_and_release
         processor.shutdown_cli_runtime_manager().await;
     } else {
         let cancel_id = generate_test_request_id("cancel-transfer", "stop");
-        processor.process_request_for_connection(connection, &json!({
+        timeout(Duration::from_secs(30), processor.process_request_for_connection(connection, &json!({
             "jsonrpc":"2.0", "id":cancel_id, "method":"turn/cancel",
             "params":{"thread_id":thread,"turn_id":turn,"reason":"stop during CLI history preparation"}
-        }).to_string()).await;
+        }).to_string())).await.expect("Stop must finish while CLI history work remains paused");
         let response = recv_response_by_id(&mut rx, cancel_id.as_str()).await;
         let cancelled: TurnCancelResponse = serde_json::from_value(response.result).unwrap();
         assert_eq!(cancelled.turn.status, TurnStatus::Interrupted);

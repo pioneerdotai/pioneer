@@ -9406,20 +9406,39 @@ impl MessageProcessor {
         active_turn_id: &str,
     ) -> anyhow::Result<()> {
         loop {
-            let live = self
-                .crud_store
-                .get_turn(thread_id, active_turn_id)
-                .await?
-                .is_some_and(|(_, turn)| turn.status == TurnStatus::InProgress);
-            let requested = self
-                .user_turn_cancel_intents
-                .lock()
-                .await
-                .contains_key(&(thread_id.to_owned(), active_turn_id.to_owned()));
-            if !live || requested || self.cli_history_shutdown.is_cancelled() {
-                anyhow::bail!("CLI history preparation was cancelled with its turn");
+            let live = self.crud_store.get_turn(thread_id, active_turn_id);
+            tokio::pin!(live);
+            loop {
+                // Waiting for database capacity must not block Stop/shutdown.
+                // Poll the existing intent while retaining just one read;
+                // returning drops its owned future before runner cleanup.
+                let requested = self
+                    .user_turn_cancel_intents
+                    .lock()
+                    .await
+                    .contains_key(&(thread_id.to_owned(), active_turn_id.to_owned()));
+                if requested {
+                    anyhow::bail!("CLI history preparation was cancelled with its turn");
+                }
+                tokio::select! { biased;
+                    _ = self.cli_history_shutdown.cancelled() => {
+                        anyhow::bail!("CLI history preparation was cancelled with its turn");
+                    },
+                    result = &mut live => {
+                        if !result?.is_some_and(|(_, turn)| turn.status == TurnStatus::InProgress) {
+                            anyhow::bail!("CLI history preparation was cancelled with its turn");
+                        }
+                        break;
+                    },
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {},
+                }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::select! {
+                _ = self.cli_history_shutdown.cancelled() => {
+                    anyhow::bail!("CLI history preparation was cancelled with its turn");
+                },
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {},
+            }
         }
     }
 

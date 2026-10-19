@@ -696,3 +696,45 @@ was opened. Local `cargo check` and functional tests were not run, as instructed
 There are no new CPU/RSS measurements: code equality supports preservation of
 the accepted optimization paths, not a claim of measured runtime equivalence.
 Compilation and execution of the combined code remain for GitHub CI.
+
+## CI cancellation follow-up
+
+The completed second attempt of run `39217624711` exposes two failures:
+the method-registry test compares the correct 158-method set to a stale literal
+156, and the pending CLI heartbeat test times out joining cancellation cleanup.
+Three CLI Stop tests never report completion (history transfer, coordinator
+wait, and selected-turn restore). The Gateway binary remains alive until the
+job is cancelled at its three-hour limit. Other `panicked at` lines in that log
+include successful intentional panic-containment tests and were not treated as
+failures. Run `39248717445` still has an active workspace step at this inspection;
+its active Linux log was unavailable, so it is not evidence of an identical result.
+
+The registry regression now retains its exact protocol-set comparison, duplicate
+checks and per-entry validation without hardcoding the number of public RPCs.
+No authorization entry or protocol method changed.
+
+Source review found that the CLI history monitor waits for `get_turn` before
+inspecting authenticated Stop intent or shutdown. A queued read therefore blocks
+the local cancellation which must drop capture/progress work before joining its
+cleanup. The monitor now retains one state-read future and races it against
+shutdown and the existing 50 ms intent check. A local Stop drops the pending read;
+it does not imply a terminal commit or acknowledge cancellation. The existing
+durable graph fence, initiator persistence, terminal receipt transaction, CLI
+transition gate and awaited runner cleanup are unchanged. There are no extra
+state queries, detached tasks, larger pools or changed scheduling classes.
+
+A new regression uses the real pooled fixture and production capture path with
+all four read-only connections occupied. It checks Stop and shutdown before any
+reader is released, rejects another thread's intent, and checks reader usability
+after cancellation. Existing Stop RPC assertions for the three stalled scenarios
+now have a 30-second bound around the request itself, while the paused work is
+still held. Their terminal-state, no-provider-start, cleanup and session-reuse
+assertions remain. The pending heartbeat test's existing failure oracle and
+timeouts are unchanged; neither failing tests nor scenarios were disabled.
+
+Local validation is `rustfmt --check`, `git diff --check`, full diff review and
+the stock mobile `check-source` with this Rust publication worktree explicitly
+selected. The source contract is unchanged. Local `cargo check`, compilation and
+functional tests were not run, per the user's instruction. Runtime confirmation
+that the read cancellation also resolves each CI stall remains for the next run;
+these changes are not reported as a passing test result or performance measurement.
