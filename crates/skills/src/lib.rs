@@ -44,9 +44,10 @@ pub use external_runtime_receipt::{
     ExternalRuntimeReceiptConversionCandidate, ExternalRuntimeSkillReceipt,
     ExternalRuntimeSkillReceiptEntry, ensure_external_runtime_receipt_v2,
     external_runtime_skill_is_current, find_external_runtime_receipt_destination_entry,
-    find_external_runtime_receipt_entry, read_external_runtime_receipt,
-    remove_external_runtime_receipt_destination_entry, remove_external_runtime_receipt_entry,
-    upsert_external_runtime_receipt_entry, write_external_runtime_receipt_atomic,
+    find_external_runtime_receipt_entry, prepare_external_runtime_receipt_v2,
+    read_external_runtime_receipt, remove_external_runtime_receipt_destination_entry,
+    remove_external_runtime_receipt_entry, upsert_external_runtime_receipt_entry,
+    write_external_runtime_receipt_atomic,
 };
 pub use file_metadata::file_link_count;
 pub use installer::{

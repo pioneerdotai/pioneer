@@ -73,22 +73,32 @@ fn build_tool_recovery_policy_section() -> PromptSection {
     }
 }
 
-fn build_subagents_policy_section() -> PromptSection {
+fn build_subagents_policy_section(cli: bool) -> PromptSection {
     PromptSection {
         id: PromptSectionId::SubagentsPolicy,
         stability: PromptStability::Dynamic,
         title: content::SECTION_TITLE_SUBAGENTS_POLICY.to_owned(),
-        content: content::SUBAGENTS_POLICY_PROMPT.to_owned(),
+        content: if cli {
+            content::CLI_SUBAGENTS_POLICY_PROMPT
+        } else {
+            content::SUBAGENTS_POLICY_PROMPT
+        }
+        .to_owned(),
         sources: Vec::new(),
     }
 }
 
-fn build_tasks_policy_section() -> PromptSection {
+fn build_tasks_policy_section(cli: bool) -> PromptSection {
     PromptSection {
         id: PromptSectionId::TasksPolicy,
         stability: PromptStability::Dynamic,
         title: content::SECTION_TITLE_TASKS_POLICY.to_owned(),
-        content: content::TASKS_POLICY_PROMPT.to_owned(),
+        content: if cli {
+            content::CLI_TASKS_POLICY_PROMPT
+        } else {
+            content::TASKS_POLICY_PROMPT
+        }
+        .to_owned(),
         sources: Vec::new(),
     }
 }
@@ -614,8 +624,12 @@ pub fn compile_prompt(input: PromptCompileInput) -> anyhow::Result<CompiledPromp
     }
 
     if input.include_task_orchestration_policy {
-        sections.push(build_subagents_policy_section());
-        sections.push(build_tasks_policy_section());
+        sections.push(build_subagents_policy_section(
+            profile == PromptProfile::CliRuntime,
+        ));
+        sections.push(build_tasks_policy_section(
+            profile == PromptProfile::CliRuntime,
+        ));
     }
 
     sections.extend(build_runtime_dynamic_sections(&input, &mut diagnostics));

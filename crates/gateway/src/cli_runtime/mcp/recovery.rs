@@ -180,16 +180,8 @@ pub(crate) async fn restore_cli_mcp_session_launch(
     }
     // Current identities above already attest the exact first-party schemas.
     // Reserve only those definitions; keep the external facade limit unchanged.
-    let mut canonical_limits = limits;
-    for tool in &projection.tools {
-        if tool.server_installation_id == pioneer_tools::html::HTML_SERVER_ID {
-            let (_, _, bytes) =
-                crate::turn_mcp::projection::canonical_schema_identity(&tool.input_schema)
-                    .map_err(|e| invalid(anyhow!(e)))?;
-            canonical_limits.max_tools += 1;
-            canonical_limits.max_total_schema_bytes += bytes.len();
-        }
-    }
+    let canonical_limits =
+        crate::turn_mcp::native_tools::projection_allowance(&projection.tools, limits);
     projection
         .finalize_identity(canonical_limits)
         .context("failed to finalize frozen MCP projection for CLI recovery")
@@ -413,8 +405,12 @@ mod tests {
             workspace_id: &str,
             binding: &TurnMcpBindingRecord,
         ) -> Result<CurrentMcpToolIdentity, TurnMcpInvocationError> {
-            if binding.server_installation_id == pioneer_tools::html::HTML_SERVER_ID {
-                return crate::mcp_service::first_party_html_identity(workspace_id, binding);
+            if crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(
+                &binding.server_installation_id,
+            )
+            .is_some()
+            {
+                return crate::turn_mcp::native_tools::current_identity(workspace_id, binding);
             }
             Ok(self.current.clone())
         }
@@ -568,7 +564,19 @@ mod tests {
             ..McpProjectionLimits::default()
         };
         let projection = if include_html {
-            projection.with_html_tools(limits).unwrap()
+            let definitions = [
+                crate::turn_mcp::native_tools::NativeToolFamily::Html,
+                crate::turn_mcp::native_tools::NativeToolFamily::Tasks,
+            ]
+            .into_iter()
+            .flat_map(|family| {
+                family
+                    .definitions()
+                    .into_iter()
+                    .map(move |spec| (family, spec))
+            })
+            .collect();
+            projection.with_native_tools(definitions, limits).unwrap()
         } else {
             projection
         };
@@ -620,7 +628,7 @@ mod tests {
         for html in projection
             .tools
             .iter()
-            .filter(|tool| tool.server_installation_id == pioneer_tools::html::HTML_SERVER_ID)
+            .filter(|tool| crate::turn_mcp::native_tools::exact_definition(tool).is_some())
         {
             let transformed = original_launch
                 .preflight
@@ -648,7 +656,7 @@ mod tests {
                     .expect("HTML annotations should canonicalize");
             binding.annotations_json = html_annotations_json;
             binding.annotations_digest = html_annotations_digest;
-            binding.effective_timeout_ms = 120000;
+            binding.effective_timeout_ms = html.timeout_ms as i64;
             binding.runtime_generation = 1;
             binding.selection_reason = "implicit_policy".into();
             binding.capability_id = None;
@@ -736,8 +744,14 @@ mod tests {
             panic!("Codex recovery expected")
         };
         assert_eq!(
-            restored.canonical_projection.html_tool_count(),
-            if include_html { 2 } else { 0 }
+            restored.canonical_projection.native_tool_count(),
+            if include_html {
+                2 + crate::turn_mcp::native_tools::NativeToolFamily::Tasks
+                    .definitions()
+                    .len()
+            } else {
+                0
+            }
         );
         let restored_tool = restored
             .canonical_projection

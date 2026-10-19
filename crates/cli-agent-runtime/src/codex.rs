@@ -12131,6 +12131,7 @@ while read line; do :; done
                 provider_manifest_hash: hash.clone(),
                 provider_contract_fingerprint: "f".repeat(64),
                 overlay_policy_version: CodexHomeOverlayPolicy::v1().version,
+                tool_timeout_secs: None,
                 tools: vec![CodexManagedMcpToolIdentity {
                     canonical_callable_name: "mcp__server__tool".to_owned(),
                     canonical_schema_fingerprint: "1".repeat(64),

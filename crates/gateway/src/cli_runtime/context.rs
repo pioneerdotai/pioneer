@@ -409,6 +409,12 @@ pub(crate) fn cli_runtime_mcp_capabilities_input(
     explicit_tools.sort();
     explicit_tools.dedup();
     Some(CliRuntimeSelectedCapabilitiesInput {
+        native_task_tools: projection
+            .tools
+            .iter()
+            .filter(|tool| crate::turn_mcp::native_tools::is_task_operation(tool))
+            .map(|tool| tool.canonical_callable_name.clone())
+            .collect(),
         total_tool_count: projection.tools.len(),
         explicit_servers: explicit_servers
             .into_iter()

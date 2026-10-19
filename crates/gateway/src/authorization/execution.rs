@@ -1032,13 +1032,31 @@ impl ExecutionAdmissionService {
         action: ResourceAction,
         runtime_draft: Option<&RuntimeDraftAccess>,
     ) -> Result<bool> {
+        self.project_root_action(
+            principal,
+            &request.workspace_id,
+            &request.root_thread_id,
+            action,
+            runtime_draft,
+        )
+        .await
+    }
+
+    async fn project_root_action(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        workspace_id: &str,
+        root_thread_id: &str,
+        action: ResourceAction,
+        runtime_draft: Option<&RuntimeDraftAccess>,
+    ) -> Result<bool> {
         let gate =
             self.policy
                 .authorize_action(principal.kind, principal.role_key.as_ref(), action);
         let resolved = match runtime_draft {
             Some(access)
-                if access.workspace_id() == request.workspace_id
-                    && access.thread_id() == request.root_thread_id =>
+                if access.workspace_id() == workspace_id
+                    && access.thread_id() == root_thread_id =>
             {
                 self.resolver
                     .authorize_runtime_draft(principal, &gate, action, access)
@@ -1047,13 +1065,7 @@ impl ExecutionAdmissionService {
             Some(_) => bail!("runtime draft differs from the execution root"),
             None => {
                 self.resolver
-                    .authorize_thread(
-                        principal,
-                        &gate,
-                        action,
-                        request.root_thread_id.as_str(),
-                        Some(request.workspace_id.as_str()),
-                    )
+                    .authorize_thread(principal, &gate, action, root_thread_id, Some(workspace_id))
                     .await
             }
         }
@@ -3464,6 +3476,22 @@ impl RuntimeDraftMaterialization {
 }
 
 impl ExecutionAuthorizationAdmission {
+    pub(crate) async fn project_root_action(
+        &self,
+        store: &CrudStore,
+        action: ResourceAction,
+    ) -> Result<bool> {
+        ExecutionAdmissionService::new(store.clone())
+            .project_root_action(
+                &self.principal,
+                &self.workspace_id,
+                &self.root_thread_id,
+                action,
+                self.runtime_draft.as_ref().map(|draft| draft.access()),
+            )
+            .await
+    }
+
     pub(crate) fn from_authorized_thread(
         request: &RequestContext,
         authorization: &AuthorizedThread,

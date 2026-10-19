@@ -45,52 +45,63 @@ impl ResolvedMcpTurnProjection {
         }
     }
 
-    pub(crate) fn with_html_tools(
+    pub(crate) fn with_native_tools(
         mut self,
-        mut limits: McpProjectionLimits,
+        definitions: Vec<(
+            super::native_tools::NativeToolFamily,
+            pioneer_tools::ConfiguredToolSpec,
+        )>,
+        limits: McpProjectionLimits,
     ) -> Result<Self, McpProjectionBuildError> {
-        for spec in pioneer_tools::html::html_tool_specs() {
-            // First-party definitions do not consume the already bounded external
-            // catalog allowance. A full valid catalog must still expose both tools.
-            let (_, _, schema_bytes) = canonical_schema_identity(&spec.spec.parameters)
-                .map_err(McpProjectionBuildError::Serialization)?;
-            limits.max_tools += 1;
-            limits.max_total_schema_bytes += schema_bytes.len();
+        // Validate the external catalog before granting reserved allowance.
+        self.finalize_identity(limits)?;
+        for (family, configured) in definitions {
+            let spec = configured.spec;
             self.tools.push(ResolvedMcpTurnTool {
-                canonical_callable_name: spec.spec.name.clone(),
+                canonical_callable_name: spec.name.clone(),
                 workspace_id: self.workspace_id.clone(),
-                server_installation_id: pioneer_tools::html::HTML_SERVER_ID.into(),
-                server_name: pioneer_tools::html::HTML_SERVER_NAME.into(),
-                raw_tool_name: spec.spec.name,
-                description: Some(spec.spec.description),
-                input_schema: spec.spec.parameters,
+                server_installation_id: family.server_id().into(),
+                server_name: family.server_name().into(),
+                timeout_ms: family.timeout_ms(&spec.name),
+                raw_tool_name: spec.name,
+                description: Some(spec.description),
+                input_schema: spec.parameters,
                 annotations: None,
-                timeout_ms: 120_000,
-                catalog_version: pioneer_tools::html::HTML_SERVER_ID.into(),
-                installation_fingerprint: pioneer_tools::html::HTML_SERVER_ID.into(),
+                catalog_version: family.server_id().into(),
+                installation_fingerprint: family.server_id().into(),
                 schema_fingerprint: String::new(),
                 runtime_generation: 1,
                 selection_reason: McpSelectionReason::ImplicitPolicy,
                 capability_id: None,
             });
         }
-        self.finalize_identity(limits)?;
+        self.finalize_identity(super::native_tools::projection_allowance(
+            &self.tools,
+            limits,
+        ))?;
         Ok(self)
     }
 
-    /// Count only the exact reserved definitions in this frozen projection.
-    /// External tools cannot borrow first-party count allowance by name alone.
-    pub(crate) fn html_tool_count(&self) -> usize {
-        let definitions = pioneer_tools::html::html_tool_specs();
+    #[cfg(test)]
+    pub(crate) fn with_html_tools(
+        self,
+        limits: McpProjectionLimits,
+    ) -> Result<Self, McpProjectionBuildError> {
+        use super::native_tools::NativeToolFamily;
+        self.with_native_tools(
+            NativeToolFamily::Html
+                .definitions()
+                .into_iter()
+                .map(|spec| (NativeToolFamily::Html, spec))
+                .collect(),
+            limits,
+        )
+    }
+
+    pub(crate) fn native_tool_count(&self) -> usize {
         self.tools
             .iter()
-            .filter(|tool| {
-                tool.server_installation_id == pioneer_tools::html::HTML_SERVER_ID
-                    && definitions.iter().any(|definition| {
-                        tool.raw_tool_name == definition.spec.name
-                            && tool.input_schema == definition.spec.parameters
-                    })
-            })
+            .filter(|tool| super::native_tools::exact_definition(tool).is_some())
             .count()
     }
 
@@ -370,7 +381,7 @@ fn normalize_name(value: &str) -> String {
 }
 
 fn base_callable_name(tool: &ResolvedMcpTurnTool) -> String {
-    if tool.server_installation_id == pioneer_tools::html::HTML_SERVER_ID {
+    if super::native_tools::exact_definition(tool).is_some() {
         return tool.raw_tool_name.clone();
     }
     format!(

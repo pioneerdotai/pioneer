@@ -409,9 +409,18 @@ pub struct AgentModelToolCatalogEntry {
     pub capability: AgentToolCapability,
 }
 
-/// Build the capability-filtered tool catalog.  No entry is returned for a
-/// missing capability; callers must not replace a missing tool with a prose
-/// fallback that pretends the action succeeded.
+/// The shared options definition; callers still project its capability.
+pub fn agent_start_options_catalog_entry() -> AgentModelToolCatalogEntry {
+    AgentModelToolCatalogEntry {
+        name: AgentModelToolName::AgentStartOptions,
+        capability: AgentToolCapability::ChildStart,
+        description: "List permitted identity, execution profile, thread creation, and target options. Use these when explicitly selecting a task launch or a thread action; options do not grant permission to execute it.".to_owned(),
+        parameters: schema::<AgentStartOptionsToolInput>(),
+    }
+}
+
+/// Build the capability-filtered tool catalog. No entry is returned for a
+/// missing capability; callers must not pretend an unavailable action succeeded.
 pub fn project_agent_model_tool_catalog(
     capabilities: &BTreeSet<AgentToolCapability>,
     options: Option<&AgentToolOptionsProjection>,
@@ -443,11 +452,12 @@ pub fn project_agent_model_tool_catalog(
         schema::<AgentCreateThreadToolInput>(),
     );
     if options.is_some() {
+        let entry = agent_start_options_catalog_entry();
         push(
-            AgentModelToolName::AgentStartOptions,
-            AgentToolCapability::ChildStart,
-            "List permitted identity, execution profile, thread creation, and target options. Use these when explicitly selecting a task launch or a thread action; options do not grant permission to execute it.",
-            schema::<AgentStartOptionsToolInput>(),
+            entry.name,
+            entry.capability,
+            &entry.description,
+            entry.parameters,
         );
     }
     if options.is_some() {

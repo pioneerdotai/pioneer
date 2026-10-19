@@ -103,7 +103,10 @@ impl TurnMcpPersistenceCoordinator {
             // bound to role/capability grants here.
             .filter(|binding| {
                 binding.server_installation_id != FIRST_PARTY_FILE_SERVER_ID
-                    && binding.server_installation_id != pioneer_tools::html::HTML_SERVER_ID
+                    && crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(
+                        &binding.server_installation_id,
+                    )
+                    .is_none()
             })
             .map(|binding| binding.server_name.clone())
             .collect::<Vec<_>>();

@@ -453,8 +453,9 @@ impl MessageProcessor {
         workspace_id: &str,
         attachments: &[crate::cli_runtime::skills::CliRuntimeSkillAttachment],
         mcp_availability: &pioneer_agent::AgentMcpAvailability,
+        include_task_orchestration: bool,
     ) -> anyhow::Result<Vec<pioneer_skills::ResolvedSkill>> {
-        if attachments.is_empty() {
+        if attachments.is_empty() && !include_task_orchestration {
             return Ok(Vec::new());
         }
         let context = self.skills_runtime_context(workspace_id)?;
@@ -489,7 +490,35 @@ impl MessageProcessor {
             dependency_input: &dependency_input,
         });
 
-        ordered_cli_runtime_explicit_skills(attachments, &explicit_refs, &catalog, &resolution)
+        let mut selected = ordered_cli_runtime_explicit_skills(
+            attachments,
+            &explicit_refs,
+            &catalog,
+            &resolution,
+        )?;
+        if include_task_orchestration {
+            for slug in ["tasks", "subagents"] {
+                let skill = resolution
+                    .active
+                    .iter()
+                    .find(|skill| {
+                        crate::cli_runtime::skills::cli_orchestration_skill(&skill.definition)
+                            && skill.definition.identity.slug == slug
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "required CLI orchestration skill pioneer/{slug} is unavailable"
+                        )
+                    })?;
+                if !selected
+                    .iter()
+                    .any(|selected| selected.skill_id == skill.skill_id)
+                {
+                    selected.push(skill.clone());
+                }
+            }
+        }
+        Ok(selected)
     }
 
     pub(crate) async fn skills_list(
