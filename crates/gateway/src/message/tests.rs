@@ -81641,6 +81641,17 @@ async fn recovery_failure_task_consumers_impl(
         "Recovery task",
         3,
     );
+    if parent_is_task_run {
+        // Let the executor create the real occurrence, including its run ID,
+        // lineage and terminal projection receipt. Changing a conversation's
+        // turn_kind alone does not establish those cleanup prerequisites.
+        params.lifecycle_policy = Some(TaskLifecyclePolicy {
+            attachment: TaskAttachmentMode::Detached,
+            on_parent_cancel: TaskParentTerminalAction::KeepRunning,
+            on_parent_failure: TaskParentTerminalAction::KeepRunning,
+            completion: TaskCompletionBehavior::CompleteOnTerminalRun,
+        });
+    }
     params.delivery_policy = Some(TaskDeliveryPolicy {
         mode: TaskDeliveryMode::Thread,
         thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
@@ -81651,19 +81662,18 @@ async fn recovery_failure_task_consumers_impl(
     });
     let created = create_task_for_test(&processor, params).await.unwrap();
     let run = created.run.unwrap();
-    if parent_is_task_run {
-        // A visible Task occurrence closes with its child; a delegating Agent Turn stays active.
-        store
-            .database_connection()
-            .execute_unprepared(&format!(
-                "UPDATE turn SET turn_kind = 'task_run' WHERE id = '{}'",
-                parent_turn
-            ))
-            .await
-            .unwrap();
-    }
+    let parent_turn = if parent_is_task_run {
+        run.id.clone()
+    } else {
+        parent_turn
+    };
     let lineage = wait_for_child_lineage_for_run(store.clone(), &run.id).await;
     // Lineage registration precedes the child's remaining preflight work.
+    assert_eq!(
+        lineage.created_by_turn_id.as_deref(),
+        Some(parent_turn.as_str()),
+        "recovery must exercise the actual conversation or occurrence parent"
+    );
     // Wait for the actual provider entry before injecting its failure; a fixed
     // 2.5-second poll window races that preparation in the parallel suite.
     timeout(Duration::from_secs(30), async {

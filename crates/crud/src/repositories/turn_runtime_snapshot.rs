@@ -194,6 +194,11 @@ pub async fn delete_turn_runtime_snapshots_for_closed_turns<C: ConnectionTrait>(
         .column(turn::Column::Id)
         .from(turn::Entity)
         .and_where(turn::Column::Status.is_in(closed_statuses))
+        // Task children retain a capsule until their existing reconciler sees
+        // the parent receipt; startup must not bypass that owner.
+        .and_where(Expr::cust(
+            "NOT EXISTS (SELECT 1 FROM task_run_turn trt WHERE trt.turn_id = turn.id)",
+        ))
         .to_owned();
 
     let deleted = turn_runtime_snapshot::Entity::delete_many()

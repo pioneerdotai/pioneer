@@ -197,6 +197,9 @@ pub async fn delete_turn_llm_context_for_turn<C: ConnectionTrait>(
 pub async fn delete_expired_turn_llm_context<C: ConnectionTrait>(db: &C) -> Result<u64> {
     let deleted = turn_llm_context::Entity::delete_many()
         .filter(turn_llm_context::Column::Source.is_not_in(MODEL_HISTORY_CONTEXT_SOURCES))
+        // The task-child owner retains pending projection capsules across
+        // restart; TTL cleanup must not consume its durable obligation.
+        .filter(Expr::cust("NOT EXISTS (SELECT 1 FROM task_run_turn trt WHERE trt.turn_id = turn_llm_context.turn_id)"))
         .filter(turn_llm_context::Column::ExpiresAt.is_not_null())
         .filter(turn_llm_context::Column::ExpiresAt.lte(chrono::Utc::now().fixed_offset()))
         .exec(db)
@@ -217,6 +220,9 @@ pub async fn delete_turn_llm_context_for_terminal_turns<C: ConnectionTrait>(db: 
         .select_only()
         .column(turn::Column::Id)
         .filter(turn::Column::Status.is_in(terminal_statuses))
+        .filter(Expr::cust(
+            "NOT EXISTS (SELECT 1 FROM task_run_turn trt WHERE trt.turn_id = turn.id)",
+        ))
         .into_query();
 
     let deleted = turn_llm_context::Entity::delete_many()

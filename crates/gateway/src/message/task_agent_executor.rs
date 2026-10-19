@@ -4467,6 +4467,15 @@ impl TaskAgentExecutor {
         // complete a task-run turn that has already been fenced terminally.
         // The aggregate resume transaction is the only path that puts this
         // durable turn back into `InProgress`.
+        // A terminal run must never enter extraction/execution again. Its
+        // retained capsule belongs to the receipt-gated cleanup continuation.
+        if let Some(ready) = processor
+            .crud_store
+            .terminal_task_child_cleanup_ready(thread_id, turn_id)
+            .await?
+        {
+            return Ok(ready);
+        }
         if child_runtime.task_run_turn.status == TaskRunTurnStatus::Blocked {
             // A late completion from the pre-resume actor must not erase the
             // blocked transcript/runtime capsule that an explicit resume
@@ -4490,7 +4499,13 @@ impl TaskAgentExecutor {
             );
         };
         if task_response.task.status.is_terminal() {
-            return Ok(true);
+            // A task can have become terminal since the first run read. Do
+            // not turn that race into an ACK of a pending parent projection.
+            return Ok(processor
+                .crud_store
+                .terminal_task_child_cleanup_ready(thread_id, turn_id)
+                .await?
+                .unwrap_or(false));
         }
         let handle = TaskExecutionHandle::new(
             processor.crud_store.clone(),
@@ -4708,6 +4723,15 @@ impl TaskAgentExecutor {
         else {
             return Ok(true);
         };
+        // A terminal run must never enter extraction/execution again. Its
+        // retained capsule belongs to the receipt-gated cleanup continuation.
+        if let Some(ready) = processor
+            .crud_store
+            .terminal_task_child_cleanup_ready(thread_id, turn_id)
+            .await?
+        {
+            return Ok(ready);
+        }
         if child_runtime.task_run_turn.status == TaskRunTurnStatus::Blocked {
             return Ok(false);
         }
@@ -4728,7 +4752,13 @@ impl TaskAgentExecutor {
             );
         };
         if task_response.task.status.is_terminal() {
-            return Ok(true);
+            // A task can have become terminal since the first run read. Do
+            // not turn that race into an ACK of a pending parent projection.
+            return Ok(processor
+                .crud_store
+                .terminal_task_child_cleanup_ready(thread_id, turn_id)
+                .await?
+                .unwrap_or(false));
         }
         let handle = TaskExecutionHandle::new(
             processor.crud_store.clone(),
@@ -4793,6 +4823,15 @@ impl TaskAgentExecutor {
         else {
             return Ok(true);
         };
+        // A terminal run must never enter extraction/execution again. Its
+        // retained capsule belongs to the receipt-gated cleanup continuation.
+        if let Some(ready) = processor
+            .crud_store
+            .terminal_task_child_cleanup_ready(thread_id, turn_id)
+            .await?
+        {
+            return Ok(ready);
+        }
         if child_runtime.task_run_turn.status == TaskRunTurnStatus::Blocked {
             return Ok(false);
         }
@@ -4815,7 +4854,13 @@ impl TaskAgentExecutor {
             );
         };
         if task_response.task.status.is_terminal() {
-            return Ok(true);
+            // A task can have become terminal since the first run read. Do
+            // not turn that race into an ACK of a pending parent projection.
+            return Ok(processor
+                .crud_store
+                .terminal_task_child_cleanup_ready(thread_id, turn_id)
+                .await?
+                .unwrap_or(false));
         }
         let handle = TaskExecutionHandle::new(
             processor.crud_store.clone(),
@@ -4857,6 +4902,15 @@ impl TaskAgentExecutor {
         else {
             return Ok(true);
         };
+        // A terminal run must never enter extraction/execution again. Its
+        // retained capsule belongs to the receipt-gated cleanup continuation.
+        if let Some(ready) = processor
+            .crud_store
+            .terminal_task_child_cleanup_ready(thread_id, turn_id)
+            .await?
+        {
+            return Ok(ready);
+        }
         if child_runtime.task_run_turn.status == TaskRunTurnStatus::Blocked {
             return Ok(false);
         }
@@ -4877,7 +4931,13 @@ impl TaskAgentExecutor {
             );
         };
         if task_response.task.status.is_terminal() {
-            return Ok(true);
+            // A task can have become terminal since the first run read. Do
+            // not turn that race into an ACK of a pending parent projection.
+            return Ok(processor
+                .crud_store
+                .terminal_task_child_cleanup_ready(thread_id, turn_id)
+                .await?
+                .unwrap_or(false));
         }
         let handle = TaskExecutionHandle::new(
             processor.crud_store.clone(),

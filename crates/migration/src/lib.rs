@@ -1,4 +1,5 @@
 mod m20261015_000001_html_preview_retention;
+mod m20261018_000001_frozen_sweep_work;
 mod m20261018_000001_html_preview_work_selection;
 mod m20261018_000001_task_cancellation_actor;
 mod task_inbox;
@@ -200,6 +201,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261018_000001_task_cancellation_actor::Migration),
             Box::new(task_inbox::indexes::Migration),
             Box::new(task_inbox::access_start::Migration),
+            Box::new(m20261018_000001_frozen_sweep_work::Migration),
         ]
     }
 }
