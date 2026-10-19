@@ -1,7 +1,8 @@
 //! Synthetic Responses fixtures; these are target protocol examples, not captures.
 use super::*;
 use crate::{
-    ChatMessage, ProviderMessageCollector, ProviderTermination, ToolChoice, ToolDefinition,
+    ChatMessage, ProviderMessageCollector, ProviderReplayState, ProviderTermination, ToolChoice,
+    ToolDefinition,
 };
 use serde_json::json;
 
