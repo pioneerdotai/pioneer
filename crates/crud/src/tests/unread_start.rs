@@ -237,7 +237,10 @@ async fn legacy_activation_excludes_history_preserves_real_read_and_survives_reo
     }
     // Cancellation/rollback must leave neither a moved activation nor a
     // partially replaced publication ledger. A later retry can commit safely.
-    let migration = Migrator::migrations().pop().unwrap();
+    let migration = Migrator::migrations()
+        .into_iter()
+        .find(|migration| migration.name() == "m20261018_000001_thread_unread_start")
+        .expect("unread migration remains registered");
     let before = gateway_identity::Entity::find_by_id(f.gateway.to_string())
         .one(&f.store.connection)
         .await
