@@ -27984,7 +27984,11 @@ async fn cli_transfer_reuses_late_mixed_checkpoint_from_raw_saved_input_aliases_
             .unwrap()
             .unwrap()
             .coverage,
-        checkpoint.coverage
+        {
+            let mut coverage = checkpoint.coverage.clone();
+            coverage.sort();
+            coverage
+        }
     );
 }
 

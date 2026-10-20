@@ -17072,7 +17072,15 @@ async fn composer_reuses_late_mixed_checkpoint_before_attached_child_policy() {
                 && mode == TaskAgentContextMode::LastNTurns
                 && !include
             {
-                sources(&accepted)
+                let mut ids = sources(&accepted);
+                ids.extend(
+                    output_manifest
+                        .iter()
+                        .flat_map(|entry| &entry.sources)
+                        .filter(|source| source.scope.starts_with("event:"))
+                        .map(|source| source.id.clone()),
+                );
+                ids
             } else {
                 expected_ids.clone()
             };

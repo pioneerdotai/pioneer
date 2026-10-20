@@ -612,7 +612,6 @@ fn cli_attached_tasks_inherit_the_exact_selected_mcp_tool() {
                 vec![selected],
                 "inherit the selected tool, not the broader admitted server ceiling"
             );
-            wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 2).await;
             let child_binding = wait_for_task_cli_child(
                 &processor,
                 child.structured_content.as_ref().unwrap()["runId"]
@@ -621,6 +620,9 @@ fn cli_attached_tasks_inherit_the_exact_selected_mcp_tool() {
                 None,
             )
             .await;
+            // Creation only persists the run; await its admitted child before
+            // checking the recording session's provider dispatch.
+            wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 2).await;
             let child_turn_id = child_binding.turn_id.as_str();
             let child_bindings = processor
                 .crud_store
