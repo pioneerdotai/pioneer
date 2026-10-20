@@ -3560,9 +3560,10 @@ fn user_config_directory_name() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CONFIG_TOML, GatewayCliAgentRuntimeConfig, GatewayCliAgentRuntimeKindConfig,
-        GatewayMemoryConfig, GatewayMemoryModelSelectionConfig, GatewayResilienceConfig,
-        GatewaySelfImprovementConfig, GatewayTelemetryConfig, InstallManagedBy, InstallState,
+        DEFAULT_CONFIG_TOML, GatewayCliAgentRuntimeConfig, GatewayCliAgentRuntimeInstancesConfig,
+        GatewayCliAgentRuntimeKindConfig, GatewayMemoryConfig, GatewayMemoryModelSelectionConfig,
+        GatewayResilienceConfig, GatewaySelfImprovementConfig, GatewayTelemetryConfig,
+        InstallManagedBy, InstallState, effective_cli_agent_runtime_instance,
         load_config_from_sources, load_install_state, save_install_state,
     };
     use std::fs;
