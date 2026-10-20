@@ -921,7 +921,17 @@ mod tests {
 
         assert_eq!(registry.cancel_session(&first_session), 1);
         assert_eq!(registry.cancel_session(&first_session), 1);
-        let error = first.read_u8().await.unwrap_err();
+        // Inspect cancellation directly: read_u8 retries Interrupted errors,
+        // which would spin forever on a permanently revoked stream.
+        let mut byte = [0_u8; 1];
+        let mut buffer = ReadBuf::new(&mut byte);
+        let waker = futures_util::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        let Poll::Ready(Err(error)) = Pin::new(&mut first).poll_read(&mut context, &mut buffer)
+        else {
+            panic!("cancelled stream must immediately return its cancellation error");
+        };
+        assert!(buffer.filled().is_empty());
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         drop(first);
         assert_eq!(registry.active_count(), 1);
