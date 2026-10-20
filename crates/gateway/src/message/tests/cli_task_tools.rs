@@ -500,7 +500,7 @@ fn cli_automatic_orchestration_skills_coexist_with_selected_user_names() {
                 );
                 let starts = harness.cli_session.turn_starts.lock().await;
                 let start = &starts[0];
-                let instructions = start.elevated_instructions.text();
+                let instructions = start.instructions.elevated().unwrap().text();
                 if kind == CLIAgentRuntimeKind::Claude {
                     assert!(instructions.contains(&format!("Selected skills:\n- {user_name}\n- pioneer-system-tasks\n- pioneer-system-subagents")),
                         "application order must retain the user's selected skill before automatic tasks/subagents");
@@ -715,7 +715,9 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
                 }
             }
             let instructions = harness.cli_session.turn_starts.lock().await[0]
-                .elevated_instructions
+                .instructions
+                .elevated()
+                .unwrap()
                 .text()
                 .to_owned();
             assert!(instructions.contains("Do not finish the parent turn while attached"));
@@ -1173,6 +1175,7 @@ fn cli_final_candidate_survives_concurrent_detach() {
                 .handle_cli_runtime_timeline_event(
                     handle.instance(),
                     RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                        item: None,
                         native_thread_id: Some(binding.native_thread_id.clone()),
                         native_turn_id: native_turn_id.to_owned(),
                         native_item_id: answer_id.clone(),
@@ -1436,6 +1439,7 @@ fn a_lost_wait_response_does_not_count_as_empty_orchestration_or_cancel_child_wo
                 assert!(!observed.is_error);
                 drop(observed);
                 processor.handle_cli_runtime_timeline_event(handle.instance(), RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                        item: None,
                     native_thread_id: Some(binding.native_thread_id.clone()), native_turn_id: binding.native_turn_id.clone().unwrap(),
                     native_item_id: "lost-wait".to_owned(), item_kind: "mcpToolCall".to_owned(), text: None,
                     summary: Vec::new(), content: Vec::new(), phase: RuntimeAgentMessagePhase::FinalAnswer,

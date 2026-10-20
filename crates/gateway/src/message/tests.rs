@@ -1422,10 +1422,10 @@ impl CLIAgentRuntimeSessionFactory for StaticCliRuntimeSessionFactory {
             crate::cli_runtime::continuation::CliProviderContinuation::AcpSession { .. }
         ) {
             if let Some(snapshot) = self.session.acp_snapshot.lock().unwrap().as_mut() {
-                snapshot.workspace_id = _instance.key().workspace_id.clone();
-                snapshot.thread_id = _instance.key().thread_id.clone();
-                snapshot.runtime_id = _instance.key().runtime_id.clone();
-                snapshot.generation = _instance.generation();
+                snapshot.workspace_id = instance.key().workspace_id.clone();
+                snapshot.thread_id = instance.key().thread_id.clone();
+                snapshot.runtime_id = instance.key().runtime_id.clone();
+                snapshot.generation = instance.generation();
                 snapshot.presentation_revision = 1;
                 snapshot.session_id = None;
                 snapshot.version = None;
@@ -85036,11 +85036,14 @@ async fn acp_configuration_failure_releases_preparation_and_never_dispatches_a_p
             let cancelling = async {
                 if cancel {
                     cli.acp_configuration_entered.notified().await;
-                    processor
-                        .user_turn_cancel_intents
-                        .lock()
-                        .await
-                        .insert((thread.into(), turn.into()), "cancel during replay".into());
+                    processor.user_turn_cancel_intents.lock().await.insert(
+                        (thread.into(), turn.into()),
+                        super::UserTurnCancellationIntent {
+                            pending_requests: 1,
+                            reason: "cancel during replay".into(),
+                            actor_id: Some(authenticated_test_superuser().principal_id.to_string()),
+                        },
+                    );
                 }
             };
             let applying = processor.apply_prepared_acp_configuration(
