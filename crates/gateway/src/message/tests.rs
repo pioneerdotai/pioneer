@@ -27766,7 +27766,10 @@ async fn cli_transfer_reuses_late_mixed_checkpoint_from_raw_saved_input_aliases_
             provider_name: "cli_runtime:codex".into(),
             reasoning_effort: None,
             agent_skill_versions_json: None,
-            hook_runtime_context_json: "{}".into(),
+            hook_runtime_context_json: serde_json::to_string(
+                &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+            )
+            .unwrap(),
             workspace_skill_policies_json: "[]".into(),
             input_json: serde_json::to_string(&vec![UserInput::Text {
                 text: "PROTECTED CURRENT INPUT".into(),

@@ -17065,6 +17065,17 @@ async fn composer_reuses_late_mixed_checkpoint_before_attached_child_policy() {
             )
             .await
             .unwrap();
+            // Without summaries, the raw composition ends with the delivered
+            // branch's shared logical turn. The projected basis instead ends
+            // with the uncovered tail. Last-N selects from each representation.
+            let expected_ids = if thread == "mixed-raw-consumer"
+                && mode == TaskAgentContextMode::LastNTurns
+                && !include
+            {
+                sources(&accepted)
+            } else {
+                expected_ids.clone()
+            };
             assert_eq!(
                 sources(&selected.messages),
                 expected_ids,
