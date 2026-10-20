@@ -34,6 +34,7 @@ impl MessageProcessor {
         workspace: &crate::authorization::AuthorizedWorkspace,
         id: RequestId,
         params: TaskCompletionInboxListParams,
+        read_all: bool,
     ) {
         let before = match params
             .cursor
@@ -41,7 +42,12 @@ impl MessageProcessor {
             .map(decode_inbox_cursor)
             .transpose()
         {
-            Ok(cursor) if params.workspace_id == workspace.workspace_id() => cursor,
+            Ok(cursor)
+                if params.workspace_id == workspace.workspace_id()
+                    && (!read_all || params.cursor.is_none()) =>
+            {
+                cursor
+            }
             _ => {
                 self.send_error(
                     context.connection_id(),
@@ -68,6 +74,18 @@ impl MessageProcessor {
             // A short read snapshot keeps the page and total on the same ACL
             // and receipt revision. Release it before projection/serialization.
             let db = self.crud_store.database_connection();
+            if read_all {
+                pioneer_crud::mark_all_task_completion_inbox_read(
+                    &db,
+                    &access,
+                    &chrono::Utc::now().to_rfc3339(),
+                )
+                .await?;
+                // The mutation is durable and writer capacity has been released.
+                // Invalidate even if the subsequent response snapshot fails.
+                self.notify_task_completion_inbox_read(context, workspace.workspace_id())
+                    .await;
+            }
             let snapshot = db.begin_read().await?;
             let rows = pioneer_crud::list_task_completion_inbox(
                 &snapshot,
@@ -100,7 +118,7 @@ impl MessageProcessor {
         match result {
             Ok(response) => {
                 self.send_task_response(context.connection_id(), id, &response)
-                    .await
+                    .await;
             }
             Err(_) => {
                 self.send_error(
@@ -191,17 +209,93 @@ impl MessageProcessor {
         }
     }
 
+    pub(super) async fn task_completion_inbox_viewed(
+        &self,
+        context: &RequestContext,
+        workspace: &crate::authorization::AuthorizedWorkspace,
+        id: RequestId,
+        params: pioneer_protocol::TaskCompletionInboxViewedParams,
+    ) {
+        let Some(access) = self.completion_inbox_access(context, workspace.workspace_id()) else {
+            self.send_error(
+                context.connection_id(),
+                AuthorizationExternalError::NotFound.response(id),
+            )
+            .await;
+            return;
+        };
+        if params.workspace_id != workspace.workspace_id()
+            || params.run_ids.len() + params.result_turn_ids.len() + params.result_items.len() > 100
+        {
+            self.send_error(
+                context.connection_id(),
+                JsonRpcErrorResponse::new(
+                    Some(id),
+                    INVALID_PARAMS_CODE,
+                    "invalid task inbox view scope",
+                ),
+            )
+            .await;
+            return;
+        }
+        let result = pioneer_crud::mark_viewed_task_completion_inbox_read(
+            &self.crud_store.database_connection(),
+            &access,
+            &params,
+            &chrono::Utc::now().to_rfc3339(),
+        )
+        .await;
+        match result {
+            Ok(confirmed) => {
+                self.send_task_response(context.connection_id(), id, &confirmed)
+                    .await;
+                if !confirmed.is_empty() {
+                    self.notify_task_completion_inbox_read_excluding_source(
+                        context,
+                        workspace.workspace_id(),
+                        true,
+                    )
+                    .await;
+                }
+            }
+            Err(_) => {
+                self.send_error(
+                    context.connection_id(),
+                    AuthorizationExternalError::Unavailable.response(id),
+                )
+                .await
+            }
+        }
+    }
+
     pub(super) async fn notify_task_completion_inbox_read(
         &self,
         context: &RequestContext,
         workspace_id: &str,
+    ) {
+        self.notify_task_completion_inbox_read_excluding_source(context, workspace_id, false)
+            .await;
+    }
+
+    async fn notify_task_completion_inbox_read_excluding_source(
+        &self,
+        context: &RequestContext,
+        workspace_id: &str,
+        exclude_source: bool,
     ) {
         // A payload-free invalidation goes only to this principal's devices.
         // Every receiver must reload through current TaskRead and root ACL.
         let connections = self
             .session_manager
             .connection_ids_for_principal(&context.principal().principal_id)
-            .await;
+            .await
+            .into_iter()
+            // Only viewed has a mandatory post-confirmation range reload in
+            // shared Client (desktop and mobile); independent hints and other
+            // read paths keep their original fanout. A failed reload surfaces
+            // an error/Retry instead of depending on this redundant own hint.
+            .filter(|connection| !exclude_source || *connection != context.connection_id())
+            .collect();
         let hint = pioneer_protocol::TaskCompletionInboxChangedNotification {
             workspace_id: workspace_id.to_owned(),
         };

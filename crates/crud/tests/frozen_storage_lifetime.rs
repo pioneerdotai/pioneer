@@ -1205,6 +1205,9 @@ async fn terminal_task_legacy_scope_mismatch_is_not_an_independent_input_root() 
 // an ordinary upgrade with already accepted failed/cancelled inputs, without backfill.
 #[tokio::test]
 async fn released_schema_upgrade_matches_fresh_triggers_and_releases_existing_inputs() {
+    use pioneer_entity::{task_run, task_run_conversation_snapshot as snapshot};
+    use sea_orm::sea_query::Query;
+
     let fresh = db_fixture(false).await;
     let cutover = "m20261015_000002_terminal_task_input_roots";
     let db = db_fixture_before(Some(cutover)).await;
@@ -1219,10 +1222,63 @@ async fn released_schema_upgrade_matches_fresh_triggers_and_releases_existing_in
         0,
         "seed accepted inputs before the terminal-task root migration"
     );
+    assert!(
+        !migration::SchemaManager::new(&db)
+            .has_column("task_run", "inbox_sequence")
+            .await
+            .unwrap(),
+        "seed the actual historical schema without later inbox compatibility fields"
+    );
     for status in ["completed", "failed", "cancelled"] {
         task(&store, status, status).await;
         let h = header(&store, status, "ws", "thread", 1, 1).await;
-        task_input(&store, status, status, &h).await;
+        // Seed the accepted historical rows directly. Today's snapshot CRUD
+        // validates through the full TaskRun Entity, including later inbox fields.
+        let run = Query::insert()
+            .into_table(task_run::Entity)
+            .columns([
+                task_run::Column::Id,
+                task_run::Column::TaskId,
+                task_run::Column::RunGroupId,
+                task_run::Column::AttemptNumber,
+                task_run::Column::RunNumber,
+                task_run::Column::Status,
+                task_run::Column::ExecutorKind,
+            ])
+            .values_panic([
+                status.into(),
+                status.into(),
+                status.into(),
+                1_i64.into(),
+                1_i64.into(),
+                "succeeded".into(),
+                "agent".into(),
+            ])
+            .to_owned();
+        let snapshot = Query::insert()
+            .into_table(snapshot::Entity)
+            .columns([
+                snapshot::Column::RunId,
+                snapshot::Column::TaskId,
+                snapshot::Column::WorkspaceId,
+                snapshot::Column::ConversationThreadId,
+                snapshot::Column::FrozenManifestId,
+                snapshot::Column::HistoryJson,
+                snapshot::Column::CreatedAt,
+            ])
+            .values_panic([
+                status.into(),
+                status.into(),
+                "ws".into(),
+                "thread".into(),
+                h.manifest_id.clone().into(),
+                serde_json::to_string(&h).unwrap().into(),
+                chrono::Utc::now().fixed_offset().into(),
+            ])
+            .to_owned();
+        let db = store.database_connection();
+        db.execute(&run).await.unwrap();
+        db.execute(&snapshot).await.unwrap();
     }
     drop(store);
     Migrator::up(&db, None).await.unwrap();
@@ -1263,6 +1319,20 @@ async fn released_schema_upgrade_matches_fresh_triggers_and_releases_existing_in
     let mut p = FrozenStorageLifetimeProgress::default();
     drive(&store, &mut p, 2500).await;
     for status in ["completed", "failed", "cancelled"] {
+        let snapshot = store
+            .get_task_run_conversation_snapshot(status)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.task_id, status);
+        assert_eq!(snapshot.workspace_id, "ws");
+        assert_eq!(snapshot.conversation_thread_id, "thread");
+        assert_eq!(
+            serde_json::from_str::<FrozenHistoryRef>(&snapshot.history_json)
+                .unwrap()
+                .manifest_id,
+            status
+        );
         assert_eq!(expired(&store, status).await, 1);
         assert_eq!(physical(&store, status).await, 0);
         assert_eq!(

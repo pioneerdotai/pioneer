@@ -214,7 +214,9 @@ pub use repositories::task_actor_contract::{
 };
 pub use repositories::task_completion_inbox::{
     TaskCompletionInboxAccess, TaskCompletionInboxRow, count_unread_task_completion_inbox,
-    find_task_completion_inbox_entry, list_task_completion_inbox, mark_task_completion_inbox_read,
+    find_task_completion_inbox_entry, list_task_completion_inbox,
+    mark_all_task_completion_inbox_read, mark_task_completion_inbox_read,
+    mark_viewed_task_completion_inbox_read,
 };
 pub use repositories::thread::{
     ThreadManagementChange, advance_thread_read_cursor, find_thread_read_cursor,
@@ -2076,6 +2078,8 @@ struct TurnEventProjectionContext {
     enqueue_optional_deliveries: bool,
     #[serde(skip)]
     native_cancellation: Option<PreparedNativeCancellation>,
+    #[serde(skip)]
+    cancellation_actor_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -5041,7 +5045,7 @@ impl CrudStore {
                 format!("SELECT t.thread_id, t.id AS turn_id, t.status, t.error \
                  FROM task_run r \
                  INNER JOIN task task_row ON task_row.id = r.task_id \
-                 INNER JOIN task_run_turn trt ON trt.run_id = r.id \
+                 INNER JOIN task_run_turn trt ON trt.run_id = r.id AND trt.task_id = r.task_id \
                  INNER JOIN \"turn\" t \
                     ON t.id = trt.turn_id AND t.thread_id = trt.thread_id \
                  WHERE t.turn_kind = 'conversation' \
@@ -5050,7 +5054,8 @@ impl CrudStore {
                      AND task_row.status IN \
                        ('draft', 'scheduled', 'queued', 'running', 'waiting', 'waiting_review') \
                      AND (trt.status = 'in_progress' \
-                        OR (trt.status = 'candidate_created' AND r.status <> 'waiting_review'))) \
+                        OR (trt.status = 'candidate_created' AND r.status <> 'waiting_review') \
+                        OR (trt.status = 'cancelled' AND t.status = 'interrupted'))) \
                     OR (r.status IN ('succeeded', 'failed', 'cancelled', 'timed_out') \
                       AND ({ready}) \
                       AND (EXISTS (SELECT 1 FROM turn_runtime_snapshot c WHERE c.turn_id = t.id) \
@@ -5063,6 +5068,7 @@ impl CrudStore {
             .context(
                 "failed to list terminal task child turns awaiting aggregate reconciliation",
             )?;
+
         rows.into_iter()
             .map(|row| {
                 let status = row.try_get::<String>("", "status")?;
@@ -16673,6 +16679,20 @@ impl CrudStore {
         terminal_reason: &str,
         finished_at: sea_orm::prelude::DateTimeWithTimeZone,
     ) -> Result<Vec<AgentWorkGraphCancellationTarget>> {
+        self.cancel_agent_work_graph_as(root_execution_id, terminal_reason, finished_at, None)
+            .await
+    }
+
+    /// Fence the graph and retain authenticated Stop attribution together.
+    /// `initiator` is (principal, originating thread, originating turn).
+    /// System/agent cancellation leaves it absent; replay never rebinds runs.
+    pub async fn cancel_agent_work_graph_as(
+        &self,
+        root_execution_id: &str,
+        terminal_reason: &str,
+        finished_at: sea_orm::prelude::DateTimeWithTimeZone,
+        initiator: Option<(&str, &str, &str)>,
+    ) -> Result<Vec<AgentWorkGraphCancellationTarget>> {
         self.run_serialized_write(|| {
             let finished_at = finished_at.clone();
             async move {
@@ -16681,6 +16701,16 @@ impl CrudStore {
                     .begin()
                     .await
                     .context("failed to begin Agent work-graph cancellation transaction")?;
+                if let Some((actor, thread, turn)) = initiator {
+                    repositories::task_cancellation_actor::record_graph(
+                        &transaction,
+                        actor,
+                        thread,
+                        turn,
+                        root_execution_id,
+                    )
+                    .await?;
+                }
                 match crate::repositories::agent_domain::cancel_agent_work_graph(
                     &transaction,
                     root_execution_id,
@@ -27150,6 +27180,29 @@ impl CrudStore {
         preparation: pioneer_protocol::NativeTerminalEffectPreparation,
         owner_id: &str,
     ) -> Result<()> {
+        self.materialize_native_cancellation_owned_as(
+            event,
+            now_unix,
+            context,
+            preparation,
+            owner_id,
+            None,
+        )
+        .await
+    }
+
+    /// Accept the authenticated Stop actor with the canonical interruption.
+    /// The saved per-run intent survives projection receipt compaction/restart;
+    /// the personal receipt is deferred to the actual RunCancelled transaction.
+    pub async fn materialize_native_cancellation_owned_as(
+        &self,
+        event: CanonicalTurnEventPayload,
+        now_unix: i64,
+        context: NativeCancellationContext,
+        preparation: pioneer_protocol::NativeTerminalEffectPreparation,
+        owner_id: &str,
+        cancellation_actor_id: Option<String>,
+    ) -> Result<()> {
         anyhow::ensure!(
             matches!(&event, CanonicalTurnEventPayload::TurnFailed(n)
             if n.turn.status == pioneer_protocol::TurnStatus::Interrupted
@@ -27186,6 +27239,7 @@ impl CrudStore {
             TurnEventProjectionContext {
                 item_started_deadlines: None,
                 enqueue_optional_deliveries: true,
+                cancellation_actor_id,
                 native_cancellation: Some(PreparedNativeCancellation {
                     revalidation,
                     effects,
@@ -29600,6 +29654,20 @@ impl CrudStore {
                 run.id
             );
 
+            // A Stop that lost to Blocked must not attribute a later
+            // cancellation after this run/turn is reopened. Retire only that
+            // operation's pending attribution, atomically with actual resume;
+            // durable personal read receipts remain untouched.
+            {
+                use pioneer_entity::task_run_cancellation_actor as stop;
+                stop::Entity::delete_many()
+                    .filter(stop::Column::RunId.eq(&run.id))
+                    .filter(stop::Column::TaskId.eq(&task_model.id))
+                    .filter(stop::Column::WorkspaceId.eq(&task_model.workspace_id))
+                    .exec(&tx)
+                    .await?;
+            }
+
             if let Some(execution) = execution_model.as_ref() {
                 let execution_update = pioneer_entity::task_run_execution::Entity::update_many()
                     .filter(pioneer_entity::task_run_execution::Column::Id.eq(execution.id.clone()))
@@ -29886,6 +29954,7 @@ impl CrudStore {
             item_started_deadlines,
             enqueue_optional_deliveries: false,
             native_cancellation: None,
+            cancellation_actor_id: None,
         };
         self.materialize_turn_event_with_projection_context(
             event,
@@ -29932,6 +30001,30 @@ impl CrudStore {
         .await
     }
 
+    /// CLI/legacy equivalent of native cancellation attribution. Attribution is
+    /// saved only for a newly accepted Interrupted event and exact active runs.
+    pub async fn materialize_native_agent_turn_event_owned_as(
+        &self,
+        event: CanonicalTurnEventPayload,
+        event_timestamp_secs: i64,
+        item_started_deadlines: Option<TurnItemAttemptDeadlines>,
+        execution_owner_id: &str,
+        cancellation_actor_id: Option<String>,
+    ) -> Result<()> {
+        self.materialize_turn_event_with_projection_context_and_owner(
+            event,
+            event_timestamp_secs,
+            TurnEventProjectionContext {
+                item_started_deadlines,
+                enqueue_optional_deliveries: true,
+                cancellation_actor_id,
+                native_cancellation: None,
+            },
+            Some(execution_owner_id),
+        )
+        .await
+    }
+
     /// Pause the ordinary parent's projector after durable acceptance. The
     /// production claim is retained, so duplicate materialization is pending.
     #[cfg(any(test, feature = "test-support"))]
@@ -29946,6 +30039,7 @@ impl CrudStore {
             TurnEventProjectionContext {
                 item_started_deadlines: None,
                 enqueue_optional_deliveries: true,
+                cancellation_actor_id: None,
                 native_cancellation: None,
             },
             generate_id(DB_ID_LEN),
@@ -29974,6 +30068,7 @@ impl CrudStore {
                 item_started_deadlines: None,
                 enqueue_optional_deliveries: true,
                 native_cancellation: None,
+                cancellation_actor_id: None,
             },
             generate_id(DB_ID_LEN),
             // An expired claim models the lost projector, without a timed wait.
@@ -29996,6 +30091,7 @@ impl CrudStore {
             item_started_deadlines,
             enqueue_optional_deliveries: true,
             native_cancellation: None,
+            cancellation_actor_id: None,
         };
         self.materialize_turn_event_with_projection_context_and_owner(
             event,
@@ -30863,6 +30959,20 @@ impl CrudStore {
                 "idempotent canonical event is waiting for its authoritative projection".to_owned(),
             )
             .into());
+        }
+
+        if let Some(actor) = projection_context.cancellation_actor_id.as_deref()
+            && let TurnEventPayload::TurnFailed(n) = &appended_event.payload
+            && n.turn.status == pioneer_protocol::TurnStatus::Interrupted
+        {
+            repositories::task_cancellation_actor::record_turn(
+                &transaction,
+                actor,
+                &n.workspace_id,
+                &n.thread_id,
+                &n.turn.id,
+            )
+            .await?;
         }
 
         if let Err(error) = turn_event_projection_state::insert_claimed(
@@ -34653,6 +34763,65 @@ mod tests {
         fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
             migrations_before(RECOVERY_EPISODE_INVARIANT_MIGRATION)
         }
+    }
+
+    // Some rollback guards exercise today's projector on a deliberately older
+    // migration prefix. Add only its unrelated inbox runtime dependencies, not
+    // migration records or historical grants. Pure upgrade fixtures must not
+    // call this helper: they retain the exact historical schema under test.
+    async fn add_inbox_runtime_fields_to_legacy_projector_fixture(store: &CrudStore) {
+        use migration::{ColumnDef, SchemaManager, Table};
+        use sea_orm::sea_query::Alias;
+
+        let transaction = store.connection.begin().await.unwrap();
+        let schema = SchemaManager::new(&*transaction);
+        for (table, column) in [
+            ("thread", "inbox_workspace_after_sequence"),
+            ("task_run", "inbox_sequence"),
+        ] {
+            schema
+                .alter_table(
+                    Table::alter()
+                        .table(Alias::new(table))
+                        .add_column(ColumnDef::new(Alias::new(column)).big_integer().null())
+                        .to_owned(),
+                )
+                .await
+                .unwrap();
+        }
+        schema
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("thread"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("inbox_workspace_started_at"))
+                            .timestamp_with_time_zone()
+                            .null(),
+                    )
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+        // Real current terminal commits allocate a sequence, even though these
+        // tests do not exercise inbox eligibility or notification history.
+        schema
+            .create_table(
+                sea_orm::Schema::new(DatabaseBackend::Sqlite)
+                    .create_table_from_entity(pioneer_entity::task_inbox_activation::Entity),
+            )
+            .await
+            .unwrap();
+        pioneer_entity::task_inbox_activation::Entity::insert(
+            pioneer_entity::task_inbox_activation::ActiveModel {
+                id: Set(1),
+                started_at: Set(0),
+                completion_sequence: Set(0),
+            },
+        )
+        .exec(&transaction)
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
     }
 
     async fn test_store_with_workspace(workspace_id: &str) -> CrudStore {
@@ -44335,6 +44504,20 @@ mod tests {
             .await
             .expect("task recovery job should become blocked");
 
+        // A previous Stop can lose its terminal race to Blocked. Reopening
+        // the same run ID must not carry that actor into a future cancellation.
+        pioneer_entity::task_run_cancellation_actor::Entity::insert(
+            pioneer_entity::task_run_cancellation_actor::ActiveModel {
+                run_id: Set(run.id.clone()),
+                task_id: Set(task.id.clone()),
+                workspace_id: Set(task.workspace_id.clone()),
+                principal_id: Set("P00000000000000000001".into()),
+                origin_turn_id: Set(turn_id.into()),
+            },
+        )
+        .exec(&store.connection)
+        .await
+        .unwrap();
         let outcome = store
             .resume_task_owned_turn(
                 thread_id,
@@ -44356,6 +44539,14 @@ mod tests {
         else {
             panic!("expected aggregate resume outcome");
         };
+        assert!(
+            pioneer_entity::task_run_cancellation_actor::Entity::find_by_id(run.id.clone())
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .is_none(),
+            "a resumed execution cannot inherit a retired Stop actor"
+        );
         assert_eq!(resumed_task.status, TaskStatus::Running);
         assert_eq!(resumed_run.status, TaskRunStatus::Running);
         assert_eq!(resumed_turn.status, TaskRunTurnStatus::InProgress);
@@ -49108,6 +49299,12 @@ mod tests {
             )
             .await
             .unwrap();
+        let db = store.database_connection();
+        db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,executor_kind,status,title,goal,priority,revision,created_at,updated_at) VALUES('stop-task',?1,'workspace',?1,'system','running','Stop task','Goal',0,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", [workspace_id.into()])).await.unwrap();
+        db.execute_unprepared("INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,created_at,updated_at) VALUES('stop-run','stop-task','stop-run',1,1,'running','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+        db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES('stop-binding','stop-task','stop-run',?,?,'initial',0,0,'in_progress',CURRENT_TIMESTAMP)", [thread_id.into(),turn_id.into()])).await.unwrap();
         let mut turn = store.get_turn(thread_id, turn_id).await.unwrap().unwrap().1;
         turn.status = TurnStatus::Interrupted;
         turn.error = Some("cancel with pending heartbeat writer".to_owned());
@@ -49120,6 +49317,7 @@ mod tests {
             item_started_deadlines: None,
             enqueue_optional_deliveries: true,
             native_cancellation: None,
+            cancellation_actor_id: Some("P00000000000000000001".into()),
         };
         // Stop the first producer at the real append/projection boundary.
         // A CLI cancellation before runtime binding has no native receipt;
@@ -49137,6 +49335,21 @@ mod tests {
             .await
             .unwrap();
         assert!(appended.was_inserted);
+        let saved = pioneer_entity::task_run_cancellation_actor::Entity::find_by_id("stop-run")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.principal_id, "P00000000000000000001");
+        assert!(
+            pioneer_entity::task_run_read::Entity::find()
+                .all(&db)
+                .await
+                .unwrap()
+                .is_empty(),
+            "canonical interruption alone is not a terminal run receipt"
+        );
+
         assert_eq!(appended.sequence, 2);
         assert!(
             store
@@ -49218,9 +49431,58 @@ mod tests {
             "original producer must retain its projection claim and finish normally"
         );
         store
-            .materialize_native_agent_turn_event(event, timestamp + 5, None)
+            .materialize_native_agent_turn_event_owned_as(
+                event,
+                timestamp + 5,
+                None,
+                "synthetic-owner",
+                Some("P00000000000000000002".into()),
+            )
             .await
-            .expect("replay after projection remains fully idempotent");
+            .expect("replay cannot replace the accepted cancellation actor");
+        let replayed_actor =
+            pioneer_entity::task_run_cancellation_actor::Entity::find_by_id("stop-run")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            replayed_actor.principal_id, saved.principal_id,
+            "replay cannot reattribute the accepted Stop"
+        );
+        // Model a crash after per-turn reconciliation and before terminal Run
+        // commit. Discovery and the subsequent commit use only durable state.
+        db.execute_unprepared(
+            "UPDATE task_run_turn SET status='cancelled' WHERE id='stop-binding'",
+        )
+        .await
+        .unwrap();
+        let pending = store
+            .list_unreconciled_terminal_task_child_turns(10)
+            .await
+            .unwrap();
+        assert!(pending.iter().any(|pending| pending.turn_id == turn_id));
+        store
+            .append_task_cancellation_events(
+                vec![pioneer_protocol::TaskEventPayload::RunCancelled {
+                    task_id: "stop-task".into(),
+                    run_id: "stop-run".into(),
+                    reason: Some("durable replay".into()),
+                    cancelled_at: timestamp + 6,
+                }],
+                timestamp + 6,
+                None,
+            )
+            .await
+            .unwrap();
+        let receipts = pioneer_entity::task_run_read::Entity::find()
+            .all(&db)
+            .await
+            .unwrap();
+        assert!(
+            receipts.is_empty(),
+            "an independent TaskService system cancellation cannot inherit a pending Stop actor; only deferred terminal reconciliation uses that attribution"
+        );
     }
 
     #[tokio::test]

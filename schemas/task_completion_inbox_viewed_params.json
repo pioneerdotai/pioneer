@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskCompletionInboxViewedParams",
+  "description": "Exact visible semantic task rows and final result turns, bounded to one viewport.",
+  "type": "object",
+  "properties": {
+    "resultItems": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/TaskCompletionInboxViewedResult"
+      }
+    },
+    "resultTurnIds": {
+      "description": "Terminal status rows only; final messages use their exact item identity.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "runIds": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "threadId": {
+      "type": "string"
+    },
+    "workspaceId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspaceId",
+    "threadId",
+    "runIds",
+    "resultTurnIds"
+  ],
+  "$defs": {
+    "TaskCompletionInboxViewedResult": {
+      "description": "A final visible message, distinguished from other messages in the same Turn.",
+      "type": "object",
+      "properties": {
+        "itemId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "turnId",
+        "itemId"
+      ]
+    }
+  }
+}

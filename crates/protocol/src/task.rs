@@ -3488,6 +3488,32 @@ pub struct TaskCompletionInboxListResponse {
     pub next_cursor: Option<String>,
 }
 
+/// Exact visible semantic task rows and final result turns, bounded to one viewport.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCompletionInboxViewedParams {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub run_ids: Vec<String>,
+    /// Terminal status rows only; final messages use their exact item identity.
+    pub result_turn_ids: Vec<String>,
+    #[serde(default)]
+    pub result_items: Vec<TaskCompletionInboxViewedResult>,
+}
+
+/// A final visible message, distinguished from other messages in the same Turn.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCompletionInboxViewedResult {
+    pub turn_id: String,
+    pub item_id: String,
+}
+impl TaskCompletionInboxViewedResult {
+    pub fn proof_key(&self) -> String {
+        format!("item:{}\0{}", self.turn_id, self.item_id)
+    }
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskCompletionInboxEntryParams {

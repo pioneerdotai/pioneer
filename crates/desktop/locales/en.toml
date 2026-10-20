@@ -1696,9 +1696,10 @@ add_confirm = "Add this participant?"
 remove_confirm = "Remove this participant?"
 
 [tasks.notifications]
+mark_all_read = "Mark all as read"
 title = "Task results"
 loading = "Loading results…"
-empty = "No task results"
+empty = "No unread task results"
 task = "Task"
 mark_read = "Mark as read"
 completed = "Task completed"
@@ -1708,7 +1709,7 @@ more = "Load more"
 read = "Read"
 unread = "Unread"
 retry = "Retry"
-loading_failed = "Couldn’t load task results"
+loading_failed = "Couldn’t update task results"
 timed_out = "Timed out"
 
 [settings.self_improvement.status]

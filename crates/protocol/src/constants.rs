@@ -135,6 +135,8 @@ pub mod methods {
     pub const TASK_COMPLETION_INBOX_LIST: &str = "task/inbox/list";
     pub const TASK_COMPLETION_INBOX_GET: &str = "task/inbox/get";
     pub const TASK_COMPLETION_INBOX_READ: &str = "task/inbox/read";
+    pub const TASK_COMPLETION_INBOX_VIEWED: &str = "task/inbox/viewed";
+    pub const TASK_COMPLETION_INBOX_READ_ALL: &str = "task/inbox/read_all";
     pub const TASK_USER_NOTIFICATION_LIST: &str = "task/user_notification/list";
     pub const TASK_USER_NOTIFICATION_ACKNOWLEDGE: &str = "task/user_notification/acknowledge";
     pub const AGENT_ROUTE_CREATE: &str = "agent/route/create";
@@ -300,6 +302,8 @@ pub mod methods {
         TASK_COMPLETION_INBOX_LIST,
         TASK_COMPLETION_INBOX_GET,
         TASK_COMPLETION_INBOX_READ,
+        TASK_COMPLETION_INBOX_READ_ALL,
+        TASK_COMPLETION_INBOX_VIEWED,
         TASK_USER_NOTIFICATION_LIST,
         TASK_USER_NOTIFICATION_ACKNOWLEDGE,
         AGENT_ROUTE_CREATE,

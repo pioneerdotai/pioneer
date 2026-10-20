@@ -638,6 +638,25 @@ impl CrudStore {
         let events = self
             .append_task_events_in_connection(db, std::mem::take(&mut prepared.events), prepared.at)
             .await?;
+        if matches!(prepared.terminal, TaskEventPayload::RunCancelled { .. })
+            && let Some(actor) = crate::repositories::task_cancellation_actor::principal(
+                db,
+                &prepared.state.task.workspace_id,
+                &prepared.state.task.id,
+                &prepared.state.run.id,
+            )
+            .await?
+        {
+            crate::repositories::task_completion_inbox::mark_cancelled_task_run_read(
+                db,
+                &actor,
+                &prepared.state.task.workspace_id,
+                &prepared.state.task.id,
+                &prepared.state.run.id,
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .await?;
+        }
         if !prepared.retry_scheduled {
             self.finalize_task_terminal_in_connection(db, &prepared, prepared.at)
                 .await?;

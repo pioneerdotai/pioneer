@@ -373,6 +373,7 @@ pub async fn update_run_result_json<C: ConnectionTrait>(
         return Ok(outcome);
     }
 
+    let inbox_sequence = super::task_completion_inbox::next_completion_sequence(db).await?;
     let result = task_run::Entity::update_many()
         .filter(task_run::Column::Id.eq(run_id.to_owned()))
         .col_expr(
@@ -382,6 +383,7 @@ pub async fn update_run_result_json<C: ConnectionTrait>(
         .col_expr(task_run::Column::ResultJson, Expr::value(result_json))
         .col_expr(task_run::Column::CompletedAt, Expr::value(completed_at))
         .col_expr(task_run::Column::UpdatedAt, Expr::value(completed_at))
+        .col_expr(task_run::Column::InboxSequence, Expr::value(inbox_sequence))
         .exec(db)
         .await
         .context("failed to update task run result")?;
@@ -420,6 +422,7 @@ pub async fn update_run_error_json<C: ConnectionTrait>(
         return Ok(outcome);
     }
 
+    let inbox_sequence = super::task_completion_inbox::next_completion_sequence(db).await?;
     let result = task_run::Entity::update_many()
         .filter(task_run::Column::Id.eq(run_id.to_owned()))
         .col_expr(
@@ -429,6 +432,7 @@ pub async fn update_run_error_json<C: ConnectionTrait>(
         .col_expr(task_run::Column::ErrorJson, Expr::value(error_json))
         .col_expr(task_run::Column::CompletedAt, Expr::value(completed_at))
         .col_expr(task_run::Column::UpdatedAt, Expr::value(completed_at))
+        .col_expr(task_run::Column::InboxSequence, Expr::value(inbox_sequence))
         .exec(db)
         .await
         .context("failed to update task run error")?;
@@ -489,5 +493,6 @@ fn active_model_from_run(run: &TaskRun) -> Result<task_run::ActiveModel> {
         error_json: Set(optional_typed_json_to_db(&run.error)?),
         created_at: Set(unix_to_datetime(run.created_at)),
         updated_at: Set(unix_to_datetime(run.updated_at)),
+        ..Default::default()
     })
 }

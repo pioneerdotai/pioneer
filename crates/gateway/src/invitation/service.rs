@@ -2768,6 +2768,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![WORKSPACE_RED_ID, WORKSPACE_BLUE_ID]
         );
+        let inbox_clock = pioneer_entity::task_inbox_activation::Entity::find_by_id(1)
+            .one(&harness.database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            memberships.iter().all(|row| {
+                row.inbox_after_sequence == Some(inbox_clock.completion_sequence)
+                    && row.created_at == accepted_principal.created_at
+            }),
+            "invitation acceptance persists each access start with the principal/session grant"
+        );
         assert!(
             device::Entity::find_by_id(response.grant.device.id.to_string())
                 .one(&harness.database)

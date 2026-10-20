@@ -2544,7 +2544,7 @@ impl TaskService {
 
         let appended = self
             .projector
-            .append_cancellation_events(events, now, agent_action)
+            .append_cancellation_events(events, now, agent_action, context.actor_id.clone())
             .await?;
         let cancelled_deliveries = appended
             .iter()

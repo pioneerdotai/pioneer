@@ -1540,6 +1540,8 @@ impl MessageProcessor {
                         | methods::CLI_RUNTIME_LIST_MODELS
                         | methods::MCP_LIST
                         | methods::TASK_COMPLETION_INBOX_LIST
+                        | methods::TASK_COMPLETION_INBOX_READ_ALL
+                        | methods::TASK_COMPLETION_INBOX_VIEWED
                         | methods::TASK_COMPLETION_INBOX_GET
                         | methods::TASK_COMPLETION_INBOX_READ
                         | methods::TASK_USER_NOTIFICATION_LIST
@@ -1601,7 +1603,15 @@ impl MessageProcessor {
                             .map_err(|_| invalid_params())?
                             .workspace_id
                     }
-                    methods::TASK_COMPLETION_INBOX_LIST => {
+                    methods::TASK_COMPLETION_INBOX_VIEWED => {
+                        serde_json::from_value::<pioneer_protocol::TaskCompletionInboxViewedParams>(
+                            params,
+                        )
+                        .map_err(|_| invalid_params())?
+                        .workspace_id
+                    }
+                    methods::TASK_COMPLETION_INBOX_LIST
+                    | methods::TASK_COMPLETION_INBOX_READ_ALL => {
                         serde_json::from_value::<TaskCompletionInboxListParams>(params)
                             .map_err(|_| invalid_params())?
                             .workspace_id
@@ -7120,7 +7130,34 @@ impl MessageProcessor {
                         }
                     }
                 }
-                methods::TASK_COMPLETION_INBOX_LIST => {
+                methods::TASK_COMPLETION_INBOX_VIEWED => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<pioneer_protocol::TaskCompletionInboxViewedParams>(
+                        params_value,
+                    ) {
+                        Ok(params) => {
+                            self.task_completion_inbox_viewed(
+                                &context,
+                                admission.workspace().expect("inbox workspace admission"),
+                                request.id,
+                                params,
+                            )
+                            .await;
+                        }
+                        Err(_) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    "invalid task inbox view",
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::TASK_COMPLETION_INBOX_LIST | methods::TASK_COMPLETION_INBOX_READ_ALL => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<TaskCompletionInboxListParams>(params_value) {
                         Ok(params) => {
@@ -7129,6 +7166,7 @@ impl MessageProcessor {
                                 admission.workspace().expect("inbox workspace admission"),
                                 request.id,
                                 params,
+                                request.method == methods::TASK_COMPLETION_INBOX_READ_ALL,
                             )
                             .await
                         }
