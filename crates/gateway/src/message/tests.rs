@@ -27862,8 +27862,9 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
             .await;
             let cancel_id =
                 generate_test_request_id("cancel-selected-restore", &child.child_turn_id);
-            processor
-                .process_request_for_connection(
+            timeout(
+                Duration::from_secs(30),
+                processor.process_request_for_connection(
                     connection,
                     &json!({
                         "jsonrpc":"2.0", "id":cancel_id, "method":"turn/cancel",
@@ -27871,8 +27872,10 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
                             "reason":"stop during accepted selected-turn restore"}
                     })
                     .to_string(),
-                )
-                .await;
+                ),
+            )
+            .await
+            .expect("Stop must finish while the selected restore remains paused");
             let cancelled = recv_response_by_id(&mut rx, cancel_id.as_str()).await;
             let cancelled: TurnCancelResponse = serde_json::from_value(cancelled.result).unwrap();
             assert_eq!(cancelled.turn.status, TurnStatus::Interrupted);
@@ -27904,6 +27907,29 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
             })
             .await
             .expect("cancelled Task run must reach a terminal state");
+            assert_eq!(
+                store.get_task_run(&run.id).await.unwrap().unwrap().status,
+                TaskRunStatus::Cancelled,
+                "Stop during restore must not become a preparation failure"
+            );
+            let actor = authenticated_test_superuser().principal_id.to_string();
+            let db = store.database_connection();
+            assert!(
+                pioneer_entity::task_run_read::Entity::find_by_id((actor.clone(), run.id.clone()))
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the exact cancelled run must retain the initiating user's receipt"
+            );
+            let attribution =
+                pioneer_entity::task_run_cancellation_actor::Entity::find_by_id(run.id.clone())
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(attribution.principal_id, actor);
+            assert_eq!(attribution.origin_turn_id, child.child_turn_id);
             pause.release();
             drop(selected_pause);
             let retry_launch = "accepted-large-task-after-restore-cancel";
@@ -28291,6 +28317,88 @@ fn cancelling_cli_history_transfer_stops_before_provider_start_and_releases_sess
             true, false,
         ),
     );
+}
+
+#[test]
+fn cli_history_stop_and_shutdown_drop_a_pending_state_read() {
+    run_standard_stack_message_test("CLI history cancellation with occupied readers", async {
+        for shutdown in [false, true] {
+            let (_directory, workspaces, store, workspace) =
+                setup_pooled_file_workspace_manager().await;
+            let processor = MessageProcessor::new(
+                Arc::new(ThreadManager::new("test-model", "openai")),
+                test_provider(),
+                Arc::new(SessionManager::new()),
+                workspaces,
+                store.clone(),
+                test_gateway_secrets(),
+                test_summary_config(),
+                test_tool_loop_config(),
+            );
+            // Exhaust the real read-only pool. Both capture and its state
+            // monitor must wait, rather than interpreting a missing Turn.
+            let db = store.database_connection();
+            let mut readers = Vec::new();
+            for _ in 0..4 {
+                readers.push(db.begin_read().await.unwrap());
+            }
+            let mut capture = Box::pin(processor.capture_cli_transfer_projection(
+                &workspace,
+                "pending-history-thread",
+                "pending-history-turn",
+                chrono::Utc::now().timestamp_millis() as u64 + 60_000,
+            ));
+            tokio::select! { biased;
+                result = &mut capture => panic!("capture must wait for its reader: {:?}", result.err()),
+                _ = tokio::task::yield_now() => {},
+            }
+            processor.user_turn_cancel_intents.lock().await.insert(
+                (
+                    "another-thread".to_owned(),
+                    "pending-history-turn".to_owned(),
+                ),
+                super::UserTurnCancellationIntent {
+                    pending_requests: 1,
+                    reason: "unrelated Stop".to_owned(),
+                    actor_id: Some(authenticated_test_superuser().principal_id.to_string()),
+                },
+            );
+            tokio::select! { biased;
+                result = &mut capture => panic!("another thread cannot cancel capture: {:?}", result.err()),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+            }
+            if shutdown {
+                processor.cli_history_shutdown.cancel();
+            } else {
+                processor.user_turn_cancel_intents.lock().await.insert(
+                    (
+                        "pending-history-thread".to_owned(),
+                        "pending-history-turn".to_owned(),
+                    ),
+                    super::UserTurnCancellationIntent {
+                        pending_requests: 1,
+                        reason: "Stop while the state read is pending".to_owned(),
+                        actor_id: Some(authenticated_test_superuser().principal_id.to_string()),
+                    },
+                );
+            }
+            let error = timeout(Duration::from_secs(5), capture)
+                .await
+                .expect("local Stop/shutdown must not need a free reader")
+                .err()
+                .expect("capture must be cancelled");
+            assert!(error.to_string().contains("cancelled with its turn"));
+            assert_eq!(readers.len(), 4, "the test did not unblock the read");
+            drop(readers);
+            timeout(Duration::from_secs(5), db.begin_read())
+                .await
+                .expect("cancelled queries must release their pool waiters")
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+        }
+    });
 }
 
 #[derive(Default)]
@@ -29087,10 +29195,10 @@ async fn cancelling_cli_history_transfer_stops_before_provider_start_and_release
         processor.shutdown_cli_runtime_manager().await;
     } else {
         let cancel_id = generate_test_request_id("cancel-transfer", "stop");
-        processor.process_request_for_connection(connection, &json!({
+        timeout(Duration::from_secs(30), processor.process_request_for_connection(connection, &json!({
             "jsonrpc":"2.0", "id":cancel_id, "method":"turn/cancel",
             "params":{"thread_id":thread,"turn_id":turn,"reason":"stop during CLI history preparation"}
-        }).to_string()).await;
+        }).to_string())).await.expect("Stop must finish while CLI history work remains paused");
         let response = recv_response_by_id(&mut rx, cancel_id.as_str()).await;
         let cancelled: TurnCancelResponse = serde_json::from_value(response.result).unwrap();
         assert_eq!(cancelled.turn.status, TurnStatus::Interrupted);
@@ -33410,11 +33518,19 @@ async fn cancelling_detached_native_task_interrupts_only_its_child_continuation_
 fn cancelling_detached_native_child_turn_cancels_parent_task_anchor() {
     run_standard_stack_message_test(
         "detached native child cancellation projection test",
-        assert_detached_native_child_turn_cancellation(),
+        assert_detached_native_child_turn_cancellation(false),
     );
 }
 
-async fn assert_detached_native_child_turn_cancellation() {
+#[test]
+fn composer_stop_native_api_child_saves_personal_cancellation_receipt() {
+    run_standard_stack_message_test(
+        "native API child Stop receipt",
+        assert_detached_native_child_turn_cancellation(true),
+    );
+}
+
+async fn assert_detached_native_child_turn_cancellation(native_api: bool) {
     let (tx, mut rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -33425,7 +33541,17 @@ async fn assert_detached_native_child_turn_cancellation() {
     let processor = Arc::new(with_enabled_test_cli_runtime_catalog(
         MessageProcessor::new(
             thread_manager.clone(),
-            test_provider(),
+            if native_api {
+                Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+                    "openai",
+                    Arc::new(DelayedProvider {
+                        delay: Duration::from_secs(60),
+                        text: "late answer".into(),
+                    }),
+                ))
+            } else {
+                test_provider()
+            },
             session_manager,
             workspace_manager,
             crud_store.clone(),
@@ -33458,27 +33584,55 @@ async fn assert_detached_native_child_turn_cancellation() {
     cli_session
         .set_next_native_turn_id("native_child_turn_cancel")
         .await;
-    let created = create_task_for_test(
-        &processor,
-        detached_cli_task_create_params(
-            workspace_id.as_str(),
+    let mut params = detached_cli_task_create_params(
+        workspace_id.as_str(),
+        parent_thread_id,
+        source_turn_id,
+        "claude",
+        CLIAgentRuntimeKind::Claude,
+        "claude-sonnet",
+        "cancel this child turn from its Composer",
+    );
+    if native_api {
+        let mut native = test_task_create_params(
+            &workspace_id,
             parent_thread_id,
             source_turn_id,
-            "claude",
-            CLIAgentRuntimeKind::Claude,
-            "claude-sonnet",
-            "cancel this child turn from its Composer",
-        ),
-    )
-    .await
-    .expect("cancellable native child Task should start");
+            "native API child Stop",
+            3,
+        );
+        native.lifecycle_policy = params.lifecycle_policy;
+        native.delivery_policy = params.delivery_policy;
+        params = native;
+    }
+    let created = create_task_for_test(&processor, params)
+        .await
+        .expect("cancellable native child Task should start");
     let run = created
         .run
         .clone()
         .expect("cancellable child run should exist");
     let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
-    let starts = wait_for_cli_runtime_turn_starts(&cli_session, 1).await;
-    assert_eq!(starts.len(), 1);
+    if native_api {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if crud_store
+                    .native_cancellation_context(&lineage.child_turn_id)
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("API child must reach durable native cancellation preparation");
+    } else {
+        let starts = wait_for_cli_runtime_turn_starts(&cli_session, 1).await;
+        assert_eq!(starts.len(), 1);
+    }
 
     thread_manager
         .thread_start_seeded(
@@ -33565,6 +33719,46 @@ async fn assert_detached_native_child_turn_cancellation() {
         .expect("task run turn should reload")
         .expect("task run turn should exist");
     assert_eq!(task_run_turn.status, TaskRunTurnStatus::Cancelled);
+    {
+        use sea_orm::EntityTrait;
+        let principal = authenticated_test_superuser().principal_id.to_string();
+        let db = crud_store.database_connection();
+        let receipt =
+            pioneer_entity::task_run_read::Entity::find_by_id((principal.clone(), run.id.clone()))
+                .one(&db)
+                .await
+                .unwrap();
+        assert!(
+            receipt.is_some(),
+            "Composer Stop must suppress the authenticated actor before any viewport read"
+        );
+        let origin =
+            pioneer_entity::task_run_cancellation_actor::Entity::find_by_id(run.id.clone())
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(origin.principal_id, principal);
+        assert_eq!(origin.origin_turn_id, lineage.child_turn_id);
+        // No live intent survives this point. Reconciliation from saved state
+        // must retain the original actor and remain idempotent.
+        processor.user_turn_cancel_intents.lock().await.clear();
+        processor
+            .task_agent_executor
+            .reconcile_child_turn_cancelled(
+                &lineage.child_thread_id,
+                &lineage.child_turn_id,
+                "replayed Stop",
+                super::TaskChildReconciliationOrigin::Live,
+            )
+            .await
+            .unwrap();
+        let receipts = pioneer_entity::task_run_read::Entity::find()
+            .all(&db)
+            .await
+            .unwrap();
+        assert_eq!(receipts.iter().filter(|r| r.run_id == run.id).count(), 1);
+    }
 
     let parent_occurrence_turn_id = lineage
         .created_by_turn_id
@@ -38183,6 +38377,20 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() 
         .runs
         .last()
         .expect("cancelled attached child task should have a run");
+    {
+        use sea_orm::EntityTrait;
+        let receipt = pioneer_entity::task_run_read::Entity::find_by_id((
+            authenticated_test_superuser().principal_id.to_string(),
+            run.id.clone(),
+        ))
+        .one(&crud_store.database_connection())
+        .await
+        .unwrap();
+        assert!(
+            receipt.is_some(),
+            "native parent Stop must carry the authenticated actor through work-graph cleanup"
+        );
+    }
     let task_run_turns = crud_store
         .list_task_run_turns(run.id.as_str())
         .await
@@ -72283,14 +72491,10 @@ async fn setup_pooled_file_workspace_manager_with_observer(
 async fn setup_workspace_manager_with_connection(
     connection: sea_orm::DatabaseConnection,
 ) -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
-    setup_workspace_manager_with_connection_migrator::<Migrator>(connection).await
-}
-
-async fn setup_workspace_manager_with_connection_migrator<M: MigratorTrait>(
-    connection: sea_orm::DatabaseConnection,
-) -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
+    // This helper invokes current Gateway bootstrap and authorization, so it
+    // requires the complete schema rather than a historical migration prefix.
     crate::compaction::load_test_catalog();
-    M::up(&connection, None)
+    Migrator::up(&connection, None)
         .await
         .expect("migrations must succeed");
     bootstrap(&connection)
@@ -84070,6 +84274,14 @@ async fn task_completion_inbox_rpc_uses_root_acl_and_syncs_personal_reads_withou
         &workspace_id,
     )
     .await;
+    let (b2, mut b2_rx) = device(
+        &sessions,
+        "P0000000000000000000B",
+        "D0000000000000000000E",
+        "S0000000000000000000E",
+        &workspace_id,
+    )
+    .await;
     let processor = MessageProcessor::new(
         Arc::new(ThreadManager::new("o4-mini", "openai")),
         test_provider(),
@@ -84215,6 +84427,89 @@ async fn task_completion_inbox_rpc_uses_root_acl_and_syncs_personal_reads_withou
     .unwrap();
     assert_eq!(dedup.entries.len(), 1);
     assert_eq!(dedup.unread_count, 1);
+    // Explicit bulk read includes a newly saved run that A never loaded.
+    db.execute_unprepared("INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,completed_at,created_at,updated_at) VALUES('R0000000000000000000J','K0000000000000000000I','R0000000000000000000J',1,2,'succeeded','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    while a2_rx.try_recv().is_ok() {}
+    while b_rx.try_recv().is_ok() {}
+    let all: TaskCompletionInboxListResponse = serde_json::from_value(
+        rpc(
+            &processor,
+            a,
+            &mut a_rx,
+            methods::TASK_COMPLETION_INBOX_READ_ALL,
+            json!({"workspaceId":workspace_id}),
+        )
+        .await
+        .result,
+    )
+    .unwrap();
+    assert_eq!(all.unread_count, 0);
+    assert!(all.entries.is_empty());
+    recv_notification_by_method(&mut a2_rx, events::TASK_COMPLETION_INBOX_CHANGED).await;
+    assert!(
+        b_rx.try_recv().is_err(),
+        "bulk read invalidates only the authenticated principal"
+    );
+    let same_user: TaskCompletionInboxListResponse = serde_json::from_value(
+        rpc(
+            &processor,
+            a2,
+            &mut a2_rx,
+            methods::TASK_COMPLETION_INBOX_LIST,
+            json!({"workspaceId":workspace_id}),
+        )
+        .await
+        .result,
+    )
+    .unwrap();
+    assert!(same_user.entries.is_empty());
+    let other_user: TaskCompletionInboxListResponse = serde_json::from_value(
+        rpc(
+            &processor,
+            b,
+            &mut b_rx,
+            methods::TASK_COMPLETION_INBOX_LIST,
+            json!({"workspaceId":workspace_id}),
+        )
+        .await
+        .result,
+    )
+    .unwrap();
+    assert_eq!(other_user.unread_count, 2);
+    while b_rx.try_recv().is_ok() {}
+    while b2_rx.try_recv().is_ok() {}
+    let viewed: Vec<String> = serde_json::from_value(rpc(
+        &processor, b, &mut b_rx, methods::TASK_COMPLETION_INBOX_VIEWED,
+        json!({"workspaceId":workspace_id,"threadId":"T0000000000000000000I","runIds":["R0000000000000000000J"],"resultTurnIds":[]}),
+    ).await.result).unwrap();
+    assert_eq!(viewed, ["run:R0000000000000000000J"]);
+    assert!(
+        b_rx.try_recv().is_err(),
+        "viewed source reloads in shared worker; no own hint"
+    );
+    recv_notification_by_method(&mut b2_rx, events::TASK_COMPLETION_INBOX_CHANGED).await;
+    let _: Vec<String> = serde_json::from_value(rpc(
+        &processor, b2, &mut b2_rx, methods::TASK_COMPLETION_INBOX_VIEWED,
+        json!({"workspaceId":workspace_id,"threadId":"T0000000000000000000I","runIds":["R0000000000000000000I"],"resultTurnIds":[]}),
+    ).await.result).unwrap();
+    recv_notification_by_method(&mut b_rx, events::TASK_COMPLETION_INBOX_CHANGED).await;
+    assert!(
+        b2_rx.try_recv().is_err(),
+        "the independent sender alone is skipped"
+    );
+    let thread_reads = db
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT COUNT(*) count FROM thread_read_cursor WHERE thread_id='T0000000000000000000I'",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        thread_reads.try_get::<i64>("", "count").unwrap(),
+        0,
+        "visible task read stays independent of thread cursors"
+    );
     db.execute_unprepared("DELETE FROM thread_membership WHERE principal_id='P0000000000000000000B' AND thread_id='T0000000000000000000I'").await.unwrap();
     let list: TaskCompletionInboxListResponse = serde_json::from_value(
         rpc(

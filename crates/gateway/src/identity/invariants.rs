@@ -310,6 +310,7 @@ mod tests {
                 updated_at: now,
             }],
             principals: vec![gateway_principal::Model {
+                inbox_after_sequence: None,
                 id: PRINCIPAL_ID.to_owned(),
                 gateway_id: GATEWAY_ID.to_owned(),
                 kind: "superuser".to_owned(),

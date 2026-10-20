@@ -43,11 +43,12 @@ impl TaskProjector {
         events: Vec<TaskEventPayload>,
         at: i64,
         action: Option<pioneer_crud::AgentCommitInput>,
+        actor_id: Option<String>,
     ) -> TaskRuntimeResult<Vec<AppendedTaskEvent>> {
         let store = self.store.clone();
         task_projector_fresh_task(async move {
             Ok(store
-                .append_task_cancellation_events(events, at, action)
+                .append_task_cancellation_events_as(events, at, action, actor_id)
                 .await?)
         })
         .await

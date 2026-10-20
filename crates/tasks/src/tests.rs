@@ -4080,8 +4080,7 @@ async fn due_trigger_materialization_rolls_back_run_when_occurrence_contract_is_
         .service()
         .store()
         .append_due_trigger_task_events(
-            trigger.id.as_str(),
-            10,
+            &trigger,
             10,
             vec![
                 TaskEventPayload::TaskQueued {
@@ -8630,5 +8629,148 @@ async fn reported_start_failure_does_not_swallow_failed_state_persistence_error(
 
 #[path = "tests_delivery_lifecycle.rs"]
 mod delivery_lifecycle;
+#[path = "tests/scheduler_catch_up.rs"]
+mod scheduler_catch_up;
 #[path = "tests/terminal_delivery.rs"]
 mod terminal_delivery;
+
+// Models the durable accepted Stop fact, retained independently of Gateway's
+// live intent map. Gateway regressions exercise creation through turn/cancel.
+#[tokio::test]
+async fn cancelled_terminal_commit_uses_saved_stop_actor_and_rolls_back_receipt_failure() {
+    let runtime = runtime().await;
+    let created = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Immediate),
+        )
+        .await
+        .unwrap();
+    let run = created.run.unwrap();
+    let store = runtime.service().store();
+    let db = store.database_connection();
+    pioneer_entity::task_run_cancellation_actor::Entity::insert(
+        pioneer_entity::task_run_cancellation_actor::ActiveModel {
+            run_id: Set(run.id.clone()),
+            task_id: Set(run.task_id.clone()),
+            workspace_id: Set(TEST_WORKSPACE_ID.into()),
+            principal_id: Set(TEST_PRINCIPAL_ID.into()),
+            origin_turn_id: Set(TEST_PARENT_TURN_ID.into()),
+        },
+    )
+    .exec(&db)
+    .await
+    .unwrap();
+    let handle = TaskExecutionHandle::new(
+        store.clone(),
+        runtime.event_bus(),
+        run.task_id.clone(),
+        run.id.clone(),
+    );
+    db.execute_unprepared("CREATE TRIGGER reject_stop_receipt BEFORE INSERT ON task_run_read BEGIN SELECT RAISE(ABORT, 'receipt fixture failure'); END").await.unwrap();
+    assert!(
+        handle
+            .cancel_run(Some("saved Stop".into()), run.created_at + 1)
+            .await
+            .is_err()
+    );
+    let unchanged = pioneer_entity::task_run::Entity::find_by_id(run.id.clone())
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        unchanged.status, "queued",
+        "receipt failure rolls back terminal transition"
+    );
+    assert!(
+        pioneer_entity::task_run_read::Entity::find()
+            .all(&db)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        pioneer_entity::task_run_cancellation_actor::Entity::find_by_id(run.id.clone())
+            .one(&db)
+            .await
+            .unwrap()
+            .is_some(),
+        "durable intent survives the failed commit"
+    );
+    let events = runtime
+        .service()
+        .get_task_events(TaskEventsParams {
+            task_id: run.task_id.clone(),
+            after_sequence: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        events
+            .events
+            .iter()
+            .all(|event| !matches!(event.payload, TaskEventPayload::RunCancelled { .. })),
+        "receipt failure also rolls back the cancellation event and fanout journal"
+    );
+    db.execute_unprepared("DROP TRIGGER reject_stop_receipt")
+        .await
+        .unwrap();
+    handle
+        .cancel_run(Some("saved Stop".into()), run.created_at + 1)
+        .await
+        .unwrap();
+    handle
+        .cancel_run(Some("saved Stop".into()), run.created_at + 1)
+        .await
+        .unwrap();
+    let committed_events = runtime
+        .service()
+        .get_task_events(TaskEventsParams {
+            task_id: run.task_id.clone(),
+            after_sequence: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        committed_events
+            .events
+            .iter()
+            .filter(|event| matches!(event.payload, TaskEventPayload::RunCancelled { .. }))
+            .count(),
+        1,
+        "an exact replay must not append another cancellation"
+    );
+    // A different reason is a conflicting outcome, not an idempotent replay.
+    // Keep the production terminal fence, and require this rejected attempt
+    // to leave the original actor's receipt and canonical journal intact.
+    let conflict = handle
+        .cancel_run(Some("replay".into()), run.created_at + 2)
+        .await
+        .unwrap_err();
+    assert!(
+        conflict
+            .downcast_ref::<pioneer_crud::TaskTerminalConflict>()
+            .is_some()
+    );
+    let after_conflict = runtime
+        .service()
+        .get_task_events(TaskEventsParams {
+            task_id: run.task_id.clone(),
+            after_sequence: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(after_conflict.events, committed_events.events);
+    let receipts = pioneer_entity::task_run_read::Entity::find()
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].principal_id, TEST_PRINCIPAL_ID);
+    assert_eq!(receipts[0].run_id, run.id);
+}
