@@ -123,7 +123,7 @@ impl ClaudeMcpSessionLaunchProjection {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut limits = limits;
-        limits.max_tools += self.canonical_projection.html_tool_count();
+        limits.max_tools += self.canonical_projection.native_tool_count();
         // Claude's two existing managed file tools are added by provider
         // preflight, outside the external catalog and the canonical HTML tools.
         limits.max_tools += self

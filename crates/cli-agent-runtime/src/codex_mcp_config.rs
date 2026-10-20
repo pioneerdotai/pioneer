@@ -44,6 +44,8 @@ pub struct CodexManagedMcpSemanticInput {
     pub provider_manifest_hash: String,
     pub provider_contract_fingerprint: String,
     pub overlay_policy_version: u32,
+    /// Managed client ceiling for native calls whose own policy has no hard deadline.
+    pub tool_timeout_secs: Option<u64>,
     pub tools: Vec<CodexManagedMcpToolIdentity>,
 }
 
@@ -163,6 +165,8 @@ struct CodexManagedStdioServer {
     command: String,
     args: Vec<String>,
     required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_timeout_sec: Option<u64>,
     enabled_tools: Vec<String>,
     tools: BTreeMap<String, CodexManagedToolPolicy>,
 }
@@ -180,6 +184,8 @@ struct CodexSemanticRestartIdentity<'a> {
     required: bool,
     isolation_features_disabled: &'static [&'static str],
     overlay_policy_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_timeout_secs: Option<u64>,
     canonical_manifest_hash: &'a str,
     provider_manifest_hash: &'a str,
     provider_contract_fingerprint: &'a str,
@@ -251,6 +257,7 @@ pub fn serialize_codex_managed_mcp_config(
                     bootstrap_path.expect("validated non-empty bootstrap path"),
                 ],
                 required: true,
+                tool_timeout_sec: input.semantic.tool_timeout_secs,
                 enabled_tools: enabled_tools.clone(),
                 tools,
             },
@@ -276,7 +283,11 @@ pub fn serialize_codex_managed_mcp_config(
             maximum: MAX_CONFIG_BYTES,
         });
     }
-    validate_serialized_config(config_toml.as_str(), enabled_tools.as_slice())?;
+    validate_serialized_config(
+        config_toml.as_str(),
+        enabled_tools.as_slice(),
+        input.semantic.tool_timeout_secs,
+    )?;
     let staged_mcp_servers = serde_json::to_value(&document.mcp_servers)
         .map_err(|error| CodexManagedMcpConfigError::Serialization(error.to_string()))?;
     let staged_mcp_servers_fingerprint = codex_config_value_fingerprint(&staged_mcp_servers)?;
@@ -315,7 +326,9 @@ fn normalized_codex_mcp_servers(
         "environment_id".to_owned(),
         JsonValue::String("local".to_owned()),
     );
-    pioneer.insert("tool_timeout_sec".to_owned(), JsonValue::Null);
+    pioneer
+        .entry("tool_timeout_sec".to_owned())
+        .or_insert(JsonValue::Null);
     Ok(staged)
 }
 
@@ -340,7 +353,21 @@ fn canonical_json(value: &JsonValue) -> JsonValue {
             keys.sort();
             let mut canonical = JsonMap::new();
             for key in keys {
-                canonical.insert(key.clone(), canonical_json(&object[key]));
+                // Codex's duration field may be serialized as integral or
+                // floating-point seconds. Attest its numeric value; retain all
+                // other fields exactly, including distinct fractional timeouts.
+                let value = if key == "tool_timeout_sec" {
+                    object[key]
+                        .as_f64()
+                        .filter(|seconds| {
+                            seconds.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(seconds)
+                        })
+                        .map(|seconds| JsonValue::from(seconds as u64))
+                        .unwrap_or_else(|| canonical_json(&object[key]))
+                } else {
+                    canonical_json(&object[key])
+                };
+                canonical.insert(key.clone(), value);
             }
             JsonValue::Object(canonical)
         }
@@ -376,6 +403,11 @@ fn validate_semantic_input(
         "provider contract fingerprint",
         input.provider_contract_fingerprint.as_str(),
     )?;
+    if input.tool_timeout_secs == Some(0)
+        || (input.tool_timeout_secs.is_some() && input.tools.is_empty())
+    {
+        return Err(CodexManagedMcpConfigError::InvalidSerializedConfig);
+    }
     if input.overlay_policy_version == 0 {
         return Err(CodexManagedMcpConfigError::InvalidOverlayPolicyVersion);
     }
@@ -436,6 +468,7 @@ fn semantic_restart_fingerprint_from_validated(
         required: !input.tools.is_empty(),
         isolation_features_disabled: ISOLATION_FEATURE_NAMES,
         overlay_policy_version: input.overlay_policy_version,
+        tool_timeout_secs: input.tool_timeout_secs,
         canonical_manifest_hash: input.canonical_manifest_hash.as_str(),
         provider_manifest_hash: input.provider_manifest_hash.as_str(),
         provider_contract_fingerprint: input.provider_contract_fingerprint.as_str(),
@@ -508,6 +541,7 @@ fn validate_projection_path(
 fn validate_serialized_config(
     config_toml: &str,
     enabled_tools: &[String],
+    tool_timeout_secs: Option<u64>,
 ) -> Result<(), CodexManagedMcpConfigError> {
     let value: toml::Value = toml::from_str(config_toml)
         .map_err(|_| CodexManagedMcpConfigError::InvalidSerializedConfig)?;
@@ -552,11 +586,28 @@ fn validate_serialized_config(
     let pioneer = servers[SYNTHETIC_SERVER_NAME]
         .as_table()
         .ok_or(CodexManagedMcpConfigError::InvalidSerializedConfig)?;
-    let allowed_server_keys = ["command", "args", "required", "enabled_tools", "tools"];
+    let allowed_server_keys = [
+        "command",
+        "args",
+        "required",
+        "enabled_tools",
+        "tools",
+        "tool_timeout_sec",
+    ];
     if pioneer
         .keys()
         .any(|key| !allowed_server_keys.contains(&key.as_str()))
         || pioneer.get("required").and_then(toml::Value::as_bool) != Some(true)
+        || match tool_timeout_secs {
+            Some(seconds) => {
+                pioneer
+                    .get("tool_timeout_sec")
+                    .and_then(toml::Value::as_integer)
+                    .and_then(|value| u64::try_from(value).ok())
+                    != Some(seconds)
+            }
+            None => pioneer.contains_key("tool_timeout_sec"),
+        }
     {
         return Err(CodexManagedMcpConfigError::InvalidSerializedConfig);
     }
@@ -632,12 +683,64 @@ mod tests {
                 provider_manifest_hash: hash('b'),
                 provider_contract_fingerprint: hash('c'),
                 overlay_policy_version: 1,
+                tool_timeout_secs: None,
                 tools,
             },
             limits: CodexManagedMcpConfigLimits { max_tools: 512 },
             helper_path: non_empty.then(|| PathBuf::from("/opt/pioneer/pioneer")),
             bootstrap_path: non_empty.then(|| PathBuf::from("/private/pioneer/session/bootstrap")),
         }
+    }
+
+    #[test]
+    fn codex_long_call_deadline_is_staged_attested_and_part_of_restart_identity() {
+        let ordinary = input(vec![tool("native_operation", 1)]);
+        let baseline = serialize_codex_managed_mcp_config(ordinary.clone()).unwrap();
+        let mut long = ordinary;
+        long.semantic.tool_timeout_secs = Some(43_200);
+        let artifact = serialize_codex_managed_mcp_config(long).unwrap();
+        assert!(artifact.config_toml.contains("tool_timeout_sec = 43200"));
+        assert_ne!(
+            baseline.semantic_restart_fingerprint,
+            artifact.semantic_restart_fingerprint
+        );
+        assert_ne!(
+            baseline.staged_mcp_servers_fingerprint,
+            artifact.staged_mcp_servers_fingerprint
+        );
+        let config: toml::Value = toml::from_str(&artifact.config_toml).unwrap();
+        let mut effective = serde_json::to_value(&config["mcp_servers"]).unwrap();
+        effective["pioneer"]["enabled"] = true.into();
+        effective["pioneer"]["environment_id"] = "local".into();
+        assert_eq!(
+            codex_config_value_fingerprint(&effective).unwrap(),
+            artifact.effective_mcp_servers_fingerprint
+        );
+        effective["pioneer"]["tool_timeout_sec"] = serde_json::json!(43_200.0);
+        assert_eq!(
+            codex_config_value_fingerprint(&effective).unwrap(),
+            artifact.effective_mcp_servers_fingerprint,
+            "equivalent provider duration encodings must attest identically"
+        );
+        effective["pioneer"]["tool_timeout_sec"] = serde_json::json!(43_200.5);
+        assert_ne!(
+            codex_config_value_fingerprint(&effective).unwrap(),
+            artifact.effective_mcp_servers_fingerprint
+        );
+        let malformed = artifact
+            .config_toml
+            .replace("tool_timeout_sec = 43200", "tool_timeout_sec = \"43200\"");
+        assert!(
+            validate_serialized_config(&malformed, &artifact.enabled_tools, Some(43_200)).is_err()
+        );
+        assert!(
+            validate_serialized_config(&artifact.config_toml, &artifact.enabled_tools, None)
+                .is_err()
+        );
+        assert!(
+            !baseline.config_toml.contains("tool_timeout_sec"),
+            "legacy contracts remain unchanged"
+        );
     }
 
     #[test]

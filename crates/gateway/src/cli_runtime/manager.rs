@@ -106,8 +106,9 @@ pub(crate) struct CLIAgentRuntimeSessionStartOptions {
     pub app_server_args: Vec<String>,
     pub env: SensitiveEnvironment,
     pub additional_directories: Vec<PathBuf>,
-    /// Exact selected Claude skill installations. Claude receives these as
-    /// generation-scoped managed plugins; the shared user settings source is
+    /// Exact selected Claude skill installations in canonical install-name order.
+    /// Application order is delivered separately in turn instructions. Claude
+    /// receives these as generation-scoped managed plugins; the shared user settings source is
     /// never enabled for skill discovery.
     pub selected_skills: Vec<super::skills::CliRuntimeSelectedSkill>,
     pub elevated_instructions: Option<CLIRuntimeElevatedInstructions>,
@@ -2132,6 +2133,97 @@ mod tests {
             .unwrap();
         assert_eq!(factory.starts.load(Ordering::SeqCst), 2);
         assert_eq!(factory.closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn claude_skill_projection_reuses_session_and_restarts_for_real_changes() {
+        use crate::cli_runtime::continuation::requires_restart;
+        use crate::cli_runtime::skills::{
+            CliRuntimeSelectedSkill, normalize_cli_runtime_selected_skills,
+        };
+        let factory = Arc::new(FakeFactory::default());
+        let manager = manager_with_factory(factory.clone());
+        let key = CLIAgentRuntimeSessionKey::new("ws", "claude", "restored-skills").unwrap();
+        let selected = normalize_cli_runtime_selected_skills(
+            ["pioneer-system-tasks", "pioneer-system-subagents"].map(|name| {
+                CliRuntimeSelectedSkill {
+                    install_name: name.to_owned(),
+                    installed_path: std::path::PathBuf::from("/native/skills").join(name),
+                    source_folder_hash: format!("hash-{name}"),
+                }
+            }),
+        )
+        .unwrap();
+        let mut current = CliSessionLaunchSpec::claude_new(
+            CLIAgentRuntimeSessionStartOptions {
+                selected_skills: selected.clone(),
+                ..Default::default()
+            },
+            CliMcpSessionLaunch::Claude(claude_mcp_launch_projection("skill-turn", 'a')),
+            uuid::Uuid::new_v4(),
+        );
+        let mut resumed_options = current.options.clone();
+        resumed_options.selected_skills =
+            normalize_cli_runtime_selected_skills(selected.into_iter().rev()).unwrap();
+        let resumed = CliSessionLaunchSpec::claude_resume(
+            resumed_options,
+            current.mcp.clone(),
+            current.continuation.claude_provider_session_id().unwrap(),
+        );
+        assert!(!requires_restart(&current, &resumed));
+        let mut handle = manager
+            .get_or_start_with_launch_spec(key.clone(), current.clone())
+            .await
+            .unwrap();
+        let reused = manager
+            .get_or_start_with_launch_spec(key.clone(), resumed.clone())
+            .await
+            .unwrap();
+        assert!(handle.ptr_eq(&reused));
+        assert_eq!(handle.instance(), reused.instance());
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(factory.closes.load(Ordering::SeqCst), 0);
+        assert!(factory.replacement_events.lock().await.is_empty());
+        current = resumed;
+        for (index, change) in ["composition", "path", "source_folder_hash"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut changed = current.clone();
+            match change {
+                "composition" => {
+                    changed.options.selected_skills.pop();
+                }
+                "path" => {
+                    changed.options.selected_skills[0].installed_path =
+                        "/native/replaced-skill".into()
+                }
+                _ => {
+                    changed.options.selected_skills[0].source_folder_hash =
+                        "changed-content".to_owned()
+                }
+            }
+            assert!(requires_restart(&current, &changed), "{change}");
+            let replacement = manager
+                .get_or_start_with_launch_spec(key.clone(), changed.clone())
+                .await
+                .unwrap();
+            assert_ne!(handle.instance(), replacement.instance(), "{change}");
+            assert_eq!(factory.starts.load(Ordering::SeqCst), index + 2, "{change}");
+            assert_eq!(factory.closes.load(Ordering::SeqCst), index + 1, "{change}");
+            let events = factory.replacement_events.lock().await;
+            assert_eq!(
+                &events[events.len() - 3..],
+                &[
+                    (index + 1, "prepare"),
+                    (index + 1, "close"),
+                    (index + 1, "confirm")
+                ]
+            );
+            drop(events);
+            current = changed;
+            handle = replacement;
+        }
     }
 
     #[tokio::test]

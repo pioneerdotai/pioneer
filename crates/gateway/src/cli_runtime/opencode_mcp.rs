@@ -65,8 +65,9 @@ impl OpenCodeMcpSessionLaunchProjection {
 
     pub(crate) fn facade_projection(
         &self,
-        limits: CliMcpFacadeProjectionLimits,
+        mut limits: CliMcpFacadeProjectionLimits,
     ) -> Result<CliMcpFacadeProjection, CliMcpFacadeBuildError> {
+        limits.max_tools += self.canonical_projection.native_tool_count();
         let tools = self
             .canonical_projection
             .tools

@@ -95,6 +95,26 @@ pub struct ThreadView {
 impl EventEmitter<ThreadNavigationEvent> for ThreadView {}
 static NEXT_MOUNT: AtomicU64 = AtomicU64::new(1);
 impl ThreadView {
+    /// Observe native composer input application without retaining client demand.
+    pub fn observe_composer_inputs(
+        this: &Entity<Self>,
+        cx: &mut App,
+        mut changed: impl FnMut(&mut App) + 'static,
+    ) -> Subscription {
+        let composer = this.read(cx).composer.clone();
+        cx.observe(&composer, move |_, cx| changed(cx))
+    }
+
+    /// Startup-only, content-independent inspection of the visible native composer.
+    pub fn composer_startup_outcome(
+        &self,
+        cx: &App,
+    ) -> Option<pioneer_observability::DesktopStartupOutcome> {
+        self.visible
+            .then(|| self.composer.read(cx).startup_outcome())
+            .flatten()
+    }
+
     pub fn is_visible(&self) -> bool {
         self.visible
     }

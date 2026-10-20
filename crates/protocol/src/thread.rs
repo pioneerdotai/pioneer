@@ -236,6 +236,20 @@ pub struct ThreadTreeResponse {
     pub agents_docs: Vec<ThreadAgentsDocSummary>,
 }
 
+impl ThreadTreeResponse {
+    /// Normalize only the directory boundary. Canonical Thread/get and stored
+    /// messages retain their full preview. Unnamed previews remain intact for
+    /// fallback titles (including name clearing) and first-message/draft flows.
+    pub fn into_directory_summary(mut self) -> Self {
+        self.threads = self
+            .threads
+            .into_iter()
+            .map(Thread::into_directory_summary)
+            .collect();
+        self
+    }
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct ThreadUnreadSummary {
     pub thread_id: String,
@@ -604,6 +618,33 @@ pub struct Thread {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visibility: Option<ThreadVisibility>,
     pub turns: Vec<Turn>,
+}
+
+impl Thread {
+    /// Directory metadata is also used for Composer defaults: preserve every
+    /// field and the latest turn marker. Named rows only need a short preview;
+    /// keep an exact Unicode prefix so normalization is idempotent.
+    pub fn into_directory_summary(mut self) -> Self {
+        if self
+            .name
+            .as_deref()
+            .is_some_and(|name| !name.trim().is_empty())
+        {
+            if let Some((end, _)) = self.preview.char_indices().nth(160) {
+                let prefix = &self.preview[..end];
+                // First-message admission also uses trim().is_empty(). A long
+                // whitespace prefix must not turn an existing message into an
+                // empty draft. Keep that exceptional preview intact.
+                if !prefix.trim().is_empty() || self.preview.trim().is_empty() {
+                    // Release the original large buffer in retained summaries.
+                    // Canonical owners are untouched.
+                    self.preview = prefix.to_owned();
+                }
+            }
+        }
+        self.turns = self.turns.into_iter().next_back().into_iter().collect();
+        self
+    }
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]

@@ -1902,7 +1902,9 @@ impl MessageProcessor {
                                 self.commit_turn_interrupted_with_recovery_disposition(
                                     thread_id.clone(),
                                     turn_id.clone(),
-                                    user_reason.unwrap_or_else(|| reason.clone()),
+                                    user_reason
+                                        .map(|intent| intent.reason)
+                                        .unwrap_or_else(|| reason.clone()),
                                     recovery.clone(),
                                     user_cancellation,
                                 )
@@ -3381,6 +3383,18 @@ impl MessageProcessor {
         item_started_deadlines: Option<pioneer_crud::TurnItemAttemptDeadlines>,
         cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> Result<()> {
+        let cancellation_actor = if matches!(&event,
+            pioneer_crud::CanonicalTurnEventPayload::TurnFailed(n)
+            if n.turn.status == TurnStatus::Interrupted)
+        {
+            self.user_turn_cancel_intents
+                .lock()
+                .await
+                .get(&(event.thread_id().to_owned(), event.turn_id().to_owned()))
+                .and_then(|intent| intent.actor_id.clone())
+        } else {
+            None
+        };
         let guarded_cli_blocked_commit = cli_blocked_guard.is_some();
         let activates_terminal_effects = matches!(
             &event,
@@ -3448,11 +3462,18 @@ impl MessageProcessor {
                         .turn_owner_generation(&notification.thread_id, &notification.turn.id)
                         .await
                         .is_some()
-                        || self
+                        // CLI turns also freeze task inheritance in a runtime
+                        // snapshot. Their cancellation uses the CLI lifecycle,
+                        // without a native controller's terminal-effect plan.
+                        // Keep the snapshot fallback fail-closed unless durable
+                        // execution ownership positively identifies a CLI turn.
+                        || (execution.as_ref().is_none_or(|e| {
+                            e.executor_kind != pioneer_crud::TurnExecutorKind::CliRuntime
+                        }) && self
                             .crud_store
                             .get_turn_runtime_snapshot(&notification.turn.id)
                             .await?
-                            .is_some()
+                            .is_some())
                     {
                         return Err(pioneer_crud::NativeCancellationContextUnavailable.into());
                     }
@@ -3496,21 +3517,23 @@ impl MessageProcessor {
                     }
                     if let Some((context, preparation)) = cancellation {
                         return crud_store
-                            .materialize_native_cancellation_owned(
+                            .materialize_native_cancellation_owned_as(
                                 event,
                                 event_timestamp_secs,
                                 context,
                                 preparation,
                                 turn_execution_owner_id.as_ref(),
+                                cancellation_actor,
                             )
                             .await;
                     }
                     crud_store
-                        .materialize_native_agent_turn_event_owned(
+                        .materialize_native_agent_turn_event_owned_as(
                             event,
                             event_timestamp_secs,
                             item_started_deadlines,
                             turn_execution_owner_id.as_ref(),
+                            cancellation_actor,
                         )
                         .await
                 },
@@ -8635,6 +8658,18 @@ impl MessageProcessor {
         }
     }
 
+    // Concurrent Stop requests share the first authenticated intent. A failed
+    // duplicate must not retire it while another request can still commit.
+    pub(super) async fn release_user_turn_cancel_intent(&self, key: &(String, String)) {
+        let mut intents = self.user_turn_cancel_intents.lock().await;
+        if let Some(intent) = intents.get_mut(key) {
+            intent.pending_requests -= 1;
+            if intent.pending_requests == 0 {
+                intents.remove(key);
+            }
+        }
+    }
+
     pub(super) async fn cancel_root_agent_work_graph_for_turn(
         &self,
         thread_id: &str,
@@ -8672,9 +8707,22 @@ impl MessageProcessor {
         // Fence every queued/running descendant before asking provider
         // runtimes to stop. Any concurrent action commit then observes the
         // terminal execution/resource state and fails closed.
+        let actor_id = self
+            .user_turn_cancel_intents
+            .lock()
+            .await
+            .get(&(thread_id.to_owned(), turn.id.clone()))
+            .and_then(|intent| intent.actor_id.clone());
         let targets = self
             .crud_store
-            .cancel_agent_work_graph(execution.id.as_str(), reason, pioneer_crud::utc_now())
+            .cancel_agent_work_graph_as(
+                execution.id.as_str(),
+                reason,
+                pioneer_crud::utc_now(),
+                actor_id
+                    .as_deref()
+                    .map(|actor| (actor, thread_id, turn.id.as_str())),
+            )
             .await?;
 
         let mut task_ids = targets
@@ -8706,7 +8754,10 @@ impl MessageProcessor {
                 .task_runtime
                 .service()
                 .cancel_task(
-                    pioneer_tasks::TaskMutationContext::default(),
+                    pioneer_tasks::TaskMutationContext {
+                        actor_id: actor_id.clone(),
+                        ..Default::default()
+                    },
                     pioneer_protocol::TaskCancelParams {
                         task_id: task_id.clone(),
                         reason: Some(reason.to_owned()),
@@ -8910,13 +8961,14 @@ impl MessageProcessor {
         transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
         start_failure: Option<&pioneer_tasks::TaskStartFailureDescriptor>,
     ) -> bool {
-        if let Some(user_cancellation_reason) = self
-            .user_turn_cancel_intents
-            .lock()
-            .await
-            .get(&(thread_id.clone(), turn_id.clone()))
-            .cloned()
-        {
+        // An if-let scrutinee keeps its temporary MutexGuard throughout the
+        // branch. The Interrupted commit reads this same map to persist the
+        // authenticated actor, so release the guard before any terminal work.
+        let user_cancellation_reason = {
+            let intents = self.user_turn_cancel_intents.lock().await;
+            intents.get(&(thread_id.clone(), turn_id.clone())).cloned()
+        };
+        if let Some(user_cancellation_reason) = user_cancellation_reason {
             // Cancellation wins over Blocked, but still cannot bypass a CLI
             // transition already performing terminal effects or admission.
             let _acquired = if transition.is_none() {
@@ -8959,7 +9011,7 @@ impl MessageProcessor {
                 .mark_turn_interrupted_with_recovery_disposition(
                     thread_id,
                     turn_id,
-                    user_cancellation_reason,
+                    user_cancellation_reason.reason,
                     None,
                     true,
                 )
@@ -9732,7 +9784,7 @@ impl MessageProcessor {
                 .mark_turn_interrupted_with_recovery_disposition(
                     thread_id,
                     turn_id,
-                    user_cancellation_reason,
+                    user_cancellation_reason.reason,
                     recovery,
                     true,
                 )

@@ -75,7 +75,7 @@ pub(crate) struct McpService {
 }
 
 pub(crate) struct McpServiceInner {
-    pub(crate) html_processor: RwLock<std::sync::Weak<crate::message::MessageProcessor>>,
+    pub(crate) native_tool_processor: RwLock<std::sync::Weak<crate::message::MessageProcessor>>,
     pub(crate) crud_store: Arc<CrudStore>,
     authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
     execution_leases: Arc<ExecutionLeaseRegistry>,
@@ -103,6 +103,8 @@ pub(crate) struct McpServiceInner {
     snapshot_version: Arc<AtomicU64>,
     runtime_generation_counter: AtomicU64,
     runtime_generations: Mutex<HashMap<String, u64>>,
+    cli_task_mutation_caches:
+        Mutex<HashMap<String, std::sync::Weak<crate::task_tools::TaskToolMutationCache>>>,
     active_invocation_counter: AtomicU64,
     active_invocations: std::sync::Mutex<HashMap<u64, ActiveMcpInvocation>>,
     secret_fingerprint_key: [u8; 32],
@@ -392,7 +394,7 @@ impl McpService {
             )
             .expect("OAuth HTTP client");
             McpServiceInner {
-                html_processor: RwLock::new(std::sync::Weak::new()),
+                native_tool_processor: RwLock::new(std::sync::Weak::new()),
                 oauth: oauth.clone(),
                 oauth_events: std::sync::Mutex::new(None),
                 shutdown_gate: Mutex::new(()),
@@ -415,6 +417,7 @@ impl McpService {
                 snapshot_version,
                 runtime_generation_counter: AtomicU64::new(runtime_generation_seed()),
                 runtime_generations: Mutex::new(HashMap::new()),
+                cli_task_mutation_caches: Mutex::new(HashMap::new()),
                 active_invocation_counter: AtomicU64::new(0),
                 active_invocations: std::sync::Mutex::new(HashMap::new()),
                 secret_fingerprint_key: rand::random(),
@@ -556,6 +559,20 @@ impl McpService {
         &self,
     ) -> Arc<dyn pioneer_tools::PermissionApprovalBroker> {
         self.inner.permission_approval_broker.read().await.clone()
+    }
+
+    pub(crate) async fn cli_task_mutation_cache(
+        &self,
+        turn_id: &str,
+    ) -> Arc<crate::task_tools::TaskToolMutationCache> {
+        let mut caches = self.inner.cli_task_mutation_caches.lock().await;
+        caches.retain(|_, cache| cache.strong_count() > 0);
+        if let Some(cache) = caches.get(turn_id).and_then(std::sync::Weak::upgrade) {
+            return cache;
+        }
+        let cache = Arc::new(crate::task_tools::TaskToolMutationCache::default());
+        caches.insert(turn_id.to_owned(), Arc::downgrade(&cache));
+        cache
     }
 
     pub(crate) fn turn_mcp_invoker(&self) -> GatewayTurnMcpInvoker {
@@ -2812,8 +2829,12 @@ impl TurnMcpRuntimeView for McpService {
         workspace_id: &str,
         binding: &pioneer_crud::TurnMcpBindingRecord,
     ) -> Result<CurrentMcpToolIdentity, TurnMcpInvocationError> {
-        if binding.server_installation_id == pioneer_tools::html::HTML_SERVER_ID {
-            return first_party_html_identity(workspace_id, binding);
+        if crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(
+            &binding.server_installation_id,
+        )
+        .is_some()
+        {
+            return crate::turn_mcp::native_tools::current_identity(workspace_id, binding);
         }
         if binding.server_installation_id == FIRST_PARTY_FILE_SERVER_ID {
             return first_party_file_tool_identity(workspace_id, binding);
@@ -2937,56 +2958,6 @@ impl TurnMcpRuntimeView for McpService {
             runtime_generation: snapshot.runtime_generation,
         })
     }
-}
-
-pub(crate) fn first_party_html_identity(
-    workspace_id: &str,
-    binding: &pioneer_crud::TurnMcpBindingRecord,
-) -> Result<CurrentMcpToolIdentity, TurnMcpInvocationError> {
-    let definition = pioneer_tools::html::definition(&binding.raw_tool_name).ok_or_else(|| {
-        TurnMcpInvocationError::new(
-            TurnMcpInvocationErrorCode::ToolUnbound,
-            "unknown HTML callable",
-        )
-    })?;
-    let (schema, fingerprint, _) =
-        crate::turn_mcp::projection::canonical_schema_identity(&definition["inputSchema"])
-            .map_err(|_| {
-                TurnMcpInvocationError::new(
-                    TurnMcpInvocationErrorCode::Internal,
-                    "HTML schema unavailable",
-                )
-            })?;
-    if workspace_id.is_empty()
-        || binding.server_name != pioneer_tools::html::HTML_SERVER_NAME
-        || binding.catalog_version != pioneer_tools::html::HTML_SERVER_ID
-        || binding.fingerprint != pioneer_tools::html::HTML_SERVER_ID
-        || binding.canonical_callable_name != binding.raw_tool_name
-        || binding.canonical_schema_fingerprint != fingerprint
-        || binding.annotations_json != "{}"
-        || binding.annotations_digest != crate::turn_mcp::projection::sha256_hex(b"{}")
-        || binding.runtime_generation != 1
-        || binding.effective_timeout_ms != 120_000
-    {
-        return Err(TurnMcpInvocationError::new(
-            TurnMcpInvocationErrorCode::ToolDrift,
-            "HTML binding differs from the canonical catalog",
-        ));
-    }
-    Ok(CurrentMcpToolIdentity {
-        server_installation_id: pioneer_tools::html::HTML_SERVER_ID.into(),
-        server_name: pioneer_tools::html::HTML_SERVER_NAME.into(),
-        raw_tool_name: binding.raw_tool_name.clone(),
-        description: definition["description"].as_str().map(str::to_owned),
-        catalog_version: pioneer_tools::html::HTML_SERVER_ID.into(),
-        installation_fingerprint: pioneer_tools::html::HTML_SERVER_ID.into(),
-        canonical_schema_fingerprint: fingerprint,
-        canonical_schema: schema,
-        annotations_json: "{}".into(),
-        annotations_digest: binding.annotations_digest.clone(),
-        effective_timeout_ms: 120_000,
-        runtime_generation: 1,
-    })
 }
 
 fn first_party_file_tool_identity(
@@ -3139,7 +3110,7 @@ impl TurnMcpValidatedExecution for McpService {
             {
                 let processor = self
                     .inner
-                    .html_processor
+                    .native_tool_processor
                     .read()
                     .expect("first-party processor lock")
                     .upgrade()
@@ -3164,44 +3135,52 @@ impl TurnMcpValidatedExecution for McpService {
                     .execute_first_party_file_tool(&validated, &security, cancellation.clone())
                     .await;
             }
-            let annotations = serde_json::from_str::<pioneer_tools::McpDynamicToolAnnotations>(
-                validated.binding.annotations_json.as_str(),
-            )
-            .map_err(|_| {
-                TurnMcpInvocationError::new(
-                    TurnMcpInvocationErrorCode::ResultInvalid,
-                    "frozen MCP annotations are invalid",
+            let native_tasks = crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(
+                &validated.binding.server_installation_id,
+            ) == Some(crate::turn_mcp::native_tools::NativeToolFamily::Tasks);
+            let bundles = if native_tasks {
+                self.materialize_cli_task_tools(&validated).await?
+            } else {
+                let annotations = serde_json::from_str::<pioneer_tools::McpDynamicToolAnnotations>(
+                    validated.binding.annotations_json.as_str(),
                 )
-            })?;
-            let descriptor = pioneer_tools::McpDynamicToolDescriptor {
-                callable_name: validated.binding.canonical_callable_name.clone(),
-                workspace_id: validated.invocation.workspace_id.clone(),
-                server_id: validated.binding.server_installation_id.clone(),
-                server_name: validated.binding.server_name.clone(),
-                raw_tool_name: validated.binding.raw_tool_name.clone(),
-                catalog_version: validated.binding.catalog_version.clone(),
-                fingerprint: validated.binding.fingerprint.clone(),
-                snapshot_version: validated.current_tool.runtime_generation,
-                description: format!(
-                    "MCP server `{}` raw tool `{}`.",
-                    validated.binding.server_name, validated.binding.raw_tool_name
-                ),
-                parameters: validated.current_tool.canonical_schema.clone(),
-                annotations,
-                timeout_ms: Some(validated.current_tool.effective_timeout_ms.max(1)),
-                max_arguments_bytes: validated.invocation_limits.max_arguments_bytes,
-                selection_reason: validated.binding.selection_reason.clone(),
-                capability_id: validated.binding.capability_id.clone(),
-            };
-            let backend: Arc<dyn pioneer_tools::McpToolExecutor> = Arc::new(self.clone());
-            let materialized = pioneer_tools::materialize_mcp_runtime_tools(&[descriptor], backend);
-            if !materialized.excluded_tools.is_empty() || materialized.bundles.len() != 1 {
-                return Err(TurnMcpInvocationError::new(
-                    TurnMcpInvocationErrorCode::ResultInvalid,
-                    "validated MCP tool could not be materialized for execution",
-                ));
-            }
+                .map_err(|_| {
+                    TurnMcpInvocationError::new(
+                        TurnMcpInvocationErrorCode::ResultInvalid,
+                        "frozen MCP annotations are invalid",
+                    )
+                })?;
+                let descriptor = pioneer_tools::McpDynamicToolDescriptor {
+                    callable_name: validated.binding.canonical_callable_name.clone(),
+                    workspace_id: validated.invocation.workspace_id.clone(),
+                    server_id: validated.binding.server_installation_id.clone(),
+                    server_name: validated.binding.server_name.clone(),
+                    raw_tool_name: validated.binding.raw_tool_name.clone(),
+                    catalog_version: validated.binding.catalog_version.clone(),
+                    fingerprint: validated.binding.fingerprint.clone(),
+                    snapshot_version: validated.current_tool.runtime_generation,
+                    description: format!(
+                        "MCP server `{}` raw tool `{}`.",
+                        validated.binding.server_name, validated.binding.raw_tool_name
+                    ),
+                    parameters: validated.current_tool.canonical_schema.clone(),
+                    annotations,
+                    timeout_ms: Some(validated.current_tool.effective_timeout_ms.max(1)),
+                    max_arguments_bytes: validated.invocation_limits.max_arguments_bytes,
+                    selection_reason: validated.binding.selection_reason.clone(),
+                    capability_id: validated.binding.capability_id.clone(),
+                };
+                let backend: Arc<dyn pioneer_tools::McpToolExecutor> = Arc::new(self.clone());
+                let materialized = pioneer_tools::materialize_mcp_runtime_tools(&[descriptor], backend);
+                if !materialized.excluded_tools.is_empty() || materialized.bundles.len() != 1 {
+                    return Err(TurnMcpInvocationError::new(
+                        TurnMcpInvocationErrorCode::ResultInvalid,
+                        "validated MCP tool could not be materialized for execution",
+                    ));
+                }
 
+                materialized.bundles
+            };
             let permission_context = pioneer_tools::PermissionEvaluationContext::for_turn(
                 validated.invocation.workspace_id.clone(),
                 validated.invocation.thread_id.clone(),
@@ -3215,7 +3194,7 @@ impl TurnMcpValidatedExecution for McpService {
                 permission_context,
                 pioneer_tools::WebToolsConfig::default(),
                 pioneer_tools::ComputerUseToolsConfig::default(),
-                materialized.bundles,
+                bundles,
                 std::collections::BTreeMap::new(),
                 Some(security.snapshot),
             )
@@ -3235,20 +3214,49 @@ impl TurnMcpValidatedExecution for McpService {
                         "MCP invocation arguments are not serializable",
                     )
                 })?;
-            let call = tools
+            let mut call = tools
                 .router
                 .build_tool_call(pioneer_tools::RawToolCall {
-                    call_id: validated.invocation.provider_call_id.clone(),
+                    call_id: if native_tasks {
+                        crate::turn_mcp::native_tools::cli_task_call_id(
+                            &validated.invocation.turn_id,
+                            &validated.binding.raw_tool_name,
+                            &validated.invocation.provider_call_id,
+                            &validated.invocation.arguments,
+                        )
+                    } else {
+                        validated.invocation.provider_call_id.clone()
+                    },
                     tool_name: validated.binding.canonical_callable_name.clone(),
                     arguments,
                 })
                 .map_err(map_shared_tool_error)?;
-            let result = match tools
-                .runtime
-                .execute_tool_call_with_cancellation(call, cancellation)
-                .await
-            {
+            if native_tasks && call.idempotency_key.is_none() {
+                call.idempotency_key = Some(format!("{}:{}", call.tool_name, call.call_id));
+            }
+            let started = std::time::Instant::now();
+            let mut tool_events = tools.event_bus.subscribe();
+            let execution = tools.runtime.execute_tool_call_with_cancellation(call, cancellation);
+            tokio::pin!(execution);
+            let outcome = loop {
+                tokio::select! {
+                    result = &mut execution => break result,
+                    event = tool_events.recv(), if native_tasks => {
+                        if matches!(event, Ok(pioneer_tools::ToolEvent { payload: pioneer_tools::ToolEventPayload::Heartbeat, .. })) {
+                            let processor = self.inner.native_tool_processor.read().expect("native tool processor lock").upgrade();
+                            if let Some(processor) = processor {
+                                processor.confirm_cli_task_activity(&validated.invocation.turn_id, &validated.invocation.provider_call_id).await;
+                            }
+                        }
+                    }
+                }
+            };
+            let result = match outcome {
                 Ok(result) => result,
+                Err(error) if native_tasks && validated.binding.raw_tool_name != "threads_start_options"
+                    && !matches!(error, pioneer_tools::ToolError::Cancelled(_)) => {
+                    return Ok(canonical_task_error_result(error, started.elapsed()));
+                }
                 Err(pioneer_tools::ToolError::Rejected(message)) => {
                     return Ok(canonical_permission_denied_result(message.as_str()));
                 }
@@ -3260,7 +3268,21 @@ impl TurnMcpValidatedExecution for McpService {
                     "shared MCP tool result projection is unavailable",
                 )
             })?;
-            canonical_result_from_tool_output(&projection.llm_payload())
+            if native_tasks {
+                let payload = projection.llm_payload();
+                let text = serde_json::to_string(&payload).map_err(|_| TurnMcpInvocationError::new(
+                    TurnMcpInvocationErrorCode::ResultInvalid, "task output cannot be serialized",
+                ))?;
+                Ok(CanonicalMcpToolResult {
+                    content: json!([{"type":"text", "text": text}]),
+                    structured_content: Some(payload),
+                    is_error: !result.success(),
+                    duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    meta: None,
+                })
+            } else {
+                canonical_result_from_tool_output(&projection.llm_payload())
+            }
         }
         .await;
         self.audit_turn_mcp_invocation_outcome(&validated, &result)
@@ -3270,6 +3292,46 @@ impl TurnMcpValidatedExecution for McpService {
 }
 
 impl McpService {
+    async fn materialize_cli_task_tools(
+        &self,
+        validated: &ValidatedTurnMcpInvocation,
+    ) -> Result<Vec<pioneer_tools::ToolExtensionBundle>, TurnMcpInvocationError> {
+        let processor = self
+            .inner
+            .native_tool_processor
+            .read()
+            .expect("native tool processor lock")
+            .upgrade()
+            .ok_or_else(|| {
+                TurnMcpInvocationError::new(
+                    TurnMcpInvocationErrorCode::ExecutionFailed,
+                    "native Gateway handler is unavailable",
+                )
+            })?;
+        let context = pioneer_agent::TurnToolContext {
+            workspace_id: validated.invocation.workspace_id.clone(),
+            thread_id: validated.invocation.thread_id.clone(),
+            turn_id: validated.invocation.turn_id.clone(),
+        };
+        let bundles = crate::turn_mcp::native_tools::materialize_task_tools(processor, context)
+            .await
+            .map_err(|error| {
+                TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::PermissionDenied, error)
+            })?;
+        if !bundles.iter().any(|bundle| {
+            bundle
+                .specs
+                .iter()
+                .any(|spec| spec.spec.name == validated.binding.raw_tool_name)
+        }) {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::PermissionDenied,
+                "task tool is no longer permitted for this execution",
+            ));
+        }
+        Ok(bundles)
+    }
+
     async fn execute_html_tool(
         &self,
         validated: &ValidatedTurnMcpInvocation,
@@ -3278,7 +3340,7 @@ impl McpService {
         use base64::Engine;
         let processor = self
             .inner
-            .html_processor
+            .native_tool_processor
             .read()
             .expect("HTML processor lock")
             .upgrade()
@@ -3654,6 +3716,33 @@ impl McpService {
                 "failed to write MCP invocation outcome audit"
             );
         }
+    }
+}
+
+fn canonical_task_error_result(
+    error: pioneer_tools::ToolError,
+    duration: std::time::Duration,
+) -> CanonicalMcpToolResult {
+    // Reuse the native handler's public error policy. Domain conflicts and
+    // unconfirmed operations retain their meaning across the MCP adapter.
+    let error = crate::task_tools::sanitize_task_tool_error(error);
+    let reason = match &error {
+        pioneer_tools::ToolError::Rejected(message)
+            if message.starts_with("task_access_denied:") =>
+        {
+            "permission_denied"
+        }
+        pioneer_tools::ToolError::Rejected(_) => "task_state_conflict",
+        pioneer_tools::ToolError::InvalidArguments(_) => "task_invalid_arguments",
+        _ => "task_operation_failed",
+    };
+    let payload = json!({"error": error.to_string()});
+    CanonicalMcpToolResult {
+        content: json!([{"type":"text", "text": payload.to_string()}]),
+        structured_content: Some(payload),
+        is_error: true,
+        duration_ms: duration.as_millis().min(u64::MAX as u128) as u64,
+        meta: Some(json!({"pioneer":{"reasonCode": reason}})),
     }
 }
 

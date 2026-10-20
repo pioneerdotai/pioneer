@@ -409,8 +409,58 @@ impl AcpMcpSessionLaunchProjection {
                 .map_err(anyhow::Error::new)
             })
             .collect::<Result<Vec<_>>>()?;
-        limits.max_tools += self.canonical_projection.html_tool_count();
+        limits.max_tools += self.canonical_projection.native_tool_count();
         CliMcpFacadeProjection::new(tools, limits)
             .context("ACP managed MCP facade exceeds its transport budget")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::turn_mcp::{McpProjectionLimits, native_tools::NativeToolFamily};
+
+    #[test]
+    fn native_tasks_share_reserved_slots_without_relaxing_the_frame_budget() {
+        let definitions = [NativeToolFamily::Html, NativeToolFamily::Tasks]
+            .into_iter()
+            .flat_map(|family| {
+                family
+                    .definitions()
+                    .into_iter()
+                    .map(move |spec| (family, spec))
+            })
+            .collect();
+        let projection = ResolvedMcpTurnProjection::empty("workspace", "turn")
+            .with_native_tools(
+                definitions,
+                McpProjectionLimits {
+                    max_tools: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let launch = AcpMcpSessionLaunchProjection::new(projection, "a".repeat(64)).unwrap();
+        let limits = CliMcpFacadeProjectionLimits {
+            max_tools: 1,
+            max_list_result_bytes: 1024 * 1024,
+        };
+        let facade = launch.facade_projection(limits).unwrap();
+        assert!(facade.tools().len() > limits.max_tools);
+        assert!(
+            launch
+                .canonical_projection
+                .tools
+                .iter()
+                .all(|tool| { facade.contains_tool(&tool.canonical_callable_name) })
+        );
+        assert!(
+            launch
+                .facade_projection(CliMcpFacadeProjectionLimits {
+                    max_list_result_bytes: 1,
+                    ..limits
+                })
+                .is_err()
+        );
     }
 }

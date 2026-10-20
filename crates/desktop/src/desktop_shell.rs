@@ -74,6 +74,13 @@ pub(crate) struct DesktopShellView {
     mounted_route: Arc<DesktopRouteSnapshot>,
 }
 impl DesktopShellView {
+    pub(crate) fn startup_thread(&self) -> Option<Entity<pioneer_desktop_thread::ThreadView>> {
+        self.navigation
+            .is_visible(MainRoute::Threads)
+            .then(|| self.thread.as_ref().map(|(_, view)| view.clone()))
+            .flatten()
+    }
+
     fn selected_screen(&self) -> Option<AnyView> {
         let route = self.navigation.snapshot();
         if route.window_route() != WindowRoute::Main {
@@ -392,7 +399,7 @@ impl DesktopShellView {
             )
             .history(
                 t!("tasks.notifications.open").to_string(),
-                t!("tasks.notifications.more").to_string(),
+                t!("tasks.notifications.mark_all_read").to_string(),
                 t!("tasks.notifications.read").to_string(),
                 t!("tasks.notifications.unread").to_string(),
                 t!("tasks.notifications.retry").to_string(),

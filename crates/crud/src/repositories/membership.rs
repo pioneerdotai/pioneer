@@ -501,11 +501,14 @@ pub async fn insert_workspace_membership(
     ensure_workspace_exists(db, input.workspace_id.as_str()).await?;
     let (actor_kind, actor_id) = actor_ref_to_db(&input.granted_by);
 
+    let inbox_after_sequence =
+        super::task_completion_inbox::current_completion_sequence(db).await?;
     workspace_membership::Entity::insert(workspace_membership::ActiveModel {
         principal_id: Set(input.principal_id.to_string()),
         workspace_id: Set(input.workspace_id.clone()),
         granted_by_actor_kind: Set(actor_kind.context("membership actor kind must be present")?),
         granted_by_actor_id: Set(actor_id),
+        inbox_after_sequence: Set(Some(inbox_after_sequence)),
         created_at: Set(input.now),
         updated_at: Set(input.now),
     })
@@ -711,11 +714,14 @@ pub async fn insert_thread_membership(
     }
     let (actor_kind, actor_id) = actor_ref_to_db(&input.added_by);
 
+    let inbox_after_sequence =
+        super::task_completion_inbox::current_completion_sequence(db).await?;
     thread_membership::Entity::insert(thread_membership::ActiveModel {
         thread_id: Set(input.thread_id.clone()),
         principal_id: Set(input.principal_id.to_string()),
         added_by_actor_kind: Set(actor_kind.context("membership actor kind must be present")?),
         added_by_actor_id: Set(actor_id),
+        inbox_after_sequence: Set(Some(inbox_after_sequence)),
         created_at: Set(input.now),
         updated_at: Set(input.now),
     })
@@ -989,6 +995,7 @@ mod tests {
             updated_at: Set(now),
             removed_at: Set(None),
             authorization_guard: Set(1),
+            ..Default::default()
         }
         .insert(&database)
         .await
@@ -1015,6 +1022,7 @@ mod tests {
 
         let private_thread_id = generate_id(AUTH_DOMAIN_ID_LEN);
         thread::ActiveModel {
+            workspace_unread_started_at: sea_orm::NotSet,
             id: Set(private_thread_id.clone()),
             workspace_id: Set(red_workspace_id.clone()),
             name: Set(Some("Private".to_owned())),
@@ -1035,6 +1043,7 @@ mod tests {
             updated_at: Set(now),
             created_by_actor_id: Set(Some(superuser_id.to_string())),
             created_by_actor_kind: Set(Some("principal".to_owned())),
+            ..Default::default()
         }
         .insert(&database)
         .await
@@ -1669,6 +1678,7 @@ mod tests {
             updated_at: Set(now),
             removed_at: Set(None),
             authorization_guard: Set(1),
+            ..Default::default()
         }
         .insert(&fixture.database)
         .await
@@ -1861,6 +1871,7 @@ mod tests {
             updated_at: Set(now),
             removed_at: Set(None),
             authorization_guard: Set(1),
+            ..Default::default()
         }
         .insert(&fixture.database)
         .await
@@ -2103,6 +2114,7 @@ mod tests {
             updated_at: Set(now),
             removed_at: Set(None),
             authorization_guard: Set(1),
+            ..Default::default()
         }
         .insert(&fixture.database)
         .await
@@ -2177,6 +2189,7 @@ mod tests {
             ),
         ] {
             thread::ActiveModel {
+                workspace_unread_started_at: sea_orm::NotSet,
                 id: Set(thread_id.to_owned()),
                 workspace_id: Set(workspace_id.to_owned()),
                 name: Set(None),
@@ -2198,6 +2211,7 @@ mod tests {
                 updated_at: Set(now),
                 created_by_actor_id: Set(Some(creator_id)),
                 created_by_actor_kind: Set(Some("principal".to_owned())),
+                ..Default::default()
             }
             .insert(&fixture.database)
             .await
@@ -2503,6 +2517,7 @@ mod tests {
                 updated_at: Set(now),
                 removed_at: Set(None),
                 authorization_guard: Set(1),
+                ..Default::default()
             }
             .insert(&fixture.database)
             .await

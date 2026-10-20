@@ -465,6 +465,25 @@ impl GatewayTurnMcpInvoker {
                     "MCP projection is stale or is not bound to this execution",
                 )
             })?;
+        let native_family =
+            super::native_tools::NativeToolFamily::from_server_id(&binding.server_installation_id);
+        let action = native_family
+            .map(|family| family.action(&binding.raw_tool_name))
+            .transpose()
+            .map_err(|_| {
+                invocation_error(
+                    TurnMcpInvocationErrorCode::ToolUnbound,
+                    "unknown native callable",
+                )
+            })?
+            .unwrap_or_else(|| {
+                if binding.server_installation_id == crate::cli_runtime::acp_skills::SKILL_SERVER_ID
+                {
+                    ResourceAction::SkillUse
+                } else {
+                    ResourceAction::McpUse
+                }
+            });
         let revalidated = self
             .execution_leases
             .revalidate_for_turn(
@@ -473,12 +492,7 @@ impl GatewayTurnMcpInvoker {
                 invocation.workspace_id.as_str(),
                 invocation.thread_id.as_str(),
                 invocation.turn_id.as_str(),
-                if binding.server_installation_id == crate::cli_runtime::acp_skills::SKILL_SERVER_ID
-                {
-                    ResourceAction::SkillUse
-                } else {
-                    ResourceAction::McpUse
-                },
+                action,
                 self.authorization_invalidation_hub
                     .current_revision()
                     .await
@@ -498,7 +512,7 @@ impl GatewayTurnMcpInvoker {
             })?;
 
         if binding.server_installation_id != FIRST_PARTY_FILE_SERVER_ID
-            && binding.server_installation_id != pioneer_tools::html::HTML_SERVER_ID
+            && native_family.is_none()
             && binding.server_installation_id != crate::cli_runtime::acp_skills::SKILL_SERVER_ID
         {
             let action_gate = AuthorizationService::new().authorize_action(

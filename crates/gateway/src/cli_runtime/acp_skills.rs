@@ -128,23 +128,9 @@ impl AcpSkillTooling {
                 capability_id: None,
             });
         }
-        // Skill tools consume the same bounded facade allowance as external
-        // tools. Only the existing reserved HTML definitions have extra slots.
-        let html_bytes = projection
-            .tools
-            .iter()
-            .filter(|tool| tool.server_installation_id == pioneer_tools::html::HTML_SERVER_ID)
-            .try_fold(0usize, |total, tool| -> Result<usize> {
-                let (_, _, bytes) =
-                    crate::turn_mcp::projection::canonical_schema_identity(&tool.input_schema)
-                        .map_err(anyhow::Error::msg)?;
-                Ok(total.saturating_add(bytes.len()))
-            })?;
-        let limits = McpProjectionLimits {
-            max_tools: limits.max_tools + projection.html_tool_count(),
-            max_total_schema_bytes: limits.max_total_schema_bytes.saturating_add(html_bytes),
-            ..limits
-        };
+        // Skill and external tools share the configured allowance. Only exact
+        // first-party definitions receive the shared reserved native slots.
+        let limits = crate::turn_mcp::native_tools::projection_allowance(&projection.tools, limits);
         projection.finalize_identity(limits)?;
         Ok(())
     }
@@ -350,7 +336,7 @@ impl McpService {
     ) -> Result<Vec<pioneer_tools::ToolExtensionBundle>> {
         let processor = self
             .inner
-            .html_processor
+            .native_tool_processor
             .read()
             .expect("processor bridge")
             .upgrade()
@@ -442,7 +428,7 @@ impl pioneer_tools::PermissionApprovalBroker for SkillApprovalGuard {
         let processor = self
             .service
             .inner
-            .html_processor
+            .native_tool_processor
             .read()
             .map_err(|_| "Tool owner unavailable")?
             .upgrade()

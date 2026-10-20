@@ -300,6 +300,7 @@ mod tests {
         let now = Utc::now().fixed_offset();
         IdentityInvariantRows {
             gateways: vec![gateway_identity::Model {
+                unread_started_at: 0,
                 id: GATEWAY_ID.to_owned(),
                 singleton_key: 1,
                 identity_bootstrap_version: 0,
@@ -309,6 +310,7 @@ mod tests {
                 updated_at: now,
             }],
             principals: vec![gateway_principal::Model {
+                inbox_after_sequence: None,
                 id: PRINCIPAL_ID.to_owned(),
                 gateway_id: GATEWAY_ID.to_owned(),
                 kind: "superuser".to_owned(),

@@ -7159,7 +7159,9 @@ async fn compaction_timeline_persists_explicit_terminal_status_with_one_item() {
 
 #[tokio::test]
 async fn compaction_migration_resumes_partial_ddl_and_preserves_legacy_data_on_reapply() {
+    use pioneer_entity::thread as legacy_thread;
     use pioneer_sqlite::{SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor};
+    use sea_orm::sea_query::{Expr, ExprTrait, Query};
     let connection = Database::connect("sqlite::memory:").await.unwrap();
     let writer = SqliteWriteExecutor::new(connection.clone());
     let migrations = Migrator::migrations();
@@ -7182,18 +7184,39 @@ async fn compaction_migration_resumes_partial_ddl_and_preserves_legacy_data_on_r
     ] {
         db.execute_unprepared(sql).await.unwrap();
     }
-    store
-        .update_thread_summary("thread", "retained old summary", 42)
-        .await
-        .unwrap();
+    // Seed only columns present at this historical migration boundary. The
+    // current Thread CRUD also selects later inbox fields, which do not exist yet.
+    let summary = Query::update()
+        .table(legacy_thread::Entity)
+        .value(
+            legacy_thread::Column::Summary,
+            Expr::val("retained old summary"),
+        )
+        .value(legacy_thread::Column::SummaryTurnCount, Expr::val(42_i64))
+        .and_where(Expr::col(legacy_thread::Column::Id).eq("thread"))
+        .to_owned();
+    assert_eq!(db.execute(&summary).await.unwrap().rows_affected(), 1);
+    let summary_query = Query::select()
+        .columns([
+            legacy_thread::Column::Summary,
+            legacy_thread::Column::SummaryTurnCount,
+        ])
+        .from(legacy_thread::Entity)
+        .and_where(Expr::col(legacy_thread::Column::Id).eq("thread"))
+        .to_owned();
     for _ in 0..2 {
         writer
             .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, Some(1))
             .await
             .unwrap();
+        let summary = db.query_one(&summary_query).await.unwrap().unwrap();
         assert_eq!(
-            store.get_thread_summary("thread").await.unwrap(),
-            Some(("retained old summary".into(), 42))
+            summary.try_get::<String>("", "summary").unwrap(),
+            "retained old summary"
+        );
+        assert_eq!(
+            summary.try_get::<i64>("", "summary_turn_count").unwrap(),
+            42
         );
         let row = db
             .query_one_raw(Statement::from_string(
@@ -7221,6 +7244,11 @@ async fn compaction_migration_resumes_partial_ddl_and_preserves_legacy_data_on_r
         .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
         .await
         .unwrap();
+    // The current CRUD is valid once the full schema has been installed.
+    assert_eq!(
+        store.get_thread_summary("thread").await.unwrap(),
+        Some(("retained old summary".into(), 42))
+    );
     source(&store, "after-migration", 1, "retained original").await;
     let page = store
         .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)

@@ -1007,6 +1007,32 @@ mod tests {
                     .unwrap(),
                 )
                 .unwrap();
+                let mut capabilities = workspace_capabilities("workspace");
+                capabilities.thread = Some(serde_json::from_value(json!({
+                "workspace_id": "workspace", "thread_id": "a", "capabilities": {
+                    "can_read": true, "can_write": true, "can_edit_own_message": true,
+                    "can_delete_own_message": false, "can_start_turn": true,
+                    "can_observe_agent_execution": false, "can_cancel_agent_execution": false,
+                    "can_resume_agent_execution": false, "can_steer_agent_execution": false,
+                    "can_observe_agent_requests": false, "can_respond_to_agent_requests": false,
+                    "can_control_cli_runtime": false, "can_create_task": false, "can_review_tasks": false,
+                    "can_cancel_tasks": false, "can_read_artifacts": true, "can_write_artifacts": true,
+                    "can_bind_artifacts": true, "can_read_agents_document": false,
+                    "can_manage_agents_document": false, "can_manage": false,
+                    "can_manage_private_participants": false, "can_move": false
+                }
+            })).unwrap());
+                let ticket = client.current_auth_ticket();
+                assert_eq!(
+                    client.accept_authorization_projection(
+                        ticket.0,
+                        ticket.1,
+                        capabilities.clone()
+                    ),
+                    pioneer_client::authorization::AuthorizationProjectionAcceptance::Accepted
+                );
+                // The first authorization revision fences protected thread data.
+                // Load this fixture's thread and timeline in the accepted epoch.
                 crate::test_support::install_thread_timeline(&client, "a", "original message");
                 client.apply_thread_timeline_page(
                 serde_json::from_value(json!({
@@ -1023,21 +1049,6 @@ mod tests {
                 .unwrap(),
                 TopLevelPageMergeMode::Reset,
             );
-                let mut capabilities = workspace_capabilities("workspace");
-                capabilities.thread = Some(serde_json::from_value(json!({
-                "workspace_id": "workspace", "thread_id": "a", "capabilities": {
-                    "can_read": true, "can_write": true, "can_edit_own_message": true,
-                    "can_delete_own_message": false, "can_start_turn": true,
-                    "can_observe_agent_execution": false, "can_cancel_agent_execution": false,
-                    "can_resume_agent_execution": false, "can_steer_agent_execution": false,
-                    "can_observe_agent_requests": false, "can_respond_to_agent_requests": false,
-                    "can_control_cli_runtime": false, "can_create_task": false, "can_review_tasks": false,
-                    "can_cancel_tasks": false, "can_read_artifacts": true, "can_write_artifacts": true,
-                    "can_bind_artifacts": true, "can_read_agents_document": false,
-                    "can_manage_agents_document": false, "can_manage": false,
-                    "can_manage_private_participants": false, "can_move": false
-                }
-            })).unwrap());
                 authority.accept_thread_capabilities_for_test(&client, capabilities);
                 client.composer_intent(ComposerIntent::Open {
                     thread_id: "a".into(),
@@ -1047,6 +1058,14 @@ mod tests {
                         ..Default::default()
                     },
                 });
+                assert_eq!(
+                    client
+                        .composer_snapshot("a")
+                        .unwrap()
+                        .authorization_fingerprint(),
+                    Some("synthetic-policy"),
+                    "fixture thread must be loaded after the authorization fence"
+                );
                 publish_connection(&client, GatewayConnectionState::Connected);
                 let (registrar, deliver) = crate::test_support::binding_router(client.clone());
                 let screen_binding = ThreadBindings::new(registrar.clone(), "a", vec![]);
@@ -1182,10 +1201,6 @@ mod tests {
         }
 
         fn publish_connection(client: &ClientCore, connection_state: GatewayConnectionState) {
-            let previous = client
-                .snapshot(&ClientScope::Session)
-                .map(|p| p.revisions())
-                .unwrap_or_default();
             let mut session = GatewaySessionPublication::default();
             session.status = Some(GatewayStatusProjection {
                 status: GatewayStatusTextUpdate::KeepExisting,
@@ -1193,6 +1208,14 @@ mod tests {
                 connection_state,
                 clear_gateway_error: false,
             });
+            publish_session(client, session);
+        }
+
+        fn publish_session(client: &ClientCore, session: GatewaySessionPublication) {
+            let previous = client
+                .snapshot(&ClientScope::Session)
+                .map(|p| p.revisions())
+                .unwrap_or_default();
             assert_eq!(
                 client
                     .publish(
@@ -1210,6 +1233,466 @@ mod tests {
                     .outcome(),
                 ClientTransitionOutcome::Changed
             );
+        }
+
+        #[gpui_kit::test]
+        fn ready_composer_ignores_full_catalog_and_an_already_executing_turn(
+            cx: &mut TestAppContext,
+        ) {
+            use pioneer_client::{
+                composer::state_machine::ComposerDomainAction,
+                conversation::ConversationEvent,
+                gateway::session_controller::{StartupStage, StartupStageState},
+                navigation::NavigationIntent,
+            };
+            use pioneer_observability::DesktopStartupOutcome;
+            for mode in [ThreadMode::Chat, ThreadMode::Agent] {
+                let mut fixture = Fixture::new(cx);
+                fixture.client.navigate(
+                    NavigationIntent::SelectThread {
+                        workspace_id: Some("workspace".into()),
+                        thread_id: Some("a".into()),
+                    },
+                    None,
+                );
+                let draft = fixture.client.composer_snapshot("a").unwrap();
+                for action in [
+                    ComposerDomainAction::SetModeFromUser { mode },
+                    ComposerDomainAction::SetModelSelectionFromUser {
+                        provider: Some("synthetic-provider".into()),
+                        model: Some("synthetic-model".into()),
+                        capability_target: None,
+                    },
+                ] {
+                    fixture.client.composer_intent(ComposerIntent::Domain {
+                        thread_id: "a".into(),
+                        draft_id: draft.draft_id(),
+                        action,
+                    });
+                }
+                for catalog in [
+                    None,
+                    Some(StartupStageState::Pending),
+                    Some(StartupStageState::Failed),
+                    Some(StartupStageState::Succeeded),
+                ] {
+                    let mut session = (*fixture.client.gateway_session()).clone();
+                    session.startup.stages.remove(&StartupStage::Provider);
+                    if let Some(state) = catalog {
+                        session.startup.stages.insert(StartupStage::Provider, state);
+                    }
+                    // The initial absent-catalog case already matches the fixture.
+                    // ClientCore deduplicates equal payloads even at a new revision.
+                    if session != *fixture.client.gateway_session() {
+                        publish_session(&fixture.client, session);
+                    }
+                    assert_eq!(
+                        fixture
+                            .client
+                            .gateway_session()
+                            .startup
+                            .stages
+                            .get(&StartupStage::Provider)
+                            .copied(),
+                        catalog
+                    );
+                    fixture.synchronize();
+                    fixture.composer.read_with(fixture.cx, |view, _| {
+                        assert_eq!(view.startup_outcome(), Some(DesktopStartupOutcome::Ready))
+                    });
+                    assert!(
+                        fixture
+                            .client
+                            .composer_snapshot("a")
+                            .unwrap()
+                            .draft()
+                            .text
+                            .is_empty()
+                    );
+                }
+                fixture.client.apply_thread_conversation_event(
+                    "workspace",
+                    ConversationEvent::LocalTurnStartRequested {
+                        thread_id: "a".into(),
+                        turn_id: "active".into(),
+                        pending_request_id: "request".into(),
+                        mode,
+                        user_text: "already submitted".into(),
+                        attachments: vec![],
+                    },
+                    None,
+                );
+                fixture.synchronize();
+                fixture.composer.update(fixture.cx, |view, cx| {
+                    assert!(
+                        !view
+                            .active_thread_conversation()
+                            .unwrap()
+                            .can_submit_message()
+                    );
+                    assert!(!view.can_submit_message(cx));
+                    assert_eq!(view.startup_outcome(), Some(DesktopStartupOutcome::Ready));
+                });
+            }
+        }
+
+        #[gpui_kit::test]
+        fn ready_catalog_does_not_complete_a_composer_waiting_for_selected_cli(
+            cx: &mut TestAppContext,
+        ) {
+            use pioneer_client::{
+                composer::{
+                    catalog::ComposerCatalogRequestState, state_machine::ComposerDomainAction,
+                },
+                gateway::session_controller::{StartupStage, StartupStageState},
+                navigation::NavigationIntent,
+                providers::{runtime::ProviderRuntimeRequestState, store::ProviderCollectionKey},
+            };
+            let mut fixture = Fixture::new(cx);
+            fixture.client.navigate(
+                NavigationIntent::SelectThread {
+                    workspace_id: Some("workspace".into()),
+                    thread_id: Some("a".into()),
+                },
+                None,
+            );
+            let draft = fixture.client.composer_snapshot("a").unwrap();
+            for action in [
+                ComposerDomainAction::SetModeFromUser {
+                    mode: ThreadMode::Agent,
+                },
+                ComposerDomainAction::SetModelSelectionFromUser {
+                    provider: Some("cli_runtime:codex".into()),
+                    model: Some("model".into()),
+                    capability_target: None,
+                },
+            ] {
+                fixture.client.composer_intent(ComposerIntent::Domain {
+                    thread_id: "a".into(),
+                    draft_id: draft.draft_id(),
+                    action,
+                });
+            }
+            fixture
+                .client
+                .composer_intent(ComposerIntent::RetryRuntimeSelection {
+                    thread_id: "a".into(),
+                    draft_id: draft.draft_id(),
+                });
+            let mut session = (*fixture.client.gateway_session()).clone();
+            session
+                .startup
+                .stages
+                .insert(StartupStage::Provider, StartupStageState::Succeeded);
+            publish_session(&fixture.client, session);
+            fixture.synchronize();
+            assert!(matches!(
+                fixture
+                    .client
+                    .composer_snapshot("a")
+                    .unwrap()
+                    .runtime_selection()
+                    .unwrap()
+                    .request
+                    .state,
+                ComposerCatalogRequestState::Loading
+            ));
+            fixture.composer.read_with(fixture.cx, |view, _| {
+                assert_eq!(view.startup_outcome(), None)
+            });
+            // The first three failed attempts retain Loading and schedule a
+            // retry. Each completion helper fetches the owner's current request.
+            for _ in 0..3 {
+                ClientMutationAuthority::for_test().complete_provider_runtime_for_test(
+                    &fixture.client,
+                    "workspace",
+                    Err(()),
+                );
+                fixture.synchronize();
+                assert_eq!(
+                    fixture
+                        .client
+                        .provider_runtime_snapshot("workspace")
+                        .unwrap()
+                        .request(),
+                    &ProviderRuntimeRequestState::Loading
+                );
+                assert!(matches!(
+                    fixture
+                        .client
+                        .composer_snapshot("a")
+                        .unwrap()
+                        .runtime_selection()
+                        .unwrap()
+                        .request
+                        .state,
+                    ComposerCatalogRequestState::Loading
+                ));
+                fixture.composer.read_with(fixture.cx, |view, _| {
+                    assert_eq!(view.startup_outcome(), None)
+                });
+            }
+            ClientMutationAuthority::for_test().complete_provider_runtime_for_test(
+                &fixture.client,
+                "workspace",
+                Err(()),
+            );
+            assert_eq!(
+                fixture
+                    .client
+                    .provider_runtime_snapshot("workspace")
+                    .unwrap()
+                    .request(),
+                &ProviderRuntimeRequestState::Failed
+            );
+            assert!(matches!(
+                fixture
+                    .client
+                    .composer_snapshot("a")
+                    .unwrap()
+                    .runtime_selection()
+                    .unwrap()
+                    .request
+                    .state,
+                ComposerCatalogRequestState::Failed { .. }
+            ));
+            fixture.synchronize();
+            fixture.composer.read_with(fixture.cx, |view, _| {
+                assert_eq!(
+                    view.startup_outcome(),
+                    Some(pioneer_observability::DesktopStartupOutcome::Degraded)
+                );
+            });
+            assert!(
+                fixture
+                    .client
+                    .provider_collection_snapshot(&ProviderCollectionKey::catalog("workspace"))
+                    .is_none(),
+                "readiness inspection cannot request the full catalog"
+            );
+        }
+
+        #[gpui_kit::test]
+        fn initializing_selected_runtime_waits_for_ready_and_native_application(
+            cx: &mut TestAppContext,
+        ) {
+            use pioneer_client::providers::types::{RuntimeStatus, RuntimeSummary};
+            use pioneer_client::{
+                composer::state_machine::ComposerDomainAction, navigation::NavigationIntent,
+            };
+            use pioneer_observability::DesktopStartupOutcome;
+            let mut fixture = Fixture::new(cx);
+            fixture.client.navigate(
+                NavigationIntent::SelectThread {
+                    workspace_id: Some("workspace".into()),
+                    thread_id: Some("a".into()),
+                },
+                None,
+            );
+            let draft = fixture.client.composer_snapshot("a").unwrap();
+            for action in [
+                ComposerDomainAction::SetModeFromUser {
+                    mode: ThreadMode::Agent,
+                },
+                ComposerDomainAction::SetModelSelectionFromUser {
+                    provider: Some("cli_runtime:codex".into()),
+                    model: Some("model".into()),
+                    capability_target: None,
+                },
+            ] {
+                fixture.client.composer_intent(ComposerIntent::Domain {
+                    thread_id: "a".into(),
+                    draft_id: draft.draft_id(),
+                    action,
+                });
+            }
+            fixture
+                .client
+                .composer_intent(ComposerIntent::RetryRuntimeSelection {
+                    thread_id: "a".into(),
+                    draft_id: draft.draft_id(),
+                });
+            let authority = ClientMutationAuthority::for_test();
+            let mut runtime: RuntimeSummary = serde_json::from_value(json!({"runtime_id":"codex", "kind":"codex", "display_name":"Codex", "enabled":true, "status":{"state":"initializing"}, "capabilities":pioneer_client::providers::types::RuntimeCapabilities::default()})).unwrap();
+            authority.complete_provider_runtime_for_test(
+                &fixture.client,
+                "workspace",
+                Ok(
+                    serde_json::from_value(json!({"revision":1,"runtimes":[runtime.clone()]}))
+                        .unwrap(),
+                ),
+            );
+            fixture.synchronize();
+            assert_eq!(
+                fixture
+                    .client
+                    .provider_runtime_snapshot("workspace")
+                    .unwrap()
+                    .request(),
+                &pioneer_client::providers::runtime::ProviderRuntimeRequestState::Ready
+            );
+            fixture.composer.read_with(fixture.cx, |view, _| {
+                assert_eq!(view.startup_outcome(), None)
+            });
+            runtime.status = RuntimeStatus::Ready;
+            runtime.capabilities.supports_threads = true;
+            runtime.capabilities.supports_model_list = true;
+            authority.provider_runtime_status_changed_for_test(
+                &fixture.client,
+                serde_json::from_value(json!({"workspace_id":"workspace","revision":2,"runtime":runtime,"removed":false})).unwrap(),
+            );
+            assert!(
+                fixture
+                    .client
+                    .composer_snapshot("a")
+                    .unwrap()
+                    .selected_provider_ready()
+            );
+            fixture.composer.read_with(fixture.cx, |view, _| {
+                assert_eq!(
+                    view.startup_outcome(),
+                    None,
+                    "Ready must reach native inputs"
+                )
+            });
+            fixture.synchronize();
+            fixture.composer.read_with(fixture.cx, |view, _| {
+                assert_eq!(view.startup_outcome(), Some(DesktopStartupOutcome::Ready))
+            });
+            runtime.status = RuntimeStatus::NeedsAuth;
+            authority.provider_runtime_status_changed_for_test(
+                &fixture.client,
+                serde_json::from_value(json!({"workspace_id":"workspace","revision":3,"runtime":runtime,"removed":false})).unwrap(),
+            );
+            fixture.synchronize();
+            fixture.composer.read_with(fixture.cx, |view, _| {
+                assert_eq!(
+                    view.startup_outcome(),
+                    Some(DesktopStartupOutcome::SetupRequired)
+                );
+            });
+            authority.provider_runtime_status_changed_for_test(
+                &fixture.client,
+                serde_json::from_value(json!({"workspace_id":"workspace","revision":4,"runtime":runtime,"removed":true})).unwrap(),
+            );
+            fixture.synchronize();
+            fixture.composer.read_with(fixture.cx, |view, _| {
+                assert_eq!(
+                    view.startup_outcome(),
+                    Some(DesktopStartupOutcome::SetupRequired)
+                );
+            });
+        }
+
+        #[gpui_kit::test]
+        fn startup_observes_applied_empty_composer_and_rejects_old_scope(cx: &mut TestAppContext) {
+            use pioneer_client::navigation::NavigationIntent;
+            use pioneer_observability::DesktopStartupOutcome;
+            let mut fixture = Fixture::new(cx);
+            fixture.client.navigate(
+                NavigationIntent::SelectThread {
+                    workspace_id: Some("workspace".into()),
+                    thread_id: Some("a".into()),
+                },
+                None,
+            );
+            fixture.synchronize();
+            fixture.composer.update(fixture.cx, |view, cx| {
+                assert_eq!(view.startup_outcome(), Some(DesktopStartupOutcome::Ready));
+                assert!(
+                    !view.can_submit_message(cx),
+                    "empty content still disables Send"
+                );
+            });
+            publish_connection(&fixture.client, GatewayConnectionState::Reconnecting);
+            fixture.synchronize();
+            fixture.composer.read_with(fixture.cx, |view, _| {
+                assert_eq!(view.startup_outcome(), None)
+            });
+            publish_connection(&fixture.client, GatewayConnectionState::Connected);
+            fixture.synchronize();
+            fixture.client.navigate(
+                NavigationIntent::SelectThread {
+                    workspace_id: Some("other".into()),
+                    thread_id: Some("b".into()),
+                },
+                None,
+            );
+            fixture.composer.read_with(fixture.cx, |view, _| {
+                assert_eq!(view.startup_outcome(), None)
+            });
+        }
+
+        #[gpui_kit::test]
+        fn startup_waits_for_native_application_and_finishes_denied_scope(cx: &mut TestAppContext) {
+            use pioneer_client::{
+                composer::state_machine::ComposerDomainAction, navigation::NavigationIntent,
+            };
+            use pioneer_observability::DesktopStartupOutcome;
+            let mut fixture = Fixture::new(cx);
+            fixture.client.navigate(
+                NavigationIntent::SelectThread {
+                    workspace_id: Some("workspace".into()),
+                    thread_id: Some("a".into()),
+                },
+                None,
+            );
+            fixture.synchronize();
+            let draft = fixture.client.composer_snapshot("a").unwrap();
+            // Message has no execution selection; configure the Agent fixture
+            // explicitly instead of relying on history in a semantic-only page.
+            for action in [
+                ComposerDomainAction::SetModeFromUser {
+                    mode: ThreadMode::Agent,
+                },
+                ComposerDomainAction::SetModelSelectionFromUser {
+                    provider: Some("synthetic-provider".into()),
+                    model: Some("synthetic-model".into()),
+                    capability_target: None,
+                },
+            ] {
+                fixture.client.composer_intent(ComposerIntent::Domain {
+                    thread_id: "a".into(),
+                    draft_id: draft.draft_id(),
+                    action,
+                });
+            }
+            assert!(
+                fixture
+                    .client
+                    .composer_snapshot("a")
+                    .unwrap()
+                    .has_complete_model_selection()
+            );
+            fixture.composer.read_with(fixture.cx, |view, _| {
+                assert_eq!(
+                    view.startup_outcome(),
+                    None,
+                    "core publication has not reached native inputs"
+                )
+            });
+            fixture.synchronize();
+            fixture.composer.read_with(fixture.cx, |view, _| {
+                assert_eq!(view.startup_outcome(), Some(DesktopStartupOutcome::Ready))
+            });
+            // The current authorization projection is changed through the existing fixture authority.
+            let mut denied = fixture
+                .client
+                .thread_capability_snapshot("a")
+                .unwrap()
+                .snapshot
+                .clone()
+                .unwrap();
+            denied.thread.as_mut().unwrap().capabilities.can_start_turn = false;
+            ClientMutationAuthority::for_test()
+                .accept_thread_capabilities_for_test(&fixture.client, denied);
+            fixture.synchronize();
+            fixture.composer.read_with(fixture.cx, |view, _| {
+                assert_eq!(
+                    view.startup_outcome(),
+                    Some(DesktopStartupOutcome::Degraded)
+                )
+            });
         }
 
         #[derive(Default)]

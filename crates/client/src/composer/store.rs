@@ -200,6 +200,25 @@ impl ComposerPublication {
     pub fn selected_permission_mode_allowed(&self) -> bool {
         self.selected_permission_mode_allowed
     }
+    /// The selection gate used by Send, without model display/catalog metadata.
+    pub fn has_complete_model_selection(&self) -> bool {
+        self.execution_selection_ready()
+    }
+
+    /// Compare only action prerequisites when acknowledging a rendered composer.
+    /// User content, display metadata and ongoing operations do not fence startup.
+    pub fn has_same_submission_prerequisites(&self, current: &Self) -> bool {
+        self.draft_id() == current.draft_id()
+            && self.authorization_fingerprint() == current.authorization_fingerprint()
+            && self.domain().selected_mode == current.domain().selected_mode
+            && (current.domain().selected_mode == pioneer_protocol::ThreadMode::Message
+                || (self.domain().selected_provider == current.domain().selected_provider
+                    && self.domain().selected_model == current.domain().selected_model
+                    && self.selected_provider_ready() == current.selected_provider_ready()
+                    && (current.selected_provider_ready()
+                        || self.runtime_selection() == current.runtime_selection())))
+    }
+
     pub fn selected_provider_ready(&self) -> bool {
         self.selected_provider_ready
     }

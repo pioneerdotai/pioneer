@@ -1374,6 +1374,14 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             crate::TaskCompletionInboxListResponse
         ),
         schema_doc!(
+            "task_completion_inbox_viewed_result.json",
+            crate::TaskCompletionInboxViewedResult
+        ),
+        schema_doc!(
+            "task_completion_inbox_viewed_params.json",
+            crate::TaskCompletionInboxViewedParams
+        ),
+        schema_doc!(
             "task_completion_inbox_entry_params.json",
             crate::TaskCompletionInboxEntryParams
         ),

@@ -66,6 +66,7 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+pioneer-client = { workspace = true, features = ["test-support"] }
 # Syntax-aware ownership and Render checks use the already locked parser.
 syn = { version = "=2.0.119", features = ["full", "visit"] }
 gpui-kit = { workspace = true, features = ["test-support"] }

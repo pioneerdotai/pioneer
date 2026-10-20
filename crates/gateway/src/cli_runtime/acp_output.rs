@@ -21,7 +21,7 @@ impl McpService {
     ) -> Result<ArtifactRef> {
         let processor = self
             .inner
-            .html_processor
+            .native_tool_processor
             .read()
             .expect("processor bridge")
             .upgrade()

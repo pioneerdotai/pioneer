@@ -1,7 +1,8 @@
 //! Retained task inbox presentation over Client publications.
 use gpui_kit::component::{
     Disableable, Icon, IconName, Sizable, StyledExt, VirtualListScrollHandle, button::*, h_flex,
-    popover::Popover, scroll::Scrollbar, theme::ActiveTheme, v_flex, v_virtual_list,
+    popover::Popover, scroll::ScrollableElement, separator::Separator, spinner::Spinner,
+    theme::ActiveTheme, v_flex, v_virtual_list,
 };
 use gpui_kit::{prelude::*, *};
 use pioneer_client::{
@@ -23,7 +24,7 @@ pub struct TaskNotificationLabels {
     completed: String,
     mark_read: String,
     open: String,
-    more: String,
+    mark_all_read: String,
     read: String,
     unread: String,
     retry: String,
@@ -45,7 +46,7 @@ impl TaskNotificationLabels {
     ) -> Self {
         Self {
             open: task.clone(),
-            more: loading.clone(),
+            mark_all_read: mark_read.clone(),
             read: mark_read.clone(),
             unread: title.clone(),
             retry: loading.clone(),
@@ -66,14 +67,14 @@ impl TaskNotificationLabels {
     pub fn history(
         mut self,
         open: String,
-        more: String,
+        mark_all_read: String,
         read: String,
         unread: String,
         retry: String,
         loading_failed: String,
     ) -> Self {
         self.open = open;
-        self.more = more;
+        self.mark_all_read = mark_all_read;
         self.read = read;
         self.unread = unread;
         self.retry = retry;
@@ -214,6 +215,7 @@ pub struct TaskNotificationView {
     inbox_open: bool,
     inbox_focus: FocusHandle,
     selected_run: Option<String>,
+    lazy: LazyInboxDemand,
 }
 impl EventEmitter<TaskNotificationEvent> for TaskNotificationView {}
 impl TaskNotificationView {
@@ -254,6 +256,7 @@ impl TaskNotificationView {
             inbox_open: false,
             inbox_focus: cx.focus_handle(),
             selected_run: None,
+            lazy: LazyInboxDemand::default(),
         };
         view.sync(cx);
         view
@@ -270,6 +273,7 @@ impl TaskNotificationView {
             self.inbox_registration.take();
             self.input = None;
             self.scroll = VirtualListScrollHandle::new();
+            self.lazy = LazyInboxDemand::default();
             self.inbox_open = false;
             self.selected_run = None;
             self.binding
@@ -300,6 +304,7 @@ impl TaskNotificationView {
                 .borrow_mut()
                 .retain(|scope, _| !matches!(scope, ClientScope::TaskInbox { .. }));
             self.permissions_epoch = permissions_epoch;
+            self.lazy = LazyInboxDemand::default();
             self.refresh();
             cx.notify();
         }
@@ -310,6 +315,10 @@ impl TaskNotificationView {
         if self.input.as_ref().map(|p| p.revision()) == next.as_ref().map(|p| p.revision()) {
             return;
         }
+        self.lazy.observe(
+            next.as_ref().and_then(|input| input.next_cursor()),
+            next.as_ref().is_some_and(|input| input.error().is_some()),
+        );
         self.input = next;
         if let Some(opened) = self.input.as_ref().and_then(|inbox| inbox.opened()) {
             if opened.operation_id() > self.opened_operation {
@@ -443,6 +452,66 @@ impl Drop for TaskNotificationView {
         self.close();
     }
 }
+/// A changed cursor/range creates one deferred demand. Failed cursors require
+/// an explicit Retry; repeated measurement never issues another request.
+#[derive(Default)]
+struct LazyInboxDemand {
+    requested_cursor: Option<String>,
+    last_range: Option<(usize, usize)>,
+    fill_pages: usize,
+    failed: bool,
+}
+impl LazyInboxDemand {
+    fn observe(&mut self, cursor: Option<&str>, failed: bool) {
+        if self.requested_cursor.as_deref() != cursor {
+            self.requested_cursor = None;
+            self.failed = false;
+        }
+        if self.requested_cursor.is_some() && failed {
+            // Unrelated successful refreshes must not hide a page's Retry or
+            // silently retry its failed cursor on every new publication.
+            self.failed = true;
+        }
+    }
+    fn retry(&mut self) {
+        self.requested_cursor = None;
+        self.failed = false;
+        self.fill_pages = 0;
+    }
+    fn demand(
+        &mut self,
+        end: usize,
+        count: usize,
+        cursor: Option<&str>,
+        loading: bool,
+        failed: bool,
+    ) -> Option<String> {
+        if self
+            .last_range
+            .is_some_and(|(old_end, old_count)| old_count == count && old_end != end)
+        {
+            self.fill_pages = 0;
+        }
+        self.last_range = Some((end, count));
+        let cursor = cursor?;
+        if loading
+            || failed
+            || self.failed
+            || end.saturating_add(3) < count
+            || self.requested_cursor.as_deref() == Some(cursor)
+        {
+            return None;
+        }
+        if end >= count {
+            if self.fill_pages >= 3 {
+                return None;
+            }
+            self.fill_pages += 1;
+        }
+        self.requested_cursor = Some(cursor.to_owned());
+        Some(cursor.to_owned())
+    }
+}
 impl TaskNotificationView {
     fn open(&self, id: String, revision: u64) {
         if let Some(workspace) = &self.workspace {
@@ -455,6 +524,68 @@ impl TaskNotificationView {
             });
         }
     }
+    fn read_all(&self) {
+        if let Some(workspace_id) = &self.workspace {
+            self.client.dispatch(ClientIntent::TaskNotification {
+                intent: TaskNotificationIntent::ReadAll {
+                    workspace_id: workspace_id.clone(),
+                },
+            });
+        }
+    }
+    fn retry(&mut self) {
+        self.lazy.retry();
+        if let Some(workspace_id) = &self.workspace {
+            self.client.dispatch(ClientIntent::TaskNotification {
+                intent: TaskNotificationIntent::Retry {
+                    workspace_id: workspace_id.clone(),
+                },
+            });
+        }
+    }
+    fn viewport_demand(&mut self, end: usize, cx: &mut Context<Self>) {
+        let Some(input) = &self.input else {
+            return;
+        };
+        let Some(cursor) = self.lazy.demand(
+            end,
+            input.items().len(),
+            input.next_cursor(),
+            input.is_loading(),
+            input.error().is_some(),
+        ) else {
+            return;
+        };
+        let workspace = self.workspace.clone();
+        let epoch = self.permissions_epoch;
+        // VirtualList reports the resolved range for wheels, thumb dragging,
+        // keyboard scrolling and resize. Domain work runs after layout.
+        let underfilled = end >= input.items().len();
+        let owner = cx.weak_entity();
+        cx.defer(move |cx| {
+            let _ = owner.update(cx, |view, _| {
+                if view.workspace != workspace || view.permissions_epoch != epoch {
+                    return;
+                }
+                if view.inbox_open
+                    && view.input.as_ref().is_some_and(|input| {
+                        !input.is_loading()
+                            && input.error().is_none()
+                            && input.next_cursor() == Some(cursor.as_str())
+                    })
+                {
+                    view.load_more();
+                } else if view.lazy.requested_cursor.as_deref() == Some(cursor.as_str()) {
+                    view.lazy.requested_cursor = None;
+                    view.lazy.fill_pages = view
+                        .lazy
+                        .fill_pages
+                        .saturating_sub(usize::from(underfilled));
+                }
+            });
+        });
+    }
+
     fn load_more(&self) {
         if let Some(workspace) = &self.workspace {
             self.client.dispatch(ClientIntent::TaskNotification {
@@ -518,6 +649,7 @@ impl TaskNotificationView {
             .w_full()
             .h(rems(8.))
             .p_2()
+            .pr_4()
             .gap_1()
             .border_b_1()
             .border_color(cx.theme().border)
@@ -604,7 +736,7 @@ impl Render for TaskNotificationView {
         div()
             .track_focus(&self.focus)
             .key_context("TaskNotifications")
-            .on_action(cx.listener(|view, _: &RetryTask, _, _| view.refresh()))
+            .on_action(cx.listener(|view, _: &RetryTask, _, _| view.retry()))
             .on_action(cx.listener(|view, action: &DismissTask, _, _| {
                 view.dismiss(action.notification_id.clone(), action.revision)
             }))
@@ -613,6 +745,7 @@ impl Render for TaskNotificationView {
             }))
             .child(
                 Popover::new("task-user-notifications-popover")
+                    .p_0()
                     .anchor(Anchor::TopRight)
                     .open(self.inbox_open)
                     .track_focus(&self.inbox_focus)
@@ -657,9 +790,9 @@ impl Render for TaskNotificationView {
                         let focus = view.inbox_focus.clone();
                         let labels = labels.clone();
                         let loading = input.as_ref().is_some_and(|p| p.is_loading());
-                        let failed = input.as_ref().is_some_and(|p| p.error().is_some());
+                        let failed =
+                            view.lazy.failed || input.as_ref().is_some_and(|p| p.error().is_some());
                         let count = input.as_ref().map_or(0, |p| p.items().len());
-                        let more = input.as_ref().is_some_and(|p| p.next_cursor().is_some());
                         // Fixed row geometry follows interface zoom. Only visible
                         // rows create elements; run IDs retain each control's identity.
                         let sizes =
@@ -668,7 +801,7 @@ impl Render for TaskNotificationView {
                                 count
                             ]);
                         let retry_owner = owner.downgrade();
-                        let more_owner = owner.downgrade();
+                        let all_owner = owner.downgrade();
                         v_flex()
                             .track_focus(&focus)
                             .key_context("TaskCompletionInbox")
@@ -713,23 +846,37 @@ impl Render for TaskNotificationView {
                                 },
                             ))
                             .w_96()
+                            .debug_selector(|| "task-inbox-popup".into())
                             .gap_2()
                             .child(
-                                div()
-                                    .px_2()
+                                h_flex()
+                                    .w_full()
+                                    .h_8()
+                                    .p_2()
+                                    .pb_0()
+                                    .gap_2()
+                                    .debug_selector(|| "task-inbox-header".into())
                                     .text_sm()
                                     .font_semibold()
-                                    .child(labels.title.clone()),
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .child(labels.title.clone()),
+                                    )
+                                    .when(loading, |this| {
+                                        this.child(
+                                            h_flex()
+                                                .gap_1()
+                                                .text_xs()
+                                                .font_normal()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(Spinner::new().small())
+                                                .child(labels.loading.clone()),
+                                        )
+                                    }),
                             )
-                            .when(loading, |this| {
-                                this.child(
-                                    div()
-                                        .px_2()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(labels.loading.clone()),
-                                )
-                            })
                             .when(failed, |this| {
                                 this.child(
                                     v_flex()
@@ -748,7 +895,7 @@ impl Render for TaskNotificationView {
                                                 .label(labels.retry.clone())
                                                 .on_click(move |_, _, cx| {
                                                     let _ = retry_owner
-                                                        .update(cx, |view, _| view.refresh());
+                                                        .update(cx, |view, _| view.retry());
                                                 }),
                                         ),
                                 )
@@ -766,6 +913,7 @@ impl Render for TaskNotificationView {
                                 this.child(
                                     div()
                                         .h_80()
+                                        .debug_selector(|| "task-inbox-viewport".into())
                                         .w_full()
                                         .relative()
                                         .child(
@@ -774,6 +922,7 @@ impl Render for TaskNotificationView {
                                                 "task-inbox-list",
                                                 sizes,
                                                 |view, range, _, cx| {
+                                                    view.viewport_demand(range.end, cx);
                                                     let Some(input) = view.input.clone() else {
                                                         return Vec::new();
                                                     };
@@ -788,29 +937,39 @@ impl Render for TaskNotificationView {
                                             )
                                             .track_scroll(&scroll),
                                         )
-                                        .child(
-                                            div()
-                                                .absolute()
-                                                .top_0()
-                                                .right_0()
-                                                .bottom_0()
-                                                .child(Scrollbar::vertical(&scroll)),
-                                        ),
+                                        .vertical_scrollbar(&scroll),
                                 )
                             })
-                            .when(more, |this| {
-                                this.child(
-                                    Button::new("more-task-inbox")
-                                        .ghost()
-                                        .small()
-                                        .label(labels.more.clone())
-                                        .disabled(loading)
-                                        .on_click(move |_, _, cx| {
-                                            let _ =
-                                                more_owner.update(cx, |view, _| view.load_more());
-                                        }),
-                                )
-                            })
+                            .child(Separator::horizontal())
+                            .child(
+                                h_flex()
+                                    .debug_selector(|| "task-inbox-footer".into())
+                                    .p_2()
+                                    .pt_0()
+                                    .justify_start()
+                                    .child(
+                                        Button::new("read-all-task-inbox")
+                                            .debug_selector(|| "task-inbox-read-all".into())
+                                            .ghost()
+                                            .xsmall()
+                                            .compact()
+                                            .disabled(
+                                                loading
+                                                    || input.as_ref().is_none_or(|input| {
+                                                        input.unread_count() == 0
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .opacity(0.6)
+                                                    .child(labels.mark_all_read.clone()),
+                                            )
+                                            .on_click(move |_, _, cx| {
+                                                let _ =
+                                                    all_owner.update(cx, |view, _| view.read_all());
+                                            }),
+                                    ),
+                            )
                             .into_any_element()
                     }),
             )

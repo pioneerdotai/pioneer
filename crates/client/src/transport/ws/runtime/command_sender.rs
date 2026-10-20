@@ -21,6 +21,10 @@ impl crate::rpc::JsonRpcRequestTransport for GatewayWsCommandSender {
         payload: String,
         response_tx: crate::rpc::JsonRpcResponseSender,
     ) -> std::result::Result<(), String> {
+        #[cfg(test)]
+        if let Some(transport) = self.test_requests.lock().unwrap().clone() {
+            return transport.send_json_rpc_request(request_id, payload, response_tx);
+        }
         self.command_tx
             .send(GatewayWsCommand::Request {
                 expected_connection: None,

@@ -104,7 +104,8 @@ pub use agent_tools::{
     AgentToolIdentityChoice, AgentToolIdentityOption, AgentToolLaunchSelection,
     AgentToolOptionsProjection, AgentToolProfileChoice, AgentToolProfileOption,
     AgentToolResultStatus, AgentToolSafeResult, AgentToolTargetOption,
-    AgentToolThreadCreationOption, AgentWaitToolInput, project_agent_model_tool_catalog,
+    AgentToolThreadCreationOption, AgentWaitToolInput, agent_start_options_catalog_entry,
+    project_agent_model_tool_catalog,
 };
 pub use app_url::{
     PIONEER_DEVELOPMENT_URL_SCHEME, PIONEER_PRODUCTION_URL_SCHEME, PioneerAppUrlScheme,
@@ -373,7 +374,8 @@ pub use task::{
     TaskCancelScope, TaskCancelledNotification, TaskCompletedNotification, TaskCompletionBehavior,
     TaskCompletionInboxChangedNotification, TaskCompletionInboxEntry,
     TaskCompletionInboxEntryParams, TaskCompletionInboxEntryResponse,
-    TaskCompletionInboxListParams, TaskCompletionInboxListResponse, TaskComposerWork,
+    TaskCompletionInboxListParams, TaskCompletionInboxListResponse,
+    TaskCompletionInboxViewedParams, TaskCompletionInboxViewedResult, TaskComposerWork,
     TaskConcurrencyConflictPolicy, TaskConcurrencyPolicy, TaskCreateParams, TaskCreateResponse,
     TaskCreatedNotification, TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery,
     TaskDeliveryAttempt, TaskDeliveryAttemptStatus, TaskDeliveryCancelledNotification,

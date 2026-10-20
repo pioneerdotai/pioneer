@@ -115,11 +115,22 @@ where
 #[derive(Clone)]
 pub(crate) struct GatewayTaskToolProvider {
     processor: Weak<MessageProcessor>,
+    cli_replay: bool,
 }
 
 impl GatewayTaskToolProvider {
     pub(crate) fn new(processor: Weak<MessageProcessor>) -> Self {
-        Self { processor }
+        Self {
+            processor,
+            cli_replay: false,
+        }
+    }
+
+    pub(crate) fn for_cli(processor: Weak<MessageProcessor>) -> Self {
+        Self {
+            processor,
+            cli_replay: true,
+        }
     }
 
     fn processor(&self) -> Result<Arc<MessageProcessor>, String> {
@@ -154,10 +165,16 @@ impl TaskToolProvider for GatewayTaskToolProvider {
             .agent_action_binding(context.turn_id.as_str())
             .await
             .map(|binding| binding.capabilities);
+        let mutation_cache = if self.cli_replay {
+            processor.cli_task_mutation_cache(&context.turn_id).await
+        } else {
+            Arc::new(TaskToolMutationCache::default())
+        };
         let handler = Arc::new(TaskToolHandler {
             processor,
             context,
-            mutation_cache: Arc::new(TaskToolMutationCache::default()),
+            mutation_cache,
+            cli_replay: self.cli_replay,
         });
         let mut bundle = ToolExtensionBundle::default();
         for configured in task_tool_specs() {
@@ -633,7 +650,10 @@ impl TaskToolProvider for GatewayTaskToolProvider {
     }
 }
 
-fn agent_bound_task_tool_visible(name: &str, capabilities: &BTreeSet<AgentToolCapability>) -> bool {
+pub(crate) fn agent_bound_task_tool_visible(
+    name: &str,
+    capabilities: &BTreeSet<AgentToolCapability>,
+) -> bool {
     match name {
         TASK_CREATE_TOOL => {
             capabilities.contains(&AgentToolCapability::TaskCreate)
@@ -674,6 +694,7 @@ fn accepted_candidate_result<'a>(
 
 #[derive(Clone)]
 struct TaskToolHandler {
+    cli_replay: bool,
     processor: Arc<MessageProcessor>,
     context: TaskTurnContext,
     mutation_cache: Arc<TaskToolMutationCache>,
@@ -1097,7 +1118,7 @@ fn task_runtime_tool_error(error: pioneer_tasks::TaskRuntimeError) -> ToolError 
     }
 }
 
-fn sanitize_task_tool_error(error: ToolError) -> ToolError {
+pub(crate) fn sanitize_task_tool_error(error: ToolError) -> ToolError {
     match error {
         ToolError::Rejected(message)
             if message.starts_with("task_access_denied:")
@@ -1134,7 +1155,7 @@ fn sanitize_task_tool_error(error: ToolError) -> ToolError {
     }
 }
 
-fn task_tool_resource_action(
+pub(crate) fn task_tool_resource_action(
     name: &str,
 ) -> Result<crate::authorization::ResourceAction, ToolError> {
     use crate::authorization::ResourceAction;
@@ -1212,7 +1233,8 @@ async fn resolve_task_tool_action_scope(
 }
 
 #[derive(Default)]
-struct TaskToolMutationCache {
+pub(crate) struct TaskToolMutationCache {
+    arguments: Mutex<HashMap<String, String>>,
     outputs: Mutex<HashMap<String, JsonValue>>,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
@@ -1448,6 +1470,33 @@ impl TaskToolHandler {
         Ok(contents)
     }
 
+    fn bind_cli_mutation_receipt(
+        &self,
+        invocation: &ToolInvocation,
+        plan: &mut crate::authorization::AgentActionCommitPlan,
+    ) -> Result<(), ToolError> {
+        if !self.cli_replay {
+            return Ok(());
+        }
+        let ToolPayload::Function { arguments } = &invocation.payload else {
+            return Err(ToolError::invalid_arguments("task_invalid_arguments"));
+        };
+        let mut response: JsonValue =
+            serde_json::from_str(plan.input.receipt_response_json.as_deref().unwrap_or("{}"))
+                .map_err(|_| ToolError::internal("task action receipt is invalid"))?;
+        response["pioneerTaskToolCall"] = json!({
+            "tool": invocation.tool_name,
+            "argumentsFingerprint": crate::cli_runtime::codex_mcp::canonical_value_fingerprint(arguments).map_err(|_| ToolError::invalid_arguments("task_invalid_arguments"))?,
+            "mutationKey": invocation.idempotency_key.as_deref().map(str::trim),
+            "taskId": arguments.get("taskId"), "runId": arguments.get("runId"), "candidateId": arguments.get("candidateId"),
+        });
+        let response = serde_json::to_string(&response)
+            .map_err(|_| ToolError::internal("task action receipt cannot serialize"))?;
+        plan.input.action_response_json = Some(response.clone());
+        plan.input.receipt_response_json = Some(response);
+        Ok(())
+    }
+
     fn mutation_cache_key(&self, invocation: &ToolInvocation) -> Option<String> {
         invocation
             .idempotency_key
@@ -1490,6 +1539,23 @@ impl TaskToolHandler {
         let Some(cache_key) = cache_key else {
             return Ok(None);
         };
+        if self.cli_replay {
+            let ToolPayload::Function { arguments } = &invocation.payload else {
+                return Err(ToolError::invalid_arguments("task_invalid_arguments"));
+            };
+            let fingerprint = crate::cli_runtime::codex_mcp::canonical_value_fingerprint(arguments)
+                .map_err(|_| ToolError::invalid_arguments("task_invalid_arguments"))?;
+            let mut fingerprints = self.mutation_cache.arguments.lock().await;
+            if fingerprints
+                .get(cache_key)
+                .is_some_and(|previous| previous != &fingerprint)
+            {
+                return Err(ToolError::invalid_arguments(
+                    "task mutation identity was reused with different input",
+                ));
+            }
+            fingerprints.insert(cache_key.to_owned(), fingerprint);
+        }
         if let Some(output) = self.cached_mutation_output(Some(cache_key)).await {
             return Ok(Some(output));
         }
@@ -1575,6 +1641,7 @@ impl TaskToolHandler {
             &mut plan,
             &source_fence,
         );
+        self.bind_cli_mutation_receipt(invocation, &mut plan)?;
         Ok(Some(plan))
     }
 
@@ -1791,6 +1858,7 @@ impl TaskToolHandler {
             &mut plan,
             &source_fence,
         );
+        self.bind_cli_mutation_receipt(&invocation, &mut plan)?;
         match prepared.normalized.target.as_ref() {
             Some(pioneer_protocol::AgentStartTarget::CurrentThread) | None => {}
             Some(pioneer_protocol::AgentStartTarget::SameCapsuleThread { thread_id }) => {
@@ -2867,6 +2935,66 @@ impl TaskToolHandler {
         else {
             return Ok(None);
         };
+        if self.cli_replay {
+            let binding = self
+                .processor
+                .agent_action_binding(&self.context.turn_id)
+                .await
+                .ok_or_else(task_tool_authorization_error)?;
+            let execution_id = binding.adapter.lock().await.execution_id().to_string();
+            let database = self.processor.crud_store.database_connection();
+            let action_id = crate::authorization::action_id_for_call(&invocation.call_id);
+            if let Some(action) = pioneer_crud::load_agent_action(&database, action_id.as_str())
+                .await
+                .map_err(|_| ToolError::execution_failed("task_operation_failed"))?
+            {
+                if action.execution_id != execution_id || action.status != "committed" {
+                    return Err(task_tool_authorization_error());
+                }
+                let receipt =
+                    pioneer_crud::load_agent_action_receipt(&database, action_id.as_str())
+                        .await
+                        .map_err(|_| ToolError::execution_failed("task_operation_failed"))?
+                        .ok_or_else(|| ToolError::execution_failed("task_operation_failed"))?;
+                let response: JsonValue =
+                    serde_json::from_str(receipt.response_json.as_deref().unwrap_or("{}"))
+                        .map_err(|_| ToolError::execution_failed("task_operation_failed"))?;
+                let ToolPayload::Function { arguments } = &invocation.payload else {
+                    return Err(ToolError::invalid_arguments("task_invalid_arguments"));
+                };
+                let fingerprint =
+                    crate::cli_runtime::codex_mcp::canonical_value_fingerprint(arguments)
+                        .map_err(|_| ToolError::invalid_arguments("task_invalid_arguments"))?;
+                let marker = &response["pioneerTaskToolCall"];
+                if marker["tool"] != invocation.tool_name
+                    || marker["argumentsFingerprint"] != fingerprint
+                    || marker["mutationKey"].as_str() != Some(current_key)
+                {
+                    return Err(ToolError::invalid_arguments(
+                        "task mutation identity was reused with different input",
+                    ));
+                }
+                if let Some(created) = response.get("taskCreation") {
+                    let task_id = created["taskId"]
+                        .as_str()
+                        .ok_or_else(|| ToolError::execution_failed("task_operation_failed"))?;
+                    // A creation grant is not a read grant. Replay only the
+                    // references committed with the mutation; current state and
+                    // waitability must be obtained through authorized tools.
+                    return Ok(Some(json!({
+                        "alreadyCommitted": true,
+                        "taskId": task_id,
+                        "triggerId": created["triggerId"],
+                        "runId": created["runId"],
+                        "guidance": "This Task was already created. Do not create it again. Use authorized task_get/task_wait to inspect current state; wait only for active attached work, never merely for a saved runId.",
+                    })));
+                }
+                return Ok(Some(
+                    json!({"alreadyCommitted": true, "taskId": marker["taskId"], "runId": marker["runId"], "candidateId": marker["candidateId"],
+                    "guidance": "This mutation already committed. Observe current state with task_get/task_wait; do not repeat it."}),
+                ));
+            }
+        }
         let parent_items = self
             .processor
             .crud_store
@@ -3841,7 +3969,7 @@ impl TaskResumeToolInput {
     }
 }
 
-fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
+pub(crate) fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
     vec![
         task_tool_spec(
             TASK_CREATE_TOOL,
@@ -4550,7 +4678,7 @@ async fn attached_tasks_for_turn(
         .collect())
 }
 
-async fn observed_terminal_task_ids(
+pub(crate) async fn observed_terminal_task_ids(
     processor: &Arc<MessageProcessor>,
     context: &TaskTurnContext,
 ) -> anyhow::Result<BTreeSet<String>> {

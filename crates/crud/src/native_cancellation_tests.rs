@@ -1232,6 +1232,7 @@ async fn cancellation_schema_store(workspace_id: &str) -> CrudStore {
 
     let store =
         test_store_with_workspace_migrator::<CancellationSchemaFixtureMigrator>(workspace_id).await;
+    add_thread_unread_column_to_legacy_fixture(&store).await;
     // Keep down(1) aimed at cancellation, without applying later migrations.
     // These tests still use today's terminal projector: its CLI binding Entity
     // selects the locator even though these fixtures have no CLI/frozen roots.
@@ -1266,6 +1267,7 @@ async fn cancellation_schema_store(workspace_id: &str) -> CrudStore {
         "the compatibility column must not reclassify existing CLI roots"
     );
     transaction.commit().await.unwrap();
+    add_inbox_runtime_fields_to_legacy_projector_fixture(&store).await;
     store
 }
 
@@ -1316,6 +1318,31 @@ struct HistoricalMigrationRows {
     events: Vec<pioneer_entity::turn_event::Model>,
     receipts: Vec<pioneer_entity::turn_event_projection_state::Model>,
     obligation: pioneer_entity::native_terminal_effect_outbox::Model,
+}
+
+fn historical_thread_query(id: &str) -> sea_orm::Select<pioneer_entity::thread::Entity> {
+    use pioneer_entity::thread;
+    use sea_orm::Iterable;
+
+    // Compare every historical field without selecting a column that did not
+    // exist yet. Zero is only a decoding placeholder for today's Entity; it
+    // is never written to this historical schema or used as a read receipt.
+    thread::Entity::find_by_id(id.to_owned())
+        .select_only()
+        .columns(thread::Column::iter().filter(|column| {
+            !matches!(
+                column,
+                thread::Column::WorkspaceUnreadStartedAt
+                    | thread::Column::InboxWorkspaceAfterSequence
+                    | thread::Column::InboxWorkspaceStartedAt
+            )
+        }))
+        .expr_as(Expr::val(0_i64), "workspace_unread_started_at")
+        .expr_as(Expr::val(None::<i64>), "inbox_workspace_after_sequence")
+        .expr_as(
+            Expr::val(None::<sea_orm::prelude::DateTimeWithTimeZone>),
+            "inbox_workspace_started_at",
+        )
 }
 
 // An already projected, failed legacy turn with one activated cleanup retry.
@@ -1417,6 +1444,13 @@ async fn seed_main_schema_history(db: &pioneer_sqlite::SqliteDatabase) -> Histor
     let stream = DatabaseBackend::Sqlite.build(&stream);
     // All JSON, hashing and statement preparation above precede the writer.
     let transaction = db.begin().await.unwrap();
+    assert!(
+        !migration::SchemaManager::new(&*transaction)
+            .has_column("thread", "inbox_workspace_after_sequence")
+            .await
+            .unwrap(),
+        "the production upgrade fixture must retain its historical schema"
+    );
     let workspace = pioneer_entity::workspace::ActiveModel {
         id: Set(workspace_id.to_owned()),
         name: Set("upgrade fixture".to_owned()),
@@ -1428,7 +1462,8 @@ async fn seed_main_schema_history(db: &pioneer_sqlite::SqliteDatabase) -> Histor
     .insert(&transaction)
     .await
     .unwrap();
-    let thread = pioneer_entity::thread::ActiveModel {
+    pioneer_entity::thread::Entity::insert(pioneer_entity::thread::ActiveModel {
+        workspace_unread_started_at: sea_orm::NotSet,
         id: Set(thread_id.to_owned()),
         workspace_id: Set(workspace_id.to_owned()),
         preview: Set(String::new()),
@@ -1443,10 +1478,15 @@ async fn seed_main_schema_history(db: &pioneer_sqlite::SqliteDatabase) -> Histor
         created_at: Set(at),
         updated_at: Set(terminal_at),
         ..Default::default()
-    }
-    .insert(&transaction)
+    })
+    .exec_without_returning(&transaction)
     .await
     .unwrap();
+    let thread = historical_thread_query(thread_id)
+        .one(&transaction)
+        .await
+        .unwrap()
+        .unwrap();
     let turn = pioneer_entity::turn::ActiveModel {
         id: Set(turn_id.to_owned()),
         thread_id: Set(thread_id.to_owned()),
@@ -1554,7 +1594,7 @@ impl HistoricalMigrationRows {
             Some(self.workspace.clone())
         );
         assert_eq!(
-            pioneer_entity::thread::Entity::find_by_id(self.thread.id.clone())
+            historical_thread_query(&self.thread.id)
                 .one(db)
                 .await
                 .unwrap(),

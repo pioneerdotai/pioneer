@@ -2282,6 +2282,18 @@ impl TaskAgentExecutor {
         .await?;
 
         if let Some((runtime_id, runtime_kind)) = cli_runtime_backend {
+            // CLI task-tool projection needs the exact admitted child adapter
+            // before provider activation, just as the native path does.
+            processor
+                .register_agent_action_binding(
+                    child_turn_id.clone(),
+                    crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+                        action_adapter,
+                        action_options,
+                        action_capabilities,
+                    ),
+                )
+                .await;
             let action_author = input_author;
             let cli_presentation_capabilities = normalized_composer_capabilities
                 .as_ref()
@@ -2511,19 +2523,6 @@ impl TaskAgentExecutor {
                 })
                 .await;
                 if matches!(activation_result, Ok(Ok(()))) {
-                    let action_binding = processor
-                        .prepare_agent_action_binding(
-                            child_turn_id.clone(),
-                            crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
-                                action_adapter,
-                                action_options,
-                                action_capabilities,
-                            ),
-                        )
-                        .await?;
-                    processor
-                        .register_agent_action_binding(child_turn_id.clone(), action_binding)
-                        .await;
                     spawn_execution_heartbeat(
                         processor,
                         execution.id,
@@ -3154,6 +3153,16 @@ impl TaskAgentExecutor {
                 .await
                 .context("failed to prepare revision Task conversation history")?;
             }
+            processor
+                .register_agent_action_binding(
+                    child_turn_id.clone(),
+                    crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+                        action_adapter,
+                        action_options,
+                        action_capabilities,
+                    ),
+                )
+                .await;
             let prepared = processor
                 .prepare_task_cli_runtime_turn(
                     TurnStartParams {
@@ -3194,19 +3203,6 @@ impl TaskAgentExecutor {
                 .activate_prepared_task_cli_runtime_turn(prepared)
                 .await
                 .context("failed to activate revision CLI runtime turn")?;
-            let action_binding = processor
-                .prepare_agent_action_binding(
-                    child_turn_id.clone(),
-                    crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
-                        action_adapter,
-                        action_options,
-                        action_capabilities,
-                    ),
-                )
-                .await?;
-            processor
-                .register_agent_action_binding(child_turn_id.clone(), action_binding)
-                .await;
             let started_at = now_timestamp_secs();
             processor
                 .crud_store
@@ -4488,6 +4484,15 @@ impl TaskAgentExecutor {
         // complete a task-run turn that has already been fenced terminally.
         // The aggregate resume transaction is the only path that puts this
         // durable turn back into `InProgress`.
+        // A terminal run must never enter extraction/execution again. Its
+        // retained capsule belongs to the receipt-gated cleanup continuation.
+        if let Some(ready) = processor
+            .crud_store
+            .terminal_task_child_cleanup_ready(thread_id, turn_id)
+            .await?
+        {
+            return Ok(ready);
+        }
         if child_runtime.task_run_turn.status == TaskRunTurnStatus::Blocked {
             // A late completion from the pre-resume actor must not erase the
             // blocked transcript/runtime capsule that an explicit resume
@@ -4511,7 +4516,13 @@ impl TaskAgentExecutor {
             );
         };
         if task_response.task.status.is_terminal() {
-            return Ok(true);
+            // A task can have become terminal since the first run read. Do
+            // not turn that race into an ACK of a pending parent projection.
+            return Ok(processor
+                .crud_store
+                .terminal_task_child_cleanup_ready(thread_id, turn_id)
+                .await?
+                .unwrap_or(false));
         }
         let handle = TaskExecutionHandle::new(
             processor.crud_store.clone(),
@@ -4729,6 +4740,15 @@ impl TaskAgentExecutor {
         else {
             return Ok(true);
         };
+        // A terminal run must never enter extraction/execution again. Its
+        // retained capsule belongs to the receipt-gated cleanup continuation.
+        if let Some(ready) = processor
+            .crud_store
+            .terminal_task_child_cleanup_ready(thread_id, turn_id)
+            .await?
+        {
+            return Ok(ready);
+        }
         if child_runtime.task_run_turn.status == TaskRunTurnStatus::Blocked {
             return Ok(false);
         }
@@ -4749,7 +4769,13 @@ impl TaskAgentExecutor {
             );
         };
         if task_response.task.status.is_terminal() {
-            return Ok(true);
+            // A task can have become terminal since the first run read. Do
+            // not turn that race into an ACK of a pending parent projection.
+            return Ok(processor
+                .crud_store
+                .terminal_task_child_cleanup_ready(thread_id, turn_id)
+                .await?
+                .unwrap_or(false));
         }
         let handle = TaskExecutionHandle::new(
             processor.crud_store.clone(),
@@ -4814,12 +4840,23 @@ impl TaskAgentExecutor {
         else {
             return Ok(true);
         };
+        // A terminal run must never enter extraction/execution again. Its
+        // retained capsule belongs to the receipt-gated cleanup continuation.
+        if let Some(ready) = processor
+            .crud_store
+            .terminal_task_child_cleanup_ready(thread_id, turn_id)
+            .await?
+        {
+            return Ok(ready);
+        }
         if child_runtime.task_run_turn.status == TaskRunTurnStatus::Blocked {
             return Ok(false);
         }
         if !matches!(
             child_runtime.task_run_turn.status,
-            TaskRunTurnStatus::InProgress | TaskRunTurnStatus::CandidateCreated
+            TaskRunTurnStatus::InProgress
+                | TaskRunTurnStatus::CandidateCreated
+                | TaskRunTurnStatus::Cancelled
         ) {
             return Ok(true);
         }
@@ -4834,7 +4871,13 @@ impl TaskAgentExecutor {
             );
         };
         if task_response.task.status.is_terminal() {
-            return Ok(true);
+            // A task can have become terminal since the first run read. Do
+            // not turn that race into an ACK of a pending parent projection.
+            return Ok(processor
+                .crud_store
+                .terminal_task_child_cleanup_ready(thread_id, turn_id)
+                .await?
+                .unwrap_or(false));
         }
         let handle = TaskExecutionHandle::new(
             processor.crud_store.clone(),
@@ -4876,6 +4919,15 @@ impl TaskAgentExecutor {
         else {
             return Ok(true);
         };
+        // A terminal run must never enter extraction/execution again. Its
+        // retained capsule belongs to the receipt-gated cleanup continuation.
+        if let Some(ready) = processor
+            .crud_store
+            .terminal_task_child_cleanup_ready(thread_id, turn_id)
+            .await?
+        {
+            return Ok(ready);
+        }
         if child_runtime.task_run_turn.status == TaskRunTurnStatus::Blocked {
             return Ok(false);
         }
@@ -4896,7 +4948,13 @@ impl TaskAgentExecutor {
             );
         };
         if task_response.task.status.is_terminal() {
-            return Ok(true);
+            // A task can have become terminal since the first run read. Do
+            // not turn that race into an ACK of a pending parent projection.
+            return Ok(processor
+                .crud_store
+                .terminal_task_child_cleanup_ready(thread_id, turn_id)
+                .await?
+                .unwrap_or(false));
         }
         let handle = TaskExecutionHandle::new(
             processor.crud_store.clone(),
@@ -5593,6 +5651,16 @@ impl TaskAgentExecutor {
                     .as_str(),
             )
             .await?;
+            processor
+                .register_agent_action_binding(
+                    task_run_turn.turn_id.clone(),
+                    crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+                        action_adapter,
+                        action_options,
+                        action_capabilities,
+                    ),
+                )
+                .await;
             let prepared = processor
                 .prepare_task_cli_runtime_turn(
                     TurnStartParams {
@@ -5643,19 +5711,6 @@ impl TaskAgentExecutor {
                 .activate_prepared_task_cli_runtime_turn(prepared)
                 .await
                 .context("failed to activate reviewer CLI runtime turn")?;
-            let action_binding = processor
-                .prepare_agent_action_binding(
-                    task_run_turn.turn_id.clone(),
-                    crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
-                        action_adapter,
-                        action_options,
-                        action_capabilities,
-                    ),
-                )
-                .await?;
-            processor
-                .register_agent_action_binding(task_run_turn.turn_id.clone(), action_binding)
-                .await;
             return Ok(());
         }
         if !matches!(
@@ -6246,14 +6301,16 @@ impl TaskAgentExecutor {
             TaskErrorClass::Cancelled,
             Some(child_runtime.task_run_turn.run_id.clone()),
         );
-        record_task_run_turn_failure(
-            &handle,
-            &child_runtime.task_run_turn,
-            TaskRunTurnStatus::Cancelled,
-            Some(error),
-            cancelled_at,
-        )
-        .await?;
+        if child_runtime.task_run_turn.status != TaskRunTurnStatus::Cancelled {
+            record_task_run_turn_failure(
+                &handle,
+                &child_runtime.task_run_turn,
+                TaskRunTurnStatus::Cancelled,
+                Some(error),
+                cancelled_at,
+            )
+            .await?;
+        }
         handle
             .cancel_run(Some(reason.to_owned()), cancelled_at)
             .await?;
@@ -11799,6 +11856,11 @@ mod tests {
     #[tokio::test]
     async fn html_response_artifacts_enter_existing_result_binding_without_model_handles() {
         let (processor, task, execution, lineage) = task_artifact_harness("html_response").await;
+        use crate::session::test_support::{
+            authenticated_test_superuser, ensure_test_superuser_execution_authority,
+        };
+        ensure_test_superuser_execution_authority(processor.crud_store.as_ref()).await;
+        let reader = authenticated_test_superuser().principal_id.clone();
         let db = processor.crud_store.database_connection();
         use sea_orm::{DbBackend, Statement};
         // Real task sources are internal children of the visible collaboration root.
@@ -12099,37 +12161,42 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let count = || pioneer_crud::count_unread_message_blocks(&db, &thread_id, "reader", "");
+            let count =
+                || pioneer_crud::count_unread_message_blocks(&db, &thread_id, reader.as_ref(), "");
             let before = count().await.unwrap();
-            pioneer_crud::upsert_thread_timeline_block(
-                &db,
-                pioneer_crud::ThreadTimelineBlockRecord {
-                    block_id: pioneer_crud::assistant_block_id(turn_id, &item_id),
-                    workspace_id: task.workspace_id.clone(),
-                    thread_id: thread_id.clone(),
-                    turn_id: Some(turn_id.clone()),
-                    block_kind: pioneer_crud::BLOCK_KIND_ASSISTANT_MESSAGE.into(),
-                    sort_key: "html-count-fixture".into(),
-                    source_kind: Some("turn_item".into()),
-                    source_key: Some(item_id),
-                    started_at: Some(now),
-                    completed_at: Some(now),
-                    metadata_json: "{}".into(),
-                    created_at: now,
-                    updated_at: now,
-                },
-            )
-            .await
-            .unwrap();
+            let completed = ItemCompletedNotification {
+                workspace_id: task.workspace_id.clone(),
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+                item: processor
+                    .crud_store
+                    .get_turn_item(turn_id, &item_id)
+                    .await
+                    .unwrap()
+                    .expect("canonical response"),
+            };
+            // Publish through the canonical path, including its durable unread
+            // position, after the reader's excluded activation second.
+            let published_at = now.timestamp() + 2;
+            processor
+                .crud_store
+                .materialize_item_completed(completed.clone(), published_at)
+                .await
+                .expect("publish completed response");
             assert_eq!(
                 count().await.unwrap(),
                 before + 1,
                 "HTML-only delivery and mixed source each count once despite multiple HTML publications"
             );
+            processor
+                .crud_store
+                .materialize_item_completed(completed, published_at + 1)
+                .await
+                .expect("replay completed response");
             assert_eq!(
                 count().await.unwrap(),
                 before + 1,
-                "repeated projections do not add unread units"
+                "replayed completion does not add unread units"
             );
         }
 

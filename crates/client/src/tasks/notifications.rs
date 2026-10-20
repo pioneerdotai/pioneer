@@ -15,6 +15,14 @@ use std::{
 // `notification_id` in the retained intent/effect API is the canonical run ID.
 // Legacy outbox IDs are used only by task/user_notification/* RPCs.
 pub enum TaskNotificationIntent {
+    ReadAll {
+        workspace_id: String,
+    },
+    /// Native-only shared viewport evidence; shells submit TimelineDemand.
+    #[serde(skip)]
+    Viewed {
+        params: pioneer_protocol::TaskCompletionInboxViewedParams,
+    },
     Refresh {
         workspace_id: String,
     },
@@ -175,6 +183,9 @@ struct Request {
     identity: InboxIdentity,
     notification: Option<(String, u64)>,
     open: bool,
+    read_all: bool,
+    viewed: Option<pioneer_protocol::TaskCompletionInboxViewedParams>,
+    viewed_epoch: u64,
     navigation_revision: Option<u64>,
     cursor: Option<String>,
     refresh_range: Option<RefreshRange>,
@@ -193,11 +204,21 @@ pub struct TaskNotificationStore {
     identity: Option<InboxIdentity>,
     native_completed: std::collections::HashSet<TaskNotificationEffect>,
     subscriptions: HashMap<String, usize>,
+    viewed_confirmed: std::collections::HashSet<(String, String, String)>,
+    viewed_epochs: HashMap<String, u64>,
+    viewed_attempted: std::collections::HashSet<(String, String, String)>,
+    // Transient transport failures, renewable by real visibility/domain facts.
+    // These are never treated as server-negative or confirmed evidence.
+    viewed_failed: std::collections::HashSet<(String, String, String)>,
 }
 impl TaskNotificationStore {
     pub(crate) fn invalidate(&mut self) {
         self.inboxes.clear();
         self.native_completed.clear();
+        self.viewed_confirmed.clear();
+        self.viewed_epochs.clear();
+        self.viewed_attempted.clear();
+        self.viewed_failed.clear();
         self.identity = None;
         self.generation += 1;
     }
@@ -209,6 +230,57 @@ impl TaskNotificationStore {
                 .iter()
                 .any(|item| item.native_effect().as_ref() == Some(effect))
         }) && self.native_completed.insert(effect.clone())
+    }
+    fn record_viewed(&mut self, request: &Request, confirmed: Option<&[String]>) {
+        if self.identity.as_ref() != Some(&request.identity)
+            || self
+                .inboxes
+                .get(&request.workspace)
+                .is_none_or(|inbox| inbox.request.as_ref() != Some(request))
+        {
+            return;
+        }
+        let Some(viewed) = &request.viewed else {
+            return;
+        };
+        let current_epoch = self
+            .viewed_epochs
+            .get(&request.workspace)
+            .copied()
+            .unwrap_or(0)
+            == request.viewed_epoch;
+        let Some(confirmed) = confirmed else {
+            // One failure per current real view. Unrelated source revisions
+            // cannot create an RPC loop; a real revisit renews this gate.
+            if current_epoch {
+                for proof in viewed_proof_keys(viewed) {
+                    self.viewed_failed.insert((
+                        viewed.workspace_id.clone(),
+                        viewed.thread_id.clone(),
+                        proof,
+                    ));
+                }
+            }
+            return;
+        };
+        // New terminal/delivery facts and real revisits fence older responses.
+        // Successful durable receipts remain valid across those epochs.
+        if current_epoch {
+            for proof in viewed_proof_keys(viewed) {
+                self.viewed_attempted.insert((
+                    viewed.workspace_id.clone(),
+                    viewed.thread_id.clone(),
+                    proof,
+                ));
+            }
+        }
+        for proof in confirmed {
+            self.viewed_confirmed.insert((
+                viewed.workspace_id.clone(),
+                viewed.thread_id.clone(),
+                proof.clone(),
+            ));
+        }
     }
     fn begin(
         &mut self,
@@ -261,6 +333,9 @@ impl TaskNotificationStore {
             identity,
             notification,
             open: false,
+            read_all: false,
+            viewed: None,
+            viewed_epoch: 0,
             navigation_revision: None,
             cursor: None,
             refresh_range,
@@ -272,6 +347,15 @@ impl TaskNotificationStore {
         &mut self,
         request: &Request,
         result: Result<TaskCompletionInboxListResponse, String>,
+    ) -> Option<bool> {
+        self.complete_request(request, result.map(Some))
+    }
+    // None is a successful viewed operation which changed no receipts. Keep
+    // the publication while still releasing ownership and deferred actions.
+    fn complete_request(
+        &mut self,
+        request: &Request,
+        result: Result<Option<TaskCompletionInboxListResponse>, String>,
     ) -> Option<bool> {
         if self.identity.as_ref() != Some(&request.identity) {
             return None;
@@ -288,12 +372,19 @@ impl TaskNotificationStore {
         match result {
             Err(error) => {
                 // A failed revalidation must never preserve a closed result.
-                inbox.publication.items.clear();
-                inbox.publication.unread_count = 0;
-                inbox.publication.next_cursor = None;
+                if request.cursor.is_none()
+                    && request.notification.is_none()
+                    && !request.read_all
+                    && request.viewed.is_none()
+                {
+                    inbox.publication.items.clear();
+                    inbox.publication.next_cursor = None;
+                    inbox.publication.unread_count = 0;
+                }
                 inbox.publication.error = Some(error);
             }
-            Ok(response) => {
+            Ok(None) => {}
+            Ok(Some(response)) => {
                 inbox.publication.unread_count = response.unread_count;
                 if response
                     .entries
@@ -315,6 +406,10 @@ impl TaskNotificationStore {
                             }
                         }
                     }
+                    inbox
+                        .publication
+                        .items
+                        .retain(|item| item.notification.read_at.is_none());
                 } else {
                     let old = std::mem::take(&mut inbox.publication.items)
                         .into_iter()
@@ -339,7 +434,10 @@ impl TaskNotificationStore {
                             },
                         );
                     }
-                    let mut items = merged.into_values().collect::<Vec<_>>();
+                    let mut items = merged
+                        .into_values()
+                        .filter(|item| item.notification.read_at.is_none())
+                        .collect::<Vec<_>>();
                     items.sort_by(|a, b| {
                         (b.notification.completed_at, &b.notification.run_id)
                             .cmp(&(a.notification.completed_at, &a.notification.run_id))
@@ -385,7 +483,63 @@ impl Drop for TaskNotificationController {
         }
     }
 }
+fn viewed_proof_keys(
+    params: &pioneer_protocol::TaskCompletionInboxViewedParams,
+) -> impl Iterator<Item = String> + '_ {
+    params
+        .run_ids
+        .iter()
+        .map(|id| format!("run:{id}"))
+        .chain(params.result_turn_ids.iter().map(|id| format!("turn:{id}")))
+        .chain(params.result_items.iter().map(|item| item.proof_key()))
+}
+
+/// Keep each writer quantum bounded without dropping evidence on large/zoomed
+/// viewports. This is transport batching of actual viewed rows, not prefetch.
+fn viewed_batches(
+    params: &pioneer_protocol::TaskCompletionInboxViewedParams,
+) -> impl Iterator<Item = pioneer_protocol::TaskCompletionInboxViewedParams> + '_ {
+    let run_count = params.run_ids.len();
+    let turn_count = params.result_turn_ids.len();
+    let item_start = run_count + turn_count;
+    let count = item_start + params.result_items.len();
+    (0..count).step_by(100).map(move |start| {
+        let end = start + 100;
+        pioneer_protocol::TaskCompletionInboxViewedParams {
+            workspace_id: params.workspace_id.clone(),
+            thread_id: params.thread_id.clone(),
+            run_ids: params.run_ids[start.min(run_count)..end.min(run_count)].to_vec(),
+            result_turn_ids: params.result_turn_ids[start.saturating_sub(run_count).min(turn_count)
+                ..end.saturating_sub(run_count).min(turn_count)]
+                .to_vec(),
+            result_items: params.result_items[start
+                .saturating_sub(item_start)
+                .min(params.result_items.len())
+                ..end
+                    .saturating_sub(item_start)
+                    .min(params.result_items.len())]
+                .to_vec(),
+        }
+    })
+}
 impl ClientCore {
+    /// Called only after accepting changed actual visibility, outside the
+    /// thread-registry lock. It renews failures, never successful evidence.
+    pub(crate) fn renew_task_inbox_view(
+        &self,
+        params: &pioneer_protocol::TaskCompletionInboxViewedParams,
+    ) {
+        let mut owner = self.task_notifications.lock().expect("task inbox poisoned");
+        *owner
+            .store
+            .viewed_epochs
+            .entry(params.workspace_id.clone())
+            .or_default() += 1;
+        owner.store.viewed_failed.retain(|(workspace, thread, _)| {
+            workspace != &params.workspace_id || thread != &params.thread_id
+        });
+    }
+
     pub(crate) fn task_inbox_subscription_changed(&self, scope: &ClientScope, added: bool) {
         let ClientScope::TaskInbox { workspace_id } = scope else {
             return;
@@ -461,33 +615,7 @@ impl ClientCore {
                         core.open_task_notification(request);
                         continue;
                     }
-                    let sender = core.transport_runtime().ws_command_sender();
-                    let result = if let Some((id, _)) = &request.notification {
-                        inbox_entry_rpc(&sender, &request.workspace, id, true).map(|r| {
-                            TaskCompletionInboxListResponse {
-                                entries: vec![r.entry],
-                                unread_count: r.unread_count,
-                                next_cursor: None,
-                            }
-                        })
-                    } else {
-                        load_task_inbox_pages(
-                            &request,
-                            || core.task_inbox_request_is_current(&request),
-                            |cursor| {
-                                crate::rpc::send_json_rpc_request_typed(
-                                    &sender,
-                                    pioneer_protocol::constants::methods::TASK_COMPLETION_INBOX_LIST,
-                                    &pioneer_protocol::TaskCompletionInboxListParams {
-                                        workspace_id: request.workspace.clone(),
-                                        cursor,
-                                        limit: Some(30),
-                                    },
-                                    crate::rpc::RPC_REQUEST_TIMEOUT,
-                                )
-                            },
-                        )
-                    };
+                    let result = core.execute_task_inbox_request(&request);
                     core.complete_task_inbox(request, result.map_err(|e| format!("{e:#}")));
                 }
             })
@@ -495,6 +623,68 @@ impl ClientCore {
         let mut owner = self.task_notifications.lock().expect("task inbox poisoned");
         owner.sender = Some(sender);
         owner.task = Some(task);
+    }
+    fn execute_task_inbox_request(
+        &self,
+        request: &Request,
+    ) -> anyhow::Result<Option<TaskCompletionInboxListResponse>> {
+        let sender = self.transport_runtime().ws_command_sender();
+        if request.read_all {
+            return crate::rpc::send_json_rpc_request_typed(
+                &sender,
+                pioneer_protocol::constants::methods::TASK_COMPLETION_INBOX_READ_ALL,
+                &pioneer_protocol::TaskCompletionInboxListParams {
+                    workspace_id: request.workspace.clone(),
+                    cursor: None,
+                    limit: Some(30),
+                },
+                crate::rpc::RPC_REQUEST_TIMEOUT,
+            )
+            .map(Some);
+        }
+        if let Some(viewed) = &request.viewed {
+            let result: anyhow::Result<Vec<String>> = crate::rpc::send_json_rpc_request_typed(
+                &sender,
+                pioneer_protocol::constants::methods::TASK_COMPLETION_INBOX_VIEWED,
+                viewed,
+                crate::rpc::RPC_REQUEST_TIMEOUT,
+            );
+            if self.task_inbox_request_is_current(request) {
+                let mut owner = self.task_notifications.lock().expect("task inbox poisoned");
+                owner
+                    .store
+                    .record_viewed(request, result.as_ref().ok().map(Vec::as_slice));
+            }
+            if result?.is_empty() {
+                return Ok(None);
+            }
+        }
+        if let Some((id, _)) = &request.notification {
+            return inbox_entry_rpc(&sender, &request.workspace, id, true).map(|response| {
+                Some(TaskCompletionInboxListResponse {
+                    entries: vec![response.entry],
+                    unread_count: response.unread_count,
+                    next_cursor: None,
+                })
+            });
+        }
+        load_task_inbox_pages(
+            request,
+            || self.task_inbox_request_is_current(request),
+            |cursor| {
+                crate::rpc::send_json_rpc_request_typed(
+                    &sender,
+                    pioneer_protocol::constants::methods::TASK_COMPLETION_INBOX_LIST,
+                    &pioneer_protocol::TaskCompletionInboxListParams {
+                        workspace_id: request.workspace.clone(),
+                        cursor,
+                        limit: Some(30),
+                    },
+                    crate::rpc::RPC_REQUEST_TIMEOUT,
+                )
+            },
+        )
+        .map(Some)
     }
     fn task_inbox_identity(&self, workspace: &str, acknowledge: bool) -> Option<InboxIdentity> {
         let auth = self.current_auth()?;
@@ -518,7 +708,9 @@ impl ClientCore {
             && self
                 .task_inbox_identity(
                     &request.workspace,
-                    request.notification.is_some() && !request.open,
+                    (request.notification.is_some() && !request.open)
+                        || request.read_all
+                        || request.viewed.is_some(),
                 )
                 .as_ref()
                 == Some(&request.identity)
@@ -574,16 +766,58 @@ impl ClientCore {
                 },
             });
         }
-        let deferred_intent = intent.clone();
+        if let TaskNotificationIntent::Viewed { params } = &intent {
+            if params.run_ids.len() + params.result_turn_ids.len() + params.result_items.len() > 100
+            {
+                let mut transition =
+                    self.transition(&ClientMutationAuthority { _private: () }, vec![], vec![]);
+                for batch in viewed_batches(params) {
+                    transition = self
+                        .task_notification_intent(TaskNotificationIntent::Viewed { params: batch });
+                }
+                return transition;
+            }
+        }
+        if let TaskNotificationIntent::Retry { workspace_id } = &intent {
+            {
+                let mut owner = self.task_notifications.lock().expect("task inbox poisoned");
+                owner
+                    .store
+                    .viewed_attempted
+                    .retain(|(workspace, _, _)| workspace != workspace_id);
+                owner
+                    .store
+                    .viewed_failed
+                    .retain(|(workspace, _, _)| workspace != workspace_id);
+                *owner
+                    .store
+                    .viewed_epochs
+                    .entry(workspace_id.clone())
+                    .or_default() += 1;
+            }
+            self.refresh_viewed_task_inbox(workspace_id);
+            return self.task_notification_intent(TaskNotificationIntent::Refresh {
+                workspace_id: workspace_id.clone(),
+            });
+        }
+        let read_all = matches!(&intent, TaskNotificationIntent::ReadAll { .. });
+        let mut viewed = if let TaskNotificationIntent::Viewed { params } = &intent {
+            Some(params.clone())
+        } else {
+            None
+        };
+        let mut deferred_intent = intent.clone();
         let open = matches!(&intent, TaskNotificationIntent::Open { .. });
         let load_more = matches!(&intent, TaskNotificationIntent::LoadMore { .. });
         let (workspace, notification) = match intent {
             TaskNotificationIntent::NativeCompletion { .. } => {
                 unreachable!("handled native completion")
             }
-            TaskNotificationIntent::Refresh { workspace_id }
+            TaskNotificationIntent::ReadAll { workspace_id }
+            | TaskNotificationIntent::Refresh { workspace_id }
             | TaskNotificationIntent::Retry { workspace_id }
             | TaskNotificationIntent::LoadMore { workspace_id } => (workspace_id, None),
+            TaskNotificationIntent::Viewed { params, .. } => (params.workspace_id, None),
             TaskNotificationIntent::Open {
                 workspace_id,
                 notification_id,
@@ -596,21 +830,81 @@ impl ClientCore {
             } => (workspace_id, Some((notification_id, revision))),
         };
         let authority = ClientMutationAuthority { _private: () };
-        let Some(identity) = self.task_inbox_identity(&workspace, notification.is_some() && !open)
-        else {
+        let Some(identity) = self.task_inbox_identity(
+            &workspace,
+            (notification.is_some() && !open) || read_all || viewed.is_some(),
+        ) else {
             return self.transition(&authority, vec![], vec![]);
         };
         let mut owner = self.task_notifications.lock().expect("task inbox poisoned");
         if self.is_stopped() {
             return self.transition(&authority, vec![], vec![]);
         }
-        if notification.is_some() {
+        if owner.store.identity.as_ref() != Some(&identity) {
+            owner.store.invalidate();
+            owner.store.identity = Some(identity.clone());
+        }
+        if let Some(params) = &mut viewed {
+            let already = |proof: String| {
+                owner.store.viewed_confirmed.contains(&(
+                    workspace.clone(),
+                    params.thread_id.clone(),
+                    proof.clone(),
+                )) || owner.store.viewed_attempted.contains(&(
+                    workspace.clone(),
+                    params.thread_id.clone(),
+                    proof.clone(),
+                )) || owner.store.viewed_failed.contains(&(
+                    workspace.clone(),
+                    params.thread_id.clone(),
+                    proof,
+                ))
+            };
+            params.run_ids.retain(|id| !already(format!("run:{id}")));
+            params
+                .result_turn_ids
+                .retain(|id| !already(format!("turn:{id}")));
+            params
+                .result_items
+                .retain(|item| !already(item.proof_key()));
+            if params.run_ids.is_empty()
+                && params.result_turn_ids.is_empty()
+                && params.result_items.is_empty()
+            {
+                return self.transition(&authority, vec![], vec![]);
+            }
+            deferred_intent = TaskNotificationIntent::Viewed {
+                params: params.clone(),
+            };
+        }
+        if notification.is_some() || read_all || viewed.is_some() || load_more {
             if let Some(inbox) = owner.store.inboxes.get_mut(&workspace) {
                 if inbox.request.is_some() {
+                    if read_all
+                        && inbox
+                            .request
+                            .as_ref()
+                            .is_some_and(|request| request.read_all)
+                    {
+                        return self.transition(&authority, vec![], vec![]);
+                    }
+                    // Repeated demand for an in-flight page is already satisfied.
+                    if load_more
+                        && inbox
+                            .request
+                            .as_ref()
+                            .is_some_and(|request| request.cursor.is_some())
+                    {
+                        return self.transition(&authority, vec![], vec![]);
+                    }
                     if inbox.pending_actions.len() < 100
                         && !inbox.pending_actions.contains(&deferred_intent)
                     {
                         inbox.pending_actions.push_back(deferred_intent);
+                    }
+                    if read_all || load_more {
+                        inbox.publication.loading = true;
+                        return self.publish_task_inbox(&mut owner.store, &workspace);
                     }
                     return self.transition(&authority, vec![], vec![]);
                 }
@@ -646,6 +940,17 @@ impl ClientCore {
             return self.transition(&authority, vec![], vec![]);
         };
         request.cursor = cursor;
+        request.read_all = read_all;
+        request.viewed = viewed;
+        request.viewed_epoch = owner
+            .store
+            .viewed_epochs
+            .get(&workspace)
+            .copied()
+            .unwrap_or(0);
+        if read_all {
+            request.refresh_range = None;
+        }
         if load_more {
             request.refresh_range = None;
         }
@@ -719,6 +1024,7 @@ impl ClientCore {
             return;
         }
         inbox.request = None;
+        inbox.publication.loading = false;
         for item in &mut inbox.publication.items {
             item.dismissing = false;
         }
@@ -759,22 +1065,8 @@ impl ClientCore {
                 inbox.publication.error = Some(format!("{error:#}"));
             }
         }
-        let opened = inbox
-            .publication
-            .opened
-            .as_ref()
-            .is_some_and(|opened| opened.operation_id == request.generation);
         self.publish_task_inbox(&mut owner.store, &request.workspace);
         drop(owner);
-        if opened {
-            // Navigation committed successfully. Read is a separate, ACL-checked
-            // server operation and never changes a thread read cursor.
-            self.task_notification_intent(TaskNotificationIntent::Dismiss {
-                workspace_id: request.workspace.clone(),
-                notification_id: notification_id.clone(),
-                revision: *revision,
-            });
-        }
         self.continue_task_inbox_actions(&request.workspace);
     }
     fn continue_task_inbox_actions(&self, workspace: &str) {
@@ -839,10 +1131,13 @@ impl ClientCore {
     fn complete_task_inbox(
         &self,
         request: Request,
-        result: Result<TaskCompletionInboxListResponse, String>,
+        result: Result<Option<TaskCompletionInboxListResponse>, String>,
     ) {
         if self
-            .task_inbox_identity(&request.workspace, request.notification.is_some())
+            .task_inbox_identity(
+                &request.workspace,
+                request.notification.is_some() || request.read_all || request.viewed.is_some(),
+            )
             .as_ref()
             != Some(&request.identity)
         {
@@ -853,7 +1148,7 @@ impl ClientCore {
             if self.is_stopped() {
                 return;
             }
-            let Some(refresh) = owner.store.complete(&request, result) else {
+            let Some(refresh) = owner.store.complete_request(&request, result) else {
                 return;
             };
             if let Some(inbox) = owner.store.inboxes.get_mut(&request.workspace) {
@@ -874,6 +1169,7 @@ impl ClientCore {
             TaskRunFailed(h) | TaskRunBlocked(h) | TaskRunCancelled(h) => {
                 Some(h.context.workspace_id.as_str())
             }
+            TaskDeliveryDelivered(h) => Some(h.context.workspace_id.as_str()),
             TaskCompleted(h) => Some(h.context.workspace_id.as_str()),
             TaskFailed(h) | TaskBlocked(h) => Some(h.context.workspace_id.as_str()),
             TaskCancelled(h) => Some(h.context.workspace_id.as_str()),
@@ -889,12 +1185,40 @@ impl ClientCore {
             }
             _ => None,
         };
-        if let Some(workspace) = workspace
-            && self.task_inbox(workspace).is_some()
-        {
-            self.task_notification_intent(TaskNotificationIntent::Refresh {
-                workspace_id: workspace.to_owned(),
-            });
+        if let Some(workspace) = workspace {
+            if self.task_inbox(workspace).is_some() {
+                self.task_notification_intent(TaskNotificationIntent::Refresh {
+                    workspace_id: workspace.to_owned(),
+                });
+            }
+            if matches!(
+                notification,
+                TaskRunCompleted(_)
+                    | TaskRunFailed(_)
+                    | TaskRunBlocked(_)
+                    | TaskRunCancelled(_)
+                    | TaskCompleted(_)
+                    | TaskFailed(_)
+                    | TaskBlocked(_)
+                    | TaskCancelled(_)
+                    | TaskDeliveryDelivered(_)
+            ) {
+                let mut owner = self.task_notifications.lock().expect("task inbox poisoned");
+                *owner
+                    .store
+                    .viewed_epochs
+                    .entry(workspace.to_owned())
+                    .or_default() += 1;
+                owner
+                    .store
+                    .viewed_attempted
+                    .retain(|(w, _, _)| w != workspace);
+                owner.store.viewed_failed.retain(|(w, _, _)| w != workspace);
+                drop(owner);
+                // Completion and destination-link commits can follow the visible
+                // final row. Retry only geometry still owned by an active viewport.
+                self.refresh_viewed_task_inbox(workspace);
+            }
         }
     }
 }
@@ -1166,7 +1490,7 @@ mod tests {
         let mut acknowledged = notification("n", "a");
         acknowledged.read_at = Some(20);
         store.complete(&dismiss, response(vec![acknowledged]));
-        assert!(!store.inboxes["a"].publication.items[0].is_actionable());
+        assert!(store.inboxes["a"].publication.items.is_empty());
         assert!(
             store
                 .begin(
@@ -1213,15 +1537,13 @@ mod tests {
             }),
         );
         let publication = &store.inboxes["a"].publication;
-        assert_eq!(publication.items().len(), 3);
+        assert_eq!(publication.items().len(), 2);
         assert_eq!(publication.unread_count(), 86);
-        assert_eq!(publication.items()[1].notification(), &changed);
-        // Read entries can still be explicitly opened from history.
-        let revision = publication.items()[1].revision();
         assert!(
-            store
-                .begin(identity("p"), "a".into(), Some(("r2".into(), revision)))
-                .is_some()
+            publication
+                .items()
+                .iter()
+                .all(|item| item.notification.run_id != "r2")
         );
     }
     fn history_cursor(run: &str) -> String {
@@ -1257,6 +1579,7 @@ mod tests {
                     .map(|cursor| serde_json::from_str::<(String, String)>(&cursor).unwrap().1);
                 let mut entries = source
                     .iter()
+                    .filter(|entry| entry.read_at.is_none())
                     .filter(|entry| before.as_ref().is_none_or(|id| &entry.run_id < id))
                     .take(31)
                     .cloned()
@@ -1332,17 +1655,24 @@ mod tests {
         assert_eq!(cursors, vec![None, Some(history_cursor("r070"))]);
         store.complete(&request, Ok(response));
         let inbox = &store.inboxes["a"].publication;
-        assert_eq!(
-            inbox.items, after_read,
-            "a read invalidation does not reset or revise equal cards"
-        );
+        assert_eq!(inbox.items.len(), 60);
         assert_eq!(inbox.unread_count, 99);
-        assert_eq!(inbox.next_cursor, Some(history_cursor("r040")));
-        assert_eq!(inbox.items[49].notification.run_id, "r050");
-        assert!(inbox.items[49].notification.read_at.is_some());
+        assert_eq!(inbox.next_cursor, Some(history_cursor("r039")));
+        assert!(
+            inbox
+                .items
+                .iter()
+                .all(|item| item.notification.run_id != "r050")
+        );
+        for previous in after_read {
+            assert!(
+                inbox.items.iter().any(|item| item == &previous),
+                "unchanged cards retain revisions"
+            );
+        }
         let more = history_request(&mut store, true);
         let (response, _) = history_response(&more, &source);
-        assert_eq!(response.entries[0].run_id, "r039");
+        assert_eq!(response.entries[0].run_id, "r038");
         store.complete(&more, Ok(response));
         assert_eq!(store.inboxes["a"].publication.items.len(), 90);
     }
@@ -1375,7 +1705,7 @@ mod tests {
         let inbox = &store.inboxes["a"].publication;
         assert_eq!(inbox.items.len(), 60);
         assert_eq!(inbox.items[0].notification.run_id, "r100");
-        assert_eq!(inbox.next_cursor, Some(history_cursor("r039")));
+        assert_eq!(inbox.next_cursor, Some(history_cursor("r038")));
         assert_eq!(inbox.unread_count, 98);
         assert!(
             inbox.items.iter().all(
@@ -1386,11 +1716,7 @@ mod tests {
             inbox
                 .items
                 .iter()
-                .find(|item| item.notification.run_id == "r050")
-                .unwrap()
-                .notification
-                .read_at
-                .is_some()
+                .all(|item| item.notification.run_id != "r050")
         );
         assert_eq!(
             inbox
@@ -1404,7 +1730,7 @@ mod tests {
         );
         let more = history_request(&mut store, true);
         let (response, _) = history_response(&more, &source);
-        assert_eq!(response.entries[0].run_id, "r038");
+        assert_eq!(response.entries[0].run_id, "r037");
         store.complete(&more, Ok(response));
         let ids = store.inboxes["a"]
             .publication
@@ -1418,11 +1744,523 @@ mod tests {
             "continuation has neither gaps nor duplicates"
         );
         assert!(
-            (9..=100)
-                .filter(|ix| *ix != 40 && *ix != 55)
+            (8..=100)
+                .filter(|ix| *ix != 40 && *ix != 55 && *ix != 50)
                 .all(|ix| ids.contains(&format!("r{ix:03}")))
         );
     }
+    #[test]
+    fn large_viewport_evidence_is_batched_without_losing_runs_or_result_items() {
+        let params = pioneer_protocol::TaskCompletionInboxViewedParams {
+            workspace_id: "a".into(),
+            thread_id: "thread".into(),
+            run_ids: (0..110).map(|ix| format!("run-{ix}")).collect(),
+            result_turn_ids: (0..12).map(|ix| format!("turn-{ix}")).collect(),
+            result_items: (0..9)
+                .map(|ix| pioneer_protocol::TaskCompletionInboxViewedResult {
+                    turn_id: format!("result-{ix}"),
+                    item_id: format!("item-{ix}"),
+                })
+                .collect(),
+        };
+        let batches = viewed_batches(&params).collect::<Vec<_>>();
+        assert_eq!(batches.len(), 2);
+        assert!(batches.iter().all(|batch| batch.run_ids.len()
+            + batch.result_turn_ids.len()
+            + batch.result_items.len()
+            <= 100));
+        assert_eq!(
+            batches
+                .iter()
+                .flat_map(|batch| batch.run_ids.clone())
+                .collect::<Vec<_>>(),
+            params.run_ids
+        );
+        assert_eq!(
+            batches
+                .iter()
+                .flat_map(|batch| batch.result_turn_ids.clone())
+                .collect::<Vec<_>>(),
+            params.result_turn_ids
+        );
+        assert_eq!(
+            batches
+                .iter()
+                .flat_map(|batch| batch.result_items.clone())
+                .collect::<Vec<_>>(),
+            params.result_items
+        );
+    }
+
+    struct WorkerTransport {
+        requests: mpsc::Sender<(String, crate::rpc::JsonRpcResponseSender)>,
+    }
+    impl crate::rpc::JsonRpcRequestTransport for WorkerTransport {
+        fn send_json_rpc_request(
+            &self,
+            _: String,
+            payload: String,
+            response: crate::rpc::JsonRpcResponseSender,
+        ) -> Result<(), String> {
+            let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            self.requests
+                .send((request["method"].as_str().unwrap().into(), response))
+                .map_err(|e| e.to_string())
+        }
+    }
+    fn worker_connection(core: &ClientCore, generation: u64) {
+        use pioneer_protocol::*;
+        core.transport_runtime()
+            .ws_command_sender()
+            .set_http_session_access_for_test(Some(crate::transport::http::GatewayHttpAccess {
+                gateway_base_url: GatewayBaseUrl::parse_presentation("https://example.test")
+                    .unwrap(),
+                gateway_id: GatewayId::new("GAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                session_id: AuthSessionId::new("SAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                generation,
+                access_expires_at_unix: 1000,
+                access_token: AuthSecretString::new("synthetic-token"),
+            }));
+    }
+    fn worker_fixture() -> (
+        Arc<ClientCore>,
+        mpsc::Receiver<(String, crate::rpc::JsonRpcResponseSender)>,
+    ) {
+        use pioneer_protocol::*;
+        let core = crate::catalog_test_support::settings_client();
+        let mut snapshot = core.authorization_snapshot(None, None).unwrap();
+        let resources = AuthorizationOperationalResourceProjection {
+            fingerprint: "inbox-resources".into(),
+            ..Default::default()
+        };
+        snapshot.workspace = Some(AuthorizationWorkspaceCapabilitySnapshot {
+            workspace_id: "a".into(),
+            capabilities: AuthorizationWorkspaceCapabilities {
+                can_read_own_notifications: true,
+                can_acknowledge_own_notifications: true,
+                ..Default::default()
+            },
+            operational_resources: resources.clone(),
+            execution_draft_policy: AuthorizationExecutionDraftPolicyProjection {
+                fingerprint: "inbox-test".into(),
+                resources,
+                permission_options: vec![],
+                can_attach_artifacts: false,
+                mcp_invocation_limits: Default::default(),
+            },
+        });
+        let (generation, connection) = core.current_auth_ticket();
+        assert_eq!(
+            core.accept_authorization_projection(generation, connection, snapshot),
+            crate::authorization::AuthorizationProjectionAcceptance::Accepted
+        );
+        worker_connection(&core, 7);
+        crate::catalog_test_support::replace_connection(&core, 7);
+        assert!(core.task_inbox_identity("a", true).is_some());
+        let (requests, receiver) = mpsc::channel();
+        *core
+            .transport_runtime()
+            .ws_command_sender()
+            .test_requests
+            .lock()
+            .unwrap() = Some(Arc::new(WorkerTransport { requests }));
+        core.start_task_notification_controller();
+        (core, receiver)
+    }
+    fn worker_view_params() -> pioneer_protocol::TaskCompletionInboxViewedParams {
+        pioneer_protocol::TaskCompletionInboxViewedParams {
+            workspace_id: "a".into(),
+            thread_id: "thread".into(),
+            run_ids: vec!["run".into()],
+            result_turn_ids: vec![],
+            result_items: vec![],
+        }
+    }
+    fn real_view(core: &ClientCore) {
+        // The same renewal used by the production validated viewport planner.
+        let params = worker_view_params();
+        core.renew_task_inbox_view(&params);
+        core.task_notification_intent(TaskNotificationIntent::Viewed { params });
+    }
+    fn worker_request(
+        receiver: &mpsc::Receiver<(String, crate::rpc::JsonRpcResponseSender)>,
+        expected: &str,
+    ) -> crate::rpc::JsonRpcResponseSender {
+        let (method, response) = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("inbox worker request");
+        assert_eq!(method, expected);
+        response
+    }
+    fn finish_worker_page(receiver: &mpsc::Receiver<(String, crate::rpc::JsonRpcResponseSender)>) {
+        worker_request(
+            receiver,
+            pioneer_protocol::constants::methods::TASK_COMPLETION_INBOX_LIST,
+        )
+        .send(Ok(serde_json::to_value(TaskCompletionInboxListResponse {
+            entries: vec![],
+            unread_count: 1,
+            next_cursor: None,
+        })
+        .unwrap()))
+        .unwrap();
+    }
+    fn wait_worker_idle(core: &ClientCore) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if core
+                .task_notifications
+                .lock()
+                .unwrap()
+                .store
+                .inboxes
+                .get("a")
+                .is_some_and(|i| i.request.is_none())
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "inbox worker did not finish"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn worker_viewed_rpc_error_allows_real_revisit_after_successful_refresh() {
+        for failure in [
+            crate::rpc::JsonRpcResponseError::transport("temporary failure"),
+            crate::rpc::JsonRpcResponseError::server(
+                Some(-32603),
+                "temporary server failure",
+                None,
+            ),
+        ] {
+            let (core, requests) = worker_fixture();
+            real_view(&core);
+            worker_request(
+                &requests,
+                pioneer_protocol::constants::methods::TASK_COMPLETION_INBOX_VIEWED,
+            )
+            .send(Err(failure))
+            .unwrap();
+            wait_worker_idle(&core);
+            assert!(core.task_inbox("a").unwrap().error().is_some());
+            assert!(
+                core.task_notifications
+                    .lock()
+                    .unwrap()
+                    .store
+                    .viewed_attempted
+                    .is_empty()
+            );
+            // Source revisions/renders with the same actually visible rows
+            // do not renew the error gate, even after a successful refresh.
+            for _ in 0..3 {
+                core.task_notification_intent(TaskNotificationIntent::Viewed {
+                    params: worker_view_params(),
+                });
+            }
+            assert!(
+                requests
+                    .recv_timeout(std::time::Duration::from_millis(30))
+                    .is_err(),
+                "no automatic retry loop"
+            );
+            core.task_notification_intent(TaskNotificationIntent::Refresh {
+                workspace_id: "a".into(),
+            });
+            finish_worker_page(&requests);
+            wait_worker_idle(&core);
+            core.task_notification_intent(TaskNotificationIntent::Viewed {
+                params: worker_view_params(),
+            });
+            assert!(
+                requests
+                    .recv_timeout(std::time::Duration::from_millis(30))
+                    .is_err(),
+                "ordinary refresh cannot spin failed view RPCs"
+            );
+            real_view(&core);
+            worker_request(
+                &requests,
+                pioneer_protocol::constants::methods::TASK_COMPLETION_INBOX_VIEWED,
+            )
+            .send(Ok(serde_json::json!(["run:run"])))
+            .unwrap();
+            finish_worker_page(&requests);
+            wait_worker_idle(&core);
+            real_view(&core);
+            assert!(
+                requests
+                    .recv_timeout(std::time::Duration::from_millis(30))
+                    .is_err(),
+                "successful proof is deduplicated"
+            );
+            core.shutdown();
+        }
+    }
+
+    #[test]
+    fn worker_negative_view_keeps_prefix_and_continues_independent_refresh() {
+        let (core, requests) = worker_fixture();
+        core.task_notification_intent(TaskNotificationIntent::Refresh {
+            workspace_id: "a".into(),
+        });
+        worker_request(
+            &requests,
+            pioneer_protocol::constants::methods::TASK_COMPLETION_INBOX_LIST,
+        )
+        .send(Ok(serde_json::to_value(TaskCompletionInboxListResponse {
+            entries: vec![notification("existing", "a")],
+            unread_count: 1,
+            next_cursor: None,
+        })
+        .unwrap()))
+        .unwrap();
+        wait_worker_idle(&core);
+        let before = core.task_inbox("a").unwrap();
+        real_view(&core);
+        let response = worker_request(
+            &requests,
+            pioneer_protocol::constants::methods::TASK_COMPLETION_INBOX_VIEWED,
+        );
+        // A genuinely independent mutation arrives while viewed owns the worker.
+        core.observe_task_notification(
+            &pioneer_protocol::GatewayNotification::TaskCompletionInboxChanged(
+                pioneer_protocol::TaskCompletionInboxChangedNotification {
+                    workspace_id: "a".into(),
+                },
+            ),
+        );
+        response.send(Ok(serde_json::json!([]))).unwrap();
+        let refresh = worker_request(
+            &requests,
+            pioneer_protocol::constants::methods::TASK_COMPLETION_INBOX_LIST,
+        );
+        let retained = core.task_inbox("a").unwrap();
+        assert_eq!(retained.items(), before.items());
+        assert_eq!(retained.unread_count(), 1);
+        refresh
+            .send(Ok(serde_json::to_value(TaskCompletionInboxListResponse {
+                entries: vec![],
+                unread_count: 0,
+                next_cursor: None,
+            })
+            .unwrap()))
+            .unwrap();
+        wait_worker_idle(&core);
+        assert_eq!(core.task_inbox("a").unwrap().unread_count(), 0);
+        assert!(
+            requests
+                .recv_timeout(std::time::Duration::from_millis(30))
+                .is_err(),
+            "only the independent refresh, no negative-view list/count"
+        );
+        // Neither the cached count=0 nor a previous negative proof may suppress
+        // a new concrete result proof.
+        let mut next = worker_view_params();
+        next.run_ids = vec!["late-run".into()];
+        core.renew_task_inbox_view(&next);
+        core.task_notification_intent(TaskNotificationIntent::Viewed { params: next });
+        worker_request(
+            &requests,
+            pioneer_protocol::constants::methods::TASK_COMPLETION_INBOX_VIEWED,
+        )
+        .send(Ok(serde_json::json!(["run:late-run"])))
+        .unwrap();
+        finish_worker_page(&requests);
+        wait_worker_idle(&core);
+        assert!(
+            requests
+                .recv_timeout(std::time::Duration::from_millis(30))
+                .is_err()
+        );
+        core.shutdown();
+    }
+
+    #[test]
+    fn worker_positive_view_reloads_once_and_retains_independent_pending_hint() {
+        for independent_hint in [false, true] {
+            let (core, requests) = worker_fixture();
+            real_view(&core);
+            let response = worker_request(
+                &requests,
+                pioneer_protocol::constants::methods::TASK_COMPLETION_INBOX_VIEWED,
+            );
+            if independent_hint {
+                core.observe_task_notification(
+                    &pioneer_protocol::GatewayNotification::TaskCompletionInboxChanged(
+                        pioneer_protocol::TaskCompletionInboxChangedNotification {
+                            workspace_id: "a".into(),
+                        },
+                    ),
+                );
+            }
+            // Gateway skips only this successful viewed's own source hint.
+            response.send(Ok(serde_json::json!(["run:run"]))).unwrap();
+            finish_worker_page(&requests);
+            if independent_hint {
+                finish_worker_page(&requests);
+            }
+            wait_worker_idle(&core);
+            assert!(
+                requests
+                    .recv_timeout(std::time::Duration::from_millis(30))
+                    .is_err()
+            );
+            real_view(&core);
+            assert!(
+                requests
+                    .recv_timeout(std::time::Duration::from_millis(30))
+                    .is_err(),
+                "successful confirmation remains deduplicated"
+            );
+            core.shutdown();
+        }
+    }
+
+    #[test]
+    fn worker_successful_negative_evidence_is_distinct_from_rpc_error() {
+        let (core, requests) = worker_fixture();
+        real_view(&core);
+        worker_request(
+            &requests,
+            pioneer_protocol::constants::methods::TASK_COMPLETION_INBOX_VIEWED,
+        )
+        .send(Ok(serde_json::json!([])))
+        .unwrap();
+        wait_worker_idle(&core);
+        assert!(
+            !core
+                .task_notifications
+                .lock()
+                .unwrap()
+                .store
+                .viewed_attempted
+                .is_empty()
+        );
+        core.task_notification_intent(TaskNotificationIntent::Refresh {
+            workspace_id: "a".into(),
+        });
+        finish_worker_page(&requests);
+        wait_worker_idle(&core);
+        real_view(&core);
+        assert!(
+            requests
+                .recv_timeout(std::time::Duration::from_millis(30))
+                .is_err(),
+            "negative evidence waits for a new domain epoch"
+        );
+        core.shutdown();
+    }
+
+    #[test]
+    fn worker_viewed_confirmation_cannot_cross_connection_identity() {
+        let (core, requests) = worker_fixture();
+        real_view(&core);
+        let old_response = worker_request(
+            &requests,
+            pioneer_protocol::constants::methods::TASK_COMPLETION_INBOX_VIEWED,
+        );
+        worker_connection(&core, 8);
+        crate::catalog_test_support::replace_connection(&core, 8);
+        // A new real view resets the operation owner and queues its own request.
+        real_view(&core);
+        old_response
+            .send(Ok(serde_json::json!(["run:run"])))
+            .unwrap();
+        worker_request(
+            &requests,
+            pioneer_protocol::constants::methods::TASK_COMPLETION_INBOX_VIEWED,
+        )
+        .send(Ok(serde_json::json!(["run:run"])))
+        .unwrap();
+        finish_worker_page(&requests);
+        wait_worker_idle(&core);
+        assert_eq!(
+            core.task_notifications
+                .lock()
+                .unwrap()
+                .store
+                .viewed_confirmed
+                .len(),
+            1
+        );
+        core.shutdown();
+    }
+
+    #[test]
+    fn late_terminal_fact_and_identity_change_cannot_poison_viewport_dedupe() {
+        let mut store = TaskNotificationStore::default();
+        let mut request = store.begin(identity("p"), "a".into(), None).unwrap();
+        request.viewed = Some(pioneer_protocol::TaskCompletionInboxViewedParams {
+            workspace_id: "a".into(),
+            thread_id: "thread".into(),
+            run_ids: vec!["run".into()],
+            result_turn_ids: vec![],
+            result_items: vec![],
+        });
+        store.inboxes.get_mut("a").unwrap().request = Some(request.clone());
+        store.viewed_epochs.insert("a".into(), 1);
+        store.record_viewed(&request, None);
+        assert!(
+            store.viewed_failed.is_empty(),
+            "an old failure cannot fence a renewed view"
+        );
+        store.record_viewed(&request, Some(&[]));
+        assert!(
+            store.viewed_attempted.is_empty(),
+            "old negative response cannot suppress retry after a terminal commit"
+        );
+        store.record_viewed(&request, Some(&["run:run".into()]));
+        assert!(
+            store
+                .viewed_confirmed
+                .contains(&("a".into(), "thread".into(), "run:run".into()))
+        );
+        store.invalidate();
+        store.begin(identity("other"), "a".into(), None).unwrap();
+        store.record_viewed(&request, Some(&["run:run".into()]));
+        assert!(
+            store.viewed_confirmed.is_empty(),
+            "a retired session cannot populate another principal's dedupe"
+        );
+    }
+
+    #[test]
+    fn page_and_bulk_read_errors_keep_the_visible_prefix_count_and_retry_cursor() {
+        let source = history_entries(99);
+        let mut store = two_history_pages(&source);
+        let before = store.inboxes["a"].publication.clone();
+        let request = history_request(&mut store, true);
+        assert_eq!(
+            store.complete(&request, Err("page unavailable".into())),
+            Some(false)
+        );
+        let failed = &store.inboxes["a"].publication;
+        assert_eq!(failed.items, before.items);
+        assert_eq!(failed.next_cursor, before.next_cursor);
+        assert_eq!(failed.unread_count, before.unread_count);
+        assert!(failed.error.is_some());
+        let retry = history_request(&mut store, true);
+        assert_eq!(retry.cursor, request.cursor);
+        let (response, _) = history_response(&retry, &source);
+        store.complete(&retry, Ok(response));
+        assert_eq!(store.inboxes["a"].publication.items.len(), 90);
+        let before = store.inboxes["a"].publication.clone();
+        let mut bulk = history_request(&mut store, false);
+        bulk.read_all = true;
+        store.inboxes.get_mut("a").unwrap().request = Some(bulk.clone());
+        store.complete(&bulk, Err("bulk unavailable".into()));
+        assert_eq!(store.inboxes["a"].publication.items, before.items);
+        assert_eq!(
+            store.inboxes["a"].publication.unread_count,
+            before.unread_count
+        );
+    }
+
     #[test]
     fn more_than_one_page_of_new_completions_preserves_the_previous_loaded_range() {
         let source = history_entries(99);

@@ -1,3 +1,6 @@
+#[path = "tests/cli_task_tools.rs"]
+mod cli_task_tools;
+
 #[path = "tests/cli_runtime_active_bindings.rs"]
 mod cli_runtime_active_bindings;
 
@@ -726,12 +729,14 @@ struct RecordingCliRuntimeSession {
     turn_liveness_probe_started: tokio::sync::Notify,
     mcp_preparations: TokioMutex<Vec<(String, String)>>,
     projected_mcp_store: TokioMutex<Option<Arc<CrudStore>>>,
+    projected_mcp_metadata: TokioMutex<HashMap<String, CLIAgentRuntimeMcpTurnMetadata>>,
     mcp_retargets: TokioMutex<Vec<(String, String, String)>>,
     mcp_terminals: TokioMutex<Vec<String>>,
     goal_resets: TokioMutex<Vec<String>>,
     fail_next_goal_reset: TokioMutex<bool>,
     goal_clears: TokioMutex<Vec<String>>,
     closes: AtomicUsize,
+    factory_starts: AtomicUsize,
     event_log: TokioMutex<Option<Arc<TokioMutex<Vec<String>>>>>,
 }
 
@@ -1055,6 +1060,16 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         let Some(crud_store) = self.projected_mcp_store.lock().await.clone() else {
             return Ok(None);
         };
+        if let Some(metadata) = self
+            .projected_mcp_metadata
+            .lock()
+            .await
+            .get_mut(pioneer_turn_id)
+        {
+            let reserved = metadata.clone();
+            metadata.projection_activation_generation += 1;
+            return Ok(Some(reserved));
+        }
         let projection = crud_store
             .get_turn_mcp_projection(pioneer_turn_id)
             .await?
@@ -1317,9 +1332,10 @@ struct StaticCliRuntimeSessionFactory {
 impl CLIAgentRuntimeSessionFactory for StaticCliRuntimeSessionFactory {
     async fn start_session_with_launch_spec(
         &self,
-        _instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
+        instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
         launch_spec: &CliSessionLaunchSpec,
     ) -> anyhow::Result<Arc<dyn CLIAgentRuntimeSession>> {
+        self.session.factory_starts.fetch_add(1, Ordering::SeqCst);
         if let crate::cli_runtime::continuation::CliProviderContinuation::ClaudeFork {
             source_session_id,
             boundary_message_uuid,
@@ -1333,6 +1349,66 @@ impl CLIAgentRuntimeSessionFactory for StaticCliRuntimeSessionFactory {
                     *provider_session_id,
                 )
                 .await?;
+        }
+        if self.session.projected_mcp_store.lock().await.is_some() {
+            use crate::cli_runtime::continuation::CliMcpSessionLaunch;
+            let limits =
+                crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits::transport_bounded(
+                    1024,
+                );
+            let facts = match &launch_spec.mcp {
+                CliMcpSessionLaunch::Codex(launch) => Some((
+                    launch.canonical_projection.turn_id.clone(),
+                    "codex_synthetic_mcp",
+                    launch.canonical_projection.manifest_hash.clone(),
+                    launch.preflight.provider_contract_fingerprint.clone(),
+                    launch.semantic_restart_fingerprint().to_owned(),
+                    launch
+                        .facade_projection(limits)?
+                        .fingerprint()
+                        .as_str()
+                        .to_owned(),
+                )),
+                CliMcpSessionLaunch::Claude(launch) => Some((
+                    launch.canonical_projection.turn_id.clone(),
+                    "claude_strict_mcp",
+                    launch.canonical_projection.manifest_hash.clone(),
+                    launch.preflight.provider_contract_fingerprint.clone(),
+                    launch.semantic_restart_fingerprint().to_owned(),
+                    launch
+                        .facade_projection(limits)?
+                        .fingerprint()
+                        .as_str()
+                        .to_owned(),
+                )),
+                CliMcpSessionLaunch::OpenCode(launch) => Some((
+                    launch.canonical_projection.turn_id.clone(),
+                    "opencode_dynamic_mcp",
+                    launch.canonical_projection.manifest_hash.clone(),
+                    launch.provider_contract_fingerprint.clone(),
+                    launch.semantic_restart_fingerprint().to_owned(),
+                    launch
+                        .facade_projection(limits)?
+                        .fingerprint()
+                        .as_str()
+                        .to_owned(),
+                )),
+                _ => None,
+            };
+            if let Some((turn_id, adapter, manifest, contract, isolation, projection)) = facts {
+                self.session.projected_mcp_metadata.lock().await.insert(
+                    turn_id,
+                    CLIAgentRuntimeMcpTurnMetadata {
+                        adapter_kind: adapter.to_owned(),
+                        manifest_hash: manifest,
+                        projection_fingerprint: projection,
+                        provider_contract_fingerprint: contract,
+                        isolation_contract_fingerprint: isolation,
+                        session_generation: instance.generation(),
+                        projection_activation_generation: 1,
+                    },
+                );
+            }
         }
         if let Some(launch_specs) = self.launch_specs.as_ref() {
             launch_specs.lock().await.push(launch_spec.clone());
@@ -1401,8 +1477,16 @@ fn with_enabled_test_cli_runtime_catalog(processor: MessageProcessor) -> Message
         settings_name.as_str(),
     )
     .expect("test Gateway settings should load");
+    let mut runtimes = pioneer_protocol::GatewayCliRuntimeSettings::default();
+    for runtime in &mut runtimes.instances {
+        runtime.home_path = runtime_home
+            .join("native-homes")
+            .join(&runtime.id)
+            .to_string_lossy()
+            .into_owned();
+    }
     settings
-        .set_cli_runtime_settings_for_tests(pioneer_protocol::GatewayCliRuntimeSettings::default())
+        .set_cli_runtime_settings_for_tests(runtimes)
         .expect("test CLI runtime catalog should be accepted");
     crate::settings::save_gateway_settings(settings_path.as_path(), &settings)
         .expect("test CLI runtime catalog should persist");
@@ -2103,7 +2187,7 @@ async fn setup_cli_runtime_skill_preflight_harness(
     let event_log = processor.cli_runtime_skill_preflight_test_events();
     cli_session.set_event_log(event_log.clone()).await;
 
-    CliRuntimeSkillPreflightHarness {
+    let harness = CliRuntimeSkillPreflightHarness {
         _temp: temp,
         rx,
         connection_id,
@@ -2121,7 +2205,18 @@ async fn setup_cli_runtime_skill_preflight_harness(
         user_root,
         registry_root,
         event_log,
+    };
+    for entry in
+        crate::system_skills::bundled_system_skill_catalog_entries(&harness.system_root).unwrap()
+    {
+        if matches!(entry.slug.as_str(), "tasks" | "subagents") {
+            let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../resources/skills/pioneer")
+                .join(&entry.slug);
+            pioneer_skills::replace_external_runtime_skill(&source, &entry.install_path).unwrap();
+        }
     }
+    harness
 }
 
 fn cli_runtime_turn_start_request_with_capabilities(
@@ -2427,7 +2522,10 @@ async fn capability_persistence_order_impl() {
             .crud_store
             .find_turn_skill_bindings(&turn_id)
             .await
-            .expect("must read persisted CLI runtime turn skill bindings");
+            .expect("must read persisted CLI runtime turn skill bindings")
+            .into_iter()
+            .filter(|binding| binding.source_kind != "system")
+            .collect::<Vec<_>>();
         assert_eq!(skill_bindings.len(), 2);
         assert_eq!(skill_bindings[0].skill_id, alpha_id);
         assert_eq!(skill_bindings[0].skill_owner.as_deref(), Some("tests"));
@@ -2465,12 +2563,9 @@ async fn capability_persistence_order_impl() {
             } if committed_turn_id == turn_id
                 && accepted.is_empty()
                 && rejected.is_empty()
-                && mcp_bindings.len() == 2
-                && mcp_bindings.iter().all(|binding| {
-                    binding.server_installation_id == pioneer_tools::html::HTML_SERVER_ID
-                })
-                && mcp_bindings.iter().map(|binding| binding.raw_tool_name.as_str())
-                    .eq(["html_preview", "html_render"])
+                && mcp_bindings.len() == 2 + crate::turn_mcp::native_tools::NativeToolFamily::Tasks.definitions().len()
+                && mcp_bindings.iter().all(|binding| crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(&binding.server_installation_id).is_some())
+                && mcp_bindings.iter().any(|binding| binding.raw_tool_name == "task_wait")
         ));
         let committed_skills = timeout(Duration::from_secs(1), committed_rx.recv())
             .await
@@ -2482,7 +2577,7 @@ async fn capability_persistence_order_impl() {
                 turn_id: committed_turn_id,
                 bindings,
                 ..
-            } if committed_turn_id == turn_id && bindings.len() == 2
+            } if committed_turn_id == turn_id && bindings.len() == 4
         ));
         if matches!(
             runtime_kind,
@@ -2491,7 +2586,13 @@ async fn capability_persistence_order_impl() {
             let input = native_turn.input.as_array().unwrap();
             let skill_items = input
                 .iter()
-                .filter(|item| item["type"] == "skill")
+                .filter(|item| {
+                    item["type"] == "skill"
+                        && !matches!(
+                            item["name"].as_str(),
+                            Some("pioneer-system-tasks" | "pioneer-system-subagents")
+                        )
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             assert_eq!(
@@ -2623,7 +2724,10 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
                 .crud_store
                 .find_turn_skill_bindings(&turn_id)
                 .await
-                .expect("must read persisted CLI runtime turn skill bindings");
+                .expect("must read persisted CLI runtime turn skill bindings")
+                .into_iter()
+                .filter(|binding| binding.source_kind != "system")
+                .collect::<Vec<_>>();
             assert_eq!(bindings.len(), 1);
             assert_eq!(bindings[0].skill_id, lifecycle_id);
             assert_eq!(bindings[0].skill_owner.as_deref(), Some("tests"));
@@ -2644,7 +2748,7 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
 
         let first_receipt_bytes = first_receipt_snapshot.unwrap();
         let first_receipt = pioneer_skills::read_external_runtime_receipt(&receipt_path).unwrap();
-        assert_eq!(first_receipt.entries.len(), 1);
+        assert_eq!(first_receipt.entries.len(), 3);
         assert_eq!(first_receipt.entries[0].skill_id, lifecycle_id);
         assert_eq!(first_receipt.entries[0].owner.as_deref(), Some("tests"));
         assert_eq!(first_receipt.entries[0].slug, "lifecycle");
@@ -2695,7 +2799,10 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
             .crud_store
             .find_turn_skill_bindings(&update_turn)
             .await
-            .expect("must read updated CLI runtime turn skill bindings");
+            .expect("must read updated CLI runtime turn skill bindings")
+            .into_iter()
+            .filter(|binding| binding.source_kind != "system")
+            .collect::<Vec<_>>();
         assert_eq!(updated_bindings.len(), 1);
         assert_eq!(updated_bindings[0].skill_id, lifecycle_id);
         assert_eq!(updated_bindings[0].skill_slug, "lifecycle");
@@ -2739,7 +2846,9 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
                 .find_turn_skill_bindings(&zero_turn)
                 .await
                 .expect("must read zero-skill CLI runtime turn bindings")
-                .is_empty()
+                .iter()
+                .all(|binding| binding.source_kind == "system"
+                    && matches!(binding.skill_slug.as_str(), "tasks" | "subagents"))
         );
         assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt_after_update);
         assert_eq!(
@@ -14896,6 +15005,42 @@ owned_voice_ingress_test!(
     early
 );
 owned_voice_ingress_test!(
+    owned_voice_context_commit_during_preview_thirteen_seconds,
+    "closed_13",
+    "winner",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_context_commit_during_preview_seventeen_seconds,
+    "closed_17",
+    "winner",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_context_long_backlog_with_rephrased_probes,
+    "long_context",
+    "winner",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_context_final_error_after_window_advance_has_no_partial_turn,
+    "long_tail_error",
+    "winner",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_context_final_error_discards_confirmed_prefix,
+    "sealed_tail_error",
+    "winner",
+    early
+);
+owned_voice_ingress_test!(
+    owned_voice_context_generation_change_fences_tail,
+    "generation_change",
+    "winner",
+    early
+);
+owned_voice_ingress_test!(
     owned_voice_incremental_engine_panic,
     "panic",
     "winner",
@@ -15045,17 +15190,49 @@ fn owned_voice_ingress_case(
                 flag = condition.wait(flag).unwrap();
             }
             drop(flag);
+            if matches!(terminal, "long_context" | "long_tail_error") {
+                if terminal == "long_tail_error" && call_count == 6 {
+                    return Err(transcription_error(
+                        VoiceTranscriptionErrorKind::RuntimeFailure,
+                        "controlled final failure after window advance",
+                    ));
+                }
+                let samples = buffer.flattened_samples();
+                return Ok(if samples.len() <= 48000 && samples[0] > 0.3 {
+                    "incorrect early boundary"
+                } else if samples[0] > 0.3 && samples.len() == 18 * 16000 {
+                    "Привет, мир. Да, да. Ещё раз, ещё раз."
+                } else if samples[0] > 0.3 {
+                    "Привет. Мир. ДА, ДА!"
+                } else if samples.len() <= 24000 {
+                    "да, да."
+                } else if samples.len() > 9 * 16000 {
+                    "Да, да. Ещё раз, ещё раз. Конец."
+                } else {
+                    "Ещё раз. ЕЩЁ РАЗ!"
+                }
+                .to_owned());
+            }
             match terminal {
                 "panic" => panic!("controlled fake panic"),
-                "tail_error" if call_count == 3 => Err(transcription_error(
+                "tail_error" if call_count == 2 => Err(transcription_error(
                     VoiceTranscriptionErrorKind::RuntimeFailure,
                     "controlled native tail failure",
+                )),
+                "sealed_tail_error" if call_count == 3 => Err(transcription_error(
+                    VoiceTranscriptionErrorKind::RuntimeFailure,
+                    "controlled failure after confirmed VAD span",
                 )),
                 "runtime_error" => Err(transcription_error(
                     VoiceTranscriptionErrorKind::RuntimeFailure,
                     "controlled fake failure",
                 )),
                 "no_speech" => Ok("  ".to_owned()),
+                // Context changes the hypothesis across the old 3 s cut. The
+                // final assertion must observe the correction, never append it.
+                _ if early && buffer.speech_samples() <= 48000 => {
+                    Ok("incorrect early boundary".to_owned())
+                }
                 _ => Ok("controlled transcript".to_owned()),
             }
         }));
@@ -15170,13 +15347,27 @@ fn owned_voice_ingress_case(
                 crate::voice::session_store::GatewayVoiceSessionState::Recording
             );
             // Duplicate accepted sequence is ACKed without replay. Keep a full
-            // second window and a seven-sample tail queued behind native work.
-            for sequence in 29..=60 {
-                let samples = if sequence == 60 { 7 } else { 1600 };
+            // second source span and a seven-sample tail behind native work.
+            let last_sequence = match terminal {
+                "long_context" | "long_tail_error" => 200,
+                "closed_13" => 129,
+                "closed_17" => 169,
+                _ => 60,
+            };
+            for sequence in 29..=last_sequence {
+                let samples = if sequence == last_sequence
+                    && !matches!(terminal, "closed_13" | "closed_17")
+                {
+                    7
+                } else {
+                    1600
+                };
                 let amplitude = if sequence == 29 {
                     12000
-                } else if sequence == 60 {
+                } else if sequence == last_sequence {
                     3000
+                } else if terminal == "sealed_tail_error" {
+                    0
                 } else {
                     6000
                 };
@@ -15365,6 +15556,23 @@ fn owned_voice_ingress_case(
             assert!(processor.voice_finalizations.has_active_work());
             assert!(!processor.voice_finalizations.tasks.is_empty());
         }
+        if terminal == "generation_change" {
+            // The next contextual call must use the recording's admitted
+            // generation; a successful old preview cannot authorize a new one.
+            processor
+                .voice_input_supervisor
+                .as_ref()
+                .unwrap()
+                .apply_desired(
+                    crate::voice::supervisor::VoiceInputDesiredState {
+                        enabled: false,
+                        provider: Some(pioneer_protocol::GatewayVoiceInputProvider::Local),
+                        model: Some("moonshine-base".to_owned()),
+                    },
+                    false,
+                )
+                .unwrap();
+        }
         release.release();
         // Closing the tracker enables waiting for completion; it does
         // not cancel the pipeline or forbid spawning by itself. Await exact worker completion, no sleeps.
@@ -15390,22 +15598,55 @@ fn owned_voice_ingress_case(
             {
                 assert_eq!(
                     calls.iter().map(Vec::len).collect::<Vec<_>>(),
-                    vec![48000, 48000, 1600]
+                    vec![48000, 96007],
+                    "Commit coalesces superseded previews into one contextual tail"
                 );
-                for ((call, amplitude), source_count) in calls
-                    .iter()
-                    .zip([12000_i16, 6000, 3000])
-                    .zip([48000, 48000, 7])
-                {
-                    assert_eq!(
-                        &call[..source_count],
-                        vec![f32::from(amplitude) / 32768.0; source_count]
-                    );
-                    assert!(
-                        call[source_count..].iter().all(|sample| *sample == 0.0),
-                        "only synthetic silence may follow the exact source prefix"
-                    );
-                }
+                assert_eq!(calls[0], vec![12000.0 / 32768.0; 48000]);
+                let mut source = vec![12000.0 / 32768.0; 48000];
+                source.extend(vec![6000.0 / 32768.0; 48000]);
+                source.extend([3000.0 / 32768.0; 7]);
+                assert_eq!(calls[1], source, "overlap must preserve source PCM order");
+            } else if terminal == "sealed_tail_error" {
+                assert_eq!(
+                    calls.iter().map(Vec::len).collect::<Vec<_>>(),
+                    vec![48000, 55200, 7687]
+                );
+                let mut confirmed_source = vec![12000.0 / 32768.0; 48000];
+                confirmed_source.extend([0.0; 7200]);
+                assert_eq!(calls[1], confirmed_source);
+                let mut tail = vec![0.0; 7680];
+                tail.extend([3000.0 / 32768.0; 7]);
+                assert_eq!(calls[2], tail);
+            } else if matches!(terminal, "closed_13" | "closed_17") {
+                let count = if terminal == "closed_13" {
+                    13 * 16000
+                } else {
+                    17 * 16000
+                };
+                assert_eq!(
+                    calls.iter().map(Vec::len).collect::<Vec<_>>(),
+                    vec![48000, count]
+                );
+                assert_eq!(calls.iter().map(Vec::len).sum::<usize>(), 48000 + count);
+                let mut source = vec![12000.0 / 32768.0; 48000];
+                source.extend(vec![6000.0 / 32768.0; count - 48000 - 1600]);
+                source.extend([3000.0 / 32768.0; 1600]);
+                assert_eq!(calls[1], source);
+            } else if matches!(terminal, "long_context" | "long_tail_error") {
+                assert_eq!(
+                    calls.iter().map(Vec::len).collect::<Vec<_>>(),
+                    vec![48000, 288000, 168000, 120000, 24000, 176007]
+                );
+                assert_eq!(calls.iter().map(Vec::len).sum::<usize>(), 824007);
+                assert!(calls.iter().all(|call| call.len() <= 18 * 16000));
+                let mut source = vec![12000.0 / 32768.0; 48000];
+                source.extend(vec![6000.0 / 32768.0; 272000]);
+                source.extend([3000.0 / 32768.0; 7]);
+                assert_eq!(calls[1], source[..288000]);
+                assert_eq!(calls[2], source[..168000]);
+                assert_eq!(calls[3], source[168000..288000]);
+                assert_eq!(calls[4], source[144000..168000]);
+                assert_eq!(calls[5], source[144000..]);
             } else {
                 assert_eq!(
                     calls.len(),
@@ -15419,27 +15660,41 @@ fn owned_voice_ingress_case(
             let result: VoiceSessionResultNotification =
                 serde_json::from_value(event.params.unwrap()).unwrap();
             let expected = match terminal {
-                "transcript" => VoiceSessionOutcome::TurnStarted,
+                "transcript" | "long_context" | "closed_13" | "closed_17" => {
+                    VoiceSessionOutcome::TurnStarted
+                }
                 "no_speech" => VoiceSessionOutcome::NoSpeech,
                 _ => VoiceSessionOutcome::Failed,
             };
             assert_eq!(result.outcome, expected);
             assert_eq!(
                 crud.get_turn(thread_id, turn_id).await.unwrap().is_some(),
-                terminal == "transcript"
+                matches!(
+                    terminal,
+                    "transcript" | "long_context" | "closed_13" | "closed_17"
+                )
             );
-            if early && terminal == "transcript" {
+            if early && matches!(terminal, "transcript" | "closed_13" | "closed_17") {
                 let history = crud
                     .get_thread_history(thread_id, Some(64))
                     .await
                     .unwrap()
                     .unwrap();
-                assert!(
-                    serde_json::to_string(&history.events).unwrap().contains(
-                        "controlled transcript controlled transcript controlled transcript"
-                    ),
-                    "Commit must concatenate each completed fragment exactly once"
-                );
+                let history = serde_json::to_string(&history.events).unwrap();
+                assert!(history.contains("controlled transcript"));
+                assert!(!history.contains("incorrect early boundary"));
+                assert!(!history.contains("controlled transcript controlled transcript"));
+            }
+            if terminal == "long_context" {
+                let history = crud
+                    .get_thread_history(thread_id, Some(64))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let history = serde_json::to_string(&history.events).unwrap();
+                assert!(history.contains("Привет, мир. Да, да. Ещё раз, ещё раз. Конец."));
+                assert!(!history.contains("incorrect early boundary"));
+                assert!(!history.contains("Да, да. Да, да."));
             }
             cancel["id"] = json!(late_cancel_id);
             processor
@@ -25955,12 +26210,23 @@ fn composer_cli_skill_pack_matches_individual_members_and_preserves_presentation
                 let run = &task.runs[0];
                 let lineage =
                     wait_for_child_lineage_for_run(harness.crud_store.clone(), &run.id).await;
-                let mut bound_ids = harness
+                let bindings = harness
                     .crud_store
                     .list_turn_skill_bindings(&lineage.child_turn_id)
                     .await
-                    .unwrap()
+                    .unwrap();
+                assert_eq!(bindings.len(), skill_ids.len() + 2);
+                for slug in ["tasks", "subagents"] {
+                    assert!(bindings.iter().any(|binding| {
+                        binding.source_kind == "system"
+                            && binding.skill_owner.as_deref() == Some("pioneer")
+                            && binding.skill_slug == slug
+                            && binding.resolved_reason == "implicit"
+                    }));
+                }
+                let mut bound_ids = bindings
                     .into_iter()
+                    .filter(|binding| binding.resolved_reason == "explicit_composer_capability")
                     .map(|binding| binding.skill_id)
                     .collect::<Vec<_>>();
                 bound_ids.sort();
@@ -26860,11 +27126,12 @@ async fn a_child_first_continued_by_another_provider_or_after_source_edit_transf
                 })
                 .await
                 .unwrap();
-            // The provider fixture is durable across this simulated Gateway
-            // restart; the manager and its process/session caches are not.
+            // Keep the configured provider homes and ownership receipts across
+            // this simulated Gateway restart; only process/session caches reset.
+            let runtime_home = processor.artifact_runtime_home.clone();
             processor.shutdown_cli_runtime_manager().await;
             manager = test_cli_runtime_manager(cli.clone());
-            processor = Arc::new(with_enabled_test_cli_runtime_catalog(
+            processor = Arc::new(
                 MessageProcessor::new(
                     Arc::new(ThreadManager::new("test-model", "openai")),
                     test_provider(),
@@ -26876,10 +27143,11 @@ async fn a_child_first_continued_by_another_provider_or_after_source_edit_transf
                     test_tool_loop_config(),
                 )
                 .with_cli_runtime_manager_for_tests(manager.clone())
-                .with_cli_mcp_readiness_override_for_tests(
-                    supported_test_cli_mcp_readiness(CLIAgentRuntimeKind::Codex),
-                ),
-            ));
+                .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(
+                    CLIAgentRuntimeKind::Codex,
+                ))
+                .with_runtime_home_for_tests(runtime_home),
+            );
             processor
                 .mark_cli_runtimes_ready_for_tests(&workspace)
                 .await
@@ -27673,8 +27941,9 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
             .await;
             let cancel_id =
                 generate_test_request_id("cancel-selected-restore", &child.child_turn_id);
-            processor
-                .process_request_for_connection(
+            timeout(
+                Duration::from_secs(30),
+                processor.process_request_for_connection(
                     connection,
                     &json!({
                         "jsonrpc":"2.0", "id":cancel_id, "method":"turn/cancel",
@@ -27682,8 +27951,10 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
                             "reason":"stop during accepted selected-turn restore"}
                     })
                     .to_string(),
-                )
-                .await;
+                ),
+            )
+            .await
+            .expect("Stop must finish while the selected restore remains paused");
             let cancelled = recv_response_by_id(&mut rx, cancel_id.as_str()).await;
             let cancelled: TurnCancelResponse = serde_json::from_value(cancelled.result).unwrap();
             assert_eq!(cancelled.turn.status, TurnStatus::Interrupted);
@@ -27715,6 +27986,29 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
             })
             .await
             .expect("cancelled Task run must reach a terminal state");
+            assert_eq!(
+                store.get_task_run(&run.id).await.unwrap().unwrap().status,
+                TaskRunStatus::Cancelled,
+                "Stop during restore must not become a preparation failure"
+            );
+            let actor = authenticated_test_superuser().principal_id.to_string();
+            let db = store.database_connection();
+            assert!(
+                pioneer_entity::task_run_read::Entity::find_by_id((actor.clone(), run.id.clone()))
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the exact cancelled run must retain the initiating user's receipt"
+            );
+            let attribution =
+                pioneer_entity::task_run_cancellation_actor::Entity::find_by_id(run.id.clone())
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(attribution.principal_id, actor);
+            assert_eq!(attribution.origin_turn_id, child.child_turn_id);
             pause.release();
             drop(selected_pause);
             let retry_launch = "accepted-large-task-after-restore-cancel";
@@ -28102,6 +28396,88 @@ fn cancelling_cli_history_transfer_stops_before_provider_start_and_releases_sess
             true, false,
         ),
     );
+}
+
+#[test]
+fn cli_history_stop_and_shutdown_drop_a_pending_state_read() {
+    run_standard_stack_message_test("CLI history cancellation with occupied readers", async {
+        for shutdown in [false, true] {
+            let (_directory, workspaces, store, workspace) =
+                setup_pooled_file_workspace_manager().await;
+            let processor = MessageProcessor::new(
+                Arc::new(ThreadManager::new("test-model", "openai")),
+                test_provider(),
+                Arc::new(SessionManager::new()),
+                workspaces,
+                store.clone(),
+                test_gateway_secrets(),
+                test_summary_config(),
+                test_tool_loop_config(),
+            );
+            // Exhaust the real read-only pool. Both capture and its state
+            // monitor must wait, rather than interpreting a missing Turn.
+            let db = store.database_connection();
+            let mut readers = Vec::new();
+            for _ in 0..4 {
+                readers.push(db.begin_read().await.unwrap());
+            }
+            let mut capture = Box::pin(processor.capture_cli_transfer_projection(
+                &workspace,
+                "pending-history-thread",
+                "pending-history-turn",
+                chrono::Utc::now().timestamp_millis() as u64 + 60_000,
+            ));
+            tokio::select! { biased;
+                result = &mut capture => panic!("capture must wait for its reader: {:?}", result.err()),
+                _ = tokio::task::yield_now() => {},
+            }
+            processor.user_turn_cancel_intents.lock().await.insert(
+                (
+                    "another-thread".to_owned(),
+                    "pending-history-turn".to_owned(),
+                ),
+                super::UserTurnCancellationIntent {
+                    pending_requests: 1,
+                    reason: "unrelated Stop".to_owned(),
+                    actor_id: Some(authenticated_test_superuser().principal_id.to_string()),
+                },
+            );
+            tokio::select! { biased;
+                result = &mut capture => panic!("another thread cannot cancel capture: {:?}", result.err()),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+            }
+            if shutdown {
+                processor.cli_history_shutdown.cancel();
+            } else {
+                processor.user_turn_cancel_intents.lock().await.insert(
+                    (
+                        "pending-history-thread".to_owned(),
+                        "pending-history-turn".to_owned(),
+                    ),
+                    super::UserTurnCancellationIntent {
+                        pending_requests: 1,
+                        reason: "Stop while the state read is pending".to_owned(),
+                        actor_id: Some(authenticated_test_superuser().principal_id.to_string()),
+                    },
+                );
+            }
+            let error = timeout(Duration::from_secs(5), capture)
+                .await
+                .expect("local Stop/shutdown must not need a free reader")
+                .err()
+                .expect("capture must be cancelled");
+            assert!(error.to_string().contains("cancelled with its turn"));
+            assert_eq!(readers.len(), 4, "the test did not unblock the read");
+            drop(readers);
+            timeout(Duration::from_secs(5), db.begin_read())
+                .await
+                .expect("cancelled queries must release their pool waiters")
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+        }
+    });
 }
 
 #[derive(Default)]
@@ -28898,10 +29274,10 @@ async fn cancelling_cli_history_transfer_stops_before_provider_start_and_release
         processor.shutdown_cli_runtime_manager().await;
     } else {
         let cancel_id = generate_test_request_id("cancel-transfer", "stop");
-        processor.process_request_for_connection(connection, &json!({
+        timeout(Duration::from_secs(30), processor.process_request_for_connection(connection, &json!({
             "jsonrpc":"2.0", "id":cancel_id, "method":"turn/cancel",
             "params":{"thread_id":thread,"turn_id":turn,"reason":"stop during CLI history preparation"}
-        }).to_string()).await;
+        }).to_string())).await.expect("Stop must finish while CLI history work remains paused");
         let response = recv_response_by_id(&mut rx, cancel_id.as_str()).await;
         let cancelled: TurnCancelResponse = serde_json::from_value(response.result).unwrap();
         assert_eq!(cancelled.turn.status, TurnStatus::Interrupted);
@@ -28961,6 +29337,7 @@ async fn attached_cli_task_starts_while_its_parent_provider_turn_is_active_impl(
         .set_connection_workspace(connection, Some(workspace.clone()))
         .await;
     let cli = Arc::new(RecordingCliRuntimeSession::default());
+    cli.enable_projected_mcp_metadata(store.clone()).await;
     let manager = test_cli_runtime_manager(cli.clone());
     let processor = Arc::new(with_enabled_test_cli_runtime_catalog(
         MessageProcessor::new(
@@ -29025,6 +29402,15 @@ async fn attached_cli_task_starts_while_its_parent_provider_turn_is_active_impl(
     assert_eq!(accepted.turn.id, parent_turn);
     let starts = wait_for_cli_runtime_turn_starts(&cli, 1).await;
     let parent_session = starts[0].native_thread_id.clone();
+    let parent_binding = store
+        .get_cli_runtime_turn_binding(parent_turn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        parent_binding.mcp.is_some(),
+        "task continuation requires the activated MCP contract"
+    );
     let mut task = detached_cli_task_create_params(
         &workspace,
         parent,
@@ -29198,6 +29584,50 @@ async fn attached_cli_task_starts_while_its_parent_provider_turn_is_active_impl(
         );
         processor.release_completed_history_preparation_barrier();
     }
+    // The child has finished, but its result has not yet been delivered to
+    // the parent model. Its first completion must continue the same Turn.
+    match processor
+        .restore_cli_runtime_launch_spec(&parent_binding)
+        .await
+    {
+        super::turn_handlers::CliRuntimeLaunchSpecRestore::Ready(_) => {}
+        super::turn_handlers::CliRuntimeLaunchSpecRestore::Unavailable { diagnostic }
+        | super::turn_handlers::CliRuntimeLaunchSpecRestore::InvalidBinding { diagnostic } => {
+            panic!("attached parent must retain its exact restorable launch: {diagnostic}")
+        }
+    }
+    cli.set_next_native_turn_id("attached-parent-observed-provider-turn")
+        .await;
+    let parent_key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", parent).unwrap();
+    let parent_handle = manager.existing_session(&parent_key).await.unwrap();
+    processor
+        .handle_cli_runtime_timeline_event(
+            parent_handle.instance(),
+            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                native_thread_id: Some(parent_session.clone()),
+                native_turn_id: "attached-active-provider-turn".to_owned(),
+                status: "completed".to_owned(),
+                native: None,
+            }),
+        )
+        .await;
+    let starts = wait_for_cli_runtime_turn_starts(&cli, 3).await;
+    assert_eq!(starts.len(), 3);
+    assert_eq!(starts[2].native_thread_id, parent_session);
+    let continuation = starts[2].input.to_string();
+    assert!(continuation.contains("ATTACHED CHILD COMPLETE"));
+    assert!(!continuation.contains("PARENT WAITS FOR ATTACHED TASK"));
+    assert_eq!(
+        store
+            .get_turn(parent, parent_turn)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::InProgress,
+        "the child result must be integrated before the parent completes"
+    );
     complete_recorded_cli_task_turn(
         &processor,
         cli.as_ref(),
@@ -29206,7 +29636,7 @@ async fn attached_cli_task_starts_while_its_parent_provider_turn_is_active_impl(
         "codex",
         parent,
         &parent_session,
-        "attached-active-provider-turn",
+        "attached-parent-observed-provider-turn",
         "PARENT COMPLETES AFTER ATTACHED CHILD",
     )
     .await;
@@ -30453,7 +30883,10 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                         .await,
                     "restart fixture must begin with an empty in-memory manager"
                 );
-                processor = Arc::new(with_enabled_test_cli_runtime_catalog(
+                // A Gateway restart keeps the runtime configuration, managed
+                // skill receipts and identity source fingerprints intact.
+                let runtime_home = processor.artifact_runtime_home.clone();
+                processor = Arc::new(
                     MessageProcessor::new(
                         cold_thread_manager.clone(),
                         provider_registry.clone(),
@@ -30467,8 +30900,9 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                     .with_cli_runtime_manager_for_tests(cli_manager.clone())
                     .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(
                         runtime_kind,
-                    )),
-                ));
+                    ))
+                    .with_runtime_home_for_tests(runtime_home),
+                );
                 processor
                     .mark_cli_runtimes_ready_for_tests(workspace_id.as_str())
                     .await
@@ -31296,15 +31730,28 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                     .expect("non-latest post-bootstrap input should be editable");
             }
         }
+        let manual_response = pioneer_crud::load_agent_turn_response(
+            &crud_store.database_connection(),
+            corrected_turn.as_str(),
+        )
+        .await
+        .expect("manual response association lookup should succeed")
+        .expect("the foreground CLI Agent turn has its own execution");
+        let manual_execution = pioneer_crud::load_agent_execution(
+            &crud_store.database_connection(),
+            &manual_response.execution_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(
-            pioneer_crud::load_agent_turn_response(
-                &crud_store.database_connection(),
-                corrected_turn.as_str(),
-            )
-            .await
-            .expect("manual response association lookup should succeed")
-            .is_none(),
+            manual_execution.parent_task_id.is_none()
+                && manual_execution.parent_execution_id.is_none(),
             "a foreground follow-up must not be falsely associated with the completed Task execution"
+        );
+        assert_eq!(
+            manual_execution.id,
+            super::agent_action_tools::root_agent_execution_id_for_turn(&corrected_turn)
         );
         let timeline_request_id =
             generate_test_request_id("manual-child-author", corrected_turn.as_str());
@@ -32936,7 +33383,24 @@ async fn cli_task_bootstrap_honors_empty_parent_context_policy_impl() {
     let provider_input = starts[0].input.to_string();
     assert!(provider_input.contains(current_marker));
     let adapter_messages = serde_json::to_value(&starts[0].input).unwrap();
-    let adapter_messages = adapter_messages.as_array().unwrap();
+    let adapter_input = adapter_messages.as_array().unwrap();
+    let skill_names = adapter_input
+        .iter()
+        .filter(|item| item["type"] == "skill")
+        .map(|item| item["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        skill_names,
+        vec!["pioneer-system-tasks", "pioneer-system-subagents"]
+    );
+    let adapter_messages = adapter_input
+        .iter()
+        .filter(|item| item["type"] == "text")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        adapter_input.len(),
+        adapter_messages.len() + skill_names.len()
+    );
     assert_eq!(adapter_messages.len(), 2);
     assert!(
         !adapter_messages[0].to_string().contains(current_marker),
@@ -33134,11 +33598,19 @@ async fn cancelling_detached_native_task_interrupts_only_its_child_continuation_
 fn cancelling_detached_native_child_turn_cancels_parent_task_anchor() {
     run_standard_stack_message_test(
         "detached native child cancellation projection test",
-        assert_detached_native_child_turn_cancellation(),
+        assert_detached_native_child_turn_cancellation(false),
     );
 }
 
-async fn assert_detached_native_child_turn_cancellation() {
+#[test]
+fn composer_stop_native_api_child_saves_personal_cancellation_receipt() {
+    run_standard_stack_message_test(
+        "native API child Stop receipt",
+        assert_detached_native_child_turn_cancellation(true),
+    );
+}
+
+async fn assert_detached_native_child_turn_cancellation(native_api: bool) {
     let (tx, mut rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -33149,7 +33621,17 @@ async fn assert_detached_native_child_turn_cancellation() {
     let processor = Arc::new(with_enabled_test_cli_runtime_catalog(
         MessageProcessor::new(
             thread_manager.clone(),
-            test_provider(),
+            if native_api {
+                Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+                    "openai",
+                    Arc::new(DelayedProvider {
+                        delay: Duration::from_secs(60),
+                        text: "late answer".into(),
+                    }),
+                ))
+            } else {
+                test_provider()
+            },
             session_manager,
             workspace_manager,
             crud_store.clone(),
@@ -33182,27 +33664,55 @@ async fn assert_detached_native_child_turn_cancellation() {
     cli_session
         .set_next_native_turn_id("native_child_turn_cancel")
         .await;
-    let created = create_task_for_test(
-        &processor,
-        detached_cli_task_create_params(
-            workspace_id.as_str(),
+    let mut params = detached_cli_task_create_params(
+        workspace_id.as_str(),
+        parent_thread_id,
+        source_turn_id,
+        "claude",
+        CLIAgentRuntimeKind::Claude,
+        "claude-sonnet",
+        "cancel this child turn from its Composer",
+    );
+    if native_api {
+        let mut native = test_task_create_params(
+            &workspace_id,
             parent_thread_id,
             source_turn_id,
-            "claude",
-            CLIAgentRuntimeKind::Claude,
-            "claude-sonnet",
-            "cancel this child turn from its Composer",
-        ),
-    )
-    .await
-    .expect("cancellable native child Task should start");
+            "native API child Stop",
+            3,
+        );
+        native.lifecycle_policy = params.lifecycle_policy;
+        native.delivery_policy = params.delivery_policy;
+        params = native;
+    }
+    let created = create_task_for_test(&processor, params)
+        .await
+        .expect("cancellable native child Task should start");
     let run = created
         .run
         .clone()
         .expect("cancellable child run should exist");
     let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
-    let starts = wait_for_cli_runtime_turn_starts(&cli_session, 1).await;
-    assert_eq!(starts.len(), 1);
+    if native_api {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if crud_store
+                    .native_cancellation_context(&lineage.child_turn_id)
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("API child must reach durable native cancellation preparation");
+    } else {
+        let starts = wait_for_cli_runtime_turn_starts(&cli_session, 1).await;
+        assert_eq!(starts.len(), 1);
+    }
 
     thread_manager
         .thread_start_seeded(
@@ -33289,6 +33799,46 @@ async fn assert_detached_native_child_turn_cancellation() {
         .expect("task run turn should reload")
         .expect("task run turn should exist");
     assert_eq!(task_run_turn.status, TaskRunTurnStatus::Cancelled);
+    {
+        use sea_orm::EntityTrait;
+        let principal = authenticated_test_superuser().principal_id.to_string();
+        let db = crud_store.database_connection();
+        let receipt =
+            pioneer_entity::task_run_read::Entity::find_by_id((principal.clone(), run.id.clone()))
+                .one(&db)
+                .await
+                .unwrap();
+        assert!(
+            receipt.is_some(),
+            "Composer Stop must suppress the authenticated actor before any viewport read"
+        );
+        let origin =
+            pioneer_entity::task_run_cancellation_actor::Entity::find_by_id(run.id.clone())
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(origin.principal_id, principal);
+        assert_eq!(origin.origin_turn_id, lineage.child_turn_id);
+        // No live intent survives this point. Reconciliation from saved state
+        // must retain the original actor and remain idempotent.
+        processor.user_turn_cancel_intents.lock().await.clear();
+        processor
+            .task_agent_executor
+            .reconcile_child_turn_cancelled(
+                &lineage.child_thread_id,
+                &lineage.child_turn_id,
+                "replayed Stop",
+                super::TaskChildReconciliationOrigin::Live,
+            )
+            .await
+            .unwrap();
+        let receipts = pioneer_entity::task_run_read::Entity::find()
+            .all(&db)
+            .await
+            .unwrap();
+        assert_eq!(receipts.iter().filter(|r| r.run_id == run.id).count(), 1);
+    }
 
     let parent_occurrence_turn_id = lineage
         .created_by_turn_id
@@ -37897,6 +38447,20 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() 
         .runs
         .last()
         .expect("cancelled attached child task should have a run");
+    {
+        use sea_orm::EntityTrait;
+        let receipt = pioneer_entity::task_run_read::Entity::find_by_id((
+            authenticated_test_superuser().principal_id.to_string(),
+            run.id.clone(),
+        ))
+        .one(&crud_store.database_connection())
+        .await
+        .unwrap();
+        assert!(
+            receipt.is_some(),
+            "native parent Stop must carry the authenticated actor through work-graph cleanup"
+        );
+    }
     let task_run_turns = crud_store
         .list_task_run_turns(run.id.as_str())
         .await
@@ -43406,6 +43970,52 @@ async fn message_attachment_requires_exact_version_and_current_thread_scope() {
     }
 }
 
+// These RPC regressions cover normal post-access unread behavior. Give their
+// isolated fixtures an earlier activation/grant, rather than depending on
+// whether setup and publication happen in the same excluded boundary second.
+async fn prepare_post_access_unread_fixture(store: &CrudStore, workspace_id: &str) {
+    let earlier = chrono::Utc::now().fixed_offset() - chrono::Duration::seconds(60);
+    // These fixtures seed updated_at with SQLite CURRENT_TIMESTAMP. Keep the
+    // same UTC text format: membership's timestamp CHECK compares stored text.
+    let earlier_sql = earlier.format("%Y-%m-%d %H:%M:%S").to_string();
+    let db = store.database_connection();
+    let tx = db.begin().await.unwrap();
+    pioneer_entity::gateway_identity::Entity::update_many()
+        .col_expr(
+            pioneer_entity::gateway_identity::Column::UnreadStartedAt,
+            Expr::val(earlier.timestamp()),
+        )
+        .filter(pioneer_entity::gateway_identity::Column::SingletonKey.eq(1))
+        .exec(&tx)
+        .await
+        .unwrap();
+    let ids = [
+        authenticated_test_superuser().principal_id.to_string(),
+        "P0000000000000000000A".into(),
+        "P0000000000000000000B".into(),
+    ];
+    pioneer_entity::gateway_principal::Entity::update_many()
+        .col_expr(
+            pioneer_entity::gateway_principal::Column::CreatedAt,
+            Expr::val(earlier_sql.clone()),
+        )
+        .filter(pioneer_entity::gateway_principal::Column::Id.is_in(ids.clone()))
+        .exec(&tx)
+        .await
+        .unwrap();
+    pioneer_entity::workspace_membership::Entity::update_many()
+        .col_expr(
+            pioneer_entity::workspace_membership::Column::CreatedAt,
+            Expr::val(earlier_sql),
+        )
+        .filter(pioneer_entity::workspace_membership::Column::WorkspaceId.eq(workspace_id))
+        .filter(pioneer_entity::workspace_membership::Column::PrincipalId.is_in(ids))
+        .exec(&tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn message_mutation_rpcs_enforce_author_moderation_revision_and_tombstone_policy() {
     const AUTHOR_ID: &str = "P0000000000000000000A";
@@ -43437,6 +44047,7 @@ async fn message_mutation_rpcs_enforce_author_moderation_revision_and_tombstone_
         )
         .await
         .expect("materialize Epic 6 mutation principals");
+    prepare_post_access_unread_fixture(crud_store.as_ref(), &workspace_id).await;
 
     let session_manager = Arc::new(SessionManager::new());
     let (author_tx, mut author_rx) = mpsc::channel(64);
@@ -44044,6 +44655,7 @@ async fn thread_read_rpc_is_monotonic_and_converges_all_principal_sessions() {
     let _secondary_connection_id =
         register_authenticated_test_connection(session_manager.as_ref(), secondary_tx).await;
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    prepare_post_access_unread_fixture(crud_store.as_ref(), &workspace_id).await;
     let processor = MessageProcessor::new(
         Arc::new(ThreadManager::new("o4-mini", "openai")),
         test_provider(),
@@ -71971,14 +72583,10 @@ async fn setup_pooled_file_workspace_manager_with_observer(
 async fn setup_workspace_manager_with_connection(
     connection: sea_orm::DatabaseConnection,
 ) -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
-    setup_workspace_manager_with_connection_migrator::<Migrator>(connection).await
-}
-
-async fn setup_workspace_manager_with_connection_migrator<M: MigratorTrait>(
-    connection: sea_orm::DatabaseConnection,
-) -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
+    // This helper invokes current Gateway bootstrap and authorization, so it
+    // requires the complete schema rather than a historical migration prefix.
     crate::compaction::load_test_catalog();
-    M::up(&connection, None)
+    Migrator::up(&connection, None)
         .await
         .expect("migrations must succeed");
     bootstrap(&connection)
@@ -81584,6 +82192,17 @@ async fn recovery_failure_task_consumers_impl(
         "Recovery task",
         3,
     );
+    if parent_is_task_run {
+        // Let the executor create the real occurrence, including its run ID,
+        // lineage and terminal projection receipt. Changing a conversation's
+        // turn_kind alone does not establish those cleanup prerequisites.
+        params.lifecycle_policy = Some(TaskLifecyclePolicy {
+            attachment: TaskAttachmentMode::Detached,
+            on_parent_cancel: TaskParentTerminalAction::KeepRunning,
+            on_parent_failure: TaskParentTerminalAction::KeepRunning,
+            completion: TaskCompletionBehavior::CompleteOnTerminalRun,
+        });
+    }
     params.delivery_policy = Some(TaskDeliveryPolicy {
         mode: TaskDeliveryMode::Thread,
         thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
@@ -81594,19 +82213,18 @@ async fn recovery_failure_task_consumers_impl(
     });
     let created = create_task_for_test(&processor, params).await.unwrap();
     let run = created.run.unwrap();
-    if parent_is_task_run {
-        // A visible Task occurrence closes with its child; a delegating Agent Turn stays active.
-        store
-            .database_connection()
-            .execute_unprepared(&format!(
-                "UPDATE turn SET turn_kind = 'task_run' WHERE id = '{}'",
-                parent_turn
-            ))
-            .await
-            .unwrap();
-    }
+    let parent_turn = if parent_is_task_run {
+        run.id.clone()
+    } else {
+        parent_turn
+    };
     let lineage = wait_for_child_lineage_for_run(store.clone(), &run.id).await;
     // Lineage registration precedes the child's remaining preflight work.
+    assert_eq!(
+        lineage.created_by_turn_id.as_deref(),
+        Some(parent_turn.as_str()),
+        "recovery must exercise the actual conversation or occurrence parent"
+    );
     // Wait for the actual provider entry before injecting its failure; a fixed
     // 2.5-second poll window races that preparation in the parallel suite.
     timeout(Duration::from_secs(30), async {
@@ -84513,6 +85131,14 @@ async fn task_completion_inbox_rpc_uses_root_acl_and_syncs_personal_reads_withou
         &workspace_id,
     )
     .await;
+    let (b2, mut b2_rx) = device(
+        &sessions,
+        "P0000000000000000000B",
+        "D0000000000000000000E",
+        "S0000000000000000000E",
+        &workspace_id,
+    )
+    .await;
     let processor = MessageProcessor::new(
         Arc::new(ThreadManager::new("o4-mini", "openai")),
         test_provider(),
@@ -84658,6 +85284,89 @@ async fn task_completion_inbox_rpc_uses_root_acl_and_syncs_personal_reads_withou
     .unwrap();
     assert_eq!(dedup.entries.len(), 1);
     assert_eq!(dedup.unread_count, 1);
+    // Explicit bulk read includes a newly saved run that A never loaded.
+    db.execute_unprepared("INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,completed_at,created_at,updated_at) VALUES('R0000000000000000000J','K0000000000000000000I','R0000000000000000000J',1,2,'succeeded','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    while a2_rx.try_recv().is_ok() {}
+    while b_rx.try_recv().is_ok() {}
+    let all: TaskCompletionInboxListResponse = serde_json::from_value(
+        rpc(
+            &processor,
+            a,
+            &mut a_rx,
+            methods::TASK_COMPLETION_INBOX_READ_ALL,
+            json!({"workspaceId":workspace_id}),
+        )
+        .await
+        .result,
+    )
+    .unwrap();
+    assert_eq!(all.unread_count, 0);
+    assert!(all.entries.is_empty());
+    recv_notification_by_method(&mut a2_rx, events::TASK_COMPLETION_INBOX_CHANGED).await;
+    assert!(
+        b_rx.try_recv().is_err(),
+        "bulk read invalidates only the authenticated principal"
+    );
+    let same_user: TaskCompletionInboxListResponse = serde_json::from_value(
+        rpc(
+            &processor,
+            a2,
+            &mut a2_rx,
+            methods::TASK_COMPLETION_INBOX_LIST,
+            json!({"workspaceId":workspace_id}),
+        )
+        .await
+        .result,
+    )
+    .unwrap();
+    assert!(same_user.entries.is_empty());
+    let other_user: TaskCompletionInboxListResponse = serde_json::from_value(
+        rpc(
+            &processor,
+            b,
+            &mut b_rx,
+            methods::TASK_COMPLETION_INBOX_LIST,
+            json!({"workspaceId":workspace_id}),
+        )
+        .await
+        .result,
+    )
+    .unwrap();
+    assert_eq!(other_user.unread_count, 2);
+    while b_rx.try_recv().is_ok() {}
+    while b2_rx.try_recv().is_ok() {}
+    let viewed: Vec<String> = serde_json::from_value(rpc(
+        &processor, b, &mut b_rx, methods::TASK_COMPLETION_INBOX_VIEWED,
+        json!({"workspaceId":workspace_id,"threadId":"T0000000000000000000I","runIds":["R0000000000000000000J"],"resultTurnIds":[]}),
+    ).await.result).unwrap();
+    assert_eq!(viewed, ["run:R0000000000000000000J"]);
+    assert!(
+        b_rx.try_recv().is_err(),
+        "viewed source reloads in shared worker; no own hint"
+    );
+    recv_notification_by_method(&mut b2_rx, events::TASK_COMPLETION_INBOX_CHANGED).await;
+    let _: Vec<String> = serde_json::from_value(rpc(
+        &processor, b2, &mut b2_rx, methods::TASK_COMPLETION_INBOX_VIEWED,
+        json!({"workspaceId":workspace_id,"threadId":"T0000000000000000000I","runIds":["R0000000000000000000I"],"resultTurnIds":[]}),
+    ).await.result).unwrap();
+    recv_notification_by_method(&mut b_rx, events::TASK_COMPLETION_INBOX_CHANGED).await;
+    assert!(
+        b2_rx.try_recv().is_err(),
+        "the independent sender alone is skipped"
+    );
+    let thread_reads = db
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT COUNT(*) count FROM thread_read_cursor WHERE thread_id='T0000000000000000000I'",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        thread_reads.try_get::<i64>("", "count").unwrap(),
+        0,
+        "visible task read stays independent of thread cursors"
+    );
     db.execute_unprepared("DELETE FROM thread_membership WHERE principal_id='P0000000000000000000B' AND thread_id='T0000000000000000000I'").await.unwrap();
     let list: TaskCompletionInboxListResponse = serde_json::from_value(
         rpc(

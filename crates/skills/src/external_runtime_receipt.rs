@@ -197,10 +197,27 @@ pub fn ensure_external_runtime_receipt_v2(
     path: &Path,
     candidates: &[ExternalRuntimeReceiptConversionCandidate],
 ) -> Result<ExternalRuntimeSkillReceipt> {
+    let (receipt, converted) = prepare_external_runtime_receipt_v2(path, candidates, &[])?;
+    if converted {
+        write_external_runtime_receipt_atomic(path, &receipt)?;
+    }
+    Ok(receipt)
+}
+
+/// Resolve the existing v1 conversion without writing it yet. Automatic
+/// installers must prove destination ownership before modifying any receipt.
+/// The boolean is true when the prepared v2 receipt needs to be persisted.
+/// A protected destination cannot be discarded as an unmapped legacy entry:
+/// its ownership must be resolved before an automatic installer can proceed.
+pub fn prepare_external_runtime_receipt_v2(
+    path: &Path,
+    candidates: &[ExternalRuntimeReceiptConversionCandidate],
+    protected_destinations: &[(&Path, &str)],
+) -> Result<(ExternalRuntimeSkillReceipt, bool)> {
     let payload = match fs::read(path) {
         Ok(payload) => payload,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ExternalRuntimeSkillReceipt::default());
+            return Ok((ExternalRuntimeSkillReceipt::default(), false));
         }
         Err(error) => {
             return Err(error).with_context(|| {
@@ -218,7 +235,7 @@ pub fn ensure_external_runtime_receipt_v2(
         )
     })?;
     if version.version == EXTERNAL_RUNTIME_RECEIPT_VERSION {
-        return read_external_runtime_receipt(path);
+        return Ok((read_external_runtime_receipt(path)?, false));
     }
     if version.version != 1 {
         bail!(
@@ -243,6 +260,13 @@ pub fn ensure_external_runtime_receipt_v2(
             })
             .collect::<Vec<_>>();
         if matches.len() != 1 {
+            for (root, name) in protected_destinations {
+                anyhow::ensure!(
+                    entry.native_skills_root != normalized_root_string(root)?
+                        || entry.install_name != *name,
+                    "external runtime receipt cannot establish ownership of protected destination `{name}`"
+                );
+            }
             continue;
         }
         let candidate = matches[0];
@@ -265,8 +289,7 @@ pub fn ensure_external_runtime_receipt_v2(
             },
         )?;
     }
-    write_external_runtime_receipt_atomic(path, &converted)?;
-    Ok(converted)
+    Ok((converted, true))
 }
 
 fn decode_legacy_external_runtime_receipt_v1(
@@ -808,7 +831,32 @@ mod tests {
             "alpha",
         )];
 
+        let legacy_bytes = fs::read(&path).unwrap();
+        let (prepared, needs_commit) =
+            prepare_external_runtime_receipt_v2(&path, &candidates, &[]).unwrap();
+        assert!(needs_commit);
+        assert_eq!(
+            prepare_external_runtime_receipt_v2(&path, &candidates, &[(&root, "alpha")])
+                .unwrap()
+                .0,
+            prepared
+        );
+        assert!(
+            prepare_external_runtime_receipt_v2(
+                &path,
+                &candidates,
+                &[(&root, "alpha"), (&root, "stale")]
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
         let first = ensure_external_runtime_receipt_v2(&path, &candidates).unwrap();
+        assert_eq!(prepared, first);
+        assert!(
+            !prepare_external_runtime_receipt_v2(&path, &candidates, &[])
+                .unwrap()
+                .1
+        );
         assert_eq!(first.entries.len(), 1);
         assert_eq!(first.entries[0].skill_id.as_str(), "AAAAAAAAAAAAAAAAAAAAA");
         assert_eq!(first.entries[0].owner.as_deref(), Some("owner"));
