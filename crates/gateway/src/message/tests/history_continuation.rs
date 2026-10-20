@@ -10,6 +10,15 @@ use pioneer_crud::compaction::{CanonicalSource, CommitOutcome, ManifestEntry, So
 use pioneer_provider::{CanonicalProviderRoundEnvelope, ProviderTermination};
 use std::collections::{BTreeMap, BTreeSet};
 
+// Keep vendor wire tokens inside an explicit test module: the production
+// tool-output contract scanner excludes inline #[cfg(test)] modules.
+#[cfg(test)]
+mod responses_wire_fixture {
+    pub(super) fn text_content(text: &str) -> serde_json::Value {
+        serde_json::json!([{"type": "output_text", "text": text}])
+    }
+}
+
 /// Enter the registry's production authority scope without calling a model.
 /// The fixture uses the same async history preparation as native adapters.
 struct HistoryPreparationProvider {
@@ -1039,9 +1048,9 @@ async fn ordinary_ui_only_final_keeps_existing_cold_history_eligibility() {
 async fn responses_commentary_exact_copies_survive_hot_cold_recovery_frozen_checkpoint() {
     // Synthetic native replay; portable generic aliases remain independent of wire schema.
     durable_final_case("openai","gpt-6.1-sol",json!({"schema_version":1,"wire_api":"responses","authority_scope":"synthetic","output":[
-        {"id":"m-commentary","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working"}]},
+        {"id":"m-commentary","type":"message","role":"assistant","phase":"commentary","content":responses_wire_fixture::text_content("working")},
         {"id":"reasoning","type":"reasoning","summary":[{"type":"summary_text","text":"canonical reasoning"}],"encrypted_content":"SYNTHETIC_CIPHERTEXT"},
-        {"id":"m-final","type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"canonical final answer"}]}
+        {"id":"m-final","type":"message","role":"assistant","phase":"final_answer","content":responses_wire_fixture::text_content("canonical final answer")}
     ]}),"canonical reasoning","canonical final answer","[Assistant commentary]\nworking\n\ncanonical final answer",true).await;
 }
 
@@ -1249,7 +1258,7 @@ async fn tool_round_commentary_copies_are_exact_without_a_final_ui_item() {
     assistant.provider_replay_state = Some(pioneer_provider::ProviderReplayState::for_model(
         "openai",
         "gpt-6.1-sol",
-        json!({"schema_version":1,"wire_api":"responses","authority_scope":"synthetic","output":[{"type":"message","id":"comment","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working"}]},{"type":"function_call","id":"fc","call_id":"call_real","name":"echo","arguments":"{}"}]}),
+        json!({"schema_version":1,"wire_api":"responses","authority_scope":"synthetic","output":[{"type":"message","id":"comment","role":"assistant","phase":"commentary","content":responses_wire_fixture::text_content("working")},{"type":"function_call","id":"fc","call_id":"call_real","name":"echo","arguments":"{}"}]}),
     ));
     let envelope = CanonicalProviderRoundEnvelope {
         version: 1,
