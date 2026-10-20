@@ -84671,10 +84671,10 @@ fn acp_composer_preparation_detached_result_and_parent_delivery_use_one_owner() 
             catalog
                 .instances
                 .push(pioneer_protocol::GatewayCliRuntimeInstanceSettings {
-                    id: "acp-regression".into(),
+                    id: "acp_regression".into(),
                     kind: CLIAgentRuntimeKind::Acp,
                     display_name: "ACP regression".into(),
-                    nickname: "acp-regression".into(),
+                    nickname: "acp_regression".into(),
                     enabled: true,
                     binary_path: "recording-runtime".into(),
                     home_path: String::new(),
@@ -84749,7 +84749,7 @@ fn acp_composer_preparation_detached_result_and_parent_delivery_use_one_owner() 
             let prepare = generate_test_request_id("acp", "prepare");
             Arc::clone(&processor).process_owned_request(context.clone(),json!({
                 "jsonrpc":"2.0","id":prepare,"method":pioneer_protocol::constants::methods::CLI_RUNTIME_ACP_SESSION,
-                "params":{"workspace_id":workspace,"thread_id":parent,"runtime_id":"acp-regression","operation":{"type":"prepare","additional_directories":[]}}
+                "params":{"workspace_id":workspace,"thread_id":parent,"runtime_id":"acp_regression","operation":{"type":"prepare","additional_directories":[]}}
             }).to_string()).await;
             let prepared: pioneer_protocol::AcpSessionResponse =
                 serde_json::from_value(recv_response_by_id(&mut rx, &prepare).await.result)
@@ -84780,7 +84780,7 @@ fn acp_composer_preparation_detached_result_and_parent_delivery_use_one_owner() 
                     "jsonrpc":"2.0","id":request,"method":"turn/start","params":{
                         "thread_id":parent,"turn_id":source_turn,"input":[{"type":"text","text":format!("request {index}")}],
                         "mode":"Agent","permission_profile":pioneer_protocol::TurnPermissionProfileSelection::full_access(),
-                        "execution_backend":{"type":"acpAgentRuntime","runtime_id":"acp-regression"},"cli_runtime_options":{"acp_configuration":selection}
+                        "execution_backend":{"type":"acpAgentRuntime","runtime_id":"acp_regression"},"cli_runtime_options":{"acp_configuration":selection}
                     }
                 }).to_string()).await;
                 let _: TurnStartResponse =
@@ -84790,7 +84790,7 @@ fn acp_composer_preparation_detached_result_and_parent_delivery_use_one_owner() 
                     loop {
                         if let Some(binding) = store
                             .get_cli_runtime_turn_binding_by_native_turn(
-                                "acp-regression",
+                                "acp_regression",
                                 &native_turn,
                             )
                             .await
@@ -84813,7 +84813,7 @@ fn acp_composer_preparation_detached_result_and_parent_delivery_use_one_owner() 
                     .unwrap();
                 let manager = processor.cli_runtime_manager.as_ref().unwrap();
                 let key =
-                    CLIAgentRuntimeSessionKey::new(&workspace, "acp-regression", &parent).unwrap();
+                    CLIAgentRuntimeSessionKey::new(&workspace, "acp_regression", &parent).unwrap();
                 let handle = manager.existing_session(&key).await.unwrap();
                 snapshot = timeout(Duration::from_secs(10), async {
                     loop {

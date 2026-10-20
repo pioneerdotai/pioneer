@@ -3575,7 +3575,8 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn prepare_task_cli_runtime_turn(
+    // Keep CLI preparation out of the enclosing Task workflow's future frame.
+    pub(super) fn prepare_task_cli_runtime_turn(
         &self,
         params: TurnStartParams,
         runtime_id: String,
@@ -3591,8 +3592,8 @@ impl MessageProcessor {
         agent_author: pioneer_protocol::TurnAuthorSnapshot,
         agent_turn_response: pioneer_crud::AgentTurnResponseInput,
         admitted_outcome: Option<crate::thread::TurnStartOutcome>,
-    ) -> anyhow::Result<PreparedCliRuntimeNativeTurnStart> {
-        scope_current_stage(Stage::TaskCliPrepare, async {
+    ) -> MessageFuture<'_, anyhow::Result<PreparedCliRuntimeNativeTurnStart>> {
+        message_future(scope_current_stage(Stage::TaskCliPrepare, async move {
             #[cfg(test)]
             self.task_cli_preparation_attempts
                 .fetch_add(1, Ordering::SeqCst);
@@ -3627,8 +3628,7 @@ impl MessageProcessor {
             receiver
                 .await
                 .context("task CLI runtime preparation ended without a result")?
-        })
-        .await
+        }))
     }
 
     pub(super) async fn prepare_committed_agent_cli_runtime_turn(
