@@ -310,22 +310,28 @@ impl ClientCore {
         thread: &str,
         runtime: &str,
     ) -> Option<AcpSessionSnapshot> {
-        if !self.capability_management_allowed(workspace) {
+        // Read the existing owner before consulting authorization. Authorization
+        // fencing clears this cache before publishing cancelled composer state,
+        // while the identity owner is still locked.
+        let (epoch, snapshot) = {
+            let owner = self
+                .provider_controller
+                .lock()
+                .expect("provider controller poisoned");
+            let epoch = owner.acp_epoch?;
+            let snapshot = owner
+                .acp_sessions
+                .get(&(workspace.into(), thread.into(), runtime.into()))?
+                .clone();
+            (epoch, snapshot)
+        };
+        if !self.capability_management_allowed(workspace) || epoch != self.provider_runtime_epoch()
+        {
             return None;
         }
-        let epoch = self.provider_runtime_epoch();
-        let owner = self
-            .provider_controller
-            .lock()
-            .expect("provider controller poisoned");
-        if owner.acp_epoch != Some(epoch) {
-            return None;
-        }
-        owner
-            .acp_sessions
-            .get(&(workspace.into(), thread.into(), runtime.into()))
-            .cloned()
+        Some(snapshot)
     }
+
     pub fn provider_operation_snapshot(
         &self,
         workspace_id: &str,
