@@ -27557,6 +27557,420 @@ async fn cli_input_admission_impl(case: CliInputAdmissionCase) {
 }
 
 #[test]
+fn cli_transfer_reuses_late_mixed_checkpoint_from_raw_saved_input_aliases() {
+    run_standard_stack_message_test(
+        "CLI transfer reuses a late mixed checkpoint over an accepted raw snapshot",
+        cli_transfer_reuses_late_mixed_checkpoint_from_raw_saved_input_aliases_impl(),
+    );
+}
+
+async fn cli_transfer_reuses_late_mixed_checkpoint_from_raw_saved_input_aliases_impl() {
+    use crate::compaction::frozen;
+    use pioneer_compaction::{
+        Checkpoint, CompactionMode, CompactionPlan, CompactionSettings, CoverageDomain,
+        ModelBudget, ModelSelection, OperationSnapshot, Transport,
+    };
+    use pioneer_crud::compaction::ManifestEntry;
+    use pioneer_provider::MessageSourceAlias;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let (workspaces, store, workspace) = setup_workspace_manager().await;
+    let cli = Arc::new(RecordingCliRuntimeSession::default());
+    let summary = Arc::new(CaptureSummaryProvider::new(
+        "must not summarize accepted history",
+    ));
+    let providers = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        summary.clone(),
+    ));
+    let processor = Arc::new(with_enabled_test_cli_runtime_catalog(
+        MessageProcessor::new(
+            Arc::new(ThreadManager::new("test-model", "openai")),
+            providers,
+            Arc::new(SessionManager::new()),
+            workspaces,
+            store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli.clone()))
+        .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(
+            CLIAgentRuntimeKind::Codex,
+        )),
+    ));
+    processor
+        .mark_cli_runtimes_ready_for_tests(&workspace)
+        .await
+        .unwrap();
+    sync_test_cli_runtime_identities(&processor).await.unwrap();
+    processor
+        .mark_cli_reasoning_model_ready_for_tests(&workspace, "codex", "gpt-5")
+        .await
+        .unwrap();
+    processor
+        .agent_manager
+        .set_context_controller(Some(Arc::new(
+            crate::compaction::GatewayNativeContextController::new(Arc::downgrade(&processor)),
+        )))
+        .await;
+    let consumer = "saved-alias-cli-consumer";
+    let producer = "saved-alias-cli-producer";
+    for (thread, turn, text) in [
+        (consumer, "saved-alias-original", "ORIGINAL SHARED QUESTION"),
+        (consumer, "saved-alias-history", "COVERED SHARED HISTORY"),
+        (producer, "saved-alias-copy", "ORIGINAL SHARED QUESTION"),
+        (consumer, "saved-alias-tail", "UNCOVERED ACCEPTED TAIL"),
+    ] {
+        seed_completed_task_parent_with_inputs(
+            &processor,
+            &workspace,
+            thread,
+            turn,
+            text,
+            vec![UserInput::Text {
+                text: text.into(),
+                text_elements: vec![],
+            }],
+        )
+        .await;
+    }
+    store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: workspace.clone(),
+                thread_id: producer.into(),
+                turn_id: "saved-alias-copy".into(),
+                item: TurnItem::AgentMessage {
+                    id: "saved-alias-own-work".into(),
+                    text: "COVERED PRODUCER OWN WORK".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            super::now_timestamp_secs(),
+        )
+        .await
+        .unwrap();
+    let mut raw =
+        frozen::capture_execution_basis_prepared(&store, &workspace, consumer, None, None, None)
+            .await
+            .unwrap()
+            .messages;
+    let foreign =
+        frozen::capture_execution_basis_prepared(&store, &workspace, producer, None, None, None)
+            .await
+            .unwrap()
+            .messages;
+    let copy = foreign
+        .iter()
+        .find(|message| message.role == pioneer_provider::Role::User)
+        .unwrap()
+        .provenance
+        .as_ref()
+        .unwrap()
+        .sources[0]
+        .clone();
+    let own_work = foreign
+        .iter()
+        .find(|message| message.content == "COVERED PRODUCER OWN WORK")
+        .unwrap()
+        .clone();
+    let original = raw
+        .iter_mut()
+        .find(|message| message.content == "ORIGINAL SHARED QUESTION")
+        .unwrap();
+    let original_origin = original.provenance.as_mut().unwrap();
+    let original_source = original_origin.sources[0].clone();
+    assert_ne!(
+        original_source, copy,
+        "the proof must bridge different exact input identities"
+    );
+    original_origin.source_aliases.push(MessageSourceAlias {
+        represented_thread_id: consumer.into(),
+        represented_source: original_source,
+        thread_id: producer.into(),
+        source: copy.clone(),
+    });
+    let own_source = own_work.provenance.as_ref().unwrap().sources[0].clone();
+    let history_source = raw
+        .iter()
+        .find(|message| message.content == "COVERED SHARED HISTORY")
+        .unwrap()
+        .provenance
+        .as_ref()
+        .unwrap()
+        .sources[0]
+        .clone();
+    let tail_index = raw
+        .iter()
+        .position(|message| message.content == "UNCOVERED ACCEPTED TAIL")
+        .unwrap();
+    let tail_sources = raw[tail_index].provenance.as_ref().unwrap().sources.clone();
+    raw.insert(tail_index, own_work);
+    for message in &mut raw {
+        let origin = message.provenance.as_mut().unwrap();
+        origin.context_thread = Some(consumer.into());
+        origin.inherited = true;
+    }
+    let allowed = BTreeSet::from([consumer.to_owned(), producer.to_owned()]);
+    let accepted = frozen::capture(&store, &workspace, consumer, &allowed, &raw)
+        .await
+        .unwrap();
+    let old_manifest = store
+        .compaction_frozen_history_page(&workspace, consumer, &accepted.manifest_id, 0)
+        .await
+        .unwrap();
+    let current_turn = "saved-alias-cli-current";
+    materialize_cli_runtime_turn_with_text(
+        &store,
+        &workspace,
+        consumer,
+        current_turn,
+        "PROTECTED CURRENT INPUT",
+    )
+    .await;
+    persist_test_execution_authorization_context_for_principal(
+        &processor,
+        authenticated_test_superuser().as_ref(),
+        &workspace,
+        consumer,
+        current_turn,
+    )
+    .await;
+    let history_json = serde_json::to_string(&accepted).unwrap();
+    let now = chrono::Utc::now().fixed_offset();
+    store
+        .upsert_turn_runtime_snapshot(pioneer_crud::NewTurnRuntimeSnapshot {
+            turn_id: current_turn.into(),
+            thread_id: consumer.into(),
+            workspace_id: workspace.clone(),
+            mode_json: r#""Agent""#.into(),
+            model: "gpt-5".into(),
+            provider_name: "cli_runtime:codex".into(),
+            reasoning_effort: None,
+            agent_skill_versions_json: None,
+            hook_runtime_context_json: "{}".into(),
+            workspace_skill_policies_json: "[]".into(),
+            input_json: serde_json::to_string(&vec![UserInput::Text {
+                text: "PROTECTED CURRENT INPUT".into(),
+                text_elements: vec![],
+            }])
+            .unwrap(),
+            capabilities_json: "[]".into(),
+            resolved_artifacts_json: "[]".into(),
+            runtime_environment_json: "{}".into(),
+            history_json: history_json.clone(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+
+    // Publish only after the raw runtime boundary is immutable. Its coverage
+    // mixes shared H with the producer's own work and uses copy B, not saved A.
+    let mut inputs = vec![];
+    for (thread, reference) in [
+        (producer, copy),
+        (consumer, history_source),
+        (producer, own_source),
+    ] {
+        inputs.push((
+            thread.to_owned(),
+            pioneer_compaction::history::SourceRef {
+                scope: reference.scope,
+                id: reference.id,
+                version: reference.version,
+            },
+        ));
+    }
+    let owner = crate::compaction::native_owner(&workspace, producer);
+    let projection_version = store
+        .compaction_projection_version(&workspace, producer)
+        .await
+        .unwrap();
+    let mut source_epochs = BTreeMap::new();
+    for thread in [consumer, producer] {
+        source_epochs.insert(
+            thread.into(),
+            store
+                .compaction_projection_version(&workspace, thread)
+                .await
+                .unwrap(),
+        );
+    }
+    let selection = ModelSelection {
+        transport: Transport::Api,
+        instance: "openai".into(),
+        model: "test-model".into(),
+        effort: None,
+    };
+    let operation = OperationSnapshot {
+        id: "saved-alias-cli-operation".into(),
+        owner: owner.clone(),
+        expected_checkpoint: None,
+        projection_version,
+        source_epochs,
+        admission: CompactionSettings::default()
+            .admit(&selection, None, 0)
+            .unwrap(),
+        plan: CompactionPlan {
+            mode: CompactionMode::Normal,
+            coverage_domain: CoverageDomain::WorkingContext,
+            compact: vec![0, 1, 2],
+            retain: vec![],
+            coverage: inputs.iter().map(|(_, source)| source.clone()).collect(),
+            fingerprint: "saved-alias-cli-plan".into(),
+        },
+    };
+    store
+        .compaction_admit(&workspace, producer, &operation)
+        .await
+        .unwrap();
+    store
+        .compaction_prepare_runner(&operation.id, &ModelBudget::new(None, None, None), 3, 0)
+        .await
+        .unwrap();
+    store
+        .compaction_append_manifest(
+            &operation.id,
+            &inputs
+                .iter()
+                .enumerate()
+                .map(|(index, (thread, source))| ManifestEntry {
+                    ordinal: index as u64,
+                    unit: index as u64,
+                    reference_only: false,
+                    thread_id: thread.clone(),
+                    source: source.clone(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+    let checkpoint = Checkpoint {
+        id: "saved-alias-cli-checkpoint".into(),
+        operation_id: operation.id,
+        owner: owner.clone(),
+        previous: None,
+        coverage: operation.plan.coverage,
+        summary: "SAVED MIXED WORKING CONTEXT SUMMARY".into(),
+        selection,
+        projection_version,
+        format_version: pioneer_compaction::FORMAT_VERSION,
+    };
+    store
+        .compaction_save_candidate(&checkpoint, 0)
+        .await
+        .unwrap();
+    for (sql, values) in [
+        (
+            "UPDATE compaction_checkpoint SET status='applied' WHERE id=?",
+            vec![checkpoint.id.clone().into()],
+        ),
+        (
+            "UPDATE compaction_context SET head=? WHERE owner=?",
+            vec![checkpoint.id.clone().into(), owner.into()],
+        ),
+    ] {
+        store
+            .database_connection()
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                sql,
+                values,
+            ))
+            .await
+            .unwrap();
+    }
+    let deadline = chrono::Utc::now().timestamp_millis() as u64 + 60_000;
+    let prepared = processor
+        .capture_cli_transfer_projection(&workspace, consumer, current_turn, deadline)
+        .await
+        .unwrap();
+    assert_eq!(
+        prepared.messages.len(),
+        2,
+        "summary plus exactly the uncovered historical tail"
+    );
+    let projected_origin = prepared.messages[0].provenance.as_ref().unwrap();
+    assert_eq!(projected_origin.sources.len(), 1);
+    assert_eq!(projected_origin.sources[0].id, checkpoint.id);
+    assert!(
+        projected_origin.inherited,
+        "mixed WorkingContext must remain inherited"
+    );
+    assert_eq!(prepared.messages[1].content, "UNCOVERED ACCEPTED TAIL");
+    assert_eq!(
+        prepared.messages[1].provenance.as_ref().unwrap().sources,
+        tail_sources
+    );
+    assert!(
+        !prepared
+            .messages
+            .iter()
+            .any(|message| message.content == "ORIGINAL SHARED QUESTION"
+                || message.content == "COVERED SHARED HISTORY"
+                || message.content == "COVERED PRODUCER OWN WORK")
+    );
+    assert!(
+        cli.turn_starts.lock().await.is_empty(),
+        "preparation must precede provider dispatch"
+    );
+    processor
+        .compact_cli_transfer_history(
+            &workspace,
+            consumer,
+            current_turn,
+            "codex",
+            CLIAgentRuntimeKind::Codex,
+            "gpt-5",
+            None,
+            0,
+            deadline,
+            None,
+            prepared,
+            None,
+        )
+        .await
+        .expect("the projected summary and tail fit without another summarizer call");
+    assert_eq!(summary.call_count(), 0);
+    let saved = store
+        .get_turn_runtime_snapshot(current_turn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.history_json, history_json);
+    let saved_input: Vec<UserInput> = serde_json::from_str(&saved.input_json).unwrap();
+    assert!(
+        matches!(&saved_input[..], [UserInput::Text { text, .. }] if text == "PROTECTED CURRENT INPUT")
+    );
+    assert_eq!(
+        store
+            .compaction_frozen_history_page(&workspace, consumer, &accepted.manifest_id, 0)
+            .await
+            .unwrap(),
+        old_manifest
+    );
+    assert_eq!(
+        frozen::restore(&store, &workspace, &allowed, &accepted)
+            .await
+            .unwrap(),
+        raw
+    );
+    assert_eq!(
+        store
+            .compaction_checkpoint(&checkpoint.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .coverage,
+        checkpoint.coverage
+    );
+}
+
+#[test]
 fn accepted_task_cli_transfer_compacts_without_later_parent_history() {
     run_large_history_message_test(
         "accepted Task CLI transfer checkpoint boundary",

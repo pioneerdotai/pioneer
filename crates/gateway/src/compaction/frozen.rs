@@ -1104,7 +1104,13 @@ async fn prepare_accepted_task_basis_prepared(
     if let Some(policy) = policy {
         select_task_history(&mut restored, policy)?;
     }
-    super::history::normalize_task_input_copies(store, workspace, &mut restored).await?;
+    super::history::normalize_task_input_copies_with_resolver(
+        store,
+        workspace,
+        &mut restored,
+        &mut graphs,
+    )
+    .await?;
     // The accepted snapshot belongs to the parent. Persist the same inherited
     // role that NativeHistoryLayout uses in this execution's context. Accepted
     // own imports already have execution_thread as their context owner.
@@ -1966,6 +1972,27 @@ async fn capture_history_line_prepared(
                     continue;
                 }
             }
+            // The complete authorized composition is the first boundary that
+            // can admit a mixed foreign WorkingContext head. Preserve all raw
+            // copies until policy has selected its window.
+            if includes_parent_summary {
+                super::history::prepare_task_input_copy_evidence_with_resolver(
+                    store,
+                    workspace,
+                    &mut messages,
+                    &mut checkpoint_graphs,
+                )
+                .await?;
+                super::checkpoint::project_accepted_working_context_checkpoints_with_resolver(
+                    store,
+                    workspace,
+                    thread,
+                    &allowed,
+                    &mut messages,
+                    &mut checkpoint_graphs,
+                )
+                .await?;
+            }
             order_conversation_history(store, workspace, &mut messages).await?;
             if let Some(policy) = policy {
                 select_task_history(&mut messages, policy)?;
@@ -1973,7 +2000,13 @@ async fn capture_history_line_prepared(
             // Selection defines the available context. Normalize only inside that
             // boundary so an older representation cannot consume the sole selected
             // copy and then be discarded by the policy.
-            super::history::normalize_task_input_copies(&store, workspace, &mut messages).await?;
+            super::history::normalize_task_input_copies_with_resolver(
+                store,
+                workspace,
+                &mut messages,
+                &mut checkpoint_graphs,
+            )
+            .await?;
             if let Some(outputs) = outputs {
                 for message in &messages {
                     let origin = message.provenance.as_ref().ok_or_else(|| {
@@ -4220,13 +4253,15 @@ async fn restore_accepted_execution_basis_prepared(
         if accepted.contains_key(&ordinal) {
             (false, execution_thread.to_owned())
         } else {
+            let context_owner = reference
+                .context_thread
+                .as_deref()
+                .unwrap_or(&reference.source_thread);
+            // Parent-owned raw rows become H in this execution before head
+            // discovery/selection, just as in the final prepared capture.
             (
-                reference.inherited,
-                reference
-                    .context_thread
-                    .as_deref()
-                    .unwrap_or(&reference.source_thread)
-                    .to_owned(),
+                reference.inherited || context_owner != execution_thread,
+                context_owner.to_owned(),
             )
         }
     };
@@ -4245,6 +4280,14 @@ async fn restore_accepted_execution_basis_prepared(
     // the exact historical-membership test below rejects any later work that
     // was not represented by the immutable manifest.
     source_threads.insert(execution_thread.to_owned());
+    // A newly discovered summary must not consume the only selected raw input
+    // when the consumer explicitly excludes summaries. Existing literal refs
+    // are still restored and selected according to the same policy below.
+    if selection_policy
+        .is_some_and(|policy| !policy.include_parent_summary || policy_omits_history(Some(policy)))
+    {
+        source_threads.clear();
+    }
     let mut boundary_claims = pioneer_agent::compaction::composition::ExactInputClaims::default();
     for reference in &references {
         if !reference.source_aliases.is_empty() {
@@ -4411,6 +4454,7 @@ async fn restore_accepted_execution_basis_prepared(
             let mut input_alias_represented = BTreeSet::new();
             let mut leaves_by_ordinal = BTreeMap::new();
             let mut cross_domain_summaries = BTreeSet::new();
+            let mut input_replacements = BTreeMap::new();
             for (ordinal, reference) in references.iter().enumerate() {
                 if omitted.contains(&ordinal) {
                     continue;
@@ -4446,10 +4490,14 @@ async fn restore_accepted_execution_basis_prepared(
                         .coverage_domain
                         == metadata.coverage_domain;
                     // A saved checkpoint can cross domains only when this
-                    // candidate contains that exact published source. An
-                    // accepted OWN import still needs its original grant.
+                    // candidate contains that exact published source. A
+                    // WorkingContext replacement remains inherited; the old
+                    // OWN grant never authorizes a new OWN replacement here.
                     if !same_domain
-                        && (!graph.checkpoints.contains(source) || accepted.contains_key(&ordinal))
+                        && (!graph.checkpoints.contains(source)
+                            || (accepted.contains_key(&ordinal)
+                                && metadata.coverage_domain
+                                    != pioneer_compaction::CoverageDomain::WorkingContext))
                     {
                         continue;
                     }
@@ -4465,6 +4513,23 @@ async fn restore_accepted_execution_basis_prepared(
                     checkpoint_graphs,
                 )
                 .await?;
+                // input:* references are typed user inputs. Use exactly the
+                // materialized predicate over their immutable saved evidence.
+                let mut origin = reference_metadata_provenance(workspace, reference);
+                append_reference_input_evidence(
+                    reference,
+                    &mut origin.source_aliases,
+                    &mut origin.ambiguous_input_aliases,
+                );
+                if let Some((_, replacement)) = super::checkpoint::input_representative_replacement(
+                    workspace,
+                    allowed,
+                    &required,
+                    &origin,
+                    &candidate_claims,
+                ) {
+                    input_replacements.insert(ordinal, replacement);
+                }
                 if same_domain {
                     input_alias_represented.extend(leaves.iter().cloned());
                 } else {
@@ -4474,6 +4539,12 @@ async fn restore_accepted_execution_basis_prepared(
                 leaves_by_ordinal.insert(ordinal, leaves);
             }
             let mut represented_coverage = represented.clone();
+            for replacement in input_replacements.values() {
+                represented_coverage.insert(ScopedHistorySource {
+                    thread: replacement.represented_thread_id.clone(),
+                    source: source(&replacement.represented_source),
+                });
+            }
             for (replay, covered_source) in &graph.replay_aliases {
                 if represented.contains(replay)
                     && (!graph.input_replay_aliases.contains(replay)
@@ -4517,6 +4588,7 @@ async fn restore_accepted_execution_basis_prepared(
                 let covered_leaf = |leaf: &ScopedHistorySource| {
                     covered.contains(&historical_frozen_identity(leaf))
                         || exact_replay_aliases.contains(leaf)
+                        || input_replacements.contains_key(ordinal)
                 };
                 let covered_summary = compatible_summaries.contains(ordinal)
                     && (if cross_domain_summaries.contains(ordinal) {
@@ -5508,6 +5580,19 @@ async fn restore_accepted_execution_basis_prepared(
                 &mut from_reference,
                 &mut ambiguous,
             );
+            // Re-evaluate against the surviving projection after absorption:
+            // its published input leaf can differ from an absorbed candidate's.
+            let mut origin = reference_metadata_provenance(workspace, &references[*ordinal]);
+            origin.source_aliases = from_reference.clone();
+            if let Some((_, replacement)) = super::checkpoint::input_representative_replacement(
+                workspace,
+                allowed,
+                &projection.coverage,
+                &origin,
+                &summary_claims,
+            ) {
+                super::checkpoint::rebase_input_evidence(&mut from_reference, &replacement);
+            }
             replaced_alias_sources.extend(
                 from_reference
                     .iter()
@@ -5756,8 +5841,13 @@ pub(crate) async fn restore_accepted_history_for_execution_with_order(
             &mut checkpoint_graphs,
         )
         .await?;
-        super::history::normalize_task_input_copies(store, workspace, &mut restored.messages)
-            .await?;
+        super::history::normalize_task_input_copies_with_resolver(
+            store,
+            workspace,
+            &mut restored.messages,
+            &mut checkpoint_graphs,
+        )
+        .await?;
         if !preserve_manifest_order {
             order_history_by_creation(store, workspace, &mut restored.messages).await?;
         }
