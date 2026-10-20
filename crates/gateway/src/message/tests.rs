@@ -27635,6 +27635,11 @@ async fn cli_transfer_reuses_late_mixed_checkpoint_from_raw_saved_input_aliases_
         )
         .await;
     }
+    // This fixture needs canonical input identities, rather than the message
+    // mode's event rendering of the same text.
+    store.database_connection().execute_unprepared(
+        "UPDATE turn SET send_mode='agent' WHERE id IN ('saved-alias-original','saved-alias-history','saved-alias-copy','saved-alias-tail')",
+    ).await.unwrap();
     store
         .materialize_item_completed(
             ItemCompletedNotification {
@@ -27665,8 +27670,12 @@ async fn cli_transfer_reuses_late_mixed_checkpoint_from_raw_saved_input_aliases_
             .messages;
     let copy = foreign
         .iter()
-        .find(|message| message.role == pioneer_provider::Role::User)
-        .unwrap()
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin.sources.len() == 1 && origin.sources[0].scope == "input:saved-alias-copy"
+            })
+        })
+        .expect("producer must carry its canonical input")
         .provenance
         .as_ref()
         .unwrap()
@@ -27679,8 +27688,14 @@ async fn cli_transfer_reuses_late_mixed_checkpoint_from_raw_saved_input_aliases_
         .clone();
     let original = raw
         .iter_mut()
-        .find(|message| message.content == "ORIGINAL SHARED QUESTION")
-        .unwrap();
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin.sources.len() == 1 && origin.sources[0].scope == "input:saved-alias-original"
+            })
+        })
+        .expect("consumer must carry its canonical input");
+    assert_eq!(original.role, pioneer_provider::Role::User);
+    assert_eq!(original.content, "ORIGINAL SHARED QUESTION");
     let original_origin = original.provenance.as_mut().unwrap();
     let original_source = original_origin.sources[0].clone();
     assert_ne!(

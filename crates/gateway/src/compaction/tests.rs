@@ -8807,17 +8807,40 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
             .count(),
         1
     );
-    assert!(e_history.iter().all(|message| {
-        message
-            .provenance
-            .as_ref()
-            .unwrap()
-            .sources
-            .iter()
-            .all(|source| {
-                Some(source.id.as_str()) != d_prepared.receipt.identity.checkpoint.as_deref()
+    let inherited_h = e_history
+        .iter()
+        .filter_map(|message| {
+            message.provenance.as_ref().filter(|origin| {
+                origin.sources.iter().any(|source| {
+                    Some(source.id.as_str()) == d_prepared.receipt.identity.checkpoint.as_deref()
+                })
             })
-    }));
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        inherited_h.len(),
+        1,
+        "frozen preparation must already reuse H's compatible checkpoint"
+    );
+    assert!(inherited_h[0].inherited);
+    assert!(
+        e_history.iter().all(|message| {
+            message
+                .provenance
+                .as_ref()
+                .unwrap()
+                .sources
+                .iter()
+                .all(|source| {
+                    !d_checkpoint.coverage.iter().any(|covered| {
+                        covered.scope == source.scope
+                            && covered.id == source.id
+                            && covered.version == source.version
+                    })
+                })
+        }),
+        "the reused checkpoint must not accompany raw covered H"
+    );
     let e_context = NativeContext {
         overflow_recovery: false,
         recovery_deadline_ms: None,
@@ -16313,7 +16336,7 @@ async fn composer_reuses_late_mixed_checkpoint_before_attached_child_policy() {
                 "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('mixed-{suffix}-run','mixed-{suffix}-task','mixed-{suffix}-run',1,1,'running','agent')"
             ),
             format!(
-                "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('mixed-{suffix}-run-turn','mixed-{suffix}-task','mixed-{suffix}-run','mixed-{suffix}','mixed-{suffix}-turn','initial',0,1,'completed',CURRENT_TIMESTAMP)"
+                "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('mixed-{suffix}-run-turn','mixed-{suffix}-task','mixed-{suffix}-run','mixed-{suffix}','mixed-{suffix}-turn','initial',0,1,'in_progress',CURRENT_TIMESTAMP)"
             ),
         ] {
             f.store
@@ -16502,6 +16525,7 @@ async fn composer_reuses_late_mixed_checkpoint_before_attached_child_policy() {
             .any(|source| source.id == "mixed-copy")
     );
     for sql in [
+        "UPDATE task_run_turn SET status='candidate_created' WHERE id='mixed-producer-run-turn'",
         "UPDATE task_run SET status='succeeded' WHERE id='mixed-producer-run'",
         "INSERT INTO task_result_candidate(id,task_id,run_id,task_run_turn_id,thread_id,turn_id,round,status,created_at,updated_at) VALUES ('mixed-candidate','mixed-producer-task','mixed-producer-run','mixed-producer-run-turn','mixed-producer','mixed-producer-turn',0,'accepted',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('mixed-delivery-turn','thread','completed','conversation','system','2022-01-01T00:00:00Z',CURRENT_TIMESTAMP)",
