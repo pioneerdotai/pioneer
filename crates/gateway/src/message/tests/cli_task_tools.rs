@@ -13,40 +13,47 @@ async fn start_task_cli_fixture(
     start_task_cli_fixture_with_task_config(kind, pioneer_tasks::TaskRuntimeConfig::default()).await
 }
 
-async fn start_task_cli_fixture_with_task_config(
+// Keep repeated fixture and invocation state machines off the enclosing test frame.
+// These tests still run on the production Gateway worker stack.
+fn start_task_cli_fixture_with_task_config(
     kind: CLIAgentRuntimeKind,
     task_config: pioneer_tasks::TaskRuntimeConfig,
-) -> (
-    CliRuntimeSkillPreflightHarness,
-    Arc<MessageProcessor>,
-    String,
-) {
-    let mut harness = setup_cli_runtime_skill_preflight_harness(kind, false).await;
-    harness.processor.task_runtime = Arc::new(pioneer_tasks::TaskRuntime::new_with_config(
-        harness.crud_store.clone(),
-        task_config,
-    ));
-    *harness.cli_session.projected_mcp_store.lock().await = Some(harness.crud_store.clone());
-    let thread_id = format!("cli_tasks_{kind:?}").to_lowercase();
-    let turn_id = format!("cli_tasks_turn_{kind:?}").to_lowercase();
-    seed_cli_runtime_skill_preflight_thread(&harness, &thread_id).await;
-    let processor = Arc::new(harness.processor.clone());
-    processor.bind_agent_tool_bridges().await;
-    let request = cli_runtime_turn_start_request_with_capabilities(
-        &generate_test_request_id("cli-tasks", &format!("{kind:?}")),
-        &thread_id,
-        &turn_id,
-        &harness.runtime_id,
-        kind,
-        Vec::new(),
-    );
-    processor
-        .process_request_for_connection(harness.connection_id, &request)
-        .await;
-    wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
-    wait_for_task_cli_activation(&processor, &turn_id).await;
+) -> MessageFuture<
+    'static,
+    (
+        CliRuntimeSkillPreflightHarness,
+        Arc<MessageProcessor>,
+        String,
+    ),
+> {
+    message_future(async move {
+        let mut harness = setup_cli_runtime_skill_preflight_harness(kind, false).await;
+        harness.processor.task_runtime = Arc::new(pioneer_tasks::TaskRuntime::new_with_config(
+            harness.crud_store.clone(),
+            task_config,
+        ));
+        *harness.cli_session.projected_mcp_store.lock().await = Some(harness.crud_store.clone());
+        let thread_id = format!("cli_tasks_{kind:?}").to_lowercase();
+        let turn_id = format!("cli_tasks_turn_{kind:?}").to_lowercase();
+        seed_cli_runtime_skill_preflight_thread(&harness, &thread_id).await;
+        let processor = Arc::new(harness.processor.clone());
+        processor.bind_agent_tool_bridges().await;
+        let request = cli_runtime_turn_start_request_with_capabilities(
+            &generate_test_request_id("cli-tasks", &format!("{kind:?}")),
+            &thread_id,
+            &turn_id,
+            &harness.runtime_id,
+            kind,
+            Vec::new(),
+        );
+        processor
+            .process_request_for_connection(harness.connection_id, &request)
+            .await;
+        wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
+        wait_for_task_cli_activation(&processor, &turn_id).await;
 
-    (harness, processor, turn_id)
+        (harness, processor, turn_id)
+    })
 }
 
 async fn wait_for_task_cli_activation(processor: &MessageProcessor, turn_id: &str) {
@@ -102,38 +109,43 @@ async fn wait_for_task_cli_child(
     .expect("Task run must activate its exact CLI child")
 }
 
-async fn invoke_task(
-    processor: &MessageProcessor,
-    turn_id: &str,
-    call_id: &str,
-    name: &str,
+fn invoke_task<'a>(
+    processor: &'a MessageProcessor,
+    turn_id: &'a str,
+    call_id: &'a str,
+    name: &'a str,
     arguments: JsonValue,
-) -> Result<CanonicalMcpToolResult, crate::turn_mcp::invoker::TurnMcpInvocationError> {
-    let binding = processor
-        .crud_store
-        .get_cli_runtime_turn_binding(turn_id)
-        .await
-        .unwrap()
-        .unwrap();
-    let generation = binding.mcp.as_ref().unwrap().session_generation as u64;
-    processor
-        .mcp_service
-        .turn_mcp_invoker()
-        .invoke(
-            TurnMcpInvocation {
-                workspace_id: binding.workspace_id,
-                thread_id: binding.thread_id,
-                turn_id: turn_id.to_owned(),
-                runtime_id: Some(binding.runtime_id),
-                session_generation: Some(generation),
-                provider_call_id: call_id.to_owned(),
-                canonical_callable_name: name.to_owned(),
-                arguments,
-                origin: TurnMcpInvocationOrigin::CliFacade,
-            },
-            tokio_util::sync::CancellationToken::new(),
-        )
-        .await
+) -> MessageFuture<
+    'a,
+    Result<CanonicalMcpToolResult, crate::turn_mcp::invoker::TurnMcpInvocationError>,
+> {
+    message_future(async move {
+        let binding = processor
+            .crud_store
+            .get_cli_runtime_turn_binding(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let generation = binding.mcp.as_ref().unwrap().session_generation as u64;
+        processor
+            .mcp_service
+            .turn_mcp_invoker()
+            .invoke(
+                TurnMcpInvocation {
+                    workspace_id: binding.workspace_id,
+                    thread_id: binding.thread_id,
+                    turn_id: turn_id.to_owned(),
+                    runtime_id: Some(binding.runtime_id),
+                    session_generation: Some(generation),
+                    provider_call_id: call_id.to_owned(),
+                    canonical_callable_name: name.to_owned(),
+                    arguments,
+                    origin: TurnMcpInvocationOrigin::CliFacade,
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+    })
 }
 
 #[test]
