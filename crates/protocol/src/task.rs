@@ -1934,6 +1934,13 @@ impl TaskEventPayload {
                 task.id, task.revision
             )),
             Self::TaskUpdated { .. } | Self::TaskPaused { .. } | Self::TaskResumed { .. } => None,
+            // Separate runs can finish without advancing the trigger cursor.
+            // Their refresh payloads have different timestamps, so a cursor key
+            // would collide. The atomic terminal batch deduplicates by run id.
+            Self::TaskRescheduled {
+                reason: TaskRescheduleReason::RunTerminalStatusRefresh,
+                ..
+            } => None,
             Self::TaskRescheduled {
                 trigger,
                 reason,

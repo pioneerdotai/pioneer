@@ -295,6 +295,28 @@ async fn saturated_trigger_obeys_catch_up_before_creating_a_bounded_queue() {
             assert_eq!(queued.runs[1].status, TaskRunStatus::Queued);
             assert_eq!(queued.triggers[0].next_fire_at, Some(FIRST + 60));
             handle.complete_run(None, FIRST + 53).await.unwrap();
+            let events_before_replay = runtime
+                .service()
+                .get_task_events(TaskEventsParams {
+                    task_id: created.task.id.clone(),
+                    after_sequence: None,
+                    limit: None,
+                })
+                .await
+                .unwrap()
+                .events;
+            handle.complete_run(None, FIRST + 53).await.unwrap();
+            let events_after_replay = runtime
+                .service()
+                .get_task_events(TaskEventsParams {
+                    task_id: created.task.id.clone(),
+                    after_sequence: None,
+                    limit: None,
+                })
+                .await
+                .unwrap()
+                .events;
+            assert_eq!(events_after_replay, events_before_replay);
             runtime
                 .register_executor(Arc::new(CompletingSystemExecutor))
                 .await;
