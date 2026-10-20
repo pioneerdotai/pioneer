@@ -15452,18 +15452,27 @@ impl CrudStore {
 
     pub async fn append_due_trigger_task_events(
         &self,
-        trigger_id: &str,
-        expected_next_fire_at: i64,
+        trigger: &TaskTrigger,
         now: i64,
         events: Vec<TaskEventPayload>,
         occurrence_contracts: Vec<pioneer_protocol::TaskOccurrenceContract>,
         reserve_executions: Vec<(String, TaskExecutorKind)>,
     ) -> Result<Vec<AppendedTaskEvent>> {
+        if trigger.status != TaskTriggerStatus::Active {
+            return Ok(Vec::new());
+        }
+        let Some(expected_next_fire_at) = trigger.next_fire_at else {
+            return Ok(Vec::new());
+        };
+        // Schedule calculation and observation happen outside the writer.
+        // Revalidate their complete input, including same-time reschedules,
+        // in the existing atomic trigger + occurrence + Run transaction.
+        let expected_snapshot = (trigger.clone(), serde_json::to_string(&trigger.spec)?);
         self.run_serialized_write(|| {
             self.append_due_trigger_task_events_once(
-                trigger_id.to_owned(),
+                trigger.id.clone(),
                 expected_next_fire_at,
-                None,
+                Some(expected_snapshot.clone()),
                 now,
                 events.clone(),
                 occurrence_contracts.clone(),
@@ -15487,10 +15496,7 @@ impl CrudStore {
         let Some(expected_next_fire_at) = trigger.next_fire_at else {
             return Ok(Vec::new());
         };
-        let expected_snapshot = (
-            trigger.task_id.clone(),
-            serde_json::to_string(&trigger.spec)?,
-        );
+        let expected_snapshot = (trigger.clone(), serde_json::to_string(&trigger.spec)?);
         let events = vec![TaskEventPayload::TaskBlocked {
             task_id: trigger.task_id.clone(),
             error: Some(error),
@@ -32463,7 +32469,7 @@ impl CrudStore {
         &self,
         trigger_id: String,
         expected_next_fire_at: i64,
-        expected_snapshot: Option<(String, String)>,
+        expected_snapshot: Option<(TaskTrigger, String)>,
         now: i64,
         events: Vec<TaskEventPayload>,
         occurrence_contracts: Vec<pioneer_protocol::TaskOccurrenceContract>,
@@ -32495,8 +32501,13 @@ impl CrudStore {
                 || expected_next_fire_at > now
                 || expected_snapshot
                     .as_ref()
-                    .is_some_and(|(task_id, spec_json)| {
-                        &trigger.task_id != task_id || &trigger.spec_json != spec_json
+                    .is_some_and(|(expected, spec_json)| {
+                        trigger.task_id != expected.task_id
+                            || &trigger.spec_json != spec_json
+                            || trigger.last_fire_at.map(|value| value.timestamp())
+                                != expected.last_fire_at
+                            || trigger.created_at.timestamp() != expected.created_at
+                            || trigger.updated_at.timestamp() != expected.updated_at
                     })
             {
                 return Ok(Vec::new());
