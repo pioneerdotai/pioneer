@@ -36146,7 +36146,12 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         "review-disabled Phase 3 must not expose review/approval tools"
     );
 
-    let chat_provider = Arc::new(SequencedToolProvider::new(Vec::new(), "done"));
+    // Start at the text response; Chat has no initial tool round to execute.
+    // Keep tool_calling enabled so the assertions exercise the mode's policy.
+    let chat_provider = Arc::new(SequencedToolProvider {
+        next_index: AtomicUsize::new(1),
+        ..SequencedToolProvider::new(Vec::new(), "done")
+    });
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "parent",
         chat_provider.clone(),
@@ -36181,6 +36186,11 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
     .await;
     let _ = recv_notification_by_method(&mut rx_chat, events::TURN_COMPLETED).await;
     let chat_requests = chat_provider.snapshot_requests();
+    assert_eq!(
+        chat_requests.len(),
+        1,
+        "Chat should finish with its text response"
+    );
     let first_chat_request = chat_requests
         .first()
         .expect("chat request should be captured");
