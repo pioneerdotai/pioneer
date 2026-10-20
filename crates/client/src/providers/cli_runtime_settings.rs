@@ -885,6 +885,7 @@ mod tests {
             [
                 CLIAgentRuntimeKind::Codex,
                 CLIAgentRuntimeKind::Claude,
+                CLIAgentRuntimeKind::Acp,
                 CLIAgentRuntimeKind::OpenCode,
             ]
         );
