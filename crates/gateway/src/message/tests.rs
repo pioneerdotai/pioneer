@@ -728,6 +728,7 @@ struct RecordingCliRuntimeSession {
     mcp_terminals: TokioMutex<Vec<String>>,
     goal_resets: TokioMutex<Vec<String>>,
     fail_next_goal_reset: TokioMutex<bool>,
+    fail_next_resume: TokioMutex<bool>,
     goal_clears: TokioMutex<Vec<String>>,
     closes: AtomicUsize,
     factory_starts: AtomicUsize,
@@ -887,6 +888,9 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         params: CLIAgentRuntimeThreadOpenParams,
         _timeout: Duration,
     ) -> anyhow::Result<CLIAgentRuntimeThreadOpenSnapshot> {
+        if std::mem::take(&mut *self.fail_next_resume.lock().await) {
+            anyhow::bail!("injected failure before recovery provider start");
+        }
         self.thread_resumes
             .lock()
             .await

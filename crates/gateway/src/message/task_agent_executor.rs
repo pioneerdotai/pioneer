@@ -6087,9 +6087,12 @@ impl TaskAgentExecutor {
             &candidate,
             &reviewer_runtime.task_run_turn,
         );
-        let advisory =
-            extract_reviewer_advisory(processor, reviewer_runtime.task_run_turn.turn_id.as_str())
-                .await?;
+        let advisory = extract_reviewer_advisory(
+            processor,
+            &task_response.task.workspace_id,
+            &reviewer_runtime.task_run_turn,
+        )
+        .await?;
         let action_decision = match advisory.decision {
             TaskResultReviewDecision::Accept => pioneer_protocol::AgentReviewDecision::Accept,
             TaskResultReviewDecision::Reject => pioneer_protocol::AgentReviewDecision::Reject,
@@ -10027,16 +10030,21 @@ struct ReviewerAdvisory {
 
 async fn extract_reviewer_advisory(
     processor: &Arc<MessageProcessor>,
-    turn_id: &str,
+    workspace_id: &str,
+    task_run_turn: &TaskRunTurn,
 ) -> Result<ReviewerAdvisory> {
-    let messages = processor
+    let final_text = processor
         .crud_store
-        .list_completed_agent_messages(turn_id)
-        .await?;
-    let final_text = messages.into_iter().rev().find_map(|item| match item {
-        TurnItem::AgentMessage { text, .. } => Some(text),
-        _ => None,
-    });
+        .completed_turn_final_answer(
+            workspace_id,
+            &task_run_turn.thread_id,
+            &task_run_turn.turn_id,
+        )
+        .await?
+        .and_then(|item| match item {
+            TurnItem::AgentMessage { text, .. } => Some(text),
+            _ => None,
+        });
     Ok(match final_text {
         Some(text) => parse_reviewer_advisory_text(text.as_str()),
         None => ReviewerAdvisory {
@@ -10452,14 +10460,18 @@ impl TaskAgentResultExtractor {
         let contract = select_agent_spec(&task_response, task_run_turn.run_id.as_str())
             .and_then(|spec| spec.result_contract);
 
-        let messages = processor
+        let final_message = processor
             .crud_store
-            .list_completed_agent_messages(task_run_turn.turn_id.as_str())
-            .await?;
-        let final_message = messages.into_iter().rev().find_map(|item| match item {
-            TurnItem::AgentMessage { id, text, .. } => Some((id, text)),
-            _ => None,
-        });
+            .completed_turn_final_answer(
+                &task_response.task.workspace_id,
+                &task_run_turn.thread_id,
+                &task_run_turn.turn_id,
+            )
+            .await?
+            .and_then(|item| match item {
+                TurnItem::AgentMessage { id, text, .. } => Some((id, text)),
+                _ => None,
+            });
         let Some((source_item_id, raw_text)) = final_message else {
             return Ok(Err(task_error(
                 "task_agent_result_missing",
