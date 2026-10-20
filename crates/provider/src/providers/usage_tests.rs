@@ -217,6 +217,12 @@ async fn audio_chat_missing_usage_stays_unknown_and_missing_finish_is_error() {
         ("data: [DONE]\n\n", false),
     ] {
         let (url, server) = fixture(body.to_owned()).await;
+        // Route facts do not imply measured token counts.
+        let expected_usage = TokenUsage {
+            api: Some("chat_completions".into()),
+            route: crate::usage::route(&url, "/chat/completions"),
+            ..Default::default()
+        };
         let provider = OpenAiProvider::with_base_url("fixture-key", url);
         let chunks: Vec<_> = crate::attachments::runtime::with_async_authority_scope(
             "usage-fixture-authority".into(),
@@ -227,9 +233,17 @@ async fn audio_chat_missing_usage_stays_unknown_and_missing_finish_is_error() {
         .collect()
         .await;
         assert_eq!(chunks.iter().all(Result::is_ok), succeeds);
+        let mut usage_snapshots = 0;
+        let mut terminal_chunks = 0;
         for chunk in chunks.into_iter().flatten() {
-            assert!(chunk.usage.is_none());
+            terminal_chunks += usize::from(chunk.is_final);
+            if let Some(usage) = chunk.usage {
+                usage_snapshots += 1;
+                assert_eq!(usage, expected_usage);
+            }
         }
+        assert_eq!(usage_snapshots, usize::from(succeeds));
+        assert_eq!(terminal_chunks, usize::from(succeeds));
         server.await.unwrap();
     }
 }

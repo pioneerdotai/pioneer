@@ -476,86 +476,92 @@ async fn generic_root_auth_profiles_and_openai_facade_dispatch_real_http() {
 
 #[tokio::test]
 async fn compiled_prompt_tool_controls_and_responses_generation_policy() {
-    let provider = ResponsesApiCompatibleProvider::new(
-        "openai",
-        "https://synthetic.invalid/prefix",
-        "fixture",
-        AuthStyle::Bearer,
-    );
-    for choice in [
-        ToolChoice::Auto,
-        ToolChoice::None,
-        ToolChoice::Required,
-        ToolChoice::Tool {
-            name: "lookup".into(),
-        },
-    ] {
-        let mut req = request();
-        req.tool_choice = Some(choice.clone());
-        req.compiled_prompt = Some(crate::CompiledPromptPayload {
-            stable_system_text: "compiled".into(),
-            dynamic_system_text: String::new(),
-            boundary_marker: String::new(),
-            full_system_text: "compiled".into(),
-        });
-        req.messages
-            .insert(0, ChatMessage::system("must not duplicate"));
-        let prepared = provider
-            .prepare(req, &provider.capabilities())
-            .await
-            .unwrap();
-        let body = provider.render(&prepared, true).unwrap();
-        assert_eq!(body["instructions"], "compiled");
-        assert!(!body["input"].to_string().contains("must not duplicate"));
-        assert_eq!(body["max_output_tokens"], 100);
-        assert_eq!(body["parallel_tool_calls"], json!(false));
-        assert!(body["tools"][0]["parameters"].get("required").is_none());
-        match choice {
-            ToolChoice::Auto => assert_eq!(body["tool_choice"], "auto"),
-            ToolChoice::None => assert_eq!(body["tool_choice"], "none"),
-            ToolChoice::Required => assert_eq!(body["tool_choice"], "required"),
-            ToolChoice::Tool { name } => {
-                assert_eq!(body["tool_choice"], json!({"type":"function","name":name}))
+    crate::attachments::runtime::with_async_authority_scope(
+        "responses-generation-fixture".into(),
+        async {
+            let provider = ResponsesApiCompatibleProvider::new(
+                "openai",
+                "https://synthetic.invalid/prefix",
+                "fixture",
+                AuthStyle::Bearer,
+            );
+            for choice in [
+                ToolChoice::Auto,
+                ToolChoice::None,
+                ToolChoice::Required,
+                ToolChoice::Tool {
+                    name: "lookup".into(),
+                },
+            ] {
+                let mut req = request();
+                req.tool_choice = Some(choice.clone());
+                req.compiled_prompt = Some(crate::CompiledPromptPayload {
+                    stable_system_text: "compiled".into(),
+                    dynamic_system_text: String::new(),
+                    boundary_marker: String::new(),
+                    full_system_text: "compiled".into(),
+                });
+                req.messages
+                    .insert(0, ChatMessage::system("must not duplicate"));
+                let prepared = provider
+                    .prepare(req, &provider.capabilities())
+                    .await
+                    .unwrap();
+                let body = provider.render(&prepared, true).unwrap();
+                assert_eq!(body["instructions"], "compiled");
+                assert!(!body["input"].to_string().contains("must not duplicate"));
+                assert_eq!(body["max_output_tokens"], 100);
+                assert_eq!(body["parallel_tool_calls"], json!(false));
+                assert!(body["tools"][0]["parameters"].get("required").is_none());
+                match choice {
+                    ToolChoice::Auto => assert_eq!(body["tool_choice"], "auto"),
+                    ToolChoice::None => assert_eq!(body["tool_choice"], "none"),
+                    ToolChoice::Required => assert_eq!(body["tool_choice"], "required"),
+                    ToolChoice::Tool { name } => {
+                        assert_eq!(body["tool_choice"], json!({"type":"function","name":name}))
+                    }
+                }
             }
-        }
-    }
-    let mut req = request();
-    req.temperature = Some(0.7);
-    assert!(
-        provider
-            .prepare(req.clone(), &provider.capabilities())
-            .await
-            .is_err()
-    );
-    req.temperature = None;
-    req.reasoning = Some(crate::ReasoningConfig::Disabled);
-    assert!(
-        provider
-            .prepare(req.clone(), &provider.capabilities())
-            .await
-            .is_err()
-    );
-    req.reasoning = Some(crate::ReasoningConfig::Effort(crate::ReasoningEffort::Max));
-    let prepared = provider
-        .prepare(req.clone(), &provider.capabilities())
-        .await
-        .unwrap();
-    assert_eq!(
-        provider.render(&prepared, false).unwrap()["reasoning"]["effort"],
-        "max"
-    );
-    assert!(crate::generation::chat_fields("azure-openai", &req).is_err());
-    assert!(crate::tools::policy::prepare_request("azure-openai", req).is_err());
-    let mut req = request();
-    req.tool_choice = Some(ToolChoice::Tool {
-        name: "missing".into(),
-    });
-    assert!(
-        provider
-            .prepare(req, &provider.capabilities())
-            .await
-            .is_err()
-    );
+            let mut req = request();
+            req.temperature = Some(0.7);
+            assert!(
+                provider
+                    .prepare(req.clone(), &provider.capabilities())
+                    .await
+                    .is_err()
+            );
+            req.temperature = None;
+            req.reasoning = Some(crate::ReasoningConfig::Disabled);
+            assert!(
+                provider
+                    .prepare(req.clone(), &provider.capabilities())
+                    .await
+                    .is_err()
+            );
+            req.reasoning = Some(crate::ReasoningConfig::Effort(crate::ReasoningEffort::Max));
+            let prepared = provider
+                .prepare(req.clone(), &provider.capabilities())
+                .await
+                .unwrap();
+            assert_eq!(
+                provider.render(&prepared, false).unwrap()["reasoning"]["effort"],
+                "max"
+            );
+            assert!(crate::generation::chat_fields("azure-openai", &req).is_err());
+            assert!(crate::tools::policy::prepare_request("azure-openai", req).is_err());
+            let mut req = request();
+            req.tool_choice = Some(ToolChoice::Tool {
+                name: "missing".into(),
+            });
+            assert!(
+                provider
+                    .prepare(req, &provider.capabilities())
+                    .await
+                    .is_err()
+            );
+        },
+    )
+    .await;
 }
 #[tokio::test]
 async fn tool_media_and_pdf_use_the_owned_prepared_positions_and_no_second_preparation() {
