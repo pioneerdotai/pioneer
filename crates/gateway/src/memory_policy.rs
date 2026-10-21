@@ -66,6 +66,8 @@ impl GatewayMemoryTurnPolicyProvider {
             .await
             .map_err(|error| format!("memory policy classifier request failed: {error:#}"))?;
 
+        pioneer_provider::ProviderMessageCollector::validate_response(&response)
+            .map_err(|_| "invalid memory policy provider messages".to_owned())?;
         parse_memory_turn_policy_response(response.text.as_str())
     }
 
@@ -345,6 +347,7 @@ mod tests {
             async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
                 *self.request.lock().expect("request lock poisoned") = Some(request);
                 Ok(ChatResponse {
+                    messages: Vec::new(),
                     text: "{}".to_owned(),
                     usage: None,
                     reasoning_content: None,
@@ -425,6 +428,7 @@ mod tests {
             async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
                 *self.request.lock().expect("request lock poisoned") = Some(request);
                 Ok(ChatResponse {
+                    messages: Vec::new(),
                     text: r#"{
                         "intent": "normal",
                         "recall": "allow",

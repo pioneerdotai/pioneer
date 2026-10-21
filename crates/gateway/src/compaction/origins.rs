@@ -133,20 +133,18 @@ pub(super) async fn resolve_message_origin_locators(
                     pioneer_provider::CanonicalProviderRoundEnvelope,
                 >(&payload)
                 {
-                    if envelope.calls.is_empty() {
-                        let evidence = super::final_response_aliases(
-                            store,
-                            workspace,
-                            &origin.thread_id,
-                            turn,
-                            &reference,
-                            &envelope.round_id,
-                            Some(&source.id),
-                        )
-                        .await?;
-                        origin.source_aliases.extend(evidence.aliases);
-                        origin.complete &= evidence.ready;
-                    }
+                    let evidence = super::provider_round_aliases(
+                        store,
+                        workspace,
+                        &origin.thread_id,
+                        turn,
+                        &reference,
+                        &envelope,
+                        Some(&source.id),
+                    )
+                    .await?;
+                    origin.source_aliases.extend(evidence.aliases);
+                    origin.complete &= evidence.ready;
                 }
             }
             resolved.push(MessageSourceRef {

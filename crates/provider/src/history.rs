@@ -8,6 +8,13 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+/// Private preparation choice; service names do not identify a compatible wire API.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectionProfile {
+    ServiceDefault,
+    Responses,
+}
+
 type UnitKey = (String, String, String, String);
 
 #[derive(Default)]
@@ -179,6 +186,18 @@ fn portable_reasoning(state: &ProviderReplayState) -> Option<String> {
 }
 
 fn remove_provider_state(message: &mut ChatMessage) {
+    if let Some((text, reasoning)) = message
+        .provider_replay_state
+        .as_ref()
+        .and_then(crate::providers::responses_api_compatible::replay::portable)
+    {
+        message.content = text;
+        if !reasoning.is_empty() {
+            message.reasoning_content = Some(reasoning);
+        }
+        message.provider_replay_state = None;
+        return;
+    }
     let common = message
         .reasoning_content
         .as_deref()
@@ -348,6 +367,24 @@ pub(crate) fn project_messages(
     thinking_override: Option<bool>,
     messages: &[ChatMessage],
 ) -> Result<Vec<ChatMessage>> {
+    project_messages_matching(
+        provider,
+        model,
+        thinking_override,
+        messages,
+        ProjectionProfile::ServiceDefault,
+        |state| state.is_compatible_with(provider, model),
+    )
+}
+
+pub(crate) fn project_messages_matching(
+    provider: &str,
+    model: &str,
+    thinking_override: Option<bool>,
+    messages: &[ChatMessage],
+    profile: ProjectionProfile,
+    compatible: impl Fn(&ProviderReplayState) -> bool,
+) -> Result<Vec<ChatMessage>> {
     let completed = completed_message_indexes(messages);
     let mut projected = messages
         .iter()
@@ -355,7 +392,7 @@ pub(crate) fn project_messages(
         .map(|(index, message)| -> Result<_> {
             let mut projected = message.clone();
             if let Some(state) = projected.provider_replay_state.as_ref()
-                && !state.is_compatible_with(provider, model)
+                && !compatible(state)
             {
                 if !completed.contains(&index) {
                     return Err(anyhow!(IncompatibleProviderReplayContinuation {
@@ -367,7 +404,8 @@ pub(crate) fn project_messages(
                 }
                 remove_provider_state(&mut projected);
             }
-            if completed.contains(&index)
+            if profile == ProjectionProfile::ServiceDefault
+                && completed.contains(&index)
                 && !target_serializes_common_reasoning(provider)
                 && projected
                     .reasoning_content
@@ -387,7 +425,8 @@ pub(crate) fn project_messages(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let deepseek_thinking = provider == "deepseek"
+    let deepseek_thinking = profile == ProjectionProfile::ServiceDefault
+        && provider == "deepseek"
         && thinking_override
             .unwrap_or_else(|| deepseek_thinking_required(model, false, &projected));
     if !deepseek_thinking {
@@ -1015,6 +1054,7 @@ mod tests {
     #[test]
     fn compaction_payload_keeps_envelope_identity_and_reasoning_without_opaque_state() {
         let envelope = CanonicalProviderRoundEnvelope {
+            ui_copies: None,
             version: 1,
             round_id: "round".into(),
             termination: crate::ProviderTermination::ToolCalls,

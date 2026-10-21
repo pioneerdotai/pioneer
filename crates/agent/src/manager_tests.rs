@@ -1728,6 +1728,7 @@ fn is_turn_preflight_request(request: &ChatRequest) -> bool {
 
 fn test_preflight_response() -> ChatResponse {
     ChatResponse {
+        messages: Vec::new(),
         text: TEST_PREFLIGHT_RESPONSE.to_owned(),
         usage: None,
         reasoning_content: None,
@@ -3062,6 +3063,7 @@ impl Provider for CaptureStandardProvider {
             return Ok(test_preflight_response());
         }
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: "done".to_owned(),
             usage: None,
             reasoning_content: None,
@@ -3109,6 +3111,7 @@ impl Provider for SequencedToolProvider {
             .push(request);
         if preflight {
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: self.preflight_response_text.clone(),
                 usage: None,
                 reasoning_content: None,
@@ -3124,6 +3127,7 @@ impl Provider for SequencedToolProvider {
                 sleep(self.first_response_delay).await;
             }
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
@@ -3138,6 +3142,7 @@ impl Provider for SequencedToolProvider {
         }
 
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: self.second_text.clone(),
             usage: None,
             reasoning_content: None,
@@ -3186,6 +3191,7 @@ impl Provider for LoopBudgetProvider {
             .push(request);
         if preflight {
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: self.preflight_response_text.clone(),
                 usage: None,
                 reasoning_content: None,
@@ -3231,6 +3237,7 @@ impl Provider for LoopBudgetProvider {
         };
 
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: if tool_calls.is_empty() {
                 if matches!(
                     self.mode,
@@ -3298,6 +3305,7 @@ impl Provider for AlwaysTaskCreateProvider {
 
         let round_index = self.next_index.fetch_add(1, Ordering::SeqCst);
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: String::new(),
             usage: None,
             reasoning_content: None,
@@ -3359,6 +3367,7 @@ impl Provider for ProviderRecoveryBoundaryProvider {
         match self.next_index.fetch_add(1, Ordering::SeqCst) {
             0 => Err(anyhow::anyhow!("initial provider failure 500")),
             1 => Ok(ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
@@ -3424,6 +3433,7 @@ impl Provider for CaptureAgentProvider {
             .push(request);
         if preflight {
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: self.preflight_response_text.clone(),
                 usage: None,
                 reasoning_content: None,
@@ -3433,6 +3443,7 @@ impl Provider for CaptureAgentProvider {
             });
         }
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: self.response_text.clone(),
             usage: None,
             reasoning_content: None,
@@ -3525,6 +3536,7 @@ impl Provider for ReviewGuardProvider {
             .unwrap_or_else(|| ReviewGuardProviderStep::text("done"));
         let response = match step {
             ReviewGuardProviderStep::Text(text) => ChatResponse {
+                messages: Vec::new(),
                 text,
                 usage: None,
                 reasoning_content: None,
@@ -3533,6 +3545,7 @@ impl Provider for ReviewGuardProvider {
                 termination: pioneer_provider::ProviderTermination::Complete,
             },
             ReviewGuardProviderStep::Tool { name, arguments } => ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
@@ -3597,6 +3610,7 @@ impl Provider for EmptyNoToolRoundProvider {
             && let Some(first_tool_call) = self.first_tool_call.clone()
         {
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
@@ -3609,6 +3623,7 @@ impl Provider for EmptyNoToolRoundProvider {
         let empty_index = index.saturating_sub(usize::from(self.first_tool_call.is_some()));
         if empty_index < self.empty_rounds_before_final {
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
@@ -3619,6 +3634,7 @@ impl Provider for EmptyNoToolRoundProvider {
         }
 
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: "done after empty response recovery".to_owned(),
             usage: None,
             reasoning_content: None,
@@ -3676,6 +3692,7 @@ impl Provider for SequencedTextProvider {
             .cloned()
             .unwrap_or_else(|| "done".to_owned());
         Ok(ChatResponse {
+            messages: Vec::new(),
             text,
             usage: None,
             reasoning_content: None,
@@ -16448,4 +16465,139 @@ async fn cancellation_context_freezes_interrupted_policy_request_handlers_and_cl
         receiver.acknowledge_last(Ok(()));
         manager.remove_thread(thread).await;
     }
+}
+
+#[tokio::test]
+async fn phased_rejected_final_keeps_native_candidate_and_commentary_before_retry() {
+    struct PhasedSequence {
+        inner: SequencedTextProvider,
+    }
+    #[async_trait::async_trait]
+    impl Provider for PhasedSequence {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.inner.capabilities()
+        }
+        async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+            let preflight = is_turn_preflight_request(&request);
+            let model = request.model.clone();
+            let mut response = self.inner.chat(request).await?;
+            if !preflight {
+                response.messages = vec![
+                    pioneer_provider::ProviderMessage {
+                        id: pioneer_provider::ProviderMessageId(0),
+                        phase: Some(pioneer_protocol::AgentMessagePhase::Commentary),
+                        text: format!("progress for {}", response.text),
+                    },
+                    pioneer_provider::ProviderMessage {
+                        id: pioneer_provider::ProviderMessageId(1),
+                        phase: Some(pioneer_protocol::AgentMessagePhase::FinalAnswer),
+                        text: response.text.clone(),
+                    },
+                ];
+                response.provider_replay_state = Some(
+                    pioneer_provider::ProviderReplayState::for_model(
+                        self.name(),
+                        model,
+                        json!({"schema_version":1,"assistant_message":{"content":response.text,"reasoning_content":null,"tool_calls":[]}}),
+                    ),
+                );
+            }
+            Ok(response)
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            anyhow::bail!("non-stream fixture")
+        }
+    }
+    let provider = Arc::new(PhasedSequence {
+        inner: SequencedTextProvider::new(vec!["premature final answer", "accepted final answer"]),
+    });
+    let finalization = Arc::new(RetryOnceFinalizationProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "sequenced-text",
+        provider.clone(),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_turn_finalization_provider(Some(finalization.clone()))
+        .await;
+    let observed = start_simple_turn(
+        &manager,
+        "phased_retry_thread",
+        "workspace",
+        "phased_retry_turn",
+        ThreadMode::Agent,
+        "sequenced-text",
+        "finish with artifact",
+    )
+    .await;
+    assert_turn_completed(&observed);
+    let items = observed
+        .iter()
+        .filter_map(|event| {
+            if let AgentEvent::ItemCompleted(notification) = event {
+                Some(&notification.item)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let finals = items
+        .iter()
+        .filter_map(|item| {
+            if let TurnItem::AgentMessage {
+                text,
+                phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                ..
+            } = item
+            {
+                Some(text.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(finals, vec!["accepted final answer"]);
+    let commentary = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                TurnItem::AgentMessage {
+                    phase: pioneer_protocol::AgentMessagePhase::Commentary,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(commentary, 2);
+    assert_eq!(
+        finalization.snapshot_contexts()[0].final_text,
+        "premature final answer"
+    );
+    let requests = provider.inner.snapshot_requests();
+    assert_eq!(requests.len(), 2);
+    let native = requests[1]
+        .messages
+        .iter()
+        .filter(|m| m.provider_replay_state.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        native.len(),
+        1,
+        "rejected candidate must survive before next dispatch"
+    );
+    assert!(
+        native[0]
+            .content
+            .contains("progress for premature final answer")
+    );
+    assert!(native[0].provenance.is_some());
+    assert!(requests[1].temperature.is_none());
 }

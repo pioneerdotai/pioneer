@@ -42,7 +42,7 @@ pub enum AuthStyle {
 /// Configurable with name, base URL, credential, auth style, and various
 /// capability flags. Used as the backbone for 40+ providers that share the
 /// same wire format but differ in endpoint and authentication.
-pub struct OpenAiCompatibleProvider {
+pub struct ChatCompletionsApiCompatibleProvider {
     name: String,
     base_url: String,
     credential: String,
@@ -373,7 +373,7 @@ fn strip_think_tags(text: &str) -> String {
 
 // ── Builder-style construction ──────────────────────────────────────────────
 
-impl OpenAiCompatibleProvider {
+impl ChatCompletionsApiCompatibleProvider {
     /// Create a new provider with the required fields.
     pub fn new(
         name: impl Into<String>,
@@ -1005,7 +1005,7 @@ impl OpenAiCompatibleProvider {
     ) -> Result<ApiChatRequest> {
         let request = crate::tools::policy::prepare_request(self.name.as_str(), request)?;
         let capabilities =
-            <OpenAiCompatibleProvider as crate::traits::Provider>::capabilities(self);
+            <ChatCompletionsApiCompatibleProvider as crate::traits::Provider>::capabilities(self);
         let prepared = prepare_messages_for_request_async(
             self.name.as_str(),
             &capabilities,
@@ -1028,7 +1028,7 @@ impl OpenAiCompatibleProvider {
     fn build_chat_request(&self, request: ChatRequest, stream: bool) -> Result<ApiChatRequest> {
         let request = crate::tools::policy::prepare_request(self.name.as_str(), request)?;
         let capabilities =
-            <OpenAiCompatibleProvider as crate::traits::Provider>::capabilities(self);
+            <ChatCompletionsApiCompatibleProvider as crate::traits::Provider>::capabilities(self);
         let prepared = prepare_messages_for_request(
             self.name.as_str(),
             &capabilities,
@@ -1136,7 +1136,7 @@ fn finish_compatible_stream(
     let mut chunks = Vec::new();
     if replay_reasoning_content && (provider_name == "deepseek" || !tool_calls.is_empty()) {
         chunks.push(StreamChunk::provider_replay_state(
-            OpenAiCompatibleProvider::assistant_replay_state(
+            ChatCompletionsApiCompatibleProvider::assistant_replay_state(
                 provider_name,
                 content,
                 reasoning_content,
@@ -1154,7 +1154,7 @@ fn finish_compatible_stream(
 // ── Provider trait implementation ───────────────────────────────────────────
 
 // The same decoder is used by HTTP transport and in-memory regression fixtures.
-impl OpenAiCompatibleProvider {
+impl ChatCompletionsApiCompatibleProvider {
     pub(super) fn decode_stream(
         byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
         provider_name: String,
@@ -1357,7 +1357,7 @@ impl OpenAiCompatibleProvider {
 }
 
 #[async_trait]
-impl crate::traits::Provider for OpenAiCompatibleProvider {
+impl crate::traits::Provider for ChatCompletionsApiCompatibleProvider {
     fn usage_api(&self) -> &'static str {
         "chat_completions"
     }
@@ -1455,6 +1455,7 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
         });
 
         Ok(ChatResponse {
+            messages: Vec::new(),
             text,
             usage,
             termination,
@@ -1559,7 +1560,7 @@ mod tests {
                 "deepseek-ai/deepseek-v4-flash-0731",
                 serde_json::json!({"reasoning":true,"api":"openai-completions","compat":{"thinkingFormat":format,"supportsReasoningEffort":false},"thinkingLevelMap":{"high":"high","max":"max"}}),
             );
-            let provider = OpenAiCompatibleProvider::new(
+            let provider = ChatCompletionsApiCompatibleProvider::new(
                 "nvidia",
                 "https://example.test/v1",
                 "",
@@ -1604,7 +1605,7 @@ mod tests {
                         .contains(&effort.into())
                 );
             }
-            let provider = OpenAiCompatibleProvider::new(
+            let provider = ChatCompletionsApiCompatibleProvider::new(
                 "nvidia",
                 "https://example.test/v1",
                 "",
@@ -1651,7 +1652,7 @@ mod tests {
     #[test]
     fn native_deepseek_source_profiles_preserve_caps_and_selected_controls() {
         let catalog = crate::generation::test_catalog(true);
-        let provider = OpenAiCompatibleProvider::new(
+        let provider = ChatCompletionsApiCompatibleProvider::new(
             "deepseek",
             "https://example.test/v1",
             "",
@@ -1713,7 +1714,7 @@ mod tests {
         ))
         .unwrap();
         for profile in profiles.as_array().unwrap() {
-            let provider = OpenAiCompatibleProvider::new(
+            let provider = ChatCompletionsApiCompatibleProvider::new(
                 profile["provider"].as_str().unwrap(),
                 "https://example.test/v1",
                 "",
@@ -1781,7 +1782,7 @@ mod tests {
             &serde_json::to_string(&generated.provenance).unwrap(),
         )
         .unwrap();
-        let provider = OpenAiCompatibleProvider::new(
+        let provider = ChatCompletionsApiCompatibleProvider::new(
             "siliconflow",
             "https://example.test/v1",
             "",
@@ -1857,7 +1858,7 @@ mod tests {
             &serde_json::to_string(&generated.provenance).unwrap(),
         )
         .unwrap();
-        let provider = OpenAiCompatibleProvider::new(
+        let provider = ChatCompletionsApiCompatibleProvider::new(
             "deepinfra",
             "https://example.test/v1",
             "",
@@ -1991,7 +1992,7 @@ mod tests {
                 serde_json::json!({"reasoning":{"enabled":true},"reasoning_effort":"high"}),
             ),
         ] {
-            let provider = OpenAiCompatibleProvider::new(
+            let provider = ChatCompletionsApiCompatibleProvider::new(
                 name,
                 "https://example.test/v1",
                 "",
@@ -2026,7 +2027,7 @@ mod tests {
                     .is_err()
             );
         }
-        let provider = OpenAiCompatibleProvider::new(
+        let provider = ChatCompletionsApiCompatibleProvider::new(
             "together",
             "https://example.test/v1",
             "",
@@ -2076,7 +2077,7 @@ mod tests {
                 serde_json::json!({"reasoning_effort":"high"}),
             ),
         ] {
-            let provider = OpenAiCompatibleProvider::new(
+            let provider = ChatCompletionsApiCompatibleProvider::new(
                 name,
                 "https://example.test/v1",
                 "",
@@ -2111,7 +2112,9 @@ mod tests {
             "deepseek-reasoner",
             serde_json::json!({"schema_version":1,"assistant_message":{"content":"answer","reasoning_content":"readable","tool_calls":[],"signature":"unknown opaque"}}),
         );
-        assert!(OpenAiCompatibleProvider::decode_replay_state(&state, "deepseek").is_err());
+        assert!(
+            ChatCompletionsApiCompatibleProvider::decode_replay_state(&state, "deepseek").is_err()
+        );
         assert_eq!(
             state.payload["assistant_message"]["signature"],
             "unknown opaque"
@@ -2183,7 +2186,7 @@ mod tests {
     }
 
     fn prepared_for(
-        provider: &OpenAiCompatibleProvider,
+        provider: &ChatCompletionsApiCompatibleProvider,
         messages: &[ChatMessage],
     ) -> crate::attachments::PreparedProviderMessages {
         prepare_messages_for_provider(provider.name(), &provider.capabilities(), messages).unwrap()
@@ -2196,8 +2199,8 @@ mod tests {
         }
     }
 
-    fn test_provider() -> OpenAiCompatibleProvider {
-        OpenAiCompatibleProvider::new(
+    fn test_provider() -> ChatCompletionsApiCompatibleProvider {
+        ChatCompletionsApiCompatibleProvider::new(
             "test-provider",
             "https://api.example.com/v1",
             "sk-test-key",
@@ -2207,7 +2210,7 @@ mod tests {
 
     #[tokio::test]
     async fn completed_transcript_keeps_typed_media_through_preflight_budget_and_wire() {
-        let provider = OpenAiCompatibleProvider::new(
+        let provider = ChatCompletionsApiCompatibleProvider::new(
             "fixture-media-renderer",
             "https://api.example.com/v1",
             "test-key",
@@ -2367,7 +2370,7 @@ mod tests {
 
     #[test]
     fn mistral_wire_keeps_two_parallel_rounds_and_canonical_ids_separate() {
-        let provider = OpenAiCompatibleProvider::new(
+        let provider = ChatCompletionsApiCompatibleProvider::new(
             "mistral",
             "https://example.invalid/v1",
             "unused",
@@ -2464,7 +2467,7 @@ mod tests {
             "deepseek", // delegates to this builder; replay validation is provider-owned
         ];
         for name in providers {
-            let provider = OpenAiCompatibleProvider::new(
+            let provider = ChatCompletionsApiCompatibleProvider::new(
                 name,
                 "https://example.invalid/v1",
                 "unused",
@@ -2552,7 +2555,7 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("X-Custom".to_string(), "value".to_string());
 
-        let provider = OpenAiCompatibleProvider::new(
+        let provider = ChatCompletionsApiCompatibleProvider::new(
             "custom",
             "https://api.example.com",
             "key",
@@ -2596,7 +2599,7 @@ mod tests {
             let definition = crate::definition::provider_definition(name).unwrap();
             let base = definition.default_base_url.unwrap();
             assert_eq!(base, fixture["base"].as_str().unwrap(), "{name}");
-            let provider = OpenAiCompatibleProvider::new(
+            let provider = ChatCompletionsApiCompatibleProvider::new(
                 name,
                 format!("{base}/"),
                 "dummy-key",
@@ -2633,7 +2636,8 @@ mod tests {
             "https://example.test/team/v9/",
             "https://example.test/team/v9/chat/completions/",
         ] {
-            let provider = OpenAiCompatibleProvider::new("custom", base, "", AuthStyle::Bearer);
+            let provider =
+                ChatCompletionsApiCompatibleProvider::new("custom", base, "", AuthStyle::Bearer);
             assert_eq!(
                 provider.chat_completions_url(),
                 "https://example.test/team/v9/chat/completions"
@@ -2656,7 +2660,7 @@ mod tests {
 
     #[test]
     fn chat_completions_url_already_present() {
-        let provider = OpenAiCompatibleProvider::new(
+        let provider = ChatCompletionsApiCompatibleProvider::new(
             "test",
             "https://api.example.com/v1/chat/completions",
             "key",
@@ -2670,7 +2674,7 @@ mod tests {
 
     #[test]
     fn chat_completions_url_trims_trailing_slash() {
-        let provider = OpenAiCompatibleProvider::new(
+        let provider = ChatCompletionsApiCompatibleProvider::new(
             "test",
             "https://api.example.com/v1/",
             "key",
@@ -2692,7 +2696,7 @@ mod tests {
         ];
 
         let prepared = prepared_for(&provider, messages.as_slice());
-        let api_messages = OpenAiCompatibleProvider::direct_convert(&prepared).unwrap();
+        let api_messages = ChatCompletionsApiCompatibleProvider::direct_convert(&prepared).unwrap();
 
         assert_eq!(api_messages.len(), 3);
         assert_eq!(api_messages[0].role, "system");
@@ -2751,7 +2755,7 @@ mod tests {
             name: "read_file".to_owned(),
             arguments: "{\"path\":\"README.md\"}".to_owned(),
         }];
-        let mut replay_state = OpenAiCompatibleProvider::assistant_replay_state(
+        let mut replay_state = ChatCompletionsApiCompatibleProvider::assistant_replay_state(
             provider.name(),
             Some(String::new()),
             Some(String::new()),
@@ -2819,7 +2823,7 @@ mod tests {
             name: "read_file".to_owned(),
             arguments: "{\"path\":\"README.md\"}".to_owned(),
         }];
-        let replay = OpenAiCompatibleProvider::assistant_replay_state(
+        let replay = ChatCompletionsApiCompatibleProvider::assistant_replay_state(
             provider.name(),
             Some(String::new()),
             Some(String::new()),
@@ -2884,7 +2888,7 @@ mod tests {
         ];
         complete_round(&mut messages);
         let canonical = messages.clone();
-        let provider = OpenAiCompatibleProvider::new(
+        let provider = ChatCompletionsApiCompatibleProvider::new(
             "deepseek",
             "https://api.deepseek.com",
             "key",
@@ -2935,7 +2939,7 @@ mod tests {
         )
         .unwrap();
 
-        let replay = OpenAiCompatibleProvider::new(
+        let replay = ChatCompletionsApiCompatibleProvider::new(
             "test-provider",
             "https://api.example.com/v1",
             "key",
@@ -2972,7 +2976,7 @@ mod tests {
         }));
 
         let prepared = prepared_for(&provider, &[ChatMessage::user("hello"), tool_message]);
-        let api_messages = OpenAiCompatibleProvider::direct_convert(&prepared).unwrap();
+        let api_messages = ChatCompletionsApiCompatibleProvider::direct_convert(&prepared).unwrap();
 
         assert_eq!(api_messages.len(), 3);
         assert_eq!(api_messages[0].role, "user");
@@ -3017,7 +3021,7 @@ mod tests {
         )])];
 
         let prepared = prepared_for(&provider, messages.as_slice());
-        let api_messages = OpenAiCompatibleProvider::direct_convert(&prepared).unwrap();
+        let api_messages = ChatCompletionsApiCompatibleProvider::direct_convert(&prepared).unwrap();
         let file_data = match api_messages[0].content.as_ref() {
             Some(ApiMessageContent::Parts(parts)) => parts.iter().find_map(|part| match part {
                 ApiContentPart::File { file } => file.file_data.clone(),

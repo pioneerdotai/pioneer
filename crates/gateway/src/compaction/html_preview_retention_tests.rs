@@ -294,6 +294,7 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
         parts.push(MessageContentPart::image(resolved.attachment));
     }
     let round = CanonicalProviderRoundEnvelope {
+        ui_copies: None,
         version: 1,
         round_id: "round".into(),
         termination: ProviderTermination::ToolCalls,
@@ -1313,6 +1314,7 @@ async fn known_rooted_import_without_preview_does_not_pin_an_independent_preview
         json!({"source":summary.artifact}).to_string(),
     );
     let round = CanonicalProviderRoundEnvelope {
+        ui_copies: None,
         version: 1,
         round_id: "independent-round".into(),
         termination: ProviderTermination::ToolCalls,

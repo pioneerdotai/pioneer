@@ -1,5 +1,5 @@
 use crate::{
-    providers::compatible::{AuthStyle, OpenAiCompatibleProvider},
+    providers::chat_completions_api_compatible::{AuthStyle, ChatCompletionsApiCompatibleProvider},
     traits::{Provider, ProviderWarmupOutcome},
     types::{
         ChatRequest, ChatResponse, ProviderCapabilities, ProviderFailureClassification,
@@ -18,7 +18,7 @@ pub(crate) const BASE_URL: &str = "https://api.deepseek.com";
 /// DeepSeek uses the OpenAI-compatible transport, but its thinking models
 /// impose an additional replay contract on assistant tool-call messages.
 pub struct DeepSeekProvider {
-    transport: OpenAiCompatibleProvider,
+    transport: ChatCompletionsApiCompatibleProvider,
 }
 
 #[derive(Debug)]
@@ -62,7 +62,7 @@ impl DeepSeekProvider {
 
     fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
-            transport: OpenAiCompatibleProvider::new(
+            transport: ChatCompletionsApiCompatibleProvider::new(
                 PROVIDER_NAME,
                 base_url,
                 api_key,
@@ -142,7 +142,9 @@ impl DeepSeekProvider {
         replay_state: Option<&ProviderReplayState>,
     ) -> Result<()> {
         let has_reasoning = replay_state
-            .map(|state| OpenAiCompatibleProvider::decode_replay_state(state, PROVIDER_NAME))
+            .map(|state| {
+                ChatCompletionsApiCompatibleProvider::decode_replay_state(state, PROVIDER_NAME)
+            })
             .transpose()?
             .is_some_and(|replay| replay.reasoning_content.is_some());
         if has_reasoning {
@@ -402,7 +404,7 @@ mod tests {
             std::sync::Arc::new(crate::attachments::admission::AdmissionState::for_test(
                 std::sync::Arc::new(crate::generation::test_catalog(true)),
             ));
-        let mut replay = OpenAiCompatibleProvider::assistant_replay_state(
+        let mut replay = ChatCompletionsApiCompatibleProvider::assistant_replay_state(
             "deepseek",
             None,
             Some("historical genuine rationale".into()),
@@ -647,7 +649,7 @@ mod tests {
 
     #[tokio::test]
     async fn final_non_tool_stream_releases_native_reasoning_state() {
-        let state = OpenAiCompatibleProvider::assistant_replay_state(
+        let state = ChatCompletionsApiCompatibleProvider::assistant_replay_state(
             "deepseek",
             Some("answer".into()),
             Some(String::new()),
@@ -807,7 +809,7 @@ mod tests {
                 id: format!("call-{index}"),
                 ..tool_call()
             };
-            let mut state = OpenAiCompatibleProvider::assistant_replay_state(
+            let mut state = ChatCompletionsApiCompatibleProvider::assistant_replay_state(
                 "deepseek",
                 None,
                 Some(reasoning.into()),
@@ -823,7 +825,7 @@ mod tests {
             messages.push(ChatMessage::tool_result(call.id, call.name, "outcome"));
         }
         let mut final_message = ChatMessage::assistant("answer");
-        let mut final_state = OpenAiCompatibleProvider::assistant_replay_state(
+        let mut final_state = ChatCompletionsApiCompatibleProvider::assistant_replay_state(
             "deepseek",
             Some("answer".into()),
             Some("final native reasoning".into()),
@@ -876,7 +878,7 @@ mod tests {
     fn accepts_provider_owned_empty_reasoning_field() {
         let provider = DeepSeekProvider::new("key");
         let calls = vec![tool_call()];
-        let mut state = OpenAiCompatibleProvider::assistant_replay_state(
+        let mut state = ChatCompletionsApiCompatibleProvider::assistant_replay_state(
             PROVIDER_NAME,
             Some(String::new()),
             Some(String::new()),
@@ -1007,7 +1009,7 @@ mod tests {
             name: "verify".into(),
             arguments: "{}".into(),
         };
-        let mut replay = OpenAiCompatibleProvider::assistant_replay_state(
+        let mut replay = ChatCompletionsApiCompatibleProvider::assistant_replay_state(
             PROVIDER_NAME,
             None,
             Some("second round rationale".into()),
@@ -1158,7 +1160,7 @@ mod tests {
     fn compatible_empty_replay_triggers_projection_for_mixed_non_reasoner_history() {
         let provider = DeepSeekProvider::new("key");
         let calls = vec![tool_call()];
-        let mut compatible = OpenAiCompatibleProvider::assistant_replay_state(
+        let mut compatible = ChatCompletionsApiCompatibleProvider::assistant_replay_state(
             PROVIDER_NAME,
             None,
             Some(String::new()),
@@ -1226,7 +1228,7 @@ mod tests {
     fn completed_same_model_non_thinking_round_is_portable_in_thinking_request() {
         let provider = DeepSeekProvider::new("key");
         for reasoning_field in [None, Some(serde_json::Value::Null)] {
-            let mut replay = OpenAiCompatibleProvider::assistant_replay_state(
+            let mut replay = ChatCompletionsApiCompatibleProvider::assistant_replay_state(
                 PROVIDER_NAME,
                 None,
                 None,
@@ -1318,7 +1320,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_rejects_missing_reasoning_before_exposing_tool_calls() {
-        let state = OpenAiCompatibleProvider::assistant_replay_state(
+        let state = ChatCompletionsApiCompatibleProvider::assistant_replay_state(
             PROVIDER_NAME,
             None,
             None,
@@ -1357,7 +1359,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_preserves_present_empty_reasoning_and_exposes_tool_calls() {
-        let state = OpenAiCompatibleProvider::assistant_replay_state(
+        let state = ChatCompletionsApiCompatibleProvider::assistant_replay_state(
             PROVIDER_NAME,
             Some(String::new()),
             Some(String::new()),

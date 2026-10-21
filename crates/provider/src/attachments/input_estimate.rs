@@ -22,7 +22,36 @@ pub struct PreparedInputBudget {
 pub(crate) async fn prepare(
     provider: &str,
     capabilities: &crate::ProviderCapabilities,
+    request: ChatRequest,
+) -> Result<PreparedInputBudget> {
+    prepare_with_profile(
+        provider,
+        capabilities,
+        request,
+        crate::history::ProjectionProfile::ServiceDefault,
+    )
+    .await
+}
+
+pub(crate) async fn prepare_responses(
+    provider: &str,
+    capabilities: &crate::ProviderCapabilities,
+    request: ChatRequest,
+) -> Result<PreparedInputBudget> {
+    prepare_with_profile(
+        provider,
+        capabilities,
+        request,
+        crate::history::ProjectionProfile::Responses,
+    )
+    .await
+}
+
+async fn prepare_with_profile(
+    provider: &str,
+    capabilities: &crate::ProviderCapabilities,
     mut request: ChatRequest,
+    profile: crate::history::ProjectionProfile,
 ) -> Result<PreparedInputBudget> {
     // Budget indexes must address the same provider view that materialization
     // emits, including tool-to-user preview media follow-ups.
@@ -41,11 +70,12 @@ pub(crate) async fn prepare(
             media: vec![],
         });
     }
-    let prepared = super::prepare_messages_for_request_async(
+    let prepared = super::prepare_messages_for_request_with_profile(
         provider,
         capabilities,
         &request,
         &request.messages,
+        profile,
     )
     .await?;
     super::ensure_no_unrendered_attachments(provider, &prepared)?;

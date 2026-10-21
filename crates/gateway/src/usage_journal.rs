@@ -74,13 +74,14 @@ impl Call {
 }
 
 impl JournalProvider {
-    async fn start(&self, model: &str) -> Result<(Call, TokenUsage)> {
+    async fn start(&self, request: &ChatRequest) -> Result<(Call, TokenUsage)> {
+        let profile = self.request_usage_profile(request)?;
         let usage = TokenUsage {
             provider: Some(self.name().into()),
-            model: Some(model.into()),
-            api: Some(self.usage_api().into()),
-            api_version: self.usage_api_version(),
-            route: self.usage_route(),
+            model: Some(request.model.clone()),
+            api: Some(profile.api),
+            api_version: profile.api_version,
+            route: profile.route,
             ..Default::default()
         };
         let call = Call::start(
@@ -99,6 +100,12 @@ impl JournalProvider {
 impl Provider for JournalProvider {
     fn name(&self) -> &str {
         self.inner.name()
+    }
+    fn request_usage_profile(
+        &self,
+        request: &ChatRequest,
+    ) -> anyhow::Result<pioneer_provider::ProviderUsageProfile> {
+        self.inner.request_usage_profile(request)
     }
     fn usage_api(&self) -> &'static str {
         self.inner.usage_api()
@@ -134,7 +141,7 @@ impl Provider for JournalProvider {
         self.inner.prepare_input_budget(request).await
     }
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let (call, mut usage) = self.start(&request.model).await?;
+        let (call, mut usage) = self.start(&request).await?;
         let response = self.inner.chat(request).await;
         if let Ok(response) = &response {
             if let Some(snapshot) = &response.usage {
@@ -166,7 +173,7 @@ impl Provider for JournalProvider {
         &self,
         request: ChatRequest,
     ) -> Result<pioneer_provider::ProviderStream> {
-        let (call, mut usage) = self.start(&request.model).await?;
+        let (call, mut usage) = self.start(&request).await?;
         let response = match self.inner.stream_chat_with_diagnostics(request).await {
             Ok(response) => response,
             Err(error) => {

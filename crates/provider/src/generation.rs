@@ -375,15 +375,118 @@ fn openai_fields(
     request: &ChatRequest,
     model: Option<&CatalogModel>,
 ) -> Result<Fields> {
+    openai_api_fields(provider, request, model, false)
+}
+
+pub(crate) fn responses_fields(provider: &str, request: &ChatRequest) -> Result<Fields> {
+    // Reuse the existing authority-scoped catalog fixture without publishing a
+    // process-global test catalog. Production still reads the runtime snapshot.
+    #[cfg(test)]
+    let fixture_catalog = crate::attachments::admission::current().and_then(|s| s.catalog.clone());
+    #[cfg(not(test))]
+    let fixture_catalog: Option<std::sync::Arc<ModelCatalog>> = None;
+    let catalog = fixture_catalog.or_else(|| model_catalog().ok());
+    responses_fields_from_catalog(catalog.as_deref(), provider, request)
+}
+
+fn responses_fields_from_catalog(
+    catalog: Option<&ModelCatalog>,
+    provider: &str,
+    request: &ChatRequest,
+) -> Result<Fields> {
+    validate_cap_with_catalog(catalog, provider, request)?;
+    let model = catalog.and_then(|c| c.model(provider, &request.model));
+    if provider == "openai" {
+        return openai_api_fields(provider, request, model, true);
+    }
+    validate_temperature(model, request)?;
+    let mut fields = Fields::new();
+    if request.max_tokens.is_none() && request.reasoning.is_none() && request.temperature.is_none()
+    {
+        return Ok(fields); // Omission leaves the compatible service's defaults.
+    }
+    let model = model
+        .filter(|m| m.api == "openai-responses")
+        .ok_or_else(|| anyhow::anyhow!("unverified Responses generation contract"))?;
+    if let Some(cap) = request.max_tokens {
+        fields.insert("max_output_tokens".into(), json!(cap));
+    }
+    if let Some(reasoning) = request.reasoning {
+        ensure!(model.reasoning, "selected model does not support reasoning");
+        ensure!(
+            model
+                .metadata
+                .get("compat")
+                .is_none_or(|c| c["supportsReasoningEffort"] != false),
+            "selected model explicitly does not support reasoning effort"
+        );
+        let effort = mapped_effort(Some(model), reasoning)?
+            .ok_or_else(|| anyhow::anyhow!("unverified Responses effort contract"))?;
+        let native = native_reasoning(provider, &request.model);
+        let denies = |key: &str| native.get(key) == Some(&Some(false));
+        let selected = match reasoning {
+            ReasoningConfig::Disabled => "none",
+            ReasoningConfig::Effort(effort) => effort.as_str(),
+        };
+        ensure!(
+            !denies("reasoning.supported")
+                && !denies("effort.supported")
+                && !denies("effort.enum")
+                && !denies(&format!("effort.{selected}"))
+                && !denies(&format!("effort.{effort}")),
+            "native model facts deny selected Responses effort"
+        );
+        ensure!(
+            !selected_off(request.reasoning) || native.get("mandatory") != Some(&Some(true)),
+            "native model facts require reasoning; off cannot be honored"
+        );
+        ensure!(
+            matches!(
+                effort.as_str(),
+                "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+            ),
+            "unsupported Responses effort mapping"
+        );
+        ensure!(
+            !selected_off(request.reasoning) || effort == "none",
+            "off mapping must disable reasoning"
+        );
+        fields.insert("reasoning".into(), json!({"effort":effort}));
+    }
+    if let Some(temperature) = request.temperature {
+        ensure!(
+            model
+                .metadata
+                .get("compat")
+                .is_some_and(|c| c["supportsTemperature"] == true)
+                || model
+                    .metadata
+                    .get("sourceGeneration")
+                    .is_some_and(|s| s["temperature"] == true),
+            "unverified Responses temperature contract"
+        );
+        fields.insert("temperature".into(), json!(temperature));
+    }
+    Ok(fields)
+}
+
+fn openai_api_fields(
+    provider: &str,
+    request: &ChatRequest,
+    model: Option<&CatalogModel>,
+    responses: bool,
+) -> Result<Fields> {
     validate_temperature(model, request)?;
     let id = request.model.as_str();
     let reasoner = openai_reasoner(id) || model.is_some_and(|m| m.reasoning);
     // A source's preferred Responses profile alone does not prove that an
     // unfamiliar model/deployment accepts Chat Completions generation fields.
-    let known = model.is_some_and(|m| m.api == "openai-completions")
+    let known = model
+        .is_some_and(|m| m.api == "openai-completions" || responses && m.api == "openai-responses")
         || openai_reasoner(id)
         || id.starts_with("gpt-4")
-        || id.starts_with("gpt-3.5");
+        || id.starts_with("gpt-3.5")
+        || super::providers::openai::chat_only_audio_model(id);
     ensure!(
         known
             || request.max_tokens.is_none()
@@ -392,7 +495,7 @@ fn openai_fields(
         "cannot resolve generation controls for {provider} model/deployment `{id}`; use a known base model ID (deployment routing is configured separately)"
     );
     ensure!(
-        !id.contains("codex") && !id.ends_with("-pro") && !id.contains("-pro-"),
+        responses || !id.contains("codex") && !id.ends_with("-pro") && !id.contains("-pro-"),
         "model `{id}` requires a Responses adapter; this provider uses Chat Completions"
     );
     let tools = request.tools.as_ref().is_some_and(|t| !t.is_empty())
@@ -402,20 +505,23 @@ fn openai_fields(
             .any(|m| m.tool_calls.as_ref().is_some_and(|t| !t.is_empty()));
     let mandatory = id.starts_with("gpt-6-astra") || id.starts_with("gpt-6.1-sol");
     ensure!(
-        !(mandatory && tools),
+        responses || !(mandatory && tools),
         "model `{id}` requires Responses for function calling"
     );
     ensure!(
-        !((id.starts_with("gpt-5.6")
-            || id.starts_with("gpt-6-sol")
-            || id.starts_with("gpt-6-luna"))
-            && tools
-            && !selected_off(request.reasoning)),
+        responses
+            || !((id.starts_with("gpt-5.6")
+                || id.starts_with("gpt-6-sol")
+                || id.starts_with("gpt-6-luna"))
+                && tools
+                && !selected_off(request.reasoning)),
         "model `{id}` requires Responses to combine tools and reasoning; explicitly select none only if desired"
     );
     let mut fields = Fields::new();
     let compat = model.and_then(|m| m.metadata.get("compat"));
-    let cap_field = if reasoner {
+    let cap_field = if responses {
+        "max_output_tokens"
+    } else if reasoner {
         "max_completion_tokens"
     } else {
         compat
@@ -423,7 +529,8 @@ fn openai_fields(
             .unwrap_or("max_tokens")
     };
     ensure!(
-        matches!(cap_field, "max_tokens" | "max_completion_tokens"),
+        matches!(cap_field, "max_tokens" | "max_completion_tokens")
+            || responses && cap_field == "max_output_tokens",
         "unsupported Chat cap field {cap_field}"
     );
     if let Some(cap) = request.max_tokens {
@@ -444,6 +551,10 @@ fn openai_fields(
                 "selected OpenAI profile explicitly does not support reasoning effort"
             );
             let mapped = mapped_effort(model, reasoning)?;
+            ensure!(
+                !responses || !id.contains("codex") || mapped.is_some(),
+                "Codex reasoning controls require an explicit model effort contract"
+            );
             let effort = mapped.unwrap_or_else(|| match reasoning {
                 ReasoningConfig::Disabled => "none".into(),
                 ReasoningConfig::Effort(e) => e.as_str().into(),
@@ -462,12 +573,21 @@ fn openai_fields(
                 !selected_off(request.reasoning) || effort == "none",
                 "off mapping must disable reasoning, not select effort `{effort}`"
             );
-            let azure = matches!(provider, "azure-openai" | "azure_openai");
+            let azure = !responses && matches!(provider, "azure-openai" | "azure_openai");
             ensure!(
                 !(azure && id.starts_with("o1-mini")),
                 "Azure o1-mini does not support reasoning_effort"
             );
-            let allowed = if id.starts_with("gpt-5.1") {
+            let pro = responses && (id.ends_with("-pro") || id.contains("-pro-"));
+            let allowed = if pro {
+                if id.starts_with("gpt-5.2-pro") || id.starts_with("gpt-5.4-pro") {
+                    matches!(effort.as_str(), "medium" | "high" | "xhigh")
+                } else if id.starts_with("gpt-5-pro") || id.starts_with("o3-pro") {
+                    effort == "high"
+                } else {
+                    false
+                }
+            } else if id.starts_with("gpt-5.1") {
                 matches!(effort.as_str(), "none" | "low" | "medium" | "high")
             } else if id.starts_with("gpt-5.2")
                 || id.starts_with("gpt-5.3")
@@ -505,12 +625,22 @@ fn openai_fields(
                         || id.starts_with("gpt-5.4"))),
                 "Azure Chat model `{id}` does not support xhigh effort"
             );
-            fields.insert("reasoning_effort".into(), json!(effort));
+            if responses {
+                fields.insert("reasoning".into(), json!({"effort":effort}));
+            } else {
+                fields.insert("reasoning_effort".into(), json!(effort));
+            }
         }
     }
     if let Some(temperature) = request.temperature {
-        let none = fields.get("reasoning_effort").is_some_and(|e| e == "none");
-        let supports = compat.is_none_or(|c| c["supportsTemperature"] != false)
+        let none = fields.get("reasoning_effort").is_some_and(|e| e == "none")
+            || fields
+                .get("reasoning")
+                .is_some_and(|v| v["effort"] == "none");
+        let supports = (!responses
+            || !id.contains("codex")
+            || compat.is_some_and(|c| c["supportsTemperature"] == true))
+            && compat.is_none_or(|c| c["supportsTemperature"] != false)
             && (!reasoner
                 || ((id.starts_with("gpt-5.1")
                     || id.starts_with("gpt-5.2")
@@ -1378,4 +1508,48 @@ pub(crate) fn test_source_temperature(provider: &str, id: &str) -> ModelCatalog 
         &serde_json::to_string(&generated.provenance).unwrap(),
     )
     .unwrap()
+}
+
+#[cfg(test)]
+mod responses_profile_tests {
+    use super::*;
+    fn request(model: &str) -> ChatRequest {
+        ChatRequest {
+            model: model.into(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: Some(100),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        }
+    }
+    #[test]
+    fn responses_pro_efforts_follow_verified_contract_and_codex_does_not_guess() {
+        for (model, allowed, rejected) in [
+            ("gpt-5-pro", ReasoningEffort::High, ReasoningEffort::Medium),
+            ("gpt-5.2-pro", ReasoningEffort::XHigh, ReasoningEffort::Low),
+            (
+                "gpt-5.4-pro",
+                ReasoningEffort::Medium,
+                ReasoningEffort::None,
+            ),
+        ] {
+            let mut req = request(model);
+            req.reasoning = Some(ReasoningConfig::Effort(allowed));
+            assert!(openai_api_fields("openai", &req, None, true).is_ok());
+            assert!(openai_api_fields("openai", &req, None, false).is_err());
+            req.reasoning = Some(ReasoningConfig::Effort(rejected));
+            assert!(openai_api_fields("openai", &req, None, true).is_err());
+        }
+        let mut req = request("gpt-5.1-codex");
+        assert!(openai_api_fields("openai", &req, None, true).is_ok());
+        req.reasoning = Some(ReasoningConfig::Disabled);
+        assert!(openai_api_fields("openai", &req, None, true).is_err());
+        req.reasoning = None;
+        req.temperature = Some(0.7);
+        assert!(openai_api_fields("openai", &req, None, true).is_err());
+    }
 }

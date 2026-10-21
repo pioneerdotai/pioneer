@@ -1153,6 +1153,13 @@ impl<'a> LearnerReviewerClient<'a> {
             })
             .await
             .map_err(|error| ModelContractError::provider_transport(stage, &error))?;
+        pioneer_provider::ProviderMessageCollector::validate_response(&response).map_err(|_| {
+            ModelContractError::new(
+                stage,
+                ModelContractErrorKind::IncompleteResponse,
+                "invalid_model_messages",
+            )
+        })?;
         let usage = ModelCallUsage::from(response.usage);
         let reason = match response.termination {
             ProviderTermination::Complete if response.tool_calls.is_empty() => None,
@@ -1566,6 +1573,7 @@ mod tests {
                 bail!("scripted response exhausted");
             };
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text,
                 usage: Some(TokenUsage {
                     input_tokens: Some(10),

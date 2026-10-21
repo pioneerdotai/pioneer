@@ -54,6 +54,9 @@ fn claude_prefix_rule(model: Option<&str>) -> Option<bool> {
 }
 
 pub fn retention(state: &ProviderReplayState) -> Retention {
+    if crate::providers::responses_api_compatible::replay::is_dialect(state) {
+        return crate::providers::responses_api_compatible::replay::retention(state);
+    }
     let p = &state.payload;
     // Older clients stamped configured Messages proxies as unverified relays.
     // An endpoint override alone does not alter the accepted native schema.

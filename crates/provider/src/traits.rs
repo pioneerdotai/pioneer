@@ -40,6 +40,15 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// Immutable per-request route evidence, captured before physical dispatch.
+    fn request_usage_profile(&self, _request: &ChatRequest) -> Result<crate::ProviderUsageProfile> {
+        Ok(crate::ProviderUsageProfile {
+            api: self.usage_api().into(),
+            api_version: self.usage_api_version(),
+            route: self.usage_route(),
+        })
+    }
+
     /// Non-secret identity of the credential/account/endpoint authority that
     /// created this instance. Registry-managed providers always expose one;
     /// directly constructed test providers may remain unbound.
@@ -183,6 +192,7 @@ mod tests {
 
         async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse> {
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text: "mock response".into(),
                 usage: Some(TokenUsage {
                     input_tokens: Some(10),

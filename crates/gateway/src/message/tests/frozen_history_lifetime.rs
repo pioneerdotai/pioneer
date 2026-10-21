@@ -1048,6 +1048,7 @@ async fn child_continuation_uses_saved_branch_second_after_expiry_and_runtime_re
                 [at.format("%Y-%m-%d %H:%M:%S").to_string().into(), format!("{marker}-event").into(), format!("{marker}-round").into()],
             )).await.unwrap();
             let envelope = pioneer_provider::CanonicalProviderRoundEnvelope {
+                ui_copies: None,
                 version: 1,
                 round_id: format!("{marker}-round"),
                 termination: pioneer_provider::ProviderTermination::Complete,
