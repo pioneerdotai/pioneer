@@ -357,12 +357,15 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
             let candidate = query_binary_version_output(&staged_binary)?;
             let config = config.clone();
             let applied = thread::spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?
-                    .block_on(pioneer_gateway::inspect_applied_database_migrations(
-                        &home, &config,
-                    ))
+                let runtime = pioneer_observability::runtime::ObservedRuntime::new(
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?,
+                    pioneer_observability::runtime::RuntimeRole::CliHelper,
+                );
+                runtime.block_on(pioneer_gateway::inspect_applied_database_migrations(
+                    &home, &config,
+                ))
             })
             .join()
             .map_err(|_| anyhow::anyhow!("schema inspection worker failed"))??;
@@ -1232,17 +1235,17 @@ fn restore_binary_and_config(
 fn probe_gateway_status(
     binary: &Path,
 ) -> std::result::Result<ServiceSnapshot, GatewayHealthFailure> {
-    let output = Command::new(binary)
-        .arg("status")
-        .arg("--json")
-        .output()
-        .map_err(|error| {
-            if error.kind() == ErrorKind::NotFound {
-                GatewayHealthFailure::MissingBinary
-            } else {
-                GatewayHealthFailure::StatusCommand
-            }
-        })?;
+    let output = pioneer_observability::resources::captured_output(
+        Command::new(binary).arg("status").arg("--json"),
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+    )
+    .map_err(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            GatewayHealthFailure::MissingBinary
+        } else {
+            GatewayHealthFailure::StatusCommand
+        }
+    })?;
     if !output.status.success() {
         return Err(GatewayHealthFailure::CommandRejected);
     }
@@ -1265,11 +1268,11 @@ fn query_gateway_status(binary: &Path) -> Result<Option<ServiceSnapshot>> {
 }
 
 fn query_binary_version_output(binary: &Path) -> Result<VersionOutput> {
-    let output = Command::new(binary)
-        .arg("version")
-        .arg("--json")
-        .output()
-        .with_context(|| format!("failed to run `{}` version --json", binary.display()))?;
+    let output = pioneer_observability::resources::captured_output(
+        Command::new(binary).arg("version").arg("--json"),
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+    )
+    .with_context(|| format!("failed to run `{}` version --json", binary.display()))?;
 
     if !output.status.success() {
         bail!(
@@ -1341,7 +1344,11 @@ fn run_gateway_start_command(binary: &Path, managed_by: &InstallManagedBy) -> Re
     command.args(args.as_slice());
     command.env("PIONEER_MANAGED_BY", managed_by_label(managed_by));
 
-    let output = command.output().with_context(|| {
+    let output = pioneer_observability::resources::captured_output(
+        &mut command,
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+    )
+    .with_context(|| {
         format!(
             "failed to run `{}`",
             render_binary_command(binary, args.as_slice())
@@ -1380,7 +1387,10 @@ fn run_gateway_command(
     command.args(args);
     command.env("PIONEER_MANAGED_BY", managed_by_label(managed_by));
 
-    let output = match command.output() {
+    let output = match pioneer_observability::resources::captured_output(
+        &mut command,
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+    ) {
         Ok(output) => output,
         Err(error) if ignore_failure => {
             let _ = error;
@@ -1926,17 +1936,18 @@ fn ensure_windows_path(config: &AppConfig, target_binary: &Path) -> Result<Comma
         [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')"#
     );
 
-    let output = Command::new("powershell")
-        .args([
+    let output = pioneer_observability::resources::captured_output(
+        Command::new("powershell").args([
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
             &script,
-        ])
-        .output()
-        .context("failed to update user PATH")?;
+        ]),
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+    )
+    .context("failed to update user PATH")?;
 
     let mut path_updated = true;
     if !output.status.success() {

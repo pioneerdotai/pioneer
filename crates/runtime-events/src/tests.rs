@@ -14,7 +14,7 @@ use crate::{
     ProgressCoalescerConfig,
 };
 
-fn completed(turn_id: &str) -> AgentDurableEvent {
+pub(super) fn completed(turn_id: &str) -> AgentDurableEvent {
     AgentDurableEvent::TurnCompleted {
         thread_id: "thread_1".to_owned(),
         turn_id: turn_id.to_owned(),
@@ -74,7 +74,7 @@ impl OrderedIngressEvent for TestIngressEvent {
     }
 }
 
-fn updated(text: &str) -> ExecutionSnapshotEvent {
+pub(super) fn updated(text: &str) -> ExecutionSnapshotEvent {
     ExecutionSnapshotEvent::ItemUpdated {
         notification: ItemUpdatedNotification {
             workspace_id: "ws_1".to_owned(),
@@ -294,12 +294,13 @@ async fn ordered_ingress_coalesces_ten_thousand_updates_before_terminal_barrier(
         OrderedIngressOffer::Accepted
     ));
 
-    let Some(TestIngressEvent::Progress { text, .. }) = rx.recv().await else {
+    let Some(TestIngressEvent::Progress { text, .. }) = rx.recv().await.map(|item| item.value)
+    else {
         panic!("coalesced progress must precede terminal event");
     };
     assert_eq!(text.len(), 10_000);
     assert_eq!(
-        rx.recv().await,
+        rx.recv().await.map(|item| item.value),
         Some(TestIngressEvent::Durable("turn/completed"))
     );
     ingress.close();
@@ -341,11 +342,11 @@ async fn ordered_ingress_bounds_progress_keys_but_never_rejects_lifecycle() {
         OrderedIngressOffer::Accepted
     ));
     assert!(matches!(
-        rx.recv().await,
+        rx.recv().await.map(|item| item.value),
         Some(TestIngressEvent::Progress { key: "item_1", .. })
     ));
     assert_eq!(
-        rx.recv().await,
+        rx.recv().await.map(|item| item.value),
         Some(TestIngressEvent::Durable("item/completed"))
     );
     ingress.close();
@@ -377,13 +378,22 @@ async fn ordered_ingress_backpressures_durable_backlog_at_configured_bound() {
     };
     sleep(Duration::from_millis(25)).await;
     assert!(!third.is_finished());
-    assert_eq!(rx.recv().await, Some(TestIngressEvent::Durable("first")));
+    assert_eq!(
+        rx.recv().await.map(|item| item.value),
+        Some(TestIngressEvent::Durable("first"))
+    );
     assert!(matches!(
         third.await.expect("third publisher task"),
         OrderedIngressOffer::Accepted
     ));
-    assert_eq!(rx.recv().await, Some(TestIngressEvent::Durable("second")));
-    assert_eq!(rx.recv().await, Some(TestIngressEvent::Durable("third")));
+    assert_eq!(
+        rx.recv().await.map(|item| item.value),
+        Some(TestIngressEvent::Durable("second"))
+    );
+    assert_eq!(
+        rx.recv().await.map(|item| item.value),
+        Some(TestIngressEvent::Durable("third"))
+    );
     ingress.close();
 }
 

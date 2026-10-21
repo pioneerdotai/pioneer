@@ -2,8 +2,9 @@ use super::*;
 
 impl GatewayWsClient {
     pub fn new() -> Self {
-        let (command_tx, command_rx) = unbounded_channel();
+        let (command_tx, command_rx) = work_channel(Boundary::ClientCommand);
         let (event_tx, event_rx) = mpsc::channel();
+        let event_tx = super::super::client::GatewayWsEventSender::from(event_tx);
 
         let command_sender = GatewayWsCommandSender {
             command_tx,
@@ -49,7 +50,7 @@ impl GatewayWsClient {
         self.command_sender.clone()
     }
 
-    pub fn drain_events(&self) -> Vec<GatewayWsEvent> {
+    pub fn drain_events(&self) -> Vec<pioneer_observability::work::WorkItem<GatewayWsEvent>> {
         let Ok(event_rx) = self.event_rx.lock() else {
             return Vec::new();
         };
@@ -63,7 +64,7 @@ impl GatewayWsClient {
         events
     }
 
-    pub fn recv_event(&self) -> Option<GatewayWsEvent> {
+    pub fn recv_event(&self) -> Option<pioneer_observability::work::WorkItem<GatewayWsEvent>> {
         let Ok(event_rx) = self.event_rx.lock() else {
             return None;
         };

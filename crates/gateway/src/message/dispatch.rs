@@ -438,36 +438,72 @@ impl MessageProcessor {
         } else {
             None
         };
-        let dispatched = message_future(pioneer_observability::turn_startup::scope_stage(
-            startup_key,
-            pioneer_observability::turn_startup::Stage::GatewayDispatch,
-            async move {
-                let admission_span = pioneer_observability::turn_startup::current_stage(
-                    pioneer_observability::turn_startup::Stage::Admission,
-                );
-                let admission = match self.authorize_normal_request(&context, &request).await {
-                    Ok(admission) => admission,
-                    Err(response) => {
-                        self.send_error(context.connection_id(), response).await;
-                        return;
-                    }
-                };
+        use pioneer_observability::work::{Boundary, ExecutorRole, Trigger, WorkCarrier, WorkKind};
+        let work_kind = match normal_method_entry(request.method.as_str()).map(|entry| entry.action)
+        {
+            Ok(
+                ResourceAction::AgentTurnStart
+                | ResourceAction::AgentExecutionResume
+                | ResourceAction::AgentExecutionSteer,
+            ) => WorkKind::RpcTurn,
+            Ok(
+                ResourceAction::WorkspaceList
+                | ResourceAction::WorkspaceRead
+                | ResourceAction::ThreadRead
+                | ResourceAction::AgentExecutionObserve
+                | ResourceAction::AgentRequestObserve
+                | ResourceAction::ArtifactRead
+                | ResourceAction::MemoryRead
+                | ResourceAction::TaskRead
+                | ResourceAction::TaskReadOperator
+                | ResourceAction::AgentsDocumentRead,
+            ) => WorkKind::RpcRead,
+            Ok(
+                ResourceAction::GatewayManage
+                | ResourceAction::AgentExecutionCancel
+                | ResourceAction::ChildControl,
+            ) => WorkKind::RpcControl,
+            Ok(_) => WorkKind::RpcMutation,
+            Err(_) => WorkKind::RpcUnknown,
+        };
+        // The network boundary carries no general remote parent in this protocol.
+        let work = WorkCarrier::independent(
+            Boundary::Rpc,
+            work_kind,
+            Trigger::Rpc,
+            ExecutorRole::Gateway,
+        );
+        let dispatched =
+            message_future(work.scope(pioneer_observability::turn_startup::scope_stage(
+                startup_key,
+                pioneer_observability::turn_startup::Stage::GatewayDispatch,
+                async move {
+                    let admission_span = pioneer_observability::turn_startup::current_stage(
+                        pioneer_observability::turn_startup::Stage::Admission,
+                    );
+                    let admission = match self.authorize_normal_request(&context, &request).await {
+                        Ok(admission) => admission,
+                        Err(response) => {
+                            self.send_error(context.connection_id(), response).await;
+                            return;
+                        }
+                    };
 
-                drop(admission_span);
-                // Large start workflows expose dedicated erased futures so constructing them does
-                // not share one native stack frame with every branch in the dispatch match.
-                let handler = if request.method == methods::TURN_START {
-                    self.dispatch_turn_start(context, request, admission)
-                } else if request.method == methods::THREAD_START {
-                    self.dispatch_thread_start(context, request, admission)
-                } else if request.method == methods::SETTINGS_UPDATE {
-                    self.dispatch_settings_update(context, request)
-                } else {
-                    self.process_request_inner(context, request, admission)
-                };
-                handler.await;
-            },
-        ));
+                    drop(admission_span);
+                    // Large start workflows expose dedicated erased futures so constructing them does
+                    // not share one native stack frame with every branch in the dispatch match.
+                    let handler = if request.method == methods::TURN_START {
+                        self.dispatch_turn_start(context, request, admission)
+                    } else if request.method == methods::THREAD_START {
+                        self.dispatch_thread_start(context, request, admission)
+                    } else if request.method == methods::SETTINGS_UPDATE {
+                        self.dispatch_settings_update(context, request)
+                    } else {
+                        self.process_request_inner(context, request, admission)
+                    };
+                    handler.await;
+                },
+            )));
 
         instrument_message_future(dispatched, span)
     }

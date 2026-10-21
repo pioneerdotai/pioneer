@@ -63,9 +63,10 @@ impl ThreadFileDeliveryService {
         let root = scope.canonical_root.clone();
         let file_name = scope.file_name.clone();
         let content_type = scope.content_type.clone();
-        let bytes = tokio::task::spawn_blocking(move || read_text_file(&root, &path))
-            .await
-            .map_err(|_| ThreadFileDeliveryError::Unavailable)??;
+        let bytes =
+            pioneer_observability::work::spawn_blocking(move || read_text_file(&root, &path))
+                .await
+                .map_err(|_| ThreadFileDeliveryError::Unavailable)??;
         self.authorize_thread(request, scope).await?;
         Ok(ThreadFileContent {
             bytes,
@@ -112,9 +113,11 @@ pub(crate) async fn prepare_thread_file(
     workspace_root: String,
     href: String,
 ) -> Result<PreparedThreadFile, ThreadFileDeliveryError> {
-    tokio::task::spawn_blocking(move || prepare_thread_file_blocking(&workspace_root, &href))
-        .await
-        .map_err(|_| ThreadFileDeliveryError::Unavailable)?
+    pioneer_observability::work::spawn_blocking(move || {
+        prepare_thread_file_blocking(&workspace_root, &href)
+    })
+    .await
+    .map_err(|_| ThreadFileDeliveryError::Unavailable)?
 }
 
 fn prepare_thread_file_blocking(

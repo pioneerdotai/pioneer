@@ -1455,7 +1455,7 @@ impl OpenCodeRuntimeState {
 fn spawn_opencode_event_stream(
     server: Arc<OpenCodeServerProcess>,
     state: Arc<Mutex<OpenCodeRuntimeState>>,
-    event_tx: mpsc::Sender<RuntimeEvent>,
+    event_tx: mpsc::Sender<pioneer_observability::work::WorkItem<RuntimeEvent>>,
     cancellation: CancellationToken,
     include_native: bool,
     budget: pioneer_cli_agent_runtime::NativeEventBudget,
@@ -1529,7 +1529,7 @@ fn spawn_opencode_event_stream(
                         {
                             Ok(events) => {
                                 for event in events {
-                                    tokio::select! { _=cancellation.cancelled()=>return, result=event_tx.send(event)=>if result.is_err(){return;} }
+                                    tokio::select! { _=cancellation.cancelled()=>return, result=event_tx.send(pioneer_observability::work::WorkItem::new(event,pioneer_observability::work::Boundary::EventLane,pioneer_observability::work::WorkKind::Event,pioneer_observability::work::ExecutorRole::Event))=>if result.is_err(){return;} }
                                 }
                             }
                             Err(_) => break,
@@ -1662,7 +1662,7 @@ fn spawn_opencode_event_stream(
                 for event in events {
                     tokio::select! {
                         _ = cancellation.cancelled() => return,
-                        result = event_tx.send(event) => if result.is_err() { return; },
+                        result = event_tx.send(pioneer_observability::work::WorkItem::new(event,pioneer_observability::work::Boundary::EventLane,pioneer_observability::work::WorkKind::Event,pioneer_observability::work::ExecutorRole::Event)) => if result.is_err() { return; },
                     }
                 }
             }
@@ -1683,7 +1683,7 @@ fn spawn_opencode_event_stream(
 async fn fail_opencode_ingress(
     server: &OpenCodeServerProcess,
     state: &Arc<Mutex<OpenCodeRuntimeState>>,
-    tx: &mpsc::Sender<RuntimeEvent>,
+    tx: &mpsc::Sender<pioneer_observability::work::WorkItem<RuntimeEvent>>,
     timeout: Duration,
 ) {
     let (session, events) = {
@@ -1700,7 +1700,16 @@ async fn fail_opencode_ingress(
     }
     let _ = server.close().await;
     for event in events {
-        if tx.send(event).await.is_err() {
+        if tx
+            .send(pioneer_observability::work::WorkItem::new(
+                event,
+                pioneer_observability::work::Boundary::EventLane,
+                pioneer_observability::work::WorkKind::Event,
+                pioneer_observability::work::ExecutorRole::Event,
+            ))
+            .await
+            .is_err()
+        {
             break;
         }
     }
@@ -1715,7 +1724,7 @@ async fn wait_or_cancel(cancellation: &CancellationToken, duration: Duration) ->
 
 async fn emit_opencode_stream_diagnostic(
     state: &Arc<Mutex<OpenCodeRuntimeState>>,
-    event_tx: &mpsc::Sender<RuntimeEvent>,
+    event_tx: &mpsc::Sender<pioneer_observability::work::WorkItem<RuntimeEvent>>,
     message: String,
 ) {
     let state = state.lock().await;
@@ -1730,7 +1739,14 @@ async fn emit_opencode_stream_diagnostic(
         native: None,
     });
     drop(state);
-    let _ = event_tx.send(event).await;
+    let _ = event_tx
+        .send(pioneer_observability::work::WorkItem::new(
+            event,
+            pioneer_observability::work::Boundary::EventLane,
+            pioneer_observability::work::WorkKind::Event,
+            pioneer_observability::work::ExecutorRole::Event,
+        ))
+        .await;
 }
 
 async fn map_opencode_event(
@@ -3231,7 +3247,7 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
             if let Some(projection) = launch_projection.as_ref() {
                 let binary = instance.binary_path.clone();
                 let version = server.version.clone();
-                let (actual_contract, _) = tokio::task::spawn_blocking(move || {
+                let (actual_contract, _) = pioneer_observability::work::spawn_blocking(move || {
                     crate::cli_runtime::mcp::readiness::opencode_executable_fingerprints(
                         &binary,
                         version.as_deref(),
@@ -3378,7 +3394,7 @@ struct OpenCodeCLIAgentRuntimeSession {
     server: Arc<OpenCodeServerProcess>,
     state: Arc<Mutex<OpenCodeRuntimeState>>,
     request_timeout: Duration,
-    event_tx: mpsc::Sender<RuntimeEvent>,
+    event_tx: mpsc::Sender<pioneer_observability::work::WorkItem<RuntimeEvent>>,
     event_receivers: std::sync::Mutex<Option<CLIAgentRuntimeEventReceivers>>,
     event_stream: std::sync::Mutex<Option<JoinHandle<()>>>,
     cancellation: CancellationToken,
@@ -3905,7 +3921,15 @@ impl CLIAgentRuntimeSession for OpenCodeCLIAgentRuntimeSession {
                 terminalize_opencode_failure(&mut state, None)
             };
             for event in events {
-                let _ = self.event_tx.send(event).await;
+                let _ = self
+                    .event_tx
+                    .send(pioneer_observability::work::WorkItem::new(
+                        event,
+                        pioneer_observability::work::Boundary::EventLane,
+                        pioneer_observability::work::WorkKind::Event,
+                        pioneer_observability::work::ExecutorRole::Event,
+                    ))
+                    .await;
             }
             if let Err(shutdown) = shutdown {
                 return Err(error.context(format!(
@@ -4007,7 +4031,15 @@ impl CLIAgentRuntimeSession for OpenCodeCLIAgentRuntimeSession {
             complete_opencode_turn(&mut state, "interrupted", None)
         };
         for event in events {
-            let _ = self.event_tx.send(event).await;
+            let _ = self
+                .event_tx
+                .send(pioneer_observability::work::WorkItem::new(
+                    event,
+                    pioneer_observability::work::Boundary::EventLane,
+                    pioneer_observability::work::WorkKind::Event,
+                    pioneer_observability::work::ExecutorRole::Event,
+                ))
+                .await;
         }
         // Resolve the durable waiters even when shutdown itself reports an
         // error. The caller still receives that failure instead of success.
@@ -4438,11 +4470,16 @@ impl OpenCodeCLIAgentRuntimeSession {
         drop(state);
         if emit {
             self.event_tx
-                .send(RuntimeEvent::TurnStarted(RuntimeTurnStarted {
-                    native_thread_id: Some(session.to_owned()),
-                    native_turn_id: turn.to_owned(),
-                    native: None,
-                }))
+                .send(pioneer_observability::work::WorkItem::new(
+                    RuntimeEvent::TurnStarted(RuntimeTurnStarted {
+                        native_thread_id: Some(session.to_owned()),
+                        native_turn_id: turn.to_owned(),
+                        native: None,
+                    }),
+                    pioneer_observability::work::Boundary::EventLane,
+                    pioneer_observability::work::WorkKind::Event,
+                    pioneer_observability::work::ExecutorRole::Event,
+                ))
                 .await
                 .map_err(|_| anyhow!("OpenCode event channel is closed"))?;
         }

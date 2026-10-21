@@ -39,10 +39,12 @@ pub enum DatabaseWorkload {
     ZstdMaintenance,
     ProjectionReceiptCleanup,
     NativeEventCleanup,
+    FrozenStorageMaintenance,
+    HtmlPreviewMaintenance,
 }
 
 impl DatabaseWorkload {
-    pub const CARDINALITY: usize = 19;
+    pub const CARDINALITY: usize = 21;
 
     const fn index(self) -> usize {
         match self {
@@ -65,6 +67,8 @@ impl DatabaseWorkload {
             Self::ZstdMaintenance => 16,
             Self::ProjectionReceiptCleanup => 17,
             Self::NativeEventCleanup => 18,
+            Self::FrozenStorageMaintenance => 19,
+            Self::HtmlPreviewMaintenance => 20,
         }
     }
 
@@ -89,6 +93,8 @@ impl DatabaseWorkload {
             Self::ZstdMaintenance => "zstd.maintenance",
             Self::ProjectionReceiptCleanup => "projection.receipt_cleanup",
             Self::NativeEventCleanup => "cli_runtime.native_event_cleanup",
+            Self::FrozenStorageMaintenance => "frozen_storage.maintenance",
+            Self::HtmlPreviewMaintenance => "html_preview.maintenance",
         }
     }
 }
@@ -449,6 +455,8 @@ mod tests {
             DatabaseWorkload::ZstdMaintenance,
             DatabaseWorkload::ProjectionReceiptCleanup,
             DatabaseWorkload::NativeEventCleanup,
+            DatabaseWorkload::FrozenStorageMaintenance,
+            DatabaseWorkload::HtmlPreviewMaintenance,
         ];
         assert_eq!(workloads.len(), DatabaseWorkload::CARDINALITY);
         assert_eq!(
@@ -473,6 +481,8 @@ mod tests {
                 "zstd.maintenance",
                 "projection.receipt_cleanup",
                 "cli_runtime.native_event_cleanup",
+                "frozen_storage.maintenance",
+                "html_preview.maintenance",
             ]
         );
     }
@@ -532,5 +542,65 @@ mod tests {
             )),
             Some("query_amplification")
         );
+    }
+}
+
+#[cfg(test)]
+mod shared_context_tests {
+    use super::*;
+    #[test]
+    fn nearest_recorder_counts_once_and_parent_is_restored() {
+        let _lock = crate::telemetry::tests::TELEMETRY_TEST_LOCK.lock().unwrap();
+        let old = crate::telemetry_enabled();
+        crate::set_telemetry_enabled(false);
+        crate::set_telemetry_enabled(true);
+        let outer = DatabaseWorkloadTrace::start(DatabaseWorkload::ThreadTreeLoad);
+        let inner = DatabaseWorkloadTrace::start(DatabaseWorkload::TimelinePage);
+        let parent = crate::work::capture().with_database(outer.context());
+        parent.run(|| {
+            let nested = crate::work::capture().with_database(inner.context());
+            assert_eq!(
+                nested.context().unwrap().parent,
+                parent.context().map(|c| c.token)
+            );
+            nested.run(|| {
+                crate::work::current_database().unwrap().record_query(
+                    7,
+                    DatabaseQueryKind::Read,
+                    Duration::from_millis(3),
+                )
+            });
+            crate::work::current_database().unwrap().record_query(
+                8,
+                DatabaseQueryKind::Write,
+                Duration::from_millis(5),
+            );
+        });
+        let a = outer.context.state.lock();
+        let b = inner.context.state.lock();
+        assert_eq!(
+            (
+                a.query_count,
+                a.read_count,
+                a.write_count,
+                a.query_duration_nanos
+            ),
+            (1, 0, 1, 5_000_000)
+        );
+        assert_eq!(
+            (
+                b.query_count,
+                b.read_count,
+                b.write_count,
+                b.query_duration_nanos
+            ),
+            (1, 1, 0, 3_000_000)
+        );
+        drop(a);
+        drop(b);
+        drop(inner);
+        drop(outer);
+        assert!(crate::work::current_database().is_none());
+        crate::set_telemetry_enabled(old);
     }
 }

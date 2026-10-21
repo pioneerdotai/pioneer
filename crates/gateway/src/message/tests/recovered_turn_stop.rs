@@ -27,8 +27,13 @@ fn run(scenario: Scenario) {
                 .enable_all()
                 .build()
                 .unwrap();
-            runtime.block_on(message_future(
-                run_interrupted_cli_runtime_turn_recovery_scenario(
+            let _runtime_observer = pioneer_observability::runtime::register(
+                runtime.handle(),
+                pioneer_observability::runtime::RuntimeRole::GatewayPatch,
+            );
+            _runtime_observer.block_on(
+                &runtime,
+                message_future(run_interrupted_cli_runtime_turn_recovery_scenario(
                     matches!(
                         scenario,
                         Scenario::ObservationActiveBeforeOpen
@@ -39,8 +44,8 @@ fn run(scenario: Scenario) {
                     matches!(scenario, Scenario::ExecutionChild),
                     false,
                     Some(scenario),
-                ),
-            ));
+                )),
+            );
         })
         .unwrap();
     thread.join().unwrap();

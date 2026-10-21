@@ -316,7 +316,10 @@ pub async fn run_catalog_updates(directory: PathBuf, cancellation: CancellationT
     }
     let saved_directory = directory.clone();
     if !matches!(
-        tokio::task::spawn_blocking(move || restore_or_install_catalog(&saved_directory)).await,
+        pioneer_observability::work::spawn_blocking(move || restore_or_install_catalog(
+            &saved_directory
+        ))
+        .await,
         Ok(Ok(()))
     ) {
         tracing::warn!("model catalog cache unavailable; awaiting successful download");
@@ -358,10 +361,12 @@ async fn run_updates(
         let result = match snapshot {
             Ok(snapshot) => {
                 let directory = directory.clone();
-                tokio::task::spawn_blocking(move || prepare_update(&directory, snapshot))
-                    .await
-                    .context("model catalog update task")
-                    .and_then(|result| result)
+                pioneer_observability::work::spawn_blocking(move || {
+                    prepare_update(&directory, snapshot)
+                })
+                .await
+                .context("model catalog update task")
+                .and_then(|result| result)
             }
             Err(error) => Err(error),
         };

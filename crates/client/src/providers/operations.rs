@@ -95,6 +95,7 @@ pub enum ProviderOperationCompletion {
     Login(CLIRuntimeLoginStartResponse),
 }
 struct ProviderWork {
+    work_context: pioneer_observability::work::WorkCarrier,
     operation: ProviderOperation,
     reply: std::sync::mpsc::SyncSender<anyhow::Result<ProviderOperationCompletion>>,
 }
@@ -106,6 +107,7 @@ pub(crate) struct ProviderController {
     active: Option<Identity>,
     prepared: Option<ProviderOperation>,
     sender: Option<std::sync::mpsc::SyncSender<ProviderWork>>,
+    observer: Option<pioneer_observability::queues::QueueObserver>,
     task: Option<std::thread::JoinHandle<()>>,
 }
 impl ProviderController {
@@ -320,13 +322,38 @@ impl ClientCore {
     }
     pub(crate) fn start_provider_operation_controller(self: &Arc<Self>) {
         let (sender, receiver) = std::sync::mpsc::sync_channel::<ProviderWork>(1);
+        let queue_observer = pioneer_observability::queues::QueueObserver::new(
+            pioneer_observability::queues::QueueKind::ClientController,
+            Some(1),
+            "unsupported: controller request payload/shared references are not serialized",
+        );
+        let worker_queue = queue_observer.clone();
         let weak = Arc::downgrade(self);
         let task = std::thread::Builder::new()
             .name("client-provider-actions".into())
             .spawn(move || {
                 while let Ok(work) = receiver.recv() {
+                    worker_queue.dequeued(pioneer_observability::queues::QueueBytes::Unsupported);
+                    let mut processing = worker_queue.processing();
+                    let carrier = work.work_context.clone().received(
+                        pioneer_observability::work::Boundary::StdThread,
+                        pioneer_observability::work::WorkKind::ClientCommand,
+                        pioneer_observability::work::ExecutorRole::ClientController,
+                    );
+                    let _scope = carrier.enter();
+                    let mut active_work = pioneer_observability::live::WorkGuard::start(
+                        pioneer_observability::work::current(),
+                        false,
+                    );
                     let result = work.operation.execute_direct(weak.clone());
+                    let outcome = if result.is_ok() {
+                        pioneer_observability::work::Outcome::Completed
+                    } else {
+                        pioneer_observability::work::Outcome::Failed
+                    };
                     let _ = work.reply.try_send(result);
+                    processing.processed();
+                    active_work.finish(outcome);
                 }
             })
             .expect("provider action worker");
@@ -334,6 +361,7 @@ impl ClientCore {
             .provider_controller
             .lock()
             .expect("provider controller poisoned");
+        owner.observer = Some(queue_observer);
         owner.sender = Some(sender);
         owner.task = Some(task);
     }
@@ -456,20 +484,30 @@ impl ProviderOperation {
             );
         }
         let (reply, receiver) = std::sync::mpsc::sync_channel(1);
-        let queued = core
+        let queue_owner = core
             .provider_controller
             .lock()
-            .expect("provider controller poisoned")
-            .sender
-            .as_ref()
-            .is_some_and(|sender| {
-                sender
-                    .try_send(ProviderWork {
+            .expect("provider controller poisoned");
+        let queued = queue_owner.sender.as_ref().is_some_and(|sender| {
+            pioneer_observability::queues::observe_try_send(
+                queue_owner.observer.as_ref(),
+                pioneer_observability::queues::QueueBytes::Unsupported,
+                || {
+                    sender.try_send(ProviderWork {
+                        work_context: pioneer_observability::work::WorkCarrier::child(
+                            pioneer_observability::work::Boundary::StdThread,
+                            pioneer_observability::work::WorkKind::ClientCommand,
+                            pioneer_observability::work::Trigger::Event,
+                            pioneer_observability::work::ExecutorRole::ClientController,
+                        ),
                         operation: self,
                         reply,
                     })
-                    .is_ok()
-            });
+                },
+            )
+            .is_ok()
+        });
+        drop(queue_owner);
         if !queued {
             return core.finish_provider_operation(
                 &identity,

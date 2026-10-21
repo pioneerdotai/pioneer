@@ -5365,7 +5365,7 @@ mod tests {
                 thread_id: "parent".into(),
             };
             let (sender, receiver) = std::sync::mpsc::channel();
-            *core.thread_request_sender.lock().unwrap() = Some(sender);
+            *core.thread_request_sender.lock().unwrap() = Some(sender.into());
             let initial_scope = if reacquire_scope {
                 Some(core.subscribe(scope.clone(), std::num::NonZeroUsize::new(8).unwrap()))
             } else {
@@ -5373,7 +5373,7 @@ mod tests {
                 None
             };
             let ThreadControllerRequest::Subscribe(first) =
-                receiver.recv_timeout(Duration::from_secs(5)).unwrap()
+                receiver.recv_timeout(Duration::from_secs(5)).unwrap().value
             else {
                 panic!()
             };
@@ -5479,7 +5479,7 @@ mod tests {
             core.publish_gateway_session(&session);
         };
         let (sender, receiver) = std::sync::mpsc::channel();
-        *core.thread_request_sender.lock().unwrap() = Some(sender);
+        *core.thread_request_sender.lock().unwrap() = Some(sender.into());
         connected();
         core.thread_demand_changed(
             &ClientScope::Timeline {
@@ -5487,7 +5487,7 @@ mod tests {
             },
             ClientDemand::Visible,
         );
-        let ThreadControllerRequest::Subscribe(first) = receiver.try_recv().unwrap() else {
+        let ThreadControllerRequest::Subscribe(first) = receiver.try_recv().unwrap().value else {
             panic!()
         };
         core.resume_visible_thread_delivery();
@@ -5525,7 +5525,7 @@ mod tests {
         }
         connected(); // the automatic reconnect retains local ID 7
         core.resume_visible_thread_delivery();
-        let ThreadControllerRequest::Subscribe(current) = receiver.try_recv().unwrap() else {
+        let ThreadControllerRequest::Subscribe(current) = receiver.try_recv().unwrap().value else {
             panic!()
         };
         assert_ne!(current.transport_revision, first.transport_revision);
@@ -5571,7 +5571,7 @@ mod tests {
             ClientDemand::Visible,
         );
         assert!(
-            matches!(receiver.try_recv(), Ok(ThreadControllerRequest::Subscribe(request)) if request.id == "parent")
+            matches!(receiver.try_recv().map(|item| item.value), Ok(ThreadControllerRequest::Subscribe(request)) if request.id == "parent")
         );
         core.shutdown();
         core.resume_visible_thread_delivery();
@@ -5713,7 +5713,7 @@ mod tests {
 
     fn reconciliation_core() -> (
         Arc<ClientCore>,
-        std::sync::mpsc::Receiver<ThreadControllerRequest>,
+        std::sync::mpsc::Receiver<pioneer_observability::work::WorkItem<ThreadControllerRequest>>,
     ) {
         reconciliation_core_with(core())
     }
@@ -5722,7 +5722,7 @@ mod tests {
         core: Arc<ClientCore>,
     ) -> (
         Arc<ClientCore>,
-        std::sync::mpsc::Receiver<ThreadControllerRequest>,
+        std::sync::mpsc::Receiver<pioneer_observability::work::WorkItem<ThreadControllerRequest>>,
     ) {
         core.upsert_thread(thread("a", "ws"));
         core.apply_thread_timeline_page(
@@ -5730,14 +5730,16 @@ mod tests {
             crate::timeline::semantic::TopLevelPageMergeMode::Reset,
         );
         let (sender, receiver) = std::sync::mpsc::channel();
-        *core.thread_request_sender.lock().unwrap() = Some(sender);
+        *core.thread_request_sender.lock().unwrap() = Some(sender.into());
         (core, receiver)
     }
 
     fn reconciliation_request(
-        receiver: &std::sync::mpsc::Receiver<ThreadControllerRequest>,
+        receiver: &std::sync::mpsc::Receiver<
+            pioneer_observability::work::WorkItem<ThreadControllerRequest>,
+        >,
     ) -> ThreadSemanticRequest {
-        let ThreadControllerRequest::Semantic(request) = receiver.try_recv().unwrap() else {
+        let ThreadControllerRequest::Semantic(request) = receiver.try_recv().unwrap().value else {
             panic!("expected timeline request")
         };
         request
@@ -6589,7 +6591,7 @@ mod tests {
                     }
                 }
                 assert!(matches!(
-                    receiver.try_recv().unwrap(),
+                    receiver.try_recv().unwrap().value,
                     ThreadControllerRequest::Resume
                 ));
                 assert_eq!(
@@ -6626,7 +6628,7 @@ mod tests {
                 assert_eq!(receiver.try_iter().count(), 0);
                 core.thread_demand_changed(&scope, ClientDemand::Visible);
                 assert!(matches!(
-                    receiver.try_recv().unwrap(),
+                    receiver.try_recv().unwrap().value,
                     ThreadControllerRequest::Resume
                 ));
                 assert_eq!(
@@ -6725,7 +6727,7 @@ mod tests {
                 assert!(receiver.try_recv().is_err());
                 core.thread_demand_changed(&scope, ClientDemand::Prefetch);
                 assert!(matches!(
-                    receiver.try_recv().unwrap(),
+                    receiver.try_recv().unwrap().value,
                     ThreadControllerRequest::Resume
                 ));
                 core.thread_demand_changed(&scope, ClientDemand::Prefetch);
@@ -6917,7 +6919,7 @@ mod tests {
                     core.fetch_thread_timeline_page(&transport, params.clone())
                         .unwrap();
                     assert!(matches!(
-                        receiver.try_recv().unwrap(),
+                        receiver.try_recv().unwrap().value,
                         ThreadControllerRequest::Resume
                     ));
                 }
@@ -7167,7 +7169,9 @@ mod tests {
             }
             struct AckTransport<'a> {
                 core: &'a ClientCore,
-                receiver: &'a std::sync::mpsc::Receiver<ThreadControllerRequest>,
+                receiver: &'a std::sync::mpsc::Receiver<
+                    pioneer_observability::work::WorkItem<ThreadControllerRequest>,
+                >,
                 fail: bool,
                 terminal_before_response: bool,
                 notification_first: bool,
@@ -8084,7 +8088,7 @@ mod tests {
                 canonical.metadata = None;
                 page.items.push(canonical);
                 let (sender, receiver) = std::sync::mpsc::channel();
-                *core.thread_request_sender.lock().unwrap() = Some(sender);
+                *core.thread_request_sender.lock().unwrap() = Some(sender.into());
                 let transport = Transport {
                     core: &core,
                     page,
@@ -8132,7 +8136,8 @@ mod tests {
                     );
                     let retry = retry_initial_work(&core);
                     core.schedule_planned_timeline_request(retry.pages[0].clone());
-                    let ThreadControllerRequest::Semantic(request) = receiver.try_recv().unwrap()
+                    let ThreadControllerRequest::Semantic(request) =
+                        receiver.try_recv().unwrap().value
                     else {
                         panic!()
                     };
@@ -8224,7 +8229,7 @@ mod tests {
             .begin_thread_semantic_request(initial_work_action())
             .unwrap();
         let (sender, receiver) = std::sync::mpsc::channel();
-        *core.thread_request_sender.lock().unwrap() = Some(sender);
+        *core.thread_request_sender.lock().unwrap() = Some(sender.into());
         let transport = Transport {
             core: &core,
             page,
@@ -8244,7 +8249,7 @@ mod tests {
                 .pending
                 .contains_key(key)
         );
-        assert!(receiver.try_iter().all(|request| !matches!(request,
+        assert!(receiver.try_iter().all(|request| !matches!(request.value,
             ThreadControllerRequest::Semantic(request)
                 if crate::timeline::semantic::semantic_timeline_request_key(&request.action) == key)));
     }
@@ -8292,10 +8297,11 @@ mod tests {
             );
             assert!(core.thread_semantic_in_flight("a").is_empty());
             let (sender, receiver) = std::sync::mpsc::channel();
-            *core.thread_request_sender.lock().unwrap() = Some(sender);
+            *core.thread_request_sender.lock().unwrap() = Some(sender.into());
             core.apply_thread_conversation_event("ws", work_delta(" more"), None);
             core.materialize_demanded_timelines();
-            let ThreadControllerRequest::Semantic(request) = receiver.try_recv().unwrap() else {
+            let ThreadControllerRequest::Semantic(request) = receiver.try_recv().unwrap().value
+            else {
                 panic!("expected initial work request");
             };
             assert!(matches!(
@@ -8368,7 +8374,7 @@ mod tests {
                 core.materialize_demanded_timelines();
                 let retry = retry_initial_work(&core);
                 core.schedule_planned_timeline_request(retry.pages[0].clone());
-                let ThreadControllerRequest::Semantic(request) = receiver.try_recv().unwrap()
+                let ThreadControllerRequest::Semantic(request) = receiver.try_recv().unwrap().value
                 else {
                     panic!()
                 };
@@ -8463,7 +8469,7 @@ mod tests {
             updated.source_updated_at_unix_micros = 5;
             updated.metadata = None;
             let (sender, receiver) = std::sync::mpsc::channel();
-            *core.thread_request_sender.lock().unwrap() = Some(sender);
+            *core.thread_request_sender.lock().unwrap() = Some(sender.into());
             let calls = std::cell::Cell::new(0);
             let request = core
                 .begin_thread_semantic_request(initial_work_action())
@@ -8596,7 +8602,8 @@ mod tests {
             let mut page = empty_work_page(&core);
             page.source_high_watermark = 10;
             page.projection_updated_at_unix_micros = 10;
-            let ThreadControllerRequest::Semantic(request) = receiver.try_recv().unwrap() else {
+            let ThreadControllerRequest::Semantic(request) = receiver.try_recv().unwrap().value
+            else {
                 panic!()
             };
             core.execute_thread_semantic_request(
@@ -8773,7 +8780,7 @@ mod tests {
             })
             .unwrap();
         let (sender, receiver) = std::sync::mpsc::channel();
-        *core.thread_request_sender.lock().unwrap() = Some(sender);
+        *core.thread_request_sender.lock().unwrap() = Some(sender.into());
         let transport = Transport(&core, Default::default());
         core.execute_thread_semantic_request(&transport, request);
         assert_eq!(*transport.1.borrow(), [200, 200, 5, 2]);
@@ -9369,7 +9376,7 @@ mod tests {
 
     fn draft_subscription_core() -> (
         Arc<ClientCore>,
-        std::sync::mpsc::Receiver<ThreadControllerRequest>,
+        std::sync::mpsc::Receiver<pioneer_observability::work::WorkItem<ThreadControllerRequest>>,
     ) {
         let core = crate::catalog_test_support::settings_client();
         {
@@ -9384,7 +9391,7 @@ mod tests {
             core.publish_gateway_session(&session);
         }
         let (sender, receiver) = std::sync::mpsc::channel();
-        *core.thread_request_sender.lock().unwrap() = Some(sender);
+        *core.thread_request_sender.lock().unwrap() = Some(sender.into());
         (core, receiver)
     }
 
@@ -9436,7 +9443,7 @@ mod tests {
         assert_eq!(composer.draft().text, "typed before bootstrap");
         assert_eq!(transport.0.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert!(
-            matches!(receiver.try_recv(), Ok(ThreadControllerRequest::Subscribe(request)) if request.id == id)
+            matches!(receiver.try_recv().map(|item| item.value), Ok(ThreadControllerRequest::Subscribe(request)) if request.id == id)
         );
         assert!(
             receiver.try_recv().is_err(),
@@ -9470,7 +9477,8 @@ mod tests {
                 },
                 NonZeroUsize::new(8).unwrap(),
             );
-            let ThreadControllerRequest::Subscribe(queued) = receiver.try_recv().unwrap() else {
+            let ThreadControllerRequest::Subscribe(queued) = receiver.try_recv().unwrap().value
+            else {
                 panic!()
             };
             core.thread_start_mutation().pending_thread_id = Some(id.clone());
@@ -9518,7 +9526,7 @@ mod tests {
                 id
             );
             assert!(
-                matches!(receiver.try_recv(), Ok(ThreadControllerRequest::Subscribe(request)) if request.id == id)
+                matches!(receiver.try_recv().map(|item| item.value), Ok(ThreadControllerRequest::Subscribe(request)) if request.id == id)
             );
         }
     }
@@ -11880,6 +11888,56 @@ pub(crate) struct ThreadSubscriptionRequest {
     attempt: u32,
 }
 
+#[derive(Clone)]
+pub(crate) struct ThreadControllerSender {
+    inner: std::sync::mpsc::Sender<pioneer_observability::work::WorkItem<ThreadControllerRequest>>,
+    pub(crate) observer: pioneer_observability::queues::QueueObserver,
+}
+impl From<std::sync::mpsc::Sender<pioneer_observability::work::WorkItem<ThreadControllerRequest>>>
+    for ThreadControllerSender
+{
+    fn from(
+        inner: std::sync::mpsc::Sender<
+            pioneer_observability::work::WorkItem<ThreadControllerRequest>,
+        >,
+    ) -> Self {
+        Self {
+            inner,
+            observer: pioneer_observability::queues::QueueObserver::new(
+                pioneer_observability::queues::QueueKind::ClientController,
+                None,
+                "thread request bytes unsupported without serialization",
+            ),
+        }
+    }
+}
+impl ThreadControllerSender {
+    pub(crate) fn send(
+        &self,
+        value: ThreadControllerRequest,
+    ) -> Result<(), std::sync::mpsc::SendError<ThreadControllerRequest>> {
+        use pioneer_observability::{
+            queues::QueueBytes,
+            work::{Boundary, ExecutorRole, WorkItem, WorkKind},
+        };
+        self.inner
+            .send(
+                WorkItem::new(
+                    value,
+                    Boundary::StdThread,
+                    WorkKind::ClientCommand,
+                    ExecutorRole::ClientController,
+                )
+                .observed(self.observer.clone(), QueueBytes::Unsupported),
+            )
+            .map_err(|error| {
+                if let Some((queue, bytes)) = &error.0.queue {
+                    queue.rejected_send(*bytes);
+                }
+                std::sync::mpsc::SendError(error.0.value)
+            })
+    }
+}
 pub(crate) enum ThreadControllerRequest {
     Read(crate::timeline::controller::TimelineReadRequest),
     Semantic(ThreadSemanticRequest),
@@ -12848,7 +12906,18 @@ impl ClientCore {
             .expect("presentation sender poisoned")
             .as_ref()
         {
-            let _ = sender.try_send(());
+            use pioneer_observability::queues::QueueBytes;
+            let observer = self.presentation_observer.in_current_epoch();
+            observer.enqueued(QueueBytes::Known(0));
+            match sender.try_send((pioneer_observability::work::capture(), observer.clone())) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    observer.coalesced_send(QueueBytes::Known(0))
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    observer.rejected_send(QueueBytes::Known(0))
+                }
+            }
         }
     }
 

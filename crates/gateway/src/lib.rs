@@ -143,11 +143,17 @@ const GATEWAY_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// poll stack can exceed Tokio's 2 MiB default in debug builds, so the runtime
 /// uses a bounded 8 MiB worker stack. Keeping this policy here prevents the
 /// standalone and service entry points from drifting apart.
-pub fn build_gateway_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+pub fn build_gateway_runtime() -> std::io::Result<pioneer_observability::runtime::ObservedRuntime> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(GATEWAY_WORKER_STACK_SIZE)
         .build()
+        .map(|runtime| {
+            pioneer_observability::runtime::ObservedRuntime::new(
+                runtime,
+                pioneer_observability::runtime::RuntimeRole::Gateway,
+            )
+        })
 }
 
 fn create_voice_input_supervisor(
@@ -181,6 +187,13 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
 pub async fn run_gateway_until_shutdown_with_startup(
     startup: pioneer_observability::GatewayStartupTrace,
 ) -> Result<()> {
+    struct LocalObservers;
+    impl Drop for LocalObservers {
+        fn drop(&mut self) {
+            pioneer_observability::stop_local_observers();
+        }
+    }
+    let _observers = LocalObservers;
     let result = run_gateway_until_shutdown_inner(&startup).await;
     if result.is_err() {
         startup.finish_failure();
@@ -236,6 +249,9 @@ async fn run_gateway_until_shutdown_inner(
                 "gateway OTLP observability pipeline is unavailable"
             );
         }
+    }
+    if let Err(error) = pioneer_observability::diagnostics::start_local_diagnostics(&runtime_home) {
+        warn!(%error,"local diagnostics unavailable");
     }
     let security_validate_stage =
         startup.stage(pioneer_observability::GatewayStartupStage::SecurityValidate);
@@ -919,7 +935,7 @@ async fn run_gateway_until_shutdown_inner(
                 ),
             }
             let restore_directory = catalog_directory.clone();
-            match tokio::task::spawn_blocking(move || {
+            match pioneer_observability::work::spawn_blocking(move || {
                 pioneer_provider::catalog::runtime::restore_or_install_catalog(
                     restore_directory.as_path(),
                 )
@@ -1144,7 +1160,7 @@ async fn run_gateway_until_shutdown_inner(
         .close()
         .await
         .context("failed to close gateway database connection");
-    match tokio::task::spawn_blocking(move || {
+    match pioneer_observability::work::spawn_blocking(move || {
         pioneer_observability::shutdown_observability(telemetry_shutdown_timeout)
     })
     .await

@@ -116,6 +116,10 @@ pub enum SqliteWriteEvent {
 pub trait SqliteWriteObserver: Send + Sync + 'static {
     fn observe(&self, event: SqliteWriteEvent);
 
+    /// Pure current owner snapshot after mutation, including the oldest of
+    /// the three FIFO class heads. No queue scan or readiness query.
+    fn observe_queue_snapshot(&self, _snapshot: crate::SqliteAdmissionSnapshot) {}
+
     /// Test-only pause after `execute_raw` owns its writer permit. The Gateway
     /// enables this feature only for tests; normal builds omit the hook.
     #[cfg(feature = "test-support")]
@@ -159,6 +163,7 @@ struct Waiter {
 
 #[derive(Default)]
 struct AdmissionState {
+    observation_revision: u64,
     active: bool,
     critical: VecDeque<Waiter>,
     interactive: VecDeque<Waiter>,
@@ -216,6 +221,7 @@ impl Reservation {
             waited: self.acquired_at.saturating_duration_since(self.enqueued_at),
             queue: self.queue,
         });
+        self.inner.observe_queue_snapshot();
     }
 }
 
@@ -240,6 +246,7 @@ impl Drop for Reservation {
                 queue,
             });
         }
+        self.inner.observe_queue_snapshot();
         AdmissionInner::dispatch(dispatch);
     }
 }
@@ -271,6 +278,7 @@ impl Drop for WaitRegistration {
             waited: self.enqueued_at.elapsed(),
             queue,
         });
+        self.inner.observe_queue_snapshot();
         AdmissionInner::dispatch(dispatch);
     }
 }
@@ -297,6 +305,37 @@ impl SqliteWritePermit {
 }
 
 impl AdmissionInner {
+    fn observe_queue_snapshot(&self) {
+        let snapshot = self.queue_observation();
+        self.observer.observe_queue_snapshot(snapshot);
+    }
+
+    fn queue_observation(&self) -> crate::SqliteAdmissionSnapshot {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.observation_revision = state.observation_revision.saturating_add(1);
+        let oldest = [
+            state.critical.front(),
+            state.interactive.front(),
+            state.maintenance.front(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|waiter| waiter.enqueued_at)
+        .min();
+        let queue = state.snapshot();
+        crate::SqliteAdmissionSnapshot::capture(
+            state.observation_revision,
+            queue
+                .critical
+                .saturating_add(queue.interactive)
+                .saturating_add(queue.maintenance),
+            oldest,
+        )
+    }
+
     fn enqueue(
         self: &Arc<Self>,
         class: SqliteWriteClass,
@@ -323,6 +362,7 @@ impl AdmissionInner {
         };
         self.observer
             .observe(SqliteWriteEvent::Enqueued { class, queue });
+        self.observe_queue_snapshot();
         Self::dispatch(dispatch);
         (
             receiver,
@@ -1116,6 +1156,27 @@ mod tests {
         })
     }
 
+    #[test]
+    fn native_current_snapshot_carries_source_order_and_oldest_without_sql() {
+        let inner = admission(SqliteWritePolicy::default());
+        let (sender, _receiver) = oneshot::channel();
+        inner.state.lock().unwrap().maintenance.push_back(Waiter {
+            id: 1,
+            enqueued_at: Instant::now() - Duration::from_millis(90),
+            sender,
+        });
+        let old = inner.queue_observation();
+        inner.state.lock().unwrap().maintenance.clear();
+        let new = inner.queue_observation();
+        assert_eq!((old.depth, new.depth), (1, 0));
+        assert!(old.oldest_waited_ms.unwrap() >= 90);
+        assert_eq!(new.oldest_waited_ms, None);
+        assert!(new.revision > old.revision);
+        assert!(new.sampled_monotonic_ms >= old.sampled_monotonic_ms);
+        // Existing observers still only implement observe; snapshot callback is optional.
+        NoopSqliteWriteObserver.observe_queue_snapshot(new);
+        NoopSqliteWriteObserver.observe_queue_snapshot(old);
+    }
     async fn acquire(inner: &Arc<AdmissionInner>, class: SqliteWriteClass) -> SqliteWritePermit {
         let (receiver, mut registration) = inner.enqueue(class);
         let reservation = receiver.await.expect("reservation");

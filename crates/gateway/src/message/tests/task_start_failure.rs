@@ -19,7 +19,13 @@ fn capture_task_start<R: Send + 'static>(
                 .enable_all()
                 .build()
                 .unwrap();
-            crate::public_error::test_support::capture_events(|| runtime.block_on(future))
+            let _runtime_observer = pioneer_observability::runtime::register(
+                runtime.handle(),
+                pioneer_observability::runtime::RuntimeRole::GatewayPatch,
+            );
+            crate::public_error::test_support::capture_events(|| {
+                _runtime_observer.block_on(&runtime, future)
+            })
         })
         .unwrap()
         .join()

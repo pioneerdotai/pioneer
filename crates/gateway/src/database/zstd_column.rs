@@ -796,7 +796,7 @@ async fn resolve_compression_dictionary(
         .into_iter()
         .map(|row| row.payload.into_bytes())
         .collect::<Vec<_>>();
-    let trained = tokio::task::spawn_blocking(move || {
+    let trained = pioneer_observability::work::spawn_blocking(move || {
         let result = pioneer_sqlite::zstd::train_dictionary(samples.as_slice(), wanted_size);
         #[cfg(test)]
         if let Some(after_training) = after_training {
@@ -875,7 +875,7 @@ async fn prepare_payload_batch(
     let preparations = cache.preparations.clone();
     #[cfg(test)]
     let after_cpu = cache.after_cpu.clone();
-    let (entry, result) = tokio::task::spawn_blocking(move || {
+    let (entry, result) = pioneer_observability::work::spawn_blocking(move || {
         let result = (|| {
             if cancellation
                 .as_ref()

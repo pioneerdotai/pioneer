@@ -38,6 +38,7 @@ enum WorkspaceRequest {
 }
 #[derive(Default)]
 pub(crate) struct WorkspaceController {
+    queue: Option<pioneer_observability::queues::QueueObserver>,
     sender: Option<mpsc::SyncSender<()>>,
     // At most one refresh per retained workspace; hints during a request leave
     // one follow-up. The wake channel carries no domain data and cannot lose it.
@@ -58,8 +59,27 @@ impl WorkspaceController {
         self.reconcile_draft = false;
     }
     fn wake(&self) {
+        let queue = self
+            .queue
+            .as_ref()
+            .map(pioneer_observability::queues::QueueObserver::in_current_epoch);
         if let Some(sender) = &self.sender {
-            let _ = sender.try_send(());
+            if let Some(queue) = &queue {
+                queue.enqueued(pioneer_observability::queues::QueueBytes::Known(0));
+            }
+            match sender.try_send(()) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(_)) => {
+                    if let Some(queue) = &queue {
+                        queue.coalesced_send(pioneer_observability::queues::QueueBytes::Known(0));
+                    }
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    if let Some(queue) = &queue {
+                        queue.rejected_send(pioneer_observability::queues::QueueBytes::Known(0));
+                    }
+                }
+            }
         }
     }
     fn retry_wait(&self, now: Instant) -> Option<Duration> {
@@ -102,6 +122,44 @@ impl Drop for WorkspaceController {
             }
         }
     }
+}
+/// One actual post-wake quantum. The native recv/timeout remains outside this
+/// scope; early shutdown/owner loss and unwind drop an unfinished guard.
+fn run_workspace_cycle(
+    weak: &std::sync::Weak<ClientCore>,
+    mut handle: impl FnMut(&ClientCore, WorkspaceRequest),
+) -> bool {
+    use pioneer_observability::{
+        live::WorkGuard,
+        work::{Boundary, ExecutorRole, Outcome, Trigger, WorkCarrier, WorkKind},
+    };
+    let cycle = WorkCarrier::independent(
+        Boundary::Timer,
+        WorkKind::ClientCommand,
+        Trigger::Reconcile,
+        ExecutorRole::ClientController,
+    );
+    let _scope = cycle.enter();
+    let mut guard = WorkGuard::start(cycle.context(), false);
+    loop {
+        let Some(core) = weak.upgrade() else {
+            return false;
+        };
+        if core.is_stopped() {
+            return false;
+        }
+        let request = core
+            .workspace_controller
+            .lock()
+            .expect("workspace controller poisoned")
+            .next(Instant::now());
+        let Some(request) = request else {
+            break;
+        };
+        handle(&core, request);
+    }
+    guard.finish(Outcome::Completed);
+    true
 }
 impl ClientCore {
     pub(crate) fn queue_workspace_draft_reconciliation(&self) {
@@ -152,6 +210,12 @@ impl ClientCore {
     }
     pub(crate) fn start_workspace_controller(self: &Arc<Self>) {
         let (sender, receiver) = mpsc::sync_channel(1);
+        let queue = pioneer_observability::queues::QueueObserver::new(
+            pioneer_observability::queues::QueueKind::ClientController,
+            Some(1),
+            "coalescing wake tokens only; zero payload bytes; domain state is reconciled separately",
+        );
+        let receiver_queue = queue.clone();
         let weak = Arc::downgrade(self);
         let task = std::thread::Builder::new()
             .name("client-workspace-directory".into())
@@ -169,84 +233,42 @@ impl ClientCore {
                     match wait {
                         Some(wait) => {
                             if matches!(
-                                receiver.recv_timeout(wait),
+                                receiver.recv_timeout(wait).map(|()| {
+                                    receiver_queue.dequeued(
+                                        pioneer_observability::queues::QueueBytes::Known(0),
+                                    );
+                                    receiver_queue.outcome(
+                                        pioneer_observability::queues::QueueOutcome::Processed,
+                                        1,
+                                    );
+                                }),
                                 Err(mpsc::RecvTimeoutError::Disconnected)
                             ) {
                                 return;
                             }
                         }
                         None => {
-                            if receiver.recv().is_err() {
+                            if receiver
+                                .recv()
+                                .map(|()| {
+                                    receiver_queue.dequeued(
+                                        pioneer_observability::queues::QueueBytes::Known(0),
+                                    );
+                                    receiver_queue.outcome(
+                                        pioneer_observability::queues::QueueOutcome::Processed,
+                                        1,
+                                    );
+                                })
+                                .is_err()
+                            {
                                 return;
                             }
                         }
                     }
-                    loop {
-                        let Some(core) = weak.upgrade() else {
-                            return;
-                        };
-                        if core.is_stopped() {
-                            return;
-                        }
-                        let request = core
-                            .workspace_controller
-                            .lock()
-                            .expect("workspace controller poisoned")
-                            .next(Instant::now());
-                        match request {
-                            Some(WorkspaceRequest::ReconcileDraft) => {
-                                if let Some(workspace) = core.navigation_snapshot().workspace_id() {
-                                    core.restore_selected_workspace_thread(workspace);
-                                }
-                            }
-                            Some(WorkspaceRequest::RetryDraft(retry)) => {
-                                let current = core.thread_draft_retry_is_current(&retry);
-                                core.retire_thread_draft_retry(&retry);
-                                if current {
-                                    let _ =
-                                        core.execute_workspace_intent(WorkspaceIntent::NewThread {
-                                            workspace_id: retry.workspace,
-                                        });
-                                }
-                            }
-                            Some(WorkspaceRequest::Bootstrap {
-                                preferred,
-                                connection,
-                            }) if core.gateway_http_generation() == connection => {
-                                if let Ok(reduction) = core.bootstrap_workspace_catalog(preferred) {
-                                    core.load_selected_workspace_directory(
-                                        &reduction.selected.workspace_id,
-                                    );
-                                }
-                            }
-                            Some(WorkspaceRequest::Refresh {
-                                workspace,
-                                connection,
-                            }) if core.gateway_http_generation() == connection
-                                && core.workspace_refresh_is_demanded(&workspace) =>
-                            {
-                                core.refresh_workspace_directory_with_transport(
-                                    &workspace,
-                                    &core.transport_runtime().ws_command_sender(),
-                                );
-                            }
-                            Some(WorkspaceRequest::Command { intent, connection })
-                                if core.gateway_http_generation() == connection =>
-                            {
-                                let operation = core.begin_directory_action(&intent);
-                                let result = core.execute_workspace_intent(intent);
-                                if core.gateway_http_generation() == connection {
-                                    if let Some(operation) = operation {
-                                        core.complete_directory_action(
-                                            operation,
-                                            result.err().map(|error| format!("{error:#}")),
-                                        );
-                                    }
-                                }
-                            }
-                            Some(_) => {}
-                            None => break,
-                        }
+                    if !run_workspace_cycle(&weak, |core, request| {
+                        core.execute_workspace_request(request)
+                    }) {
+                        return;
                     }
                 }
             })
@@ -255,8 +277,62 @@ impl ClientCore {
             .workspace_controller
             .lock()
             .expect("workspace controller poisoned");
+        owner.queue = Some(queue);
         owner.sender = Some(sender);
         owner.task = Some(task);
+    }
+    fn execute_workspace_request(&self, request: WorkspaceRequest) {
+        let core = self;
+        match request {
+            WorkspaceRequest::ReconcileDraft => {
+                if let Some(workspace) = core.navigation_snapshot().workspace_id() {
+                    core.restore_selected_workspace_thread(workspace);
+                }
+            }
+            WorkspaceRequest::RetryDraft(retry) => {
+                let current = core.thread_draft_retry_is_current(&retry);
+                core.retire_thread_draft_retry(&retry);
+                if current {
+                    let _ = core.execute_workspace_intent(WorkspaceIntent::NewThread {
+                        workspace_id: retry.workspace,
+                    });
+                }
+            }
+            WorkspaceRequest::Bootstrap {
+                preferred,
+                connection,
+            } if core.gateway_http_generation() == connection => {
+                if let Ok(reduction) = core.bootstrap_workspace_catalog(preferred) {
+                    core.load_selected_workspace_directory(&reduction.selected.workspace_id);
+                }
+            }
+            WorkspaceRequest::Refresh {
+                workspace,
+                connection,
+            } if core.gateway_http_generation() == connection
+                && core.workspace_refresh_is_demanded(&workspace) =>
+            {
+                core.refresh_workspace_directory_with_transport(
+                    &workspace,
+                    &core.transport_runtime().ws_command_sender(),
+                );
+            }
+            WorkspaceRequest::Command { intent, connection }
+                if core.gateway_http_generation() == connection =>
+            {
+                let operation = core.begin_directory_action(&intent);
+                let result = core.execute_workspace_intent(intent);
+                if core.gateway_http_generation() == connection {
+                    if let Some(operation) = operation {
+                        core.complete_directory_action(
+                            operation,
+                            result.err().map(|error| format!("{error:#}")),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
     }
     pub fn request_workspace_bootstrap(&self, preferred: Option<String>) {
         let mut owner = self
@@ -531,6 +607,134 @@ impl ClientCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn actual_workspace_quantum_is_live_during_handlers_and_terminal_before_idle() {
+        use pioneer_observability::{
+            live::{self, JournalPayload, WorkState},
+            work::{self, Outcome},
+        };
+        let _lock = crate::OBSERVABILITY_TEST_LOCK.lock().unwrap();
+        let old = pioneer_observability::telemetry_enabled();
+        pioneer_observability::set_telemetry_enabled(false);
+        pioneer_observability::set_telemetry_enabled(true);
+        let core = Arc::new(ClientCore::new());
+        struct Cleanup {
+            core: Arc<ClientCore>,
+            enabled: bool,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.core.shutdown();
+                pioneer_observability::set_telemetry_enabled(self.enabled);
+            }
+        }
+        let _cleanup = Cleanup {
+            core: core.clone(),
+            enabled: old,
+        };
+        {
+            let mut owner = core.workspace_controller.lock().unwrap();
+            owner.bootstrap = Some((None, None));
+            owner.refresh.insert("ws".into(), None);
+            owner.commands.push_back((
+                WorkspaceIntent::NewThread {
+                    workspace_id: "ws".into(),
+                },
+                None,
+            ));
+        }
+        let mut order = Vec::new();
+        let mut token = None;
+        run_workspace_cycle(&Arc::downgrade(&core), |_, request| {
+            let current = work::current().unwrap();
+            token = Some(current.token);
+            let snapshot = live::snapshot().unwrap();
+            assert!(
+                snapshot
+                    .active
+                    .iter()
+                    .any(|entry| entry.context.token == current.token
+                        && entry.state == WorkState::Running)
+            );
+            assert!(!snapshot.journal.iter().any(|r| matches!(&r.payload, JournalPayload::Work(w) if w.context.token == current.token && matches!(w.state, WorkState::Terminal(_)))));
+            order.push(match request {
+                WorkspaceRequest::Bootstrap { .. } => "bootstrap",
+                WorkspaceRequest::Command { .. } => "command",
+                WorkspaceRequest::Refresh { .. } => "refresh",
+                _ => panic!("unexpected fixture request"),
+            });
+        });
+        assert_eq!(order, ["bootstrap", "command", "refresh"]);
+        assert!(token.is_some());
+        assert!(
+            live::snapshot()
+                .unwrap()
+                .active
+                .iter()
+                .all(|entry| Some(entry.context.token) != token)
+        ); // native next wake wait owns no active cycle
+        let terminals: Vec<_> = live::snapshot()
+            .unwrap()
+            .journal
+            .iter()
+            .filter_map(|r| match &r.payload {
+                JournalPayload::Work(w) if Some(w.context.token) == token => match w.state {
+                    WorkState::Terminal(outcome) => Some(outcome),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terminals, [Outcome::Completed]);
+        core.workspace_controller.lock().unwrap().bootstrap = Some((None, None));
+        let mut panic_token = None;
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_workspace_cycle(
+                &Arc::downgrade(&core),
+                |_, _| {
+                    panic_token = work::current().map(|c| c.token);
+                    panic!("fake handler panic")
+                }
+            )))
+            .is_err()
+        );
+        core.workspace_controller.lock().unwrap().bootstrap = Some((None, None));
+        let mut cancelled_token = None;
+        assert!(!run_workspace_cycle(&Arc::downgrade(&core), |core, _| {
+            cancelled_token = work::current().map(|c| c.token);
+            core.shutdown();
+        }));
+        assert_eq!(work::current(), None);
+        assert!(!run_workspace_cycle(
+            &std::sync::Weak::new(),
+            |_, _| unreachable!()
+        ));
+        let snapshot = live::snapshot().unwrap();
+        assert!(snapshot.active.iter().all(|entry| {
+            ![token, panic_token, cancelled_token].contains(&Some(entry.context.token))
+        }));
+        for (token, outcome) in [
+            (panic_token, Outcome::Panicked),
+            (cancelled_token, Outcome::Cancelled),
+        ] {
+            assert!(token.is_some());
+            let terminal: Vec<_> = snapshot
+                .journal
+                .iter()
+                .filter_map(|r| match &r.payload {
+                    JournalPayload::Work(w)
+                        if Some(w.context.token) == token
+                            && matches!(w.state, WorkState::Terminal(_)) =>
+                    {
+                        Some(w.state)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(terminal, [WorkState::Terminal(outcome)]);
+        }
+    }
+
     use pioneer_protocol::{
         SandboxMode, SandboxPolicy, ThreadStartParams, ThreadStartResponse, ThreadVisibility,
     };

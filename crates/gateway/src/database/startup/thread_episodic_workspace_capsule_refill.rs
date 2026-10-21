@@ -1826,7 +1826,7 @@ impl ThreadEpisodicMemvidBackend for BlockingRefillTestBackend {
             let native = self.native.clone();
             let ownership = self.ownership.clone();
             let runtime = tokio::runtime::Handle::current();
-            tokio::task::spawn_blocking(move || {
+            pioneer_observability::work::spawn_blocking(move || {
                 let _ownership = ownership;
                 let _ = started.send(());
                 release.recv().map_err(|_| {
@@ -4344,7 +4344,7 @@ mod tests {
             .await
         });
 
-        tokio::task::spawn_blocking(move || started_rx.recv())
+        pioneer_observability::work::spawn_blocking(move || started_rx.recv())
             .await
             .expect("provider-start waiter should join")
             .expect("provider should start");

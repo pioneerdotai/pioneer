@@ -424,6 +424,12 @@ where
             .with_subscriber(dispatch)
             .bind_hub(sentry::Hub::current())
     };
+    let future = pioneer_observability::work::inherit(
+        pioneer_observability::work::Boundary::MessageFreshTask,
+        pioneer_observability::work::WorkKind::Message,
+        pioneer_observability::work::ExecutorRole::Gateway,
+        future,
+    );
     AbortOnDropMessageTask::new(tokio::spawn(future))
         .join()
         .await

@@ -693,7 +693,8 @@ impl ClientCore {
         let mut changed = self.watch_publications();
         let task = std::thread::Builder::new().name("client-settings-model-picker".into()).spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("settings model picker runtime");
-            runtime.block_on(async {
+        let _runtime_observer=pioneer_observability::runtime::register(runtime.handle(),pioneer_observability::runtime::RuntimeRole::ClientHttp);
+            _runtime_observer.block_on(&runtime, async {
                 loop {
                     let work = tokio::select! {
                         result = changed.changed() => {

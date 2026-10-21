@@ -149,6 +149,9 @@ impl GatewayWsCommandSender {
             })
             .map_err(|_| anyhow!("websocket worker is not available"))?;
 
+        let _wait = pioneer_observability::live::WaitGuard::new(
+            pioneer_observability::live::WaitKind::Reply,
+        );
         let result = result_rx
             .recv()
             .map_err(|_| anyhow!("websocket worker dropped initial connect result"))?;
@@ -190,6 +193,9 @@ impl GatewayWsCommandSender {
                 result_tx,
             })
             .map_err(|_| anyhow!("websocket worker is not available"))?;
+        let _wait = pioneer_observability::live::WaitGuard::new(
+            pioneer_observability::live::WaitKind::Reply,
+        );
         result_rx
             .recv()
             .map_err(|_| anyhow!("websocket worker dropped access replacement result"))?
@@ -222,6 +228,10 @@ impl GatewayWsCommandSender {
                 response_tx,
             })
             .map_err(|_| anyhow!("websocket worker is not available"))?;
+        let _wait = pioneer_observability::live::WaitGuard::with_timeout(
+            pioneer_observability::live::WaitKind::Reply,
+            crate::rpc::RPC_REQUEST_TIMEOUT + Duration::from_secs(1),
+        );
         response_rx
             .recv_timeout(crate::rpc::RPC_REQUEST_TIMEOUT + Duration::from_secs(1))
             .map_err(|_| anyhow!("connection renewal unavailable"))?
@@ -1039,6 +1049,10 @@ impl GatewayWsCommandSender {
             })
             .map_err(|_| anyhow!("websocket worker is not available"))?;
 
+        let _wait = pioneer_observability::live::WaitGuard::with_timeout(
+            pioneer_observability::live::WaitKind::Reply,
+            UPLOAD_CHUNK_ACK_TIMEOUT,
+        );
         let response = response_rx
             .recv_timeout(UPLOAD_CHUNK_ACK_TIMEOUT)
             .map_err(|_| anyhow!("timed out waiting for artifact upload chunk ack"))?;
@@ -1132,6 +1146,10 @@ impl GatewayWsCommandSender {
             })
             .map_err(|_| anyhow!("websocket worker is not available"))?;
 
+        let _wait = pioneer_observability::live::WaitGuard::with_timeout(
+            pioneer_observability::live::WaitKind::Reply,
+            UPLOAD_CHUNK_ACK_TIMEOUT,
+        );
         let response = response_rx
             .recv_timeout(UPLOAD_CHUNK_ACK_TIMEOUT)
             .map_err(|_| anyhow!("timed out waiting for skill upload chunk ack"))?;

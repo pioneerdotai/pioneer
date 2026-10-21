@@ -26,7 +26,14 @@ pub(crate) fn run(args: impl Iterator<Item = String>) -> Result<()> {
         .enable_all()
         .build()
         .context("failed to create task invariant scanner runtime")?;
-    let report = runtime.block_on(scanner.scan_sqlite_path(&command.db_path, observed_at_unix))?;
+    let _runtime_observer = pioneer_observability::runtime::register(
+        runtime.handle(),
+        pioneer_observability::runtime::RuntimeRole::CliHelper,
+    );
+    let report = _runtime_observer.block_on(
+        &runtime,
+        scanner.scan_sqlite_path(&command.db_path, observed_at_unix),
+    )?;
 
     if command.json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);

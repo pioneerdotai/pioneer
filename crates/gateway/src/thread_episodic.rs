@@ -13119,7 +13119,7 @@ mod tests {
             };
             let runtime = tokio::runtime::Handle::current();
             let native = self.native.clone();
-            tokio::task::spawn_blocking(move || {
+            pioneer_observability::work::spawn_blocking(move || {
                 let _ = started.send(());
                 // Sender drop on panic releases this blocking task as well.
                 release.recv().map_err(|_| {

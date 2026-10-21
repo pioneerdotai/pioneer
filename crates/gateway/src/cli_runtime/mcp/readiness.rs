@@ -1195,7 +1195,7 @@ pub(crate) async fn opencode_mcp_readiness_for_instance(
     let configured_binary = instance.binary_path.clone();
     let version_for_attestation = version.map(str::to_owned);
     let fingerprints = if instance.enabled && normal_runtime_ready {
-        tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String)> {
+        pioneer_observability::work::spawn_blocking(move || -> anyhow::Result<(String, String)> {
             opencode_executable_fingerprints(&configured_binary, version_for_attestation.as_deref())
         })
         .await

@@ -80,7 +80,7 @@ impl ComputerUseHandler {
             .to_path_buf();
         let snapshot_bytes = frame.png_bytes.clone();
         let write_root = snapshots_root.clone();
-        tokio::task::spawn_blocking(move || {
+        pioneer_observability::work::spawn_blocking(move || {
             write_snapshot_secure(
                 write_root.as_path(),
                 relative_destination.as_path(),

@@ -108,6 +108,10 @@ fi
 cargo build --release -p pioneer-desktop --target "$TARGET"
 cargo build --release -p pioneer-app-updater --target "$TARGET"
 cargo build --release -p pioneer-cli --features computer-use --target "$TARGET"
+if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
+  python3 scripts/packaging/symbol-inputs.py export --target "$TARGET" "$PIONEER_SYMBOL_INPUTS_DIR" \
+    "target/$TARGET/release/pioneer-app" "target/$TARGET/release/pioneer" "target/$TARGET/release/pioneer-app-updater"
+fi
 
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
@@ -169,6 +173,14 @@ ln -s "pioneer.png" "$APPDIR/.DirIcon"
 scripts/packaging/desktop/check-package-contents.sh linux-appdir "$APPDIR"
 
 APPIMAGE_NAME="pioneer-linux-${ARCH}.AppImage"
+strip --strip-debug "$APPDIR/usr/bin/pioneer-app" "$APPDIR/usr/bin/pioneer-app-updater" "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap"
+if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
+  python3 scripts/packaging/symbol-inputs.py record "$APPDIR/usr/bin/pioneer-app" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
+  python3 scripts/packaging/symbol-inputs.py record "$APPDIR/usr/bin/pioneer-app-updater" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
+fi
+if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
+  python3 scripts/packaging/symbol-inputs.py record "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
+fi
 APPIMAGE_PATH="$OUT_DIR/$APPIMAGE_NAME"
 
 if [[ -x "$APPIMAGETOOL_BIN" ]]; then

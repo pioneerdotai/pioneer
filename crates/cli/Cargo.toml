@@ -23,6 +23,7 @@ required-features = ["dev"]
 [dependencies]
 anyhow.workspace = true
 pioneer-config.workspace = true
+toml.workspace = true
 pioneer-cli-mcp-bridge.workspace = true
 pioneer-gateway.workspace = true
 pioneer-observability.workspace = true
@@ -40,3 +41,8 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json"] }
 tempfile = "3"
 dirs.workspace = true
+
+[build-dependencies]
+sha2.workspace = true
+hex.workspace = true
+serde_json.workspace = true

@@ -267,6 +267,7 @@ pub struct PreparedCLIAgentCommand {
 }
 
 pub struct CLIAgentProcess {
+    observation: pioneer_observability::resources::ChildRegistration,
     child: Box<dyn ChildWrapper>,
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
@@ -297,7 +298,14 @@ impl CLIAgentProcess {
     }
 
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
-        self.child.try_wait().context("failed to poll CLI process")
+        let status = self
+            .child
+            .try_wait()
+            .context("failed to poll CLI process")?;
+        if let Some(status) = status {
+            self.observation.exited(status.success());
+        }
+        Ok(status)
     }
 
     pub async fn wait(&mut self) -> Result<ExitStatus> {
@@ -306,6 +314,7 @@ impl CLIAgentProcess {
             .wait()
             .await
             .context("failed to wait for CLI process")?;
+        self.observation.exited(status.success());
         self.wait_for_stderr().await?;
         Ok(status)
     }
@@ -337,6 +346,7 @@ impl CLIAgentProcess {
                     .context("failed to wait for force-killed CLI process")
             }
         }?;
+        self.observation.exited(status.success());
         self.wait_for_stderr().await?;
         Ok(status)
     }
@@ -497,6 +507,11 @@ pub fn spawn_prepared_cli_agent_process(
     let mut child = wrapped
         .spawn()
         .with_context(|| format!("failed to spawn CLI process `{}`", prepared.executable))?;
+    let observation = pioneer_observability::resources::ChildRegistration::register(
+        child.id(),
+        pioneer_observability::resources::ChildRole::CliAgent,
+        prepared.process_generation,
+    );
     let stdin = child.stdin().take();
     let stdout = child.stdout().take();
     let stderr = StderrRing::new_with_redactions(
@@ -515,6 +530,7 @@ pub fn spawn_prepared_cli_agent_process(
     });
 
     Ok(CLIAgentProcess {
+        observation,
         child,
         stdin,
         stdout,
