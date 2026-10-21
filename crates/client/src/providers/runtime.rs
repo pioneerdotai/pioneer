@@ -1375,6 +1375,64 @@ mod tests {
         );
     }
     #[test]
+    fn cli_partial_deltas_preserve_siblings_and_revision_gap_recovers_full_snapshot() {
+        let core = authorized_core();
+        let first = observe(&core, "workspace");
+        core.complete_provider_runtime(&first, Ok(response(10, &["a", "b", "c"])), Instant::now());
+        let before = core.provider_runtime_snapshot("workspace").unwrap();
+        let notify = |revision, id: &str, removed, enabled| {
+            let mut changed = runtime(id);
+            changed.enabled = enabled;
+            if !enabled {
+                changed.status = pioneer_protocol::RuntimeStatus::Disabled;
+            }
+            core.reduce_provider_runtime_notification(
+                &GatewayNotification::CLIRuntimeStatusChanged(
+                    pioneer_protocol::CLIRuntimeStatusChangedNotification {
+                        workspace_id: "workspace".into(),
+                        revision,
+                        runtime: changed,
+                        removed,
+                    },
+                ),
+            );
+        };
+        notify(11, "a", false, false);
+        let disabled = core.provider_runtime_snapshot("workspace").unwrap();
+        assert!(!disabled.runtimes[0].enabled);
+        for index in [1, 2] {
+            assert!(Arc::ptr_eq(
+                &before.runtimes[index],
+                &disabled.runtimes[index]
+            ));
+        }
+        notify(12, "a", true, false);
+        let removed = core.provider_runtime_snapshot("workspace").unwrap();
+        assert_eq!(removed.runtimes.len(), 2);
+        assert!(Arc::ptr_eq(&before.runtimes[1], &removed.runtimes[0]));
+        // Revision 13 was lost. Applying 14 would create a mixed catalog;
+        // the reducer retains rows and requests an authoritative snapshot.
+        notify(14, "b", false, false);
+        assert!(Arc::ptr_eq(
+            &removed,
+            &core.provider_runtime_snapshot("workspace").unwrap()
+        ));
+        let recovery = request(&core, "workspace");
+        core.complete_provider_runtime(&recovery, Ok(response(14, &["b", "c"])), Instant::now());
+        let recovered = core.provider_runtime_snapshot("workspace").unwrap();
+        assert_eq!(recovered.runtimes.len(), 2);
+        notify(13, "a", false, true);
+        assert!(Arc::ptr_eq(
+            &recovered,
+            &core.provider_runtime_snapshot("workspace").unwrap()
+        ));
+        assert!(
+            core.provider_runtime_request_for_test("workspace")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn access_invalidation_drops_data_and_rejects_old_request() {
         let core = authorized_core();
         let work = observe(&core, "workspace");
