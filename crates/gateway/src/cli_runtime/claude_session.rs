@@ -3278,6 +3278,21 @@ impl ClaudeStreamClient {
                 "message".to_owned(),
                 ToolMetadataValue::from_json(JsonValue::String(output.clone())),
             );
+            if matches!(
+                tool.binding.canonical_callable_name.as_str(),
+                "task_wait" | "task_get" | "task_cancel" | "task_accept"
+            ) && tool
+                .binding
+                .metadata
+                .get("serverInstallationId")
+                .and_then(ToolMetadataValue::as_str)
+                == Some("pioneer-task-tools-v1")
+                && let Some(payload) = crate::task_tools::delivered_task_payload(&json!({
+                    "content": block.get("content"), "isError": is_error,
+                }))
+            {
+                metadata.insert("taskResult", ToolMetadataValue::from_json(payload));
+            }
             if let Some(result) = value.get("tool_use_result") {
                 metadata.insert("result", ToolMetadataValue::from_json(result.clone()));
             }
@@ -4821,6 +4836,92 @@ done
                 .contains("permission-malformed"),
             "a disconnected callback is consumed exactly once rather than retried elsewhere"
         );
+    }
+
+    #[tokio::test]
+    async fn claude_task_result_survives_typed_metadata_redaction_only_on_received_success() {
+        use crate::turn_mcp::native_tools::NativeToolFamily;
+        let projection = ResolvedMcpTurnProjection::empty("workspace", "provider-turn")
+            .with_native_tools(
+                NativeToolFamily::Tasks
+                    .definitions()
+                    .into_iter()
+                    .map(|spec| (NativeToolFamily::Tasks, spec))
+                    .collect(),
+                McpProjectionLimits::default(),
+            )
+            .unwrap();
+        let projection =
+            build_claude_mcp_session_launch_projection(projection, "a".repeat(64)).unwrap();
+        let session = uuid::Uuid::parse_str("01900000-0000-7000-8000-000000000031").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (client, mut child, _) = fake_claude_stream_client_with_mcp(
+            &temp.path().join("task-result.log"),
+            session,
+            Some(claude_mcp_event_context(projection, 7)),
+        )
+        .await;
+        bind_claude_mcp_test_turn(&client, session, "provider-turn").await;
+        let mut fixture: JsonValue = serde_json::from_str(include_str!(
+            "../../../cli-agent-runtime/tests/fixtures/claude_mcp/lifecycle.json"
+        ))
+        .unwrap();
+        let payload = json!({"accepted":true,"taskId":"accepted_task","runId":"run","candidateId":"candidate","status":"completed","taskTerminal":true,"finalAnswerAllowed":true});
+        for block in fixture["messages"][0]["message"]["content"]
+            .as_array_mut()
+            .unwrap()
+        {
+            block["name"] = json!("mcp__pioneer__task_accept");
+            block["input"] =
+                json!({"taskId":"accepted_task","runId":"run","candidateId":"candidate"});
+        }
+        for block in fixture["messages"][1]["message"]["content"]
+            .as_array_mut()
+            .unwrap()
+        {
+            block["content"] = json!([{"type":"text","text":payload.to_string()}]);
+        }
+        client.map_message(fixture["messages"][0].clone()).await;
+        let outcomes = client.map_message(fixture["messages"][1].clone()).await;
+        assert_eq!(outcomes.len(), 2);
+        for event in outcomes {
+            let RuntimeEvent::ItemCompleted(item) = &event else {
+                panic!("native completion");
+            };
+            let projected = project_cli_runtime_event(
+                &CLIRuntimeProjectorContext {
+                    workspace_id: "workspace".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    recovery: None,
+                },
+                &event,
+            );
+            let AgentDurableEvent::ItemCompleted { notification } = &projected.durable[0] else {
+                panic!("durable completion");
+            };
+            let TurnItem::DynamicToolCall {
+                storage: pioneer_protocol::ToolStoragePayload::Metadata { metadata },
+                ..
+            } = &notification.item
+            else {
+                panic!("stored metadata");
+            };
+            let metadata = metadata.to_json();
+            let ids = pioneer_agent::observed_terminal_task_outcomes_from_payload(
+                "task_accept",
+                &metadata["taskResult"],
+            );
+            assert_eq!(
+                ids.contains(&pioneer_agent::ObservedTaskOutcome::AcceptedCandidate {
+                    task_id: "accepted_task".into(),
+                    run_id: "run".into(),
+                    candidate_id: "candidate".into()
+                }),
+                item.native_item_id == "call-a"
+            );
+        }
+        child.kill().await.unwrap();
     }
 
     #[tokio::test]

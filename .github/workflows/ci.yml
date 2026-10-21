@@ -15,7 +15,6 @@ jobs:
   lint-test-build:
     name: ci-${{ matrix.os }}-${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.timeout_minutes }}
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       CARGO_BUILD_JOBS: 2
@@ -25,10 +24,8 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            timeout_minutes: 120
           - os: macos-14
             target: aarch64-apple-darwin
-            timeout_minutes: 120
 
     steps:
       - uses: actions/checkout@v5

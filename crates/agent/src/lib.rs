@@ -11,6 +11,8 @@ mod hooks;
 mod manager_recovery;
 #[cfg(test)]
 mod manager_tests;
+mod task_observation;
+pub use task_observation::{ObservedTaskOutcome, observed_terminal_task_outcomes_from_payload};
 pub mod post_turn;
 
 use pioneer_hooks::{HookMetadataKey, HookPhase, HookPhaseRequest, HookRuntime, HookValue};
@@ -448,6 +450,8 @@ pub struct ReviewRequiredTaskObservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalTaskObservation {
     pub task_id: String,
+    pub task_revision: i64,
+    pub accepted_candidate_id: Option<String>,
     pub run_id: Option<String>,
     pub title: String,
     pub status: String,

@@ -1,6 +1,8 @@
 use super::*;
+use crate::message::agent_runtime::TurnFailureRecoveryKind;
 use crate::turn_mcp::invoker::{TurnMcpInvocation, TurnMcpInvocationOrigin, TurnMcpInvoker};
 use crate::turn_mcp::result::CanonicalMcpToolResult;
+use pioneer_protocol::AgentMessagePhase;
 use std::path::Path;
 
 async fn start_task_cli_fixture(
@@ -134,6 +136,1282 @@ async fn invoke_task(
             tokio_util::sync::CancellationToken::new(),
         )
         .await
+}
+
+// Replay provider-shaped native completions through the existing durable item
+// lane. The fixture invokes real task handlers, while no provider process runs.
+async fn deliver_task_cli_outcome(
+    harness: &CliRuntimeSkillPreflightHarness,
+    processor: &Arc<MessageProcessor>,
+    turn_id: &str,
+    call_id: &str,
+    name: &str,
+    arguments: JsonValue,
+    result: &CanonicalMcpToolResult,
+    native_success: bool,
+    identified: bool,
+) {
+    let binding = processor
+        .crud_store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let key = CLIAgentRuntimeSessionKey::new(
+        &binding.workspace_id,
+        &binding.runtime_id,
+        &binding.continuation_thread_id,
+    )
+    .unwrap();
+    let handle = harness.cli_manager.existing_session(&key).await.unwrap();
+    let returned = match binding.runtime_kind.as_str() {
+        "opencode" => result.content.clone(),
+        "claude" => json!({"content":result.content,"isError":result.is_error}),
+        _ => {
+            json!({"content":result.content,"structuredContent":result.structured_content,"isError":result.is_error})
+        }
+    };
+    processor
+        .handle_cli_runtime_timeline_event(
+            handle.instance(),
+            RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                native_thread_id: Some(binding.native_thread_id),
+                native_turn_id: binding.native_turn_id.unwrap(),
+                native_item_id: call_id.into(),
+                item_kind: "mcpToolCall".into(),
+                text: None,
+                summary: vec![],
+                content: vec![],
+                phase: RuntimeAgentMessagePhase::FinalAnswer,
+                metadata: Some(json!({"canonicalCallableName":name,"rawToolName":name,
+            "serverName":if identified {"pioneer_tasks"} else {"foreign"},
+            "serverInstallationId":if identified {"pioneer-task-tools-v1"} else {"foreign"},
+            "providerCallId":call_id,"invocationCorrelationId":format!("fixture-{call_id}"),
+            "sessionGeneration":binding.mcp.unwrap().session_generation,
+            "arguments":arguments,"result":returned,"success":native_success,
+            "status":if native_success {"completed"} else {"failed"},
+            "message":"display preview deliberately contains no task facts"})),
+                native_item_redacted: None,
+                native: None,
+            }),
+        )
+        .await;
+}
+
+async fn observed_cli_tasks(
+    processor: &Arc<MessageProcessor>,
+    turn_id: &str,
+) -> std::collections::BTreeSet<String> {
+    let binding = processor
+        .crud_store
+        .get_cli_runtime_turn_binding(turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    use pioneer_agent::TaskToolProvider;
+    let context = pioneer_agent::TaskTurnContext {
+        workspace_id: binding.workspace_id,
+        thread_id: binding.thread_id,
+        turn_id: turn_id.into(),
+    };
+    let observed = crate::task_tools::observed_terminal_task_outcomes(processor, &context)
+        .await
+        .unwrap();
+    crate::task_tools::GatewayTaskToolProvider::new(Arc::downgrade(processor))
+        .attached_task_finalization_snapshot(context)
+        .await
+        .unwrap()
+        .terminal
+        .into_iter()
+        .filter(|item| item.was_observed(&observed))
+        .map(|item| item.task_id)
+        .collect()
+}
+
+#[test]
+fn cli_accepted_nested_result_keeps_substantive_final_without_another_attempt() {
+    run_standard_stack_message_test("CLI accepted final delivery", async {
+        for kind in [
+            CLIAgentRuntimeKind::Codex,
+            CLIAgentRuntimeKind::Claude,
+            CLIAgentRuntimeKind::OpenCode,
+        ] {
+            let mut config = review_enabled_task_runtime_config();
+            config
+                .review
+                .default_parent_review_for_immediate_attached_agent_tasks = true;
+            let (harness, processor, root) =
+                start_task_cli_fixture_with_task_config(kind, config).await;
+            *harness.cli_session.next_native_turn_id.lock().await =
+                Some(format!("middle_{kind:?}"));
+            let parent = invoke_task(&processor, &root, "parent-create", "task_create", json!({
+                "title":"Integrate research", "goal":"Review research and provide the final explanation",
+                "outputInstructions":"Return the complete explanation."
+            })).await.unwrap().structured_content.unwrap();
+            let middle =
+                wait_for_task_cli_child(&processor, parent["runId"].as_str().unwrap(), None).await;
+            *harness.cli_session.next_native_turn_id.lock().await =
+                Some(format!("researcher_{kind:?}"));
+            let child = invoke_task(&processor, &middle.turn_id, "child-create", "task_create", json!({
+                "title":"Research", "goal":"Return specific evidence", "outputInstructions":"Return all evidence."
+            })).await.unwrap().structured_content.unwrap();
+            let researcher =
+                wait_for_task_cli_child(&processor, child["runId"].as_str().unwrap(), None).await;
+            let research_text = "The build fails because the generated source contract is stale. Regenerate it from the current inputs.";
+            finish_task_cli_child(&harness, &processor, &researcher.turn_id, research_text).await;
+            let args = json!({"runIds":[child["runId"]],"timeoutMs":10000});
+            let review = invoke_task(
+                &processor,
+                &middle.turn_id,
+                "child-wait",
+                "task_wait",
+                args.clone(),
+            )
+            .await
+            .unwrap();
+            let candidate = &review.structured_content.as_ref().unwrap()["reviewRequired"][0];
+            assert_eq!(candidate["reviewContent"]["content"], research_text);
+            assert_eq!(candidate["reviewContent"]["truncated"], false);
+            deliver_task_cli_outcome(
+                &harness,
+                &processor,
+                &middle.turn_id,
+                "child-wait",
+                "task_wait",
+                args,
+                &review,
+                true,
+                true,
+            )
+            .await;
+            assert!(
+                observed_cli_tasks(&processor, &middle.turn_id)
+                    .await
+                    .is_empty(),
+                "reviewRequired is not terminal"
+            );
+            let args = json!({"taskId":child["taskId"],"runId":child["runId"],"candidateId":candidate["candidate"]["id"]});
+            let accepted = invoke_task(
+                &processor,
+                &middle.turn_id,
+                "child-accept",
+                "task_accept",
+                args.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                accepted.structured_content.as_ref().unwrap()["taskTerminal"],
+                true
+            );
+            assert!(
+                observed_cli_tasks(&processor, &middle.turn_id)
+                    .await
+                    .is_empty(),
+                "backend commit alone is not delivery"
+            );
+            deliver_task_cli_outcome(
+                &harness,
+                &processor,
+                &middle.turn_id,
+                "child-accept",
+                "task_accept",
+                args,
+                &accepted,
+                true,
+                true,
+            )
+            .await;
+            assert!(
+                observed_cli_tasks(&processor, &middle.turn_id)
+                    .await
+                    .contains(child["taskId"].as_str().unwrap())
+            );
+            let starts = harness.cli_session.turn_starts.lock().await.len();
+            let final_text = "Regenerate the source contract, commit the generated changes, and rebuild. The research was reviewed and the evidence supports this fix.";
+            finish_task_cli_child(&harness, &processor, &middle.turn_id, final_text).await;
+            assert_eq!(
+                harness.cli_session.turn_starts.lock().await.len(),
+                starts,
+                "{kind:?}: accepted research must not require an ACK attempt"
+            );
+            assert_eq!(
+                processor
+                    .crud_store
+                    .latest_cli_runtime_turn_attempt(&middle.turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .attempt_index,
+                1
+            );
+            let final_item = processor
+                .crud_store
+                .completed_turn_final_answer(
+                    &middle.workspace_id,
+                    &middle.thread_id,
+                    &middle.turn_id,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(final_item, TurnItem::AgentMessage { phase: AgentMessagePhase::FinalAnswer, ref text, .. } if text == final_text)
+            );
+            let upper_review = invoke_task(
+                &processor,
+                &root,
+                "parent-wait",
+                "task_wait",
+                json!({"runIds":[parent["runId"]],"timeoutMs":10000}),
+            )
+            .await
+            .unwrap();
+            let upper = &upper_review.structured_content.as_ref().unwrap()["reviewRequired"][0];
+            assert_eq!(
+                upper["reviewContent"]["content"], final_text,
+                "upper parent receives exactly the accepted final"
+            );
+        }
+    });
+}
+
+#[test]
+fn cli_terminal_outcomes_require_successful_identified_durable_delivery() {
+    run_standard_stack_message_test("CLI terminal outcome recovery", async {
+        for kind in [
+            CLIAgentRuntimeKind::Codex,
+            CLIAgentRuntimeKind::Claude,
+            CLIAgentRuntimeKind::OpenCode,
+        ] {
+            for tool in ["task_wait", "task_get", "task_cancel"] {
+                let (harness, processor, turn_id) = start_task_cli_fixture(kind).await;
+                *harness.cli_session.next_native_turn_id.lock().await =
+                    Some(format!("terminal_child_{kind:?}"));
+                let created = invoke_task(
+                    &processor,
+                    &turn_id,
+                    "terminal-create",
+                    "task_create",
+                    json!({"title":"Terminal child","goal":"Inspect the project"}),
+                )
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+                wait_for_task_cli_child(&processor, created["runId"].as_str().unwrap(), None).await;
+                let id = created["taskId"].as_str().unwrap();
+                let cancel_args = json!({"taskId":id});
+                let cancelled = invoke_task(
+                    &processor,
+                    &turn_id,
+                    "cancel-commit",
+                    "task_cancel",
+                    cancel_args.clone(),
+                )
+                .await
+                .unwrap();
+                assert!(!cancelled.is_error);
+                assert!(observed_cli_tasks(&processor, &turn_id).await.is_empty());
+                let args = if tool == "task_wait" {
+                    json!({"taskIds":[id],"timeoutMs":1})
+                } else {
+                    cancel_args
+                };
+                let result =
+                    invoke_task(&processor, &turn_id, "terminal-outcome", tool, args.clone())
+                        .await
+                        .unwrap();
+                assert!(!result.is_error);
+                deliver_task_cli_outcome(
+                    &harness,
+                    &processor,
+                    &turn_id,
+                    "terminal-outcome",
+                    tool,
+                    args.clone(),
+                    &result,
+                    false,
+                    true,
+                )
+                .await;
+                assert!(
+                    observed_cli_tasks(&processor, &turn_id).await.is_empty(),
+                    "failed native item cannot inherit committed mutation success"
+                );
+                deliver_task_cli_outcome(
+                    &harness,
+                    &processor,
+                    &turn_id,
+                    "foreign-outcome",
+                    tool,
+                    args.clone(),
+                    &result,
+                    true,
+                    false,
+                )
+                .await;
+                assert!(
+                    observed_cli_tasks(&processor, &turn_id).await.is_empty(),
+                    "name alone is not identity"
+                );
+                // Retrying the same committed mutation yields only references,
+                // which must not mask the failed native result.
+                let replay =
+                    invoke_task(&processor, &turn_id, "terminal-outcome", tool, args.clone())
+                        .await
+                        .unwrap();
+                if tool == "task_cancel" {
+                    assert_eq!(
+                        replay.structured_content.as_ref().unwrap()["alreadyCommitted"],
+                        true
+                    );
+                    deliver_task_cli_outcome(
+                        &harness,
+                        &processor,
+                        &turn_id,
+                        "commit-replay",
+                        tool,
+                        args.clone(),
+                        &replay,
+                        true,
+                        true,
+                    )
+                    .await;
+                    assert!(observed_cli_tasks(&processor, &turn_id).await.is_empty());
+                }
+                let revision = processor
+                    .crud_store
+                    .get_task(id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .revision;
+                let received =
+                    invoke_task(&processor, &turn_id, "received-outcome", tool, args.clone())
+                        .await
+                        .unwrap();
+                // A new received native item establishes knowledge; re-reading
+                // the durable source after reconstruction needs no mutation.
+                deliver_task_cli_outcome(
+                    &harness,
+                    &processor,
+                    &turn_id,
+                    "received-outcome",
+                    tool,
+                    args,
+                    &received,
+                    true,
+                    true,
+                )
+                .await;
+                assert_eq!(
+                    processor
+                        .crud_store
+                        .get_task(id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .task
+                        .revision,
+                    revision,
+                    "retry must not repeat the terminal state mutation"
+                );
+                let mut reconstructed = (*processor).clone();
+                reconstructed.crud_store =
+                    Arc::new(CrudStore::new(processor.crud_store.database_connection()));
+                let reconstructed = Arc::new(reconstructed);
+                assert_eq!(
+                    observed_cli_tasks(&reconstructed, &turn_id).await,
+                    std::collections::BTreeSet::from([id.to_owned()])
+                );
+                assert_eq!(
+                    processor
+                        .crud_store
+                        .get_task(id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .task
+                        .status,
+                    TaskStatus::Cancelled
+                );
+                *harness.cli_session.next_native_turn_id.lock().await =
+                    Some(format!("other_child_{kind:?}"));
+                let other = invoke_task(
+                    &processor,
+                    &turn_id,
+                    "other-create",
+                    "task_create",
+                    json!({"title":"Other child","goal":"Inspect another part"}),
+                )
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+                wait_for_task_cli_child(&processor, other["runId"].as_str().unwrap(), None).await;
+                assert!(
+                    !observed_cli_tasks(&processor, &turn_id)
+                        .await
+                        .contains(other["taskId"].as_str().unwrap())
+                );
+                let binding = processor
+                    .crud_store
+                    .get_cli_runtime_turn_binding(&turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let key = CLIAgentRuntimeSessionKey::new(
+                    &binding.workspace_id,
+                    &binding.runtime_id,
+                    &binding.continuation_thread_id,
+                )
+                .unwrap();
+                let handle = harness.cli_manager.existing_session(&key).await.unwrap();
+                processor
+                    .handle_cli_runtime_timeline_event(
+                        handle.instance(),
+                        RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                            native_thread_id: Some(binding.native_thread_id.clone()),
+                            native_turn_id: binding.native_turn_id.clone().unwrap(),
+                            native_item_id: "premature-final".into(),
+                            item_kind: "agentMessage".into(),
+                            text: Some("Premature completion".into()),
+                            summary: vec![],
+                            content: vec![],
+                            phase: RuntimeAgentMessagePhase::FinalAnswer,
+                            metadata: None,
+                            native_item_redacted: None,
+                            native: None,
+                        }),
+                    )
+                    .await;
+                assert!(
+                    matches!(
+                        processor
+                            .crud_store
+                            .get_turn_item(&turn_id, "premature-final")
+                            .await
+                            .unwrap(),
+                        Some(TurnItem::AgentMessage {
+                            phase: AgentMessagePhase::Commentary,
+                            ..
+                        })
+                    ),
+                    "another child still blocks the final"
+                );
+                let args = json!({"taskId":other["taskId"]});
+                let cancelled = invoke_task(
+                    &processor,
+                    &turn_id,
+                    "other-cancel",
+                    "task_cancel",
+                    args.clone(),
+                )
+                .await
+                .unwrap();
+                deliver_task_cli_outcome(
+                    &harness,
+                    &processor,
+                    &turn_id,
+                    "other-cancel",
+                    "task_cancel",
+                    args,
+                    &cancelled,
+                    true,
+                    true,
+                )
+                .await;
+                let starts = harness.cli_session.turn_starts.lock().await.len();
+                finish_task_cli_child(
+                    &harness,
+                    &processor,
+                    &turn_id,
+                    "Child cancellation was observed; the remaining explanation is complete.",
+                )
+                .await;
+                assert_eq!(
+                    harness.cli_session.turn_starts.lock().await.len(),
+                    starts,
+                    "{kind:?}/{tool}: terminal delivery must not add an attempt"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn cli_observation_tracks_the_child_outcome_across_same_run_resume() {
+    run_standard_stack_message_test("CLI same-run observation freshness", async {
+        for kind in [
+            CLIAgentRuntimeKind::Codex,
+            CLIAgentRuntimeKind::Claude,
+            CLIAgentRuntimeKind::OpenCode,
+        ] {
+            for tool in ["task_get", "task_wait"] {
+                let (harness, processor, turn_id) = start_task_cli_fixture(kind).await;
+                harness
+                    .cli_session
+                    .set_next_native_turn_id("resume_a")
+                    .await;
+                let a = invoke_task(
+                    &processor,
+                    &turn_id,
+                    "create-a",
+                    "task_create",
+                    json!({"title":"Child A","goal":"Inspect A"}),
+                )
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+                let a_child =
+                    wait_for_task_cli_child(&processor, a["runId"].as_str().unwrap(), None).await;
+                harness
+                    .cli_session
+                    .set_next_native_turn_id("resume_b")
+                    .await;
+                let b = invoke_task(
+                    &processor,
+                    &turn_id,
+                    "create-b",
+                    "task_create",
+                    json!({"title":"Child B","goal":"Inspect B"}),
+                )
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+                wait_for_task_cli_child(&processor, b["runId"].as_str().unwrap(), None).await;
+                let a_id = a["taskId"].as_str().unwrap();
+                let run_id = a["runId"].as_str().unwrap();
+                assert!(
+                    processor
+                        .mark_turn_blocked(
+                            a_child.thread_id.clone(),
+                            a_child.turn_id.clone(),
+                            "blocked child A".into()
+                        )
+                        .await
+                );
+                processor
+                    .reconcile_terminal_task_child_turns(64)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    processor
+                        .crud_store
+                        .get_task_run_turn_by_turn(&a_child.thread_id, &a_child.turn_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    pioneer_protocol::TaskRunTurnStatus::Blocked
+                );
+                let first_error = processor
+                    .crud_store
+                    .get_task_run(run_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .error;
+                let args = if tool == "task_wait" {
+                    json!({"taskIds":[a_id],"timeoutMs":1})
+                } else {
+                    json!({"taskId":a_id})
+                };
+                let first = invoke_task(&processor, &turn_id, "first-outcome", tool, args.clone())
+                    .await
+                    .unwrap();
+                assert!(!first.is_error);
+                deliver_task_cli_outcome(
+                    &harness,
+                    &processor,
+                    &turn_id,
+                    "first-outcome",
+                    tool,
+                    args.clone(),
+                    &first,
+                    true,
+                    true,
+                )
+                .await;
+                assert!(
+                    observed_cli_tasks(&processor, &turn_id)
+                        .await
+                        .contains(a_id)
+                );
+                let binding = processor
+                    .crud_store
+                    .get_cli_runtime_turn_binding(&turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let state = processor
+                    .cli_task_finalization_state(&binding)
+                    .await
+                    .unwrap();
+                assert!(state.blocks_completion(), "B remains pending");
+                let a_outcomes = state
+                    .snapshot
+                    .terminal
+                    .iter()
+                    .filter(|item| item.task_id == a_id)
+                    .map(|item| item.outcome())
+                    .collect::<std::collections::BTreeSet<_>>();
+                // Both new semantic markers and legacy ID-only markers must not
+                // turn into a bypass after the very same run is reopened.
+                for details in [json!({"outcomes":a_outcomes}), json!({"taskIds":[a_id]})] {
+                    processor
+                        .crud_store
+                        .materialize_item_completed(
+                            ItemCompletedNotification {
+                                workspace_id: binding.workspace_id.clone(),
+                                thread_id: binding.thread_id.clone(),
+                                turn_id: turn_id.clone(),
+                                item: TurnItem::SystemEvent {
+                                    id: pioneer_protocol::generate_id(21),
+                                    level: pioneer_protocol::SystemEventLevel::Info,
+                                    message: "Previously delivered A outcome".into(),
+                                    code: Some("task.terminal.observed".into()),
+                                    details: Some(details),
+                                },
+                            },
+                            now_timestamp_secs(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                let updated = invoke_task(
+                    &processor,
+                    &turn_id,
+                    "update-b",
+                    "task_update",
+                    json!({"taskId":b["taskId"],"title":"Child B still active"}),
+                )
+                .await
+                .unwrap();
+                assert!(!updated.is_error);
+                let mut reconstructed = (*processor).clone();
+                reconstructed.crud_store =
+                    Arc::new(CrudStore::new(processor.crud_store.database_connection()));
+                let processor = Arc::new(reconstructed);
+                assert!(
+                    observed_cli_tasks(&processor, &turn_id)
+                        .await
+                        .contains(a_id),
+                    "B revision cannot invalidate unchanged A after restart"
+                );
+                let before = processor
+                    .crud_store
+                    .get_task(a_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .revision;
+                let now = now_timestamp_secs();
+                let job = processor
+                    .crud_store
+                    .enqueue_recovery_job(
+                        a_child.turn_id.clone(),
+                        "resume-a".into(),
+                        pioneer_protocol::TurnItemType::Reasoning,
+                        None,
+                        pioneer_protocol::RecoveryTrigger::Timeout,
+                        pioneer_protocol::RecoveryAction::BlockResumable,
+                        Some("blocked A".into()),
+                        None,
+                        None,
+                        None,
+                        0,
+                        0,
+                        json!({}),
+                        json!({"base_backoff_secs":0,"max_wall_clock_secs":60}),
+                        now,
+                    )
+                    .await
+                    .unwrap();
+                processor
+                    .crud_store
+                    .mark_recovery_job_terminal(
+                        &job.id,
+                        RecoveryJobStatus::Blocked,
+                        Some("blocked A".into()),
+                        now,
+                    )
+                    .await
+                    .unwrap();
+                let stale_terminal = processor
+                    .crud_store
+                    .prepare_task_terminal_transition(
+                        pioneer_protocol::TaskEventPayload::RunBlocked {
+                            task_id: a_id.into(),
+                            run_id: run_id.into(),
+                            error: first_error.clone(),
+                            blocked_at: now,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let resumed = processor
+                    .crud_store
+                    .resume_task_owned_turn(
+                        &a_child.thread_id,
+                        &a_child.turn_id,
+                        Some(&job.id),
+                        now,
+                        processor.turn_execution_owner_id.as_ref(),
+                        now + 100,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let pioneer_crud::TaskOwnedTurnResumeOutcome::Resumed {
+                    task,
+                    run,
+                    task_run_turn: mut resumed_turn,
+                    ..
+                } = resumed
+                else {
+                    panic!("same-run task-owned resume must succeed");
+                };
+                assert_eq!(run.id, run_id);
+                assert!(task.revision > before);
+                assert!(
+                    processor
+                        .crud_store
+                        .commit_task_terminal_transition(stale_terminal)
+                        .await
+                        .is_err(),
+                    "a terminal write prepared before resume must lose its occurrence fence"
+                );
+                assert_eq!(
+                    processor
+                        .crud_store
+                        .get_task_run(run_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    pioneer_protocol::TaskRunStatus::Running,
+                    "stale terminal rejection must roll back the entire transition"
+                );
+                assert!(
+                    processor
+                        .cli_task_finalization_state(&binding)
+                        .await
+                        .unwrap()
+                        .blocks_completion()
+                );
+                // New terminal outcome deliberately has the same run, status and
+                // error as the first. Only durable task revision differs.
+                let resumed_execution = pioneer_tasks::TaskExecutionHandle::new(
+                    processor.crud_store.clone(),
+                    processor.task_runtime.event_bus(),
+                    a_id.into(),
+                    run_id.into(),
+                );
+                resumed_turn.status = pioneer_protocol::TaskRunTurnStatus::Blocked;
+                resumed_turn.completed_at = Some(now + 1);
+                resumed_execution
+                    .record_task_run_turn_blocked(
+                        resumed_turn.clone(),
+                        first_error.clone(),
+                        now + 1,
+                    )
+                    .await
+                    .unwrap();
+                resumed_execution
+                    .block_run(first_error.clone(), now + 1)
+                    .await
+                    .unwrap();
+                let reblocked = processor
+                    .crud_store
+                    .get_latest_task_run_turn(run_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    reblocked.status,
+                    pioneer_protocol::TaskRunTurnStatus::Blocked
+                );
+                assert_eq!(reblocked.completed_at, Some(now + 1));
+                let revision = processor
+                    .crud_store
+                    .get_task(a_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .revision;
+                resumed_execution
+                    .record_task_run_turn_blocked(resumed_turn, first_error.clone(), now + 2)
+                    .await
+                    .unwrap();
+                resumed_execution
+                    .block_run(first_error, now + 2)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    processor
+                        .crud_store
+                        .get_task(a_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .task
+                        .revision,
+                    revision,
+                    "replaying the new outcome must not project it twice"
+                );
+                assert!(
+                    !observed_cli_tasks(&processor, &turn_id)
+                        .await
+                        .contains(a_id)
+                );
+                let b_args = json!({"taskId":b["taskId"]});
+                let cancelled = invoke_task(
+                    &processor,
+                    &turn_id,
+                    "cancel-b",
+                    "task_cancel",
+                    b_args.clone(),
+                )
+                .await
+                .unwrap();
+                deliver_task_cli_outcome(
+                    &harness,
+                    &processor,
+                    &turn_id,
+                    "cancel-b",
+                    "task_cancel",
+                    b_args,
+                    &cancelled,
+                    true,
+                    true,
+                )
+                .await;
+                let state = processor
+                    .cli_task_finalization_state(&binding)
+                    .await
+                    .unwrap();
+                assert!(state.snapshot.pending.is_empty());
+                assert!(
+                    state.blocks_completion(),
+                    "new A outcome alone still gates finalization"
+                );
+                let mut restarted = (*processor).clone();
+                restarted.crud_store =
+                    Arc::new(CrudStore::new(processor.crud_store.database_connection()));
+                let processor = Arc::new(restarted);
+                assert!(
+                    !observed_cli_tasks(&processor, &turn_id)
+                        .await
+                        .contains(a_id),
+                    "old items and both marker forms cannot cover reopened A"
+                );
+                let latest = invoke_task(&processor, &turn_id, "new-outcome", tool, args.clone())
+                    .await
+                    .unwrap();
+                deliver_task_cli_outcome(
+                    &harness,
+                    &processor,
+                    &turn_id,
+                    "new-outcome",
+                    tool,
+                    args.clone(),
+                    &latest,
+                    false,
+                    true,
+                )
+                .await;
+                assert!(
+                    processor
+                        .cli_task_finalization_state(&binding)
+                        .await
+                        .unwrap()
+                        .blocks_completion(),
+                    "failed delivery cannot observe new A"
+                );
+                deliver_task_cli_outcome(
+                    &harness,
+                    &processor,
+                    &turn_id,
+                    "new-outcome-success",
+                    tool,
+                    args,
+                    &latest,
+                    true,
+                    true,
+                )
+                .await;
+                assert!(
+                    !processor
+                        .cli_task_finalization_state(&binding)
+                        .await
+                        .unwrap()
+                        .blocks_completion()
+                );
+                let starts = harness.cli_session.turn_starts.lock().await.len();
+                let final_text = "A was resumed in its original run and blocked again; B was cancelled. Both current outcomes have been integrated.";
+                finish_task_cli_child(&harness, &processor, &turn_id, final_text).await;
+                assert_eq!(harness.cli_session.turn_starts.lock().await.len(), starts);
+                assert!(
+                    matches!(processor.crud_store.completed_turn_final_answer(&binding.workspace_id, &binding.thread_id, &turn_id).await.unwrap().unwrap(), TurnItem::AgentMessage { ref text, phase:AgentMessagePhase::FinalAnswer, .. } if text == final_text)
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn cli_recovery_delivers_exact_task_facts_and_preserves_substantive_final() {
+    run_standard_stack_message_test("CLI task payload recovery", async {
+        for kind in [
+            CLIAgentRuntimeKind::Codex,
+            CLIAgentRuntimeKind::Claude,
+            CLIAgentRuntimeKind::OpenCode,
+        ] {
+            // 0: fresh recovery, 1: committed receipt before marker, 2: marker before provider start.
+            for window in 0..3 {
+                let mut config = review_enabled_task_runtime_config();
+                config
+                    .review
+                    .default_parent_review_for_immediate_attached_agent_tasks = true;
+                let (harness, processor, root) =
+                    start_task_cli_fixture_with_task_config(kind, config).await;
+                harness
+                    .cli_session
+                    .set_next_native_turn_id("payload_middle")
+                    .await;
+                let parent = invoke_task(&processor, &root, "payload-parent", "task_create", json!({"title":"Integrate recovered work","goal":"Return the full explanation"})).await.unwrap().structured_content.unwrap();
+                let middle =
+                    wait_for_task_cli_child(&processor, parent["runId"].as_str().unwrap(), None)
+                        .await;
+                let turn_id = middle.turn_id.clone();
+                harness
+                    .cli_session
+                    .set_next_native_turn_id("payload_child")
+                    .await;
+                let child = invoke_task(
+                    &processor,
+                    &turn_id,
+                    "payload-create",
+                    "task_create",
+                    json!({"title":"Payload child","goal":"Inspect the project"}),
+                )
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+                wait_for_task_cli_child(&processor, child["runId"].as_str().unwrap(), None).await;
+                let future = invoke_task(&processor, &turn_id, "payload-schedule", "task_create", json!({
+                    "title":"Future project inspection", "goal":"Inspect the project on schedule",
+                    "instructions":["Inspect current project state and report findings without changing files."],
+                    "outputInstructions":"Return a concise status report.",
+                    "trigger":{"kind":"cron","cronExpr":"0 7 * * *","timezone":"Europe/Moscow"}
+                })).await.unwrap().structured_content.unwrap();
+                assert_eq!(future["waitable"], false);
+                let cancelled = invoke_task(
+                    &processor,
+                    &turn_id,
+                    "payload-cancel",
+                    "task_cancel",
+                    json!({"taskId":child["taskId"]}),
+                )
+                .await
+                .unwrap();
+                assert!(!cancelled.is_error);
+                let binding = processor
+                    .crud_store
+                    .get_cli_runtime_turn_binding(&turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let key = CLIAgentRuntimeSessionKey::new(
+                    &binding.workspace_id,
+                    &binding.runtime_id,
+                    &binding.continuation_thread_id,
+                )
+                .unwrap();
+                let handle = harness.cli_manager.existing_session(&key).await.unwrap();
+                let saved_input = if window == 2 {
+                    *harness.cli_session.fail_next_resume.lock().await = true;
+                    processor
+                        .handle_cli_runtime_timeline_event(
+                            handle.instance(),
+                            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                                native_thread_id: Some(binding.native_thread_id.clone()),
+                                native_turn_id: binding.native_turn_id.clone().unwrap(),
+                                status: "completed".into(),
+                                native: None,
+                            }),
+                        )
+                        .await;
+                    let attempt = timeout(Duration::from_secs(10), async {
+                        loop {
+                            let attempt = processor
+                                .crud_store
+                                .latest_cli_runtime_turn_attempt(&turn_id)
+                                .await
+                                .unwrap()
+                                .unwrap();
+                            if attempt.attempt_index == 2
+                                && attempt.status
+                                    == pioneer_crud::CliRuntimeTurnAttemptStatus::Failed
+                            {
+                                break attempt;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        harness.cli_session.turn_starts.lock().await.len(),
+                        3,
+                        "provider never received continuation"
+                    );
+                    assert!(
+                        observed_cli_tasks(&processor, &turn_id)
+                            .await
+                            .contains(child["taskId"].as_str().unwrap())
+                    );
+                    let receipt = processor
+                        .crud_store
+                        .get_cli_runtime_native_event(&format!("{}:task-continuation", attempt.id))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let payload: JsonValue =
+                        serde_json::from_str(&receipt.payload_redacted_json).unwrap();
+                    assert!(
+                        processor
+                            .report_turn_failure(
+                                binding.thread_id.clone(),
+                                turn_id.clone(),
+                                TurnFailureRecoveryKind::RuntimeFailure,
+                                "process lost before task payload delivery".into()
+                            )
+                            .await
+                    );
+                    Some(payload["input"].clone())
+                } else {
+                    let saved = if window == 1 {
+                        // Persist precisely the production renderer's block + semantic
+                        // facts, then model a crash before the separate marker write.
+                        let state = processor
+                            .cli_task_finalization_state(&binding)
+                            .await
+                            .unwrap();
+                        let input = serde_json::to_value(vec![
+                            pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text {
+                                text: state.continuation_text(),
+                            },
+                        ])
+                        .unwrap();
+                        let now = chrono::Utc::now().fixed_offset();
+                        let receipt = pioneer_crud::NewCliRuntimeNativeEvent {
+                            id: "crashed-task-input".into(),
+                            runtime_id: binding.runtime_id.clone(),
+                            runtime_kind: binding.runtime_kind.clone(),
+                            workspace_id: Some(binding.workspace_id.clone()),
+                            thread_id: Some(binding.thread_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            native_thread_id: Some(binding.native_thread_id.clone()),
+                            native_turn_id: binding.native_turn_id.clone(),
+                            native_method: "gateway/task_continuation".into(),
+                            payload_redacted_json: json!({"input":input,"terminalObservations":state.continuation_outcomes()}).to_string(),
+                            sequence: now.timestamp_millis(),
+                            created_at: now,
+                        };
+                        processor
+                            .crud_store
+                            .append_cli_runtime_native_event(receipt)
+                            .await
+                            .unwrap();
+                        assert!(
+                            observed_cli_tasks(&processor, &turn_id).await.is_empty(),
+                            "receipt commit is not observation"
+                        );
+                        Some(input)
+                    } else {
+                        None
+                    };
+                    processor
+                        .handle_cli_runtime_timeline_event(
+                            handle.instance(),
+                            RuntimeEvent::TurnInterrupted(RuntimeTurnInterrupted {
+                                native_thread_id: Some(binding.native_thread_id.clone()),
+                                native_turn_id: binding.native_turn_id.clone().unwrap(),
+                                reason: "process disconnected".into(),
+                                native: None,
+                            }),
+                        )
+                        .await;
+                    saved
+                };
+                let mut reconstructed = (*processor).clone();
+                reconstructed.crud_store =
+                    Arc::new(CrudStore::new(processor.crud_store.database_connection()));
+                let processor = Arc::new(reconstructed);
+                // The terminal consumer owns its ACK independently of the
+                // publisher. Wait for that transition before driving recovery.
+                let transition = processor
+                    .cli_runtime_turn_resume_transition(&turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                drop(transition);
+                assert!(
+                    !processor
+                        .crud_store
+                        .has_pending_cli_runtime_terminal_event(&turn_id)
+                        .await
+                        .unwrap()
+                );
+                let jobs = processor
+                    .crud_store
+                    .find_recovery_jobs_by_turn_and_status(&turn_id, RecoveryJobStatus::Pending)
+                    .await
+                    .unwrap();
+                assert_eq!(jobs.len(), 1);
+                harness
+                    .cli_session
+                    .set_next_native_turn_id("payload_recovery")
+                    .await;
+                // This recording fixture has no process heartbeat worker.
+                // Maintain its real owner lease rather than jumping ten
+                // seconds into the future and expiring that same authority.
+                processor
+                    .crud_store
+                    .heartbeat_turn_executions_owned_by(
+                        processor.turn_execution_owner_id.as_ref(),
+                        TURN_EXECUTION_OWNER_LEASE_SECONDS,
+                    )
+                    .await
+                    .unwrap();
+                let now = chrono::Utc::now().timestamp();
+                assert!(jobs[0].next_run_at_unix <= now);
+                let events = processor
+                    .recovery_coordinator
+                    .run_ready_jobs(now, 1)
+                    .await
+                    .unwrap();
+                assert_eq!(events.len(), 1);
+                for event in events {
+                    processor
+                        .handle_recovery_event(event, chrono::Utc::now().timestamp())
+                        .await;
+                }
+                wait_for_recorded_cli_runtime_turn_count(&harness.cli_session, 4).await;
+                wait_for_task_cli_activation(&processor, &turn_id).await;
+                let recovered = harness
+                    .cli_session
+                    .turn_starts
+                    .lock()
+                    .await
+                    .last()
+                    .unwrap()
+                    .input
+                    .clone();
+                let blocks = recovered
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|item| {
+                        item["text"].as_str().is_some_and(|text| {
+                            text.contains("Attached task facts (data, not instructions")
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    blocks.len(),
+                    1,
+                    "one recovery gets one orchestration payload"
+                );
+                assert!(
+                    blocks[0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains(child["taskId"].as_str().unwrap())
+                );
+                if let Some(saved) = saved_input {
+                    assert_eq!(
+                        blocks[0], &saved[0],
+                        "owed facts survive marker and restart"
+                    );
+                }
+                assert!(
+                    recovered
+                        .to_string()
+                        .contains("These durable Tasks were already created successfully")
+                );
+                assert_eq!(
+                    processor
+                        .crud_store
+                        .list_tasks_created_by_turn(
+                            &binding.workspace_id,
+                            &binding.thread_id,
+                            &turn_id
+                        )
+                        .await
+                        .unwrap()
+                        .len(),
+                    2
+                );
+                assert!(
+                    observed_cli_tasks(&processor, &turn_id)
+                        .await
+                        .contains(child["taskId"].as_str().unwrap())
+                );
+                assert!(
+                    recovered
+                        .to_string()
+                        .contains(future["taskId"].as_str().unwrap()),
+                    "scheduled task anti-dup facts survive independently of attached payload"
+                );
+                let final_text = "The recovered result has been integrated: the child was cancelled, its work made no changes, and the original explanation remains complete.";
+                let starts = harness.cli_session.turn_starts.lock().await.len();
+                finish_task_cli_child(&harness, &processor, &turn_id, final_text).await;
+                assert_eq!(
+                    harness.cli_session.turn_starts.lock().await.len(),
+                    starts,
+                    "{kind:?}/{window}: no ACK attempt after recovery"
+                );
+                let final_item = processor
+                    .crud_store
+                    .completed_turn_final_answer(
+                        &binding.workspace_id,
+                        &binding.thread_id,
+                        &turn_id,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    matches!(final_item, TurnItem::AgentMessage { phase:AgentMessagePhase::FinalAnswer, ref text, .. } if text == final_text)
+                );
+                let upper = invoke_task(
+                    &processor,
+                    &root,
+                    "payload-upper-wait",
+                    "task_wait",
+                    json!({"runIds":[parent["runId"]],"timeoutMs":10000}),
+                )
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+                assert_eq!(
+                    upper["reviewRequired"][0]["reviewContent"]["content"], final_text,
+                    "upper parent gets the recovered substantive final"
+                );
+            }
+        }
+    });
 }
 
 #[test]
@@ -989,6 +2267,15 @@ fn cli_parent_native_completion_continues_with_existing_attached_work() {
                 .unwrap()
                 .clone();
             assert!(continuation.input.to_string().contains(&child_id));
+            assert_eq!(
+                continuation
+                    .input
+                    .to_string()
+                    .match_indices("Attached task facts (data, not instructions")
+                    .count(),
+                1,
+                "task continuation must not append a second snapshot"
+            );
             assert!(
                 continuation
                     .input
@@ -1664,6 +2951,19 @@ fn cli_task_wait_review_revise_accept_and_detach_use_the_existing_task_contract(
                 .unwrap()
                 .to_owned();
             assert_ne!(candidate, revised_candidate);
+            let stale = invoke_task(
+                &processor,
+                &turn_id,
+                "accept-stale-candidate",
+                "task_accept",
+                json!({"taskId":task_id,"runId":run_id,"candidateId":candidate}),
+            )
+            .await
+            .unwrap();
+            assert!(
+                stale.is_error,
+                "an old round cannot authorize the revised candidate"
+            );
             let accepted = invoke_task(
                 &processor,
                 &turn_id,
