@@ -32,15 +32,16 @@ fn cli_probe_failure_reaches_execution_and_never_repeats_an_accepted_turn() {
                             .is_none(),
                         "first operation has no successful catalog"
                     );
+                    let list_request_id = generate_test_request_id("probe", "no-models");
                     let list_request = json!({
-                        "jsonrpc":"2.0", "id":"probe-no-models", "method": pioneer_protocol::constants::methods::CLI_RUNTIME_LIST_MODELS,
+                        "jsonrpc":"2.0", "id":list_request_id, "method": pioneer_protocol::constants::methods::CLI_RUNTIME_LIST_MODELS,
                         "params": { "workspace_id": harness.workspace_id, "runtime_id": harness.runtime_id },
                     }).to_string();
                     harness
                         .processor
                         .process_request_for_connection(harness.connection_id, &list_request)
                         .await;
-                    let response = recv_response_by_id(&mut harness.rx, "probe-no-models").await;
+                    let response = recv_response_by_id(&mut harness.rx, &list_request_id).await;
                     let catalog: pioneer_protocol::CLIRuntimeListModelsResponse =
                         serde_json::from_value(response.result).unwrap();
                     assert!(catalog.models.is_empty());
@@ -61,8 +62,9 @@ fn cli_probe_failure_reaches_execution_and_never_repeats_an_accepted_turn() {
                     *harness.cli_session.next_turn_start_error.lock().await =
                         Some("synthetic execution authorization failure".into());
                 }
+                let request_id = generate_test_request_id("probe", "isolation");
                 let request = cli_runtime_turn_start_request_with_capabilities(
-                    "probe-isolation",
+                    &request_id,
                     thread_id,
                     turn_id,
                     &harness.runtime_id,
@@ -73,7 +75,7 @@ fn cli_probe_failure_reaches_execution_and_never_repeats_an_accepted_turn() {
                     .processor
                     .process_request_for_connection(harness.connection_id, &request)
                     .await;
-                let response = recv_response_by_id(&mut harness.rx, "probe-isolation").await;
+                let response = recv_response_by_id(&mut harness.rx, &request_id).await;
                 let accepted: TurnStartResponse = serde_json::from_value(response.result)
                     .expect("admission must reach the recording runtime");
                 assert_eq!(accepted.turn.id, turn_id);
@@ -166,8 +168,9 @@ fn cli_probe_failure_does_not_bypass_technical_mcp_admission() {
             harness.processor = harness
                 .processor
                 .with_cli_mcp_readiness_override_for_tests(unavailable);
+            let request_id = generate_test_request_id("probe", "mcp");
             let request = cli_runtime_turn_start_request_with_capabilities(
-                "probe-mcp",
+                &request_id,
                 "probe-mcp-thread",
                 "probe-mcp-turn",
                 &harness.runtime_id,
@@ -194,7 +197,7 @@ fn cli_probe_failure_does_not_bypass_technical_mcp_admission() {
                 .processor
                 .process_request_for_connection(harness.connection_id, &request)
                 .await;
-            let payload = recv_jsonrpc_payload_by_id(&mut harness.rx, "probe-mcp").await;
+            let payload = recv_jsonrpc_payload_by_id(&mut harness.rx, &request_id).await;
             let error: JsonRpcErrorResponse = serde_json::from_str(&payload)
                 .expect("unsupported MCP admission must return an error, not accept the turn");
             assert_public_error(
@@ -299,8 +302,9 @@ fn cli_probe_failure_cannot_admit_a_disabled_or_deleted_configuration() {
                     )
                     .unwrap();
                 crate::settings::save_gateway_settings(&path, &settings).unwrap();
+                let request_id = generate_test_request_id("probe", "config");
                 let request = cli_runtime_turn_start_request_with_capabilities(
-                    "probe-config",
+                    &request_id,
                     "probe-config-thread",
                     "probe-config-turn",
                     &harness.runtime_id,
@@ -311,7 +315,7 @@ fn cli_probe_failure_cannot_admit_a_disabled_or_deleted_configuration() {
                     .processor
                     .process_request_for_connection(harness.connection_id, &request)
                     .await;
-                let _error = recv_error_by_id(&mut harness.rx, "probe-config").await;
+                let _error = recv_error_by_id(&mut harness.rx, &request_id).await;
                 assert_eq!(harness.cli_session.factory_starts.load(Ordering::SeqCst), 0);
                 assert!(harness.cli_session.turn_starts.lock().await.is_empty());
             }
