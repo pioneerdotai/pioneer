@@ -571,6 +571,17 @@ async fn ephemeral_cli_execution_is_fenced_by_its_registered_runtime_source() {
     actor.role_label = None;
     profile.compatible_agent_identity_ids.push(actor.id.clone());
     profile.compatible_agent_identity_ids.sort();
+    // Match the production derivation when extending a profile to an
+    // execution-local identity; the parent profile itself remains immutable.
+    profile.fingerprint = hex::encode(Sha256::digest(
+        format!(
+            "agent-derived-profile\0{}\0{}",
+            profile.fingerprint,
+            actor.id.as_str()
+        )
+        .as_bytes(),
+    ));
+    child.child_execution.resolved_profile_fingerprint = Some(profile.fingerprint.clone());
     child.identity.id = actor.id.as_str().to_owned();
     child.identity.source_kind = SOURCE_EPHEMERAL.to_owned();
     child.identity.source_id = "ephemeral:test".to_owned();
