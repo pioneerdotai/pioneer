@@ -46803,6 +46803,23 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
         })
         .expect("native Agent work must execute in an exact Composer child")
         .clone();
+    let admission = harness
+        .crud_store
+        .get_task_execution_admission(&native_task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let saved_authority =
+        crate::authorization::ExecutionAuthorizationContext::load_for_task_admission(
+            harness.crud_store.as_ref(),
+            &admission,
+        )
+        .await
+        .unwrap();
+    assert!(
+        saved_authority.granted_skill_ids().contains(&skill_id_text),
+        "the Agent skill must already belong to the saved Task allowance"
+    );
     let native_run_id =
         wait_for_task_run_id(harness.crud_store.clone(), native_task.id.as_str()).await;
     let native_child =

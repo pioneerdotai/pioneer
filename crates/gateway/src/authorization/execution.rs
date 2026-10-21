@@ -1605,6 +1605,17 @@ impl ExecutionAuthorizationContext {
     ) -> Result<Self> {
         revalidated.verify_context(self)?;
         let mut resolved = self.clone();
+        // Older non-composer CLI Task admissions encode the selected runtime
+        // as a provider grant. Its registry fingerprint is an immutable source
+        // fence, not an API credential that can be refreshed or constructed.
+        if self.continuation_provider().is_some_and(|(provider, _)| {
+            provider
+                .strip_prefix("cli_runtime:")
+                .is_some_and(|id| !id.is_empty())
+        }) {
+            self.verify_current_provider_authority(registry)?;
+            return Ok(resolved);
+        }
         if let Some(provider) = resolved.grant_manifest.provider.as_mut() {
             let (kind, role) = self.registered_role_identity()?;
             let policy = AuthorizationService::new();
@@ -3667,6 +3678,10 @@ impl ExecutionAuthorizationAdmission {
             root_route_grants: Vec::new(),
             runtime_draft: None,
         })
+    }
+
+    pub(crate) fn initiating_principal_id(&self) -> &PrincipalId {
+        &self.initiating_principal_id
     }
 
     pub(crate) const fn uses_scoped_collaboration_policy(&self) -> bool {

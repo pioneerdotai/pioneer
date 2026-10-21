@@ -666,6 +666,62 @@ async fn native_source_disable_between_preparation_and_commit_is_not_a_connectio
 }
 
 #[tokio::test]
+async fn legacy_cli_task_provider_grant_is_not_resolved_as_an_api_connection() {
+    let registry = test_provider();
+    let (processor, workspace) = processor_with_registry(registry.clone()).await;
+    let mut params = detached_cli_task_create_params(
+        &workspace,
+        "continuity-root",
+        "continuity-parent",
+        "codex",
+        CLIAgentRuntimeKind::Codex,
+        "pinned-cli-model",
+        "legacy CLI admission",
+    );
+    params.metadata = None;
+    let response = create_task_for_test(&processor, params).await.unwrap();
+    let admission = processor
+        .crud_store
+        .get_task_execution_admission(&response.task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let context = crate::authorization::ExecutionAuthorizationContext::load_for_task_admission(
+        processor.crud_store.as_ref(),
+        &admission,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        context.continuation_provider(),
+        Some(("cli_runtime:codex", "pinned-cli-model"))
+    );
+    assert!(
+        registry
+            .available_authority_fingerprint_for_workspace(&workspace, "cli_runtime:codex")
+            .is_err()
+    );
+    let before = context.to_persisted_json().unwrap();
+    let revalidated = processor
+        .execution_leases
+        .revalidate_context(
+            processor.crud_store.as_ref(),
+            &context,
+            crate::authorization::ResourceAction::TaskCreate,
+            processor.current_authorization_revision().await.unwrap(),
+        )
+        .await
+        .unwrap();
+    let resolved = context
+        .resolve_new_task_provider_authority(&registry, &revalidated)
+        .unwrap();
+    assert_eq!(resolved.to_persisted_json().unwrap(), before);
+    resolved
+        .verify_current_provider_authority(&registry)
+        .unwrap();
+}
+
+#[tokio::test]
 async fn api_task_rotates_connection_only_after_current_authorization_and_keeps_saved_envelope() {
     let key = Arc::new(std::sync::RwLock::new("key-one".to_owned()));
     let registry = Arc::new(pioneer_provider::ProviderRegistry::new({
@@ -839,10 +895,22 @@ async fn api_task_rotates_connection_only_after_current_authorization_and_keeps_
             .resolve_new_task_provider_authority(&registry, &revalidated)
             .is_err()
     );
-    // Revoke all collaborators in this isolated fixture. Rotating credentials
-    // cannot turn a saved allowance into proof of current capsule access.
-    use sea_orm::{EntityTrait, sea_query::Expr};
+    // Downgrade and suspend the isolated initiator atomically: a superuser
+    // cannot itself have suspended status. A rotated key cannot restore access.
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr};
     pioneer_entity::gateway_principal::Entity::update_many()
+        .filter(
+            pioneer_entity::gateway_principal::Column::Id
+                .eq(context.initiating_principal_id().as_str()),
+        )
+        .col_expr(
+            pioneer_entity::gateway_principal::Column::Kind,
+            Expr::value("user"),
+        )
+        .col_expr(
+            pioneer_entity::gateway_principal::Column::RoleKey,
+            Expr::value("member"),
+        )
         .col_expr(
             pioneer_entity::gateway_principal::Column::Status,
             Expr::value("suspended"),
