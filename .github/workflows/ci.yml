@@ -57,6 +57,8 @@ jobs:
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       CARGO_BUILD_JOBS: 2
+      RUSTUP_TOOLCHAIN: 1.99.1
+      CARGO_LLVM_COV_TARGET_DIR: ${{ github.workspace }}/target/coverage
     strategy:
       fail-fast: false
       matrix:
@@ -68,10 +70,11 @@ jobs:
           submodules: recursive
 
       - name: setup-rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.99.1
           targets: x86_64-unknown-linux-gnu
-          components: rustfmt
+          components: rustfmt, llvm-tools-preview
 
       - name: configure-linux-build-profile
         shell: bash
@@ -82,9 +85,11 @@ jobs:
       - name: rust-cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-x86_64-unknown-linux-gnu-no-debug-v1
+          shared-key: ci-x86_64-unknown-linux-gnu-coverage-v1-rust-1.99.1
+          workspaces: . -> target/coverage
 
       - name: rustfmt-check
+        id: fmt
         if: matrix.shard == 1
         shell: bash
         run: |
@@ -131,27 +136,132 @@ jobs:
           # Official pre-built binary; pin the same version on every shard.
           curl -LsSf https://get.nexte.st/0.9.149/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
 
+      - name: install-coverage-tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -LsSf https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.1/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz \
+            | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: install-coverage-parser
+        run: |
+          python -m pip install --only-binary=:all: -r scripts/coverage/requirements.txt
+
+      - name: prepare-coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Restore instrumented dependencies, then clear workspace artifacts and old profiles.
+          cargo llvm-cov clean --locked --workspace
+          rm -rf coverage-shard target/coverage-nextest
+          mkdir coverage-shard
+          rustc --print cfg --target x86_64-unknown-linux-gnu > coverage-shard/target-cfg.txt
+
       - name: cargo-nextest-workspace
         id: nextest
         shell: bash
         run: |
           set -euo pipefail
           # Tests may create multithreaded Tokio runtimes: start with two at once.
-          cargo nextest run --locked --workspace --partition hash:${{ matrix.shard }}/4 \
+          cargo llvm-cov nextest --locked --workspace --no-report --no-cfg-coverage \
+            --profile coverage --partition hash:${{ matrix.shard }}/4 \
             --test-threads 2 --no-fail-fast --retries 0 \
-            --status-level pass --final-status-level fail --failure-output immediate-final
+            --status-level pass --final-status-level fail --failure-output immediate-final \
+            --cargo-message-format json-render-diagnostics > coverage-shard/build.jsonl
 
       - name: cargo-test-doctests
+        id: doctests
         if: ${{ !cancelled() && matrix.shard == 1 && (steps.nextest.outcome == 'success' || steps.nextest.outcome == 'failure') }}
         shell: bash
         run: |
           set -euo pipefail
           cargo test --locked --workspace --doc
 
+      - name: export-coverage-shard
+        env:
+          COVERAGE_NEXTEST_RESULT: ${{ steps.nextest.outcome }}
+          COVERAGE_FMT_RESULT: ${{ steps.fmt.outcome }}
+          COVERAGE_DOCTESTS_RESULT: ${{ steps.doctests.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo llvm-cov report --locked --lcov --no-default-ignore-filename-regex \
+            --output-path coverage-shard/raw.lcov
+          python scripts/coverage/coverage.py pack --shard ${{ matrix.shard }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-shard-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
+          path: coverage-shard/
+          if-no-files-found: error
+          retention-days: 7
+
+  coverage:
+    name: ci-linux-production-coverage
+    needs: linux-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: install-coverage-parser
+        run: |
+          python -m pip install --only-binary=:all: -r scripts/coverage/requirements.txt
+
+      # Exact names bind downloads to this run AND attempt. A missing shard is fatal.
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage-shard-${{ github.run_id }}-${{ github.run_attempt }}-1
+          path: coverage-input/shard-1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage-shard-${{ github.run_id }}-${{ github.run_attempt }}-2
+          path: coverage-input/shard-2
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage-shard-${{ github.run_id }}-${{ github.run_attempt }}-3
+          path: coverage-input/shard-3
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage-shard-${{ github.run_id }}-${{ github.run_attempt }}-4
+          path: coverage-input/shard-4
+
+      - name: merge-production-coverage
+        env:
+          COVERAGE_LINUX_RESULT: ${{ needs.linux-tests.result }}
+        run: python scripts/coverage/coverage.py merge --input coverage-input
+
+      - name: upload-production-coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-production-coverage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: coverage-report/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: publish-coverage-summary
+        shell: bash
+        run: cat coverage-report/summary.md >> "$GITHUB_STEP_SUMMARY"
+
   linux-result:
     # Preserve the Linux check name used by branch protection.
     name: ci-ubuntu-latest-x86_64-unknown-linux-gnu
-    needs: linux-tests
+    needs: [linux-tests, coverage]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -159,9 +269,12 @@ jobs:
       - name: require-all-linux-checks
         env:
           LINUX_RESULT: ${{ needs.linux-tests.result }}
+          COVERAGE_RESULT: ${{ needs.coverage.result }}
         shell: bash
         run: |
           set -euo pipefail
           # The matrix includes all four shards, rustfmt and the single doctest run.
           echo "Linux checks: ${LINUX_RESULT}"
+          echo "Coverage: ${COVERAGE_RESULT}"
           test "${LINUX_RESULT}" = success
+          test "${COVERAGE_RESULT}" = success

@@ -1,0 +1,6 @@
+[store]
+dir = "target/coverage-nextest"
+
+[profile.coverage.junit]
+path = "junit.xml"
+report-skipped = "none"

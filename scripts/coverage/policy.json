@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "policy_version": "pioneer-production-lines-v1",
+  "metric": "Linux production line coverage, excluding doctests",
+  "rust": "1.99.1",
+  "nextest": "0.9.149",
+  "cargo_llvm_cov": "0.9.1",
+  "target": "x86_64-unknown-linux-gnu",
+  "shards": 4,
+  "source_scope": "tracked Rust files under workspace member src directories",
+  "excluded_components": [
+    "tests",
+    "fixtures",
+    "testdata",
+    "benches",
+    "examples",
+    "generated",
+    "vendor",
+    "vendored",
+    "third_party"
+  ],
+  "excluded_filename_regex": "(^|[_-])(tests?|fixtures?)([_-]|\\.rs$)",
+  "generated_header_marker": "@generated",
+  "test_attributes": [
+    "test",
+    "rstest",
+    "test_case",
+    "quickcheck"
+  ],
+  "test_support_feature": "test-support",
+  "line_merge": "sum counts by repository-relative file and line; covered iff sum > 0",
+  "measurement": {
+    "workspace": true,
+    "locked": true,
+    "features": [],
+    "default_features": true,
+    "target_selection": "Cargo default test targets, host target; no --all-targets",
+    "cargo_profile": "test",
+    "nextest_profile": "coverage",
+    "partition": "hash:N/4",
+    "test_threads": 2,
+    "retries": 0,
+    "fail_fast": false,
+    "doctests_in_coverage": false,
+    "cfg_coverage": false,
+    "include_ffi": false,
+    "default_llvm_filename_exclusions": false,
+    "coverage_target_dir": "target/coverage",
+    "clean": "cargo llvm-cov clean --locked --workspace before every shard",
+    "instrumentation": "LLVM source-based -C instrument-coverage; cargo-llvm-cov default flags"
+  }
+}
