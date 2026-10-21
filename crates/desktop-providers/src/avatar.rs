@@ -179,6 +179,7 @@ impl ProviderCatalogView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::prelude::v1::test;
     use pioneer_client::providers::types::CLIAgentRuntimeKind;
     use std::cell::RefCell;
 
