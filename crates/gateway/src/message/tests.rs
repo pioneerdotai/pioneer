@@ -4,6 +4,10 @@ mod cli_task_tools;
 #[path = "tests/cli_runtime_active_bindings.rs"]
 mod cli_runtime_active_bindings;
 
+#[cfg(unix)]
+#[path = "tests/opencode_startup.rs"]
+mod opencode_startup;
+
 #[path = "tests/recovered_turn_stop.rs"]
 mod recovered_turn_stop;
 

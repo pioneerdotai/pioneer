@@ -11780,6 +11780,9 @@ impl MessageProcessor {
                         runtime_kind,
                     )
                 });
+                let model_stage = refresh_trace.map(|trace| {
+                    trace.runtime_stage(GatewayProviderWarmupStage::RuntimeModelsLoad, runtime_kind)
+                });
                 let probe = probe_opencode_instance(
                     &instance,
                     self.artifact_runtime_home.as_path(),
@@ -11791,6 +11794,16 @@ impl MessageProcessor {
                 }
                 let normal_runtime_ready = probe.status == OpenCodeProbeStatus::Ready;
                 let provider_version = probe.version.clone();
+                // The account probe already fetched this catalog from its owned server.
+                // Pass it through live readiness so warmup does not launch serve again.
+                let result =
+                    runtime_model_list_from_opencode_probe(probe.clone(), &instance.custom_models);
+                if let Some(stage) = model_stage
+                    && result.error_message.is_none()
+                {
+                    stage.succeed();
+                }
+                models = Some(result);
                 let mut summary = apply_opencode_probe_to_summary(summary, probe);
                 let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
                 #[cfg(test)]
