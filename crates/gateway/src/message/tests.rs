@@ -2145,7 +2145,7 @@ fn cli_runtime_turn_start_request_with_capabilities(
     ))
     .unwrap();
     request["params"]["capabilities"] = JsonValue::Array(capabilities);
-    serde_json::from_value::<JsonRpcRequest>(request.clone())
+    serde_json::from_value::<pioneer_protocol::JsonRpcRequest>(request.clone())
         .expect("CLI turn/start fixture must match the JSON-RPC envelope, including request ID");
     serde_json::from_value::<pioneer_protocol::TurnStartParams>(request["params"].clone())
         .expect("proposal 51 turn/start fixture must match protocol");
