@@ -84852,6 +84852,51 @@ fn acp_composer_preparation_detached_result_and_parent_delivery_use_one_owner() 
                 assert_ne!(binding.thread_id, parent);
                 assert_eq!(binding.continuation_thread_id, parent);
                 assert_eq!(binding.runtime_kind, "acp");
+                assert_eq!(
+                    binding.mcp.as_ref().unwrap().adapter_kind,
+                    crate::cli_runtime::acp_mcp::ACP_MCP_ADAPTER_KIND
+                );
+                assert!(
+                    store
+                        .list_turn_mcp_bindings(&binding.turn_id)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|tool| tool.server_installation_id
+                            == crate::cli_runtime::acp_skills::SKILL_SERVER_ID)
+                );
+                let mut authority =
+                    crate::authorization::ExecutionAuthorizationContext::load_for_turn(
+                        store.as_ref(),
+                        &binding.turn_id,
+                    )
+                    .await
+                    .unwrap();
+                let skills = store
+                    .find_turn_skill_bindings(&binding.turn_id)
+                    .await
+                    .unwrap();
+                assert!(!skills.is_empty());
+                authority
+                    .verify_skill_projection(&workspace, &skills)
+                    .unwrap();
+                let projection = store
+                    .get_turn_mcp_projection(&binding.turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                // Carrying skill tools through the managed facade must not
+                // grant an external MCP server, even with the same name.
+                assert!(
+                    authority
+                        .bind_mcp_projection(
+                            &workspace,
+                            projection.projection_version.try_into().unwrap(),
+                            &projection.manifest_hash,
+                            &[crate::cli_runtime::acp_skills::SKILL_SERVER_NAME.to_owned()],
+                        )
+                        .is_err()
+                );
                 let execution = store
                     .get_task_run_turn_by_turn(&binding.thread_id, &binding.turn_id)
                     .await
