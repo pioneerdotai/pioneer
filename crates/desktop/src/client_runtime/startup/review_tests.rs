@@ -434,6 +434,20 @@ fn runtime_wait_uses_application_acknowledgement_after_cli_discovery() {
         thread_id: "a".into(),
         draft_id: draft.draft_id(),
     });
+    assert!(
+        !core
+            .composer_snapshot("a")
+            .unwrap()
+            .selected_provider_ready()
+    );
+    // Start observing before discovery: a usable runtime no longer starts a wait.
+    let mut telemetry = StartupTelemetry::new(DesktopStartupTrace::start());
+    telemetry.observe(&core, None);
+    assert!(
+        telemetry
+            .active
+            .contains_key(&DesktopStartupStage::ComposerRuntimeWait)
+    );
     let authority = ClientMutationAuthority::for_test();
     let mut runtime: RuntimeSummary = serde_json::from_value(json!({"runtime_id":"codex","kind":"codex","display_name":"Codex","enabled":true,"status":{"state":"initializing"},"capabilities":RuntimeCapabilities { supports_threads:true, supports_model_list:true, ..Default::default() }})).unwrap();
     authority.complete_provider_runtime_for_test(
@@ -455,7 +469,6 @@ fn runtime_wait_uses_application_acknowledgement_after_cli_discovery() {
             .unwrap()
             .selected_provider_ready()
     );
-    let mut telemetry = StartupTelemetry::new(DesktopStartupTrace::start());
     telemetry.observe(&core, None);
     assert!(
         telemetry
