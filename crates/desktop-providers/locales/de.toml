@@ -165,6 +165,18 @@ description = "Gemini-Modelle von Google AI"
 title = "GLM"
 description = "GLM- und Zhipu-kompatible Modelle"
 
+[providers.catalog.zai]
+title = "Z.AI"
+description = "GLM-Modelle über die globale Z.AI-API"
+
+[providers.catalog.glm-coding]
+title = "GLM Coding Plan"
+description = "GLM-Abonnement zum Programmieren über die API für China"
+
+[providers.catalog.zai-coding]
+title = "Z.AI Coding Plan"
+description = "GLM-Abonnement zum Programmieren über die globale Z.AI-API"
+
 [providers.catalog.groq]
 title = "Groq"
 description = "Schnelle Inferenz mit Groq-Hardware"

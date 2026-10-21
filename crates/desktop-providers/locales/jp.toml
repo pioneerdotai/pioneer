@@ -165,6 +165,18 @@ description = "Google AI の Gemini モデル"
 title = "GLM"
 description = "GLM と Zhipu 互換モデル"
 
+[providers.catalog.zai]
+title = "Z.AI"
+description = "Z.AI のグローバル API 経由の GLM モデル"
+
+[providers.catalog.glm-coding]
+title = "GLM Coding Plan"
+description = "中国向け API 経由の GLM コーディングサブスクリプション"
+
+[providers.catalog.zai-coding]
+title = "Z.AI Coding Plan"
+description = "Z.AI のグローバル API 経由の GLM コーディングサブスクリプション"
+
 [providers.catalog.groq]
 title = "Groq"
 description = "Groq ハードウェアによる高速推論"

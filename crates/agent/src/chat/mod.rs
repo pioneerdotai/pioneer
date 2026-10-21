@@ -328,7 +328,7 @@ struct TaskMutationFinalizationGuard {
 
 #[derive(Debug)]
 struct RenderedTaskObservation {
-    task_ids: Vec<String>,
+    outcomes: BTreeSet<crate::ObservedTaskOutcome>,
     message: String,
     details: JsonValue,
 }
@@ -3244,11 +3244,11 @@ fn render_pending_snapshot(pending: &[PendingAttachedTask]) -> Option<String> {
 
 fn render_terminal_snapshot(
     observations: &[TerminalTaskObservation],
-    observed_task_ids: &BTreeSet<String>,
+    observed_outcomes: &BTreeSet<crate::ObservedTaskOutcome>,
 ) -> Option<RenderedTaskObservation> {
     let mut observations = observations
         .iter()
-        .filter(|observation| !observed_task_ids.contains(observation.task_id.as_str()))
+        .filter(|observation| !observation.was_observed(observed_outcomes))
         .take(MAX_TERMINAL_TASK_OBSERVATIONS)
         .cloned()
         .collect::<Vec<_>>();
@@ -3256,23 +3256,24 @@ fn render_terminal_snapshot(
         return None;
     }
     observations.sort_by(|left, right| left.task_id.cmp(&right.task_id));
-    let task_ids = observations
+    let outcomes = observations
         .iter()
-        .map(|observation| observation.task_id.clone())
-        .collect::<Vec<_>>();
+        .map(TerminalTaskObservation::outcome)
+        .collect::<BTreeSet<_>>();
     let payload = observations
         .iter()
         .map(task_observation_payload)
         .collect::<Vec<_>>();
     let payload_text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".to_owned());
     Some(RenderedTaskObservation {
-        task_ids,
+        outcomes: outcomes.clone(),
         message: format!(
             "Attached task results are available:\n{payload_text}\nUse these TaskRun results/errors in the next response. Full details are available with task_get."
         ),
         details: json!({
             "taskIds": observations.iter().map(|observation| observation.task_id.clone()).collect::<Vec<_>>(),
             "observations": payload,
+            "outcomes": outcomes,
         }),
     })
 }
@@ -3334,7 +3335,7 @@ async fn terminal_attached_task_observation(
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
-    observed_task_ids: &BTreeSet<String>,
+    observed_outcomes: &BTreeSet<crate::ObservedTaskOutcome>,
 ) -> Option<RenderedTaskObservation> {
     let provider = provider?;
     let observations = match provider
@@ -3359,7 +3360,7 @@ async fn terminal_attached_task_observation(
 
     let mut observations = observations
         .into_iter()
-        .filter(|observation| !observed_task_ids.contains(observation.task_id.as_str()))
+        .filter(|observation| !observation.was_observed(observed_outcomes))
         .take(MAX_TERMINAL_TASK_OBSERVATIONS)
         .collect::<Vec<_>>();
     if observations.is_empty() {
@@ -3367,10 +3368,10 @@ async fn terminal_attached_task_observation(
     }
     observations.sort_by(|left, right| left.task_id.cmp(&right.task_id));
 
-    let task_ids = observations
+    let outcomes = observations
         .iter()
-        .map(|observation| observation.task_id.clone())
-        .collect::<Vec<_>>();
+        .map(TerminalTaskObservation::outcome)
+        .collect::<BTreeSet<_>>();
     let payload = observations
         .iter()
         .map(task_observation_payload)
@@ -3381,11 +3382,12 @@ async fn terminal_attached_task_observation(
     );
 
     Some(RenderedTaskObservation {
-        task_ids,
+        outcomes: outcomes.clone(),
         message,
         details: json!({
             "taskIds": observations.iter().map(|observation| observation.task_id.clone()).collect::<Vec<_>>(),
             "observations": payload,
+            "outcomes": outcomes,
         }),
     })
 }
@@ -3393,6 +3395,7 @@ async fn terminal_attached_task_observation(
 fn task_observation_payload(observation: &TerminalTaskObservation) -> JsonValue {
     json!({
         "taskId": observation.task_id,
+        "taskRevision": observation.task_revision,
         "runId": observation.run_id,
         "title": observation.title,
         "status": observation.status,
@@ -3413,59 +3416,20 @@ fn bounded_task_text(value: &str, max_chars: usize) -> String {
     }
 }
 
-fn record_observed_terminal_task_ids(
-    observed_task_ids: &mut BTreeSet<String>,
+fn record_observed_terminal_task_outcomes(
+    observed_outcomes: &mut BTreeSet<crate::ObservedTaskOutcome>,
     result: &ExecutedToolResult,
 ) {
-    let Ok(value) = serde_json::from_str::<JsonValue>(result.model_visible_text.as_str()) else {
+    if !result.success {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<JsonValue>(&result.model_visible_text) else {
         return;
     };
-    match result.tool_name.as_str() {
-        "task_wait" => {
-            for key in ["completed", "failed", "cancelled"] {
-                if let Some(items) = value.get(key).and_then(JsonValue::as_array) {
-                    for item in items {
-                        if let Some(task_id) = item.get("taskId").and_then(JsonValue::as_str) {
-                            observed_task_ids.insert(task_id.to_owned());
-                        }
-                    }
-                }
-            }
-        }
-        "task_get" => {
-            if let Some(task) = value.get("task")
-                && let Some(status) = task.get("status").and_then(JsonValue::as_str)
-                && terminal_task_status_label(status)
-                && let Some(task_id) = task.get("id").and_then(JsonValue::as_str)
-            {
-                observed_task_ids.insert(task_id.to_owned());
-            }
-        }
-        "task_cancel" => {
-            if let Some(task_id) = value
-                .get("task")
-                .and_then(|task| task.get("taskId"))
-                .and_then(JsonValue::as_str)
-            {
-                observed_task_ids.insert(task_id.to_owned());
-            }
-        }
-        "task_accept" => {
-            if value
-                .get("taskTerminal")
-                .and_then(JsonValue::as_bool)
-                .unwrap_or(false)
-                && let Some(task_id) = value.get("taskId").and_then(JsonValue::as_str)
-            {
-                observed_task_ids.insert(task_id.to_owned());
-            }
-        }
-        _ => {}
-    }
-}
-
-fn terminal_task_status_label(status: &str) -> bool {
-    matches!(status, "completed" | "failed" | "cancelled")
+    observed_outcomes.extend(crate::observed_terminal_task_outcomes_from_payload(
+        &result.tool_name,
+        &value,
+    ));
 }
 
 fn workdir_from_execution_security_snapshot(
@@ -4539,7 +4503,7 @@ async fn execute_agent_provider_response(
     let mut pending_retry_instruction: Option<String> = None;
     let mut applied_retry_instruction: Option<String> = None;
     let mut observed_review_required_signatures = BTreeSet::<String>::new();
-    let mut observed_terminal_task_ids = BTreeSet::<String>::new();
+    let mut observed_terminal_task_outcomes = BTreeSet::<crate::ObservedTaskOutcome>::new();
     let window_budget = &tool_loop_config.execution_windows.window;
     let mut tool_loop_guard = ToolLoopGuard::new_execution_window(
         window_budget.clone(),
@@ -4681,12 +4645,10 @@ async fn execute_agent_provider_response(
             }
 
             if let Some(observation) = task_gate_snapshot.as_ref().and_then(|snapshot| {
-                render_terminal_snapshot(snapshot.terminal.as_slice(), &observed_terminal_task_ids)
+                render_terminal_snapshot(snapshot.terminal.as_slice(), &observed_terminal_task_outcomes)
             })
             {
-                for task_id in &observation.task_ids {
-                    observed_terminal_task_ids.insert(task_id.clone());
-                }
+                observed_terminal_task_outcomes.extend(observation.outcomes.clone());
                 let event_item_id = generate_id(TURN_ITEM_ID_LEN);
                 emit_durable_event(
                     event_tx.as_ref(),
@@ -5038,7 +5000,7 @@ async fn execute_agent_provider_response(
 
                 if let Some(snapshot) = final_task_gate_snapshot.as_ref() {
                     let has_unobserved_terminal = snapshot.terminal.iter().any(|observation| {
-                        !observed_terminal_task_ids.contains(observation.task_id.as_str())
+                        !observation.was_observed(&observed_terminal_task_outcomes)
                     });
                     if !snapshot.pending.is_empty()
                         || !snapshot.review_required.is_empty()
@@ -5450,12 +5412,10 @@ async fn execute_agent_provider_response(
                 }
 
                 if let Some(observation) = final_task_gate_snapshot.as_ref().and_then(|snapshot| {
-                    render_terminal_snapshot(snapshot.terminal.as_slice(), &observed_terminal_task_ids)
+                    render_terminal_snapshot(snapshot.terminal.as_slice(), &observed_terminal_task_outcomes)
                 })
                 {
-                    for task_id in &observation.task_ids {
-                        observed_terminal_task_ids.insert(task_id.clone());
-                    }
+                    observed_terminal_task_outcomes.extend(observation.outcomes.clone());
                     send_reasoning_completed(
                         workspace_id,
                         thread_id,
@@ -6493,7 +6453,7 @@ async fn execute_agent_provider_response(
             record_requested_tool_names(&mut requested_tool_names, &executed_results);
 
             for result in &executed_results {
-                record_observed_terminal_task_ids(&mut observed_terminal_task_ids, result);
+                record_observed_terminal_task_outcomes(&mut observed_terminal_task_outcomes, result);
                 task_mutation_finalization_guard.observe(result);
             }
             post_turn_tool_events.extend(
@@ -9389,6 +9349,102 @@ mod tests {
         assert!(phase03_names.contains(&"task_create".to_owned()));
         assert!(phase03_names.contains(&"task_wait".to_owned()));
         assert!(!phase03_names.contains(&"task_cancel".to_owned()));
+    }
+
+    #[test]
+    fn failed_native_task_result_cannot_establish_terminal_observation() {
+        let payload = r#"{"taskId":"accepted","runId":"run","candidateId":"candidate","status":"completed","taskTerminal":true,"finalAnswerAllowed":true}"#;
+        let mut ids = std::collections::BTreeSet::new();
+        super::record_observed_terminal_task_outcomes(
+            &mut ids,
+            &task_result("task_accept", false, payload),
+        );
+        super::record_observed_terminal_task_outcomes(
+            &mut ids,
+            &task_result("mcp_foreign_task_accept", true, payload),
+        );
+        assert!(ids.is_empty());
+        super::record_observed_terminal_task_outcomes(
+            &mut ids,
+            &task_result("task_accept", true, payload),
+        );
+        assert_eq!(
+            ids,
+            std::collections::BTreeSet::from([crate::ObservedTaskOutcome::AcceptedCandidate {
+                task_id: "accepted".into(),
+                run_id: "run".into(),
+                candidate_id: "candidate".into()
+            }])
+        );
+    }
+
+    #[test]
+    fn native_terminal_observation_does_not_survive_same_run_reopen() {
+        let mut task = pioneer_protocol::PublicTask {
+            id: "A".into(),
+            workspace_id: "workspace".into(),
+            owner_kind: pioneer_protocol::TaskOwnerKind::User,
+            owner_id: None,
+            created_by_thread_id: Some("parent".into()),
+            created_by_turn_id: Some("turn".into()),
+            root_task_id: None,
+            parent_task_id: None,
+            executor_kind: pioneer_protocol::TaskExecutorKind::Agent,
+            status: pioneer_protocol::TaskStatus::Blocked,
+            title: "A".into(),
+            goal: "Inspect A".into(),
+            priority: 0,
+            result: None,
+            error: None,
+            revision: 4,
+            created_at: 1,
+            updated_at: 2,
+            completed_at: Some(2),
+        };
+        let mut outcome = crate::TerminalTaskObservation {
+            task_id: task.id.clone(),
+            task_revision: task.revision,
+            accepted_candidate_id: None,
+            run_id: Some("same-run".into()),
+            title: task.title.clone(),
+            status: "blocked".into(),
+            summary: None,
+            error_message: None,
+            child_thread_id: None,
+            child_turn_id: None,
+        };
+        let mut observed = std::collections::BTreeSet::new();
+        let payload = serde_json::json!({"task":task});
+        super::record_observed_terminal_task_outcomes(
+            &mut observed,
+            &task_result("task_get", true, &payload.to_string()),
+        );
+        assert!(super::render_terminal_snapshot(&[outcome.clone()], &observed).is_none());
+        // Task-owned resume and a second block increment the durable task
+        // revision without changing the run or the terminal status.
+        task.revision += 2;
+        task.updated_at += 1;
+        task.completed_at = Some(3);
+        outcome.task_revision = task.revision;
+        let rendered = super::render_terminal_snapshot(&[outcome.clone()], &observed)
+            .expect("new outcome must reach the model");
+        assert!(rendered.message.contains("same-run"));
+        assert_eq!(
+            rendered.outcomes,
+            std::collections::BTreeSet::from([outcome.outcome()])
+        );
+        let payload = serde_json::json!({"task":task});
+        super::record_observed_terminal_task_outcomes(
+            &mut observed,
+            &task_result("task_get", false, &payload.to_string()),
+        );
+        assert!(!outcome.was_observed(&observed));
+        super::record_observed_terminal_task_outcomes(
+            &mut observed,
+            &task_result("task_get", true, &payload.to_string()),
+        );
+        assert!(outcome.was_observed(&observed));
+        assert!(super::render_terminal_snapshot(&[outcome], &observed).is_none());
     }
 
     #[test]

@@ -147,6 +147,17 @@ Database changes require focused regression coverage for:
 - concurrent interactive and maintenance work;
 - retry/restart idempotency and poison-row progress for background jobs.
 
+Use `cargo-nextest` for Rust unit and integration tests:
+
+- Workspace: `cargo nextest run --locked --workspace --test-threads 2 --no-fail-fast --retries 0`.
+- Focused: `cargo nextest run --locked -p <package> --test-threads 2 --no-fail-fast --retries 0 <filter>`;
+  retain the required feature and target flags.
+- Doctests only: `cargo test --locked --workspace --doc` (nextest does not run
+  doctests).
+
+Do not use `cargo test` for unit or integration suites. If nextest is missing,
+install its pre-built binary rather than falling back to `cargo test`.
+
 Run the narrow affected tests first. Before declaring a repository-wide
 database change complete, run formatting checks and the relevant workspace
 tests. Never weaken a production invariant merely to make an invalid fixture

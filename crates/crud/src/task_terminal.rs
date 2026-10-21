@@ -251,6 +251,12 @@ impl CrudStore {
                 error,
                 state.actor.delivery.destination_user_id.as_deref(),
             ) {
+                if state.occurrence.retry_attempt > 0 {
+                    queued.delivery_key = format!(
+                        "retry:{}:{}",
+                        state.occurrence.retry_attempt, queued.delivery_key
+                    );
+                }
                 // A prior terminal run owns its already-frozen delivery
                 // fallback. Task.result/error can now belong to a later run.
                 // Read and decode that bounded exact row on the reader path;
@@ -520,13 +526,13 @@ impl CrudStore {
                 TaskEventPayload::RunCancelled { .. } => "cancelled",
                 _ => unreachable!(),
             };
-            let event = task_event::find_event_by_idempotency_key(
-                db,
-                &current.task.id,
-                &format!("run:{}:terminal", current.run.id),
-            )
-            .await?
-            .context("terminal Task run has no terminal event")?;
+            let terminal_key = task_event::terminal_idempotency_key(db, &prepared.terminal)
+                .await?
+                .context("terminal Task outcome has no idempotency key")?;
+            let event =
+                task_event::find_event_by_idempotency_key(db, &current.task.id, &terminal_key)
+                    .await?
+                    .context("terminal Task run has no terminal event")?;
             if current.run.status != expected_status
                 || event.event_type != prepared.terminal.event_type()
                 || current.run.result_json != prepared.result_json
@@ -534,7 +540,12 @@ impl CrudStore {
             {
                 return conflict("different committed run outcome");
             }
-            let queued = task_event::find_queued_delivery_for_run(db, &current.run.id).await?;
+            let queued = task_event::find_queued_delivery_for_run(
+                db,
+                &current.run.id,
+                current.occurrence.retry_attempt,
+            )
+            .await?;
             let delivery_id = match (queued, prepared.delivery.take()) {
                 (Some(event), Some(candidate)) => {
                     let persisted =

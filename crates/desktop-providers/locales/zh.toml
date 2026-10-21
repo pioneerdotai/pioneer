@@ -165,6 +165,18 @@ description = "来自 Google AI 的 Gemini 模型"
 title = "GLM"
 description = "GLM 和兼容 Zhipu 的模型"
 
+[providers.catalog.zai]
+title = "Z.AI"
+description = "通过 Z.AI 国际 API 使用 GLM 模型"
+
+[providers.catalog.glm-coding]
+title = "GLM Coding Plan"
+description = "通过中国区 API 使用 GLM 编程订阅"
+
+[providers.catalog.zai-coding]
+title = "Z.AI Coding Plan"
+description = "通过 Z.AI 国际 API 使用 GLM 编程订阅"
+
 [providers.catalog.groq]
 title = "Groq"
 description = "使用 Groq 硬件进行快速推理"

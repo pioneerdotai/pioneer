@@ -970,6 +970,19 @@ fn mcp_tool_item(item_id: &str, metadata: Option<&JsonValue>, status: ToolCallSt
     {
         lines.push(error.to_owned());
     }
+    // Preserve the semantic public task result before ToolMetadata redacts raw
+    // MCP content/text. Lifecycle/identity are validated separately by the gate.
+    // Claude already normalizes before its earlier typed metadata conversion.
+    if matches!(
+        tool_name.as_str(),
+        "task_wait" | "task_get" | "task_cancel" | "task_accept"
+    ) && metadata_json["serverInstallationId"] == "pioneer-task-tools-v1"
+        && metadata_json["rawToolName"].as_str() == Some(tool_name.as_str())
+        && metadata_json.get("taskResult").is_none()
+        && let Some(payload) = crate::task_tools::delivered_task_payload(&metadata_json["result"])
+    {
+        metadata_json["taskResult"] = payload;
+    }
     let summary = tool_summary(
         format!("MCP: {server_name} / {raw_tool_name}"),
         lines,
@@ -2889,6 +2902,47 @@ mod tests {
                     }
                 );
             }
+        }
+    }
+
+    #[test]
+    fn task_result_normalization_precedes_raw_metadata_redaction() {
+        let payload = json!({"taskId":"accepted_task","runId":"run","candidateId":"candidate","status":"completed","taskTerminal":true,"finalAnswerAllowed":true});
+        let blocks = json!([{"type":"text","text":payload.to_string()}]);
+        // Codex's content-only MCP envelope and OpenCode V2's content array.
+        for result in [json!({"content":blocks}), blocks.clone()] {
+            let item = super::mcp_tool_item(
+                "native-task",
+                Some(&json!({
+                    "canonicalCallableName":"task_accept", "rawToolName":"task_accept",
+                    "serverInstallationId":"pioneer-task-tools-v1", "serverName":"pioneer_tasks",
+                    "status":"completed", "success":true, "result":result,
+                    "message":"preview contains no IDs",
+                })),
+                pioneer_protocol::ToolCallStatus::Completed,
+            );
+            let TurnItem::DynamicToolCall {
+                storage: ToolStoragePayload::Metadata { metadata },
+                ..
+            } = item
+            else {
+                panic!("metadata");
+            };
+            let metadata = metadata.to_json();
+            assert_eq!(
+                pioneer_agent::observed_terminal_task_outcomes_from_payload(
+                    "task_accept",
+                    &metadata["taskResult"]
+                ),
+                std::collections::BTreeSet::from([
+                    pioneer_agent::ObservedTaskOutcome::AcceptedCandidate {
+                        task_id: "accepted_task".into(),
+                        run_id: "run".into(),
+                        candidate_id: "candidate".into()
+                    }
+                ])
+            );
+            assert_ne!(metadata["result"], result, "raw content remains redacted");
         }
     }
 

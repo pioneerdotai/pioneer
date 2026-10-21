@@ -4,6 +4,10 @@ mod cli_task_tools;
 #[path = "tests/cli_runtime_active_bindings.rs"]
 mod cli_runtime_active_bindings;
 
+#[cfg(unix)]
+#[path = "tests/opencode_startup.rs"]
+mod opencode_startup;
+
 #[path = "tests/recovered_turn_stop.rs"]
 mod recovered_turn_stop;
 
@@ -728,6 +732,7 @@ struct RecordingCliRuntimeSession {
     mcp_terminals: TokioMutex<Vec<String>>,
     goal_resets: TokioMutex<Vec<String>>,
     fail_next_goal_reset: TokioMutex<bool>,
+    fail_next_resume: TokioMutex<bool>,
     goal_clears: TokioMutex<Vec<String>>,
     closes: AtomicUsize,
     factory_starts: AtomicUsize,
@@ -887,6 +892,9 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         params: CLIAgentRuntimeThreadOpenParams,
         _timeout: Duration,
     ) -> anyhow::Result<CLIAgentRuntimeThreadOpenSnapshot> {
+        if std::mem::take(&mut *self.fail_next_resume.lock().await) {
+            anyhow::bail!("injected failure before recovery provider start");
+        }
         self.thread_resumes
             .lock()
             .await
@@ -33847,6 +33855,29 @@ async fn cancelling_detached_native_task_interrupts_only_its_child_continuation_
     let starts = wait_for_cli_runtime_turn_starts(&cli_session, 1).await;
     assert_eq!(starts.len(), 1);
     let native_thread_id = starts[0].native_thread_id.clone();
+    // The fake records entry into start_turn before the gateway persists the
+    // returned native turn and releases its startup transition. Cancel only
+    // after that handoff: this test covers cancellation of an active turn.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(binding) = crud_store
+                .get_cli_runtime_turn_binding(first_lineage.child_turn_id.as_str())
+                .await
+                .expect("native cancellation binding should load")
+                && binding.native_turn_id.as_deref() == Some("native_cancel_turn_1")
+                && let Some(transition) = processor
+                    .try_cli_runtime_turn_transition(&binding)
+                    .await
+                    .expect("native startup transition should be observable")
+            {
+                drop(transition);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("native turn must finish its startup handoff before cancellation");
 
     cancel_task_for_test(
         &processor,
@@ -40907,7 +40938,18 @@ async fn production_settings_recovery_transitions_projection_before_new_source_c
         ThreadEpisodicIndexExecutor, ThreadEpisodicRuntimeConfig,
     };
     use pioneer_memory::ThreadEpisodicEmbeddingProvider;
-    let (workspace_manager, store, workspace) = setup_workspace_manager().await;
+    let (workspace_manager, store, _) = setup_workspace_manager().await;
+    // Capsule ownership is process-wide and keyed by workspace ID. Separate
+    // databases/storage roots alone do not isolate the default workspace lock
+    // from other concurrently running Gateway fixtures.
+    let workspace = workspace_manager
+        .create_workspace(
+            &pioneer_protocol::generate_id(21),
+            Some("Settings projection recovery"),
+        )
+        .await
+        .unwrap()
+        .id;
     let root = tempfile::tempdir().unwrap();
     let mut processor = MessageProcessor::with_agent_manager(
         Arc::new(ThreadManager::new("test-model", "openai")),
@@ -41135,6 +41177,7 @@ async fn production_settings_recovery_transitions_projection_before_new_source_c
             );
         }
     }
+    executor.shutdown().await;
 }
 
 #[tokio::test]
@@ -72930,9 +72973,21 @@ async fn setup_workspace_manager_with_connection(
     // This helper invokes current Gateway bootstrap and authorization, so it
     // requires the complete schema rather than a historical migration prefix.
     crate::compaction::load_test_catalog();
-    Migrator::up(&connection, None)
+    // Keep fresh fixture initialization on one physical connection. There is
+    // no concurrent fixture consumer until migration commits; bootstrap and
+    // every tested Gateway operation still use their normal storage paths.
+    let database = pioneer_sqlite::SqliteDatabase::from_single_connection(connection.clone());
+    let migration = database
+        .begin()
+        .await
+        .expect("fixture migration transaction");
+    Migrator::up(&*migration, None)
         .await
         .expect("migrations must succeed");
+    migration
+        .commit()
+        .await
+        .expect("fixture schema must commit");
     bootstrap(&connection)
         .await
         .expect("gateway bootstrap should create default workspace");

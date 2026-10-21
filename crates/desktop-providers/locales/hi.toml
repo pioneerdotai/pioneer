@@ -165,6 +165,18 @@ description = "Google AI के Gemini मॉडल"
 title = "GLM"
 description = "GLM और Zhipu-संगत मॉडल"
 
+[providers.catalog.zai]
+title = "Z.AI"
+description = "वैश्विक Z.AI API के ज़रिए GLM मॉडल"
+
+[providers.catalog.glm-coding]
+title = "GLM Coding Plan"
+description = "चीन के API के ज़रिए प्रोग्रामिंग के लिए GLM सदस्यता"
+
+[providers.catalog.zai-coding]
+title = "Z.AI Coding Plan"
+description = "वैश्विक Z.AI API के ज़रिए प्रोग्रामिंग के लिए GLM सदस्यता"
+
 [providers.catalog.groq]
 title = "Groq"
 description = "Groq हार्डवेयर पर तेज अनुमान"
