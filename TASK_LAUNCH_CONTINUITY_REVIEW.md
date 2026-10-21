@@ -275,3 +275,22 @@ Run 39613532359 (head 3811fd49) завершился с 17 ошибками Gate
 - Фикстура отзыва доступа атомарно переводит изолированного инициатора в suspended member: статус suspended запрещён для superuser ограничением БД. Проверка отказа revalidation сохранена.
 
 Проверены вызывающие пути и весь добавленный diff. `cargo fmt --all` и `git diff --check` выполнены. Локальная компиляция и тесты не запускались. Новые результаты ожидаются от GitHub CI.
+
+## Стабилизация mixed-checkpoint регрессии
+
+Run 39638523268 на head 5b8a49ba: Linux shard 1 упал в
+`composer_reuses_late_mixed_checkpoint_before_attached_child_policy`; остальные
+пять matrix jobs прошли. При LastNTurns без summary ожидался старый принятый
+turn, а выбран был uncovered tail с полным tool round.
+
+Проверка `order_history_by_creation` и `select_task_history` подтвердила:
+порядок определяется датами исходных сообщений, а фикстура задавала статические
+даты только turn, оставляя источникам CURRENT_TIMESTAMP. Совпадение секунд
+сохраняло порядок композиции, переход секунды менял выбранный последний turn.
+Фикстура теперь задаёт явную хронологию исходным input/event/context rows
+до создания frozen snapshots. Для raw и projected basis ожидается один
+uncovered tail; дополнительно проверяется сохранение точных источников,
+единственность и порядок tool call/result. Production-код не изменён.
+
+Выполнены статический просмотр, форматирование и `git diff --check`.
+Локальные сборки, cargo check и тесты не запускались.
