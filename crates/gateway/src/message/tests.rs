@@ -84877,8 +84877,12 @@ fn acp_composer_preparation_detached_result_and_parent_delivery_use_one_owner() 
                     .await
                     .unwrap();
                 assert!(!skills.is_empty());
-                authority
-                    .verify_skill_projection(&workspace, &skills)
+                processor
+                    .revalidate_persisted_turn_skill_projection(
+                        &binding.thread_id,
+                        &binding.turn_id,
+                    )
+                    .await
                     .unwrap();
                 let projection = store
                     .get_turn_mcp_projection(&binding.turn_id)
