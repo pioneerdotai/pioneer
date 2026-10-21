@@ -556,7 +556,7 @@ mod tests {
     use super::{ProviderCatalogConfig, ProviderCatalogView};
     use crate::ports::*;
     use gpui_kit::component::{Root, input::InputState};
-    use gpui_kit::{App, AppContext, TestAppContext, Window};
+    use gpui_kit::{App, AppContext, Task, TestAppContext, Window};
     use pioneer_client::{
         core::{
             ClientCore, ClientMutationAuthority, ClientRevisions, ClientScope, ContentRevision,
