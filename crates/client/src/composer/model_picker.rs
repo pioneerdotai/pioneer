@@ -29,6 +29,7 @@ pub struct ComposerModelPickerProvider {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ComposerModelPickerPublication {
     pub provider_rows: Vec<ComposerModelPickerProvider>,
+    pub acp_session: Option<pioneer_protocol::AcpSessionSnapshot>,
     pub reasoning_rows: Vec<presentation::ReasoningEffortRow>,
     pub selected_provider_ready: bool,
     pub identity: ComposerOperationIdentity,
@@ -120,6 +121,7 @@ struct ModelPickerWork {
 enum ModelPickerResult {
     Providers(Result<ProviderListResponse, String>),
     Models(Result<ProviderListModelsResponse, String>),
+    Acp(Result<pioneer_protocol::AcpSessionResponse, String>),
 }
 #[derive(Default)]
 pub(crate) struct ComposerModelPickerController {
@@ -208,6 +210,20 @@ impl ClientCore {
         store: &mut ComposerStore,
         mut next: ComposerModelPickerPublication,
     ) -> ClientTransition {
+        next.acp_session = next
+            .selector
+            .selected_provider()
+            .and_then(list::runtime_id_from_cli_runtime_provider_key)
+            .and_then(|runtime| {
+                self.thread_coordinator_snapshot(&next.identity.thread_id)
+                    .and_then(|thread| {
+                        self.acp_session_snapshot(
+                            &thread.workspace_id,
+                            &next.identity.thread_id,
+                            runtime,
+                        )
+                    })
+            });
         next.provider_rows = next
             .selector
             .provider_rows()
@@ -317,6 +333,7 @@ impl ClientCore {
             };
             let next = ComposerModelPickerPublication {
                 provider_rows: vec![],
+                acp_session: None,
                 reasoning_rows: vec![],
                 selected_provider_ready: false,
                 identity: identity.clone(),
@@ -580,6 +597,15 @@ impl ClientCore {
                     model_request = Some(RequestKind::Models(provider));
                 }
             }
+            ModelPickerResult::Acp(result) => match result {
+                Ok(response) => {
+                    next.acp_session = Some(response.snapshot);
+                    next.models_request.state = ComposerCatalogRequestState::Ready;
+                }
+                Err(message) => {
+                    next.models_request.state = ComposerCatalogRequestState::Failed { message }
+                }
+            },
             ModelPickerResult::Models(result) => match result {
                 Ok(response) => {
                     next.selector.apply_provider_models_success(response);
@@ -626,6 +652,54 @@ impl ClientCore {
         if let Some(kind) = model_request {
             self.request_composer_model_picker(work.identity, kind, false);
         }
+    }
+    pub(crate) fn refresh_composer_acp_picker(
+        &self,
+        snapshot: &pioneer_protocol::AcpSessionSnapshot,
+    ) {
+        // Direct replies may finish after a newer notification or auth fence.
+        // Publish only the current authoritative cache entry for this scope.
+        let Some(snapshot) = self.acp_session_snapshot(
+            &snapshot.workspace_id,
+            &snapshot.thread_id,
+            &snapshot.runtime_id,
+        ) else {
+            return;
+        };
+        let mut store = self.composer_store.lock().expect("composer store poisoned");
+        if let Some(current) = store
+            .drafts
+            .get(&snapshot.thread_id)
+            .filter(|draft| {
+                draft
+                    .domain()
+                    .selected_provider
+                    .as_deref()
+                    .and_then(list::runtime_id_from_cli_runtime_provider_key)
+                    == Some(snapshot.runtime_id.as_str())
+            })
+            .cloned()
+        {
+            self.publish_composer_model_display(&mut store, (*current).clone());
+        }
+        let Some(current) = store
+            .model_pickers
+            .get(&snapshot.thread_id)
+            .filter(|picker| {
+                !picker.closed
+                    && picker
+                        .selector
+                        .selected_provider()
+                        .and_then(list::runtime_id_from_cli_runtime_provider_key)
+                        == Some(snapshot.runtime_id.as_str())
+            })
+            .cloned()
+        else {
+            return;
+        };
+        let mut next = (*current).clone();
+        next.acp_session = Some(snapshot.clone());
+        self.publish_composer_model_picker(&mut store, next);
     }
     pub(crate) fn cancel_composer_model_picker(&self, thread: &str) {
         let mut store = self.composer_store.lock().expect("composer store poisoned");
@@ -694,6 +768,25 @@ impl ClientCore {
                     };
                     if !core.model_picker_work_current(&work) {
                         continue;
+                    }
+                    if let RequestKind::Models(provider) = &work.kind {
+                        let runtime = list::runtime_id_from_cli_runtime_provider_key(provider)
+                            .and_then(|runtime| core.composer_model_picker_snapshot(&work.identity.thread_id)
+                                .and_then(|picker| picker.selector.cli_runtimes().iter().find(|row| row.runtime_id == runtime && row.kind == pioneer_protocol::CLIAgentRuntimeKind::Acp).cloned()));
+                        if let Some(runtime) = runtime {
+                            let result = core.execute_provider_command(crate::providers::operations::ProviderCommand::AcpSession(pioneer_protocol::AcpSessionParams {
+                                workspace_id: work.workspace.clone(), thread_id: work.identity.thread_id.clone(), runtime_id: runtime.runtime_id,
+                                // Initialize/discover auth before session/new: an agent
+                                // may require login before exposing session descriptors.
+                                // The shared controls then prepare the session explicitly.
+                                operation: pioneer_protocol::AcpSessionOperation::Snapshot,
+                            })).and_then(|completion| match completion {
+                                crate::providers::operations::ProviderOperationCompletion::AcpSession(response) => Ok(response),
+                                _ => Err(anyhow::anyhow!("Agent session response unavailable")),
+                            }).map_err(|error| error.to_string());
+                            core.complete_composer_model_picker(work, ModelPickerResult::Acp(result));
+                            continue;
+                        }
                     }
                     use crate::providers::store::{ProviderCollectionKey, ProviderModelKind};
                     let key = match &work.kind {

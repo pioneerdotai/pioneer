@@ -1,3 +1,5 @@
+mod package_snapshot;
+pub use package_snapshot::{SkillPackageFile, snapshot_skill_package};
 pub mod audit;
 pub mod catalog;
 pub mod compile;

@@ -19,11 +19,15 @@ pub(crate) enum CliMcpSessionLaunch {
     ManagementOnly,
     Codex(CodexMcpSessionLaunchProjection),
     Claude(ClaudeMcpSessionLaunchProjection),
+    Acp(super::acp_mcp::AcpMcpSessionLaunchProjection),
     OpenCode(OpenCodeMcpSessionLaunchProjection),
 }
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum CliProviderContinuation {
+    AcpSession {
+        session_id: Option<String>,
+    },
     CodexRpcThread {
         native_thread_id: Option<String>,
     },
@@ -46,6 +50,10 @@ pub(crate) enum CliProviderContinuation {
 impl fmt::Debug for CliProviderContinuation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::AcpSession { .. } => formatter
+                .debug_struct("AcpSession")
+                .field("session_id", &"<redacted>")
+                .finish(),
             Self::CodexRpcThread { native_thread_id } => formatter
                 .debug_struct("CodexRpcThread")
                 .field("native_thread_id", native_thread_id)
@@ -83,8 +91,9 @@ impl CliProviderContinuation {
                 provider_session_id,
                 ..
             } => Some(*provider_session_id),
-            Self::CodexRpcThread { .. } => None,
-            Self::OpenCodeServerSession { .. } => None,
+            Self::CodexRpcThread { .. }
+            | Self::AcpSession { .. }
+            | Self::OpenCodeServerSession { .. } => None,
         }
     }
 }
@@ -98,6 +107,18 @@ pub(crate) struct CliSessionLaunchSpec {
 }
 
 impl CliSessionLaunchSpec {
+    pub(crate) fn acp(
+        options: CLIAgentRuntimeSessionStartOptions,
+        mcp: CliMcpSessionLaunch,
+        session_id: Option<String>,
+    ) -> Self {
+        Self {
+            options,
+            mcp,
+            continuation: CliProviderContinuation::AcpSession { session_id },
+            native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget::default(),
+        }
+    }
     pub(crate) fn codex(
         options: CLIAgentRuntimeSessionStartOptions,
         mcp: CliMcpSessionLaunch,
@@ -134,6 +155,9 @@ impl CliSessionLaunchSpec {
             )),
             pioneer_protocol::CLIAgentRuntimeKind::Claude => {
                 anyhow::bail!("Claude forks require a typed transcript continuation")
+            }
+            pioneer_protocol::CLIAgentRuntimeKind::Acp => {
+                anyhow::bail!("ACP management requires its session control contract")
             }
         }
     }
@@ -238,6 +262,7 @@ fn restart_relevant_options_changed(
         || old.authorization_scope_fingerprint != new.authorization_scope_fingerprint
         || old.app_server_args != new.app_server_args
         || old.env != new.env
+        || old.additional_directories != new.additional_directories
         || old.selected_skills != new.selected_skills
         || instruction_fingerprint(&old.elevated_instructions)
             != instruction_fingerprint(&new.elevated_instructions)
@@ -256,6 +281,14 @@ fn continuation_identity_changed(
     new: &CliProviderContinuation,
 ) -> bool {
     match (old, new) {
+        (
+            CliProviderContinuation::AcpSession { session_id: old },
+            CliProviderContinuation::AcpSession { session_id: new },
+        ) => {
+            // A concrete different session is a replacement. Omission means
+            // the same cached process may keep its already opened session.
+            old.is_some() && new.is_some() && old != new
+        }
         (
             CliProviderContinuation::CodexRpcThread { .. },
             CliProviderContinuation::CodexRpcThread { .. },

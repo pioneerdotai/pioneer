@@ -524,3 +524,29 @@ impl MessageProcessor {
             .remove(turn_id);
     }
 }
+
+impl MessageProcessor {
+    /// ACP proxies share the same first-party tools and authorization wrappers
+    /// as the ordinary agent runtime; no second Task/artifact implementation.
+    pub(crate) async fn materialize_acp_skill_extensions(
+        self: &Arc<Self>,
+        context: TurnToolContext,
+    ) -> Result<Vec<ToolExtensionBundle>> {
+        use pioneer_agent::TaskToolProvider;
+        let mut bundles = GatewayArtifactToolProvider::new(Arc::downgrade(self))
+            .materialize_turn_tools(context.clone())
+            .await
+            .map_err(anyhow::Error::msg)?
+            .bundles;
+        let tasks = crate::task_tools::GatewayTaskToolProvider::new(Arc::downgrade(self))
+            .materialize_task_tools(pioneer_agent::TaskTurnContext {
+                workspace_id: context.workspace_id,
+                thread_id: context.thread_id,
+                turn_id: context.turn_id,
+            })
+            .await
+            .map_err(anyhow::Error::msg)?;
+        bundles.extend(tasks.bundles);
+        Ok(bundles)
+    }
+}

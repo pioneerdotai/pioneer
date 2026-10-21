@@ -729,6 +729,7 @@ fn cli_runtime_options_with_reasoning_effort(
     };
 
     let mut options = options.unwrap_or(TurnCLIRuntimeOptions {
+        acp_configuration: None,
         sandbox: None,
         effort: None,
         personality: None,
@@ -1260,6 +1261,7 @@ mod tests {
         });
         context.selected_reasoning_effort = Some("high".to_owned());
         context.cli_runtime_options = Some(TurnCLIRuntimeOptions {
+            acp_configuration: None,
             sandbox: None,
             effort: Some("high".to_owned()),
             personality: None,

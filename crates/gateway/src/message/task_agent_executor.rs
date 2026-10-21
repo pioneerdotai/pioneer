@@ -262,6 +262,9 @@ async fn exact_task_agent_source_id(
     }
     if let AgentExecutionProfileBackend::CliRuntime {
         runtime_instance_id,
+    }
+    | AgentExecutionProfileBackend::AcpAgentRuntime {
+        runtime_id: runtime_instance_id,
     } = &facts.profile.backend
         && runtime_instance_id != &identity.source_id
     {
@@ -1716,6 +1719,9 @@ impl TaskAgentExecutor {
                     .find(|runtime| runtime.id == *runtime_instance_id && runtime.enabled)
                     .context("selected Task CLI runtime is unavailable")?;
                 let runtime_kind = match runtime.kind {
+                    pioneer_config::GatewayCliAgentRuntimeKindConfig::Acp => {
+                        anyhow::bail!("native CLI execution profile cannot select an ACP instance")
+                    }
                     pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex => {
                         CLIAgentRuntimeKind::Codex
                     }
@@ -1734,14 +1740,28 @@ impl TaskAgentExecutor {
                     }),
                 )
             }
-            AgentExecutionProfileBackend::AcpAgentRuntime { runtime_id } => (
-                None,
-                Some(AgentExecutionBackend::ACPAgentRuntime {
-                    runtime_id: runtime_id.clone(),
-                }),
-            ),
+            AgentExecutionProfileBackend::AcpAgentRuntime { runtime_id } => {
+                let runtime = processor
+                    .load_cli_runtime_instances()?
+                    .into_iter()
+                    .find(|runtime| runtime.id == *runtime_id && runtime.enabled)
+                    .context("selected Task ACP runtime is unavailable")?;
+                anyhow::ensure!(
+                    runtime.kind == pioneer_config::GatewayCliAgentRuntimeKindConfig::Acp,
+                    "ACP execution profile does not match its configured transport"
+                );
+                (
+                    Some((runtime_id.clone(), CLIAgentRuntimeKind::Acp)),
+                    Some(AgentExecutionBackend::ACPAgentRuntime {
+                        runtime_id: runtime_id.clone(),
+                    }),
+                )
+            }
         };
         let startup_runtime = match &selected_execution_backend {
+            Some(AgentExecutionBackend::ACPAgentRuntime { .. }) => {
+                pioneer_observability::turn_startup::Runtime::Acp
+            }
             Some(AgentExecutionBackend::CLIAgentRuntime {
                 runtime_kind: CLIAgentRuntimeKind::Codex,
                 ..
@@ -3944,6 +3964,7 @@ impl TaskAgentExecutor {
                     let runtime_kind = match binding.runtime_kind.as_str() {
                         "codex" => CLIAgentRuntimeKind::Codex,
                         "claude" => CLIAgentRuntimeKind::Claude,
+                        "acp" => CLIAgentRuntimeKind::Acp,
                         "opencode" => CLIAgentRuntimeKind::OpenCode,
                         _ => {
                             return Err(anyhow!(
@@ -4831,12 +4852,17 @@ impl TaskAgentExecutor {
         if child_runtime.task_run_turn.status == TaskRunTurnStatus::Blocked {
             return Ok(false);
         }
+        let acp_cancellation =
+            acp_child_interruption_is_cancellation(&processor, &child_runtime.task_run_turn)
+                .await?;
         if !matches!(
             child_runtime.task_run_turn.status,
             TaskRunTurnStatus::InProgress
                 | TaskRunTurnStatus::CandidateCreated
                 | TaskRunTurnStatus::Cancelled
-        ) {
+        ) && !(child_runtime.task_run_turn.status == TaskRunTurnStatus::Interrupted
+            && acp_cancellation.is_some())
+        {
             return Ok(true);
         }
         let Some(task_response) = processor
@@ -4864,8 +4890,18 @@ impl TaskAgentExecutor {
             child_runtime.task_run_turn.task_id.clone(),
             child_runtime.task_run_turn.run_id.clone(),
         );
-        self.cancel_child_turn(child_runtime, reason, handle)
+        if acp_cancellation == Some(false) {
+            self.fail_child_turn(
+                child_runtime,
+                reason,
+                TaskRunTurnStatus::Interrupted,
+                handle,
+            )
             .await?;
+        } else {
+            self.cancel_child_turn(child_runtime, reason, handle)
+                .await?;
+        }
         Ok(true)
     }
 
@@ -5411,6 +5447,7 @@ impl TaskAgentExecutor {
                                     == match runtime_kind {
                                         CLIAgentRuntimeKind::Codex => "codex",
                                         CLIAgentRuntimeKind::Claude => "claude",
+                                        pioneer_protocol::CLIAgentRuntimeKind::Acp => "acp",
                                         CLIAgentRuntimeKind::OpenCode => "opencode",
                                     } => {}
                         (None, None) => {}
@@ -6235,6 +6272,15 @@ impl TaskAgentExecutor {
             .processor()?
             .with_database_class(SqliteWriteClass::Critical);
         let handle = handle.with_critical_writes();
+        if target_status == TaskRunTurnStatus::Interrupted
+            && acp_child_interruption_is_cancellation(&processor, &child_runtime.task_run_turn)
+                .await?
+                == Some(true)
+        {
+            return self
+                .cancel_child_turn(child_runtime, error_message, handle)
+                .await;
+        }
         let failed_at = now_timestamp_secs();
         let error = task_turn_failure_error(
             &processor,
@@ -6623,10 +6669,8 @@ fn validate_composer_launch_backend(launch: &TurnStartParams) -> Result<()> {
     match launch.execution_backend.as_ref() {
         None
         | Some(AgentExecutionBackend::ApiProvider { .. })
-        | Some(AgentExecutionBackend::CLIAgentRuntime { .. }) => Ok(()),
-        Some(AgentExecutionBackend::ACPAgentRuntime { runtime_id }) => {
-            bail!("composer work selected unsupported ACP runtime `{runtime_id}`")
-        }
+        | Some(AgentExecutionBackend::CLIAgentRuntime { .. })
+        | Some(AgentExecutionBackend::ACPAgentRuntime { .. }) => Ok(()),
     }
 }
 
@@ -9159,6 +9203,101 @@ fn runtime_auto_accept_review_event_id(run_id: &str, turn_id: &str) -> String {
     format!("trre_auto_{run_id}_{turn_id}")
 }
 
+/// Classify an already accepted ACP interruption, without re-running a provider
+/// or requiring its expired process lease. Task transitions retain their own CAS.
+pub(super) fn acp_child_interruption_is_cancellation<'a>(
+    processor: &'a MessageProcessor,
+    child: &'a TaskRunTurn,
+) -> MessageFuture<'a, Result<Option<bool>>> {
+    message_future(async move {
+        let Some(snapshot) = processor
+            .crud_store
+            .cli_runtime_turn_terminal_guard_by_id(&child.turn_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let binding = &snapshot.binding;
+        if binding.runtime_kind != "acp" || snapshot.turn_status != TurnStatus::Interrupted {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            binding.thread_id == child.thread_id,
+            "ACP child scope changed"
+        );
+        if processor
+            .crud_store
+            .task_turn_has_accepted_cancellation(
+                &binding.workspace_id,
+                &child.task_id,
+                &child.run_id,
+                &child.turn_id,
+            )
+            .await?
+        {
+            return Ok(Some(true));
+        }
+        let attempt = snapshot
+            .attempt
+            .as_ref()
+            .context("ACP terminal attempt missing")?;
+        let record = processor
+            .crud_store
+            .latest_cli_runtime_native_event(pioneer_crud::CliRuntimeNativeEventListFilter {
+                runtime_id: Some(binding.runtime_id.clone()),
+                thread_id: Some(binding.thread_id.clone()),
+                turn_id: Some(binding.turn_id.clone()),
+                native_thread_id: Some(binding.native_thread_id.clone()),
+                native_turn_id: binding.native_turn_id.clone(),
+                native_method: Some("gateway/terminal_delivery".into()),
+                ..Default::default()
+            })
+            .await?
+            .context("ACP accepted terminal outcome missing")?;
+        let (source, event): (
+            pioneer_protocol::CliRuntimeBlockedTurnGuard,
+            pioneer_cli_agent_runtime::event::RuntimeEvent,
+        ) = serde_json::from_str(&record.payload_redacted_json)?;
+        anyhow::ensure!(
+            record.id == source.terminal_delivery_id()
+                && record.runtime_kind == "acp"
+                && record.workspace_id.as_deref() == Some(binding.workspace_id.as_str())
+                && source.runtime_kind == "acp"
+                && source.workspace_id == binding.workspace_id
+                && source.thread_id == binding.thread_id
+                && source.turn_id == binding.turn_id
+                && source.runtime_id == binding.runtime_id
+                && source.continuation_thread_id == binding.continuation_thread_id
+                && source.native_thread_id == binding.native_thread_id
+                && source.binding_native_turn_id == binding.native_turn_id
+                && source.attempt_id == attempt.id
+                && attempt.turn_id == binding.turn_id
+                && attempt.runtime_id == binding.runtime_id
+                && attempt.runtime_kind == binding.runtime_kind
+                && attempt.native_thread_id == binding.native_thread_id
+                && source.attempt_native_turn_id == attempt.native_turn_id
+                && source.recovery_job_id == attempt.recovery_job_id
+                && source.recovery_attempt_id == attempt.recovery_attempt_id
+                && source.segment.as_ref().map(|(id, native, _)| (id, native))
+                    == snapshot
+                        .segment
+                        .as_ref()
+                        .map(|segment| (&segment.id, &segment.native_turn_id)),
+            "ACP accepted terminal outcome belongs to another execution"
+        );
+        let pioneer_cli_agent_runtime::event::RuntimeEvent::TurnInterrupted(interrupted) = event
+        else {
+            bail!("ACP interrupted child has a different accepted terminal outcome");
+        };
+        anyhow::ensure!(
+            interrupted.native_thread_id.as_deref() == Some(binding.native_thread_id.as_str())
+                && Some(interrupted.native_turn_id.as_str()) == binding.native_turn_id.as_deref(),
+            "ACP interrupted event belongs to another native execution"
+        );
+        Ok(Some(interrupted.reason == "cancelled"))
+    })
+}
+
 fn task_run_turn_terminal_status_from_child_turn_status(
     status: TurnStatus,
 ) -> Option<TaskRunTurnStatus> {
@@ -9304,6 +9443,9 @@ async fn resolved_task_execution_turn_settings(
                 .find(|runtime| runtime.id == *runtime_instance_id && runtime.enabled)
                 .context("pinned Task CLI runtime is unavailable")?;
             let runtime_kind = match runtime.kind {
+                pioneer_config::GatewayCliAgentRuntimeKindConfig::Acp => {
+                    anyhow::bail!("native CLI execution profile cannot select an ACP instance")
+                }
                 pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex => {
                     CLIAgentRuntimeKind::Codex
                 }
@@ -9322,12 +9464,23 @@ async fn resolved_task_execution_turn_settings(
                 Some((runtime_instance_id.clone(), runtime_kind)),
             )
         }
-        AgentExecutionProfileBackend::AcpAgentRuntime { runtime_id } => (
-            AgentExecutionBackend::ACPAgentRuntime {
-                runtime_id: runtime_id.clone(),
-            },
-            None,
-        ),
+        AgentExecutionProfileBackend::AcpAgentRuntime { runtime_id } => {
+            let configured = processor
+                .load_cli_runtime_instances()?
+                .into_iter()
+                .find(|runtime| runtime.id == *runtime_id && runtime.enabled)
+                .context("pinned Task ACP instance is unavailable")?;
+            anyhow::ensure!(
+                configured.kind == pioneer_config::GatewayCliAgentRuntimeKindConfig::Acp,
+                "pinned Task ACP profile does not match its configured transport"
+            );
+            (
+                AgentExecutionBackend::ACPAgentRuntime {
+                    runtime_id: runtime_id.clone(),
+                },
+                Some((runtime_id.clone(), CLIAgentRuntimeKind::Acp)),
+            )
+        }
     };
     let capabilities = match launch {
         Some(launch) => {
@@ -9484,6 +9637,11 @@ async fn resolve_task_child_cli_execution_security_snapshot(
         })?
         .snapshot;
         let execution_backend = match runtime_kind {
+            CLIAgentRuntimeKind::Acp => {
+                crate::turn_security::TurnSecurityResolverExecutionBackend::Acp {
+                    runtime_id: runtime_id.to_owned(),
+                }
+            }
             CLIAgentRuntimeKind::Codex => {
                 crate::turn_security::TurnSecurityResolverExecutionBackend::CodexCli {
                     runtime_id: runtime_id.to_owned(),
@@ -10456,8 +10614,22 @@ impl TaskAgentResultExtractor {
             .crud_store
             .list_completed_agent_messages(task_run_turn.turn_id.as_str())
             .await?;
+        // ACP has no wire final marker. Only the reducer's prompt-completion
+        // candidate is a result; earlier completed commentary is not one.
+        // Native backends retain their existing extraction semantics.
+        let require_final_phase = processor
+            .crud_store
+            .get_cli_runtime_turn_binding(task_run_turn.turn_id.as_str())
+            .await?
+            .is_some_and(|binding| binding.runtime_kind == "acp");
         let final_message = messages.into_iter().rev().find_map(|item| match item {
-            TurnItem::AgentMessage { id, text, .. } => Some((id, text)),
+            TurnItem::AgentMessage {
+                id, text, phase, ..
+            } if !require_final_phase
+                || phase == pioneer_protocol::AgentMessagePhase::FinalAnswer =>
+            {
+                Some((id, text))
+            }
             _ => None,
         });
         let Some((source_item_id, raw_text)) = final_message else {
@@ -12406,6 +12578,149 @@ mod tests {
             advisory.feedback_text.as_deref(),
             Some("I would accept this result.")
         );
+    }
+
+    #[tokio::test]
+    async fn acp_task_extraction_uses_only_the_exact_prompt_final_candidate() {
+        use pioneer_cli_agent_runtime::acp::{
+            reducer::{Context as AcpContext, Reducer},
+            schema,
+        };
+        use pioneer_protocol::AgentDurableEvent;
+        for (name, answer, stop) in [
+            ("acp_answer", true, schema::StopReason::EndTurn),
+            ("acp_no_answer", false, schema::StopReason::EndTurn),
+            ("acp_cancelled", true, schema::StopReason::Cancelled),
+        ] {
+            let (processor, task, execution, lineage) = task_artifact_harness(name).await;
+            let store = &processor.crud_store;
+            store
+                .append_task_event(
+                    pioneer_protocol::TaskEventPayload::TaskCreated { task: task.clone() },
+                    1,
+                )
+                .await
+                .unwrap();
+            crate::message::tests::materialize_cli_runtime_turn_with_text(
+                store,
+                &task.workspace_id,
+                &execution.thread_id,
+                &execution.turn_id,
+                "request",
+            )
+            .await;
+            let now = chrono::Utc::now().fixed_offset();
+            store
+                .upsert_cli_runtime_turn_binding(pioneer_crud::NewCliRuntimeTurnBinding {
+                    workspace_id: task.workspace_id.clone(),
+                    thread_id: execution.thread_id.clone(),
+                    continuation_thread_id: lineage.parent_thread_id.clone(),
+                    turn_id: execution.turn_id.clone(),
+                    runtime_id: "agent".into(),
+                    runtime_kind: "acp".into(),
+                    native_thread_id: "session".into(),
+                    native_turn_id: Some("prompt".into()),
+                    request_id: None,
+                    status: "running".into(),
+                    model: None,
+                    cwd: None,
+                    sandbox_json: None,
+                    approval_policy: None,
+                    input_mapping_json: "{}".into(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await
+                .unwrap();
+            let mut reducer = Reducer::new(
+                AcpContext {
+                    workspace_id: task.workspace_id.clone(),
+                    thread_id: execution.thread_id.clone(),
+                    turn_id: execution.turn_id.clone(),
+                    session_id: "session".into(),
+                    session_scope: format!("process:{name}:session"),
+                },
+                64,
+                65536,
+            )
+            .unwrap();
+            let mut updates = vec![
+                serde_json::json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Проверю"}}),
+                serde_json::json!({"sessionUpdate":"tool_call","toolCallId":"tool","title":"Work","status":"completed"}),
+            ];
+            if answer {
+                updates.push(serde_json::json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Done"}}));
+            }
+            let mut completed = Vec::new();
+            for update in updates {
+                let notification = serde_json::from_value(
+                    serde_json::json!({"sessionId":"session","update":update}),
+                )
+                .unwrap();
+                for event in reducer.update(notification).unwrap().durable {
+                    match event {
+                        AgentDurableEvent::ItemStarted { notification } => {
+                            store
+                                .materialize_item_started(notification, 2)
+                                .await
+                                .unwrap();
+                        }
+                        AgentDurableEvent::ItemCompleted { notification } => {
+                            completed.push(notification)
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            let (remaining, final_answer) =
+                reducer.finish(&schema::PromptResponse::new(stop)).unwrap();
+            completed.extend(
+                remaining
+                    .durable
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        AgentDurableEvent::ItemCompleted { notification } => Some(notification),
+                        _ => None,
+                    }),
+            );
+            let source = final_answer
+                .as_ref()
+                .map(|item| item.item.item_id().to_owned());
+            completed.extend(final_answer);
+            for notification in completed {
+                store
+                    .materialize_item_completed(notification, 3)
+                    .await
+                    .unwrap();
+            }
+            let extracted = TaskAgentResultExtractor::extract_with_artifact_mode(
+                &processor,
+                &execution,
+                &lineage,
+                TaskAgentResultArtifactMode::FinalResult,
+            )
+            .await
+            .unwrap();
+            if answer && stop != schema::StopReason::Cancelled {
+                let result = extracted.unwrap();
+                assert_eq!(result.summary.as_deref(), Some("Done"));
+                let data = serde_json::to_value(&result).unwrap().to_string();
+                assert!(data.contains(source.as_ref().unwrap()));
+                let again = TaskAgentResultExtractor::extract_with_artifact_mode(
+                    &processor,
+                    &execution,
+                    &lineage,
+                    TaskAgentResultArtifactMode::FinalResult,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(result, again);
+            } else {
+                assert_eq!(extracted.unwrap_err().code, "task_agent_result_missing");
+                assert!(source.is_none());
+            }
+        }
     }
 
     #[tokio::test]

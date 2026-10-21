@@ -485,6 +485,7 @@ mod tests {
                 &binding,
                 &RuntimeEvent::ItemCompleted(
                     pioneer_cli_agent_runtime::event::RuntimeItemCompleted {
+                        item: None,
                         native_thread_id: Some("native-thread".to_owned()),
                         native_turn_id: "native-turn".to_owned(),
                         native_item_id: "item".to_owned(),

@@ -99,6 +99,9 @@ open_shadow_home = "Открыть shadow home"
 expand = "Показать детали CLI провайдера"
 collapse = "Скрыть детали CLI провайдера"
 
+edit_launch = "Изменить параметры запуска…"
+acp_auth_hint = "Авторизация — в выборе агента композера"
+
 [providers.cli.status_detail]
 authenticated = "Вход выполнен: %{account}"
 authenticated_with_plan = "Вход выполнен: %{account} · %{plan}"
@@ -132,6 +135,7 @@ error = "Ошибка"
 settings_load_failed = "Не удалось загрузить настройки CLI-провайдеров"
 settings_forbidden = "У этого аккаунта нет прав на управление настройками Gateway"
 login_failed = "Не удалось начать вход для %{runtime}"
+session_failed = "Не удалось выполнить действие с сессией %{runtime}"
 proxy_failed = "Не удалось изменить прокси %{runtime}"
 save_failed = "Не удалось сохранить настройки %{runtime}"
 enabled_failed = "Не удалось включить или отключить %{runtime}"
@@ -357,3 +361,9 @@ choose = "Выбрать…"
 reset = "Сбросить"
 save_first = "Сохраните CLI-провайдера, чтобы выбрать его модель."
 invalid = "Выберите модель и режим reasoning, поддерживаемые этим CLI-провайдером."
+
+[providers.cli.acp]
+arguments = "Аргументы (JSON-массив)"
+environment = "Переменные окружения (JSON-объект)"
+environment_hint = "Укажите имена переменных агента и соответствующие им имена на сервере Gateway. Значения останутся на сервере."
+invalid_launch = "Укажите аргументы как JSON-массив строк, а переменные окружения — как JSON-объект."

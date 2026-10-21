@@ -415,6 +415,11 @@ pub fn resolve_cli_runtime_execution_backend(
             && runtime.enabled
             && matches!(runtime.status, RuntimeStatus::Ready)
     }) {
+        if runtime.kind == pioneer_protocol::CLIAgentRuntimeKind::Acp {
+            return Ok(Some(AgentExecutionBackend::ACPAgentRuntime {
+                runtime_id: runtime.runtime_id.clone(),
+            }));
+        }
         return Ok(Some(AgentExecutionBackend::CLIAgentRuntime {
             runtime_id: runtime.runtime_id.clone(),
             runtime_kind: runtime.kind,
@@ -480,7 +485,7 @@ fn cli_runtime_provider_row(runtime: &RuntimeSummary) -> Option<ProviderModelSel
 fn cli_runtime_visible_in_model_selector(runtime: &RuntimeSummary) -> bool {
     runtime.enabled
         && runtime.capabilities.supports_threads
-        && runtime.capabilities.supports_model_list
+        && (runtime.kind == CLIAgentRuntimeKind::Acp || runtime.capabilities.supports_model_list)
         && matches!(runtime.status, RuntimeStatus::Ready)
 }
 

@@ -155,6 +155,9 @@ pub(crate) fn cli_runtime_native_skills_root(
     runtime_kind: pioneer_protocol::CLIAgentRuntimeKind,
 ) -> Result<PathBuf> {
     let configured_root = match runtime_kind {
+        pioneer_protocol::CLIAgentRuntimeKind::Acp => {
+            anyhow::bail!("ACP has no native skills directory; use the resolved skill context")
+        }
         pioneer_protocol::CLIAgentRuntimeKind::Codex => runtime.home_path.as_str(),
         pioneer_protocol::CLIAgentRuntimeKind::Claude => runtime
             .shadow_home_path
@@ -206,6 +209,7 @@ pub(crate) fn build_cli_runtime_skill_install_plans(
             runtime_kind: match runtime_kind {
                 pioneer_protocol::CLIAgentRuntimeKind::Codex => "codex",
                 pioneer_protocol::CLIAgentRuntimeKind::Claude => "claude",
+                pioneer_protocol::CLIAgentRuntimeKind::Acp => "acp",
                 pioneer_protocol::CLIAgentRuntimeKind::OpenCode => "opencode",
             }
             .to_owned(),
@@ -250,6 +254,7 @@ pub(crate) fn restore_cli_runtime_selected_skills(
     let runtime_kind_name = match runtime_kind {
         pioneer_protocol::CLIAgentRuntimeKind::Codex => "codex",
         pioneer_protocol::CLIAgentRuntimeKind::Claude => "claude",
+        pioneer_protocol::CLIAgentRuntimeKind::Acp => "acp",
         pioneer_protocol::CLIAgentRuntimeKind::OpenCode => "opencode",
     };
     let native_skills_root = cli_runtime_native_skills_root(runtime, runtime_kind)?;
@@ -386,6 +391,7 @@ pub(crate) struct CliRuntimeCombinedPreflightPlan {
     pub(crate) mcp_projection: Option<crate::turn_mcp::ResolvedMcpTurnProjection>,
     pub(crate) skill_install_plans: Vec<CliRuntimeSkillInstallPlan>,
     pub(crate) skill_bindings: Vec<TurnSkillBinding>,
+    pub(crate) acp_skills: Vec<pioneer_skills::ResolvedSkill>,
 }
 
 pub(crate) fn partition_cli_runtime_capabilities(
@@ -949,6 +955,7 @@ mod tests {
             shadow_home_path,
             custom_models: Vec::new(),
             app_server_args: Vec::new(),
+            env_from: Default::default(),
             startup_probe_timeout_ms: 1_000,
             request_timeout_ms: 1_000,
             idle_session_ttl_secs: 60,

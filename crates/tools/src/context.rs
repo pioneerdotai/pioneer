@@ -115,8 +115,8 @@ pub struct ToolInvocation {
     pub permission_metadata: ToolPermissionMetadata,
     pub execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
     /// Canonical parse/resolve result or typed preflight rejection bound to
-    /// the permission decision. Only the orchestrator may populate it;
-    /// model/provider payloads cannot.
+    /// the permission decision. The orchestrator or the typed full-text-write
+    /// preflight may populate it; model/provider payloads cannot.
     pub apply_patch_preflight: Option<ApplyPatchPreflight>,
     pub cancellation: CancellationToken,
 }

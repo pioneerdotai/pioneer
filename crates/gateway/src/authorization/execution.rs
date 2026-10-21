@@ -23,6 +23,17 @@ use super::{
     RuntimePrincipalPolicy, record_stale_policy_revision,
 };
 
+fn is_standard_session_backend(backend: Option<&AgentExecutionBackend>) -> bool {
+    matches!(
+        backend,
+        Some(AgentExecutionBackend::ACPAgentRuntime { .. })
+            | Some(AgentExecutionBackend::CLIAgentRuntime {
+                runtime_kind: CLIAgentRuntimeKind::Acp,
+                ..
+            })
+    )
+}
+
 const EXECUTION_AUTHORIZATION_CONTEXT_VERSION: u32 = 8;
 const SKILL_PROJECTION_VERSION: u32 = 1;
 const CLI_RUNTIME_PROJECTION_VERSION: u32 = 1;
@@ -718,6 +729,14 @@ impl ExecutionAdmissionService {
                     runtime_draft,
                 )
                 .await?;
+                if is_standard_session_backend(request.execution_backend.as_ref())
+                    && !self.policy.standard_session_configuration_allowed(
+                        principal.kind,
+                        principal.role_key.as_ref(),
+                    )
+                {
+                    bail!("ACP session configuration cannot prove a model-specific CLI allowlist");
+                }
                 if !self.policy.cli_model_allowed(
                     principal.kind,
                     principal.role_key.as_ref(),
@@ -2868,6 +2887,12 @@ impl ExecutionAuthorizationContext {
         let (provider_grant, cli_grant) = match execution_backend {
             Some(AgentExecutionBackend::CLIAgentRuntime { runtime_id, .. })
             | Some(AgentExecutionBackend::ACPAgentRuntime { runtime_id }) => {
+                if is_standard_session_backend(execution_backend)
+                    && !policy
+                        .standard_session_configuration_allowed(principal_kind, role_key.as_ref())
+                {
+                    bail!("current role no longer permits opaque ACP session configuration");
+                }
                 if !self
                     .grant_manifest
                     .allows_action(ResourceAction::CliRuntimeUse)
@@ -3275,6 +3300,13 @@ fn cli_runtime_projection(
     execution_backend: Option<&AgentExecutionBackend>,
 ) -> Option<ExecutionCliRuntimeProjectionIdentity> {
     match execution_backend {
+        Some(AgentExecutionBackend::ACPAgentRuntime { runtime_id }) => {
+            Some(ExecutionCliRuntimeProjectionIdentity {
+                version: CLI_RUNTIME_PROJECTION_VERSION,
+                runtime_id: runtime_id.clone(),
+                runtime_kind: CLIAgentRuntimeKind::Acp,
+            })
+        }
         Some(AgentExecutionBackend::CLIAgentRuntime {
             runtime_id,
             runtime_kind,
@@ -3773,6 +3805,14 @@ impl ExecutionAuthorizationAdmission {
         match execution_backend {
             Some(AgentExecutionBackend::CLIAgentRuntime { runtime_id, .. })
             | Some(AgentExecutionBackend::ACPAgentRuntime { runtime_id }) => {
+                if is_standard_session_backend(execution_backend)
+                    && !policy.standard_session_configuration_allowed(
+                        self.principal.kind,
+                        self.principal.role_key.as_ref(),
+                    )
+                {
+                    bail!("ACP session configuration cannot prove a model-specific CLI allowlist");
+                }
                 if !policy.cli_model_allowed(
                     self.principal.kind,
                     self.principal.role_key.as_ref(),

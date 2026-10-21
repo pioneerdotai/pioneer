@@ -520,6 +520,47 @@ impl McpService {
         *self.inner.permission_approval_broker.write().await = broker;
     }
 
+    pub(crate) async fn acp_execution_guard(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        runtime: &str,
+    ) -> anyhow::Result<()> {
+        let context = crate::authorization::ExecutionAuthorizationContext::load_for_turn(
+            self.inner.crud_store.as_ref(),
+            turn,
+        )
+        .await?;
+        context.verify_cli_runtime_projection(
+            workspace,
+            runtime,
+            pioneer_protocol::CLIAgentRuntimeKind::Acp,
+        )?;
+        self.inner
+            .execution_leases
+            .revalidate_for_turn(
+                self.inner.crud_store.as_ref(),
+                &context,
+                workspace,
+                thread,
+                turn,
+                context.continuation_action(),
+                self.inner
+                    .authorization_invalidation_hub
+                    .current_revision()
+                    .await?,
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn permission_approval_broker(
+        &self,
+    ) -> Arc<dyn pioneer_tools::PermissionApprovalBroker> {
+        self.inner.permission_approval_broker.read().await.clone()
+    }
+
     pub(crate) async fn cli_task_mutation_cache(
         &self,
         turn_id: &str,
@@ -540,6 +581,20 @@ impl McpService {
             self.inner.crud_store.clone(),
             shared.clone(),
             shared,
+            self.inner.authorization_invalidation_hub.clone(),
+            self.inner.execution_leases.clone(),
+            self.inner.invocation_governor.clone(),
+        )
+    }
+
+    pub(crate) fn turn_mcp_invoker_with_runtime_view(
+        &self,
+        view: Arc<dyn TurnMcpRuntimeView>,
+    ) -> GatewayTurnMcpInvoker {
+        GatewayTurnMcpInvoker::new(
+            self.inner.crud_store.clone(),
+            view,
+            Arc::new(self.clone()),
             self.inner.authorization_invalidation_hub.clone(),
             self.inner.execution_leases.clone(),
             self.inner.invocation_governor.clone(),
@@ -3049,6 +3104,31 @@ impl TurnMcpValidatedExecution for McpService {
                 return self
                     .execute_html_tool(&validated, cancellation.clone())
                     .await;
+            }
+            if validated.binding.server_installation_id
+                == crate::cli_runtime::acp_skills::SKILL_SERVER_ID
+            {
+                let processor = self
+                    .inner
+                    .native_tool_processor
+                    .read()
+                    .expect("first-party processor lock")
+                    .upgrade()
+                    .ok_or_else(|| {
+                        TurnMcpInvocationError::new(
+                            TurnMcpInvocationErrorCode::RuntimeNotLive,
+                            "Gateway execution owner unavailable",
+                        )
+                    })?;
+                return processor
+                    .execute_acp_skill_tool(&validated, cancellation.clone())
+                    .await
+                    .map_err(|error| {
+                        TurnMcpInvocationError::new(
+                            TurnMcpInvocationErrorCode::PermissionDenied,
+                            error.to_string(),
+                        )
+                    });
             }
             if validated.binding.server_installation_id == FIRST_PARTY_FILE_SERVER_ID {
                 return self

@@ -214,6 +214,13 @@ impl ComposerView {
         {
             return ProviderModelDisplayState::Missing;
         }
+        if let Some(label) = self
+            .composer_input
+            .as_ref()
+            .and_then(|input| input.session_model_label())
+        {
+            return ProviderModelDisplayState::Label(label.to_owned());
+        }
         let Some(display) = self
             .composer_input
             .as_ref()

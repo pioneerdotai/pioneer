@@ -127,6 +127,7 @@ impl CliRuntimeAgentBinding {
             role_label: Some(match self.kind {
                 CLIAgentRuntimeKind::Codex => "Codex CLI".to_owned(),
                 CLIAgentRuntimeKind::Claude => "Claude CLI".to_owned(),
+                CLIAgentRuntimeKind::Acp => "ACP agent".to_owned(),
                 CLIAgentRuntimeKind::OpenCode => "OpenCode CLI".to_owned(),
             }),
             source_revision: self.source_revision,
@@ -138,12 +139,21 @@ impl CliRuntimeAgentBinding {
         profile
             .compatible_agent_identity_ids
             .contains(&self.identity_id)
-            && matches!(
-                &profile.backend,
-                AgentExecutionProfileBackend::CliRuntime {
-                    runtime_instance_id
-                } if runtime_instance_id == &self.runtime_instance_id
-            )
+            && match (&self.kind, &profile.backend) {
+                (
+                    CLIAgentRuntimeKind::Acp,
+                    AgentExecutionProfileBackend::AcpAgentRuntime { runtime_id },
+                ) => runtime_id == &self.runtime_instance_id,
+                (
+                    CLIAgentRuntimeKind::Codex
+                    | CLIAgentRuntimeKind::Claude
+                    | CLIAgentRuntimeKind::OpenCode,
+                    AgentExecutionProfileBackend::CliRuntime {
+                        runtime_instance_id,
+                    },
+                ) => runtime_instance_id == &self.runtime_instance_id,
+                _ => false,
+            }
     }
 
     pub fn bind_execution(
@@ -226,6 +236,7 @@ const fn runtime_kind_name(kind: CLIAgentRuntimeKind) -> &'static str {
     match kind {
         CLIAgentRuntimeKind::Codex => "codex",
         CLIAgentRuntimeKind::Claude => "claude",
+        CLIAgentRuntimeKind::Acp => "acp",
         CLIAgentRuntimeKind::OpenCode => "opencode",
     }
 }
@@ -307,6 +318,30 @@ mod tests {
         assert_eq!(
             runtime.reconnect(&persisted, 4, &profile),
             CliRuntimeReconnectDecision::Resume
+        );
+    }
+    #[test]
+    fn acp_uses_configured_identity_and_exact_existing_acp_profile() {
+        let runtime = binding("arbitrary-instance", CLIAgentRuntimeKind::Acp, true);
+        let mut offered = profile(&runtime);
+        assert!(!runtime.profile_is_bound(&offered));
+        offered.backend = AgentExecutionProfileBackend::AcpAgentRuntime {
+            runtime_id: "arbitrary-instance".into(),
+        };
+        assert!(runtime.profile_is_bound(&offered));
+        let execution = runtime.bind_execution(&offered, 7).unwrap();
+        let restarted = binding("arbitrary-instance", CLIAgentRuntimeKind::Acp, true);
+        assert_eq!(runtime.identity_id(), restarted.identity_id());
+        assert_eq!(
+            restarted.reconnect(&execution, 8, &offered),
+            CliRuntimeReconnectDecision::FenceStaleSession
+        );
+        assert!(
+            !binding("another-instance", CLIAgentRuntimeKind::Acp, true).profile_is_bound(&offered)
+        );
+        assert!(
+            !binding("arbitrary-instance", CLIAgentRuntimeKind::Codex, true)
+                .profile_is_bound(&offered)
         );
     }
 }

@@ -306,6 +306,7 @@ mod tests {
             shadow_home_path: None,
             custom_models: vec![],
             app_server_args: vec![],
+            env_from: Default::default(),
             startup_probe_timeout_ms: 1000,
             request_timeout_ms: 1000,
             idle_session_ttl_secs: 60,

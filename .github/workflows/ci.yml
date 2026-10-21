@@ -113,6 +113,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cargo test --locked -p pioneer-gateway --lib acp_composer_preparation_detached_result_and_parent_delivery_use_one_owner -- --nocapture
+          cargo test --locked -p pioneer-gateway --lib message::tests::cli_task_tools:: -- --nocapture --test-threads=1
           cargo test --locked -p pioneer-gateway --lib failed_snapshot_update_keeps_live_roots_and_root_failure_is_isolated -- --nocapture
           cargo test --locked -p pioneer-gateway --lib cli_native_terminal_consumer_acks_delivery_and_retains_ownership_after_publisher_cancel -- --nocapture
           cargo test --locked -p pioneer-gateway --lib refill_confirmed_prefix_survives_poison_and_unknown_commit_without_replay -- --nocapture

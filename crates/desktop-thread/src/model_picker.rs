@@ -25,6 +25,8 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
+mod acp_controls;
+
 const MODEL_ROW_MIN_HEIGHT: f32 = 32.0;
 const MODEL_LIST_MAX_HEIGHT: f32 = 260.0;
 const SELECTOR_POPOVER_FALLBACK_WIDTH: f32 = 380.0;
@@ -86,6 +88,16 @@ pub(crate) struct ComposerModelPickerView {
     _release: Subscription,
     dialog_open: bool,
     state: ModelSelectorDialogState,
+    acp_operation: Option<Task<()>>,
+    acp_busy: bool,
+    acp_result: Option<serde_json::Value>,
+    acp_auth_result: Option<serde_json::Value>,
+    acp_auth_owner: Option<pioneer_client::cli_runtime::acp::AcpSessionParams>,
+    acp_error: Option<String>,
+    acp_auth_input: Entity<InputState>,
+    acp_session_input: Entity<InputState>,
+    acp_roots_input: Entity<InputState>,
+    _acp_inputs: Vec<Subscription>,
 }
 impl ComposerModelPickerView {
     pub(crate) fn new(
@@ -116,6 +128,23 @@ impl ComposerModelPickerView {
                         let input = view.binding.input.borrow().clone();
                         match input {
                             Some(input) if input.identity == view.identity && !input.closed => {
+                                if view
+                                    .state
+                                    .input
+                                    .acp_session
+                                    .as_ref()
+                                    .map(|snapshot| (&snapshot.runtime_id, snapshot.generation))
+                                    != input
+                                        .acp_session
+                                        .as_ref()
+                                        .map(|snapshot| (&snapshot.runtime_id, snapshot.generation))
+                                {
+                                    view.cleanup_acp_auth(cx);
+                                    view.acp_auth_input
+                                        .update(cx, |input, cx| input.set_value("", window, cx));
+                                    view.acp_auth_result = None;
+                                    view.acp_error = None;
+                                }
                                 view.state.input = input;
                             }
                             _ => view.close(window, cx),
@@ -148,6 +177,17 @@ impl ComposerModelPickerView {
             model_trigger_width_px: Rc::new(RefCell::new(SELECTOR_POPOVER_FALLBACK_WIDTH)),
             reasoning_trigger_width_px: Rc::new(RefCell::new(SELECTOR_POPOVER_FALLBACK_WIDTH)),
         };
+        let acp_session_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("chat.acp.session_id").to_string())
+        });
+        let acp_roots_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(t!("chat.acp.additional_directories").to_string())
+        });
+        let acp_inputs = vec![
+            cx.observe(&acp_session_input, |_, _, cx| cx.notify()),
+            cx.observe(&acp_roots_input, |_, _, cx| cx.notify()),
+        ];
         Self {
             client,
             identity,
@@ -156,6 +196,16 @@ impl ComposerModelPickerView {
             task: Some(task),
             _release: release,
             dialog_open: false,
+            acp_operation: None,
+            acp_busy: false,
+            acp_result: None,
+            acp_auth_result: None,
+            acp_auth_owner: None,
+            acp_error: None,
+            acp_auth_input: cx.new(|cx| InputState::new(window, cx).masked(true)),
+            acp_session_input,
+            acp_roots_input,
+            _acp_inputs: acp_inputs,
             state,
         }
     }
@@ -180,6 +230,9 @@ impl ComposerModelPickerView {
         self.task.take();
     }
     pub(crate) fn close(&mut self, window: &mut Window, cx: &mut App) {
+        self.acp_auth_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.cleanup_acp_auth(cx);
         self.retire();
         if std::mem::take(&mut self.dialog_open) {
             window.close_dialog(cx);
@@ -253,20 +306,34 @@ impl ComposerModelPickerView {
                             .into_any_element(),
                     ]))
                 .child(v_flex().w_full().pt_4().pb_5().child({
-                    let form = v_form()
-                        .child(Self::render_provider_selector_section(
-                            state.clone(),
-                            provider_trigger_label,
-                        ))
-                        .child(Self::render_model_selector_section(
-                            state.clone(),
-                            model_trigger_label,
-                            model_trigger_loading,
-                        ));
-                    if let Some(reasoning) = Self::render_reasoning_effort_selector_section(state) {
-                        form.child(reasoning)
+                    if state.input.acp_session.is_some() {
+                        v_flex()
+                            .w_full()
+                            .gap_4()
+                            .child(v_form().child(Self::render_provider_selector_section(
+                                state.clone(),
+                                provider_trigger_label,
+                            )))
+                            .child(Self::render_acp_controls(state, cx))
+                            .into_any_element()
                     } else {
-                        form
+                        let form = v_form()
+                            .child(Self::render_provider_selector_section(
+                                state.clone(),
+                                provider_trigger_label,
+                            ))
+                            .child(Self::render_model_selector_section(
+                                state.clone(),
+                                model_trigger_label,
+                                model_trigger_loading,
+                            ));
+                        if let Some(reasoning) =
+                            Self::render_reasoning_effort_selector_section(state)
+                        {
+                            form.child(reasoning).into_any_element()
+                        } else {
+                            form.into_any_element()
+                        }
                     }
                 }))
         });
@@ -1249,6 +1316,7 @@ mod lifecycle_tests {
                 providers_request: Default::default(),
                 models_request: Default::default(),
                 provider_rows: vec![],
+                acp_session: None,
                 reasoning_rows: vec![],
                 selected_provider_ready: true,
             });

@@ -670,24 +670,7 @@ impl MessageProcessor {
                                 return;
                             }
                             AgentExecutionBackend::ACPAgentRuntime { runtime_id } => {
-                                let error = VoiceError {
-                                    kind: VoiceErrorKind::Unknown,
-                                    message: format!(
-                                        "ACP agent runtime `{runtime_id}` is not supported"
-                                    ),
-                                    public_error: None,
-                                };
-                                self.send_voice_session_result_notification(
-                                    connection_id,
-                                    session.thread_id.as_str(),
-                                    VoiceSessionResultNotification {
-                                        session_id: session.session_id.clone(),
-                                        outcome: VoiceSessionOutcome::Failed,
-                                        turn_id: Some(session.turn_id.clone()),
-                                        error: Some(error),
-                                    },
-                                )
-                                .await;
+                                self.turn_start_cli_runtime(connection_id, request_id, request_actor, turn_params, runtime_id, pioneer_protocol::CLIAgentRuntimeKind::Acp, super::turn_handlers::TurnExecutionAuthority::Fresh(execution_admission), super::turn_handlers::TurnStartSuccessResponse::VoiceSessionFinalizeAccepted { session_id: session.session_id.clone() }).await;
                                 return;
                             }
                         }

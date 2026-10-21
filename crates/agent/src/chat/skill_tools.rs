@@ -10,9 +10,9 @@ use pioneer_tools::{
 };
 use std::collections::HashMap;
 
-pub(super) type SkillToolMaterialization = SkillRuntimeToolMaterialization;
+pub type SkillToolMaterialization = SkillRuntimeToolMaterialization;
 
-pub(super) fn materialize_skill_tooling(
+pub fn materialize_skill_tooling(
     runtime_plan: &SkillRuntimePlan,
     skills_config: &SkillsLoopConfig,
 ) -> SkillToolMaterialization {
@@ -200,5 +200,49 @@ mod tests {
                 .iter()
                 .any(|spec| spec.spec.name == "read_skill")
         );
+    }
+}
+
+/// Compile already-authorized resolved skills using the same runtime budgets as
+/// the API loop. This performs no resolution or external runtime installation.
+pub fn resolved_skill_runtime_plan(
+    active: &[pioneer_skills::ResolvedSkill],
+    skills: &SkillsLoopConfig,
+) -> SkillRuntimePlan {
+    pioneer_skills::build_skill_runtime_plan(
+        active,
+        pioneer_skills::SkillRuntimeBudget {
+            enable_dynamic_tools: skills.runtime.enable_dynamic_tools,
+            max_dynamic_tools_per_skill: skills.runtime.max_dynamic_tools_per_skill,
+            allow_shell_tools: skills.runtime.allow_shell_tools,
+            allow_http_tools: skills.runtime.allow_http_tools,
+            allow_function_proxy_tools: skills.runtime.allow_function_proxy_tools,
+            allow_untrusted_install: skills.security.allow_untrusted_install,
+            min_trust_for_shell_tools: skills.security.min_trust_for_shell_tools.clone(),
+            min_trust_for_http_tools: skills.security.min_trust_for_http_tools.clone(),
+            min_trust_for_function_proxy_tools: skills
+                .security
+                .min_trust_for_function_proxy_tools
+                .clone(),
+        },
+    )
+}
+
+pub fn skill_runtime_recheck_policy(
+    skills: &SkillsLoopConfig,
+) -> pioneer_skills::RuntimeExecutionRecheckPolicy {
+    pioneer_skills::RuntimeExecutionRecheckPolicy {
+        runtime_recheck_on_tool_call: skills.dependencies.runtime_recheck_on_tool_call,
+        security: pioneer_skills::SkillSecurityPolicy {
+            allow_untrusted_install: skills.security.allow_untrusted_install,
+            min_trust_for_shell_tools: skills.security.min_trust_for_shell_tools.clone(),
+            min_trust_for_http_tools: skills.security.min_trust_for_http_tools.clone(),
+            min_trust_for_function_proxy_tools: skills
+                .security
+                .min_trust_for_function_proxy_tools
+                .clone(),
+            max_install_archive_bytes: skills.security.max_install_archive_bytes,
+            max_install_file_bytes: skills.security.max_install_file_bytes,
+        },
     }
 }

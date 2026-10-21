@@ -1157,6 +1157,40 @@ impl<'de> Deserialize<'de> for GatewayCliAgentRuntimeInstancesConfig {
                     "duplicate CLI agent runtime instance id `{id}` after normalization"
                 )));
             }
+            if wire.kind == GatewayCliAgentRuntimeKindConfig::Acp {
+                if wire
+                    .binary_path
+                    .as_deref()
+                    .is_none_or(|path| path.trim().is_empty())
+                {
+                    return Err(serde::de::Error::custom(
+                        "ACP instances require an explicit binary_path",
+                    ));
+                }
+                if wire.home_path.is_some()
+                    || wire.shadow_home_path.is_some()
+                    || !wire.custom_models.is_empty()
+                {
+                    return Err(serde::de::Error::custom(
+                        "ACP uses configured launch data and standard session descriptors; native home paths and custom_models are not applicable",
+                    ));
+                }
+            }
+            for (name, source) in &wire.env_from {
+                if [name, source]
+                    .iter()
+                    .any(|value| value.is_empty() || value.contains(['=', '\0']))
+                {
+                    return Err(serde::de::Error::custom(
+                        "runtime env_from requires valid environment variable names",
+                    ));
+                }
+            }
+            if wire.kind != GatewayCliAgentRuntimeKindConfig::Acp && !wire.env_from.is_empty() {
+                return Err(serde::de::Error::custom(
+                    "env_from is available for ACP launches",
+                ));
+            }
             instances.insert(
                 id.clone(),
                 GatewayCliAgentRuntimeInstanceConfig::from_wire(id, wire),
@@ -1184,6 +1218,10 @@ pub struct GatewayCliAgentRuntimeInstanceConfig {
     pub custom_models: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub app_server_args: Vec<String>,
+    /// ACP child variable -> host variable reference. Values are resolved only at
+    /// launch and are never persisted as credentials in settings/catalog DTOs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env_from: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_probe_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1210,6 +1248,7 @@ impl GatewayCliAgentRuntimeInstanceConfig {
             shadow_home_path: normalize_optional_cli_agent_runtime_text(wire.shadow_home_path),
             custom_models: normalize_cli_agent_runtime_string_list(wire.custom_models),
             app_server_args: wire.app_server_args,
+            env_from: wire.env_from,
             startup_probe_timeout_ms: wire.startup_probe_timeout_ms.map(|timeout| {
                 non_zero_or_default(timeout, default_cli_agent_runtime_startup_timeout_ms())
             }),
@@ -1252,6 +1291,8 @@ struct GatewayCliAgentRuntimeInstanceConfigWire {
     custom_models: Vec<String>,
     #[serde(default)]
     app_server_args: Vec<String>,
+    #[serde(default)]
+    env_from: BTreeMap<String, String>,
     #[serde(default, alias = "startup_timeout_ms")]
     startup_probe_timeout_ms: Option<u64>,
     #[serde(default)]
@@ -1272,6 +1313,7 @@ pub enum GatewayCliAgentRuntimeKindConfig {
     #[default]
     Codex,
     Claude,
+    Acp,
     #[serde(rename = "opencode")]
     OpenCode,
 }
@@ -1290,6 +1332,8 @@ pub struct EffectiveGatewayCliAgentRuntimeInstanceConfig {
     pub custom_models: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub app_server_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env_from: BTreeMap<String, String>,
     pub startup_probe_timeout_ms: u64,
     pub request_timeout_ms: u64,
     pub idle_session_ttl_secs: u64,
@@ -2391,6 +2435,7 @@ fn default_codex_cli_agent_runtime_instance(
         shadow_home_path: None,
         custom_models: Vec::new(),
         app_server_args: Vec::new(),
+        env_from: Default::default(),
         startup_probe_timeout_ms: defaults.startup_timeout_ms,
         request_timeout_ms: defaults.request_timeout_ms,
         idle_session_ttl_secs: defaults.idle_session_ttl_secs,
@@ -2413,6 +2458,7 @@ fn default_claude_cli_agent_runtime_instance(
         shadow_home_path: None,
         custom_models: Vec::new(),
         app_server_args: Vec::new(),
+        env_from: Default::default(),
         startup_probe_timeout_ms: defaults.startup_timeout_ms,
         request_timeout_ms: defaults.request_timeout_ms,
         idle_session_ttl_secs: defaults.idle_session_ttl_secs,
@@ -2435,6 +2481,7 @@ fn default_opencode_cli_agent_runtime_instance(
         shadow_home_path: None,
         custom_models: Vec::new(),
         app_server_args: Vec::new(),
+        env_from: Default::default(),
         startup_probe_timeout_ms: defaults.startup_timeout_ms,
         request_timeout_ms: defaults.request_timeout_ms,
         idle_session_ttl_secs: defaults.idle_session_ttl_secs,
@@ -2478,6 +2525,7 @@ fn effective_cli_agent_runtime_instance(
         shadow_home_path: instance.shadow_home_path.clone(),
         custom_models: instance.custom_models.clone(),
         app_server_args: instance.app_server_args.clone(),
+        env_from: instance.env_from.clone(),
         startup_probe_timeout_ms: instance
             .startup_probe_timeout_ms
             .unwrap_or(defaults.startup_timeout_ms),
@@ -2503,6 +2551,7 @@ fn default_cli_agent_runtime_binary_path(kind: GatewayCliAgentRuntimeKindConfig)
     match kind {
         GatewayCliAgentRuntimeKindConfig::Codex => "codex".to_owned(),
         GatewayCliAgentRuntimeKindConfig::Claude => "claude".to_owned(),
+        GatewayCliAgentRuntimeKindConfig::Acp => String::new(),
         GatewayCliAgentRuntimeKindConfig::OpenCode => "opencode".to_owned(),
     }
 }
@@ -2511,6 +2560,7 @@ fn default_cli_agent_runtime_home_path(kind: GatewayCliAgentRuntimeKindConfig) -
     match kind {
         GatewayCliAgentRuntimeKindConfig::Codex => "~/.codex".to_owned(),
         GatewayCliAgentRuntimeKindConfig::Claude => "~/.claude".to_owned(),
+        GatewayCliAgentRuntimeKindConfig::Acp => String::new(),
         GatewayCliAgentRuntimeKindConfig::OpenCode => "~/.config/opencode".to_owned(),
     }
 }
@@ -3510,9 +3560,10 @@ fn user_config_directory_name() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CONFIG_TOML, GatewayCliAgentRuntimeConfig, GatewayCliAgentRuntimeKindConfig,
-        GatewayMemoryConfig, GatewayMemoryModelSelectionConfig, GatewayResilienceConfig,
-        GatewaySelfImprovementConfig, GatewayTelemetryConfig, InstallManagedBy, InstallState,
+        DEFAULT_CONFIG_TOML, GatewayCliAgentRuntimeConfig, GatewayCliAgentRuntimeInstancesConfig,
+        GatewayCliAgentRuntimeKindConfig, GatewayMemoryConfig, GatewayMemoryModelSelectionConfig,
+        GatewayResilienceConfig, GatewaySelfImprovementConfig, GatewayTelemetryConfig,
+        InstallManagedBy, InstallState, effective_cli_agent_runtime_instance,
         load_config_from_sources, load_install_state, save_install_state,
     };
     use std::fs;
@@ -3900,6 +3951,47 @@ request_timeout_ms = 60000
         assert_eq!(instances[1].request_timeout_ms, 60_000);
 
         let _ = fs::remove_file(workspace_override);
+    }
+
+    #[test]
+    fn acp_instances_are_launch_data_and_do_not_inherit_native_defaults() {
+        let configured: GatewayCliAgentRuntimeInstancesConfig = toml::from_str(
+            r#"
+[first]
+kind = "acp"
+binary_path = "agent"
+app_server_args = ["acp"]
+[first.env_from]
+AGENT_TOKEN = "FIRST_AGENT_TOKEN"
+[second]
+kind = "acp"
+binary_path = "/opt/another-agent"
+app_server_args = ["--stdio", "--profile", "work"]
+"#,
+        )
+        .unwrap();
+        let first = effective_cli_agent_runtime_instance(
+            &configured.instances["first"],
+            &Default::default(),
+        );
+        let second = effective_cli_agent_runtime_instance(
+            &configured.instances["second"],
+            &Default::default(),
+        );
+        assert_eq!(first.kind, GatewayCliAgentRuntimeKindConfig::Acp);
+        assert_eq!(second.kind, first.kind);
+        assert_eq!(first.app_server_args, ["acp"]);
+        assert_eq!(second.app_server_args, ["--stdio", "--profile", "work"]);
+        assert_eq!(first.env_from["AGENT_TOKEN"], "FIRST_AGENT_TOKEN");
+        assert!(first.home_path.is_empty() && second.home_path.is_empty());
+        assert!(first.custom_models.is_empty());
+        for invalid in [
+            "[bad]\nkind='acp'",
+            "[bad]\nkind='acp'\nbinary_path='agent'\nhome_path='~/.native'",
+            "[bad]\nkind='acp'\nbinary_path='agent'\ncustom_models=['guessed-model']",
+        ] {
+            assert!(toml::from_str::<GatewayCliAgentRuntimeInstancesConfig>(invalid).is_err());
+        }
     }
 
     #[test]

@@ -13,40 +13,47 @@ async fn start_task_cli_fixture(
     start_task_cli_fixture_with_task_config(kind, pioneer_tasks::TaskRuntimeConfig::default()).await
 }
 
-async fn start_task_cli_fixture_with_task_config(
+// Keep repeated fixture and invocation state machines off the enclosing test frame.
+// These tests still run on the production Gateway worker stack.
+fn start_task_cli_fixture_with_task_config(
     kind: CLIAgentRuntimeKind,
     task_config: pioneer_tasks::TaskRuntimeConfig,
-) -> (
-    CliRuntimeSkillPreflightHarness,
-    Arc<MessageProcessor>,
-    String,
-) {
-    let mut harness = setup_cli_runtime_skill_preflight_harness(kind, false).await;
-    harness.processor.task_runtime = Arc::new(pioneer_tasks::TaskRuntime::new_with_config(
-        harness.crud_store.clone(),
-        task_config,
-    ));
-    *harness.cli_session.projected_mcp_store.lock().await = Some(harness.crud_store.clone());
-    let thread_id = format!("cli_tasks_{kind:?}").to_lowercase();
-    let turn_id = format!("cli_tasks_turn_{kind:?}").to_lowercase();
-    seed_cli_runtime_skill_preflight_thread(&harness, &thread_id).await;
-    let processor = Arc::new(harness.processor.clone());
-    processor.bind_agent_tool_bridges().await;
-    let request = cli_runtime_turn_start_request_with_capabilities(
-        &generate_test_request_id("cli-tasks", &format!("{kind:?}")),
-        &thread_id,
-        &turn_id,
-        &harness.runtime_id,
-        kind,
-        Vec::new(),
-    );
-    processor
-        .process_request_for_connection(harness.connection_id, &request)
-        .await;
-    wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
-    wait_for_task_cli_activation(&processor, &turn_id).await;
+) -> MessageFuture<
+    'static,
+    (
+        CliRuntimeSkillPreflightHarness,
+        Arc<MessageProcessor>,
+        String,
+    ),
+> {
+    message_future(async move {
+        let mut harness = setup_cli_runtime_skill_preflight_harness(kind, false).await;
+        harness.processor.task_runtime = Arc::new(pioneer_tasks::TaskRuntime::new_with_config(
+            harness.crud_store.clone(),
+            task_config,
+        ));
+        *harness.cli_session.projected_mcp_store.lock().await = Some(harness.crud_store.clone());
+        let thread_id = format!("cli_tasks_{kind:?}").to_lowercase();
+        let turn_id = format!("cli_tasks_turn_{kind:?}").to_lowercase();
+        seed_cli_runtime_skill_preflight_thread(&harness, &thread_id).await;
+        let processor = Arc::new(harness.processor.clone());
+        processor.bind_agent_tool_bridges().await;
+        let request = cli_runtime_turn_start_request_with_capabilities(
+            &generate_test_request_id("cli-tasks", &format!("{kind:?}")),
+            &thread_id,
+            &turn_id,
+            &harness.runtime_id,
+            kind,
+            Vec::new(),
+        );
+        processor
+            .process_request_for_connection(harness.connection_id, &request)
+            .await;
+        wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
+        wait_for_task_cli_activation(&processor, &turn_id).await;
 
-    (harness, processor, turn_id)
+        (harness, processor, turn_id)
+    })
 }
 
 async fn wait_for_task_cli_activation(processor: &MessageProcessor, turn_id: &str) {
@@ -102,38 +109,43 @@ async fn wait_for_task_cli_child(
     .expect("Task run must activate its exact CLI child")
 }
 
-async fn invoke_task(
-    processor: &MessageProcessor,
-    turn_id: &str,
-    call_id: &str,
-    name: &str,
+fn invoke_task<'a>(
+    processor: &'a MessageProcessor,
+    turn_id: &'a str,
+    call_id: &'a str,
+    name: &'a str,
     arguments: JsonValue,
-) -> Result<CanonicalMcpToolResult, crate::turn_mcp::invoker::TurnMcpInvocationError> {
-    let binding = processor
-        .crud_store
-        .get_cli_runtime_turn_binding(turn_id)
-        .await
-        .unwrap()
-        .unwrap();
-    let generation = binding.mcp.as_ref().unwrap().session_generation as u64;
-    processor
-        .mcp_service
-        .turn_mcp_invoker()
-        .invoke(
-            TurnMcpInvocation {
-                workspace_id: binding.workspace_id,
-                thread_id: binding.thread_id,
-                turn_id: turn_id.to_owned(),
-                runtime_id: Some(binding.runtime_id),
-                session_generation: Some(generation),
-                provider_call_id: call_id.to_owned(),
-                canonical_callable_name: name.to_owned(),
-                arguments,
-                origin: TurnMcpInvocationOrigin::CliFacade,
-            },
-            tokio_util::sync::CancellationToken::new(),
-        )
-        .await
+) -> MessageFuture<
+    'a,
+    Result<CanonicalMcpToolResult, crate::turn_mcp::invoker::TurnMcpInvocationError>,
+> {
+    message_future(async move {
+        let binding = processor
+            .crud_store
+            .get_cli_runtime_turn_binding(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let generation = binding.mcp.as_ref().unwrap().session_generation as u64;
+        processor
+            .mcp_service
+            .turn_mcp_invoker()
+            .invoke(
+                TurnMcpInvocation {
+                    workspace_id: binding.workspace_id,
+                    thread_id: binding.thread_id,
+                    turn_id: turn_id.to_owned(),
+                    runtime_id: Some(binding.runtime_id),
+                    session_generation: Some(generation),
+                    provider_call_id: call_id.to_owned(),
+                    canonical_callable_name: name.to_owned(),
+                    arguments,
+                    origin: TurnMcpInvocationOrigin::CliFacade,
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+    })
 }
 
 #[test]
@@ -500,7 +512,7 @@ fn cli_automatic_orchestration_skills_coexist_with_selected_user_names() {
                 );
                 let starts = harness.cli_session.turn_starts.lock().await;
                 let start = &starts[0];
-                let instructions = start.elevated_instructions.text();
+                let instructions = start.instructions.elevated().unwrap().text();
                 if kind == CLIAgentRuntimeKind::Claude {
                     assert!(instructions.contains(&format!("Selected skills:\n- {user_name}\n- pioneer-system-tasks\n- pioneer-system-subagents")),
                         "application order must retain the user's selected skill before automatic tasks/subagents");
@@ -717,7 +729,9 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
                 }
             }
             let instructions = harness.cli_session.turn_starts.lock().await[0]
-                .elevated_instructions
+                .instructions
+                .elevated()
+                .unwrap()
                 .text()
                 .to_owned();
             assert!(instructions.contains("Do not finish the parent turn while attached"));
@@ -1175,6 +1189,7 @@ fn cli_final_candidate_survives_concurrent_detach() {
                 .handle_cli_runtime_timeline_event(
                     handle.instance(),
                     RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                        item: None,
                         native_thread_id: Some(binding.native_thread_id.clone()),
                         native_turn_id: native_turn_id.to_owned(),
                         native_item_id: answer_id.clone(),
@@ -1438,6 +1453,7 @@ fn a_lost_wait_response_does_not_count_as_empty_orchestration_or_cancel_child_wo
                 assert!(!observed.is_error);
                 drop(observed);
                 processor.handle_cli_runtime_timeline_event(handle.instance(), RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                        item: None,
                     native_thread_id: Some(binding.native_thread_id.clone()), native_turn_id: binding.native_turn_id.clone().unwrap(),
                     native_item_id: "lost-wait".to_owned(), item_kind: "mcpToolCall".to_owned(), text: None,
                     summary: Vec::new(), content: Vec::new(), phase: RuntimeAgentMessagePhase::FinalAnswer,

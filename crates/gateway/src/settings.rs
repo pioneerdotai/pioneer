@@ -389,9 +389,14 @@ struct GatewayCliRuntimeInstanceSettingsOverride {
     nickname: String,
     enabled: bool,
     binary_path: String,
+    #[serde(default)]
     home_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     shadow_home_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    args: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    env_from: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -824,6 +829,11 @@ impl GatewaySettings {
                     } = &selection
                     {
                         let expected = match instance.kind {
+                            pioneer_protocol::CLIAgentRuntimeKind::Acp => {
+                                anyhow::bail!(
+                                    "select an API or native CLI model for Pioneer-managed history compaction"
+                                );
+                            }
                             pioneer_protocol::CLIAgentRuntimeKind::Codex => {
                                 pioneer_protocol::ModelSelectionTransport::Codex
                             }
@@ -1095,6 +1105,8 @@ impl GatewaySettings {
                 || instance.binary_path != id
                 || instance.home_path != home
                 || instance.shadow_home_path.is_some()
+                || !instance.args.is_empty()
+                || !instance.env_from.is_empty()
                 || (!instance.nickname.is_empty() && instance.nickname != id)
                 || (instance.display_name != display
                     && instance.display_name != format!("{display} CLI"))
@@ -1113,6 +1125,8 @@ impl GatewaySettings {
                 binary_path: "opencode".into(),
                 home_path: "~/.config/opencode".into(),
                 shadow_home_path: None,
+                args: Vec::new(),
+                env_from: Default::default(),
             });
         self.migrated = true;
         true
@@ -1137,6 +1151,8 @@ impl GatewaySettings {
                 binary_path: "claude".to_owned(),
                 home_path: "~/.claude".to_owned(),
                 shadow_home_path: None,
+                args: Vec::new(),
+                env_from: Default::default(),
             });
         self.migrated = true;
         true
@@ -1156,6 +1172,8 @@ fn cli_runtime_settings_look_like_legacy_default_codex_only(
         && instance.binary_path == "codex"
         && instance.home_path == "~/.codex"
         && instance.shadow_home_path.is_none()
+        && instance.args.is_empty()
+        && instance.env_from.is_empty()
         && (instance.display_name == "Codex" || instance.display_name == "Codex CLI")
 }
 
@@ -2038,8 +2056,22 @@ impl GatewayCliRuntimeSettingsOverride {
 
             let binary_path =
                 normalize_cli_runtime_required_path("binary_path", instance.binary_path.as_str())?;
-            let home_path =
-                normalize_cli_runtime_required_path("home_path", instance.home_path.as_str())?;
+            let home_path = if instance.kind == pioneer_protocol::CLIAgentRuntimeKind::Acp {
+                if !instance.home_path.is_empty() || instance.shadow_home_path.is_some() {
+                    bail!("ACP instances do not use native agent home paths");
+                }
+                String::new()
+            } else {
+                normalize_cli_runtime_required_path("home_path", instance.home_path.as_str())?
+            };
+            for (name, source) in &instance.env_from {
+                if [name, source]
+                    .iter()
+                    .any(|value| value.is_empty() || value.contains(['=', '\0']))
+                {
+                    bail!("runtime env_from requires valid environment variable names");
+                }
+            }
             let shadow_home_path = normalize_cli_runtime_optional_path(
                 "shadow_home_path",
                 instance.shadow_home_path.as_deref(),
@@ -2048,6 +2080,11 @@ impl GatewayCliRuntimeSettingsOverride {
                 bail!("shadow_home_path must differ from home_path for CLI runtime `{id}`");
             }
 
+            if instance.kind != pioneer_protocol::CLIAgentRuntimeKind::Acp
+                && !instance.env_from.is_empty()
+            {
+                bail!("env_from is available for ACP launches");
+            }
             normalized_instances.push(GatewayCliRuntimeInstanceSettingsOverride {
                 id,
                 kind: cli_runtime_kind_from_protocol(instance.kind)?,
@@ -2057,6 +2094,8 @@ impl GatewayCliRuntimeSettingsOverride {
                 binary_path,
                 home_path,
                 shadow_home_path,
+                args: instance.args,
+                env_from: instance.env_from,
             });
         }
 
@@ -2080,10 +2119,12 @@ impl GatewayCliRuntimeSettingsOverride {
                         display_name: Some(instance.display_name.clone()),
                         enabled: Some(instance.enabled),
                         binary_path: Some(instance.binary_path.clone()),
-                        home_path: Some(instance.home_path.clone()),
+                        home_path: (instance.kind != GatewayCliAgentRuntimeKindConfig::Acp)
+                            .then(|| instance.home_path.clone()),
                         shadow_home_path: instance.shadow_home_path.clone(),
                         custom_models: Vec::new(),
-                        app_server_args: Vec::new(),
+                        app_server_args: instance.args.clone(),
+                        env_from: instance.env_from.clone(),
                         startup_probe_timeout_ms: None,
                         request_timeout_ms: None,
                         idle_session_ttl_secs: None,
@@ -2127,6 +2168,8 @@ fn cli_runtime_settings_from_gateway_config(
                     binary_path: instance.binary_path,
                     home_path: instance.home_path,
                     shadow_home_path: instance.shadow_home_path,
+                    args: instance.app_server_args,
+                    env_from: instance.env_from,
                 }
             })
             .collect(),
@@ -2139,6 +2182,7 @@ fn cli_runtime_kind_to_protocol(
     match kind {
         GatewayCliAgentRuntimeKindConfig::Codex => pioneer_protocol::CLIAgentRuntimeKind::Codex,
         GatewayCliAgentRuntimeKindConfig::Claude => pioneer_protocol::CLIAgentRuntimeKind::Claude,
+        GatewayCliAgentRuntimeKindConfig::Acp => pioneer_protocol::CLIAgentRuntimeKind::Acp,
         GatewayCliAgentRuntimeKindConfig::OpenCode => {
             pioneer_protocol::CLIAgentRuntimeKind::OpenCode
         }
@@ -2149,6 +2193,7 @@ fn cli_runtime_kind_from_protocol(
     kind: pioneer_protocol::CLIAgentRuntimeKind,
 ) -> Result<GatewayCliAgentRuntimeKindConfig> {
     match kind {
+        pioneer_protocol::CLIAgentRuntimeKind::Acp => Ok(GatewayCliAgentRuntimeKindConfig::Acp),
         pioneer_protocol::CLIAgentRuntimeKind::Codex => Ok(GatewayCliAgentRuntimeKindConfig::Codex),
         pioneer_protocol::CLIAgentRuntimeKind::Claude => {
             Ok(GatewayCliAgentRuntimeKindConfig::Claude)
@@ -4271,6 +4316,8 @@ backend = "keystore"
                             binary_path: "codex".to_owned(),
                             home_path: "~/.codex".to_owned(),
                             shadow_home_path: None,
+                            args: Vec::new(),
+                            env_from: Default::default(),
                         },
                         pioneer_protocol::GatewayCliRuntimeInstanceSettings {
                             compaction_model: None,
@@ -4282,6 +4329,8 @@ backend = "keystore"
                             binary_path: "/opt/homebrew/bin/codex".to_owned(),
                             home_path: "~/.codex-work".to_owned(),
                             shadow_home_path: Some("~/.pioneer/codex-work".to_owned()),
+                            args: Vec::new(),
+                            env_from: Default::default(),
                         },
                     ],
                 }),
@@ -4573,6 +4622,8 @@ backend = "keystore"
                             binary_path: "codex".to_owned(),
                             home_path: "~/.codex".to_owned(),
                             shadow_home_path: None,
+                            args: Vec::new(),
+                            env_from: Default::default(),
                         },
                         pioneer_protocol::GatewayCliRuntimeInstanceSettings {
                             compaction_model: None,
@@ -4584,6 +4635,8 @@ backend = "keystore"
                             binary_path: "codex".to_owned(),
                             home_path: "~/.codex-two".to_owned(),
                             shadow_home_path: None,
+                            args: Vec::new(),
+                            env_from: Default::default(),
                         },
                     ],
                 }),
@@ -4606,6 +4659,8 @@ backend = "keystore"
                             binary_path: "codex".to_owned(),
                             home_path: "~/.codex".to_owned(),
                             shadow_home_path: None,
+                            args: Vec::new(),
+                            env_from: Default::default(),
                         },
                         pioneer_protocol::GatewayCliRuntimeInstanceSettings {
                             compaction_model: None,
@@ -4617,6 +4672,8 @@ backend = "keystore"
                             binary_path: "codex".to_owned(),
                             home_path: "~/.codex-two".to_owned(),
                             shadow_home_path: None,
+                            args: Vec::new(),
+                            env_from: Default::default(),
                         },
                     ],
                 }),
@@ -4638,6 +4695,8 @@ backend = "keystore"
                         binary_path: "codex\nbad".to_owned(),
                         home_path: "~/.codex".to_owned(),
                         shadow_home_path: None,
+                        args: Vec::new(),
+                        env_from: Default::default(),
                     }],
                 }),
                 ..pioneer_protocol::GatewaySettingsUpdate::default()

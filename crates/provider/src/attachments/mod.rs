@@ -628,6 +628,56 @@ pub fn ensure_no_unrendered_attachments(
     Ok(())
 }
 
+/// Reuse source authorization, exact digest/size checks, normalization and the
+/// blocking governor for ACP's negotiated input contract. API model catalog
+/// MIME/renderer rules cannot establish what a standard ACP session accepts.
+pub async fn materialize_acp_attachment(
+    authority_fingerprint: String,
+    capabilities: ProviderCapabilities,
+    kind: InputContentType,
+    attachment: MessageAttachment,
+    config: AttachmentPipelineConfig,
+    materialized_total_bytes: usize,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<PreparedAttachment> {
+    anyhow::ensure!(
+        !authority_fingerprint.is_empty(),
+        "attachment operation requires an execution authority fingerprint"
+    );
+    let permit = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => anyhow::bail!("attachment preparation cancelled"),
+        permit = attachment_blocking_governor().acquire_owned() => permit
+            .map_err(|_| anyhow::anyhow!("attachment materialization governor is closed"))?,
+    };
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        anyhow::ensure!(
+            !cancellation.is_cancelled(),
+            "attachment preparation cancelled"
+        );
+        let prepared = runtime::with_blocking_authority_scope(authority_fingerprint, || {
+            resolve_attachment(
+                "acp",
+                &capabilities,
+                0,
+                0,
+                kind,
+                &attachment,
+                &config,
+                materialized_total_bytes,
+            )
+        })?;
+        anyhow::ensure!(
+            !cancellation.is_cancelled(),
+            "attachment preparation cancelled"
+        );
+        Ok(prepared)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("attachment materialization worker failed: {error}"))?
+}
+
 fn resolve_attachment(
     provider_name: &str,
     capabilities: &ProviderCapabilities,

@@ -44,6 +44,7 @@ pub fn cli_runtime_avatar_revision(
     match kind {
         CLIAgentRuntimeKind::Codex => CODEX_AGENT_AVATAR_REVISION,
         CLIAgentRuntimeKind::Claude => CLAUDE_AGENT_AVATAR_REVISION,
+        CLIAgentRuntimeKind::Acp => pioneer_protocol::PIONEER_AGENT_AVATAR_REVISION,
         CLIAgentRuntimeKind::OpenCode if dark => OPENCODE_AGENT_AVATAR_DARK_REVISION,
         CLIAgentRuntimeKind::OpenCode => OPENCODE_AGENT_AVATAR_LIGHT_REVISION,
     }

@@ -2005,6 +2005,7 @@ fn project_opencode_content(
     if previous.is_none() {
         state.item_order.push(id.to_owned());
         events.push(RuntimeEvent::ItemStarted(RuntimeItemStarted {
+            item: None,
             native_thread_id: Some(session.clone()),
             native_turn_id: turn.clone(),
             native_item_id: id.to_owned(),
@@ -2039,6 +2040,7 @@ fn project_opencode_content(
     }
     if completed {
         events.push(RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+            item: None,
             native_thread_id: Some(session),
             native_turn_id: turn,
             native_item_id: id.to_owned(),
@@ -2134,6 +2136,7 @@ fn complete_opencode_turn(
             metadata["success"] = json!(false);
         }
         events.push(RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+            item: None,
             native_thread_id: Some(native_thread_id.clone()),
             native_turn_id: native_turn_id.clone(),
             native_item_id: item_id.clone(),
@@ -2153,6 +2156,7 @@ fn complete_opencode_turn(
     }
     if let Some(usage) = &state.last_usage {
         events.push(RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+            item: None,
             native_thread_id: Some(native_thread_id.clone()),
             native_turn_id: native_turn_id.clone(),
             native_item_id: format!("{native_turn_id}:usage"),
@@ -3132,7 +3136,9 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
         let launch_projection = match &launch_spec.mcp {
             CliMcpSessionLaunch::Disabled | CliMcpSessionLaunch::ManagementOnly => None,
             CliMcpSessionLaunch::OpenCode(projection) => Some(projection.clone()),
-            CliMcpSessionLaunch::Codex(_) | CliMcpSessionLaunch::Claude(_) => {
+            CliMcpSessionLaunch::Acp(_)
+            | CliMcpSessionLaunch::Codex(_)
+            | CliMcpSessionLaunch::Claude(_) => {
                 bail!("OpenCode runtime cannot consume another provider's MCP projection")
             }
         };
@@ -3615,7 +3621,7 @@ impl CLIAgentRuntimeSession for OpenCodeCLIAgentRuntimeSession {
             body["id"] = json!(native_turn_id);
             body["delivery"] = json!("queue");
             body["metadata"] = json!({"pioneer":true});
-            body["pioneerInstructions"] = json!(params.elevated_instructions.text());
+            body["pioneerInstructions"] = json!(params.instructions.elevated()?.text());
             if model.is_none() && params.effort.as_deref().is_some_and(|v| !v.is_empty()) {
                 let default = self
                     .server

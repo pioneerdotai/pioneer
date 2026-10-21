@@ -148,6 +148,10 @@ fn select_profile(
             AgentExecutionProfileBackend::CliRuntime {
                 runtime_instance_id: _,
             },
+        )
+        | (
+            AgentIdentitySourceKind::CliRuntimeInstance,
+            AgentExecutionProfileBackend::AcpAgentRuntime { runtime_id: _ },
         ) => {
             // The server-owned profile projection already contains the exact
             // compatible identity IDs.  Runtime instance IDs intentionally

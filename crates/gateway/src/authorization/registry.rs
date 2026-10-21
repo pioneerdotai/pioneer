@@ -579,6 +579,13 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         Execution,
     ),
     method_entry(
+        CLI_RUNTIME_ACP_SESSION,
+        CliRuntimeManage,
+        Capability,
+        Forbidden,
+        Management,
+    ),
+    method_entry(
         CLI_RUNTIME_LIST_MODELS,
         CliRuntimeDiscover,
         Workspace,

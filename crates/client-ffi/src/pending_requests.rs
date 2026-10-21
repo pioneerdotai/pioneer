@@ -8,18 +8,29 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct ClientPendingRequestPresentationRequest {
     pub request: PendingRequest,
+    #[serde(default)]
+    pub answers: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct ClientPendingRequestPresentationResult {
     pub presentation: PendingRequestPresentation,
+    pub resolution: Option<pioneer_client::cli_runtime::approvals::PendingRequestResolution>,
 }
 
 pub fn pending_request_presentation_for_bridge(
     request: ClientPendingRequestPresentationRequest,
 ) -> Result<ClientPendingRequestPresentationResult, String> {
+    let resolution = request
+        .answers
+        .map(|answers| {
+            pioneer_client::cli_runtime::acp_human::answered_resolution(&request.request, answers)
+        })
+        .transpose()
+        .map_err(|error| error.to_string())?;
     Ok(ClientPendingRequestPresentationResult {
+        resolution,
         presentation: present_pending_request(&request.request),
     })
 }
@@ -51,6 +62,7 @@ mod tests {
         let result =
             pending_request_presentation_for_bridge(ClientPendingRequestPresentationRequest {
                 request: native_pending_request(),
+                answers: None,
             })
             .expect("bridge should present request");
 

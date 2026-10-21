@@ -231,6 +231,7 @@ mod tests {
         value["draft"]["domain"]["selected_provider"] = json!("cli_runtime:codex");
         value["draft"]["domain"]["selected_model"] = json!("model");
         value["selected_provider_ready"] = json!(ready);
+        value["execution_selection_ready"] = json!(ready);
         if let Some(state) = runtime {
             value["runtime_selection"] = json!({
                 "identity": {"thread_id":"thread", "draft_id":current.draft_id(), "generation":1},

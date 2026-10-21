@@ -112,7 +112,8 @@ pub(crate) fn project_cli_runtime_event(
         RuntimeEvent::DiffUpdated(diff) => project_diff_updated(context, diff),
         RuntimeEvent::ThreadStateChanged(thread) => project_thread_state_changed(context, thread),
         RuntimeEvent::Raw(raw) => project_raw_event(context, raw),
-        RuntimeEvent::SessionStateChanged(_)
+        RuntimeEvent::SessionCompaction { .. }
+        | RuntimeEvent::SessionStateChanged(_)
         | RuntimeEvent::ThreadNameUpdated(_)
         | RuntimeEvent::ThreadGoalUpdated(_)
         | RuntimeEvent::ThreadGoalCleared(_)
@@ -153,13 +154,15 @@ fn project_item_started(
         return CLIRuntimeProjectedEvents::ignored("native userMessage echo");
     }
 
-    let item = started_turn_item(
-        started.item_kind.as_str(),
-        started.native_item_id.as_str(),
-        started.title.as_deref(),
-        started.phase,
-        started.metadata.as_ref(),
-    );
+    let item = started.item.clone().unwrap_or_else(|| {
+        started_turn_item(
+            started.item_kind.as_str(),
+            started.native_item_id.as_str(),
+            started.title.as_deref(),
+            started.phase,
+            started.metadata.as_ref(),
+        )
+    });
 
     if context.recovery.is_none()
         && matches!(
@@ -345,6 +348,16 @@ fn project_item_updated(
     context: &CLIRuntimeProjectorContext,
     updated: &RuntimeItemUpdated,
 ) -> CLIRuntimeProjectedEvents {
+    if let Some(item) = &updated.item {
+        return CLIRuntimeProjectedEvents::snapshot(AgentSnapshotEvent::ItemUpdated {
+            notification: ItemUpdatedNotification {
+                workspace_id: context.workspace_id.clone(),
+                thread_id: context.thread_id.clone(),
+                turn_id: context.turn_id.clone(),
+                item: item.clone(),
+            },
+        });
+    }
     let item = generic_agent_system_item(
         updated.native_item_id.as_str(),
         updated.item_kind.as_str(),
@@ -586,6 +599,9 @@ fn started_turn_item(
 }
 
 fn completed_turn_item(completed: &RuntimeItemCompleted) -> TurnItem {
+    if let Some(item) = &completed.item {
+        return item.clone();
+    }
     if is_agent_message_kind(completed.item_kind.as_str()) {
         return TurnItem::AgentMessage {
             id: completed.native_item_id.clone(),
@@ -1460,6 +1476,7 @@ fn system_level_for_tool_status(status: ToolCallStatus) -> SystemEventLevel {
 
 fn event_kind_name(event: &RuntimeEvent) -> &'static str {
     match event {
+        RuntimeEvent::SessionCompaction { .. } => "session_compaction",
         RuntimeEvent::SessionStateChanged(_) => "session_state_changed",
         RuntimeEvent::ThreadStateChanged(_) => "thread_state_changed",
         RuntimeEvent::ThreadNameUpdated(_) => "thread_name_updated",
@@ -2665,6 +2682,7 @@ mod tests {
                 "sessionGeneration": 7
             });
             let event = RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                item: None,
                 native_thread_id: Some("native_thread_1".to_owned()),
                 native_turn_id: "native_turn_1".to_owned(),
                 native_item_id: raw_tool_name.to_owned(),
@@ -2912,6 +2930,7 @@ mod tests {
             "status": "inProgress"
         });
         let started_event = RuntimeEvent::ItemStarted(RuntimeItemStarted {
+            item: None,
             native_thread_id: Some("native_thread_1".to_owned()),
             native_turn_id: "native_turn_1".to_owned(),
             native_item_id: "native_mcp_1".to_owned(),
@@ -2923,6 +2942,7 @@ mod tests {
             native: None,
         });
         let completed_event = RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+            item: None,
             native_thread_id: Some("native_thread_1".to_owned()),
             native_turn_id: "native_turn_1".to_owned(),
             native_item_id: "native_mcp_1".to_owned(),

@@ -31,6 +31,12 @@ pub(crate) const MAX_CODEX_INPUT_TEXT_CHARS: usize = 1 << 20;
 pub(crate) fn codex_input_text_chars(input: &[CLIRuntimeTurnInputItem]) -> usize {
     input.iter().fold(0_usize, |total, item| {
         total.saturating_add(match item {
+            CLIRuntimeTurnInputItem::AcpContent { content } => content
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .map(|text| text.chars().count())
+                .unwrap_or(0),
+            CLIRuntimeTurnInputItem::AcpAttachment { .. } => 0,
             CLIRuntimeTurnInputItem::Text { text } => text.chars().count(),
             CLIRuntimeTurnInputItem::Image { .. }
             | CLIRuntimeTurnInputItem::LocalImage { .. }
@@ -149,6 +155,7 @@ pub(crate) fn compile_cli_runtime_delivery_plan(
             initiating_thread_id: input.initiating_thread_id.to_owned(),
             turn_id: input.turn_id.to_owned(),
             runtime_id: input.runtime_id.to_owned(),
+            runtime_kind: input.runtime_kind,
             runtime_label: Some(input.runtime_label.to_owned()),
             model: input.model.and_then(normalized_optional).map(str::to_owned),
             cwd: input.cwd.and_then(normalized_optional).map(str::to_owned),
@@ -323,6 +330,7 @@ pub(crate) fn completed_cli_history_budget(
     Vec<pioneer_provider::attachments::MediaInputEstimate>,
 )> {
     let label = match runtime_kind {
+        pioneer_protocol::CLIAgentRuntimeKind::Acp => "ACP agent",
         pioneer_protocol::CLIAgentRuntimeKind::Codex => "Codex CLI",
         pioneer_protocol::CLIAgentRuntimeKind::Claude => "Claude CLI",
         pioneer_protocol::CLIAgentRuntimeKind::OpenCode => "OpenCode CLI",
@@ -1274,20 +1282,17 @@ mod tests {
             text: thread_context_from_history(&history).unwrap().text,
         }];
         input.extend(mapping.input);
-        let (tokens, per_message, media) = completed_cli_history_budget(
-            &history,
-            "workspace",
-            None,
-            pioneer_protocol::CLIAgentRuntimeKind::Codex,
-        )
-        .unwrap();
-        assert_eq!(
-            tokens,
-            pioneer_compaction::text_tokens(&serde_json::to_string(&input).unwrap())
-        );
-        assert_eq!(per_message, vec![tokens]);
-        assert_eq!((media[0].message, media[0].part), (0, 0));
-        assert!(media[0].input_tokens > 0);
+        for runtime in [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Acp] {
+            let (tokens, per_message, media) =
+                completed_cli_history_budget(&history, "workspace", None, runtime).unwrap();
+            assert_eq!(
+                tokens,
+                pioneer_compaction::text_tokens(&serde_json::to_string(&input).unwrap())
+            );
+            assert_eq!(per_message, vec![tokens]);
+            assert_eq!((media[0].message, media[0].part), (0, 0));
+            assert!(media[0].input_tokens > 0);
+        }
         assert!(matches!(
             history[0].content_parts[0],
             MessageContentPart::Image { .. }

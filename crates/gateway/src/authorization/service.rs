@@ -392,6 +392,18 @@ impl AuthorizationService {
         ) && self.cli_runtime_allowed(principal_kind, role_key, runtime_id)
     }
 
+    /// Opaque ACP options cannot prove a model-specific CLI allowlist. Never
+    /// authorize them using the thread's unrelated legacy model fallback.
+    pub(crate) fn standard_session_configuration_allowed(
+        &self,
+        kind: PrincipalKind,
+        role: Option<&RoleKey>,
+    ) -> bool {
+        self.roles
+            .resolve(kind, role)
+            .is_some_and(|role| role.operational_resources.cli_models.is_none())
+    }
+
     pub(crate) fn cli_model_allowed(
         &self,
         principal_kind: PrincipalKind,

@@ -6,6 +6,9 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+portable-pty = "0.9"
+agent-client-protocol-schema = { version = "=1.11.0", default-features = false }
+async-trait.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 hex.workspace = true
@@ -19,6 +22,8 @@ serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 toml.workspace = true
-uuid.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+url.workspace = true
 zeroize = { version = "1", features = ["derive"] }
