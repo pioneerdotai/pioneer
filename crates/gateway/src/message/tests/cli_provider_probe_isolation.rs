@@ -42,7 +42,7 @@ fn cli_probe_failure_reaches_execution_and_never_repeats_an_accepted_turn() {
                         .await;
                     let response = recv_response_by_id(&mut harness.rx, "probe-no-models").await;
                     let catalog: pioneer_protocol::CLIRuntimeListModelsResponse =
-                        serde_json::from_value(response.result.unwrap()).unwrap();
+                        serde_json::from_value(response.result).unwrap();
                     assert!(catalog.models.is_empty());
                     assert!(catalog.refreshed_at_unix_ms.is_none());
                     assert!(catalog.diagnostics.iter().any(
@@ -74,10 +74,9 @@ fn cli_probe_failure_reaches_execution_and_never_repeats_an_accepted_turn() {
                     .process_request_for_connection(harness.connection_id, &request)
                     .await;
                 let response = recv_response_by_id(&mut harness.rx, "probe-isolation").await;
-                assert!(
-                    response.result.is_some(),
-                    "admission must reach the recording runtime"
-                );
+                let accepted: TurnStartResponse = serde_json::from_value(response.result)
+                    .expect("admission must reach the recording runtime");
+                assert_eq!(accepted.turn.id, turn_id);
                 assert_eq!(
                     wait_for_cli_runtime_turn_starts(&harness.cli_session, 1)
                         .await
