@@ -12,7 +12,7 @@ use crate::message::task_agent_executor::{
 pub(super) async fn assert_materialized_child_security(
     processor: &Arc<MessageProcessor>,
     run: &TaskRun,
-    lineage: &TaskThreadLineage,
+    lineage: &TestChildRuntimeAnchor,
     expected_parent: &str,
     backend: crate::turn_security::TurnSecurityResolverExecutionBackend,
 ) {
