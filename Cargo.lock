@@ -10515,6 +10515,7 @@ dependencies = [
  "pioneer-desktop-foundation",
  "rust-i18n",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

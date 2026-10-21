@@ -82,3 +82,30 @@ pub(super) fn provider_logo_path(provider_id: &str) -> &'static str {
         _ => "logos/providers/synthetic.svg",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn every_catalog_entry_has_text_in_each_locale_without_fallback() {
+        let locales = rust_i18n::available_locales!();
+        assert!(!locales.is_empty());
+        let mut missing = Vec::new();
+        for locale in locales {
+            for entry in super::provider_catalog_entries() {
+                for field in ["title", "description"] {
+                    let key = format!("providers.catalog.{}.{field}", entry.id);
+                    // Query the compiled backend directly: English fallback must
+                    // not make an incomplete non-English catalog pass.
+                    match crate::_rust_i18n_backend().translate(locale.as_ref(), &key) {
+                        Some(text) if !text.trim().is_empty() && text != key => {}
+                        _ => missing.push(format!("{locale}: {key}")),
+                    }
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "missing catalog translations: {missing:#?}"
+        );
+    }
+}
