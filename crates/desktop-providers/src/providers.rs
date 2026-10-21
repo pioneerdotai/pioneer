@@ -19,6 +19,7 @@ static NEXT_MOUNT: AtomicU64 = AtomicU64::new(1);
 pub struct ProviderCatalogConfig {
     client: Arc<ClientCore>,
     registrar: Arc<dyn ClientBindingRegistrar>,
+    avatars: Arc<dyn ProviderAvatarPort>,
     credential: Arc<dyn ProviderCredentialPort>,
     external: Arc<dyn ProviderExternalNavigationPort>,
     model_picker: Arc<dyn ProviderModelPickerPort>,
@@ -27,6 +28,7 @@ impl ProviderCatalogConfig {
     pub fn new(
         client: Arc<ClientCore>,
         registrar: Arc<dyn ClientBindingRegistrar>,
+        avatars: Arc<dyn ProviderAvatarPort>,
         credential: Arc<dyn ProviderCredentialPort>,
         external: Arc<dyn ProviderExternalNavigationPort>,
         model_picker: Arc<dyn ProviderModelPickerPort>,
@@ -34,6 +36,7 @@ impl ProviderCatalogConfig {
         Self {
             client,
             registrar,
+            avatars,
             credential,
             external,
             model_picker,
@@ -59,6 +62,7 @@ pub struct ProviderCatalogView {
         (String, String),
         Entity<crate::view::CliRuntimeInlineInputState>,
     >,
+    pub(crate) cli_avatars: crate::avatar::CliAvatars,
     binding: Arc<ProviderBinding>,
     sidebar: Entity<ProviderSidebar>,
     demanded: Option<String>,
@@ -69,6 +73,7 @@ pub struct ProviderCatalogView {
     pub(crate) model_picker: Arc<dyn ProviderModelPickerPort>,
     pub(crate) dialogs: Vec<Entity<crate::dialog_lifetime::DialogLifetime>>,
     _release: Subscription,
+    _theme: Subscription,
     pub(crate) mount: u64,
     pub(crate) operation: Option<Task<()>>,
     pub(crate) window_active: bool,
@@ -103,6 +108,14 @@ impl ProviderCatalogView {
                 }
             });
             let mut view = Self {
+                cli_avatars: crate::avatar::CliAvatars::new(config.avatars),
+                _theme: cx.observe_global_in::<gpui_kit::component::Theme>(
+                    window,
+                    |view, window, cx| {
+                        view.sync_publications(window, cx);
+                        cx.notify();
+                    },
+                ),
                 dialogs: Vec::new(),
                 _release: release,
                 navigation_input: config.client.navigation_snapshot(),
@@ -443,7 +456,12 @@ impl ProviderCatalogView {
             self.providers.runtimes = None;
             self.providers.operation = None;
         }
+        self.reconcile_cli_avatars(cx);
+        scopes.extend(self.cli_avatars.scopes());
         self.binding.set_scopes(&scopes);
+        self.cli_avatars.start_requests(cx);
+        let avatars_changed = self.cli_avatars.sync_publications(&self.client);
+
         let route = self.navigation_input.providers_route();
         let can_manage = self
             .principal_presentation_capabilities()
@@ -458,7 +476,7 @@ impl ProviderCatalogView {
         });
         self.sync_inline_inputs(window, cx);
         self.sync_loading(cx);
-        if previous != self.presentation_key() {
+        if previous != self.presentation_key() || avatars_changed {
             cx.notify();
         }
     }
@@ -538,7 +556,7 @@ mod tests {
     use super::{ProviderCatalogConfig, ProviderCatalogView};
     use crate::ports::*;
     use gpui_kit::component::{Root, input::InputState};
-    use gpui_kit::{App, AppContext, TestAppContext, Window};
+    use gpui_kit::{App, AppContext, Task, TestAppContext, Window};
     use pioneer_client::{
         core::{
             ClientCore, ClientMutationAuthority, ClientRevisions, ClientScope, ContentRevision,
@@ -568,6 +586,21 @@ mod tests {
         }
     }
     struct Ports;
+    impl ProviderAvatarPort for Ports {
+        fn resolve_agent(
+            &self,
+            _: String,
+            _: tokio_util::sync::CancellationToken,
+            _: &mut App,
+        ) -> Task<
+            Result<
+                pioneer_client::avatars::AgentAvatarCacheResult,
+                pioneer_client::avatars::AvatarCacheError,
+            >,
+        > {
+            Task::ready(Err(pioneer_client::avatars::AvatarCacheError::Offline))
+        }
+    }
     impl ProviderCredentialPort for Ports {
         fn copy(
             &self,
@@ -645,6 +678,7 @@ mod tests {
                         ProviderCatalogConfig::new(
                             core.clone(),
                             Arc::new(Registrar(scopes)),
+                            Arc::new(Ports),
                             Arc::new(Ports),
                             Arc::new(Ports),
                             Arc::new(Ports),
@@ -774,6 +808,7 @@ mod tests {
                     ProviderCatalogConfig::new(
                         core.clone(),
                         Arc::new(Registrar(scopes.clone())),
+                        Arc::new(Ports),
                         Arc::new(Ports),
                         Arc::new(Ports),
                         Arc::new(Ports),
@@ -954,6 +989,7 @@ mod tests {
                     ProviderCatalogConfig::new(
                         core.clone(),
                         Arc::new(Registrar(Rc::new(RefCell::new(HashSet::new())))),
+                        Arc::new(Ports),
                         Arc::new(Ports),
                         Arc::new(Ports),
                         Arc::new(Ports),

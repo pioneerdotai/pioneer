@@ -34,6 +34,7 @@ use pioneer_protocol::{
 };
 use sea_orm::{
     ActiveValue::Set, ConnectionTrait, Database, DatabaseBackend, EntityTrait, Statement,
+    TransactionTrait,
 };
 use std::collections::BTreeMap;
 use std::sync::{
@@ -355,9 +356,18 @@ async fn runtime() -> TaskRuntime {
     let connection = Database::connect("sqlite::memory:")
         .await
         .expect("sqlite memory database should connect");
-    Migrator::up(&connection, None)
+    let database = pioneer_sqlite::SqliteDatabase::from_single_connection(connection.clone());
+    let migration = database
+        .begin()
+        .await
+        .expect("fixture migration transaction");
+    Migrator::up(&*migration, None)
         .await
         .expect("migration should apply");
+    migration
+        .commit()
+        .await
+        .expect("fixture schema must commit");
     seed_task_test_workspace(&connection).await;
     let store = Arc::new(CrudStore::new(connection));
     TaskRuntime::new(store)
@@ -367,9 +377,18 @@ async fn runtime_with_review_config() -> TaskRuntime {
     let connection = Database::connect("sqlite::memory:")
         .await
         .expect("sqlite memory database should connect");
-    Migrator::up(&connection, None)
+    let database = pioneer_sqlite::SqliteDatabase::from_single_connection(connection.clone());
+    let migration = database
+        .begin()
+        .await
+        .expect("fixture migration transaction");
+    Migrator::up(&*migration, None)
         .await
         .expect("migration should apply");
+    migration
+        .commit()
+        .await
+        .expect("fixture schema must commit");
     seed_task_test_workspace(&connection).await;
     let store = Arc::new(CrudStore::new(connection));
     TaskRuntime::new_with_config(

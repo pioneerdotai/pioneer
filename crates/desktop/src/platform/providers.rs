@@ -1,4 +1,4 @@
-use gpui_kit::{App, ClipboardItem};
+use gpui_kit::{App, AppContext, ClipboardItem};
 use pioneer_client::core::ClientCore;
 use pioneer_desktop_providers::*;
 use std::{
@@ -6,7 +6,32 @@ use std::{
     process::Command,
     sync::Arc,
 };
-struct DesktopProviderPlatform;
+struct DesktopProviderPlatform {
+    client: Arc<ClientCore>,
+}
+
+impl ProviderAvatarPort for DesktopProviderPlatform {
+    fn resolve_agent(
+        &self,
+        revision: String,
+        cancellation: tokio_util::sync::CancellationToken,
+        cx: &mut App,
+    ) -> gpui_kit::Task<
+        Result<
+            pioneer_client::avatars::AgentAvatarCacheResult,
+            pioneer_client::avatars::AvatarCacheError,
+        >,
+    > {
+        use pioneer_client::avatars::AvatarCacheError;
+        let client = self.client.clone();
+        cx.background_spawn(async move {
+            let home = crate::state::runtime_home_dir().map_err(|_| AvatarCacheError::Offline)?;
+            let service = client.avatar_cache_service(home)?;
+            let runtime = tokio::runtime::Runtime::new().map_err(|_| AvatarCacheError::Offline)?;
+            runtime.block_on(client.resolve_agent_avatar(&service, revision, cancellation))
+        })
+    }
+}
 impl ProviderCredentialPort for DesktopProviderPlatform {
     fn copy(
         &self,
@@ -61,7 +86,9 @@ impl ProviderModelPickerPort for DesktopProviderModelPicker {
     }
 }
 pub(crate) fn provider_config(client: Arc<ClientCore>, cx: &App) -> ProviderCatalogConfig {
-    let platform = Arc::new(DesktopProviderPlatform);
+    let platform = Arc::new(DesktopProviderPlatform {
+        client: client.clone(),
+    });
     let registrar = cx
         .global::<crate::client_runtime::DesktopRuntimeCoordinator>()
         .registrar();
@@ -69,7 +96,14 @@ pub(crate) fn provider_config(client: Arc<ClientCore>, cx: &App) -> ProviderCata
         client: client.clone(),
         registrar: registrar.clone(),
     });
-    ProviderCatalogConfig::new(client, registrar, platform.clone(), platform, picker)
+    ProviderCatalogConfig::new(
+        client,
+        registrar,
+        platform.clone(),
+        platform.clone(),
+        platform,
+        picker,
+    )
 }
 fn expand_cli_runtime_provider_path(raw: &str) -> anyhow::Result<PathBuf> {
     let trimmed = raw.trim();

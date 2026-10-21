@@ -117,6 +117,9 @@ impl PreparedTaskEvent {
     }
 
     pub async fn preflight_idempotency<C: ConnectionTrait>(mut self, db: &C) -> Result<Self> {
+        if self.idempotency_key == self.payload.idempotency_key() {
+            self.idempotency_key = terminal_idempotency_key(db, &self.payload).await?;
+        }
         let Some(idempotency_key) = self.idempotency_key.as_deref() else {
             return Ok(self);
         };
@@ -216,6 +219,54 @@ impl PreparedTaskEvent {
         self.delivery_authority = prepared;
         self
     }
+}
+
+/// A task-owned resume can reopen the same run and turn. Read its persisted
+/// retry generation in the existing writer transaction, before deduplication;
+/// the original terminal event must not consume the new outcome's projection.
+pub(crate) async fn terminal_idempotency_key<C: ConnectionTrait>(
+    db: &C,
+    payload: &TaskEventPayload,
+) -> Result<Option<String>> {
+    let key = payload.idempotency_key();
+    let run_id = match payload {
+        TaskEventPayload::RunCompleted { run_id, .. }
+        | TaskEventPayload::RunFailed { run_id, .. }
+        | TaskEventPayload::RunBlocked { run_id, .. }
+        | TaskEventPayload::RunCancelled { run_id, .. } => run_id.clone(),
+        TaskEventPayload::TaskRunTurnCompleted { task_run_turn }
+        | TaskEventPayload::TaskRunTurnFailed { task_run_turn, .. }
+        | TaskEventPayload::TaskRunTurnBlocked { task_run_turn, .. } => {
+            task_run_turn.run_id.clone()
+        }
+        TaskEventPayload::TaskCompleted { task_id, .. }
+        | TaskEventPayload::TaskFailed { task_id, .. }
+        | TaskEventPayload::TaskBlocked { task_id, .. }
+        | TaskEventPayload::TaskCancelled { task_id, .. } => {
+            let Some(run) = super::task_run::find_latest_numbered_run(db, task_id).await? else {
+                return Ok(key);
+            };
+            run.id
+        }
+        _ => return Ok(key),
+    };
+    let Some(occurrence) =
+        super::task_actor_contract::find_task_occurrence_by_run_id(db, &run_id).await?
+    else {
+        return Ok(key);
+    };
+    anyhow::ensure!(
+        occurrence.task_id == payload.task_id(),
+        "terminal occurrence crosses Task boundary"
+    );
+    // Keep the existing keys for initial execution and legacy replay.
+    Ok(key.map(|key| {
+        if occurrence.retry_attempt == 0 {
+            key
+        } else {
+            format!("{key}:run:{run_id}:retry:{}", occurrence.retry_attempt)
+        }
+    }))
 }
 
 pub async fn append_event<C: ConnectionTrait>(
@@ -514,7 +565,39 @@ fn terminal_outcome(payload: &TaskEventPayload) -> Option<TerminalOutcome> {
 pub(crate) async fn find_queued_delivery_for_run<C: ConnectionTrait>(
     db: &C,
     run_id: &str,
+    retry_attempt: u32,
 ) -> Result<Option<task_event::Model>> {
+    if retry_attempt > 0 {
+        // Earlier outcomes of this same run retain their own deliveries.
+        // Bound this lookup to the current retry rather than mixing them.
+        use pioneer_entity::task_delivery;
+        let mut deliveries = task_delivery::Entity::find()
+            .filter(task_delivery::Column::RunId.eq(run_id.to_owned()))
+            .filter(
+                task_delivery::Column::DeliveryKey.starts_with(format!("retry:{retry_attempt}:")),
+            )
+            .limit(2)
+            .all(db)
+            .await?;
+        if deliveries.len() > 1 {
+            anyhow::bail!("terminal Task retry has multiple queued deliveries");
+        }
+        let Some(delivery) = deliveries.pop() else {
+            return Ok(None);
+        };
+        let event = find_event_by_idempotency_key(
+            db,
+            &delivery.task_id,
+            &format!("delivery:{}:queued", delivery.id),
+        )
+        .await?
+        .context("terminal Task retry delivery has no queued event")?;
+        anyhow::ensure!(
+            event.run_id.as_deref() == Some(run_id),
+            "delivery event crosses run boundary"
+        );
+        return Ok(Some(event));
+    }
     let mut rows = task_event::Entity::find()
         .filter(task_event::Column::RunId.eq(run_id.to_owned()))
         .filter(
