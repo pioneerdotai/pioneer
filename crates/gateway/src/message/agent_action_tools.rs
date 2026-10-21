@@ -742,11 +742,11 @@ pub(crate) async fn resolve_workspace_task_launch(
                 Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime {
                     runtime_id,
                     ..
-                }) => runtime_id == &identity_row.source_id,
-                Some(
-                    pioneer_protocol::AgentExecutionBackend::ApiProvider { .. }
-                    | pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime { .. },
-                ) => false,
+                })
+                | Some(pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime { runtime_id }) => {
+                    runtime_id == &identity_row.source_id
+                }
+                Some(pioneer_protocol::AgentExecutionBackend::ApiProvider { .. }) => false,
             } =>
         {
             let runtime = cli_identity_catalog

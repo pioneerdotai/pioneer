@@ -8356,17 +8356,17 @@ fn detached_cli_task_create_params(
     params
 }
 
-async fn complete_recorded_cli_task_turn(
-    processor: &Arc<MessageProcessor>,
-    cli: &RecordingCliRuntimeSession,
-    manager: &Arc<CLIAgentRuntimeManager>,
-    workspace_id: &str,
-    runtime_id: &str,
-    _parent_thread_id: &str,
-    native_thread_id: &str,
-    native_turn_id: &str,
-    result_text: &str,
-) {
+fn complete_recorded_cli_task_turn<'a>(
+    processor: &'a Arc<MessageProcessor>,
+    cli: &'a RecordingCliRuntimeSession,
+    manager: &'a Arc<CLIAgentRuntimeManager>,
+    workspace_id: &'a str,
+    runtime_id: &'a str,
+    _parent_thread_id: &'a str,
+    native_thread_id: &'a str,
+    native_turn_id: &'a str,
+    result_text: &'a str,
+) -> MessageFuture<'a, ()> {
     complete_recorded_cli_task_turn_with_recovery(
         processor,
         cli,
@@ -8380,71 +8380,75 @@ async fn complete_recorded_cli_task_turn(
         false,
         false,
     )
-    .await;
 }
 
-async fn complete_recorded_cli_task_turn_with_recovery(
-    processor: &Arc<MessageProcessor>,
-    cli: &RecordingCliRuntimeSession,
-    manager: &Arc<CLIAgentRuntimeManager>,
-    workspace_id: &str,
-    runtime_id: &str,
-    _parent_thread_id: &str,
-    native_thread_id: &str,
-    native_turn_id: &str,
-    result_text: &str,
+// Completion composes several large timeline-handler futures. Erase the shared
+// fixture and each handler separately so repeated completions do not accumulate
+// their state machines in the enclosing CLI Task test frame.
+fn complete_recorded_cli_task_turn_with_recovery<'a>(
+    processor: &'a Arc<MessageProcessor>,
+    cli: &'a RecordingCliRuntimeSession,
+    manager: &'a Arc<CLIAgentRuntimeManager>,
+    workspace_id: &'a str,
+    runtime_id: &'a str,
+    _parent_thread_id: &'a str,
+    native_thread_id: &'a str,
+    native_turn_id: &'a str,
+    result_text: &'a str,
     fail_boundary_write_once: bool,
     recover_from_minimal_journal: bool,
-) {
-    cli.record_provider_assistant_message(native_thread_id, result_text)
-        .await;
-    cli.record_provider_boundary(native_thread_id, native_turn_id)
-        .await;
-    let continuation = timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(binding) = processor
-                .crud_store
-                .get_cli_runtime_turn_binding_by_native_turn(runtime_id, native_turn_id)
-                .await
-                .expect("native Task binding lookup should succeed")
-            {
-                break binding;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("native Task binding must become durable after provider start");
-    let continuation_thread_id = continuation.continuation_thread_id.clone();
-    let pioneer_turn_id = continuation.turn_id.clone();
-    let claude_runtime = continuation.runtime_kind == "claude";
-    let claude_record_uuid = if claude_runtime {
-        let record_uuid = uuid::Uuid::new_v4();
-        cli.record_claude_boundary(record_uuid, native_thread_id)
+) -> MessageFuture<'a, ()> {
+    message_future(async move {
+        cli.record_provider_assistant_message(native_thread_id, result_text)
             .await;
-        Some(record_uuid)
-    } else {
-        None
-    };
-    let key =
-        CLIAgentRuntimeSessionKey::new(workspace_id, runtime_id, continuation_thread_id.as_str())
-            .expect("native Task session key should build");
-    let handle = manager
-        .existing_session(&key)
+        cli.record_provider_boundary(native_thread_id, native_turn_id)
+            .await;
+        let continuation = timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(binding) = processor
+                    .crud_store
+                    .get_cli_runtime_turn_binding_by_native_turn(runtime_id, native_turn_id)
+                    .await
+                    .expect("native Task binding lookup should succeed")
+                {
+                    break binding;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
         .await
-        .expect("native Task session should remain active");
-    processor
-        .handle_cli_runtime_timeline_event(
+        .expect("native Task binding must become durable after provider start");
+        let continuation_thread_id = continuation.continuation_thread_id.clone();
+        let pioneer_turn_id = continuation.turn_id.clone();
+        let claude_runtime = continuation.runtime_kind == "claude";
+        let claude_record_uuid = if claude_runtime {
+            let record_uuid = uuid::Uuid::new_v4();
+            cli.record_claude_boundary(record_uuid, native_thread_id)
+                .await;
+            Some(record_uuid)
+        } else {
+            None
+        };
+        let key = CLIAgentRuntimeSessionKey::new(
+            workspace_id,
+            runtime_id,
+            continuation_thread_id.as_str(),
+        )
+        .expect("native Task session key should build");
+        let handle = manager
+            .existing_session(&key)
+            .await
+            .expect("native Task session should remain active");
+        message_future(processor.handle_cli_runtime_timeline_event(
             handle.instance(),
             RuntimeEvent::TurnStarted(RuntimeTurnStarted {
                 native_thread_id: Some(native_thread_id.to_owned()),
                 native_turn_id: native_turn_id.to_owned(),
                 native: None,
             }),
-        )
+        ))
         .await;
-    processor
-        .handle_cli_runtime_timeline_event(
+        message_future(processor.handle_cli_runtime_timeline_event(
             handle.instance(),
             RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
                 item: None,
@@ -8460,185 +8464,189 @@ async fn complete_recorded_cli_task_turn_with_recovery(
                 native_item_redacted: None,
                 native: None,
             }),
-        )
+        ))
         .await;
-    let terminal = if let Some(record_uuid) = claude_record_uuid {
-        crate::cli_runtime::claude_session::tests::mapped_assistant_completion_for_gateway_test(
-            uuid::Uuid::parse_str(native_thread_id).unwrap(),
-            native_turn_id,
-            record_uuid,
-        )
-        .await
-    } else {
-        RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
-            native_thread_id: Some(native_thread_id.to_owned()),
-            native_turn_id: native_turn_id.to_owned(),
-            status: "completed".to_owned(),
-            native: None,
-        })
-    };
-    if fail_boundary_write_once {
-        assert!(
-            claude_runtime,
-            "boundary write recovery requires a Claude adapter"
-        );
-        processor
-            .persist_cli_runtime_canonical_event(handle.instance(), "claude", &terminal, false)
-            .await;
-        let journal = processor
-            .crud_store
-            .latest_cli_runtime_native_event(CliRuntimeNativeEventListFilter {
-                runtime_id: Some(runtime_id.to_owned()),
-                turn_id: Some(pioneer_turn_id.clone()),
-                native_method: Some("turn_completed".to_owned()),
-                limit: Some(1),
-                ..Default::default()
-            })
+        let terminal = if let Some(record_uuid) = claude_record_uuid {
+            crate::cli_runtime::claude_session::tests::mapped_assistant_completion_for_gateway_test(
+                uuid::Uuid::parse_str(native_thread_id).unwrap(),
+                native_turn_id,
+                record_uuid,
+            )
             .await
-            .unwrap()
-            .unwrap();
-        let journal_payload: serde_json::Value =
-            serde_json::from_str(&journal.payload_redacted_json).unwrap();
-        assert_eq!(
-            journal_payload["assistantRecordUuid"],
-            json!(claude_record_uuid.unwrap()),
-            "minimal journal must retain the transcript UUID without debug capture"
-        );
-        processor
-            .claude_boundary_write_failures
-            .lock()
-            .await
-            .insert(pioneer_turn_id.clone());
-    }
-    processor
-        .handle_cli_runtime_timeline_event(handle.instance(), terminal.clone())
-        .await;
-    if fail_boundary_write_once {
-        let (_, before) = processor
-            .crud_store
-            .get_turn(continuation.thread_id.as_str(), pioneer_turn_id.as_str())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_ne!(
-            before.status,
-            TurnStatus::Completed,
-            "a failed Claude boundary write must not commit completion"
-        );
-        let observed_terminal = if recover_from_minimal_journal {
-            let mut without_native = terminal.clone();
-            if let RuntimeEvent::TurnCompleted(completed) = &mut without_native {
-                completed.native = None;
-            }
-            without_native
         } else {
-            terminal.clone()
-        };
-        *cli.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
-            status: CLIAgentRuntimeObservedTurnStatus::Completed,
-            message: None,
-            reconciliation_events: vec![observed_terminal],
-        });
-        // The first lookup may race admission's final context bookkeeping.
-        // Reconciliation receives a fresh discovery snapshot after delivery.
-        let current_binding = processor
-            .crud_store
-            .get_cli_runtime_turn_binding(&pioneer_turn_id)
-            .await
-            .unwrap()
-            .unwrap();
-        let recovered = processor
-            .reconcile_cli_runtime_turn_from_runtime(&current_binding, workspace_id, &before)
-            .await
-            .unwrap();
-        assert!(matches!(
-            recovered,
-            crate::message::cli_runtime::CLIRuntimeAuthoritativeTurnState::Terminal
-        ));
-        processor
-            .handle_cli_runtime_timeline_event(handle.instance(), terminal.clone())
-            .await;
-        let boundaries = processor
-            .crud_store
-            .list_cli_runtime_native_events(CliRuntimeNativeEventListFilter {
-                runtime_id: Some(runtime_id.to_owned()),
-                thread_id: Some(continuation.thread_id.clone()),
-                turn_id: Some(pioneer_turn_id.clone()),
-                native_method: Some("claude/assistant_record_boundary".to_owned()),
-                ..Default::default()
+            RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                native_thread_id: Some(native_thread_id.to_owned()),
+                native_turn_id: native_turn_id.to_owned(),
+                status: "completed".to_owned(),
+                native: None,
             })
-            .await
-            .unwrap();
-        assert_eq!(
-            boundaries.len(),
-            1,
-            "replay must retain one transcript boundary"
-        );
-    }
-    let receipt_wait = timeout(Duration::from_secs(10), async {
-        loop {
-            let binding = processor
-                .crud_store
-                .get_cli_runtime_thread_binding(continuation_thread_id.as_str())
-                .await
-                .expect("completed provider conversation binding should load")
-                .expect("completed provider conversation binding should exist");
-            assert_eq!(
-                binding.native_thread_id, native_thread_id,
-                "completion must not switch provider conversations"
+        };
+        if fail_boundary_write_once {
+            assert!(
+                claude_runtime,
+                "boundary write recovery requires a Claude adapter"
             );
-            if crate::cli_runtime::thread_binding::completed_context_basis_from_binding(&binding)
+            processor
+                .persist_cli_runtime_canonical_event(handle.instance(), "claude", &terminal, false)
+                .await;
+            let journal = processor
+                .crud_store
+                .latest_cli_runtime_native_event(CliRuntimeNativeEventListFilter {
+                    runtime_id: Some(runtime_id.to_owned()),
+                    turn_id: Some(pioneer_turn_id.clone()),
+                    native_method: Some("turn_completed".to_owned()),
+                    limit: Some(1),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            let journal_payload: serde_json::Value =
+                serde_json::from_str(&journal.payload_redacted_json).unwrap();
+            assert_eq!(
+                journal_payload["assistantRecordUuid"],
+                json!(claude_record_uuid.unwrap()),
+                "minimal journal must retain the transcript UUID without debug capture"
+            );
+            processor
+                .claude_boundary_write_failures
+                .lock()
+                .await
+                .insert(pioneer_turn_id.clone());
+        }
+        message_future(
+            processor.handle_cli_runtime_timeline_event(handle.instance(), terminal.clone()),
+        )
+        .await;
+        if fail_boundary_write_once {
+            let (_, before) = processor
+                .crud_store
+                .get_turn(continuation.thread_id.as_str(), pioneer_turn_id.as_str())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(
+                before.status,
+                TurnStatus::Completed,
+                "a failed Claude boundary write must not commit completion"
+            );
+            let observed_terminal = if recover_from_minimal_journal {
+                let mut without_native = terminal.clone();
+                if let RuntimeEvent::TurnCompleted(completed) = &mut without_native {
+                    completed.native = None;
+                }
+                without_native
+            } else {
+                terminal.clone()
+            };
+            *cli.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
+                status: CLIAgentRuntimeObservedTurnStatus::Completed,
+                message: None,
+                reconciliation_events: vec![observed_terminal],
+            });
+            // The first lookup may race admission's final context bookkeeping.
+            // Reconciliation receives a fresh discovery snapshot after delivery.
+            let current_binding = processor
+                .crud_store
+                .get_cli_runtime_turn_binding(&pioneer_turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let recovered = processor
+                .reconcile_cli_runtime_turn_from_runtime(&current_binding, workspace_id, &before)
+                .await
+                .unwrap();
+            assert!(matches!(
+                recovered,
+                crate::message::cli_runtime::CLIRuntimeAuthoritativeTurnState::Terminal
+            ));
+            message_future(
+                processor.handle_cli_runtime_timeline_event(handle.instance(), terminal.clone()),
+            )
+            .await;
+            let boundaries = processor
+                .crud_store
+                .list_cli_runtime_native_events(CliRuntimeNativeEventListFilter {
+                    runtime_id: Some(runtime_id.to_owned()),
+                    thread_id: Some(continuation.thread_id.clone()),
+                    turn_id: Some(pioneer_turn_id.clone()),
+                    native_method: Some("claude/assistant_record_boundary".to_owned()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                boundaries.len(),
+                1,
+                "replay must retain one transcript boundary"
+            );
+        }
+        let receipt_wait = timeout(Duration::from_secs(10), async {
+            loop {
+                let binding = processor
+                    .crud_store
+                    .get_cli_runtime_thread_binding(continuation_thread_id.as_str())
+                    .await
+                    .expect("completed provider conversation binding should load")
+                    .expect("completed provider conversation binding should exist");
+                assert_eq!(
+                    binding.native_thread_id, native_thread_id,
+                    "completion must not switch provider conversations"
+                );
+                if crate::cli_runtime::thread_binding::completed_context_basis_from_binding(
+                    &binding,
+                )
                 .expect("completed context receipt should decode")
                 .is_some_and(|basis| {
                     basis
                         .delivered_turns
                         .iter()
                         .any(|turn| turn.turn_id == pioneer_turn_id)
-                })
-            {
-                break;
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
+        })
+        .await;
+        if receipt_wait.is_err() {
+            let binding = processor
+                .crud_store
+                .get_cli_runtime_thread_binding(continuation_thread_id.as_str())
+                .await;
+            let turn = processor
+                .crud_store
+                .get_turn(continuation.thread_id.as_str(), pioneer_turn_id.as_str())
+                .await;
+            panic!(
+                "provider completion must publish its exact continuity receipt before the next turn: runtime={runtime_id}, pioneer_turn={pioneer_turn_id}, native_turn={native_turn_id}, binding={:?}, turn={:?}",
+                binding.map(|row| row.map(|row| (
+                    row.status,
+                    row.native_thread_id,
+                    row.resume_cursor_json
+                ))),
+                turn.map(|row| row.map(|(_, turn)| (turn.status, turn.error)))
+            );
+        }
+        if let Some(expected) = claude_record_uuid {
+            let source = processor
+                .crud_store
+                .get_cli_runtime_turn_binding(pioneer_turn_id.as_str())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                crate::cli_runtime::thread_binding::claude_assistant_record_boundary(
+                    processor.crud_store.as_ref(),
+                    &source,
+                )
+                .await
+                .unwrap(),
+                Some(expected),
+                "the completion handler must persist the mapper's transcript UUID",
+            );
         }
     })
-    .await;
-    if receipt_wait.is_err() {
-        let binding = processor
-            .crud_store
-            .get_cli_runtime_thread_binding(continuation_thread_id.as_str())
-            .await;
-        let turn = processor
-            .crud_store
-            .get_turn(continuation.thread_id.as_str(), pioneer_turn_id.as_str())
-            .await;
-        panic!(
-            "provider completion must publish its exact continuity receipt before the next turn: runtime={runtime_id}, pioneer_turn={pioneer_turn_id}, native_turn={native_turn_id}, binding={:?}, turn={:?}",
-            binding.map(|row| row.map(|row| (
-                row.status,
-                row.native_thread_id,
-                row.resume_cursor_json
-            ))),
-            turn.map(|row| row.map(|(_, turn)| (turn.status, turn.error)))
-        );
-    }
-    if let Some(expected) = claude_record_uuid {
-        let source = processor
-            .crud_store
-            .get_cli_runtime_turn_binding(pioneer_turn_id.as_str())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            crate::cli_runtime::thread_binding::claude_assistant_record_boundary(
-                processor.crud_store.as_ref(),
-                &source,
-            )
-            .await
-            .unwrap(),
-            Some(expected),
-            "the completion handler must persist the mapper's transcript UUID",
-        );
-    }
 }
 
 async fn sync_test_cli_runtime_identities(processor: &MessageProcessor) -> anyhow::Result<()> {
