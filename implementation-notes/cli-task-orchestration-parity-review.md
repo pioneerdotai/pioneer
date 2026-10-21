@@ -345,3 +345,26 @@ Targeted rustfmt and `git diff --check` passed. No local build, compilation or
 tests were run. Removing repeated pool acquisition is established by source
 inspection; the time saved and completion within the existing CI limit require
 the next remote run and are not claimed as measured results.
+
+## CI fixture isolation — head `7bc28097`
+
+Run `39589873110` finished with a test failure rather than the job timeout:
+Gateway reported 2931 passed, 1 failed, 8 ignored. The only failure was
+`production_settings_recovery_transitions_projection_before_new_source_capsule_write`,
+at its five-second wait for the recovered source's completed index job.
+
+The fixture bootstrapped the fixed default workspace `000000000000000000000`.
+Memvid ownership is process-wide and keyed only by workspace ID
+(`memory/src/thread_episodic.rs::workspace_lock`); separate databases and temporary
+storage roots therefore still shared this lock with concurrent Gateway tests.
+The ordinary runner and projection refill both use this ownership boundary.
+That source-level isolation defect permits unrelated work to delay this test;
+the log establishes the elapsed wait but does not identify the competing owner.
+
+The test now creates a unique workspace through WorkspaceManager, which also
+seeds its reserved identity, and uses that ID throughout the existing scenario.
+It explicitly shuts down its executor after its assertions. Both model/dimension
+transitions, provider-unavailable nonmutation checks, retry accounting and capsule
+metadata checks are retained. No timeout, assertion, production lock or CI setting
+changed. Targeted rustfmt and `git diff --check` passed; local builds/tests remain
+unrun. The next remote run must validate the repair.

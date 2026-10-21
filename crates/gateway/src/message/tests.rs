@@ -40911,7 +40911,18 @@ async fn production_settings_recovery_transitions_projection_before_new_source_c
         ThreadEpisodicIndexExecutor, ThreadEpisodicRuntimeConfig,
     };
     use pioneer_memory::ThreadEpisodicEmbeddingProvider;
-    let (workspace_manager, store, workspace) = setup_workspace_manager().await;
+    let (workspace_manager, store, _) = setup_workspace_manager().await;
+    // Capsule ownership is process-wide and keyed by workspace ID. Separate
+    // databases/storage roots alone do not isolate the default workspace lock
+    // from other concurrently running Gateway fixtures.
+    let workspace = workspace_manager
+        .create_workspace(
+            &pioneer_protocol::generate_id(21),
+            Some("Settings projection recovery"),
+        )
+        .await
+        .unwrap()
+        .id;
     let root = tempfile::tempdir().unwrap();
     let mut processor = MessageProcessor::with_agent_manager(
         Arc::new(ThreadManager::new("test-model", "openai")),
@@ -41139,6 +41150,7 @@ async fn production_settings_recovery_transitions_projection_before_new_source_c
             );
         }
     }
+    executor.shutdown().await;
 }
 
 #[tokio::test]
