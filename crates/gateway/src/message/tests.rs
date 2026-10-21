@@ -84853,6 +84853,15 @@ fn acp_composer_preparation_detached_result_and_parent_delivery_use_one_owner() 
                 assert_eq!(binding.continuation_thread_id, parent);
                 assert_eq!(binding.runtime_kind, "acp");
                 assert_eq!(
+                    store
+                        .get_turn_execution(&binding.turn_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .executor_kind,
+                    pioneer_crud::TurnExecutorKind::AcpRuntime,
+                );
+                assert_eq!(
                     binding.mcp.as_ref().unwrap().adapter_kind,
                     crate::cli_runtime::acp_mcp::ACP_MCP_ADAPTER_KIND
                 );
@@ -85031,6 +85040,14 @@ fn acp_composer_preparation_detached_result_and_parent_delivery_use_one_owner() 
                 };
                 wait_for_task_status(store.clone(), &execution.task_id, expected).await;
                 let task = store.get_task(&execution.task_id).await.unwrap().unwrap();
+                let child = store
+                    .get_turn(&binding.thread_id, &binding.turn_id)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    task.task.status, expected,
+                    "ACP task did not settle (answer={answer}, cancelled={cancelled}, index={index}); task={task:#?}; child={child:#?}"
+                );
                 if answer && !cancelled {
                     assert_eq!(
                         task.task.result.as_ref().unwrap().summary.as_deref(),

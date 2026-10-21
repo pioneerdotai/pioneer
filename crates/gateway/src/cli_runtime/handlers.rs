@@ -7455,7 +7455,10 @@ impl MessageProcessor {
         }
         self.prepare_cli_post_turn_hook(binding, generation, final_item.as_ref())
             .await?;
+        // ACP results must come from the reducer's final answer. An empty CLI
+        // fallback would incorrectly turn a missing ACP result into success.
         let final_item = if final_item.is_none()
+            && binding.runtime_kind != "acp"
             && self
                 .crud_store
                 .list_turn_mcp_bindings(&binding.turn_id)

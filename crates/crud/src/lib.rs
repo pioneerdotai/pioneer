@@ -7054,7 +7054,14 @@ impl CrudStore {
                 Some(owner) => {
                     owner.owner_id == owner_id
                         && owner.status.is_active()
-                        && owner.executor_kind == TurnExecutorKind::CliRuntime
+                        && matches!(
+                            (owner.executor_kind, expected.runtime_kind.as_str()),
+                            (TurnExecutorKind::AcpRuntime, "acp")
+                                | (
+                                    TurnExecutorKind::CliRuntime,
+                                    "codex" | "claude" | "opencode"
+                                )
+                        )
                         && owner.executor_key.as_deref() == Some(expected.runtime_id.as_str())
                         && owner.lease_until > chrono::Utc::now().fixed_offset()
                 }
