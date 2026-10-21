@@ -730,6 +730,7 @@ struct RecordingCliRuntimeSession {
     mcp_preparations: TokioMutex<Vec<(String, String)>>,
     projected_mcp_store: TokioMutex<Option<Arc<CrudStore>>>,
     projected_mcp_metadata: TokioMutex<HashMap<String, CLIAgentRuntimeMcpTurnMetadata>>,
+    acp_mcp_metadata: TokioMutex<Option<CLIAgentRuntimeMcpTurnMetadata>>,
     mcp_retargets: TokioMutex<Vec<(String, String, String)>>,
     mcp_terminals: TokioMutex<Vec<String>>,
     goal_resets: TokioMutex<Vec<String>>,
@@ -1060,6 +1061,32 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         let Some(crud_store) = self.projected_mcp_store.lock().await.clone() else {
             return Ok(None);
         };
+        let acp_generation = self
+            .acp_snapshot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|snapshot| snapshot.generation);
+        if let Some(generation) = acp_generation {
+            let projection = crud_store
+                .get_turn_mcp_projection(pioneer_turn_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("test ACP MCP projection is missing"))?;
+            let mut slot = self.acp_mcp_metadata.lock().await;
+            let metadata = slot
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("test ACP MCP session was not launched"))?;
+            anyhow::ensure!(
+                metadata.session_generation == generation
+                    && metadata.manifest_hash == projection.manifest_hash,
+                "test ACP MCP session does not match the current projection"
+            );
+            // A reused ACP process reserves each turn against the same facade,
+            // with a new activation generation, just like AcpMcpBridge.
+            let reserved = metadata.clone();
+            metadata.projection_activation_generation += 1;
+            return Ok(Some(reserved));
+        }
         if let Some(metadata) = self
             .projected_mcp_metadata
             .lock()
@@ -1408,18 +1435,24 @@ impl CLIAgentRuntimeSessionFactory for StaticCliRuntimeSessionFactory {
                 _ => None,
             };
             if let Some((turn_id, adapter, manifest, contract, isolation, projection)) = facts {
-                self.session.projected_mcp_metadata.lock().await.insert(
-                    turn_id,
-                    CLIAgentRuntimeMcpTurnMetadata {
-                        adapter_kind: adapter.to_owned(),
-                        manifest_hash: manifest,
-                        projection_fingerprint: projection,
-                        provider_contract_fingerprint: contract,
-                        isolation_contract_fingerprint: isolation,
-                        session_generation: instance.generation(),
-                        projection_activation_generation: 1,
-                    },
-                );
+                let metadata = CLIAgentRuntimeMcpTurnMetadata {
+                    adapter_kind: adapter.to_owned(),
+                    manifest_hash: manifest,
+                    projection_fingerprint: projection,
+                    provider_contract_fingerprint: contract,
+                    isolation_contract_fingerprint: isolation,
+                    session_generation: instance.generation(),
+                    projection_activation_generation: 1,
+                };
+                if adapter == crate::cli_runtime::acp_mcp::ACP_MCP_ADAPTER_KIND {
+                    *self.session.acp_mcp_metadata.lock().await = Some(metadata);
+                } else {
+                    self.session
+                        .projected_mcp_metadata
+                        .lock()
+                        .await
+                        .insert(turn_id, metadata);
+                }
             }
         }
         if let Some(launch_specs) = self.launch_specs.as_ref() {
@@ -84775,6 +84808,7 @@ fn acp_composer_preparation_detached_result_and_parent_delivery_use_one_owner() 
                 serde_json::from_value(recv_response_by_id(&mut rx, &prepare).await.result)
                     .unwrap();
             let mut snapshot = prepared.snapshot;
+            let mut previous_mcp: Option<pioneer_crud::CliRuntimeTurnMcpMetadata> = None;
             // A second send uses the published execution snapshot, without any selector RPC.
             for index in 0..if answer && !cancelled { 2 } else { 1 } {
                 let native_turn = format!("acp-native-{index}");
@@ -84865,6 +84899,28 @@ fn acp_composer_preparation_detached_result_and_parent_delivery_use_one_owner() 
                     binding.mcp.as_ref().unwrap().adapter_kind,
                     crate::cli_runtime::acp_mcp::ACP_MCP_ADAPTER_KIND
                 );
+                let metadata = binding.mcp.as_ref().unwrap();
+                if let Some(previous) = previous_mcp.as_ref() {
+                    assert_eq!(metadata.session_generation, previous.session_generation);
+                    assert_eq!(metadata.manifest_hash, previous.manifest_hash);
+                    assert_eq!(
+                        metadata.projection_fingerprint,
+                        previous.projection_fingerprint
+                    );
+                    assert_eq!(
+                        metadata.provider_contract_fingerprint,
+                        previous.provider_contract_fingerprint
+                    );
+                    assert_eq!(
+                        metadata.isolation_contract_fingerprint,
+                        previous.isolation_contract_fingerprint
+                    );
+                    assert!(
+                        metadata.projection_activation_generation
+                            > previous.projection_activation_generation
+                    );
+                }
+                previous_mcp = Some(metadata.clone());
                 assert!(
                     store
                         .list_turn_mcp_bindings(&binding.turn_id)
