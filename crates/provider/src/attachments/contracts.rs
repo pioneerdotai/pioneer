@@ -20,11 +20,28 @@ pub(super) fn validate_model_inputs(
     validate_effective_model_inputs(provider, adapter, messages, catalog.model(provider, model))
 }
 
+#[cfg(test)]
 pub(super) fn validate_effective_model_inputs(
     provider: &str,
     adapter: &ProviderCapabilities,
     messages: &[ChatMessage],
     entry: Option<&CatalogModel>,
+) -> Result<()> {
+    validate_effective_model_inputs_for_profile(
+        provider,
+        adapter,
+        messages,
+        entry,
+        crate::history::ProjectionProfile::ServiceDefault,
+    )
+}
+
+pub(super) fn validate_effective_model_inputs_for_profile(
+    provider: &str,
+    adapter: &ProviderCapabilities,
+    messages: &[ChatMessage],
+    entry: Option<&CatalogModel>,
+    profile: crate::history::ProjectionProfile,
 ) -> Result<()> {
     let provider = crate::definition::provider_definition(provider)
         .map(|d| d.name)
@@ -64,7 +81,9 @@ pub(super) fn validate_effective_model_inputs(
             // https://developers.openai.com/api/docs/guides/pdf-files
             if kind == InputContentType::File
                 && mime == "application/pdf"
-                && matches!(provider, "openai" | "anthropic")
+                && (provider == "openai"
+                    || provider == "anthropic"
+                        && profile == crate::history::ProjectionProfile::ServiceDefault)
                 && entry.input_capability(InputContentType::Image)
                     == InputCapabilityState::Supported
             {
@@ -91,15 +110,11 @@ pub(super) fn validate_effective_model_inputs(
                 )
                 .into());
             }
-            validate_endpoint(entry, provider, kind).context(MediaInputRejection(
+            validate_endpoint(entry, provider, kind, profile).context(MediaInputRejection(
                 "model media metadata does not establish support on the selected protocol endpoint",
             ))?;
-            validate_representation(
-                provider,
-                kind,
-                message.role.clone(),
-                &mime,
-                &attachment.source,
+            validate_representation_for_profile(
+                provider, kind, message.role.clone(), &mime, &attachment.source, profile,
             ).context(MediaInputRejection("media MIME, source or role is unsupported by the selected adapter; opaque references require owned materialized bytes"))?;
             validate_catalog_constraints(
                 entry,
@@ -117,6 +132,7 @@ pub(super) fn validate_effective_model_inputs(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn validate_representation(
     provider: &str,
     kind: InputContentType,
@@ -124,8 +140,50 @@ pub(super) fn validate_representation(
     mime: &str,
     source: &AttachmentDataSource,
 ) -> Result<()> {
+    validate_representation_for_profile(
+        provider,
+        kind,
+        role,
+        mime,
+        source,
+        crate::history::ProjectionProfile::ServiceDefault,
+    )
+}
+
+pub(super) fn validate_representation_for_profile(
+    provider: &str,
+    kind: InputContentType,
+    role: Role,
+    mime: &str,
+    source: &AttachmentDataSource,
+    profile: crate::history::ProjectionProfile,
+) -> Result<()> {
     let normalized = super::normalize::normalize_mime(mime)?;
     let mime = super::normalize::canonical_mime(&normalized);
+    if profile == crate::history::ProjectionProfile::Responses {
+        // Actual renderer contract; catalog/model/role/source constraints are
+        // still intersected by admission. No service's Chat media is inferred.
+        ensure!(
+            matches!(role, Role::User | Role::Tool),
+            "Responses media role is unsupported"
+        );
+        ensure!(
+            !matches!(source, AttachmentDataSource::Reference { .. }),
+            "external media reference requires verified ownership and materialized original bytes"
+        );
+        ensure!(
+            match kind {
+                InputContentType::Image => matches!(
+                    mime,
+                    "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+                ),
+                InputContentType::File => mime == "application/pdf",
+                _ => false,
+            },
+            "unsupported Responses media representation"
+        );
+        return Ok(());
+    }
     let Some(definition) = crate::definition::provider_definition(provider) else {
         // Unregistered test doubles exercise materialization independently of
         // provider contracts. Production custom endpoints have canonical IDs.
@@ -386,13 +444,15 @@ pub(super) fn validate_prepared(
     provider: &str,
     messages: &[ChatMessage],
     attachments: &[super::PreparedAttachment],
+    profile: crate::history::ProjectionProfile,
 ) -> Result<()> {
     // Text-only adapters have no native media contract to validate. Keep this
     // separate from unknown adapters with actual binary input, which fail closed.
     if attachments.is_empty() {
         return Ok(());
     }
-    let Some(definition) = crate::definition::provider_definition(provider) else {
+    let definition = crate::definition::provider_definition(provider);
+    if profile == crate::history::ProjectionProfile::ServiceDefault && definition.is_none() {
         // Unregistered test doubles exercise materialization independently of
         // provider contracts. Production custom endpoints have canonical IDs.
         #[cfg(test)]
@@ -400,10 +460,12 @@ pub(super) fn validate_prepared(
         #[cfg(not(test))]
         anyhow::bail!("unknown adapter media contract for `{provider}`");
     };
-    let provider = definition.name;
+    let provider = definition
+        .map(|definition| definition.name)
+        .unwrap_or(provider);
     for attachment in attachments {
         // Revalidate MIME after content sniffing; declared MIME is not evidence.
-        validate_representation(
+        validate_representation_for_profile(
             provider,
             attachment.kind,
             messages[attachment.message_index].role.clone(),
@@ -411,6 +473,7 @@ pub(super) fn validate_prepared(
             &AttachmentDataSource::Bytes {
                 base64_data: String::new(),
             },
+            profile,
         )?;
     }
     // All image renderers send the reconciled encoded format. Parse actual
@@ -437,7 +500,7 @@ pub(super) fn validate_prepared(
             _ => {}
         }
     }
-    if provider == "groq" {
+    if profile == crate::history::ProjectionProfile::ServiceDefault && provider == "groq" {
         // Current Groq vision Chat profile: all resent history counts.
         // https://console.groq.com/docs/vision (3 images, 20 MB request).
         ensure!(
@@ -467,7 +530,7 @@ pub(super) fn validate_prepared(
             "OpenAI combined file input exceeds 50 MB"
         );
     }
-    if provider == "gemini" {
+    if profile == crate::history::ProjectionProfile::ServiceDefault && provider == "gemini" {
         // https://ai.google.dev/gemini-api/docs/file-input-methods
         for pdf in attachments
             .iter()
@@ -479,7 +542,7 @@ pub(super) fn validate_prepared(
             );
         }
     }
-    if provider == "anthropic" {
+    if profile == crate::history::ProjectionProfile::ServiceDefault && provider == "anthropic" {
         validate_claude_image_dimensions(attachments, false)?;
         // Direct Claude image size is 10 MB base64-encoded, not raw bytes.
         for attachment in attachments
@@ -492,7 +555,7 @@ pub(super) fn validate_prepared(
             );
         }
     }
-    if provider == "bedrock" {
+    if profile == crate::history::ProjectionProfile::ServiceDefault && provider == "bedrock" {
         // https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Message.html
         for (index, message) in messages.iter().enumerate() {
             let images = attachments
@@ -541,7 +604,13 @@ pub(super) fn validate_model_media_limits(
     provider: &str,
     entry: &CatalogModel,
     attachments: &[super::PreparedAttachment],
+    profile: crate::history::ProjectionProfile,
 ) -> Result<()> {
+    if profile == crate::history::ProjectionProfile::Responses && provider != "openai" {
+        // Catalog materialized constraints were checked separately. These
+        // supplements describe other native APIs, not compatible Responses.
+        return Ok(());
+    }
     if provider == "gemini" {
         // https://ai.google.dev/gemini-api/docs/document-processing
         ensure!(
@@ -669,7 +738,12 @@ fn pdf_pages(attachments: &[super::PreparedAttachment]) -> Result<usize> {
         })
 }
 
-fn validate_endpoint(entry: &CatalogModel, provider: &str, kind: InputContentType) -> Result<()> {
+fn validate_endpoint(
+    entry: &CatalogModel,
+    provider: &str,
+    kind: InputContentType,
+    profile: crate::history::ProjectionProfile,
+) -> Result<()> {
     let provider = crate::definition::provider_definition(provider)
         .map(|d| d.name)
         .unwrap_or(provider);
@@ -679,50 +753,57 @@ fn validate_endpoint(entry: &CatalogModel, provider: &str, kind: InputContentTyp
     // https://ai.google.dev/gemini-api/docs/deep-research
     // https://developers.openai.com/api/docs/guides/realtime
     ensure!(
-        !(provider == "gemini"
+        !(profile == crate::history::ProjectionProfile::ServiceDefault
+            && provider == "gemini"
             && (entry.id.contains("-live") || entry.id.starts_with("deep-research")))
             && !(provider == "openai" && entry.id.contains("realtime")),
         "model requires a separate live/realtime/interactions endpoint"
     );
-    let supported = match provider {
-        "anthropic" => entry.api == "anthropic-messages",
-        "gemini" => entry.api == "google-generative-ai",
-        "bedrock" => matches!(
-            entry.api.as_str(),
-            "bedrock-converse" | "bedrock-converse-stream"
-        ),
-        // OpenRouter's Chat gateway routes these native model profiles itself.
-        "openrouter" => matches!(
-            entry.api.as_str(),
-            "openai-completions" | "anthropic-messages"
-        ),
-        // Chat vision/PDF are documented on OpenAI and Azure; Responses catalog
-        // membership alone does not establish Chat audio/realtime compatibility.
-        "openai" if kind == InputContentType::Audio => entry.api == "openai-completions",
-        "openai" | "azure-openai" => {
-            matches!(kind, InputContentType::Image | InputContentType::File)
-                && matches!(
-                    entry.api.as_str(),
-                    "openai-completions" | "openai-responses" | "azure-openai-responses"
-                )
+    let supported = if profile == crate::history::ProjectionProfile::Responses {
+        (entry.api == "openai-responses"
+            || provider == "openai" && entry.api == "openai-completions")
+            && matches!(kind, InputContentType::Image | InputContentType::File)
+    } else {
+        match provider {
+            "anthropic" => entry.api == "anthropic-messages",
+            "gemini" => entry.api == "google-generative-ai",
+            "bedrock" => matches!(
+                entry.api.as_str(),
+                "bedrock-converse" | "bedrock-converse-stream"
+            ),
+            // OpenRouter's Chat gateway routes these native model profiles itself.
+            "openrouter" => matches!(
+                entry.api.as_str(),
+                "openai-completions" | "anthropic-messages"
+            ),
+            // Chat vision/PDF are documented on OpenAI and Azure; Responses catalog
+            // membership alone does not establish Chat audio/realtime compatibility.
+            "openai" if kind == InputContentType::Audio => entry.api == "openai-completions",
+            "openai" | "azure-openai" => {
+                matches!(kind, InputContentType::Image | InputContentType::File)
+                    && matches!(
+                        entry.api.as_str(),
+                        "openai-completions" | "openai-responses" | "azure-openai-responses"
+                    )
+            }
+            "copilot" => entry.api == "openai-completions",
+            "ollama" => entry.api == "ollama-chat",
+            "mistral" => {
+                kind == InputContentType::Image
+                    && matches!(
+                        entry.api.as_str(),
+                        "openai-completions" | "mistral-conversations"
+                    )
+            }
+            "xai" => {
+                kind == InputContentType::Image
+                    && matches!(
+                        entry.api.as_str(),
+                        "openai-completions" | "openai-responses"
+                    )
+            }
+            _ => entry.api == "openai-completions",
         }
-        "copilot" => entry.api == "openai-completions",
-        "ollama" => entry.api == "ollama-chat",
-        "mistral" => {
-            kind == InputContentType::Image
-                && matches!(
-                    entry.api.as_str(),
-                    "openai-completions" | "mistral-conversations"
-                )
-        }
-        "xai" => {
-            kind == InputContentType::Image
-                && matches!(
-                    entry.api.as_str(),
-                    "openai-completions" | "openai-responses"
-                )
-        }
-        _ => entry.api == "openai-completions",
     };
     ensure!(
         supported,
@@ -745,10 +826,26 @@ mod tests {
         let mut entry = c.model("openrouter", "vision").unwrap().clone();
         for api in ["bedrock-converse", "bedrock-converse-stream"] {
             entry.api = api.into();
-            assert!(validate_endpoint(&entry, "bedrock", InputContentType::Image).is_ok());
+            assert!(
+                validate_endpoint(
+                    &entry,
+                    "bedrock",
+                    InputContentType::Image,
+                    crate::history::ProjectionProfile::ServiceDefault
+                )
+                .is_ok()
+            );
         }
         entry.api = "anthropic-messages".into();
-        assert!(validate_endpoint(&entry, "bedrock", InputContentType::Image).is_err());
+        assert!(
+            validate_endpoint(
+                &entry,
+                "bedrock",
+                InputContentType::Image,
+                crate::history::ProjectionProfile::ServiceDefault
+            )
+            .is_err()
+        );
     }
 
     fn catalog() -> ModelCatalog {
@@ -888,6 +985,25 @@ mod tests {
                 )
                 .is_ok()
             );
+            if provider == "openai" {
+                let entry = catalog().model(provider, "vision").unwrap().clone();
+                assert_ne!(
+                    entry.input_capability(InputContentType::File),
+                    InputCapabilityState::Supported
+                );
+                assert!(
+                    validate_effective_model_inputs_for_profile(
+                        provider,
+                        &ceiling(),
+                        &[ChatMessage::user_parts(vec![MessageContentPart::file(
+                            attachment("application/pdf")
+                        )])],
+                        Some(&entry),
+                        crate::history::ProjectionProfile::Responses,
+                    )
+                    .is_ok()
+                );
+            }
             assert!(
                 validate(
                     provider,
@@ -1106,15 +1222,57 @@ mod tests {
         let mut entry = catalog().model("gemini", "media").unwrap().clone();
         for id in ["gemini-fixture-live-preview", "deep-research-fixture"] {
             entry.id = id.into();
-            assert!(validate_endpoint(&entry, "gemini", InputContentType::Audio).is_err());
+            assert!(
+                validate_endpoint(
+                    &entry,
+                    "gemini",
+                    InputContentType::Audio,
+                    crate::history::ProjectionProfile::ServiceDefault
+                )
+                .is_err()
+            );
         }
         let mut entry = catalog().model("openai", "vision").unwrap().clone();
         entry.id = "gpt-realtime-fixture".into();
-        assert!(validate_endpoint(&entry, "openai", InputContentType::Image).is_err());
+        assert!(
+            validate_endpoint(
+                &entry,
+                "openai",
+                InputContentType::Image,
+                crate::history::ProjectionProfile::ServiceDefault
+            )
+            .is_err()
+        );
+        entry.api = "openai-responses".into();
+        assert!(
+            validate_endpoint(
+                &entry,
+                "openai",
+                InputContentType::Image,
+                crate::history::ProjectionProfile::Responses,
+            )
+            .is_err()
+        );
         let mut entry = catalog().model("openai", "media").unwrap().clone();
-        assert!(validate_endpoint(&entry, "openai", InputContentType::Audio).is_err());
+        assert!(
+            validate_endpoint(
+                &entry,
+                "openai",
+                InputContentType::Audio,
+                crate::history::ProjectionProfile::ServiceDefault
+            )
+            .is_err()
+        );
         entry.api = "openai-completions".into();
-        assert!(validate_endpoint(&entry, "openai", InputContentType::Audio).is_ok());
+        assert!(
+            validate_endpoint(
+                &entry,
+                "openai",
+                InputContentType::Audio,
+                crate::history::ProjectionProfile::ServiceDefault
+            )
+            .is_ok()
+        );
     }
     #[test]
     fn explicit_modalities_win_over_file_attachment_flag_without_enabling_unknown_formats() {
@@ -1156,22 +1314,32 @@ mod tests {
         )
         .unwrap();
         assert!(
-            validate_prepared("bedrock", &prepared.messages, &prepared.attachments)
-                .unwrap_err()
-                .root_cause()
-                .to_string()
-                .contains("sibling text")
+            validate_prepared(
+                "bedrock",
+                &prepared.messages,
+                &prepared.attachments,
+                crate::history::ProjectionProfile::ServiceDefault
+            )
+            .unwrap_err()
+            .root_cause()
+            .to_string()
+            .contains("sibling text")
         );
         let mut messages = prepared.messages;
         messages[0].content = "analyze".into();
         let mut files = prepared.attachments;
         files[0].size_bytes = 4_500_001;
         assert!(
-            validate_prepared("bedrock", &messages, &files)
-                .unwrap_err()
-                .root_cause()
-                .to_string()
-                .contains("4.5 MB")
+            validate_prepared(
+                "bedrock",
+                &messages,
+                &files,
+                crate::history::ProjectionProfile::ServiceDefault
+            )
+            .unwrap_err()
+            .root_cause()
+            .to_string()
+            .contains("4.5 MB")
         );
     }
 }

@@ -11,6 +11,7 @@ struct CompletionProvider {
 
 fn response(termination: ProviderTermination) -> ChatResponse {
     ChatResponse {
+        messages: Vec::new(),
         text: r#"{"facts":[]}"#.to_owned(),
         termination,
         usage: None,
@@ -228,5 +229,61 @@ async fn stream_errors_require_typed_proof_for_completion_retry_policy() {
         );
         assert_eq!(metadata(&error, "failure_stage"), "transport_completion");
         assert!(error.retryable);
+    }
+}
+
+#[tokio::test]
+async fn extractor_uses_result_projection_and_drains_after_phased_terminal() {
+    use pioneer_provider::{
+        ProviderMessage, ProviderMessageBoundary as Boundary, ProviderMessageId,
+        ProviderMessageMetadata,
+    };
+    for streaming in [false, true] {
+        let messages = vec![
+            ProviderMessage {
+                id: ProviderMessageId(0),
+                phase: Some(pioneer_protocol::AgentMessagePhase::Commentary),
+                text: "not JSON: preparing facts".into(),
+            },
+            ProviderMessage {
+                id: ProviderMessageId(1),
+                phase: None,
+                text: r#"{"facts":[]}"#.into(),
+            },
+        ];
+        let mut completed = response(ProviderTermination::Complete);
+        completed.messages = messages.clone();
+        let mut chunks = Vec::new();
+        for msg in messages {
+            for boundary in [Boundary::Start, Boundary::Delta, Boundary::End] {
+                let mut chunk = StreamChunk::delta(if boundary == Boundary::Delta {
+                    msg.text.as_str()
+                } else {
+                    ""
+                });
+                chunk.message = Some(ProviderMessageMetadata {
+                    id: msg.id,
+                    phase: msg.phase,
+                    boundary,
+                });
+                chunks.push(chunk);
+            }
+        }
+        chunks.push(StreamChunk::final_chunk_with(ProviderTermination::Complete));
+        chunks.push(StreamChunk::usage(pioneer_provider::TokenUsage {
+            output_tokens: Some(10),
+            ..Default::default()
+        }));
+        let provider = CompletionProvider {
+            streaming,
+            response: completed,
+            chunks,
+        };
+        assert_eq!(
+            request_post_turn_extractor_json(&provider, "selected-model", "extract".into())
+                .await
+                .unwrap(),
+            r#"{"facts":[]}"#
+        );
     }
 }

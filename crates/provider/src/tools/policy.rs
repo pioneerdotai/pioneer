@@ -101,8 +101,24 @@ pub(crate) fn prepare_request(provider: &str, request: ChatRequest) -> Result<Ch
 
 pub(crate) fn prepare_request_with_catalog(
     provider: &str,
+    request: ChatRequest,
+    catalog: Option<&crate::catalog::ModelCatalog>,
+) -> Result<ChatRequest> {
+    prepare_request_for_api(provider, request, catalog, false)
+}
+
+pub(crate) fn prepare_responses_request(
+    provider: &str,
+    request: ChatRequest,
+) -> Result<ChatRequest> {
+    let catalog = crate::catalog::model_catalog().ok();
+    prepare_request_for_api(provider, request, catalog.as_deref(), true)
+}
+fn prepare_request_for_api(
+    provider: &str,
     mut request: ChatRequest,
     catalog: Option<&crate::catalog::ModelCatalog>,
+    responses: bool,
 ) -> Result<ChatRequest> {
     let provider = policy_id(provider);
     let use_public_catalog = DISCOVERY_TOOLS
@@ -112,7 +128,7 @@ pub(crate) fn prepare_request_with_catalog(
     let tools = request.tools.as_deref().unwrap_or_default();
     let mut names = BTreeSet::new();
     for tool in tools {
-        validate_tool_name(provider, &tool.name)?;
+        validate_tool_name(if responses { "openai" } else { provider }, &tool.name)?;
         ensure!(
             names.insert(tool.name.as_str()),
             "provider `{provider}`: duplicate tool name"
@@ -152,7 +168,8 @@ pub(crate) fn prepare_request_with_catalog(
     );
     // Converse has no None union member. Omitting the tool config is equivalent
     // for a fresh text request, but cannot safely continue toolUse/toolResult.
-    if provider == "bedrock"
+    if !responses
+        && provider == "bedrock"
         && disabled
         && request
             .messages
@@ -161,7 +178,8 @@ pub(crate) fn prepare_request_with_catalog(
     {
         bail!("provider `bedrock`: None cannot be represented with tool continuation history");
     }
-    if disabled
+    if !responses
+        && disabled
         && matches!(
             provider,
             "bedrock"
@@ -187,7 +205,8 @@ pub(crate) fn prepare_request_with_catalog(
     }
     // These families expose the tools field on Responses, not Chat, even if
     // a caller disables new calls. Azure opaque deployments cannot be inferred.
-    if matches!(provider, "openai" | "azure-openai")
+    if !responses
+        && matches!(provider, "openai" | "azure-openai")
         && ["gpt-6-astra", "gpt-6.1-sol"]
             .iter()
             .any(|p| request.model == *p || request.model.starts_with(&format!("{p}-")))
@@ -196,7 +215,8 @@ pub(crate) fn prepare_request_with_catalog(
     }
     // Published Messages contract: these families reject forced tool use even
     // with thinking disabled. This is a protocol supplement, not a model list.
-    if provider == "anthropic"
+    if !responses
+        && provider == "anthropic"
         && matches!(
             request.tool_choice,
             Some(ToolChoice::Required | ToolChoice::Tool { .. })
@@ -217,26 +237,34 @@ pub(crate) fn prepare_request_with_catalog(
             "provider `anthropic`: this model family does not support Required/named tool choice"
         );
     }
-    if matches!(
-        provider,
-        "cohere" | "ollama" | "glm" | "zai" | "glm-coding" | "zai-coding" | "novita"
-    ) {
+    if !responses
+        && matches!(
+            provider,
+            "cohere" | "ollama" | "glm" | "zai" | "glm-coding" | "zai-coding" | "novita"
+        )
+    {
         ensure!(
             matches!(request.tool_choice, None | Some(ToolChoice::Auto)),
             "provider `{provider}`: Required/named tool choice is not supported by this API profile"
         );
         request.tool_choice = None; // Native/default Auto, not a forced mode.
     }
-    if provider == "synthetic" && matches!(request.tool_choice, Some(ToolChoice::Required)) {
+    if !responses
+        && provider == "synthetic"
+        && matches!(request.tool_choice, Some(ToolChoice::Required))
+    {
         bail!("provider `synthetic`: Required is not in the published Chat tool choice contract");
     }
-    if provider == "bedrock" && matches!(request.tool_choice, Some(ToolChoice::Tool { .. })) {
+    if !responses
+        && provider == "bedrock"
+        && matches!(request.tool_choice, Some(ToolChoice::Tool { .. }))
+    {
         ensure!(
             request.model.contains("anthropic.claude-3") || request.model.contains("amazon.nova"),
             "provider `bedrock`: named tool choice requires a verified Claude 3 or Nova model identity"
         );
     }
-    if !disabled && provider != "anthropic" {
+    if !disabled && (responses || provider != "anthropic") {
         let metadata_control = catalog
             .and_then(|c| c.model(provider, &request.model))
             .and_then(|m| m.metadata.get("compat").cloned())
@@ -244,7 +272,8 @@ pub(crate) fn prepare_request_with_catalog(
         let verified_chat_control = catalog
             .and_then(|c| c.model(provider, &request.model))
             .is_some_and(|m| m.api == "openai-completions" && metadata_control == Some(true));
-        let native = (native_parallel_control(provider) && metadata_control != Some(false))
+        let native = ((responses || native_parallel_control(provider))
+            && metadata_control != Some(false))
             || verified_chat_control
                 && !matches!(
                     provider,
@@ -267,7 +296,7 @@ pub(crate) fn prepare_request_with_catalog(
         if !native {
             request.parallel_tool_calls = None;
         }
-    } else if disabled {
+    } else if disabled && !responses {
         request.parallel_tool_calls = None;
     }
     Ok(request)
@@ -306,6 +335,19 @@ fn wire_id(provider: &str, id: &str) -> Result<String> {
 /// Validate completed outbound rounds, then normalize both sides of every
 /// binding. Operates on the prepared view, never on persisted canonical IDs.
 pub(crate) fn prepare_history(provider: &str, messages: &mut [ChatMessage]) -> Result<()> {
+    prepare_history_for_api(provider, messages, false)
+}
+pub(crate) fn prepare_responses_history(
+    provider: &str,
+    messages: &mut [ChatMessage],
+) -> Result<()> {
+    prepare_history_for_api(provider, messages, true)
+}
+fn prepare_history_for_api(
+    provider: &str,
+    messages: &mut [ChatMessage],
+    responses: bool,
+) -> Result<()> {
     let mut pending = BTreeMap::<String, (String, String)>::new();
     let mut used_wire = BTreeMap::<String, String>::new();
     for message in messages {
@@ -329,7 +371,7 @@ pub(crate) fn prepare_history(provider: &str, messages: &mut [ChatMessage]) -> R
             "provider `{provider}`: missing results before next message/round"
         );
         for call in message.tool_calls.iter_mut().flatten() {
-            validate_tool_name(provider, &call.name)?;
+            validate_tool_name(if responses { "openai" } else { provider }, &call.name)?;
             ensure!(
                 message.role == Role::Assistant,
                 "provider `{provider}`: tool calls need assistant role"
@@ -341,7 +383,7 @@ pub(crate) fn prepare_history(provider: &str, messages: &mut [ChatMessage]) -> R
                 input.is_object(),
                 "provider `{provider}`: tool arguments must be a JSON object"
             );
-            let normalized = wire_id(provider, &call.id)?;
+            let normalized = wire_id(if responses { "openai" } else { provider }, &call.id)?;
             if let Some(original) = used_wire.insert(normalized.clone(), call.id.clone()) {
                 ensure!(
                     original == call.id,

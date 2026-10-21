@@ -1578,6 +1578,7 @@ impl crate::traits::Provider for OpenRouterProvider {
             }
 
             Ok(ChatResponse {
+                messages: Vec::new(),
                 text,
                 usage,
                 termination,
@@ -2141,7 +2142,7 @@ mod tests {
         }
     }
     use crate::attachments::{prepare_messages_for_provider, prepare_messages_for_provider_model};
-    use crate::providers::OpenAiCompatibleProvider;
+    use crate::providers::ChatCompletionsApiCompatibleProvider;
     use crate::tools::stream::IncrementalLineDecoder;
     use crate::traits::Provider;
     use crate::types::{
@@ -2605,7 +2606,7 @@ mod tests {
             name: "inspect".to_owned(),
             arguments: "{}".to_owned(),
         }];
-        let replay = OpenAiCompatibleProvider::assistant_replay_state(
+        let replay = ChatCompletionsApiCompatibleProvider::assistant_replay_state(
             "deepseek",
             None,
             Some("portable deepseek reasoning".to_owned()),

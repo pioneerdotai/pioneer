@@ -2046,6 +2046,7 @@ impl Provider for ProviderFixture {
             Reply::Success | Reply::Invalid => {}
         }
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: if invalid {
                 "private invalid model response".into()
             } else {
@@ -3451,6 +3452,7 @@ async fn legacy_frozen_failed_provider_observation_restores_portable_execution_a
         ]}),
     ));
     let payload = serde_json::to_string(&CanonicalProviderRoundEnvelope {
+        ui_copies: None,
         version: 1,
         round_id: "failed-round".into(),
         termination: ProviderTermination::ProviderError,
@@ -3778,6 +3780,7 @@ async fn canonical_inputs_and_contexts_release_each_bounded_raw_payload_batch() 
             && sequence % 2 == 1
         {
             let envelope = CanonicalProviderRoundEnvelope {
+                ui_copies: None,
                 version: 1,
                 round_id: format!("large-round-{round}"),
                 termination: ProviderTermination::ToolCalls,
@@ -11004,6 +11007,7 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
             .await
             .unwrap();
         let envelope = CanonicalProviderRoundEnvelope {
+            ui_copies: None,
             version: 1,
             round_id: round.into(),
             termination: ProviderTermination::ToolCalls,
@@ -11555,6 +11559,7 @@ async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_dele
         }],
     );
     let envelope = CanonicalProviderRoundEnvelope {
+        ui_copies: None,
         version: 1,
         round_id: "covered-round".into(),
         termination: ProviderTermination::ToolCalls,
@@ -11955,6 +11960,7 @@ async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_dele
         }],
     );
     let second_envelope = CanonicalProviderRoundEnvelope {
+        ui_copies: None,
         version: 1,
         round_id: "new-round".into(),
         termination: ProviderTermination::ToolCalls,
@@ -20652,6 +20658,7 @@ async fn new_task_output_ignores_cleanup_context_before_payload_and_aliases() {
         .unwrap();
     }
     let round = CanonicalProviderRoundEnvelope {
+        ui_copies: None,
         version: 1,
         round_id: "allowed-round".into(),
         termination: ProviderTermination::ToolCalls,
@@ -26039,6 +26046,7 @@ async fn foreground_native_projection_reuses_one_owner_across_model_windows() {
         }),
     ));
     let canonical = serde_json::to_string(&CanonicalProviderRoundEnvelope {
+        ui_copies: None,
         version: 1,
         round_id: "historical-round".into(),
         termination: ProviderTermination::Complete,
@@ -26227,6 +26235,7 @@ async fn durable_context_cursor_finishes_old_text_before_portable_next_source() 
                 }),
             ));
             serde_json::to_string(&CanonicalProviderRoundEnvelope {
+                ui_copies: None,
                 version: 1,
                 round_id: id.into(),
                 termination: ProviderTermination::Complete,
@@ -26535,6 +26544,7 @@ async fn partially_read_portable_context_survives_checkpoint_and_restart() {
             serde_json::json!({"reasoning_details":[{"type":"reasoning.encrypted","data":"opaque-secret"}]}),
         ));
         serde_json::to_string(&CanonicalProviderRoundEnvelope {
+            ui_copies: None,
             version: 1,
             round_id: id.into(),
             termination: ProviderTermination::Complete,
@@ -26918,6 +26928,7 @@ async fn runner_projects_provider_reasoning_for_compact_and_reference_only_witho
             )
         };
         serde_json::to_string(&CanonicalProviderRoundEnvelope {
+            ui_copies: None,
             version: 1,
             round_id: round.into(),
             termination: ProviderTermination::Complete,
@@ -27022,6 +27033,7 @@ async fn alternating_source_projections_share_one_summarizer_request() {
     let db = f.store.database_connection();
     let context_payload = |id: &str| {
         serde_json::to_string(&CanonicalProviderRoundEnvelope {
+            ui_copies: None,
             version: 1,
             round_id: id.into(),
             termination: ProviderTermination::Complete,

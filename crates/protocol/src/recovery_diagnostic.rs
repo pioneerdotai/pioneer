@@ -120,7 +120,7 @@ impl JsonSchema for ProviderRequestId {
         schemars::json_schema!({
             "type": "string",
             "maxLength": 128,
-            "pattern": "^(gen-|req-|cmpl-|chatcmpl-)[A-Za-z0-9_-]+$"
+            "pattern": "^(gen-|req-|req_|cmpl-|chatcmpl-)[A-Za-z0-9_-]+$"
         })
     }
 }
@@ -129,7 +129,7 @@ impl TryFrom<String> for ProviderRequestId {
     type Error = &'static str;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        let prefix = ["gen-", "req-", "cmpl-", "chatcmpl-"]
+        let prefix = ["gen-", "req-", "req_", "cmpl-", "chatcmpl-"]
             .into_iter()
             .find(|prefix| value.starts_with(prefix));
         if value.len() > 128
@@ -293,6 +293,8 @@ mod tests {
             assert!(ProviderRequestId::try_from(id.to_owned()).is_err());
             assert!(serde_json::from_value::<ProviderRequestId>(serde_json::json!(id)).is_err());
         }
+        assert!(ProviderRequestId::try_from("req_openai_native".to_owned()).is_ok());
+        assert!(ProviderRequestId::try_from("req_private?secret".to_owned()).is_err());
         let legacy: RecoveryProviderFailure = serde_json::from_str(r#"{"class":"provider_5xx","stage":"mid_stream","transport":"stream","httpStatus":502}"#).unwrap();
         assert!(legacy.error_reason.is_none());
         assert!(legacy.request_id.is_none());

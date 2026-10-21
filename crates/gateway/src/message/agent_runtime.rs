@@ -5088,7 +5088,12 @@ impl MessageProcessor {
         &self,
         notification: &pioneer_protocol::ItemCompletedNotification,
     ) {
-        if let TurnItem::AgentMessage { text, .. } = &notification.item {
+        if let TurnItem::AgentMessage {
+            text,
+            phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+            ..
+        } = &notification.item
+        {
             self.turn_final_assistant_texts
                 .lock()
                 .await

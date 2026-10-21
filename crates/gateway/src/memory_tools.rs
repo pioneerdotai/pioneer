@@ -979,6 +979,16 @@ async fn request_post_turn_extractor_json_once(
             classified
         })
         .and_then(|response| {
+            pioneer_provider::ProviderMessageCollector::validate_response(&response).map_err(
+                |_| {
+                    extractor_completion_error(
+                        provider.name(),
+                        model,
+                        ExtractorCompletionFailure::AfterCompletion,
+                        Some(&response.termination),
+                    )
+                },
+            )?;
             validate_extractor_completion(
                 provider.name(),
                 model,
@@ -1002,6 +1012,7 @@ async fn collect_post_turn_extractor_stream(
     request_attempt: &'static str,
 ) -> HookResult<String> {
     let mut text = String::new();
+    let mut collector = pioneer_provider::ProviderMessageCollector::default();
     let mut completed = false;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
@@ -1041,7 +1052,8 @@ async fn collect_post_turn_extractor_stream(
             // Drain usage and transport completion so the auxiliary journal
             // can finalize the physical attempt. Completion cannot admit more
             // generated content or change the accepted termination.
-            if !chunk.delta.is_empty()
+            if chunk.message.is_some()
+                || !chunk.delta.is_empty()
                 || chunk
                     .reasoning_delta
                     .as_ref()
@@ -1078,14 +1090,31 @@ async fn collect_post_turn_extractor_stream(
                 false,
             )?;
         }
+        collector.push(&chunk).map_err(|_| {
+            extractor_completion_error(
+                provider.name(),
+                model,
+                ExtractorCompletionFailure::AfterCompletion,
+                chunk.termination.as_ref(),
+            )
+        })?;
+        let projected_bytes = text.len().saturating_add(collector.result_delta().len());
         validate_extractor_response_size(
             provider.name(),
             model,
-            text.len().saturating_add(chunk.delta.len()),
+            projected_bytes,
             chunk.termination.as_ref(),
         )?;
-        text.push_str(&chunk.delta);
+        text.push_str(collector.result_delta());
         if chunk.is_final {
+            collector.finish().map_err(|_| {
+                extractor_completion_error(
+                    provider.name(),
+                    model,
+                    ExtractorCompletionFailure::AfterCompletion,
+                    chunk.termination.as_ref(),
+                )
+            })?;
             completed = true;
         }
     }

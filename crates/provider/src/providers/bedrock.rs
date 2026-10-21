@@ -1013,6 +1013,7 @@ impl BedrockProvider {
         }
 
         Ok(ChatResponse {
+            messages: Vec::new(),
             text,
             usage,
             termination,

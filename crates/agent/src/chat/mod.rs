@@ -210,6 +210,9 @@ struct TurnCapabilityResolutionSummary {
 
 #[derive(Debug)]
 struct AgentRoundResponse {
+    round_id: String,
+    messages: Vec<pioneer_provider::ProviderMessage>,
+    ui_copies: Vec<pioneer_provider::ProviderRoundUiCopy>,
     usage: Option<pioneer_provider::TokenUsage>,
     text: String,
     reasoning: String,
@@ -1055,6 +1058,15 @@ async fn persist_provider_history_message(
     item_id: &str,
     envelope: &CanonicalProviderRoundEnvelope,
 ) -> Result<(), ChatTurnError> {
+    let bytes = serde_json::to_vec(envelope).map_err(|_| {
+        ChatTurnError::Terminal("canonical provider history serialization failed".into())
+    })?;
+    pioneer_provider::ProviderResponseLimits::default()
+        .validate_retained_bytes(bytes.len())
+        .map_err(|_| {
+            ChatTurnError::Terminal("canonical provider history exceeds retained limit".into())
+        })?;
+    drop(bytes);
     let payload = serde_json::to_value(envelope).map_err(|error| {
         ChatTurnError::Terminal(format!(
             "failed to serialize canonical provider history: {error}"
@@ -2881,7 +2893,7 @@ async fn execute_standard_provider_response(
     let request = ChatRequest {
         model,
         messages,
-        temperature: Some(0.7),
+        temperature: None,
         max_tokens: None,
         tools: None,
         tool_choice: None,
@@ -4521,12 +4533,22 @@ async fn execute_agent_provider_response(
     )
     .await?;
 
+    let mut pending_completed: Option<CanonicalProviderRoundEnvelope> = None;
     let turn_result: Result<AgentProviderLoopOutcome, (ChatTurnError, String)> = async {
         let mut current_thinking_id = initial_thinking_item_id;
+        let mut last_provider_reasoning_id: Option<String> = None;
         let mut consecutive_rejected_no_tool_rounds = 0usize;
         let mut task_gate_query_failures = 0usize;
 
         loop {
+            if let Some(envelope) = pending_completed.take() {
+                provider::persist_completed_response(event_tx.as_ref(), thread_id, turn_id, &envelope)
+                    .await.map_err(|error| (error, current_thinking_id.clone()))?;
+                retain_provider_history_message(
+                    &mut continuation_provider_history, &mut next_provider_history_sequence,
+                    &envelope.message,
+                );
+            }
             retain_agent_attachment_messages(&mut messages);
 
             let task_gate_snapshot = match attached_task_finalization_snapshot(
@@ -4856,7 +4878,7 @@ async fn execute_agent_provider_response(
             let request = ChatRequest {
                     model: model.clone(),
                     messages: messages.clone(),
-                    temperature: Some(0.7),
+                    temperature: None,
                     max_tokens: None,
                     tools: tool_definitions,
                     tool_choice: None,
@@ -4872,6 +4894,12 @@ async fn execute_agent_provider_response(
                 (prepared.request, Some(prepared.receipt))
             } else { (request, None) };
             messages = request.messages.clone();
+            if last_provider_reasoning_id.as_deref() == Some(current_thinking_id.as_str()) {
+                current_thinking_id = start_reasoning_item(
+                    workspace_id, thread_id, turn_id, event_tx.as_ref(),
+                ).await.map_err(|error| (error, current_thinking_id.clone()))?;
+            }
+            last_provider_reasoning_id = Some(current_thinking_id.clone());
             let round = await_context_request(context_session, provider::request_agent_round(
                 provider,
                 request,
@@ -4891,6 +4919,27 @@ async fn execute_agent_provider_response(
                     ChatTurnError::Blocked(format!("context usage unavailable: {e}")),
                     current_thinking_id.clone(),
                 ))?;
+            }
+
+            if round.tool_calls.is_empty() {
+                send_reasoning_completed(
+                    workspace_id, thread_id, turn_id, &current_thinking_id,
+                    &round.reasoning, event_tx.as_ref(),
+                ).await.map_err(|error| (error, current_thinking_id.clone()))?;
+                let mut copies = round.ui_copies.clone();
+                copies.extend(provider::reasoning_copy(&current_thinking_id, &round.reasoning));
+                let mut message = ChatMessage::assistant(provider::history_text(&round.text, &round.messages));
+                message.reasoning_content = (!round.reasoning.is_empty()).then(|| round.reasoning.clone());
+                message.provider_replay_state = round.provider_replay_state.clone();
+                message.provenance = Some(crate::compaction::history::pending_origin(
+                    workspace_id, thread_id, turn_id, &round.round_id,
+                    crate::compaction::history::PendingOriginKind::Assistant, &round.round_id,
+                ));
+                pending_completed = Some(CanonicalProviderRoundEnvelope {
+                    version: 1, round_id: round.round_id.clone(), termination: round.termination.clone(),
+                    message: message.clone(), calls: vec![], ui_copies: Some(copies),
+                });
+                messages.push(message);
             }
 
             if !round.text.trim().is_empty() {
@@ -5617,10 +5666,14 @@ async fn execute_agent_provider_response(
                     .map_err(|error| (error, current_thinking_id.clone()))?;
                 }
 
-                provider::persist_completed_response(
-                    event_tx.as_ref(), thread_id, turn_id, message_item_id, current_thinking_id.as_str(),
-                    &round.text, &round.reasoning, round.provider_replay_state.as_ref(),
-                ).await.map_err(|error| (error, current_thinking_id.clone()))?;
+                if let Some(mut envelope) = pending_completed.take() {
+                    if final_text == round.text && !final_text.trim().is_empty() {
+                        envelope.ui_copies.as_mut().expect("explicit copies")
+                            .push(provider::final_copy(message_item_id, &final_text));
+                    }
+                    provider::persist_completed_response(event_tx.as_ref(), thread_id, turn_id, &envelope)
+                        .await.map_err(|error| (error, current_thinking_id.clone()))?;
+                }
 
                 emit_durable_event(
                     event_tx.as_ref(),
@@ -5663,12 +5716,15 @@ async fn execute_agent_provider_response(
             .map_err(|error| (error, current_thinking_id.clone()))?;
 
             let mut assistant_round = ChatMessage::assistant_tool_calls_with_provider_state(
-                (!round.text.is_empty()).then_some(round.text.clone()),
+                {
+                    let text = provider::history_text(&round.text, &round.messages);
+                    (!text.is_empty()).then_some(text)
+                },
                 (!round.reasoning.is_empty()).then_some(round.reasoning.clone()),
                 round.tool_calls.clone(),
                 round.provider_replay_state.clone(),
             );
-            let round_id = current_thinking_id.clone();
+            let round_id = round.round_id.clone();
             let resolved_tool_calls = round
                 .tool_calls
                 .into_iter()
@@ -5690,7 +5746,10 @@ async fn execute_agent_provider_response(
                 })
                 .collect::<Result<Vec<_>, ChatTurnError>>()
                 .map_err(|error| (error, current_thinking_id.clone()))?;
+            let mut round_copies = round.ui_copies.clone();
+            round_copies.extend(provider::reasoning_copy(&current_thinking_id, &round.reasoning));
             let provider_round = CanonicalProviderRoundEnvelope {
+                ui_copies: Some(round_copies),
                 version: 1,
                 round_id: round_id.clone(),
                 termination: round.termination,
@@ -5708,7 +5767,7 @@ async fn execute_agent_provider_response(
                 event_tx.as_ref(),
                 thread_id,
                 turn_id,
-                current_thinking_id.as_str(),
+                round_id.as_str(),
                 &provider_round,
             )
             .await
@@ -6567,6 +6626,15 @@ async fn execute_agent_provider_response(
 
     finish_tool_event_forwarder(tool_event_forwarder).await?;
 
+    if let Some(envelope) = pending_completed.take() {
+        provider::persist_completed_response(event_tx.as_ref(), thread_id, turn_id, &envelope)
+            .await?;
+        retain_provider_history_message(
+            &mut continuation_provider_history,
+            &mut next_provider_history_sequence,
+            &envelope.message,
+        );
+    }
     match turn_result {
         Ok(AgentProviderLoopOutcome::Completed) => {
             let summary = AgentTurnPostTurnSummary::succeeded_with_model(

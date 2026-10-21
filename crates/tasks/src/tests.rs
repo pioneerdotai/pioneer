@@ -4080,8 +4080,7 @@ async fn due_trigger_materialization_rolls_back_run_when_occurrence_contract_is_
         .service()
         .store()
         .append_due_trigger_task_events(
-            trigger.id.as_str(),
-            10,
+            &trigger,
             10,
             vec![
                 TaskEventPayload::TaskQueued {
@@ -8630,6 +8629,8 @@ async fn reported_start_failure_does_not_swallow_failed_state_persistence_error(
 
 #[path = "tests_delivery_lifecycle.rs"]
 mod delivery_lifecycle;
+#[path = "tests/scheduler_catch_up.rs"]
+mod scheduler_catch_up;
 #[path = "tests/terminal_delivery.rs"]
 mod terminal_delivery;
 

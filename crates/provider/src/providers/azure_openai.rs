@@ -1149,6 +1149,7 @@ impl crate::traits::Provider for AzureOpenAiProvider {
         }
 
         Ok(ChatResponse {
+            messages: Vec::new(),
             text,
             usage,
             termination,

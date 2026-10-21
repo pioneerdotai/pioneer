@@ -3726,6 +3726,7 @@ impl Provider for CancellationBarrierProvider {
         self.entered.notify_one();
         self.release.notified().await;
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: "released".to_owned(),
             usage: None,
             reasoning_content: None,
@@ -3862,6 +3863,7 @@ impl Provider for DelayedProvider {
     async fn chat(&self, _request: ChatRequest) -> anyhow::Result<ChatResponse> {
         sleep(self.delay).await;
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: self.text.clone(),
             usage: None,
             reasoning_content: None,
@@ -3922,6 +3924,7 @@ impl Provider for RevisionProvider {
             r#"<task_result>{"summary":"missing precipitation chance","data":{"ok":false}}</task_result>"#
         };
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: text.to_owned(),
             usage: None,
             reasoning_content: None,
@@ -4001,6 +4004,7 @@ impl Provider for RevisionHangingProvider {
             r#"<task_result>{"summary":"needs revision","data":{"ok":false}}</task_result>"#
         };
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: text.to_owned(),
             usage: None,
             reasoning_content: None,
@@ -4074,6 +4078,7 @@ impl Provider for CountingDelayedProvider {
         self.calls.fetch_add(1, Ordering::SeqCst);
         sleep(self.delay).await;
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: self.text.clone(),
             usage: None,
             reasoning_content: None,
@@ -4348,6 +4353,7 @@ impl Provider for CaptureSummaryProvider {
             self.release_first.notified().await;
         }
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: if is_summary_request {
                 format!(
                     "## Goal and constraints\nContinue the accepted child conversation.\n\
@@ -4656,6 +4662,7 @@ impl Provider for FlakyTitleProvider {
         }
 
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: self.text.clone(),
             usage: None,
             reasoning_content: None,
@@ -4721,6 +4728,7 @@ impl Provider for GuardAwareProvider {
                 .contains("Generate a concise title (2-6 words)")
         }) {
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: "Delegated task".to_owned(),
                 usage: None,
                 reasoning_content: None,
@@ -4732,6 +4740,7 @@ impl Provider for GuardAwareProvider {
         if is_child_task_request(&request) {
             sleep(Duration::from_secs(10)).await;
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: "slow child".to_owned(),
                 usage: None,
                 reasoning_content: None,
@@ -4748,6 +4757,7 @@ impl Provider for GuardAwareProvider {
         let index = self.next_index.fetch_add(1, Ordering::SeqCst);
         let response = match index {
             0 => ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
@@ -4764,6 +4774,7 @@ impl Provider for GuardAwareProvider {
                 }],
             },
             1 => ChatResponse {
+                messages: Vec::new(),
                 text: "premature final".to_owned(),
                 usage: None,
                 reasoning_content: None,
@@ -4775,6 +4786,7 @@ impl Provider for GuardAwareProvider {
                 let task_id = extract_task_id_from_messages(&request.messages)
                     .unwrap_or_else(|| "missing_task_id".to_owned());
                 ChatResponse {
+                    messages: Vec::new(),
                     text: String::new(),
                     usage: None,
                     reasoning_content: None,
@@ -4788,6 +4800,7 @@ impl Provider for GuardAwareProvider {
                 }
             }
             _ => ChatResponse {
+                messages: Vec::new(),
                 text: "detached and done".to_owned(),
                 usage: None,
                 reasoning_content: None,
@@ -4859,6 +4872,7 @@ impl Provider for CreateThenHangProvider {
                 .contains("Generate a concise title (2-6 words)")
         }) {
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: "Delegated task".to_owned(),
                 usage: None,
                 reasoning_content: None,
@@ -4871,6 +4885,7 @@ impl Provider for CreateThenHangProvider {
         if index == 0 {
             self.root_main_started.notify_one();
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
@@ -4890,6 +4905,7 @@ impl Provider for CreateThenHangProvider {
         if is_child_task_request(&request) {
             sleep(Duration::from_secs(10)).await;
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: "slow child".to_owned(),
                 usage: None,
                 reasoning_content: None,
@@ -4900,6 +4916,7 @@ impl Provider for CreateThenHangProvider {
         }
         sleep(Duration::from_secs(10)).await;
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: "should not complete".to_owned(),
             usage: None,
             reasoning_content: None,
@@ -5788,6 +5805,7 @@ impl Provider for VerticalSelfImprovementProvider {
             .pop_front()
             .ok_or_else(|| anyhow::anyhow!("vertical learner response script exhausted"))?;
         Ok(ChatResponse {
+            messages: Vec::new(),
             text,
             usage: None,
             reasoning_content: None,
@@ -5939,6 +5957,7 @@ impl Provider for VerticalCollaborativeSourceProvider {
         let round = self.next_round.fetch_add(1, Ordering::SeqCst);
         if round % 2 == 0 {
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
@@ -5962,6 +5981,7 @@ impl Provider for VerticalCollaborativeSourceProvider {
             .get(result_index)
             .ok_or_else(|| anyhow::anyhow!("vertical source response script exhausted"))?;
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: format!(
                 "<task_result>{}</task_result>",
                 json!({
@@ -6046,6 +6066,7 @@ impl Provider for VerticalReadSkillProvider {
             .push(request);
         if self.next_round.fetch_add(1, Ordering::SeqCst) == 0 {
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
@@ -6063,6 +6084,7 @@ impl Provider for VerticalReadSkillProvider {
         }
         self.release_result.notified().await;
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: "The learned procedure was read.".to_owned(),
             usage: None,
             reasoning_content: None,
@@ -6139,6 +6161,7 @@ impl Provider for MemoryAgentE2eProvider {
                 .expect("memory e2e provider policy requests lock poisoned")
                 .push(request);
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: memory_policy_json_for_script(self.script),
                 usage: None,
                 reasoning_content: None,
@@ -6567,6 +6590,7 @@ fn memory_agent_e2e_response(
 
 fn text_response(text: impl Into<String>) -> ChatResponse {
     ChatResponse {
+        messages: Vec::new(),
         text: text.into(),
         usage: None,
         reasoning_content: None,
@@ -6716,6 +6740,7 @@ impl Provider for SequencedToolProvider {
             .and_then(|rounds| rounds.get(index))
         {
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
@@ -6731,6 +6756,7 @@ impl Provider for SequencedToolProvider {
                 pioneer_provider::ProviderTermination::ToolCalls
             };
             return Ok(ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
@@ -6741,6 +6767,7 @@ impl Provider for SequencedToolProvider {
         }
 
         Ok(ChatResponse {
+            messages: Vec::new(),
             text: self.second_text.clone(),
             usage: None,
             reasoning_content: None,
@@ -6798,6 +6825,7 @@ impl Provider for DirectAgentSandboxProvider {
         if child {
             return Ok(match self.child_round.fetch_add(1, Ordering::SeqCst) {
                 0 => ChatResponse {
+                    messages: Vec::new(),
                     text: String::new(),
                     usage: None,
                     reasoning_content: None,
@@ -6821,6 +6849,7 @@ impl Provider for DirectAgentSandboxProvider {
 
         Ok(match self.root_round.fetch_add(1, Ordering::SeqCst) {
             0 => ChatResponse {
+                messages: Vec::new(),
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
@@ -6841,6 +6870,7 @@ impl Provider for DirectAgentSandboxProvider {
                         )
                     })?;
                 ChatResponse {
+                    messages: Vec::new(),
                     text: String::new(),
                     usage: None,
                     reasoning_content: None,
@@ -9979,6 +10009,63 @@ async fn assistant_progress_delta_is_live_only_and_completed_item_is_durable() {
             ..
         } if id == &harness.item_id && text == "hello"
     )));
+}
+
+#[tokio::test]
+async fn commentary_completion_does_not_enter_gateway_final_accounting() {
+    let harness = setup_progress_delta_harness(
+        "commentary_accounting",
+        TurnItem::AgentMessage {
+            id: "commentary-accounting".into(),
+            text: String::new(),
+            phase: pioneer_protocol::AgentMessagePhase::Commentary,
+            markdown: None,
+            markdown_version: None,
+        },
+        false,
+    )
+    .await;
+    for (id, phase, text) in [
+        (
+            harness.item_id.as_str(),
+            pioneer_protocol::AgentMessagePhase::Commentary,
+            "working",
+        ),
+        (
+            "result-accounting",
+            pioneer_protocol::AgentMessagePhase::FinalAnswer,
+            "answer",
+        ),
+    ] {
+        assert!(
+            harness
+                .processor
+                .handle_durable_agent_event(AgentDurableEvent::ItemCompleted {
+                    notification: ItemCompletedNotification {
+                        workspace_id: harness.workspace_id.clone(),
+                        thread_id: harness.thread_id.clone(),
+                        turn_id: harness.turn_id.clone(),
+                        item: TurnItem::AgentMessage {
+                            id: id.into(),
+                            text: text.into(),
+                            phase,
+                            markdown: None,
+                            markdown_version: None
+                        },
+                    },
+                })
+                .await
+        );
+        let texts = harness.processor.turn_final_assistant_texts.lock().await;
+        if phase == pioneer_protocol::AgentMessagePhase::Commentary {
+            assert!(!texts.contains_key(&harness.turn_id));
+        } else {
+            assert_eq!(
+                texts.get(&harness.turn_id).map(String::as_str),
+                Some("answer")
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -36257,7 +36344,12 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         "review-disabled Phase 3 must not expose review/approval tools"
     );
 
-    let chat_provider = Arc::new(SequencedToolProvider::new(Vec::new(), "done"));
+    // Start at the text response; Chat has no initial tool round to execute.
+    // Keep tool_calling enabled so the assertions exercise the mode's policy.
+    let chat_provider = Arc::new(SequencedToolProvider {
+        next_index: AtomicUsize::new(1),
+        ..SequencedToolProvider::new(Vec::new(), "done")
+    });
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "parent",
         chat_provider.clone(),
@@ -36292,6 +36384,11 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
     .await;
     let _ = recv_notification_by_method(&mut rx_chat, events::TURN_COMPLETED).await;
     let chat_requests = chat_provider.snapshot_requests();
+    assert_eq!(
+        chat_requests.len(),
+        1,
+        "Chat should finish with its text response"
+    );
     let first_chat_request = chat_requests
         .first()
         .expect("chat request should be captured");
@@ -76819,6 +76916,7 @@ async fn compaction_failed_partial_writer_preserves_event_but_excludes_observati
         arguments: "{}".into(),
     }]);
     let payload = serde_json::to_value(pioneer_provider::CanonicalProviderRoundEnvelope {
+        ui_copies: None,
         version: 1,
         round_id: "failed-thinking".into(),
         termination: pioneer_provider::ProviderTermination::ProviderError,
@@ -77105,6 +77203,7 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
             };
             if first && !self.1.is_empty() {
                 return Ok(ChatResponse {
+                    messages: Vec::new(),
                     text: String::new(),
                     usage: None,
                     reasoning_content: None,
@@ -79894,6 +79993,7 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
             }],
         );
         let envelope = CanonicalProviderRoundEnvelope {
+            ui_copies: None,
             version: 1,
             round_id: "ordered-round".into(),
             termination: pioneer_provider::ProviderTermination::ToolCalls,
@@ -81088,6 +81188,7 @@ async fn background_completed_history_projects_reasoning_before_fit_and_compacti
         }),
     ));
     let canonical = serde_json::to_string(&CanonicalProviderRoundEnvelope {
+        ui_copies: None,
         version: 1,
         round_id: "portable-round".into(),
         termination: ProviderTermination::ToolCalls,
@@ -81303,6 +81404,7 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
     // completed turn and the checkpoint goal remain protected by the planner.
     let historical_content = "saved context fact ".repeat(10_000);
     let canonical = serde_json::to_string(&CanonicalProviderRoundEnvelope {
+        ui_copies: None,
         version: 1,
         round_id: "historical-round".into(),
         termination: ProviderTermination::ToolCalls,

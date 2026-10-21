@@ -25,7 +25,7 @@ fn canonical_chat_rounds_keep_nested_arguments_and_ids_for_each_profile() {
                     | "azure-openai"
             )
     }) {
-        let provider = OpenAiCompatibleProvider::new(
+        let provider = ChatCompletionsApiCompatibleProvider::new(
             definition.name,
             definition.default_base_url.unwrap(),
             "fixture",

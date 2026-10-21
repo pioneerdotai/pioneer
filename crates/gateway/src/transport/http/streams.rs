@@ -555,8 +555,10 @@ where
         }
         if this.lease.cancelled() || this.lease.cancellation_wait.as_mut().poll(cx).is_ready() {
             this.lease.set_outcome(StreamOutcome::Cancelled);
+            // Revocation is terminal. AsyncReadExt retries Interrupted, which
+            // would spin forever because this lease stays cancelled.
             return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Interrupted,
+                io::ErrorKind::ConnectionAborted,
                 "artifact stream authority was revoked",
             )));
         }
@@ -921,23 +923,28 @@ mod tests {
 
         assert_eq!(registry.cancel_session(&first_session), 1);
         assert_eq!(registry.cancel_session(&first_session), 1);
-        // Tokio's integer readers retry Interrupted inside a single poll.
-        // Inspect the cancellation boundary directly, including repeated polls.
+        // Inspect repeated polls before using an adapter that retries Interrupted:
+        // a regression must fail here rather than trap the test in a loop.
         for _ in 0..2 {
-            let mut bytes = [0];
+            let mut bytes = [0_u8; 1];
             let mut buffer = ReadBuf::new(&mut bytes);
-            let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
-            let Poll::Ready(Err(error)) = Pin::new(&mut first).poll_read(&mut cx, &mut buffer)
+            let mut context = Context::from_waker(std::task::Waker::noop());
+            let Poll::Ready(Err(error)) = Pin::new(&mut first).poll_read(&mut context, &mut buffer)
             else {
-                panic!("a cancelled stream must immediately return an error");
+                panic!("cancelled stream must immediately return a terminal error");
             };
-            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
-            assert_eq!(buffer.filled().len(), 0);
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+            assert!(buffer.filled().is_empty());
         }
+        let error = first.read_u8().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
         drop(first);
         assert_eq!(registry.active_count(), 1);
+        assert_eq!(registry.metrics_observation().1, 1);
+        assert_eq!(registry.metrics_observation().3, 0);
         drop(second);
         assert_eq!(registry.active_count(), 0);
+        assert_eq!(registry.metrics_observation().1, 1);
     }
 
     #[tokio::test]

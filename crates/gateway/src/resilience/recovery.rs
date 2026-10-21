@@ -4549,23 +4549,21 @@ async fn hydrated_retained_history_origins(
         else {
             continue;
         };
-        if envelope.calls.is_empty() {
-            if let (Some(round), Some(source)) =
-                (origins.get_mut(&row.sequence), sources.get(&row.sequence))
-            {
-                let evidence = crate::compaction::final_response_aliases(
-                    store,
-                    workspace,
-                    thread,
-                    turn,
-                    source,
-                    &envelope.round_id,
-                    row.item_id.as_deref(),
-                )
-                .await?;
-                round.assistant.source_aliases = evidence.aliases;
-                round.assistant.complete &= evidence.ready;
-            }
+        if let (Some(round), Some(source)) =
+            (origins.get_mut(&row.sequence), sources.get(&row.sequence))
+        {
+            let evidence = crate::compaction::provider_round_aliases(
+                store,
+                workspace,
+                thread,
+                turn,
+                source,
+                &envelope,
+                row.item_id.as_deref(),
+            )
+            .await?;
+            round.assistant.source_aliases = evidence.aliases;
+            round.assistant.complete &= evidence.ready;
         }
     }
     Ok(origins)
@@ -5299,6 +5297,7 @@ mod tests {
             serde_json::json!({"schema_version":2,"blocks":[{"type":"text","text":"answer"}]}),
         ));
         let envelope = CanonicalProviderRoundEnvelope {
+            ui_copies: None,
             version: 1,
             round_id: "final".into(),
             termination: ProviderTermination::Complete,
@@ -5459,6 +5458,7 @@ mod tests {
             Some(round_id),
             None,
             serde_json::to_string(&CanonicalProviderRoundEnvelope {
+                ui_copies: None,
                 version: 1,
                 round_id: round_id.to_owned(),
                 termination: ProviderTermination::ToolCalls,
@@ -5507,6 +5507,7 @@ mod tests {
             Some("failed-round"),
             None,
             serde_json::to_string(&CanonicalProviderRoundEnvelope {
+                ui_copies: None,
                 version: 1,
                 round_id: "failed-round".into(),
                 termination: ProviderTermination::ProviderError,

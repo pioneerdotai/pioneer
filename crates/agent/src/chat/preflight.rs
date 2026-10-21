@@ -747,10 +747,22 @@ async fn call_turn_preflight_provider_once(
 ) -> Result<TurnPreflightProviderSuccess, TurnPreflightProviderAttemptFailure> {
     let started = Instant::now();
     let request = turn_preflight_chat_request(endpoint.model.as_str(), prompt.to_owned());
-    let observation = super::provider::ProviderAttemptObservation::new(
+    let observation = super::provider::ProviderAttemptObservation::for_request(
         endpoint.provider.as_ref(),
-        &endpoint.model,
-    );
+        &request,
+    )
+    .map_err(|_| {
+        turn_preflight_attempt_failure(
+            TurnPreflightFallbackReason::ProviderError,
+            "preflight.usage.profile_unavailable",
+            "provider usage profile unavailable".into(),
+            endpoint,
+            attempt,
+            input_chars,
+            0,
+            elapsed_ms(started),
+        )
+    })?;
     if let Some(context) = usage_context {
         if observation
             .publish(
@@ -1021,6 +1033,7 @@ async fn request_turn_preflight_provider_json(
             )
         })?;
         let mut text = String::new();
+        let mut collector = pioneer_provider::ProviderMessageCollector::default();
         let mut completed = false;
         while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
             let chunk = chunk.map_err(|error| {
@@ -1050,10 +1063,17 @@ async fn request_turn_preflight_provider_json(
                     text.as_str(),
                 )
             })?;
+            collector.push(&chunk).map_err(|error| {
+                TurnPreflightProviderRequestFailure::response_validation(
+                    "message_validation",
+                    error,
+                    &text,
+                )
+            })?;
             let next_chars = text
                 .chars()
                 .count()
-                .saturating_add(chunk.delta.chars().count());
+                .saturating_add(collector.result_delta().chars().count());
             if next_chars > max_output_chars {
                 return Err(TurnPreflightProviderRequestFailure::response_validation(
                     "stream_response_size_validation",
@@ -1066,7 +1086,7 @@ async fn request_turn_preflight_provider_json(
                 )
                 .into());
             }
-            text.push_str(chunk.delta.as_str());
+            text.push_str(collector.result_delta());
             if chunk.is_final {
                 validate_preflight_completion(
                     chunk.termination.as_ref(),
@@ -1077,6 +1097,13 @@ async fn request_turn_preflight_provider_json(
                         "stream_completion_validation",
                         error,
                         text.as_str(),
+                    )
+                })?;
+                collector.finish().map_err(|error| {
+                    TurnPreflightProviderRequestFailure::response_validation(
+                        "message_completion_validation",
+                        error,
+                        &text,
                     )
                 })?;
                 completed = true;
@@ -1131,6 +1158,13 @@ async fn request_turn_preflight_provider_json(
             "non_stream_response_validation",
             error,
             response.text.as_str(),
+        )
+    })?;
+    pioneer_provider::ProviderMessageCollector::validate_response(&response).map_err(|error| {
+        TurnPreflightProviderRequestFailure::response_validation(
+            "message_validation",
+            error,
+            &response.text,
         )
     })?;
     let output_chars = response.text.chars().count();
@@ -2270,6 +2304,7 @@ mod tests {
     struct FakePreflightProvider {
         name: String,
         streaming: bool,
+        phased: bool,
         responses: Mutex<VecDeque<FakePreflightResponse>>,
         requests: Mutex<Vec<ChatRequest>>,
     }
@@ -2284,6 +2319,7 @@ mod tests {
             Self {
                 name: name.into(),
                 streaming,
+                phased: false,
                 responses: Mutex::new(responses.into_iter().collect()),
                 requests: Mutex::new(Vec::new()),
             }
@@ -2396,8 +2432,14 @@ mod tests {
                 .lock()
                 .expect("test request lock poisoned")
                 .push(request);
+            let text = self.next_response().await?;
             Ok(ChatResponse {
-                text: self.next_response().await?,
+                messages: if self.phased {
+                    preflight_messages(&text)
+                } else {
+                    Vec::new()
+                },
+                text,
                 usage: None,
                 reasoning_content: None,
                 tool_calls: Vec::new(),
@@ -2416,12 +2458,76 @@ mod tests {
                 .expect("test request lock poisoned")
                 .push(request);
             let text = self.next_response().await?;
+            if self.phased {
+                use pioneer_provider::{ProviderMessageBoundary as B, ProviderMessageMetadata};
+                let mut chunks = Vec::new();
+                for message in preflight_messages(&text) {
+                    for (boundary, delta) in [
+                        (B::Start, String::new()),
+                        (B::Delta, message.text),
+                        (B::End, String::new()),
+                    ] {
+                        let mut chunk = StreamChunk::delta(delta);
+                        chunk.message = Some(ProviderMessageMetadata {
+                            id: message.id,
+                            phase: message.phase,
+                            boundary,
+                        });
+                        chunks.push(Ok(chunk));
+                    }
+                }
+                chunks.push(Ok(StreamChunk::final_chunk_with(
+                    pioneer_provider::ProviderTermination::Complete,
+                )));
+                return Ok(Box::pin(futures_util::stream::iter(chunks)));
+            }
             Ok(Box::pin(futures_util::stream::iter(vec![
                 Ok(StreamChunk::delta(text)),
                 Ok(StreamChunk::final_chunk_with(
                     pioneer_provider::ProviderTermination::Complete,
                 )),
             ])))
+        }
+    }
+
+    fn preflight_messages(text: &str) -> Vec<pioneer_provider::ProviderMessage> {
+        use pioneer_protocol::AgentMessagePhase;
+        use pioneer_provider::{ProviderMessage, ProviderMessageId};
+        vec![
+            ProviderMessage {
+                id: ProviderMessageId(0),
+                phase: Some(AgentMessagePhase::Commentary),
+                text: "Inspecting candidate tools; this is deliberately not JSON".into(),
+            },
+            ProviderMessage {
+                id: ProviderMessageId(1),
+                phase: Some(AgentMessagePhase::FinalAnswer),
+                text: text.into(),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn phased_preflight_uses_only_result_json_in_both_modes() {
+        for streaming in [false, true] {
+            let mut provider = FakePreflightProvider::new(
+                "preflight-provider",
+                streaming,
+                [FakePreflightResponse::Text(
+                    r#"{"tools":{"visibleTools":["task_create"]}}"#.into(),
+                )],
+            );
+            provider.phased = true;
+            let endpoint =
+                provider_endpoint(Arc::new(provider), "preflight-provider", "preflight-model");
+            match call_turn_preflight_provider(provider_call_input(endpoint)).await {
+                TurnPreflightProviderCallResult::Success(success) => {
+                    assert_eq!(success.plan.tools.visible_tools, vec!["task_create"])
+                }
+                TurnPreflightProviderCallResult::Failure(failure) => {
+                    panic!("phased preflight failed: {failure:?}")
+                }
+            }
         }
     }
 
