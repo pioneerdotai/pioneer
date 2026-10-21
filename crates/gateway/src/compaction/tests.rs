@@ -17234,12 +17234,52 @@ async fn composer_reuses_late_mixed_checkpoint_before_attached_child_policy() {
         .compaction_frozen_import_page("ws", "thread", &own_composer.descriptor.manifest_id, 0)
         .await
         .unwrap();
-    assert!(
+    let own_manifest = f
+        .store
+        .compaction_frozen_history_page("ws", "thread", &own_composer.descriptor.manifest_id, 0)
+        .await
+        .unwrap();
+    // Grants keep the immutable output sources and ordinals. Their message
+    // ordinal binds those sources to the exact replacing checkpoint root.
+    let expected_own_grants = output_manifest
+        .iter()
+        .enumerate()
+        .flat_map(|(ordinal, entry)| {
+            entry
+                .sources
+                .iter()
+                .map(move |source| (entry.source_thread.clone(), source.clone(), ordinal as u64))
+        })
+        .filter(|(_, source, _)| own_checkpoint.coverage.contains(source))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(expected_own_grants.len(), own_checkpoint.coverage.len());
+    assert_eq!(own_imports.len(), expected_own_grants.len());
+    assert_eq!(
         own_imports
             .iter()
-            .any(|record| record.render_source() == &own_root),
-        "the accepted parent basis must carry the exact OWN checkpoint import grant"
+            .map(|record| {
+                (
+                    record.source_thread.clone(),
+                    record.source.clone(),
+                    record.output_ordinal,
+                )
+            })
+            .collect::<BTreeSet<_>>(),
+        expected_own_grants,
+        "the accepted parent basis must preserve every exact immutable OWN output grant"
     );
+    for record in &own_imports {
+        assert_eq!(record.delivery_id, delivery.delivery_id);
+        assert_eq!(record.candidate_id, delivery.candidate_id);
+        assert_eq!(record.output_manifest, output.history.manifest_id);
+        assert_eq!(record.acknowledgement, outputs.branches[0].acknowledgement);
+        assert_eq!(record.render_source(), &record.source);
+        let target = &own_manifest[usize::try_from(record.message_ordinal).unwrap()];
+        assert_eq!(target.source_thread, "mixed-producer");
+        assert_eq!(target.sources, vec![own_root.clone()]);
+        assert_eq!(target.context_thread.as_deref(), Some("thread"));
+        assert!(target.complete && !target.inherited && !target.protected_input);
+    }
     install_child(&f, "own-consumer", "mixed-composer-current").await;
     save_task_input_snapshot(
         &f,
