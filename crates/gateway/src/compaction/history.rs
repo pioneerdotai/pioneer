@@ -1282,6 +1282,27 @@ pub(crate) async fn normalize_task_input_copies_with_resolver(
     messages: &mut Vec<ChatMessage>,
     graphs: &mut super::coverage::CheckpointGraphResolver,
 ) -> Result<()> {
+    task_input_copy_evidence_with_resolver(store, workspace, messages, graphs, false).await
+}
+
+/// Enrich the assembled boundary before checkpoint projection without removing
+/// copies: policy may later select a copy while excluding its representative.
+pub(super) async fn prepare_task_input_copy_evidence_with_resolver(
+    store: &CrudStore,
+    workspace: &str,
+    messages: &mut Vec<ChatMessage>,
+    graphs: &mut super::coverage::CheckpointGraphResolver,
+) -> Result<()> {
+    task_input_copy_evidence_with_resolver(store, workspace, messages, graphs, true).await
+}
+
+async fn task_input_copy_evidence_with_resolver(
+    store: &CrudStore,
+    workspace: &str,
+    messages: &mut Vec<ChatMessage>,
+    graphs: &mut super::coverage::CheckpointGraphResolver,
+    retain_copies: bool,
+) -> Result<()> {
     // A raw representative may already have been replaced by a published
     // summary. Its exact input-leaf proof is carried by the summary's frozen
     // provenance, not by the checkpoint source itself. Validate that leaf
@@ -1394,7 +1415,7 @@ pub(crate) async fn normalize_task_input_copies_with_resolver(
     checkpoint_evidence
         .owners
         .retain(|copy, _| !checkpoint_evidence.ambiguous.contains(copy));
-    if !checkpoint_evidence.owners.is_empty() {
+    if !retain_copies && !checkpoint_evidence.owners.is_empty() {
         messages.retain(|message| {
             let Some(origin) = &message.provenance else {
                 return true;
@@ -1665,7 +1686,7 @@ pub(crate) async fn normalize_task_input_copies_with_resolver(
         if id != keep {
             dropped_messages.insert(represented[id].message);
             aliases.entry(keep.clone()).or_default().insert(id.clone());
-            if let Some(previous) = aliases_by_represented.get(id) {
+            if !retain_copies && let Some(previous) = aliases_by_represented.get(id) {
                 for previous in previous {
                     if alias_claims
                         .get(previous)
@@ -1682,7 +1703,7 @@ pub(crate) async fn normalize_task_input_copies_with_resolver(
     }
     let mut normalized = Vec::with_capacity(messages.len());
     for (message_index, message) in messages.iter().enumerate() {
-        if dropped_messages.contains(&message_index) {
+        if !retain_copies && dropped_messages.contains(&message_index) {
             continue;
         }
         let mut message = message.clone();
@@ -1707,9 +1728,10 @@ pub(crate) async fn normalize_task_input_copies_with_resolver(
                 let pair = alias_key(existing);
                 if represented_sources.contains(&pair.0)
                     && pair.0 != pair.1
-                    && alias_claims
-                        .get(&pair.1)
-                        .is_none_or(|claims| claims.len() == 1)
+                    && (retain_copies
+                        || alias_claims
+                            .get(&pair.1)
+                            .is_none_or(|claims| claims.len() == 1))
                 {
                     normalized_aliases.insert(pair);
                 }

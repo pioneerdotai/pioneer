@@ -8810,17 +8810,40 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
             .count(),
         1
     );
-    assert!(e_history.iter().all(|message| {
-        message
-            .provenance
-            .as_ref()
-            .unwrap()
-            .sources
-            .iter()
-            .all(|source| {
-                Some(source.id.as_str()) != d_prepared.receipt.identity.checkpoint.as_deref()
+    let inherited_h = e_history
+        .iter()
+        .filter_map(|message| {
+            message.provenance.as_ref().filter(|origin| {
+                origin.sources.iter().any(|source| {
+                    Some(source.id.as_str()) == d_prepared.receipt.identity.checkpoint.as_deref()
+                })
             })
-    }));
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        inherited_h.len(),
+        1,
+        "frozen preparation must already reuse H's compatible checkpoint"
+    );
+    assert!(inherited_h[0].inherited);
+    assert!(
+        e_history.iter().all(|message| {
+            message
+                .provenance
+                .as_ref()
+                .unwrap()
+                .sources
+                .iter()
+                .all(|source| {
+                    !d_checkpoint.coverage.iter().any(|covered| {
+                        covered.scope == source.scope
+                            && covered.id == source.id
+                            && covered.version == source.version
+                    })
+                })
+        }),
+        "the reused checkpoint must not accompany raw covered H"
+    );
     let e_context = NativeContext {
         overflow_recovery: false,
         recovery_deadline_ms: None,
@@ -16282,6 +16305,1077 @@ async fn publish_projection_checkpoint(
         .await
         .unwrap();
     checkpoint
+}
+
+/// A terminal output exports OWN only. Its late mixed head becomes usable
+/// only after the recipient composes that output with the accepted parent H.
+#[tokio::test]
+async fn composer_reuses_late_mixed_checkpoint_before_attached_child_policy() {
+    use pioneer_compaction::CoverageDomain;
+    use pioneer_protocol::{TaskAgentContextMode, TaskAgentContextPolicy};
+    use pioneer_provider::{
+        CanonicalProviderRoundEnvelope, ChatMessage, ProviderCallIdentity, ProviderRegistry,
+        ProviderToolCall,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+
+    async fn install_child(f: &Fixture, suffix: &str, source_turn: &str) {
+        let created_at = if suffix == "producer" {
+            "2021-01-01T00:00:00Z"
+        } else {
+            "2025-01-01T00:00:00Z"
+        };
+        for sql in [
+            format!(
+                "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('mixed-{suffix}','ws','','agent','gpt-4','main-fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            ),
+            format!(
+                "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('mixed-{suffix}','thread','thread',1,CURRENT_TIMESTAMP)"
+            ),
+            format!(
+                "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('mixed-{suffix}-turn','mixed-{suffix}','completed','conversation','system','{created_at}',CURRENT_TIMESTAMP)"
+            ),
+            format!(
+                "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('mixed-{suffix}-task','ws','thread','thread','thread','{source_turn}','agent','running','Mixed checkpoint','fixture')"
+            ),
+            format!(
+                "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('mixed-{suffix}-run','mixed-{suffix}-task','mixed-{suffix}-run',1,1,'running','agent')"
+            ),
+            format!(
+                "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('mixed-{suffix}-run-turn','mixed-{suffix}-task','mixed-{suffix}-run','mixed-{suffix}','mixed-{suffix}-turn','initial',0,1,'in_progress',CURRENT_TIMESTAMP)"
+            ),
+        ] {
+            f.store
+                .database_connection()
+                .execute_unprepared(&sql)
+                .await
+                .unwrap();
+        }
+    }
+    async fn assistant(f: &Fixture, thread: &str, turn: &str, id: &str, text: &str) {
+        f.store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    item: pioneer_protocol::TurnItem::AgentMessage {
+                        id: id.into(),
+                        text: text.into(),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap();
+    }
+    fn sources(messages: &[ChatMessage]) -> BTreeSet<String> {
+        messages
+            .iter()
+            .flat_map(|message| message.provenance.iter())
+            .flat_map(|origin| &origin.sources)
+            .map(|source| source.id.clone())
+            .collect()
+    }
+
+    fn assert_tail_round(messages: &[ChatMessage], expected_sources: &[SourceRef]) {
+        let calls = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| {
+                message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| calls.iter().any(|call| call.id == "mixed-tail-call"))
+            })
+            .collect::<Vec<_>>();
+        let results = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.tool_call_id.as_deref() == Some("mixed-tail-call"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the uncovered tool call must survive exactly once"
+        );
+        assert_eq!(
+            results.len(),
+            1,
+            "the matching uncovered tool result must survive exactly once"
+        );
+        assert!(
+            calls[0].0 < results[0].0,
+            "the tool result must follow its call"
+        );
+        assert_eq!(results[0].1.content, "uncovered tool result");
+        let actual_sources = calls
+            .iter()
+            .chain(&results)
+            .flat_map(|(_, message)| &message.provenance.as_ref().unwrap().sources)
+            .map(|source| {
+                (
+                    source.scope.clone(),
+                    source.id.clone(),
+                    source.version.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let expected_sources = expected_sources
+            .iter()
+            .map(|source| {
+                (
+                    source.scope.clone(),
+                    source.id.clone(),
+                    source.version.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            actual_sources, expected_sources,
+            "the uncovered round must retain exact source identities"
+        );
+    }
+
+    let f = fixture("raw accepted H", vec![], true, false).await;
+    let db = f.store.database_connection();
+    for sql in [
+        "UPDATE turn SET status='completed',created_at='2020-01-01T00:00:00Z' WHERE id='turn'",
+        r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('mixed-original','turn',0,'text','accepted question','{"type":"text","text":"accepted question"}',CURRENT_TIMESTAMP)"#,
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    super::history::prepare_history(&f.store, "ws", "thread")
+        .await
+        .unwrap();
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let accepted = super::history::load_task_line_history_turns(
+        &f.store,
+        "ws",
+        "thread",
+        &BTreeSet::from(["turn".into()]),
+        &fence,
+    )
+    .await
+    .unwrap();
+    assert_eq!(accepted.len(), 2);
+    let parent_snapshot = super::frozen::capture(
+        &f.store,
+        "ws",
+        "thread",
+        &BTreeSet::from(["thread".into()]),
+        &accepted,
+    )
+    .await
+    .unwrap();
+    let parent_manifest = f
+        .store
+        .compaction_frozen_history_page("ws", "thread", &parent_snapshot.manifest_id, 0)
+        .await
+        .unwrap();
+
+    install_child(&f, "producer", "turn").await;
+    db.execute_unprepared(r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('mixed-copy','mixed-producer-turn',0,'text','accepted question','{"type":"text","text":"accepted question"}',CURRENT_TIMESTAMP)"#).await.unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE task SET metadata_json=? WHERE id='mixed-producer-task'",
+        [task_input_launch_metadata("thread", "turn", "accepted question").into()],
+    ))
+    .await
+    .unwrap();
+    save_task_input_snapshot(
+        &f,
+        "mixed-producer-run",
+        "mixed-producer-task",
+        "thread",
+        "turn",
+        &parent_snapshot,
+    )
+    .await;
+    assistant(
+        &f,
+        "mixed-producer",
+        "mixed-producer-turn",
+        "mixed-own",
+        "raw completed own work",
+    )
+    .await;
+    let task_turn = f
+        .store
+        .get_task_run_turn("mixed-producer-run-turn")
+        .await
+        .unwrap()
+        .unwrap();
+    let output = super::frozen::capture_task_output(&f.store, "ws", &task_turn)
+        .await
+        .unwrap();
+    let output_manifest = f
+        .store
+        .compaction_frozen_history_page("ws", "mixed-producer", &output.history.manifest_id, 0)
+        .await
+        .unwrap();
+    assert!(
+        output_manifest
+            .iter()
+            .flat_map(|entry| &entry.sources)
+            .all(|source| { source.id != "source" && source.id != "mixed-original" }),
+        "terminal output must never re-export inherited H"
+    );
+    assert!(
+        output_manifest
+            .iter()
+            .flat_map(|entry| &entry.sources)
+            .any(|source| source.id == "mixed-copy")
+    );
+    for sql in [
+        "UPDATE task_run_turn SET status='candidate_created' WHERE id='mixed-producer-run-turn'",
+        "UPDATE task_run SET status='succeeded' WHERE id='mixed-producer-run'",
+        "INSERT INTO task_result_candidate(id,task_id,run_id,task_run_turn_id,thread_id,turn_id,round,status,created_at,updated_at) VALUES ('mixed-candidate','mixed-producer-task','mixed-producer-run','mixed-producer-run-turn','mixed-producer','mixed-producer-turn',0,'accepted',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('mixed-delivery-turn','thread','completed','conversation','system','2022-01-01T00:00:00Z',CURRENT_TIMESTAMP)",
+        "INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES ('mixed-delivery','ws','mixed-producer-task','mixed-producer-run','mixed-delivery','thread','origin_thread','thread','delivered',1,1,'mixed-delivery-turn')",
+        "INSERT INTO compaction_delivery_output(delivery_id,candidate_id,task_run_turn_id) VALUES ('mixed-delivery','mixed-candidate','mixed-producer-run-turn')",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('mixed-tail-turn','thread','completed','conversation','user','2023-01-01T00:00:00Z',CURRENT_TIMESTAMP)",
+        r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('mixed-tail','mixed-tail-turn',0,'text','uncovered tail question','{"type":"text","text":"uncovered tail question"}',CURRENT_TIMESTAMP)"#,
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('mixed-composer-current','thread','in_progress','conversation','user','2024-01-01T00:00:00Z',CURRENT_TIMESTAMP)",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    assistant(
+        &f,
+        "thread",
+        "mixed-delivery-turn",
+        &pioneer_protocol::task_delivery_result_item_id("mixed-delivery"),
+        "raw completed own work",
+    )
+    .await;
+    assistant(
+        &f,
+        "thread",
+        "mixed-tail-turn",
+        "mixed-tail-answer",
+        "uncovered tail answer",
+    )
+    .await;
+    // Read the persisted envelope so optional metadata added by newer providers
+    // uses its serde default, just as it does when restoring historical rounds.
+    let tail_round: CanonicalProviderRoundEnvelope = serde_json::from_value(serde_json::json!({
+        "version": 1,
+        "round_id": "mixed-tail-round",
+        "termination": ProviderTermination::ToolCalls,
+        "message": ChatMessage::assistant_tool_calls(
+            None::<String>,
+            vec![ProviderToolCall {
+                id: "mixed-tail-call".into(),
+                name: "mixed_tail_tool".into(),
+                arguments: "{}".into(),
+            }],
+        ),
+        "calls": vec![ProviderCallIdentity {
+            provider_call_id: "mixed-tail-call".into(),
+            turn_item_id: "mixed-tail-tool-item".into(),
+            ordinal: 0,
+        }],
+    }))
+    .unwrap();
+    let tail_result = pioneer_tools::ToolResultView::Json {
+        value: serde_json::to_value(ChatMessage::tool_result(
+            "mixed-tail-call",
+            "mixed_tail_tool",
+            "uncovered tool result",
+        ))
+        .unwrap(),
+        truncated: false,
+    };
+    for (id, item, sequence, kind, payload) in [
+        (
+            "mixed-tail-round",
+            "mixed-tail-round",
+            1_i64,
+            "assistant_round",
+            serde_json::to_string(&tail_round).unwrap(),
+        ),
+        (
+            "mixed-tail-result",
+            "mixed-tail-tool-item",
+            2_i64,
+            "tool_result_v2",
+            serde_json::to_string(&tail_result).unwrap(),
+        ),
+    ] {
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES(?,'mixed-tail-turn',?,?,?,?,'{}',CURRENT_TIMESTAMP)",
+            [id.into(), item.into(), sequence.into(), kind.into(), payload.into()],
+        )).await.unwrap();
+    }
+    super::history::prepare_history(&f.store, "ws", "thread")
+        .await
+        .unwrap();
+    let delivery = f
+        .store
+        .compaction_delivery_output("ws", "mixed-delivery")
+        .await
+        .unwrap()
+        .unwrap();
+    let acknowledgement = f
+        .store
+        .compaction_source_page("ws", "thread", "mixed-delivery-turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    let allowed: BTreeSet<String> = BTreeSet::from(["thread".into(), "mixed-producer".into()]);
+    let mut epochs = BTreeMap::new();
+    for thread in &allowed {
+        epochs.insert(
+            thread.clone(),
+            f.store
+                .compaction_projection_version("ws", thread)
+                .await
+                .unwrap(),
+        );
+    }
+    let outputs = super::delivered::AuthorizedOutputSet {
+        workspace: "ws".into(),
+        destination: "thread".into(),
+        checkpoint: None,
+        fence: f.store.compaction_history_read_fence().await.unwrap(),
+        authorization_revision: 0,
+        source_epochs: epochs,
+        branches: vec![super::delivered::AuthorizedOutputBranch {
+            snapshot: delivery.clone(),
+            acknowledgement: acknowledgement.clone(),
+            acknowledgements: vec![acknowledgement],
+            source_threads: BTreeSet::from(["mixed-producer".into()]),
+        }],
+    };
+    let raw_composer = super::frozen::capture_execution_basis_prepared_with_outputs(
+        &f.store,
+        "ws",
+        "thread",
+        Some("mixed-composer-current"),
+        Some("mixed-composer-current"),
+        None,
+        Some(&outputs),
+    )
+    .await
+    .unwrap();
+    assert!(sources(&raw_composer.messages).contains("mixed-original"));
+    assert!(!sources(&raw_composer.messages).contains("mixed-copy"));
+    let representative = raw_composer
+        .messages
+        .iter()
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == "mixed-original")
+            })
+        })
+        .unwrap()
+        .provenance
+        .as_ref()
+        .unwrap();
+    assert!(
+        representative.source_aliases.iter().any(|alias| {
+            alias.represented_thread_id == "thread"
+                && alias.represented_source.id == "mixed-original"
+                && alias.thread_id == "mixed-producer"
+                && alias.source.id == "mixed-copy"
+        }),
+        "the launch-copy correspondence must be saved as exact source evidence"
+    );
+    let raw_manifest = f
+        .store
+        .compaction_frozen_history_page("ws", "thread", &raw_composer.descriptor.manifest_id, 0)
+        .await
+        .unwrap();
+    let raw_imports = f
+        .store
+        .compaction_frozen_import_page("ws", "thread", &raw_composer.descriptor.manifest_id, 0)
+        .await
+        .unwrap();
+
+    install_child(&f, "raw-consumer", "mixed-composer-current").await;
+    save_task_input_snapshot(
+        &f,
+        "mixed-raw-consumer-run",
+        "mixed-raw-consumer-task",
+        "thread",
+        "mixed-composer-current",
+        &raw_composer.descriptor,
+    )
+    .await;
+
+    // Publication occurs after both immutable output and recipient raw basis.
+    // K covers the producer's distinct input identity, requiring saved aliases
+    // when the recipient presents the original canonical input instead.
+    let copy = output_manifest
+        .iter()
+        .flat_map(|entry| &entry.sources)
+        .find(|source| source.id == "mixed-copy")
+        .unwrap()
+        .clone();
+    let own = output_manifest
+        .iter()
+        .flat_map(|entry| &entry.sources)
+        .find(|source| source.id != "mixed-copy")
+        .unwrap()
+        .clone();
+    let inherited = parent_manifest
+        .iter()
+        .flat_map(|entry| &entry.sources)
+        .find(|source| source.id == "source")
+        .unwrap()
+        .clone();
+    let output_messages = super::frozen::restore(&f.store, "ws", &allowed, &output.history)
+        .await
+        .unwrap();
+    let mut publication_messages = accepted.clone();
+    publication_messages.extend(output_messages);
+    let publication_projection = super::frozen::capture(
+        &f.store,
+        "ws",
+        "mixed-producer",
+        &allowed,
+        &publication_messages,
+    )
+    .await
+    .unwrap();
+    let checkpoint = publish_projection_checkpoint(
+        &f,
+        "mixed-producer",
+        "late-mixed-working-context",
+        &[
+            ("mixed-producer".into(), copy.clone()),
+            ("thread".into(), inherited),
+            ("mixed-producer".into(), own),
+        ],
+        CoverageDomain::WorkingContext,
+        Some(&publication_projection),
+    )
+    .await;
+    let checkpoint_source = f
+        .store
+        .compaction_checkpoint_source("ws", "mixed-producer", &checkpoint.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let composed = super::frozen::capture_execution_basis_prepared_with_outputs(
+        &f.store,
+        "ws",
+        "thread",
+        Some("mixed-composer-current"),
+        Some("mixed-composer-current"),
+        None,
+        Some(&outputs),
+    )
+    .await
+    .unwrap();
+    let mut expected = BTreeSet::from([
+        checkpoint.id.clone(),
+        "mixed-tail".into(),
+        f.store
+            .compaction_source_page("ws", "thread", "mixed-tail-turn", PagedSource::Event, 0)
+            .await
+            .unwrap()
+            .entries[0]
+            .reference
+            .id
+            .clone(),
+    ]);
+    let tail_sources = f
+        .store
+        .compaction_source_page(
+            "ws",
+            "thread",
+            "mixed-tail-turn",
+            PagedSource::ProviderContext,
+            0,
+        )
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .map(|entry| entry.reference)
+        .collect::<Vec<_>>();
+    assert_eq!(tail_sources.len(), 2);
+    expected.extend(tail_sources.iter().map(|source| source.id.clone()));
+    assert_tail_round(&composed.messages, &tail_sources);
+    assert_eq!(
+        sources(&composed.messages),
+        expected,
+        "Composer must replace the whole covered H + OWN boundary"
+    );
+    let summary = composed
+        .messages
+        .iter()
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == checkpoint.id)
+            })
+        })
+        .unwrap();
+    let origin = summary.provenance.as_ref().unwrap();
+    assert_eq!(
+        origin.sources,
+        vec![pioneer_provider::MessageSourceRef {
+            scope: checkpoint_source.scope.clone(),
+            id: checkpoint_source.id.clone(),
+            version: checkpoint_source.version.clone(),
+        }]
+    );
+    assert!(
+        origin.inherited,
+        "mixed WorkingContext must not acquire OWN authority from delivery grants"
+    );
+    assert_eq!(
+        composed
+            .messages
+            .iter()
+            .filter(
+                |message| message.provenance.as_ref().is_some_and(|origin| origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == checkpoint.id))
+            )
+            .count(),
+        1
+    );
+    assert!(
+        composed
+            .messages
+            .iter()
+            .all(|message| !message.content.contains("raw accepted H")
+                && !message.content.contains("raw completed own work")
+                && message.content != "accepted question")
+    );
+    assert_eq!(
+        f.store
+            .compaction_task_output("ws", "mixed-producer-run-turn")
+            .await
+            .unwrap()
+            .unwrap(),
+        output
+    );
+    assert_eq!(
+        f.store
+            .compaction_delivery_output("ws", "mixed-delivery")
+            .await
+            .unwrap()
+            .unwrap(),
+        delivery
+    );
+    assert_eq!(
+        f.store
+            .compaction_frozen_history_page("ws", "thread", &parent_snapshot.manifest_id, 0)
+            .await
+            .unwrap(),
+        parent_manifest
+    );
+    assert_eq!(
+        f.store
+            .compaction_frozen_history_page("ws", "thread", &raw_composer.descriptor.manifest_id, 0)
+            .await
+            .unwrap(),
+        raw_manifest
+    );
+    assert_eq!(
+        f.store
+            .compaction_frozen_import_page("ws", "thread", &raw_composer.descriptor.manifest_id, 0)
+            .await
+            .unwrap(),
+        raw_imports
+    );
+    assert_eq!(
+        f.store
+            .compaction_frozen_history_page("ws", "mixed-producer", &output.history.manifest_id, 0)
+            .await
+            .unwrap(),
+        output_manifest
+    );
+
+    install_child(&f, "consumer", "mixed-composer-current").await;
+    save_task_input_snapshot(
+        &f,
+        "mixed-consumer-run",
+        "mixed-consumer-task",
+        "thread",
+        "mixed-composer-current",
+        &composed.descriptor,
+    )
+    .await;
+    let last_one = TaskAgentContextPolicy {
+        mode: TaskAgentContextMode::LastNTurns,
+        max_turns: Some(1),
+        ..super::frozen::default_task_context_policy()
+    };
+    // A Task that already accepted the raw Composer basis receives the same
+    // compatible late representation without rewriting that literal snapshot.
+    let raw_child = super::frozen::prepare_exact_task_fixture(
+        &f.store,
+        "ws",
+        "mixed-raw-consumer",
+        "mixed-raw-consumer-turn",
+        Some(&last_one),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sources(&raw_child.messages), expected);
+    assert_eq!(raw_child.messages.len(), 5);
+    assert_tail_round(&raw_child.messages, &tail_sources);
+    assert!(
+        raw_child
+            .messages
+            .iter()
+            .all(|message| message.provenance.as_ref().unwrap().inherited)
+    );
+    let raw_again = super::frozen::prepare_exact_task_fixture(
+        &f.store,
+        "ws",
+        "mixed-raw-consumer",
+        "mixed-raw-consumer-turn",
+        Some(&last_one),
+    )
+    .await
+    .unwrap();
+    assert_eq!(raw_again.messages, raw_child.messages);
+    assert_eq!(
+        raw_again.descriptor.identity_sha256,
+        raw_child.descriptor.identity_sha256
+    );
+    let accepted_raw_binding = f
+        .store
+        .compaction_task_basis_snapshot("ws", "mixed-raw-consumer", "mixed-raw-consumer-turn")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        accepted_raw_binding.history_json,
+        serde_json::to_string(&raw_composer.descriptor).unwrap()
+    );
+    assert_eq!(f.store.compaction_frozen_history_page(
+        "ws", "thread", &raw_composer.descriptor.manifest_id, 0,
+    ).await.unwrap(), raw_manifest);
+
+    let child = super::frozen::prepare_exact_task_fixture(
+        &f.store,
+        "ws",
+        "mixed-consumer",
+        "mixed-consumer-turn",
+        Some(&last_one),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sources(&child.messages),
+        expected,
+        "last-N must see the projected summary before selecting the complete tail round"
+    );
+    assert_eq!(child.messages.len(), 5);
+    assert_tail_round(&child.messages, &tail_sources);
+    assert!(
+        child
+            .messages
+            .iter()
+            .all(|message| message.provenance.as_ref().unwrap().inherited)
+    );
+    let again = super::frozen::prepare_exact_task_fixture(
+        &f.store,
+        "ws",
+        "mixed-consumer",
+        "mixed-consumer-turn",
+        Some(&last_one),
+    )
+    .await
+    .unwrap();
+    assert_eq!(again.messages, child.messages);
+    assert_eq!(
+        again.descriptor.identity_sha256,
+        child.descriptor.identity_sha256
+    );
+    let raw_without_summary_policy = TaskAgentContextPolicy {
+        include_parent_summary: false,
+        max_turns: Some(20),
+        ..last_one.clone()
+    };
+    let raw_without_summary = super::frozen::prepare_exact_task_fixture(
+        &f.store,
+        "ws",
+        "mixed-raw-consumer",
+        "mixed-raw-consumer-turn",
+        Some(&raw_without_summary_policy),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sources(&raw_without_summary.messages),
+        sources(&raw_composer.messages),
+        "disabling summaries must retain every selected raw covered input rather than project K then discard it"
+    );
+    assert!(sources(&raw_without_summary.messages).contains("mixed-original"));
+    assert!(!sources(&raw_without_summary.messages).contains(&checkpoint.id));
+    assert!(
+        raw_without_summary
+            .messages
+            .iter()
+            .any(|message| message.content == "accepted question")
+    );
+    assert!(
+        raw_without_summary
+            .messages
+            .iter()
+            .any(|message| message.content == "raw completed own work")
+    );
+
+    for (mode, include, expected_ids) in [
+        (
+            TaskAgentContextMode::LastNTurns,
+            false,
+            expected
+                .iter()
+                .filter(|id| **id != checkpoint.id)
+                .cloned()
+                .collect(),
+        ),
+        (
+            TaskAgentContextMode::SummaryOnly,
+            true,
+            BTreeSet::from([checkpoint.id.clone()]),
+        ),
+        (TaskAgentContextMode::SummaryOnly, false, BTreeSet::new()),
+        (TaskAgentContextMode::Empty, true, BTreeSet::new()),
+        (TaskAgentContextMode::Custom, true, BTreeSet::new()),
+    ] {
+        let policy = TaskAgentContextPolicy {
+            mode,
+            include_parent_summary: include,
+            custom_context: None,
+            ..last_one.clone()
+        };
+        for (thread, turn) in [
+            ("mixed-consumer", "mixed-consumer-turn"),
+            ("mixed-raw-consumer", "mixed-raw-consumer-turn"),
+        ] {
+            let selected = super::frozen::prepare_exact_task_fixture(
+                &f.store,
+                "ws",
+                thread,
+                turn,
+                Some(&policy),
+            )
+            .await
+            .unwrap();
+            // Without summaries, the raw composition ends with the delivered
+            // branch's shared logical turn. The projected basis instead ends
+            // with the uncovered tail. Last-N selects from each representation.
+            let expected_ids = if thread == "mixed-raw-consumer"
+                && mode == TaskAgentContextMode::LastNTurns
+                && !include
+            {
+                let mut ids = sources(&accepted);
+                ids.extend(
+                    output_manifest
+                        .iter()
+                        .flat_map(|entry| &entry.sources)
+                        .filter(|source| source.scope.starts_with("event:"))
+                        .map(|source| source.id.clone()),
+                );
+                ids
+            } else {
+                expected_ids.clone()
+            };
+            assert_eq!(
+                sources(&selected.messages),
+                expected_ids,
+                "policy on {thread}"
+            );
+        }
+    }
+
+    let providers = ProviderRegistry::new(|_| "fixture-key".into());
+    providers
+        .insert("summary-fixture", f.provider.clone())
+        .unwrap();
+    providers
+        .insert("main-fixture", Arc::new(SmallWindowMain))
+        .unwrap();
+    let settings = CompactionSettings {
+        selection: Some(ModelSelection {
+            transport: Transport::Api,
+            instance: "summary-fixture".into(),
+            model: "summary-model".into(),
+            effort: None,
+        }),
+    };
+    let context = pioneer_agent::compaction::controller::NativeContext {
+        overflow_recovery: false,
+        recovery_deadline_ms: None,
+        workspace_id: "ws".into(),
+        thread_id: "mixed-consumer".into(),
+        turn_id: "mixed-consumer-turn".into(),
+        conversation_thread_id: Some("thread".into()),
+        provider_instance: "main-fixture".into(),
+        provider: providers
+            .get_or_create_for_workspace("ws", "main-fixture")
+            .unwrap(),
+        events: Arc::new(ExecutionEventHub::new()),
+        cancellation: CancellationToken::new(),
+    };
+    let mut request_messages = child.messages.clone();
+    request_messages.push(ChatMessage::user("new protected consumer input"));
+    let prepared = super::native::prepare_native_projection(
+        &f.store,
+        &providers,
+        &settings,
+        &context,
+        ChatRequest {
+            model: "gpt-4".into(),
+            messages: request_messages,
+            temperature: None,
+            max_tokens: Some(512),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        },
+        None,
+        false,
+        f.observer.clone(),
+        f.clock.clone(),
+        Some(child.descriptor),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(sources(&prepared.request.messages), expected);
+    assert_tail_round(&prepared.request.messages, &tail_sources);
+    assert!(
+        prepared
+            .request
+            .messages
+            .iter()
+            .any(|message| message.content == "new protected consumer input")
+    );
+    assert_eq!(
+        prepared
+            .request
+            .messages
+            .iter()
+            .filter(
+                |message| message.provenance.as_ref().is_some_and(|origin| origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == checkpoint.id))
+            )
+            .count(),
+        1
+    );
+    assert!(
+        f.provider.calls.lock().unwrap().is_empty(),
+        "a fitting request with reused K must not ask the summarizer to recompress H"
+    );
+
+    // The same accepted composition can contain a separately authorized OWN
+    // checkpoint. A later mixed head may consume that atomic root only when
+    // its published graph names the exact root, and must remain inherited.
+    let mut own_publication = super::frozen::restore(&f.store, "ws", &allowed, &output.history)
+        .await
+        .unwrap();
+    own_publication.extend(accepted.clone());
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut own_publication)
+        .await
+        .unwrap();
+    own_publication
+        .retain(|message| message.provenance.as_ref().unwrap().thread_id == "mixed-producer");
+    let own_projection =
+        super::frozen::capture(&f.store, "ws", "mixed-producer", &allowed, &own_publication)
+            .await
+            .unwrap();
+    let own_source = output_manifest
+        .iter()
+        .flat_map(|entry| &entry.sources)
+        .find(|source| source.id != "mixed-copy")
+        .unwrap()
+        .clone();
+    let own_checkpoint = publish_projection_checkpoint(
+        &f,
+        "mixed-producer",
+        "accepted-pure-own-checkpoint",
+        &[
+            ("mixed-producer".into(), copy),
+            ("mixed-producer".into(), own_source),
+        ],
+        CoverageDomain::OwnContribution,
+        Some(&own_projection),
+    )
+    .await;
+    let own_root = f
+        .store
+        .compaction_checkpoint_source("ws", "mixed-producer", &own_checkpoint.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let own_composer = super::frozen::capture_execution_basis_prepared_with_outputs(
+        &f.store,
+        "ws",
+        "thread",
+        Some("mixed-composer-current"),
+        Some("mixed-composer-current"),
+        None,
+        Some(&outputs),
+    )
+    .await
+    .unwrap();
+    assert!(sources(&own_composer.messages).contains(&own_checkpoint.id));
+    assert!(!sources(&own_composer.messages).contains("mixed-original"));
+    let own_imports = f
+        .store
+        .compaction_frozen_import_page("ws", "thread", &own_composer.descriptor.manifest_id, 0)
+        .await
+        .unwrap();
+    let own_manifest = f
+        .store
+        .compaction_frozen_history_page("ws", "thread", &own_composer.descriptor.manifest_id, 0)
+        .await
+        .unwrap();
+    // Grants keep the immutable output sources and ordinals. Their message
+    // ordinal binds those sources to the exact replacing checkpoint root.
+    let expected_own_grants = output_manifest
+        .iter()
+        .enumerate()
+        .flat_map(|(ordinal, entry)| {
+            entry
+                .sources
+                .iter()
+                .map(move |source| (entry.source_thread.clone(), source.clone(), ordinal as u64))
+        })
+        .filter(|(_, source, _)| own_checkpoint.coverage.contains(source))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(expected_own_grants.len(), own_checkpoint.coverage.len());
+    assert_eq!(own_imports.len(), expected_own_grants.len());
+    assert_eq!(
+        own_imports
+            .iter()
+            .map(|record| {
+                (
+                    record.source_thread.clone(),
+                    record.source.clone(),
+                    record.output_ordinal,
+                )
+            })
+            .collect::<BTreeSet<_>>(),
+        expected_own_grants,
+        "the accepted parent basis must preserve every exact immutable OWN output grant"
+    );
+    for record in &own_imports {
+        assert_eq!(record.delivery_id, delivery.delivery_id);
+        assert_eq!(record.candidate_id, delivery.candidate_id);
+        assert_eq!(record.output_manifest, output.history.manifest_id);
+        assert_eq!(record.acknowledgement, outputs.branches[0].acknowledgement);
+        assert_eq!(record.render_source(), &record.source);
+        let target = &own_manifest[usize::try_from(record.message_ordinal).unwrap()];
+        assert_eq!(target.source_thread, "mixed-producer");
+        assert_eq!(target.sources, vec![own_root.clone()]);
+        assert_eq!(target.context_thread.as_deref(), Some("thread"));
+        assert!(target.complete && !target.inherited && !target.protected_input);
+    }
+    install_child(&f, "own-consumer", "mixed-composer-current").await;
+    save_task_input_snapshot(
+        &f,
+        "mixed-own-consumer-run",
+        "mixed-own-consumer-task",
+        "thread",
+        "mixed-composer-current",
+        &own_composer.descriptor,
+    )
+    .await;
+    let inherited_source = parent_manifest
+        .iter()
+        .flat_map(|entry| &entry.sources)
+        .find(|source| source.id == "source")
+        .unwrap()
+        .clone();
+    // This standard helper's None path supplies synthetic applied historical
+    // checkpoint metadata. Runtime scope and accepted-boundary validation still
+    // run through the real frozen Task preparation below.
+    let mixed_own = publish_projection_checkpoint(
+        &f,
+        "mixed-producer",
+        "mixed-including-exact-own-root",
+        &[
+            ("mixed-producer".into(), own_root),
+            ("thread".into(), inherited_source),
+        ],
+        CoverageDomain::WorkingContext,
+        None,
+    )
+    .await;
+    let inherited_own = super::frozen::prepare_exact_task_fixture(
+        &f.store,
+        "ws",
+        "mixed-own-consumer",
+        "mixed-own-consumer-turn",
+        Some(&last_one),
+    )
+    .await
+    .unwrap();
+    let mut expected_mixed_own = expected.clone();
+    expected_mixed_own.remove(&checkpoint.id);
+    expected_mixed_own.insert(mixed_own.id.clone());
+    assert_eq!(sources(&inherited_own.messages), expected_mixed_own);
+    assert_eq!(inherited_own.messages.len(), 5);
+    assert_tail_round(&inherited_own.messages, &tail_sources);
+    assert!(
+        inherited_own
+            .messages
+            .iter()
+            .all(|message| message.provenance.as_ref().unwrap().inherited)
+    );
+    assert!(
+        f.store
+            .compaction_frozen_import_page(
+                "ws",
+                "mixed-own-consumer",
+                &inherited_own.descriptor.manifest_id,
+                0,
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+        "mixed WorkingContext must not inherit the narrower OWN grants"
+    );
+    let own_again = super::frozen::prepare_exact_task_fixture(
+        &f.store,
+        "ws",
+        "mixed-own-consumer",
+        "mixed-own-consumer-turn",
+        Some(&last_one),
+    )
+    .await
+    .unwrap();
+    assert_eq!(own_again.messages, inherited_own.messages);
+    assert_eq!(
+        own_again.descriptor.identity_sha256,
+        inherited_own.descriptor.identity_sha256
+    );
+    assert_eq!(
+        f.store
+            .compaction_frozen_import_page("ws", "thread", &own_composer.descriptor.manifest_id, 0,)
+            .await
+            .unwrap(),
+        own_imports
+    );
+    assert!(f.provider.calls.lock().unwrap().is_empty());
 }
 
 struct ContainedCheckpointFixture {
