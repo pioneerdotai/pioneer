@@ -5031,6 +5031,23 @@ impl CrudStore {
         turn_llm_context::delete_expired_turn_llm_context(&self.connection).await
     }
 
+    pub async fn task_turn_has_accepted_cancellation(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        run_id: &str,
+        turn_id: &str,
+    ) -> Result<bool> {
+        repositories::task_cancellation_actor::accepted_for_turn(
+            &self.connection,
+            workspace_id,
+            task_id,
+            run_id,
+            turn_id,
+        )
+        .await
+    }
+
     pub async fn list_unreconciled_terminal_task_child_turns(
         &self,
         limit: u64,
@@ -30577,7 +30594,10 @@ impl CrudStore {
             // TurnStarted was projected before the ownership receipt existed.
             // Refresh within this same atomic admission so a visible CLI child
             // already shows its queued state, even without a runtime binding.
-            if execution.executor_kind == TurnExecutorKind::CliRuntime {
+            if matches!(
+                execution.executor_kind,
+                TurnExecutorKind::CliRuntime | TurnExecutorKind::AcpRuntime
+            ) {
                 self.project_cli_runtime_turn_binding_state(
                     &transaction,
                     &execution.turn_id,
@@ -49366,6 +49386,21 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(saved.principal_id, "P00000000000000000001");
+        for (workspace, task, run, origin, expected) in [
+            (workspace_id, "stop-task", "stop-run", turn_id, true),
+            (workspace_id, "stop-task", "stop-run", "other-turn", false),
+            (workspace_id, "other-task", "stop-run", turn_id, false),
+            ("other-workspace", "stop-task", "stop-run", turn_id, false),
+            (workspace_id, "stop-task", "other-run", turn_id, false),
+        ] {
+            assert_eq!(
+                store
+                    .task_turn_has_accepted_cancellation(workspace, task, run, origin)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
         assert!(
             pioneer_entity::task_run_read::Entity::find()
                 .all(&db)

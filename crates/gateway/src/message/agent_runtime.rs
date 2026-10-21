@@ -1897,7 +1897,15 @@ impl MessageProcessor {
                                 .await
                                 .get(&(thread_id.clone(), turn_id.clone()))
                                 .cloned();
-                            let user_cancellation = user_reason.is_some();
+                            // ACP's authenticated prompt response reports cancellation
+                            // without a local turn/cancel request. The saved terminal
+                            // source was re-authorized above; preserve that outcome on
+                            // both live delivery and journal replay. ACP session_closed
+                            // and other interruptions retain their failure disposition.
+                            let task_cancellation = user_reason.is_some()
+                                || terminal_delivery.as_ref().is_some_and(|source| {
+                                    source.runtime_kind == "acp" && reason == "cancelled"
+                                });
                             Some(
                                 self.commit_turn_interrupted_with_recovery_disposition(
                                     thread_id.clone(),
@@ -1906,7 +1914,7 @@ impl MessageProcessor {
                                         .map(|intent| intent.reason)
                                         .unwrap_or_else(|| reason.clone()),
                                     recovery.clone(),
-                                    user_cancellation,
+                                    task_cancellation,
                                 )
                                 .await,
                             )
@@ -9845,7 +9853,7 @@ impl MessageProcessor {
         turn_id: String,
         reason: String,
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
-        user_cancellation: bool,
+        task_cancellation: bool,
     ) -> Result<(), DurableCommitRejection> {
         let terminal_actor_generation = self
             .agent_manager
@@ -9904,7 +9912,7 @@ impl MessageProcessor {
                     terminal_actor_generation,
                 )
                 .await;
-                if user_cancellation
+                if task_cancellation
                     && let Err(error) = self
                         .task_agent_executor
                         .reconcile_child_turn_cancelled(
@@ -10101,7 +10109,7 @@ impl MessageProcessor {
             );
         }
 
-        let task_reconciliation_succeeded = match if user_cancellation {
+        let task_reconciliation_succeeded = match if task_cancellation {
             self.task_agent_executor
                 .reconcile_child_turn_cancelled(
                     thread_id.as_str(),
@@ -10134,7 +10142,7 @@ impl MessageProcessor {
                     thread_id,
                     turn_id,
                     error = %format!("{error:#}"),
-                    user_cancellation,
+                    task_cancellation,
                     "interrupted child task reconciliation is pending durable retry"
                 );
                 false

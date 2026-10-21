@@ -4852,12 +4852,17 @@ impl TaskAgentExecutor {
         if child_runtime.task_run_turn.status == TaskRunTurnStatus::Blocked {
             return Ok(false);
         }
+        let acp_cancellation =
+            acp_child_interruption_is_cancellation(&processor, &child_runtime.task_run_turn)
+                .await?;
         if !matches!(
             child_runtime.task_run_turn.status,
             TaskRunTurnStatus::InProgress
                 | TaskRunTurnStatus::CandidateCreated
                 | TaskRunTurnStatus::Cancelled
-        ) {
+        ) && !(child_runtime.task_run_turn.status == TaskRunTurnStatus::Interrupted
+            && acp_cancellation.is_some())
+        {
             return Ok(true);
         }
         let Some(task_response) = processor
@@ -4885,8 +4890,18 @@ impl TaskAgentExecutor {
             child_runtime.task_run_turn.task_id.clone(),
             child_runtime.task_run_turn.run_id.clone(),
         );
-        self.cancel_child_turn(child_runtime, reason, handle)
+        if acp_cancellation == Some(false) {
+            self.fail_child_turn(
+                child_runtime,
+                reason,
+                TaskRunTurnStatus::Interrupted,
+                handle,
+            )
             .await?;
+        } else {
+            self.cancel_child_turn(child_runtime, reason, handle)
+                .await?;
+        }
         Ok(true)
     }
 
@@ -6257,6 +6272,15 @@ impl TaskAgentExecutor {
             .processor()?
             .with_database_class(SqliteWriteClass::Critical);
         let handle = handle.with_critical_writes();
+        if target_status == TaskRunTurnStatus::Interrupted
+            && acp_child_interruption_is_cancellation(&processor, &child_runtime.task_run_turn)
+                .await?
+                == Some(true)
+        {
+            return self
+                .cancel_child_turn(child_runtime, error_message, handle)
+                .await;
+        }
         let failed_at = now_timestamp_secs();
         let error = task_turn_failure_error(
             &processor,
@@ -9177,6 +9201,101 @@ fn task_result_candidate_id(run_id: &str, turn_id: &str) -> String {
 
 fn runtime_auto_accept_review_event_id(run_id: &str, turn_id: &str) -> String {
     format!("trre_auto_{run_id}_{turn_id}")
+}
+
+/// Classify an already accepted ACP interruption, without re-running a provider
+/// or requiring its expired process lease. Task transitions retain their own CAS.
+pub(super) fn acp_child_interruption_is_cancellation<'a>(
+    processor: &'a MessageProcessor,
+    child: &'a TaskRunTurn,
+) -> MessageFuture<'a, Result<Option<bool>>> {
+    message_future(async move {
+        let Some(snapshot) = processor
+            .crud_store
+            .cli_runtime_turn_terminal_guard_by_id(&child.turn_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let binding = &snapshot.binding;
+        if binding.runtime_kind != "acp" || snapshot.turn_status != TurnStatus::Interrupted {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            binding.thread_id == child.thread_id,
+            "ACP child scope changed"
+        );
+        if processor
+            .crud_store
+            .task_turn_has_accepted_cancellation(
+                &binding.workspace_id,
+                &child.task_id,
+                &child.run_id,
+                &child.turn_id,
+            )
+            .await?
+        {
+            return Ok(Some(true));
+        }
+        let attempt = snapshot
+            .attempt
+            .as_ref()
+            .context("ACP terminal attempt missing")?;
+        let record = processor
+            .crud_store
+            .latest_cli_runtime_native_event(pioneer_crud::CliRuntimeNativeEventListFilter {
+                runtime_id: Some(binding.runtime_id.clone()),
+                thread_id: Some(binding.thread_id.clone()),
+                turn_id: Some(binding.turn_id.clone()),
+                native_thread_id: Some(binding.native_thread_id.clone()),
+                native_turn_id: binding.native_turn_id.clone(),
+                native_method: Some("gateway/terminal_delivery".into()),
+                ..Default::default()
+            })
+            .await?
+            .context("ACP accepted terminal outcome missing")?;
+        let (source, event): (
+            pioneer_protocol::CliRuntimeBlockedTurnGuard,
+            pioneer_cli_agent_runtime::event::RuntimeEvent,
+        ) = serde_json::from_str(&record.payload_redacted_json)?;
+        anyhow::ensure!(
+            record.id == source.terminal_delivery_id()
+                && record.runtime_kind == "acp"
+                && record.workspace_id.as_deref() == Some(binding.workspace_id.as_str())
+                && source.runtime_kind == "acp"
+                && source.workspace_id == binding.workspace_id
+                && source.thread_id == binding.thread_id
+                && source.turn_id == binding.turn_id
+                && source.runtime_id == binding.runtime_id
+                && source.continuation_thread_id == binding.continuation_thread_id
+                && source.native_thread_id == binding.native_thread_id
+                && source.binding_native_turn_id == binding.native_turn_id
+                && source.attempt_id == attempt.id
+                && attempt.turn_id == binding.turn_id
+                && attempt.runtime_id == binding.runtime_id
+                && attempt.runtime_kind == binding.runtime_kind
+                && attempt.native_thread_id == binding.native_thread_id
+                && source.attempt_native_turn_id == attempt.native_turn_id
+                && source.recovery_job_id == attempt.recovery_job_id
+                && source.recovery_attempt_id == attempt.recovery_attempt_id
+                && source.segment.as_ref().map(|(id, native, _)| (id, native))
+                    == snapshot
+                        .segment
+                        .as_ref()
+                        .map(|segment| (&segment.id, &segment.native_turn_id)),
+            "ACP accepted terminal outcome belongs to another execution"
+        );
+        let pioneer_cli_agent_runtime::event::RuntimeEvent::TurnInterrupted(interrupted) = event
+        else {
+            bail!("ACP interrupted child has a different accepted terminal outcome");
+        };
+        anyhow::ensure!(
+            interrupted.native_thread_id.as_deref() == Some(binding.native_thread_id.as_str())
+                && Some(interrupted.native_turn_id.as_str()) == binding.native_turn_id.as_deref(),
+            "ACP interrupted event belongs to another native execution"
+        );
+        Ok(Some(interrupted.reason == "cancelled"))
+    })
 }
 
 fn task_run_turn_terminal_status_from_child_turn_status(

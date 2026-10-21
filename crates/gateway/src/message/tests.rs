@@ -84697,7 +84697,13 @@ fn acp_composer_preparation_detached_result_and_parent_delivery_use_one_owner() 
             reducer::{Context as AcpContext, Reducer},
             schema,
         };
-        for (answer, cancelled) in [(true, false), (false, false), (true, true)] {
+        for (answer, cancelled, closed) in [
+            (true, false, false),
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let interrupted = cancelled || closed;
             let (processor, _, old_rx, workspace, store, cli) =
                 cli_runtime_approval_processor().await;
             drop(old_rx);
@@ -84810,7 +84816,7 @@ fn acp_composer_preparation_detached_result_and_parent_delivery_use_one_owner() 
             let mut snapshot = prepared.snapshot;
             let mut previous_mcp: Option<pioneer_crud::CliRuntimeTurnMcpMetadata> = None;
             // A second send uses the published execution snapshot, without any selector RPC.
-            for index in 0..if answer && !cancelled { 2 } else { 1 } {
+            for index in 0..if answer && !interrupted { 2 } else { 1 } {
                 let native_turn = format!("acp-native-{index}");
                 cli.set_next_native_turn_id(&native_turn).await;
                 let source_turn = format!("acp-source-{answer}-{cancelled}-{index}");
@@ -85046,7 +85052,7 @@ fn acp_composer_preparation_detached_result_and_parent_delivery_use_one_owner() 
                             .await;
                     }
                 }
-                let stop = if cancelled {
+                let stop = if interrupted {
                     schema::StopReason::Cancelled
                 } else {
                     schema::StopReason::EndTurn
@@ -85069,11 +85075,16 @@ fn acp_composer_preparation_detached_result_and_parent_delivery_use_one_owner() 
                         .handle_cli_runtime_timeline_event(handle.instance(), event)
                         .await;
                 }
-                let terminal = if cancelled {
+                let terminal = if interrupted {
                     RuntimeEvent::TurnInterrupted(RuntimeTurnInterrupted {
                         native_thread_id: Some(binding.native_thread_id.clone()),
                         native_turn_id: native_turn.clone(),
-                        reason: "cancelled".into(),
+                        reason: if closed {
+                            "session_closed"
+                        } else {
+                            "cancelled"
+                        }
+                        .into(),
                         native: None,
                     })
                 } else {
@@ -85087,7 +85098,7 @@ fn acp_composer_preparation_detached_result_and_parent_delivery_use_one_owner() 
                 processor
                     .handle_cli_runtime_timeline_event(handle.instance(), terminal.clone())
                     .await;
-                let expected = if answer && !cancelled {
+                let expected = if answer && !interrupted {
                     TaskStatus::Completed
                 } else if cancelled {
                     TaskStatus::Cancelled
@@ -85102,9 +85113,63 @@ fn acp_composer_preparation_detached_result_and_parent_delivery_use_one_owner() 
                     .unwrap();
                 assert_eq!(
                     task.task.status, expected,
-                    "ACP task did not settle (answer={answer}, cancelled={cancelled}, index={index}); task={task:#?}; child={child:#?}"
+                    "ACP task did not settle (answer={answer}, cancelled={cancelled}, closed={closed}, index={index}); task={task:#?}; child={child:#?}"
                 );
-                if answer && !cancelled {
+                assert_eq!(
+                    child.as_ref().unwrap().1.status,
+                    if interrupted {
+                        TurnStatus::Interrupted
+                    } else {
+                        TurnStatus::Completed
+                    },
+                );
+                let child_record = task
+                    .task_run_turns
+                    .iter()
+                    .find(|turn| turn.turn_id == binding.turn_id)
+                    .unwrap();
+                assert_eq!(
+                    super::task_agent_executor::acp_child_interruption_is_cancellation(
+                        &processor,
+                        child_record,
+                    )
+                    .await
+                    .unwrap(),
+                    interrupted.then_some(cancelled),
+                    "durable ACP provenance must preserve cancellation versus session closure",
+                );
+                assert_eq!(
+                    task.runs
+                        .iter()
+                        .find(|run| run.id == execution.run_id)
+                        .unwrap()
+                        .status,
+                    if cancelled {
+                        pioneer_protocol::TaskRunStatus::Cancelled
+                    } else if answer && !closed {
+                        pioneer_protocol::TaskRunStatus::Succeeded
+                    } else {
+                        pioneer_protocol::TaskRunStatus::Failed
+                    },
+                );
+                if cancelled {
+                    assert_eq!(
+                        task.task_run_turns
+                            .iter()
+                            .find(|turn| turn.turn_id == binding.turn_id)
+                            .unwrap()
+                            .status,
+                        pioneer_protocol::TaskRunTurnStatus::Cancelled,
+                    );
+                } else if closed {
+                    assert_eq!(task.task.error.as_ref().unwrap().code, "child_turn_failed");
+                } else if !answer {
+                    assert_eq!(
+                        task.task.error.as_ref().unwrap().code,
+                        "task_agent_result_missing"
+                    );
+                }
+                if answer && !interrupted {
                     assert_eq!(
                         task.task.result.as_ref().unwrap().summary.as_deref(),
                         Some(format!("Done {index}").as_str())
@@ -85145,6 +85210,18 @@ fn acp_composer_preparation_detached_result_and_parent_delivery_use_one_owner() 
                 if !cancelled {
                     assert_eq!(deliveries.deliveries.len(), 1);
                 }
+                assert!(deliveries.deliveries.len() <= 1);
+                assert_eq!(
+                    store
+                        .get_task(&execution.task_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .task
+                        .status,
+                    expected,
+                    "duplicate ACP terminal delivery must preserve the Task outcome",
+                );
                 assert!(
                     deliveries
                         .deliveries
@@ -85157,7 +85234,7 @@ fn acp_composer_preparation_detached_result_and_parent_delivery_use_one_owner() 
                         .unwrap()
                         .contains("Проверю")
                 );
-                if answer && !cancelled {
+                if answer && !interrupted {
                     assert_eq!(
                         deliveries.deliveries[0].status,
                         TaskDeliveryStatus::Delivered
