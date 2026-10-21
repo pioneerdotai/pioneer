@@ -1023,7 +1023,11 @@ mod tests {
         core.complete_composer_model_picker(rx.try_recv().unwrap(), providers());
         let mut runtime: RuntimeSummary = serde_json::from_value(serde_json::json!({
             "runtime_id":"codex", "kind":"codex", "display_name":"Codex", "enabled":true,
-            "status":{"state":"initializing"}, "capabilities":{"supports_threads":true,"supports_model_list":true}
+            "status":{"state":"initializing"}, "capabilities": pioneer_protocol::RuntimeCapabilities {
+                supports_threads: true,
+                supports_model_list: true,
+                ..Default::default()
+            }
         })).unwrap();
         let request = core.provider_runtime_request_for_test("ws").unwrap();
         core.complete_provider_runtime_for_test(

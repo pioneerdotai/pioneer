@@ -555,7 +555,11 @@ mod tests {
         let mut runtime: RuntimeSummary = serde_json::from_value(serde_json::json!({
             "runtime_id":"codex", "kind":"codex", "display_name":"Codex", "enabled":true,
             "status":{"state":"ready"}, "models_refreshed_at_unix_ms":10,
-            "capabilities":{"supports_threads":true,"supports_model_list":true}
+            "capabilities": pioneer_protocol::RuntimeCapabilities {
+                supports_threads: true,
+                supports_model_list: true,
+                ..Default::default()
+            }
         }))
         .unwrap();
         let work = core.provider_runtime_request_for_test("ws").unwrap();
