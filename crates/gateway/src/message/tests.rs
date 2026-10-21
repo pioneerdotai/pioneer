@@ -1393,6 +1393,18 @@ impl CLIAgentRuntimeSessionFactory for StaticCliRuntimeSessionFactory {
                         .as_str()
                         .to_owned(),
                 )),
+                CliMcpSessionLaunch::Acp(launch) => Some((
+                    launch.canonical_projection.turn_id.clone(),
+                    crate::cli_runtime::acp_mcp::ACP_MCP_ADAPTER_KIND,
+                    launch.canonical_projection.manifest_hash.clone(),
+                    launch.contract_fingerprint.clone(),
+                    launch.semantic_restart_fingerprint().to_owned(),
+                    launch
+                        .facade_projection(limits)?
+                        .fingerprint()
+                        .as_str()
+                        .to_owned(),
+                )),
                 _ => None,
             };
             if let Some((turn_id, adapter, manifest, contract, isolation, projection)) = facts {
@@ -84809,8 +84821,34 @@ fn acp_composer_preparation_detached_result_and_parent_delivery_use_one_owner() 
                         tokio::task::yield_now().await;
                     }
                 })
-                .await
-                .expect("ACP detached child must dispatch");
+                .await;
+                let binding = match binding {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        let tasks = store
+                            .list_tasks_created_by_turn(&workspace, &parent, &source_turn)
+                            .await
+                            .unwrap();
+                        let mut states = Vec::new();
+                        let mut child_turns = Vec::new();
+                        for task in tasks {
+                            let state = store.get_task(&task.id).await.unwrap().unwrap();
+                            for child in &state.task_run_turns {
+                                child_turns.push(
+                                    store
+                                        .get_turn(&child.thread_id, &child.turn_id)
+                                        .await
+                                        .unwrap(),
+                                );
+                            }
+                            states.push(state);
+                        }
+                        let starts = cli.turn_starts.lock().await.clone();
+                        panic!(
+                            "ACP detached child must dispatch (answer={answer}, cancelled={cancelled}, index={index}): {error}; tasks={states:#?}; child_turns={child_turns:#?}; provider_starts={starts:#?}"
+                        );
+                    }
+                };
                 assert_ne!(binding.thread_id, parent);
                 assert_eq!(binding.continuation_thread_id, parent);
                 assert_eq!(binding.runtime_kind, "acp");

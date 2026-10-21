@@ -3462,13 +3462,17 @@ impl MessageProcessor {
                         .turn_owner_generation(&notification.thread_id, &notification.turn.id)
                         .await
                         .is_some()
-                        // CLI turns also freeze task inheritance in a runtime
+                        // CLI and ACP turns also freeze task inheritance in a runtime
                         // snapshot. Their cancellation uses the CLI lifecycle,
                         // without a native controller's terminal-effect plan.
                         // Keep the snapshot fallback fail-closed unless durable
                         // execution ownership positively identifies a CLI turn.
                         || (execution.as_ref().is_none_or(|e| {
-                            e.executor_kind != pioneer_crud::TurnExecutorKind::CliRuntime
+                            !matches!(
+                                e.executor_kind,
+                                pioneer_crud::TurnExecutorKind::CliRuntime
+                                    | pioneer_crud::TurnExecutorKind::AcpRuntime
+                            )
                         }) && self
                             .crud_store
                             .get_turn_runtime_snapshot(&notification.turn.id)

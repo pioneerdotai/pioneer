@@ -6157,7 +6157,26 @@ impl MessageProcessor {
         .await
     }
 
-    async fn process_bound_cli_runtime_event_from_source(
+    // Keep the shared live/journal event state machine out of its callers'
+    // frames. Terminal delivery composes this with transition and Task state.
+    fn process_bound_cli_runtime_event_from_source<'a>(
+        &'a self,
+        instance: Option<&'a CliSessionInstanceId>,
+        turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
+        event: RuntimeEvent,
+        turn_transition: Option<&'a Arc<tokio::sync::OwnedMutexGuard<()>>>,
+        terminal_delivery: Option<&'a pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+    ) -> MessageFuture<'a, bool> {
+        message_future(self.process_bound_cli_runtime_event_from_source_inner(
+            instance,
+            turn_binding,
+            event,
+            turn_transition,
+            terminal_delivery,
+        ))
+    }
+
+    async fn process_bound_cli_runtime_event_from_source_inner(
         &self,
         instance: Option<&CliSessionInstanceId>,
         mut turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
@@ -6858,25 +6877,30 @@ impl MessageProcessor {
         };
         let projected = crate::cli_runtime::projector::project_cli_runtime_event(&context, &event);
         for durable in projected.durable {
-            let committed = if let Some(instance) = instance {
-                self.publish_cli_runtime_durable_guarded(
-                    instance,
-                    durable,
-                    turn_transition,
-                    terminal_delivery.cloned(),
-                )
-                .await
-                .map_err(|error| error.to_string())
-            } else {
-                self.scoped_for_background_reconciliation()
-                    .commit_durable_agent_event_with_cli_blocked_guard(
+            // Canonical commit has its own large lifecycle future. Keep it
+            // separate from the native event's recovery/finalization frame.
+            let committed = message_future(async {
+                if let Some(instance) = instance {
+                    self.publish_cli_runtime_durable_guarded(
+                        instance,
                         durable,
+                        turn_transition,
                         terminal_delivery.cloned(),
-                        turn_transition.cloned(),
                     )
                     .await
-                    .map_err(|error| format!("{error:?}"))
-            };
+                    .map_err(|error| error.to_string())
+                } else {
+                    self.scoped_for_background_reconciliation()
+                        .commit_durable_agent_event_with_cli_blocked_guard(
+                            durable,
+                            terminal_delivery.cloned(),
+                            turn_transition.cloned(),
+                        )
+                        .await
+                        .map_err(|error| format!("{error:?}"))
+                }
+            })
+            .await;
             if let Err(error) = committed {
                 warn!(
                     workspace_id = key.workspace_id.as_str(),
