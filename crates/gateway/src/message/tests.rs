@@ -33851,6 +33851,29 @@ async fn cancelling_detached_native_task_interrupts_only_its_child_continuation_
     let starts = wait_for_cli_runtime_turn_starts(&cli_session, 1).await;
     assert_eq!(starts.len(), 1);
     let native_thread_id = starts[0].native_thread_id.clone();
+    // The fake records entry into start_turn before the gateway persists the
+    // returned native turn and releases its startup transition. Cancel only
+    // after that handoff: this test covers cancellation of an active turn.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(binding) = crud_store
+                .get_cli_runtime_turn_binding(first_lineage.child_turn_id.as_str())
+                .await
+                .expect("native cancellation binding should load")
+                && binding.native_turn_id.as_deref() == Some("native_cancel_turn_1")
+                && let Some(transition) = processor
+                    .try_cli_runtime_turn_transition(&binding)
+                    .await
+                    .expect("native startup transition should be observable")
+            {
+                drop(transition);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("native turn must finish its startup handoff before cancellation");
 
     cancel_task_for_test(
         &processor,
