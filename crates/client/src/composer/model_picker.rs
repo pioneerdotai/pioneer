@@ -938,12 +938,11 @@ mod tests {
         ModelPickerResult::Models(Ok(serde_json::from_value(serde_json::json!({"provider":provider,"models":[{"id":"one", "provider":provider,"name":"One", "limits":{}, "capabilities":{}}]})).unwrap()))
     }
     fn ready(core: &ClientCore, rx: &mpsc::Receiver<ModelPickerWork>) {
-        core.complete_composer_model_picker(rx.try_recv().unwrap(), providers());
-        if let Ok(work) = rx.try_recv() {
-            let RequestKind::Models(provider) = &work.kind else {
-                panic!("models expected");
+        while let Ok(work) = rx.try_recv() {
+            let result = match &work.kind {
+                RequestKind::Providers => providers(),
+                RequestKind::Models(provider) => models(provider),
             };
-            let result = models(provider);
             core.complete_composer_model_picker(work, result);
         }
     }
@@ -1390,8 +1389,18 @@ mod tests {
             },
         );
         open(&core, false);
-        core.complete_composer_model_picker(rx.try_recv().unwrap(), providers());
-        let model_work = rx.try_recv().unwrap();
+        // Runtime reconciliation can enqueue models before the provider catalog.
+        // Finish providers first and retain the newest model request generation.
+        let mut model_work = None;
+        while let Ok(work) = rx.try_recv() {
+            match &work.kind {
+                RequestKind::Providers => {
+                    core.complete_composer_model_picker(work, providers());
+                }
+                RequestKind::Models(_) => model_work = Some(work),
+            }
+        }
+        let model_work = model_work.expect("model catalog request");
         let request = core.provider_runtime_request_for_test("ws").unwrap();
         core.complete_provider_runtime_for_test(
             request,
