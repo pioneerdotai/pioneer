@@ -23,18 +23,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            run_tests: "true"
-            # Include cold workspace compilation and the complete test suite.
-            timeout_minutes: 180
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            run_tests: "false"
             timeout_minutes: 120
           - os: macos-14
             target: aarch64-apple-darwin
-            run_tests: "false"
             timeout_minutes: 120
 
     steps:
@@ -48,8 +41,42 @@ jobs:
           targets: ${{ matrix.target }}
           components: rustfmt
 
+      - name: rust-cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-${{ matrix.target }}
+
+      - name: cargo-check-workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked --workspace
+
+  linux-tests:
+    name: ci-ubuntu-latest-x86_64-unknown-linux-gnu-shard-${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    # Include cold workspace compilation; do not extend the original timeout.
+    timeout-minutes: 180
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      CARGO_BUILD_JOBS: 2
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: setup-rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+          components: rustfmt
+
       - name: configure-linux-build-profile
-        if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: |
           echo 'CARGO_PROFILE_DEV_DEBUG=0' >> "$GITHUB_ENV"
@@ -58,17 +85,16 @@ jobs:
       - name: rust-cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-${{ matrix.target }}${{ matrix.os == 'ubuntu-latest' && '-no-debug-v1' || '' }}
+          shared-key: ci-x86_64-unknown-linux-gnu-no-debug-v1
 
       - name: rustfmt-check
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.shard == 1
         shell: bash
         run: |
           set -euo pipefail
           cargo fmt --all --check
 
       - name: install-linux-build-dependencies
-        if: matrix.os == 'ubuntu-latest'
         timeout-minutes: 10
         shell: bash
         run: |
@@ -101,26 +127,44 @@ jobs:
           multiarch="$(gcc -print-multiarch)"
           echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
 
-      - name: cargo-check-workspace
-        if: matrix.run_tests != 'true'
+      - name: install-nextest
         shell: bash
         run: |
           set -euo pipefail
-          cargo check --locked --workspace
+          # Official pre-built binary; pin the same version on every shard.
+          curl -LsSf https://get.nexte.st/0.9.149/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
 
-      - name: cargo-test-pr-regressions
-        if: matrix.run_tests == 'true'
+      - name: cargo-nextest-workspace
+        id: nextest
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked -p pioneer-gateway --lib failed_snapshot_update_keeps_live_roots_and_root_failure_is_isolated -- --nocapture
-          cargo test --locked -p pioneer-gateway --lib cli_native_terminal_consumer_acks_delivery_and_retains_ownership_after_publisher_cancel -- --nocapture
-          cargo test --locked -p pioneer-gateway --lib refill_confirmed_prefix_survives_poison_and_unknown_commit_without_replay -- --nocapture
-          cargo test --locked -p pioneer-gateway --lib thread_episodic -- --nocapture
+          # Tests may create multithreaded Tokio runtimes: start with two at once.
+          cargo nextest run --locked --workspace --partition hash:${{ matrix.shard }}/4 \
+            --test-threads 2 --no-fail-fast --retries 0 \
+            --status-level pass --final-status-level fail --failure-output immediate-final
 
-      - name: cargo-test-workspace
-        if: matrix.run_tests == 'true'
+      - name: cargo-test-doctests
+        if: ${{ !cancelled() && matrix.shard == 1 && (steps.nextest.outcome == 'success' || steps.nextest.outcome == 'failure') }}
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked -- --nocapture
+          cargo test --locked --workspace --doc
+
+  linux-result:
+    # Preserve the Linux check name used by branch protection.
+    name: ci-ubuntu-latest-x86_64-unknown-linux-gnu
+    needs: linux-tests
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: require-all-linux-checks
+        env:
+          LINUX_RESULT: ${{ needs.linux-tests.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The matrix includes all four shards, rustfmt and the single doctest run.
+          echo "Linux checks: ${LINUX_RESULT}"
+          test "${LINUX_RESULT}" = success
