@@ -8,6 +8,11 @@ on:
     branches:
       - main
 
+# Keep only the latest run for each PR/branch; other refs stay independent.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
