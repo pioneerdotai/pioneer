@@ -148,6 +148,12 @@ fn cli_probe_failure_does_not_bypass_technical_mcp_admission() {
     run_gateway_message_test("cli-probe-mcp-admission", || async {
         for kind in CLI_KINDS {
             let mut harness = setup_cli_runtime_skill_preflight_harness(kind, false).await;
+            seed_ready_fake_mcp_server(
+                &harness.processor,
+                harness.crud_store.as_ref(),
+                &harness.workspace_id,
+            )
+            .await;
             seed_cli_runtime_skill_preflight_thread(&harness, "probe-mcp-thread").await;
             harness
                 .processor
@@ -166,13 +172,31 @@ fn cli_probe_failure_does_not_bypass_technical_mcp_admission() {
                 "probe-mcp-turn",
                 &harness.runtime_id,
                 kind,
-                Vec::new(),
+                // Select a real fixture tool so every provider enters MCP admission.
+                vec![
+                    serde_json::to_value(TurnCapability {
+                        id: pioneer_protocol::mcp_tool_capability_key(
+                            McpScopeKind::Workspace,
+                            "resend",
+                            "send",
+                        ),
+                        kind: TurnCapabilityKind::McpTool {
+                            server_name: "resend".into(),
+                            raw_tool_name: "send".into(),
+                            scope_kind: McpScopeKind::Workspace,
+                        },
+                        label: None,
+                    })
+                    .unwrap(),
+                ],
             );
             harness
                 .processor
                 .process_request_for_connection(harness.connection_id, &request)
                 .await;
-            let error = recv_error_by_id(&mut harness.rx, "probe-mcp").await;
+            let payload = recv_jsonrpc_payload_by_id(&mut harness.rx, "probe-mcp").await;
+            let error: JsonRpcErrorResponse = serde_json::from_str(&payload)
+                .expect("unsupported MCP admission must return an error, not accept the turn");
             assert_public_error(
                 &error,
                 PublicErrorCode::Internal,
