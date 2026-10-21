@@ -37,6 +37,8 @@ const CLI_RUNTIME_READINESS_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_WORKSPACE_WARMUPS: usize = 4;
 /// Bounds actual provider network/process probes across all warm workspaces.
 const MAX_CONCURRENT_PROVIDER_PROBES: usize = 8;
+/// Selection metadata may bridge a transient discovery outage, never indefinitely.
+const CLI_MODEL_CATALOG_MAX_AGE_MS: i64 = 24 * 60 * 60 * 1_000;
 
 type ProviderWarmupTaskOutcome =
     Result<anyhow::Result<Option<ProviderWarmupScope>>, Box<dyn std::any::Any + Send + 'static>>;
@@ -227,6 +229,8 @@ struct CliRuntimeReadinessChange {
 pub(super) struct CliRuntimeModelSnapshot {
     pub(super) result: super::cli_runtime::RuntimeModelListResult,
     pub(super) refreshed_at_unix_ms: i64,
+    source_fingerprint: Option<String>,
+    account: Option<pioneer_protocol::RuntimeAccountSnapshot>,
 }
 
 #[derive(Clone, Debug)]
@@ -737,9 +741,44 @@ impl MessageProcessor {
         else {
             return Ok(None);
         };
+        let mut models = snapshot.models.get(runtime_id).cloned();
+        if let Some(catalog) = models.as_ref() {
+            // No process/network probes on a read. Revalidate bounded local
+            // source metadata so an external home/config change or an expired
+            // catalog cannot leak selection/limit data until the next warmup.
+            let current_source = if catalog.source_fingerprint.is_some() {
+                let instances = self.load_cli_runtime_instances()?;
+                match instances
+                    .iter()
+                    .find(|instance| instance.id == runtime_id && instance.enabled)
+                {
+                    Some(instance) => {
+                        let proxy = self
+                            .prepare_cli_runtime_proxy_url(workspace_id, runtime_id)
+                            .await?;
+                        cli_model_source_fingerprint(instance, proxy.as_deref()).ok()
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let synthetic_fixture = cfg!(test) && catalog.source_fingerprint.is_none();
+            if !synthetic_fixture
+                && retained_cli_models(
+                    Some(catalog.clone()),
+                    &summary,
+                    current_source.as_deref(),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .is_none()
+            {
+                models = None;
+            }
+        }
         Ok(Some(CliRuntimeProbeSnapshot {
             summary,
-            models: snapshot.models.get(runtime_id).cloned(),
+            models,
             mcp_readiness: snapshot.mcp_readiness.get(runtime_id).cloned(),
         }))
     }
@@ -751,6 +790,14 @@ impl MessageProcessor {
     ) -> anyhow::Result<()> {
         self.invalidate_cli_runtime_readiness_snapshot(workspace_id)
             .await?;
+        self.reconcile_cli_readiness_for_tests(workspace_id).await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn reconcile_cli_readiness_for_tests(
+        &self,
+        workspace_id: &str,
+    ) -> anyhow::Result<()> {
         let trace = GatewayProviderWarmupTrace::start(GatewayProviderWarmupScope::Cli);
         let generation = self.provider_readiness.cli_generation(workspace_id).await;
         self.perform_cli_runtime_warmup(
@@ -767,8 +814,8 @@ impl MessageProcessor {
     /// CLI process manager with an in-memory recording runtime.
     ///
     /// Production readiness is always established by the supervisor. Tests
-    /// must seed the same authoritative snapshot instead of bypassing the turn
-    /// admission gate or relying on a client-triggered probe.
+    /// seed discovery metadata without performing process/network probes.
+    /// Technical admission remains independently controlled by the fake adapter.
     #[cfg(test)]
     pub(super) async fn mark_cli_runtimes_ready_for_tests(
         &self,
@@ -803,6 +850,8 @@ impl MessageProcessor {
                             error_message: None,
                         },
                         refreshed_at_unix_ms,
+                        source_fingerprint: None,
+                        account: None,
                     },
                 )
             })
@@ -826,6 +875,42 @@ impl MessageProcessor {
             )
             .await
             .ok_or_else(|| anyhow::anyhow!("test CLI readiness generation was superseded"))?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) async fn mark_cli_runtime_probe_failed_for_tests(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> anyhow::Result<()> {
+        let mut snapshot = self
+            .provider_readiness
+            .snapshot(workspace_id)
+            .await
+            .context("missing test snapshot")?;
+        let summary = snapshot
+            .runtimes
+            .iter_mut()
+            .find(|runtime| runtime.runtime_id == runtime_id)
+            .context("missing test runtime")?;
+        summary.status = RuntimeStatus::Error {
+            message: "workspace routing discovery failed".into(),
+        };
+        summary.capabilities.supports_mcp_tools = false;
+        summary.version = None;
+        snapshot.mcp_readiness.remove(runtime_id);
+        let generation = self.provider_readiness.cli_generation(workspace_id).await;
+        self.provider_readiness
+            .replace_probe_results_if_generation(
+                workspace_id,
+                generation,
+                snapshot.runtimes,
+                snapshot.models,
+                snapshot.mcp_readiness,
+            )
+            .await
+            .context("test failure publication superseded")?;
         Ok(())
     }
 
@@ -1132,11 +1217,23 @@ impl MessageProcessor {
         let instances = self.load_cli_runtime_instances()?;
         cli_catalog_stage.succeed();
 
+        let previous = self
+            .provider_readiness
+            .snapshot(workspace_id)
+            .await
+            .unwrap_or_default();
         let probe_results = join_all(instances.into_iter().map(|instance| {
+            let previous_models = previous.models.get(instance.id.as_str()).cloned();
             let provider_concurrency = provider_concurrency.clone();
             async move {
                 let runtime_kind = instance.kind;
                 let fallback_instance = instance.clone();
+                let proxy_url = self
+                    .prepare_cli_runtime_proxy_url(workspace_id, &instance.id)
+                    .await;
+                let source_fingerprint = proxy_url.as_ref().ok().and_then(|proxy| {
+                    cli_model_source_fingerprint(&instance, proxy.as_deref()).ok()
+                });
                 let result = async {
                     let _permit = provider_concurrency
                         .acquire_owned()
@@ -1164,7 +1261,6 @@ impl MessageProcessor {
                                 }
                             };
                             let refreshed_at_unix_ms = chrono::Utc::now().timestamp_millis();
-                            summary.models_refreshed_at_unix_ms = Some(refreshed_at_unix_ms);
                             if let Some(error) = result.error_message.as_deref() {
                                 summary.status = RuntimeStatus::Degraded {
                                     message: "runtime model catalog is unavailable".to_owned(),
@@ -1176,10 +1272,15 @@ impl MessageProcessor {
                                     "CLI runtime model catalog is not ready"
                                 );
                             }
-                            Some(CliRuntimeModelSnapshot {
-                                result,
-                                refreshed_at_unix_ms,
-                            })
+                            result
+                                .error_message
+                                .is_none()
+                                .then(|| CliRuntimeModelSnapshot {
+                                    result,
+                                    refreshed_at_unix_ms,
+                                    source_fingerprint: source_fingerprint.clone(),
+                                    account: summary.account.clone(),
+                                })
                         } else {
                             None
                         };
@@ -1193,7 +1294,7 @@ impl MessageProcessor {
                     .map_err(|_| anyhow::anyhow!("CLI runtime readiness check timed out"))?
                 }
                 .await;
-                match result {
+                let mut result = match result {
                     Ok(result) => result,
                     Err(error) => {
                         warn!(
@@ -1202,12 +1303,43 @@ impl MessageProcessor {
                             "CLI runtime readiness check failed"
                         );
                         CliRuntimeProbeResult {
-                            summary: cli_runtime_error_summary(fallback_instance),
+                            summary: cli_runtime_error_summary(fallback_instance.clone()),
                             models: None,
                             mcp_readiness: None,
                         }
                     }
+                };
+                // Proxy configuration is source metadata even when the probe
+                // timed out. Do not publish its absence as a source change.
+                if let Ok(proxy) = &proxy_url {
+                    result.summary.proxy_url = proxy.clone();
                 }
+                // A source mutation during discovery cannot publish a catalog
+                // from either side of that mutation. No credentials are read.
+                let source_still_current = proxy_url.as_ref().ok().and_then(|proxy| {
+                    cli_model_source_fingerprint(&fallback_instance, proxy.as_deref()).ok()
+                }) == source_fingerprint
+                    && source_fingerprint.is_some();
+                if !source_still_current {
+                    result.models = None;
+                    if matches!(result.summary.status, RuntimeStatus::Ready) {
+                        result.summary.status = RuntimeStatus::Degraded {
+                            message: "runtime model source changed during refresh".into(),
+                        };
+                    }
+                } else if result.models.is_none() {
+                    result.models = retained_cli_models(
+                        previous_models,
+                        &result.summary,
+                        source_fingerprint.as_deref(),
+                        chrono::Utc::now().timestamp_millis(),
+                    );
+                }
+                result.summary.models_refreshed_at_unix_ms = result
+                    .models
+                    .as_ref()
+                    .map(|models| models.refreshed_at_unix_ms);
+                result
             }
         }))
         .await;
@@ -1839,6 +1971,97 @@ fn register_workspace_probe(
     false
 }
 
+/// Bind selection metadata to the entire launch configuration, proxy and local
+/// account/config file revisions. Metadata only: never open credential contents
+/// or a provider database. Managed account mutations also fence generations.
+fn cli_model_source_fingerprint(
+    instance: &pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig,
+    proxy_url: Option<&str>,
+) -> anyhow::Result<String> {
+    use pioneer_config::GatewayCliAgentRuntimeKindConfig;
+    let mut homes = vec![pioneer_cli_agent_runtime::process::expand_home_path(
+        &instance.home_path,
+        None,
+    )?];
+    if let Some(shadow) = instance.shadow_home_path.as_deref() {
+        homes.push(pioneer_cli_agent_runtime::process::expand_home_path(
+            shadow, None,
+        )?);
+    }
+    for home in &mut homes {
+        match std::fs::canonicalize(home.as_path()) {
+            Ok(resolved) => *home = resolved,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let files: &[&str] = match instance.kind {
+        GatewayCliAgentRuntimeKindConfig::Codex => &["auth.json", "config.toml"],
+        GatewayCliAgentRuntimeKindConfig::Claude => &[".credentials.json", "settings.json"],
+        GatewayCliAgentRuntimeKindConfig::OpenCode => &["opencode.json", "opencode.jsonc"],
+    };
+    let revisions = homes
+        .iter()
+        .flat_map(|home| files.iter().map(move |file| (home, file)))
+        .map(|(home, file)| {
+            let path = home.join(file);
+            match std::fs::metadata(&path) {
+                Ok(metadata) => {
+                    let modified = metadata.modified()?.duration_since(std::time::UNIX_EPOCH)?;
+                    #[cfg(unix)]
+                    let change = {
+                        use std::os::unix::fs::MetadataExt;
+                        (metadata.ino(), metadata.ctime(), metadata.ctime_nsec())
+                    };
+                    #[cfg(not(unix))]
+                    let change = (0_u64, 0_i64, 0_i64);
+                    Ok(serde_json::json!([
+                        file,
+                        metadata.len(),
+                        modified.as_nanos().to_string(),
+                        change
+                    ]))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(serde_json::json!([file, null]))
+                }
+                Err(error) => Err(anyhow::Error::from(error)),
+            }
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    pioneer_cli_agent_runtime::codex_attestation::sha256_json(&serde_json::json!({
+        "instance": instance, "proxy": proxy_url, "homes": homes, "revisions": revisions,
+    }))
+}
+
+fn retained_cli_models(
+    previous: Option<CliRuntimeModelSnapshot>,
+    summary: &RuntimeSummary,
+    source_fingerprint: Option<&str>,
+    now_unix_ms: i64,
+) -> Option<CliRuntimeModelSnapshot> {
+    let previous = previous?;
+    let age = now_unix_ms.checked_sub(previous.refreshed_at_unix_ms)?;
+    (summary.enabled
+        && !matches!(
+            summary.status,
+            RuntimeStatus::Disabled | RuntimeStatus::NeedsAuth
+        )
+        && !summary
+            .account
+            .as_ref()
+            .is_some_and(|account| !account.authenticated)
+        && summary
+            .account
+            .as_ref()
+            .is_none_or(|account| Some(account) == previous.account.as_ref())
+        && source_fingerprint.is_some()
+        && previous.source_fingerprint.as_deref() == source_fingerprint
+        && previous.result.error_message.is_none()
+        && (0..=CLI_MODEL_CATALOG_MAX_AGE_MS).contains(&age))
+    .then_some(previous)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1886,6 +2109,8 @@ mod tests {
                 error_message: None,
             },
             refreshed_at_unix_ms: 1,
+            source_fingerprint: None,
+            account: None,
         }
     }
 
@@ -1902,6 +2127,201 @@ mod tests {
             max_tools: 1_024,
             max_schema_bytes: 8 * 1_024 * 1_024,
             diagnostics: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_retains_only_applicable_catalog_and_keeps_error_diagnostic() {
+        for kind in [
+            CLIAgentRuntimeKind::Codex,
+            CLIAgentRuntimeKind::Claude,
+            CLIAgentRuntimeKind::OpenCode,
+        ] {
+            let supervisor = ProviderReadinessSupervisor::default();
+            let generation = supervisor.cli_generation("ws").await;
+            let mut summary = runtime_summary("cli", RuntimeStatus::Ready);
+            summary.kind = kind;
+            let mut models = model_snapshot("chosen-model");
+            models.refreshed_at_unix_ms = 100;
+            models.source_fingerprint = Some("source-a".into());
+            supervisor
+                .replace_probe_results_if_generation(
+                    "ws",
+                    generation,
+                    vec![summary.clone()],
+                    HashMap::from([("cli".into(), models)]),
+                    HashMap::from([("cli".into(), mcp_readiness())]),
+                )
+                .await
+                .unwrap();
+            for now in [200, 300] {
+                let previous = supervisor
+                    .runtime_probe_snapshot("ws", "cli")
+                    .await
+                    .unwrap();
+                summary.status = RuntimeStatus::Error {
+                    message: "account/read failed".into(),
+                };
+                let retained =
+                    retained_cli_models(previous.models, &summary, Some("source-a"), now);
+                supervisor
+                    .replace_probe_results_if_generation(
+                        "ws",
+                        generation,
+                        vec![summary.clone()],
+                        HashMap::from([("cli".into(), retained.unwrap())]),
+                        HashMap::new(),
+                    )
+                    .await
+                    .unwrap();
+                let current = supervisor
+                    .runtime_probe_snapshot("ws", "cli")
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    current.summary.status,
+                    RuntimeStatus::Error { .. }
+                ));
+                assert!(
+                    current.mcp_readiness.is_none(),
+                    "catalog is not MCP evidence"
+                );
+                let models = current.models.unwrap();
+                assert_eq!(models.result.models[0].id, "chosen-model");
+                assert_eq!(
+                    models.refreshed_at_unix_ms, 100,
+                    "failure must not renew age"
+                );
+                assert!(
+                    retained_cli_models(Some(models.clone()), &summary, Some("source-b"), now)
+                        .is_none()
+                );
+                assert!(retained_cli_models(Some(models.clone()), &summary, None, now).is_none());
+                assert!(
+                    retained_cli_models(
+                        Some(models.clone()),
+                        &summary,
+                        Some("source-a"),
+                        101 + CLI_MODEL_CATALOG_MAX_AGE_MS
+                    )
+                    .is_none()
+                );
+                summary.status = RuntimeStatus::NeedsAuth;
+                assert!(
+                    retained_cli_models(Some(models.clone()), &summary, Some("source-a"), now)
+                        .is_none()
+                );
+                summary.status = RuntimeStatus::Error {
+                    message: "unknown account".into(),
+                };
+                summary.account = Some(
+                    serde_json::from_value(
+                        serde_json::json!({"authenticated":true,"email":"new@example.test"}),
+                    )
+                    .unwrap(),
+                );
+                assert!(
+                    retained_cli_models(Some(models.clone()), &summary, Some("source-a"), now)
+                        .is_none()
+                );
+                summary.account = None;
+                summary.enabled = false;
+                assert!(
+                    retained_cli_models(Some(models), &summary, Some("source-a"), now).is_none()
+                );
+                summary.enabled = true;
+            }
+            assert!(retained_cli_models(None, &summary, Some("source-a"), 300).is_none());
+            supervisor.invalidate_snapshot("ws").await;
+            assert!(
+                supervisor
+                    .runtime_probe_snapshot("ws", "cli")
+                    .await
+                    .unwrap()
+                    .models
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn model_source_changes_with_launch_account_home_and_proxy_revisions() {
+        use pioneer_config::{
+            EffectiveGatewayCliAgentRuntimeInstanceConfig, GatewayCliAgentRuntimeKindConfig,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let base = EffectiveGatewayCliAgentRuntimeInstanceConfig {
+            id: "cli".into(),
+            kind: GatewayCliAgentRuntimeKindConfig::Codex,
+            display_name: "CLI".into(),
+            enabled: true,
+            binary_path: "fake-cli".into(),
+            home_path: temp.path().to_string_lossy().into_owned(),
+            shadow_home_path: None,
+            custom_models: vec![],
+            app_server_args: vec![],
+            startup_probe_timeout_ms: 100,
+            request_timeout_ms: 100,
+            idle_session_ttl_secs: 300,
+            event_channel_capacity: 64,
+            stderr_ring_lines: 64,
+            debug_native_events: false,
+        };
+        for (kind, account_file) in [
+            (GatewayCliAgentRuntimeKindConfig::Codex, "auth.json"),
+            (
+                GatewayCliAgentRuntimeKindConfig::Claude,
+                ".credentials.json",
+            ),
+            (GatewayCliAgentRuntimeKindConfig::OpenCode, "opencode.json"),
+        ] {
+            let instance = EffectiveGatewayCliAgentRuntimeInstanceConfig {
+                kind,
+                ..base.clone()
+            };
+            let original = cli_model_source_fingerprint(&instance, None).unwrap();
+            for changed in [
+                EffectiveGatewayCliAgentRuntimeInstanceConfig {
+                    id: "other".into(),
+                    ..instance.clone()
+                },
+                EffectiveGatewayCliAgentRuntimeInstanceConfig {
+                    binary_path: "other-cli".into(),
+                    ..instance.clone()
+                },
+                EffectiveGatewayCliAgentRuntimeInstanceConfig {
+                    home_path: temp.path().join("other").to_string_lossy().into_owned(),
+                    ..instance.clone()
+                },
+                EffectiveGatewayCliAgentRuntimeInstanceConfig {
+                    shadow_home_path: Some(
+                        temp.path().join("shadow").to_string_lossy().into_owned(),
+                    ),
+                    ..instance.clone()
+                },
+                EffectiveGatewayCliAgentRuntimeInstanceConfig {
+                    app_server_args: vec!["--changed".into()],
+                    ..instance.clone()
+                },
+                EffectiveGatewayCliAgentRuntimeInstanceConfig {
+                    custom_models: vec!["different".into()],
+                    ..instance.clone()
+                },
+            ] {
+                assert_ne!(
+                    original,
+                    cli_model_source_fingerprint(&changed, None).unwrap()
+                );
+            }
+            assert_ne!(
+                original,
+                cli_model_source_fingerprint(&instance, Some("http://proxy.test")).unwrap()
+            );
+            std::fs::write(temp.path().join(account_file), b"synthetic revision").unwrap();
+            assert_ne!(
+                original,
+                cli_model_source_fingerprint(&instance, None).unwrap()
+            );
         }
     }
 

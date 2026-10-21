@@ -702,6 +702,66 @@ impl ClientCore {
         drop(owner);
         self.sync_provider_startup(&request.key);
     }
+    /// Called by the runtime owner before it publishes new catalog evidence.
+    /// Removing the request identity fences even an already received old RPC
+    /// response. Existing waiters follow the replacement request, not its data.
+    pub(super) fn invalidate_cli_runtime_model_collections(
+        &self,
+        workspace: &str,
+        runtime_ids: &[String],
+    ) {
+        if runtime_ids.is_empty() {
+            return;
+        }
+        let mut owner = self.provider_store.lock().expect("provider store poisoned");
+        for (key, state) in &mut owner.collections {
+            if key.workspace_id != workspace
+                || !matches!(&key.collection,
+                ProviderCollection::Models { provider, .. } if list::runtime_id_from_cli_runtime_provider_key(provider)
+                    .is_some_and(|id| runtime_ids.iter().any(|changed| changed == id)))
+            {
+                continue;
+            }
+            let demanded = state.demand > 0 || !state.waiters.is_empty();
+            state.request = None;
+            let mut next = (*state.publication).clone();
+            next.models.clear();
+            next.runtime_models = None;
+            next.failure = None;
+            // Do not release current readers with an obsolete terminal value.
+            next.request = if demanded {
+                ProviderLoadState::Loading
+            } else {
+                ProviderLoadState::Idle
+            };
+            self.publish_provider_collection(state, next);
+        }
+    }
+
+    /// Resume after releasing the runtime owner: authorization publication
+    /// takes identity -> runtime, so runtime -> identity must never be nested.
+    pub(crate) fn resume_cli_runtime_model_collections(&self, workspace: &str) {
+        let keys = self
+            .provider_store
+            .lock()
+            .expect("provider store poisoned")
+            .collections
+            .iter()
+            .filter(|(key, state)| {
+                key.workspace_id == workspace
+                    && state.request.is_none()
+                    && state.publication.request == ProviderLoadState::Loading
+                    && (state.demand > 0 || !state.waiters.is_empty())
+                    && matches!(&key.collection, ProviderCollection::Models { provider, .. }
+                    if list::runtime_id_from_cli_runtime_provider_key(provider).is_some())
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.provider_collection_intent(ProviderCollectionIntent::Refresh { key });
+        }
+    }
+
     pub(crate) fn invalidate_provider_collections(&self) {
         let mut owner = self.provider_store.lock().expect("provider store poisoned");
         for state in owner.collections.values_mut() {
@@ -853,6 +913,103 @@ mod tests {
     fn models(provider: &str, names: &[&str]) -> Response {
         Response::Models(ProviderListModelsResponse { provider: provider.into(), models: names.iter().map(|id| serde_json::from_value(serde_json::json!({"id":id,"name":id,"provider":provider,"limits":{},"capabilities":{}})).unwrap()).collect() })
     }
+    #[test]
+    fn cli_catalog_update_fences_shared_collection_and_only_refreshes_its_scope() {
+        use crate::providers::runtime::ProviderRuntimeIntent;
+        let (core, requests) = fixture();
+        let key = ProviderCollectionKey::models(
+            "workspace",
+            "cli_runtime:codex",
+            ProviderModelKind::Chat,
+        );
+        let other = ProviderCollectionKey::models("workspace", "openai", ProviderModelKind::Chat);
+        core.provider_collection_intent(ProviderCollectionIntent::Observe { key: other.clone() });
+        core.complete_provider_collection(
+            requests.try_recv().unwrap(),
+            Ok(models("openai", &["untouched"])),
+        );
+        let other_before = core.provider_collection_snapshot(&other).unwrap();
+        let different_workspace = ProviderCollectionKey::models(
+            "elsewhere",
+            "cli_runtime:codex",
+            ProviderModelKind::Chat,
+        );
+        core.provider_collection_intent(ProviderCollectionIntent::Observe {
+            key: different_workspace.clone(),
+        });
+        core.complete_provider_collection(
+            requests.try_recv().unwrap(),
+            Ok(models("cli_runtime:codex", &["elsewhere"])),
+        );
+        let elsewhere_before = core
+            .provider_collection_snapshot(&different_workspace)
+            .unwrap();
+        core.provider_runtime_intent(ProviderRuntimeIntent::Observe {
+            workspace_id: "workspace".into(),
+        });
+        let mut runtime: RuntimeSummary = serde_json::from_value(serde_json::json!({
+            "runtime_id":"codex", "kind":"codex", "display_name":"Codex", "enabled":true,
+            "status":{"state":"initializing"}, "capabilities":{"supports_threads":true,"supports_model_list":true}
+        })).unwrap();
+        let initial = core.provider_runtime_request_for_test("workspace").unwrap();
+        core.complete_provider_runtime_for_test(
+            initial,
+            Ok(CLIRuntimeListResponse {
+                revision: 1,
+                runtimes: vec![runtime.clone()],
+            }),
+        );
+        let read = core.read_provider_collection(key.clone(), false).unwrap();
+        let stale = requests.try_recv().unwrap();
+        runtime.models_refreshed_at_unix_ms = Some(10);
+        core.observe_provider_runtime_notification(&GatewayNotification::CLIRuntimeStatusChanged(
+            CLIRuntimeStatusChangedNotification {
+                workspace_id: "workspace".into(),
+                revision: 2,
+                runtime: runtime.clone(),
+                removed: false,
+            },
+        ));
+        let current = requests.try_recv().unwrap();
+        assert_ne!(stale.generation, current.generation);
+        core.complete_provider_collection(stale, Ok(models("cli_runtime:codex", &["obsolete"])));
+        assert!(
+            core.provider_collection_snapshot(&key)
+                .unwrap()
+                .models()
+                .is_empty()
+        );
+        core.complete_provider_collection(current, Ok(models("cli_runtime:codex", &["current"])));
+        assert_eq!(read.wait().unwrap().models()[0].id(), "current");
+        assert!(Arc::ptr_eq(
+            &other_before,
+            &core.provider_collection_snapshot(&other).unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &elsewhere_before,
+            &core
+                .provider_collection_snapshot(&different_workspace)
+                .unwrap()
+        ));
+        let before = core.provider_collection_snapshot(&key).unwrap();
+        runtime.status = RuntimeStatus::Error {
+            message: "account/read failed".into(),
+        };
+        core.observe_provider_runtime_notification(&GatewayNotification::CLIRuntimeStatusChanged(
+            CLIRuntimeStatusChangedNotification {
+                workspace_id: "workspace".into(),
+                revision: 3,
+                runtime,
+                removed: false,
+            },
+        ));
+        assert!(Arc::ptr_eq(
+            &before,
+            &core.provider_collection_snapshot(&key).unwrap()
+        ));
+        assert!(requests.try_recv().is_err());
+    }
+
     fn transcription_model(id: &str, recommended: bool) -> ProviderModelInfo {
         ProviderModelInfo {
             id: id.to_owned(),

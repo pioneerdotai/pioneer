@@ -410,7 +410,7 @@ fn ready_native_composer_requires_application_draw_and_once_only_acknowledgement
 }
 
 #[test]
-fn runtime_wait_survives_ready_discovery_with_initializing_selected_row() {
+fn runtime_wait_uses_application_acknowledgement_after_cli_discovery() {
     let core = ClientCore::new();
     prepare(&core, true);
     let draft = core.composer_snapshot("a").unwrap();
@@ -451,8 +451,7 @@ fn runtime_wait_survives_ready_discovery_with_initializing_selected_row() {
         &pioneer_client::providers::runtime::ProviderRuntimeRequestState::Ready
     );
     assert!(
-        !core
-            .composer_snapshot("a")
+        core.composer_snapshot("a")
             .unwrap()
             .selected_provider_ready()
     );

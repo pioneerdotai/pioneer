@@ -1,13 +1,15 @@
 //! Provider list state.
 
 use super::catalog;
+#[cfg(test)]
+use pioneer_protocol::RuntimeStatus;
 use pioneer_protocol::{
     AgentExecutionBackend, CLIAgentRuntimeKind, CLIRuntimeListModelsParams,
     CLIRuntimeListModelsResponse, CLIRuntimeListParams, ProviderListModelsParams,
     ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
     ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits,
     ProviderModelReasoningCapabilities, ProviderSummary, ReasoningCapabilitySource,
-    RuntimeModelInfo, RuntimeStatus, RuntimeSummary,
+    RuntimeModelInfo, RuntimeSummary,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -307,7 +309,29 @@ impl ProviderModelSelectorState {
         self.error = None;
     }
 
+    pub(crate) fn selected_cli_catalog_changed(&self, runtimes: &[RuntimeSummary]) -> bool {
+        let Some(id) = self
+            .selected_provider
+            .as_deref()
+            .and_then(runtime_id_from_cli_runtime_provider_key)
+        else {
+            return false;
+        };
+        cli_runtime_catalog_changed(
+            self.cli_runtimes
+                .iter()
+                .find(|runtime| runtime.runtime_id == id),
+            runtimes.iter().find(|runtime| runtime.runtime_id == id),
+        )
+    }
+
     pub fn sync_cli_runtime_snapshot(&mut self, runtimes: Vec<RuntimeSummary>) {
+        if self.selected_cli_catalog_changed(&runtimes) {
+            // Catalog changes fence requests in the owning controllers. Keep
+            // the user's identity while discarding metadata from the old catalog.
+            self.models.clear();
+            self.loading_models = false;
+        }
         self.cli_runtimes = runtimes;
         self.loading_cli_runtimes = false;
     }
@@ -380,6 +404,28 @@ pub fn runtime_id_from_cli_runtime_provider_key(provider_key: &str) -> Option<&s
     provider_key.strip_prefix(CLI_RUNTIME_PROVIDER_PREFIX)
 }
 
+/// Only catalog/source evidence changes its applicability. Account metadata
+/// may be absent in a failed diagnostic response; that absence is not a change
+/// of source. The Gateway's catalog timestamp also covers invisible launch args.
+pub(crate) fn cli_runtime_catalog_changed(
+    previous: Option<&RuntimeSummary>,
+    current: Option<&RuntimeSummary>,
+) -> bool {
+    match (previous, current) {
+        (None, None) => false,
+        (Some(previous), Some(current)) => {
+            previous.enabled != current.enabled
+                || previous.kind != current.kind
+                || previous.home_path != current.home_path
+                || previous.shadow_home_path != current.shadow_home_path
+                || previous.binary_path != current.binary_path
+                || previous.proxy_url != current.proxy_url
+                || previous.models_refreshed_at_unix_ms != current.models_refreshed_at_unix_ms
+        }
+        _ => true,
+    }
+}
+
 pub fn provider_ready_for_model_selector(
     provider_key: Option<&str>,
     runtimes: &[RuntimeSummary],
@@ -410,11 +456,10 @@ pub fn resolve_cli_runtime_execution_backend(
         return Ok(None);
     };
 
-    if let Some(runtime) = cli_runtimes.iter().find(|runtime| {
-        runtime.runtime_id == runtime_id
-            && runtime.enabled
-            && matches!(runtime.status, RuntimeStatus::Ready)
-    }) {
+    if let Some(runtime) = cli_runtimes
+        .iter()
+        .find(|runtime| runtime.runtime_id == runtime_id && runtime.enabled)
+    {
         return Ok(Some(AgentExecutionBackend::CLIAgentRuntime {
             runtime_id: runtime.runtime_id.clone(),
             runtime_kind: runtime.kind,
@@ -422,7 +467,7 @@ pub fn resolve_cli_runtime_execution_backend(
     }
 
     Err(format!(
-        "CLI runtime `{runtime_id}` is not ready for message submission"
+        "CLI runtime `{runtime_id}` is missing or disabled for message submission"
     ))
 }
 
@@ -481,7 +526,6 @@ fn cli_runtime_visible_in_model_selector(runtime: &RuntimeSummary) -> bool {
     runtime.enabled
         && runtime.capabilities.supports_threads
         && runtime.capabilities.supports_model_list
-        && matches!(runtime.status, RuntimeStatus::Ready)
 }
 
 fn provider_model_from_runtime_model(
@@ -839,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_model_selector_exposes_ready_cli_runtime_rows() {
+    fn provider_model_selector_exposes_enabled_cli_runtime_rows() {
         let mut state = ProviderModelSelectorState::new(None, None);
         state.apply_provider_list_success(ProviderListResponse {
             providers: vec![ProviderSummary {
@@ -872,7 +916,7 @@ mod tests {
         });
 
         let rows = state.provider_rows();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 4);
         assert!(rows.iter().any(|row| row.id == "openai"));
         let codex = rows
             .iter()
@@ -887,19 +931,17 @@ mod tests {
             }
         );
         assert!(
-            !rows
-                .iter()
+            rows.iter()
                 .any(|row| row.id == cli_runtime_provider_key("claude_degraded"))
         );
         assert!(
-            !rows
-                .iter()
+            rows.iter()
                 .any(|row| row.id == cli_runtime_provider_key("claude_loading"))
         );
     }
 
     #[test]
-    fn provider_model_selector_hides_persisted_cli_selection_until_ready() {
+    fn provider_model_selector_keeps_persisted_cli_selection_during_initialization() {
         let provider_key = cli_runtime_provider_key("codex_work");
         let mut state =
             ProviderModelSelectorState::new(Some(provider_key.clone()), Some("gpt-5".to_owned()));
@@ -916,9 +958,16 @@ mod tests {
             )],
         });
 
-        assert_eq!(state.selected_provider_label(), None);
-        assert_eq!(state.preload_selected_provider_models(), None);
-        assert!(!state.loading_models());
+        assert_eq!(
+            state.selected_provider_label().as_deref(),
+            Some("Codex Work")
+        );
+        assert_eq!(
+            state.preload_selected_provider_models(),
+            Some(provider_key.clone())
+        );
+        assert!(state.loading_models());
+        assert_eq!(state.selection_parts().1.as_deref(), Some("gpt-5"));
 
         state.sync_cli_runtime_snapshot(vec![runtime_summary(
             "codex_work",
@@ -1299,6 +1348,58 @@ mod tests {
     }
 
     #[test]
+    fn selector_preserves_model_and_catalog_on_probe_error_but_drops_invalidated_rows() {
+        let provider = cli_runtime_provider_key("cli");
+        let mut selector =
+            ProviderModelSelectorState::new(Some(provider.clone()), Some("chosen".into()));
+        let mut runtime = runtime_summary("cli", "CLI", RuntimeStatus::Ready);
+        runtime.models_refreshed_at_unix_ms = Some(100);
+        selector.sync_cli_runtime_snapshot(vec![runtime.clone()]);
+        selector.apply_provider_models_success(
+            provider_models_response_from_cli_runtime_models_response(
+                provider.clone(),
+                CLIRuntimeListModelsResponse {
+                    runtime_id: "cli".into(),
+                    models: vec![RuntimeModelInfo {
+                        id: "chosen".into(),
+                        name: None,
+                        description: None,
+                        family: None,
+                        is_custom: false,
+                        active: Some(true),
+                        effort_options: vec![],
+                        input_modalities: vec![],
+                        output_modalities: vec![],
+                        supports_reasoning: None,
+                        supports_vision: None,
+                        max_input_tokens: None,
+                        max_output_tokens: None,
+                    }],
+                    diagnostics: vec![],
+                    refreshed_at_unix_ms: Some(100),
+                },
+            ),
+        );
+        runtime.status = RuntimeStatus::Error {
+            message: "probe failed".into(),
+        };
+        selector.sync_cli_runtime_snapshot(vec![runtime.clone()]);
+        assert_eq!(selector.models().len(), 1);
+        assert_eq!(
+            selector.selection_parts(),
+            (Some(provider.clone()), Some("chosen".into()))
+        );
+        assert!(provider_ready_for_model_selector(
+            Some(&provider),
+            &[runtime.clone()]
+        ));
+        runtime.models_refreshed_at_unix_ms = None;
+        selector.sync_cli_runtime_snapshot(vec![runtime]);
+        assert!(selector.models().is_empty());
+        assert_eq!(selector.selection_parts().1.as_deref(), Some("chosen"));
+    }
+
+    #[test]
     fn cli_runtime_backend_resolves_from_runtime_cache() {
         let backend = resolve_cli_runtime_execution_backend(
             Some(cli_runtime_provider_key("codex_work").as_str()),
@@ -1321,18 +1422,47 @@ mod tests {
     }
 
     #[test]
-    fn cli_runtime_backend_rejects_non_ready_runtime() {
-        let error = resolve_cli_runtime_execution_backend(
-            Some("cli_runtime:codex"),
-            &[runtime_summary(
-                "codex",
-                "Codex CLI",
+    fn cli_runtime_probe_failure_allows_attempt_but_disabled_and_missing_do_not() {
+        for kind in [
+            CLIAgentRuntimeKind::Codex,
+            CLIAgentRuntimeKind::Claude,
+            CLIAgentRuntimeKind::OpenCode,
+        ] {
+            for status in [
                 RuntimeStatus::Initializing,
-            )],
-        )
-        .expect_err("initializing CLI runtime must not be selected");
-
-        assert!(error.contains("not ready"));
+                RuntimeStatus::NeedsAuth,
+                RuntimeStatus::Error {
+                    message: "workspace routing discovery failed".into(),
+                },
+                RuntimeStatus::Degraded {
+                    message: "model refresh failed".into(),
+                },
+            ] {
+                let mut runtime = runtime_summary("cli", "CLI", status);
+                runtime.kind = kind;
+                assert!(provider_ready_for_model_selector(
+                    Some("cli_runtime:cli"),
+                    &[runtime.clone()]
+                ));
+                assert!(
+                    resolve_cli_runtime_execution_backend(
+                        Some("cli_runtime:cli"),
+                        &[runtime.clone()]
+                    )
+                    .unwrap()
+                    .is_some()
+                );
+                runtime.enabled = false;
+                assert!(!provider_ready_for_model_selector(
+                    Some("cli_runtime:cli"),
+                    &[runtime.clone()]
+                ));
+                assert!(
+                    resolve_cli_runtime_execution_backend(Some("cli_runtime:cli"), &[runtime])
+                        .is_err()
+                );
+            }
+        }
     }
 
     #[test]
