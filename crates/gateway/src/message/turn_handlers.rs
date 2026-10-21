@@ -8497,7 +8497,7 @@ impl MessageProcessor {
             attempt,
             input,
             transition,
-            false,
+            None,
         )
         .await
     }
@@ -8509,8 +8509,11 @@ impl MessageProcessor {
         attempt: pioneer_crud::CliRuntimeTurnAttemptRecord,
         mut input: JsonValue,
         transition: Arc<tokio::sync::OwnedMutexGuard<()>>,
-        task_continuation: bool,
+        task_continuation_outcomes: Option<
+            std::collections::BTreeSet<pioneer_agent::ObservedTaskOutcome>,
+        >,
     ) -> Result<bool, CliRuntimeRecoveryStartFailure> {
+        let task_continuation = task_continuation_outcomes.is_some();
         if task_continuation {
             self.restore_cli_runtime_recovery_turn_snapshot(&prepared_binding)
                 .await?;
@@ -8525,20 +8528,87 @@ impl MessageProcessor {
                 return Ok(false);
             }
         }
-        // Recovery may occur after the continuation receipt was committed but
-        // before its prompt reached the provider. Always include fresh task facts.
-        let task_state = self.cli_task_finalization_state(&prepared_binding).await?;
-        if !task_state.snapshot.pending.is_empty()
-            || !task_state.snapshot.review_required.is_empty()
-            || !task_state.snapshot.terminal.is_empty()
-        {
+        // Task continuations already carry their persisted snapshot. A marker
+        // can precede provider start: retain the saved terminal facts even when
+        // they are now observed. Ordinary recovery constructs a new input and
+        // still needs exactly one snapshot here.
+        let mut recovery_outcomes = task_continuation_outcomes.unwrap_or_default();
+        if !task_continuation {
+            let saved = self
+                .crud_store
+                .latest_cli_runtime_native_event(pioneer_crud::CliRuntimeNativeEventListFilter {
+                    turn_id: Some(prepared_binding.turn_id.clone()),
+                    native_method: Some("gateway/task_continuation".to_owned()),
+                    ..Default::default()
+                })
+                .await?;
+            let payload = if let Some(receipt) = saved {
+                // Replay the exact saved block even if its marker already exists.
+                serde_json::from_str::<JsonValue>(&receipt.payload_redacted_json)
+                    .map_err(anyhow::Error::from)?
+            } else {
+                let task_state = self.cli_task_finalization_state(&prepared_binding).await?;
+                if task_state.snapshot.pending.is_empty()
+                    && task_state.snapshot.review_required.is_empty()
+                    && task_state.snapshot.terminal.is_empty()
+                {
+                    json!({"input":[]})
+                } else {
+                    let task_input = serde_json::to_value(vec![
+                        pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text {
+                            text: task_state.continuation_text(),
+                        },
+                    ])
+                    .map_err(anyhow::Error::from)?;
+                    let payload = json!({"input":task_input, "terminalObservations":task_state.continuation_outcomes()});
+                    // A fresh recovery also owes this exact block if it crashes
+                    // after its marker. Use the existing input receipt lane;
+                    // do not include anti-dup facts or the generic recovery text.
+                    // No terminalTools/taskRevision counters: this is not an
+                    // empty native completion and must not spend/reset its budget.
+                    let now = chrono::Utc::now().fixed_offset();
+                    let receipt = self
+                        .crud_store
+                        .append_cli_runtime_native_event_if_absent(
+                            pioneer_crud::NewCliRuntimeNativeEvent {
+                                id: format!("{}:task-recovery-input", attempt.id),
+                                runtime_id: prepared_binding.runtime_id.clone(),
+                                runtime_kind: prepared_binding.runtime_kind.clone(),
+                                workspace_id: Some(prepared_binding.workspace_id.clone()),
+                                thread_id: Some(prepared_binding.thread_id.clone()),
+                                turn_id: Some(prepared_binding.turn_id.clone()),
+                                native_thread_id: Some(prepared_binding.native_thread_id.clone()),
+                                native_turn_id: None,
+                                native_method: "gateway/task_continuation".to_owned(),
+                                payload_redacted_json: serde_json::to_string(&payload)
+                                    .map_err(anyhow::Error::from)?,
+                                sequence: now.timestamp_millis(),
+                                created_at: now,
+                            },
+                        )
+                        .await?;
+                    serde_json::from_str::<JsonValue>(&receipt.payload_redacted_json)
+                        .map_err(anyhow::Error::from)?
+                }
+            };
+            recovery_outcomes = payload
+                .get("terminalObservations")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(anyhow::Error::from)?
+                .unwrap_or_default();
             let mut items: Vec<pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem> =
                 serde_json::from_value(input).map_err(anyhow::Error::from)?;
-            items.push(
-                pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text {
-                    text: task_state.continuation_text(),
-                },
-            );
+            let saved: Vec<pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem> =
+                serde_json::from_value(
+                    payload
+                        .get("input")
+                        .cloned()
+                        .context("task continuation receipt has no input")?,
+                )
+                .map_err(anyhow::Error::from)?;
+            items.extend(saved);
             input = serde_json::to_value(items).map_err(anyhow::Error::from)?;
         }
         let created = self
@@ -8600,6 +8670,13 @@ impl MessageProcessor {
                 restored.launch_spec.clone(),
             )
             .await?;
+        self.publish_cli_task_observations(
+            session_handle.instance(),
+            &prepared_binding,
+            &recovery_outcomes,
+            Some(&transition),
+        )
+        .await?;
         let cli_session = session_handle.session();
         self.ensure_cli_runtime_session_event_pumps(
             session_handle.instance(),

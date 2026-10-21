@@ -923,9 +923,9 @@ mod tests {
 
         assert_eq!(registry.cancel_session(&first_session), 1);
         assert_eq!(registry.cancel_session(&first_session), 1);
-        {
-            // Check one poll before using an adapter that retries Interrupted:
-            // a regression must fail here rather than trap the test in a loop.
+        // Inspect repeated polls before using an adapter that retries Interrupted:
+        // a regression must fail here rather than trap the test in a loop.
+        for _ in 0..2 {
             let mut bytes = [0_u8; 1];
             let mut buffer = ReadBuf::new(&mut bytes);
             let mut context = Context::from_waker(std::task::Waker::noop());

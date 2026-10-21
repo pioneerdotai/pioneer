@@ -310,6 +310,22 @@ impl TaskToolProvider for GatewayTaskToolProvider {
             ));
         }
 
+        let mut accepted_candidates = BTreeMap::new();
+        for item in &wait_state.completed {
+            if let Some(run) = &item.run {
+                if let Some(candidate) = processor
+                    .crud_store
+                    .get_accepted_task_result_candidate(&run.id)
+                    .await
+                    .map_err(|error| format!("{error:#}"))?
+                {
+                    if candidate.task_id == item.task.id && candidate.run_id == run.id {
+                        accepted_candidates.insert(item.task.id.clone(), candidate.id);
+                    }
+                }
+            }
+        }
+
         let revision_after = processor
             .crud_store
             .task_finalization_revision(context.thread_id.as_str(), context.turn_id.as_str())
@@ -357,6 +373,8 @@ impl TaskToolProvider for GatewayTaskToolProvider {
                 let run = item.run.as_ref();
                 TerminalTaskObservation {
                     task_id: item.task.id.clone(),
+                    task_revision: item.task.revision,
+                    accepted_candidate_id: accepted_candidates.get(&item.task.id).cloned(),
                     run_id: run.map(|run| run.id.clone()),
                     title: item.task.title.clone(),
                     status: task_status_label(item.task.status),
@@ -540,7 +558,7 @@ impl TaskToolProvider for GatewayTaskToolProvider {
         resolve_task_tool_authorization_scope(processor.as_ref(), &context)
             .await
             .map_err(|error| error.to_string())?;
-        let observed = observed_terminal_task_ids(&processor, &context)
+        let observed = observed_terminal_task_outcomes(&processor, &context)
             .await
             .map_err(|error| format!("{error:#}"))?;
         let tasks = attached_tasks_for_turn(&processor, &context)
@@ -548,7 +566,7 @@ impl TaskToolProvider for GatewayTaskToolProvider {
             .map_err(|error| format!("{error:#}"))?;
         let mut observations = Vec::new();
         for task in tasks {
-            if !task.status.is_terminal() || observed.contains(task.id.as_str()) {
+            if !task.status.is_terminal() {
                 continue;
             }
             let response = processor
@@ -567,8 +585,17 @@ impl TaskToolProvider for GatewayTaskToolProvider {
                 None => Default::default(),
             };
             let accepted_result = run.and_then(|run| accepted_candidate_result(&response, run));
-            observations.push(TerminalTaskObservation {
+            let observation = TerminalTaskObservation {
                 task_id: response.task.id.clone(),
+                task_revision: response.task.revision,
+                accepted_candidate_id: run
+                    .and_then(|run| {
+                        response.result_candidates.iter().find(|candidate| {
+                            candidate.run_id == run.id
+                                && candidate.status == TaskResultCandidateStatus::Accepted
+                        })
+                    })
+                    .map(|candidate| candidate.id.clone()),
                 run_id: run.map(|run| run.id.clone()),
                 title: response.task.title.clone(),
                 status: task_status_label(response.task.status),
@@ -601,7 +628,10 @@ impl TaskToolProvider for GatewayTaskToolProvider {
                     }),
                 child_thread_id: child_anchor.child_thread_id,
                 child_turn_id: child_anchor.child_turn_id,
-            });
+            };
+            if !observation.was_observed(&observed) {
+                observations.push(observation);
+            }
         }
         Ok(observations)
     }
@@ -4678,15 +4708,15 @@ async fn attached_tasks_for_turn(
         .collect())
 }
 
-pub(crate) async fn observed_terminal_task_ids(
+pub(crate) async fn observed_terminal_task_outcomes(
     processor: &Arc<MessageProcessor>,
     context: &TaskTurnContext,
-) -> anyhow::Result<BTreeSet<String>> {
+) -> anyhow::Result<BTreeSet<pioneer_agent::ObservedTaskOutcome>> {
     let parent_items = processor
         .crud_store
         .list_turn_items_by_type(context.turn_id.as_str(), "system_event")
         .await?;
-    let mut task_ids = BTreeSet::new();
+    let mut outcomes = BTreeSet::new();
     for item in parent_items {
         let TurnItem::SystemEvent {
             code,
@@ -4699,13 +4729,131 @@ pub(crate) async fn observed_terminal_task_ids(
         if code.as_deref() != Some("task.terminal.observed") {
             continue;
         }
-        if let Some(ids) = details.get("taskIds").and_then(JsonValue::as_array) {
-            for task_id in ids.iter().filter_map(JsonValue::as_str) {
-                task_ids.insert(task_id.to_owned());
-            }
+        // Legacy ID-only markers cannot prove which outcome was delivered.
+        if let Some(keys) = details.get("outcomes") {
+            outcomes.extend(
+                serde_json::from_value::<BTreeSet<pioneer_agent::ObservedTaskOutcome>>(
+                    keys.clone(),
+                )
+                .unwrap_or_default(),
+            );
         }
     }
-    Ok(task_ids)
+    // A mutation receipt proves commit, not delivery. Only a successful native
+    // completion with its actual result can supplement the observation events.
+    // The turn-scoped item lane survives restart and includes earlier attempts
+    // of this logical turn; do not restrict it to the latest session generation.
+    let Some(cli_binding) = processor
+        .crud_store
+        .get_cli_runtime_turn_binding(&context.turn_id)
+        .await?
+    else {
+        return Ok(outcomes);
+    };
+    if cli_binding.workspace_id != context.workspace_id
+        || cli_binding.thread_id != context.thread_id
+    {
+        return Ok(outcomes);
+    }
+    let bindings = processor
+        .crud_store
+        .list_turn_mcp_bindings(&context.turn_id)
+        .await?;
+    let mut tools = processor
+        .crud_store
+        .list_turn_items_with_status_by_type_for_turns(
+            std::slice::from_ref(&context.turn_id),
+            "dynamic_tool_call",
+        )
+        .await?;
+    for (item, lifecycle) in tools.remove(&context.turn_id).unwrap_or_default() {
+        if lifecycle.as_deref() != Some("completed") {
+            continue;
+        }
+        let TurnItem::DynamicToolCall {
+            id,
+            tool_name,
+            status: pioneer_protocol::ToolCallStatus::Completed,
+            success: Some(true),
+            storage,
+            ..
+        } = item
+        else {
+            continue;
+        };
+        let metadata = match storage {
+            ToolStoragePayload::Metadata { metadata } => metadata.to_json(),
+            ToolStoragePayload::Summary(summary) => summary.metadata.to_json(),
+            _ => continue,
+        };
+        let Some(binding) = bindings.iter().find(|binding| {
+            binding.canonical_callable_name == tool_name
+                && binding.raw_tool_name == tool_name
+                && crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(
+                    &binding.server_installation_id,
+                ) == Some(crate::turn_mcp::native_tools::NativeToolFamily::Tasks)
+                && crate::turn_mcp::native_tools::current_identity(&context.workspace_id, binding)
+                    .is_ok()
+        }) else {
+            continue;
+        };
+        if metadata["canonicalCallableName"].as_str() != Some(tool_name.as_str())
+            || metadata["rawToolName"].as_str() != Some(binding.raw_tool_name.as_str())
+            || metadata["serverInstallationId"].as_str()
+                != Some(binding.server_installation_id.as_str())
+            || metadata["serverName"].as_str() != Some(binding.server_name.as_str())
+            || metadata["providerCallId"].as_str() != Some(id.as_str())
+            || metadata["sessionGeneration"].as_u64().is_none()
+            || metadata["invocationCorrelationId"]
+                .as_str()
+                .is_none_or(|id| id.is_empty())
+            || metadata["status"].as_str() != Some("completed")
+        {
+            continue;
+        }
+        // Older items can still have sufficient canonical structuredContent.
+        // Content-only metadata that was already redacted cannot be recovered.
+        let payload = metadata
+            .get("taskResult")
+            .cloned()
+            .or_else(|| delivered_task_payload(&metadata["result"]));
+        if let Some(payload) = payload {
+            outcomes.extend(pioneer_agent::observed_terminal_task_outcomes_from_payload(
+                &tool_name, &payload,
+            ));
+        }
+    }
+    Ok(outcomes)
+}
+
+// These are native MCP result envelopes/content blocks, never display text or
+// arguments. Codex preserves the envelope; Claude normalizes tool_result.content
+// to it; OpenCode preserves the exact returned content array. Missing/omitted
+// result metadata deliberately leaves the terminal task for the existing gate.
+pub(crate) fn delivered_task_payload(result: &JsonValue) -> Option<JsonValue> {
+    if result.get("isError").and_then(JsonValue::as_bool) == Some(true) {
+        return None;
+    }
+    if let Some(payload) = result
+        .get("structuredContent")
+        .filter(|value| value.is_object())
+    {
+        return Some(payload.clone());
+    }
+    let content = result.get("content").unwrap_or(result);
+    let text = if let Some(text) = content.as_str() {
+        text
+    } else {
+        let blocks = content.as_array()?;
+        let [block] = blocks.as_slice() else {
+            return None;
+        };
+        if block.get("type")?.as_str()? != "text" {
+            return None;
+        }
+        block.get("text")?.as_str()?
+    };
+    serde_json::from_str(text).ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6474,6 +6622,210 @@ mod tests {
     }
 
     #[test]
+    fn terminal_observation_uses_current_public_task_projections() {
+        fn observed(tool: &str, value: &JsonValue) -> BTreeSet<String> {
+            pioneer_agent::observed_terminal_task_outcomes_from_payload(tool, value)
+                .into_iter()
+                .map(|outcome| match outcome {
+                    pioneer_agent::ObservedTaskOutcome::TaskRevision { task_id, .. }
+                    | pioneer_agent::ObservedTaskOutcome::AcceptedCandidate { task_id, .. } => {
+                        task_id
+                    }
+                })
+                .collect()
+        }
+        let mut response = sample_review_wait_response(
+            vec![pioneer_protocol::TaskWaitReviewAction::TaskAccept],
+            1,
+            None,
+            TaskResultCandidateStatus::PendingReview,
+        );
+        let mut item = response.review_required[0].item.clone();
+        let mut terminal_ids = BTreeSet::new();
+        for (bucket, status) in [
+            (&mut response.completed, TaskStatus::Completed),
+            (&mut response.failed, TaskStatus::Failed),
+            (&mut response.blocked, TaskStatus::Blocked),
+            (&mut response.cancelled, TaskStatus::Cancelled),
+        ] {
+            item.task.status = status;
+            item.task.id = format!("terminal_{status:?}");
+            item.task.completed_at = Some(200);
+            if let Some(run) = &mut item.run {
+                run.id = format!("terminal_run_{status:?}");
+                run.task_id = item.task.id.clone();
+                run.status = match status {
+                    TaskStatus::Completed => TaskRunStatus::Succeeded,
+                    TaskStatus::Failed => TaskRunStatus::Failed,
+                    TaskStatus::Blocked => TaskRunStatus::Blocked,
+                    TaskStatus::Cancelled => TaskRunStatus::Cancelled,
+                    _ => unreachable!(),
+                };
+                run.completed_at = Some(200);
+            }
+            terminal_ids.insert(item.task.id.clone());
+            bucket.push(item.clone());
+        }
+        item.task.id = "still_running".into();
+        item.task.status = TaskStatus::Running;
+        item.task.completed_at = None;
+        if let Some(run) = &mut item.run {
+            run.id = "still_running_run".into();
+            run.task_id = item.task.id.clone();
+            run.status = TaskRunStatus::Running;
+            run.completed_at = None;
+        }
+        response.pending.push(item.clone());
+        item.task.id = "future_scheduled".into();
+        item.task.status = TaskStatus::Scheduled;
+        item.run = None;
+        response
+            .non_waitable
+            .push(pioneer_protocol::TaskWaitNonWaitableItem {
+                item,
+                reason: pioneer_protocol::TaskWaitNonWaitableReason::FutureScheduledTaskWithoutActiveRun,
+                next_fire_at: Some(9999),
+            });
+        response.mode = TaskWaitMode::AllTerminal;
+        response.timed_out = true;
+        response.terminal_count = 4;
+        response.pending_count = 1;
+        response.non_waitable_count = 1;
+        response.blocked_count = 1;
+        response.total_count = 7;
+        let signature = TaskWaitSignature {
+            task_ids: terminal_ids
+                .iter()
+                .cloned()
+                .chain(response.pending.iter().map(|item| item.task.id.clone()))
+                .chain(
+                    response
+                        .review_required
+                        .iter()
+                        .map(|review| review.item.task.id.clone()),
+                )
+                .chain(
+                    response
+                        .non_waitable
+                        .iter()
+                        .map(|future| future.item.task.id.clone()),
+                )
+                .chain(["unreturned_target".into()])
+                .collect(),
+            run_ids: vec![],
+            mode: response.mode,
+        };
+        let payload = task_wait_tool_output(&response, &signature, &BTreeMap::new());
+        let _: pioneer_protocol::PublicTaskWaitResponse =
+            serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(observed("task_wait", &payload), terminal_ids);
+        let durable =
+            pioneer_protocol::ToolMetadata::from_json(json!({"taskResult":payload})).to_json();
+        assert_eq!(
+            observed("task_wait", &durable["taskResult"]),
+            terminal_ids,
+            "raw result body redaction must preserve terminal public task identities"
+        );
+        for item in response
+            .completed
+            .iter()
+            .chain(&response.failed)
+            .chain(&response.blocked)
+            .chain(&response.cancelled)
+        {
+            assert!(
+                pioneer_agent::observed_terminal_task_outcomes_from_payload(
+                    "task_wait",
+                    &durable["taskResult"]
+                )
+                .contains(&pioneer_agent::ObservedTaskOutcome::TaskRevision {
+                    task_id: item.task.id.clone(),
+                    revision: item.task.revision
+                })
+            );
+        }
+        assert!(observed("foreign_task_wait", &payload).is_empty());
+        for status in [
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Blocked,
+            TaskStatus::Cancelled,
+            TaskStatus::Running,
+            TaskStatus::Queued,
+            TaskStatus::WaitingReview,
+            TaskStatus::Scheduled,
+        ] {
+            let response = sample_task_response(status, vec![], None);
+            let get = task_get_tool_output(&response, false, &[], 200).unwrap();
+            let cancel = json!({"task": task_summary(&response.task)});
+            for (tool, payload) in [("task_get", get), ("task_cancel", cancel)] {
+                assert_eq!(
+                    observed(tool, &payload).contains(&response.task.id),
+                    status.is_terminal()
+                );
+            }
+        }
+        response.completed.clear();
+        response.failed.clear();
+        response.blocked.clear();
+        response.cancelled.clear();
+        response.review_required.clear();
+        response.non_waitable.clear();
+        response.terminal_count = 0;
+        response.blocked_count = 0;
+        response.review_required_count = 0;
+        response.non_waitable_count = 0;
+        response.total_count = 1;
+        assert!(
+            observed(
+                "task_wait",
+                &task_wait_tool_output(&response, &signature, &BTreeMap::new())
+            )
+            .is_empty()
+        );
+        for (tool, payload) in [
+            (
+                "task_accept",
+                json!({"alreadyCommitted":true,"taskId":"committed","runId":"run"}),
+            ),
+            (
+                "task_accept",
+                json!({"taskId":"pending","taskTerminal":false,"finalAnswerAllowed":true}),
+            ),
+            (
+                "task_revise",
+                json!({"taskId":"revised","taskTerminal":true}),
+            ),
+            ("task_wait", json!({"error":"failed"})),
+        ] {
+            assert!(observed(tool, &payload).is_empty());
+        }
+    }
+
+    #[test]
+    fn native_task_delivery_requires_a_complete_result_not_preview_or_arguments() {
+        let payload = json!({"taskId":"accepted", "taskTerminal":true});
+        let content = json!([{"type":"text","text":payload.to_string()}]);
+        for result in [
+            json!({"structuredContent":payload,"isError":false}),
+            json!({"content":content,"isError":false}),
+            content.clone(),
+            json!({"content":payload.to_string(),"isError":false}),
+        ] {
+            assert_eq!(delivered_task_payload(&result), Some(payload.clone()));
+        }
+        for result in [
+            json!({"structuredContent":payload,"isError":true}),
+            json!({"message":payload.to_string()}),
+            json!({"arguments":payload}),
+            json!({"content":[{"type":"text","text":"truncated {"}]}),
+            json!({"content":[{"type":"text","text":payload.to_string()},{"type":"text","text":"extra"}]}),
+        ] {
+            assert!(delivered_task_payload(&result).is_none());
+        }
+    }
+
+    #[test]
     fn task_wait_tool_output_uses_safe_review_projection() {
         let mut response = sample_review_wait_response(
             vec![
@@ -6680,6 +7032,57 @@ mod tests {
         };
 
         let output = task_accept_tool_output(&response, true);
+        assert_eq!(
+            pioneer_agent::observed_terminal_task_outcomes_from_payload("task_accept", &output),
+            BTreeSet::from([pioneer_agent::ObservedTaskOutcome::AcceptedCandidate {
+                task_id: response.task.id.clone(),
+                run_id: response.run.id.clone(),
+                candidate_id: response.candidate.id.clone()
+            }])
+        );
+
+        let observed =
+            pioneer_agent::observed_terminal_task_outcomes_from_payload("task_accept", &output);
+        let mut snapshot = TerminalTaskObservation {
+            task_id: response.task.id.clone(),
+            task_revision: response.task.revision,
+            accepted_candidate_id: Some(response.candidate.id.clone()),
+            run_id: Some(response.run.id.clone()),
+            title: response.task.title.clone(),
+            status: "completed".into(),
+            summary: None,
+            error_message: None,
+            child_thread_id: None,
+            child_turn_id: None,
+        };
+        assert!(snapshot.was_observed(&observed));
+        snapshot.accepted_candidate_id = Some("different-candidate".into());
+        assert!(
+            !snapshot.was_observed(&observed),
+            "accept cannot observe another candidate in the same run"
+        );
+        snapshot.accepted_candidate_id = Some(response.candidate.id.clone());
+        snapshot.status = "blocked".into();
+        assert!(
+            !snapshot.was_observed(&observed),
+            "an old accepted candidate cannot observe a blocked outcome"
+        );
+        let mut blocked_output = output.clone();
+        blocked_output["status"] = json!("blocked");
+        assert!(
+            pioneer_agent::observed_terminal_task_outcomes_from_payload(
+                "task_accept",
+                &blocked_output
+            )
+            .is_empty(),
+            "blocked acceptance cannot observe a future completion of that candidate after resume"
+        );
+        let mut incomplete = output.clone();
+        incomplete.as_object_mut().unwrap().remove("candidateId");
+        assert!(
+            pioneer_agent::observed_terminal_task_outcomes_from_payload("task_accept", &incomplete)
+                .is_empty()
+        );
 
         assert_eq!(output["accepted"], true);
         assert_eq!(output["alreadyAccepted"], false);
@@ -6746,6 +7149,14 @@ mod tests {
         };
 
         let output = task_accept_tool_output(&response, false);
+        assert_eq!(
+            pioneer_agent::observed_terminal_task_outcomes_from_payload("task_accept", &output),
+            BTreeSet::from([pioneer_agent::ObservedTaskOutcome::AcceptedCandidate {
+                task_id: response.task.id.clone(),
+                run_id: response.run.id.clone(),
+                candidate_id: response.candidate.id.clone()
+            }])
+        );
 
         assert_eq!(output["taskTerminal"], true);
         assert_eq!(output["finalAnswerAllowed"], false);

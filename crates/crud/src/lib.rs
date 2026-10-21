@@ -19365,6 +19365,67 @@ impl CrudStore {
             .collect()
     }
 
+    /// The answer accepted by the completed Turn's finalization commit. Legacy
+    /// workers have no intent: only an unambiguous FinalAnswer is usable there.
+    /// Read through this store's scheduling scope; decode after fetching rows.
+    pub async fn completed_turn_final_answer(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<TurnItem>> {
+        let Some(completed_turn) =
+            turn::find_turn_by_thread_and_id(&self.connection, thread_id, turn_id).await?
+        else {
+            return Ok(None);
+        };
+        let Some(owner) = thread::find_thread_by_id(&self.connection, thread_id).await? else {
+            return Ok(None);
+        };
+        if completed_turn.status != "completed" || owner.workspace_id != workspace_id {
+            return Ok(None);
+        }
+        if let Some(intent) = turn_finalization::find_by_turn_id(&self.connection, turn_id).await? {
+            if intent.status != turn_finalization::STATUS_COMMITTED
+                || intent.committed_at.is_none()
+                || intent.turn_id != turn_id
+                || intent.thread_id != thread_id
+                || intent.workspace_id != workspace_id
+            {
+                return Ok(None);
+            }
+            let notification = turn_finalization::notification_from_model(&intent)?;
+            return Ok(matches!(
+                &notification.item,
+                TurnItem::AgentMessage { id, phase: pioneer_protocol::AgentMessagePhase::FinalAnswer, .. }
+                    if id == &intent.item_id
+            )
+            .then_some(notification.item));
+        }
+        // Expand/migrate/contract compatibility with older workers. Neither
+        // created_at ties nor item-id sorting establish which of several finals
+        // was accepted, so ambiguity retains the existing missing-result path.
+        let mut finals = self
+            .list_completed_agent_messages(turn_id)
+            .await?
+            .into_iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    TurnItem::AgentMessage {
+                        phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                        ..
+                    }
+                )
+            });
+        let answer = finals.next();
+        Ok(if finals.next().is_none() {
+            answer
+        } else {
+            None
+        })
+    }
+
     pub async fn get_turn_item_events(
         &self,
         thread_id: &str,
@@ -34874,9 +34935,21 @@ mod tests {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
-        M::up(&connection, None)
+        // This private fixture has no published state yet. Pin its initial
+        // migration chain to one connection instead of reacquiring the pool
+        // for each schema statement. Runtime/domain transactions are unchanged.
+        let database = pioneer_sqlite::SqliteDatabase::from_single_connection(connection.clone());
+        let migration = database
+            .begin()
+            .await
+            .expect("fixture migration transaction");
+        M::up(&*migration, None)
             .await
             .expect("migrations must succeed");
+        migration
+            .commit()
+            .await
+            .expect("fixture schema must commit");
 
         let timestamp = unix_to_datetime(1_700_000_000);
         pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
@@ -36735,6 +36808,174 @@ mod tests {
         );
         drop(events);
         database.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_final_selector_uses_committed_intent_and_checks_ownership() {
+        for final_id in ["a_final", "z_final"] {
+            let (store, _, _) =
+                test_store_with_started_turn("ws_select", "thr_select", "turn_select").await;
+            let notification = |id: &str, phase, text: &str| ItemCompletedNotification {
+                workspace_id: "ws_select".into(),
+                thread_id: "thr_select".into(),
+                turn_id: "turn_select".into(),
+                item: TurnItem::AgentMessage {
+                    id: id.into(),
+                    text: text.into(),
+                    phase,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            };
+            let answer = notification(
+                final_id,
+                AgentMessagePhase::FinalAnswer,
+                "accepted substantive answer",
+            );
+            store
+                .materialize_item_completed(
+                    notification(
+                        "old_partial_final",
+                        AgentMessagePhase::FinalAnswer,
+                        "old attempt",
+                    ),
+                    1_700_000_100,
+                )
+                .await
+                .unwrap();
+            for (id, phase) in [
+                ("0_commentary", AgentMessagePhase::Commentary),
+                ("old_partial_final", AgentMessagePhase::Commentary),
+                ("zz_commentary", AgentMessagePhase::Commentary),
+            ] {
+                store
+                    .materialize_item_completed(
+                        notification(id, phase, "not the answer"),
+                        1_700_000_100,
+                    )
+                    .await
+                    .unwrap();
+            }
+            store
+                .prepare_turn_finalization(&answer, 1, None, 1_700_000_100)
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .completed_turn_final_answer("ws_select", "thr_select", "turn_select")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            store
+                .commit_prepared_turn_finalization("turn_select", 1_700_000_100)
+                .await
+                .unwrap();
+            store
+                .materialize_item_completed(
+                    notification(
+                        "late_commentary",
+                        AgentMessagePhase::Commentary,
+                        "not a final",
+                    ),
+                    1_700_000_100,
+                )
+                .await
+                .unwrap();
+            let restarted = CrudStore::new(store.database_connection()).with_maintenance_access();
+            assert_eq!(
+                restarted
+                    .completed_turn_final_answer("ws_select", "thr_select", "turn_select")
+                    .await
+                    .unwrap(),
+                Some(answer.item)
+            );
+            assert!(
+                restarted
+                    .completed_turn_final_answer("foreign", "thr_select", "turn_select")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                restarted
+                    .completed_turn_final_answer("ws_select", "foreign", "turn_select")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_final_selector_rejects_commentary_and_ambiguous_finals() {
+        for final_count in 0..=2 {
+            for final_id in ["a_final", "z_final"] {
+                let (store, _, mut turn) = test_store_with_started_turn(
+                    "ws_legacy_select",
+                    "thr_legacy_select",
+                    "turn_legacy_select",
+                )
+                .await;
+                let item = |id: &str, phase| TurnItem::AgentMessage {
+                    id: id.into(),
+                    text: id.into(),
+                    phase,
+                    markdown: None,
+                    markdown_version: None,
+                };
+                let answer = item(final_id, AgentMessagePhase::FinalAnswer);
+                let mut items = vec![
+                    item("0_commentary", AgentMessagePhase::Commentary),
+                    item("old_partial_final", AgentMessagePhase::Commentary),
+                    item("zz_commentary", AgentMessagePhase::Commentary),
+                ];
+                if final_count > 0 {
+                    items.push(answer.clone());
+                }
+                if final_count > 1 {
+                    items.push(item("other_final", AgentMessagePhase::FinalAnswer));
+                }
+                items.push(item("late_commentary", AgentMessagePhase::Commentary));
+                for item in items {
+                    store
+                        .materialize_item_completed(
+                            ItemCompletedNotification {
+                                workspace_id: "ws_legacy_select".into(),
+                                thread_id: "thr_legacy_select".into(),
+                                turn_id: "turn_legacy_select".into(),
+                                item,
+                            },
+                            1_700_000_100,
+                        )
+                        .await
+                        .unwrap();
+                }
+                turn.status = TurnStatus::Completed;
+                store
+                    .materialize_turn_completed(
+                        TurnCompletedNotification {
+                            workspace_id: "ws_legacy_select".into(),
+                            thread_id: "thr_legacy_select".into(),
+                            turn,
+                        },
+                        1_700_000_100,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    store
+                        .completed_turn_final_answer(
+                            "ws_legacy_select",
+                            "thr_legacy_select",
+                            "turn_legacy_select"
+                        )
+                        .await
+                        .unwrap(),
+                    (final_count == 1).then_some(answer)
+                );
+            }
+        }
     }
 
     #[tokio::test]
