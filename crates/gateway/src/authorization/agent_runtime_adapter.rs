@@ -279,6 +279,7 @@ impl BoundAgentActionAdapter {
     pub(crate) fn resolve_named_task_reviewer_launch(
         &self,
         nickname: &str,
+        saved_ceiling: &pioneer_protocol::ChildAgentLaunchGrantSet,
     ) -> Result<(AgentIdentityProjection, AgentExecutionProfileProjection), AgentToolAdapterError>
     {
         let nickname = nickname.trim();
@@ -287,11 +288,12 @@ impl BoundAgentActionAdapter {
                 "reviewer agent nickname is required".to_owned(),
             ));
         }
-        let mut identities = self
-            .start_options
-            .agents
-            .iter()
-            .filter(|identity| identity.nickname.eq_ignore_ascii_case(nickname));
+        let mut identities = self.start_options.agents.iter().filter(|identity| {
+            saved_ceiling.identities.iter().any(|saved| {
+                saved.nickname.eq_ignore_ascii_case(nickname)
+                    && pioneer_protocol::agent_identity_has_same_launch_source(identity, saved)
+            })
+        });
         let identity = identities.next().cloned().ok_or_else(|| {
             AgentToolAdapterError::InvalidInput(
                 "reviewer agent identity is stale or unavailable".to_owned(),
@@ -1263,6 +1265,7 @@ pub(crate) fn materialize_selected_task_agent_action_binding(
     depth: u16,
     role_key: &str,
     policy_generation: u64,
+    parent: &BoundAgentActionAdapter,
 ) -> Result<
     (
         BoundAgentActionAdapter,
@@ -1276,7 +1279,7 @@ pub(crate) fn materialize_selected_task_agent_action_binding(
         identity_status: pioneer_protocol::AgentIdentityStatus::Active,
         role_key: role_key.to_owned(),
         root_capsule_id: root_capsule_id.to_owned(),
-        parent_envelope: None,
+        parent_envelope: Some(parent.envelope.clone()),
         policy_generation,
     }
     .derive_envelope(RoleDefinitionRegistry::new())

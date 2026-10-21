@@ -34,6 +34,9 @@ mod memory_post_turn_response;
 #[path = "tests/task_capsule.rs"]
 mod task_capsule;
 
+#[path = "tests/task_launch_continuity.rs"]
+mod task_launch_continuity;
+
 #[path = "tests/reconciliation_workers.rs"]
 mod reconciliation_workers;
 
@@ -20978,6 +20981,16 @@ async fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_
         Some("turn_parent_task_test"),
         "immediate attached subagent should stay under the live parent turn"
     );
+    task_launch_continuity::assert_materialized_child_security(
+        &processor,
+        &run,
+        &lineage,
+        "turn_parent_task_test",
+        crate::turn_security::TurnSecurityResolverExecutionBackend::NativeApiProvider {
+            provider: "openai".to_owned(),
+        },
+    )
+    .await;
     let binding = crud_store
         .get_task_run_primary_thread_binding(run.id.as_str())
         .await
@@ -24787,6 +24800,16 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn_impl() 
         lineage.created_by_turn_id.as_deref(),
         Some(creation_turn_id)
     );
+    task_launch_continuity::assert_materialized_child_security(
+        &processor,
+        run,
+        &lineage,
+        run.id.as_str(),
+        crate::turn_security::TurnSecurityResolverExecutionBackend::NativeApiProvider {
+            provider: "openai".to_owned(),
+        },
+    )
+    .await;
     let occurrence_actor = turn::Entity::find_by_id(run.id.as_str())
         .one(&crud_store.database_connection())
         .await
@@ -30507,6 +30530,26 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             Some(run.id.as_str()),
             "the child security snapshot must inherit through the durable Task occurrence anchor"
         );
+        task_launch_continuity::assert_materialized_child_security(
+            &processor,
+            &run,
+            &lineage,
+            run.id.as_str(),
+            match runtime_kind {
+                CLIAgentRuntimeKind::Codex => {
+                    crate::turn_security::TurnSecurityResolverExecutionBackend::CodexCli {
+                        runtime_id: runtime_id.to_owned(),
+                    }
+                }
+                CLIAgentRuntimeKind::Claude => {
+                    crate::turn_security::TurnSecurityResolverExecutionBackend::ClaudeCli {
+                        runtime_id: runtime_id.to_owned(),
+                    }
+                }
+                CLIAgentRuntimeKind::OpenCode => unreachable!(),
+            },
+        )
+        .await;
         assert_eq!(
             security.backend.execution_backend,
             match runtime_kind {

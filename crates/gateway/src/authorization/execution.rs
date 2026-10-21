@@ -1581,6 +1581,71 @@ impl ExecutionAuthorizationContext {
         Ok(())
     }
 
+    pub(crate) fn provider_authority_for_selection(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Option<&str> {
+        self.grant_manifest
+            .provider
+            .as_ref()
+            .filter(|grant| grant.provider == provider && grant.model == model)
+            .map(|grant| grant.authority_fingerprint.as_str())
+    }
+
+    /// A Task is an allowance for future executions, not a credential lease.
+    /// Only a new execution may resolve the current connection, and only after
+    /// the saved provider/model and capsule authority passed lease revalidation.
+    /// Keep all other saved facts, including role, actions and resource caps.
+    /// Existing execution recovery must use verify_current_provider_authority.
+    pub(crate) fn resolve_new_task_provider_authority(
+        &self,
+        registry: &pioneer_provider::ProviderRegistry,
+        revalidated: &RevalidatedExecutionAuthorization,
+    ) -> Result<Self> {
+        revalidated.verify_context(self)?;
+        let mut resolved = self.clone();
+        if let Some(provider) = resolved.grant_manifest.provider.as_mut() {
+            let (kind, role) = self.registered_role_identity()?;
+            let policy = AuthorizationService::new();
+            if !self.grants_action(ResourceAction::ProviderUse)
+                || !policy.provider_model_allowed(
+                    kind,
+                    role.as_ref(),
+                    &provider.provider,
+                    &provider.model,
+                )
+                || !policy.provider_model_allowed(
+                    revalidated.principal.kind,
+                    revalidated.principal.role_key.as_ref(),
+                    &provider.provider,
+                    &provider.model,
+                )
+            {
+                bail!("saved Task provider/model is no longer granted");
+            }
+            // Resolve the same workspace-scoped instance through the registry:
+            // keys, endpoint/proxy validation and revocation remain registry-owned.
+            // This constructs an adapter; it does not call the external service.
+            let expected = registry.available_authority_fingerprint_for_workspace(
+                &self.workspace_id,
+                &provider.provider,
+            )?;
+            let current =
+                registry.get_or_create_for_workspace(&self.workspace_id, &provider.provider)?;
+            provider.authority_fingerprint = current
+                .authority_fingerprint()
+                .context("Task provider has no current workspace authority")?
+                .to_owned();
+            if provider.authority_fingerprint != expected.as_str() {
+                bail!("Task provider changed during new execution admission");
+            }
+        }
+        resolved.grant_manifest.validate()?;
+        resolved.verify_current_provider_authority(registry)?;
+        Ok(resolved)
+    }
+
     pub(crate) fn to_persisted_json(&self) -> Result<String> {
         serde_json::to_string(self).context("failed to serialize execution authorization context")
     }
