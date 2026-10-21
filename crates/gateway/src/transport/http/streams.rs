@@ -921,8 +921,19 @@ mod tests {
 
         assert_eq!(registry.cancel_session(&first_session), 1);
         assert_eq!(registry.cancel_session(&first_session), 1);
-        let error = first.read_u8().await.unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        // Tokio's integer readers retry Interrupted inside a single poll.
+        // Inspect the cancellation boundary directly, including repeated polls.
+        for _ in 0..2 {
+            let mut bytes = [0];
+            let mut buffer = ReadBuf::new(&mut bytes);
+            let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+            let Poll::Ready(Err(error)) = Pin::new(&mut first).poll_read(&mut cx, &mut buffer)
+            else {
+                panic!("a cancelled stream must immediately return an error");
+            };
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            assert_eq!(buffer.filled().len(), 0);
+        }
         drop(first);
         assert_eq!(registry.active_count(), 1);
         drop(second);

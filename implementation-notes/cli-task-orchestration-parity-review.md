@@ -259,3 +259,57 @@ before parsing/rendering/publication/provider calls. The snapshot's existing
 before/after aggregate revision fence covers the accepted-candidate lookup;
 commit-time finalization revalidation remains unchanged. Semantic receipt fields
 are prepared outside DB capacity and travel in the existing atomic write set.
+
+## CI repair — 21 October 2026
+
+Starting published HEAD: `eb2dd66b037b7984d6b1cf51419864a9f72e6f0d`.
+Evidence: the three attempts of Actions run `39445886024`, including Ubuntu job
+`118991938083`. All three hit the three-hour job limit. Windows/macOS checks
+succeeded. This repair changes no workflow, CI steps, dependency versions or
+timeouts; it does not skip tests or weaken their assertions.
+
+The lasting hang is the pre-existing
+`cancellation_and_repeated_drop_release_only_the_target_stream` test in
+`transport/http/streams.rs`. Its `read_u8` future retries `Interrupted` in a loop
+inside one poll in locked Tokio 1.54.0, while the cancelled reader always returns
+that error. Consequently the future never returns to its executor. The test now
+polls `AsyncRead` directly and checks immediate `Interrupted` twice, an empty
+buffer, and the original independent-stream/drop accounting. The Tokio test
+runtime is retained for the reader's idle timer. Production reader behavior is
+unchanged.
+
+Two new CLI regressions also failed before the suite timed out:
+
+- `cli_observation_tracks_the_child_outcome_across_same_run_resume` reached an
+  actual terminal-event collision after legal same-run resume. Persisted run,
+  turn and task terminal keys now include the existing occurrence retry number
+  when it is nonzero. Initial/legacy keys stay unchanged. This permits the new
+  projection while retaining deduplication within that retry. The terminal replay
+  lookup uses the identical key rule. Deliveries similarly receive a retry prefix,
+  and replay examines at most two delivery rows for that exact run/retry, rather
+  than confusing an earlier outcome's delivery with the current one.
+- `cli_recovery_delivers_exact_task_facts_and_preserves_substantive_final` expected
+  a recovery event while advancing ten seconds beyond job creation, under a
+  fifteen-second process-owner lease. Fixture setup consumes part of that lease.
+  The production coordinator correctly defers a lease-expired active execution.
+  The fixture now waits for the terminal consumer/ACK transition, heartbeats its
+  real process owner through CrudStore, and runs recovery at current time after
+  checking the job is due. The complete payload, substantive final and upper-parent
+  result assertions remain in place for all providers and crash windows.
+
+Database boundary: key selection reads the persisted occurrence and, only for
+task-level terminal payloads, the latest numbered run. These bounded reads remain
+inside the existing serialized append transaction, so preceding events in the
+same batch are visible. Delivery preparation reads occurrence state outside the
+writer as before; terminal commit still compares the exact occurrence, actor,
+policy and execution fence before writing. No transaction/ACK boundary or
+scheduling class changed, and no external work was added under DB capacity.
+The same-run regression additionally rejects a terminal transition prepared
+before resume, verifies rollback leaves the run running, checks that the new
+blocked turn is actually projected, and repeats the new terminal outcome without
+another task revision change. Existing stale-observation/restart checks remain.
+
+Validation performed: targeted rustfmt and `git diff --check`; static review of
+the changed paths, terminal replay and occurrence fences. No local build,
+compilation, test runner or runtime scenario was executed. CI must validate the
+repair after push; runtime success is not claimed here.

@@ -843,6 +843,18 @@ fn cli_observation_tracks_the_child_outcome_across_same_run_resume() {
                     )
                     .await
                     .unwrap();
+                let stale_terminal = processor
+                    .crud_store
+                    .prepare_task_terminal_transition(
+                        pioneer_protocol::TaskEventPayload::RunBlocked {
+                            task_id: a_id.into(),
+                            run_id: run_id.into(),
+                            error: first_error.clone(),
+                            blocked_at: now,
+                        },
+                    )
+                    .await
+                    .unwrap();
                 let resumed = processor
                     .crud_store
                     .resume_task_owned_turn(
@@ -869,6 +881,25 @@ fn cli_observation_tracks_the_child_outcome_across_same_run_resume() {
                 assert!(task.revision > before);
                 assert!(
                     processor
+                        .crud_store
+                        .commit_task_terminal_transition(stale_terminal)
+                        .await
+                        .is_err(),
+                    "a terminal write prepared before resume must lose its occurrence fence"
+                );
+                assert_eq!(
+                    processor
+                        .crud_store
+                        .get_task_run(run_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    pioneer_protocol::TaskRunStatus::Running,
+                    "stale terminal rejection must roll back the entire transition"
+                );
+                assert!(
+                    processor
                         .cli_task_finalization_state(&binding)
                         .await
                         .unwrap()
@@ -885,13 +916,56 @@ fn cli_observation_tracks_the_child_outcome_across_same_run_resume() {
                 resumed_turn.status = pioneer_protocol::TaskRunTurnStatus::Blocked;
                 resumed_turn.completed_at = Some(now + 1);
                 resumed_execution
-                    .record_task_run_turn_blocked(resumed_turn, first_error.clone(), now + 1)
+                    .record_task_run_turn_blocked(
+                        resumed_turn.clone(),
+                        first_error.clone(),
+                        now + 1,
+                    )
                     .await
                     .unwrap();
                 resumed_execution
-                    .block_run(first_error, now + 1)
+                    .block_run(first_error.clone(), now + 1)
                     .await
                     .unwrap();
+                let reblocked = processor
+                    .crud_store
+                    .get_latest_task_run_turn(run_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    reblocked.status,
+                    pioneer_protocol::TaskRunTurnStatus::Blocked
+                );
+                assert_eq!(reblocked.completed_at, Some(now + 1));
+                let revision = processor
+                    .crud_store
+                    .get_task(a_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .revision;
+                resumed_execution
+                    .record_task_run_turn_blocked(resumed_turn, first_error.clone(), now + 2)
+                    .await
+                    .unwrap();
+                resumed_execution
+                    .block_run(first_error, now + 2)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    processor
+                        .crud_store
+                        .get_task(a_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .task
+                        .revision,
+                    revision,
+                    "replaying the new outcome must not project it twice"
+                );
                 assert!(
                     !observed_cli_tasks(&processor, &turn_id)
                         .await
@@ -1183,6 +1257,21 @@ fn cli_recovery_delivers_exact_task_facts_and_preserves_substantive_final() {
                 reconstructed.crud_store =
                     Arc::new(CrudStore::new(processor.crud_store.database_connection()));
                 let processor = Arc::new(reconstructed);
+                // The terminal consumer owns its ACK independently of the
+                // publisher. Wait for that transition before driving recovery.
+                let transition = processor
+                    .cli_runtime_turn_resume_transition(&turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                drop(transition);
+                assert!(
+                    !processor
+                        .crud_store
+                        .has_pending_cli_runtime_terminal_event(&turn_id)
+                        .await
+                        .unwrap()
+                );
                 let jobs = processor
                     .crud_store
                     .find_recovery_jobs_by_turn_and_status(&turn_id, RecoveryJobStatus::Pending)
@@ -1193,9 +1282,22 @@ fn cli_recovery_delivers_exact_task_facts_and_preserves_substantive_final() {
                     .cli_session
                     .set_next_native_turn_id("payload_recovery")
                     .await;
+                // This recording fixture has no process heartbeat worker.
+                // Maintain its real owner lease rather than jumping ten
+                // seconds into the future and expiring that same authority.
+                processor
+                    .crud_store
+                    .heartbeat_turn_executions_owned_by(
+                        processor.turn_execution_owner_id.as_ref(),
+                        TURN_EXECUTION_OWNER_LEASE_SECONDS,
+                    )
+                    .await
+                    .unwrap();
+                let now = chrono::Utc::now().timestamp();
+                assert!(jobs[0].next_run_at_unix <= now);
                 let events = processor
                     .recovery_coordinator
-                    .run_ready_jobs(jobs[0].scheduled_at_unix.saturating_add(10), 1)
+                    .run_ready_jobs(now, 1)
                     .await
                     .unwrap();
                 assert_eq!(events.len(), 1);
