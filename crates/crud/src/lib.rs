@@ -34935,9 +34935,21 @@ mod tests {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
-        M::up(&connection, None)
+        // This private fixture has no published state yet. Pin its initial
+        // migration chain to one connection instead of reacquiring the pool
+        // for each schema statement. Runtime/domain transactions are unchanged.
+        let database = pioneer_sqlite::SqliteDatabase::from_single_connection(connection.clone());
+        let migration = database
+            .begin()
+            .await
+            .expect("fixture migration transaction");
+        M::up(&*migration, None)
             .await
             .expect("migrations must succeed");
+        migration
+            .commit()
+            .await
+            .expect("fixture schema must commit");
 
         let timestamp = unix_to_datetime(1_700_000_000);
         pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {

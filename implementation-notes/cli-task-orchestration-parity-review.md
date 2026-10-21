@@ -313,3 +313,35 @@ Validation performed: targeted rustfmt and `git diff --check`; static review of
 the changed paths, terminal replay and occurrence fences. No local build,
 compilation, test runner or runtime scenario was executed. CI must validate the
 repair after push; runtime success is not claimed here.
+
+## CI duration repair — head `48a109b3`
+
+Actions run `39565257931` reached the 180-minute job limit while still
+executing Tasks tests. It did not stall on the old stream test. The complete
+Gateway suite passed (2932 passed, 8 ignored) in 4579.19 seconds; CRUD unit tests
+passed (713 passed) in 1899.90 seconds. The same-run observation and all recovery
+payload regressions passed. Test completions continued until cancellation.
+Successful main run `39556987142` already spent 4045.83 seconds in Gateway and
+1686.43 seconds in CRUD, with a total workflow duration near 163 minutes.
+The PR runner took longer across these existing suites, exhausting the margin.
+
+The shared CRUD, Gateway and Tasks fixtures repeatedly build the full schema
+from an empty database. Many migrations use SQLite's default non-transactional
+SeaORM path, so each schema operation reacquires a pooled connection. The fixture
+helpers now run initial migration within one transaction through SqliteDatabase,
+pinning the physical connection for that chain. Migrations which request their
+own transaction use SeaORM's existing nested SAVEPOINT support. All migration
+steps, seed data, fixture isolation and test assertions remain in place.
+
+This atomic boundary is limited to unpublished fixture initialization: the
+database is private and no fixture consumer exists until commit. No domain state
+can become stale through a concurrent application writer at this point. The
+transaction is committed before workspace bootstrap, seeding, provider work or
+the actual test scenario. Migration/rollback tests which construct their own
+connections keep their existing setup. Production storage and migration entry
+points, dependencies and CI configuration are unchanged.
+
+Targeted rustfmt and `git diff --check` passed. No local build, compilation or
+tests were run. Removing repeated pool acquisition is established by source
+inspection; the time saved and completion within the existing CI limit require
+the next remote run and are not claimed as measured results.
