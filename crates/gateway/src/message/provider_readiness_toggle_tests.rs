@@ -119,10 +119,13 @@ fn assert_preserved(
     id: &str,
 ) {
     assert_eq!(
-        before
-            .runtimes
-            .iter()
-            .find(|runtime| runtime.runtime_id == id),
+        Some(
+            before
+                .runtimes
+                .iter()
+                .find(|runtime| runtime.runtime_id == id)
+                .expect("preserved runtime must exist in the baseline"),
+        ),
         after
             .runtimes
             .iter()
@@ -481,8 +484,17 @@ struct Harness {
 
 impl Harness {
     async fn new() -> Self {
-        let (processor, sessions, connection, notifications, workspaces, workspace) =
+        let (processor, sessions, connection, _, workspaces, workspace) =
             crate::message::tests::setup_workspace_message_processor().await;
+        sessions.unregister_connection(connection).await;
+        // Keep the complete notification sequence across repeated saves and
+        // probes without evicting this fixture's settings connection.
+        let (tx, notifications) = mpsc::channel(512);
+        let connection = crate::session::test_support::register_authenticated_test_connection(
+            sessions.as_ref(),
+            tx,
+        )
+        .await;
         let peer = workspaces
             .create_workspace("toggle-peer", Some("Toggle peer"))
             .await
@@ -501,9 +513,9 @@ impl Harness {
         .unwrap();
         let mut runtimes = GatewayCliRuntimeSettings::default();
         let mut second = runtimes.instances[0].clone();
-        second.id = "codex-two".into();
+        second.id = "codex_two".into();
         second.display_name = "Codex two".into();
-        second.nickname = "codex-two".into();
+        second.nickname = "codex_two".into();
         runtimes.instances.push(second);
         for instance in &mut runtimes.instances {
             instance.binary_path = home
@@ -677,7 +689,7 @@ async fn drain(
 async fn saved_toggles_probe_only_the_changed_instance_across_workspaces_and_kinds() {
     let h = Harness::new().await;
     h.baseline().await;
-    for target in ["codex", "claude", "opencode", "codex-two"] {
+    for target in ["codex", "claude", "opencode", "codex_two"] {
         let before = h
             .processor
             .provider_readiness
@@ -918,7 +930,7 @@ async fn fake_scheduler_rerun_and_retry_keep_selected_ids_and_independent_retry(
     h.failures.lock().unwrap().insert("codex".into());
     let mut scheduler = ProviderProbeScheduler::new(Arc::downgrade(&h.processor));
     assert!(scheduler.schedule_workspace(h.workspace.clone(), selected(&["codex"]), false));
-    assert!(!scheduler.schedule_workspace(h.workspace.clone(), selected(&["codex-two"]), true));
+    assert!(!scheduler.schedule_workspace(h.workspace.clone(), selected(&["codex_two"]), true));
     let completed = drain(&mut scheduler).await;
     assert_eq!(completed.len(), 2);
     let mut retries = HashMap::from([(h.workspace.clone(), selected(&["claude"]))]);
@@ -1182,7 +1194,7 @@ async fn successive_saves_coalesce_ids_and_preserve_known_catalogs_until_regular
             .snapshot(workspace)
             .await
             .unwrap();
-        for sibling in ["opencode", "codex-two"] {
+        for sibling in ["opencode", "codex_two"] {
             assert_preserved(&before, &snapshot, sibling);
         }
     }
@@ -1192,7 +1204,7 @@ async fn successive_saves_coalesce_ids_and_preserve_known_catalogs_until_regular
         .snapshot("known")
         .await
         .unwrap();
-    for sibling in ["opencode", "codex-two"] {
+    for sibling in ["opencode", "codex_two"] {
         assert_preserved(&known, &known_after, sibling);
     }
     scheduler
@@ -1234,10 +1246,13 @@ async fn settings_application_lock_keeps_seed_and_probe_from_reading_staged_conf
         .unwrap()
         .enabled = false;
     staged
-        .apply_protocol_update(GatewaySettingsUpdate {
-            cli_runtimes: Some(runtimes),
-            ..Default::default()
-        })
+        .apply_protocol_update_for_workspace(
+            GatewaySettingsUpdate {
+                cli_runtimes: Some(runtimes),
+                ..Default::default()
+            },
+            Some(&h.workspace),
+        )
         .unwrap();
     crate::settings::save_gateway_settings(&path, &staged).unwrap();
     let (seed_started, seed_wait) = tokio::sync::oneshot::channel();
@@ -1439,7 +1454,7 @@ async fn merged_command_behind_full_probe_repeats_only_the_forced_id_on_fake() {
         *h.counts.lock().unwrap(),
         HashMap::from([
             ("codex".into(), 2),
-            ("codex-two".into(), 1),
+            ("codex_two".into(), 1),
             ("claude".into(), 1),
             ("opencode".into(), 1)
         ])
@@ -1608,7 +1623,7 @@ async fn deferred_forced_global_request_survives_listing_failure(ordinary_full_b
                 .status,
             RuntimeStatus::Initializing
         ));
-        for sibling in ["claude", "opencode", "codex-two"] {
+        for sibling in ["claude", "opencode", "codex_two"] {
             assert_preserved(&before, &snapshot, sibling);
         }
     }
@@ -1636,7 +1651,7 @@ async fn deferred_forced_global_request_survives_listing_failure(ordinary_full_b
             ("codex".into(), 2),
             ("claude".into(), 2),
             ("opencode".into(), 2),
-            ("codex-two".into(), 2)
+            ("codex_two".into(), 2)
         ])
     );
     for workspace in [&h.workspace, &h.peer] {
@@ -1650,7 +1665,7 @@ async fn deferred_forced_global_request_survives_listing_failure(ordinary_full_b
                 .status,
             RuntimeStatus::Ready
         ));
-        for sibling in ["claude", "opencode", "codex-two"] {
+        for sibling in ["claude", "opencode", "codex_two"] {
             assert_preserved(&before, &snapshot, sibling);
         }
     }
@@ -1846,7 +1861,7 @@ async fn assert_cli_save_failure_outcome(mode: FailedCliSave) {
         );
         for (previous, current) in [(&before, &after), (&peer_before, &peer_after)] {
             assert_eq!(current.revision, previous.revision + 1);
-            for sibling in ["claude", "opencode", "codex-two"] {
+            for sibling in ["claude", "opencode", "codex_two"] {
                 assert_preserved(previous, current, sibling);
             }
             let a = current
