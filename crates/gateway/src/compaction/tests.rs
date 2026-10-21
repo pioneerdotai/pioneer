@@ -16553,11 +16553,13 @@ async fn composer_reuses_late_mixed_checkpoint_before_attached_child_policy() {
         "uncovered tail answer",
     )
     .await;
-    let tail_round = CanonicalProviderRoundEnvelope {
-        version: 1,
-        round_id: "mixed-tail-round".into(),
-        termination: ProviderTermination::ToolCalls,
-        message: ChatMessage::assistant_tool_calls(
+    // Read the persisted envelope so optional metadata added by newer providers
+    // uses its serde default, just as it does when restoring historical rounds.
+    let tail_round: CanonicalProviderRoundEnvelope = serde_json::from_value(serde_json::json!({
+        "version": 1,
+        "round_id": "mixed-tail-round",
+        "termination": ProviderTermination::ToolCalls,
+        "message": ChatMessage::assistant_tool_calls(
             None::<String>,
             vec![ProviderToolCall {
                 id: "mixed-tail-call".into(),
@@ -16565,12 +16567,13 @@ async fn composer_reuses_late_mixed_checkpoint_before_attached_child_policy() {
                 arguments: "{}".into(),
             }],
         ),
-        calls: vec![ProviderCallIdentity {
+        "calls": vec![ProviderCallIdentity {
             provider_call_id: "mixed-tail-call".into(),
             turn_item_id: "mixed-tail-tool-item".into(),
             ordinal: 0,
         }],
-    };
+    }))
+    .unwrap();
     let tail_result = pioneer_tools::ToolResultView::Json {
         value: serde_json::to_value(ChatMessage::tool_result(
             "mixed-tail-call",
