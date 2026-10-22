@@ -3,6 +3,7 @@ use super::*;
 use crate::authorization::{
     AuthorizationResolver, AuthorizationService, ProofResolution, ResourceAction,
 };
+use anyhow::anyhow;
 use axum::extract::ws::Message;
 use pioneer_protocol::{
     TaskInboxPatch, ThreadIndicatorPatch, WorkspacePushNotification, WorkspacePushParams,
