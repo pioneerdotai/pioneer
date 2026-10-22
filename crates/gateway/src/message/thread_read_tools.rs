@@ -715,5 +715,5 @@ fn thread_metadata_page_fits(threads: &[Value]) -> Result<bool> {
 }
 
 fn children_path_fingerprint(path: &[String]) -> Result<String> {
-    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(path)?)))
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(path)?)))
 }

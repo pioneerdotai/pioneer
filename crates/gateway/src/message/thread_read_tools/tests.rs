@@ -521,7 +521,7 @@ async fn legacy_tool_result_and_retained_log_are_readable_but_deleted_turn_is_no
                 turn_id: "legacy-tool-turn".into(),
                 item_id: "legacy-tool".into(),
                 delta: "retained stdout".into(),
-                stream: pioneer_protocol::ItemDeltaStream::Stdout,
+                stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
                 payload: None,
                 markdown: None,
                 markdown_version: None,

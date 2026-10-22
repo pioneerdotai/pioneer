@@ -234,7 +234,7 @@ impl MessageProcessor {
                 continue;
             };
             let encoded = serde_json::to_string(&record)?;
-            let digest = format!("{:x}", Sha256::digest(encoded.as_bytes()));
+            let digest = hex::encode(Sha256::digest(encoded.as_bytes()));
             let offset = state.fragment.as_ref().map_or(0, |f| f.offset);
             if let Some(fragment) = &state.fragment {
                 ensure!(

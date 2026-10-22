@@ -277,7 +277,10 @@ impl MessageProcessor {
         let text = serde_json::to_string(
             &serde_json::json!({"kind":"saved_item", "fullResultSaved":false, "item":saved}),
         )?;
-        let version = format!("saved-item:{:x}", Sha256::digest(text.as_bytes()));
+        let version = format!(
+            "saved-item:{}",
+            hex::encode(Sha256::digest(text.as_bytes()))
+        );
         if let Some(cursor) = &params.cursor {
             ensure!(cursor.version == version, "tool result cursor is stale");
         }
