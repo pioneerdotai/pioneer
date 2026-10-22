@@ -252,7 +252,7 @@ async fn assert_admitted_turn_owner(processor: &MessageProcessor, thread_id: &st
     );
 }
 
-async fn registered_request_context(
+pub(super) async fn registered_request_context(
     processor: &MessageProcessor,
     connection_id: ConnectionId,
     canonical_method: &'static str,
@@ -73016,7 +73016,7 @@ async fn setup_workspace_manager_with_connection(
     (workspace_manager, crud_store, workspace_id)
 }
 
-async fn setup_workspace_message_processor() -> (
+pub(super) async fn setup_workspace_message_processor() -> (
     MessageProcessor,
     Arc<SessionManager>,
     crate::session::ConnectionId,
