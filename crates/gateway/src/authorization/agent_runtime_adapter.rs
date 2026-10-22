@@ -893,6 +893,11 @@ fn validate_tool_launch(
     selection: &AgentToolLaunchSelection,
     options: &AgentToolOptionsProjection,
 ) -> Result<(), AgentToolAdapterError> {
+    if selection.use_default_reasoning && selection.reasoning.is_some() {
+        return Err(AgentToolAdapterError::InvalidInput(
+            "default reasoning and an explicit effort are mutually exclusive".to_owned(),
+        ));
+    }
     if selection.skill_ids.iter().collect::<BTreeSet<_>>().len() != selection.skill_ids.len()
         || selection
             .mcp_server_ids
@@ -1916,6 +1921,7 @@ mod tests {
             reasoning: Some(TurnReasoningSelection {
                 effort: "medium".to_owned(),
             }),
+            use_default_reasoning: false,
             permission_profile: Some(TurnPermissionProfileSelection {
                 mode: TurnPermissionMode::Supervised,
             }),

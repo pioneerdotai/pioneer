@@ -255,6 +255,11 @@ pub struct AgentToolLaunchSelection {
     pub profile: AgentToolProfileChoice,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<crate::TurnReasoningSelection>,
+    /// Use the selected model's native default, without inheriting an effort.
+    /// Mutually exclusive with reasoning. Omitted/false retains inheritance;
+    /// legacy reasoning:null also retains inheritance.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub use_default_reasoning: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_profile: Option<crate::TurnPermissionProfileSelection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -279,6 +284,7 @@ impl Default for AgentToolLaunchSelection {
             identity: Default::default(),
             profile: Default::default(),
             reasoning: None,
+            use_default_reasoning: false,
             permission_profile: None,
             skill_ids: Vec::new(),
             mcp_server_ids: Vec::new(),
@@ -319,6 +325,9 @@ impl AgentToolLaunchSelection {
                         model_id,
                     },
                 },
+                // Tool defaults are resolved before admission. A native-default
+                // choice persists as None alongside the exact chosen profile;
+                // recovery must not interpret that None as inheritance again.
                 reasoning: self.reasoning,
                 permission_profile: self.permission_profile,
                 skill_ids: self.skill_ids,
@@ -506,7 +515,7 @@ pub fn agent_turn_start_catalog_entry() -> AgentModelToolCatalogEntry {
     AgentModelToolCatalogEntry {
         name: AgentModelToolName::StartAgent,
         capability: AgentToolCapability::ChildStart,
-        description: "Start an Agent-turn in a permitted thread. Omit launch to inherit the current identity, executor, model and reasoning. For explicit models use threads_identity_odels_list. Use task_create for task delegation and attached subagents.".to_owned(),
+        description: "Start an Agent-turn in a permitted thread. Omit launch to inherit the current identity, executor, model and reasoning. For explicit models use threads_identity_odels_list. Set launch.useDefaultReasoning=true to use the selected model's native default without inheriting effort; do not combine it with launch.reasoning. Use task_create for task delegation and attached subagents.".to_owned(),
         parameters: schema::<AgentStartToolInput>(),
     }
 }
@@ -515,7 +524,7 @@ pub fn agent_identity_models_catalog_entry() -> AgentModelToolCatalogEntry {
     AgentModelToolCatalogEntry {
         name: AgentModelToolName::IdentityModelsList,
         capability: AgentToolCapability::ChildStart,
-        description: "List the admitted executors and models for an available identity, with per-model reasoning metadata. Select a model with launch.profile={kind: model, providerId, modelId}; identity uses launch.identity={kind: exact, id}. Catalogs do not grant launch authority.".to_owned(),
+        description: "List the admitted executors and models for an available identity, with per-model reasoning metadata. Select a model with launch.profile={kind: model, providerId, modelId}; identity uses launch.identity={kind: exact, id}. Set launch.useDefaultReasoning=true to avoid inheriting an effort, including for models without reasoning controls. Catalogs do not grant launch authority.".to_owned(),
         parameters: schema::<AgentIdentityModelsToolInput>(),
     }
 }
@@ -910,6 +919,7 @@ mod tests {
         for launch in [
             None,
             Some(json!({})),
+            Some(json!({"reasoning": null})),
             Some(json!({"reasoning": {"effort": "high"}})),
         ] {
             let mut input = json!({"targetOptionId": "current", "input": []});
@@ -922,7 +932,20 @@ mod tests {
                 AgentToolIdentityChoice::InheritParent
             );
             assert_eq!(input.launch.profile, AgentToolProfileChoice::InheritParent);
+            assert!(!input.launch.use_default_reasoning);
         }
+        let default: AgentToolLaunchSelection = serde_json::from_value(json!({
+            "useDefaultReasoning": true
+        }))
+        .unwrap();
+        assert!(default.use_default_reasoning);
+        assert!(
+            default
+                .into_server_selection()
+                .execution
+                .reasoning
+                .is_none()
+        );
         let input: AgentStartToolInput = serde_json::from_value(json!({
             "targetOptionId": "current", "input": [],
             "launch": { "profile": {"kind": "model", "providerId": "openai", "modelId": "catalog-model"} }
@@ -950,6 +973,7 @@ mod tests {
             },
             profile: AgentToolProfileChoice::InheritParent,
             reasoning: None,
+            use_default_reasoning: false,
             permission_profile: None,
             skill_ids: Vec::new(),
             mcp_server_ids: Vec::new(),

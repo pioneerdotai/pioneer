@@ -1731,6 +1731,7 @@ impl TaskToolHandler {
                 identity: AgentToolIdentityChoice::InheritParent,
                 profile: AgentToolProfileChoice::InheritParent,
                 reasoning: None,
+                use_default_reasoning: false,
                 permission_profile: None,
                 skill_ids: Vec::new(),
                 mcp_server_ids: Vec::new(),
@@ -3295,6 +3296,8 @@ struct TaskCreateToolInput {
     /// Optional child identity/profile and additional Skill/MCP selection from
     /// threads_start_options. Immediate tasks in the current capsule inherit the
     /// current Turn's selected capabilities. Empty lists keep that inheritance.
+    /// Set useDefaultReasoning=true to use the model's native default instead
+    /// of inheriting effort; this cannot be combined with reasoning.
     launch: Option<AgentToolLaunchSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Omit for an immediate attached subagent. Use this object directly; do not wrap it in spec, schedule, or triggerInput. For daily scheduled work choose the cron trigger kind and fill its leaf fields.
@@ -5839,6 +5842,7 @@ mod tests {
             identity: AgentToolIdentityChoice::InheritParent,
             profile: AgentToolProfileChoice::InheritParent,
             reasoning: None,
+            use_default_reasoning: false,
             permission_profile: None,
             skill_ids: Vec::new(),
             mcp_server_ids: Vec::new(),
@@ -5869,6 +5873,7 @@ mod tests {
             identity: AgentToolIdentityChoice::InheritParent,
             profile: AgentToolProfileChoice::InheritParent,
             reasoning: None,
+            use_default_reasoning: false,
             permission_profile: None,
             skill_ids: Vec::new(),
             mcp_server_ids: Vec::new(),

@@ -282,6 +282,41 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
         .unwrap()
         .unwrap();
     assert_eq!(message_thread.turns[0].mode, ThreadMode::Message);
+    let loaded = processor
+        .thread_manager
+        .thread_get(thread_id)
+        .await
+        .unwrap();
+    assert!(
+        processor
+            .thread_manager
+            .unload_orphaned_thread_if_idle(thread_id)
+            .await
+    );
+    processor
+        .ensure_thread_loaded(thread_id, &context.workspace_id)
+        .await
+        .unwrap();
+    let restored = processor
+        .thread_manager
+        .thread_get(thread_id)
+        .await
+        .unwrap();
+    let listed = processor
+        .crud_store
+        .list_threads_for_workspace(&context.workspace_id, 100)
+        .await
+        .unwrap();
+    let listed = listed.iter().find(|thread| thread.id == thread_id).unwrap();
+    for snapshot in [&loaded, &message_thread, &restored, listed] {
+        assert_eq!(snapshot.model_provider, "openai");
+        assert_eq!(snapshot.model, "gpt-5.4");
+        assert_eq!(snapshot.reasoning_effort.as_deref(), Some("high"));
+    }
+    for snapshot in [&loaded, &message_thread, listed] {
+        assert_eq!(snapshot.turns.len(), 1, "sending must not launch a model");
+        assert_eq!(snapshot.turns[0].mode, ThreadMode::Message);
+    }
     assert_eq!(
         message_thread.turns[0].author.as_ref().unwrap().actor,
         pioneer_protocol::PersistedActorRef::AgentExecution(facts.execution_id.clone())
@@ -434,8 +469,134 @@ async fn identity_models_catalog_exposes_model_reasoning_without_secrets_and_rej
         ceiling.profiles.contains(&public_profile),
         "Task actor profile must match its immutable grant exactly"
     );
+    let creation = binding
+        .options
+        .thread_creation_options
+        .iter()
+        .find(|option| option.label == "New delegated root")
+        .unwrap();
+    let created = call(
+        &tools,
+        "thread_create",
+        "create-no-effort",
+        json!({"optionId":creation.id}),
+    )
+    .await;
+    let targets: Vec<pioneer_protocol::AgentToolTargetOption> =
+        serde_json::from_value(created["targetOptions"].clone()).unwrap();
+    let target = targets
+        .iter()
+        .find(|target| {
+            !binding
+                .options
+                .target_options
+                .iter()
+                .any(|existing| existing.id == target.id)
+        })
+        .unwrap();
+    let arguments = json!({
+        "targetOptionId":target.id, "input":[{"type":"text","text":"Use native defaults"}],
+        "launch":{"profile":{"kind":"model", "providerId":"openai", "modelId":"catalog-no-effort"},
+            "useDefaultReasoning":true, "permissionProfile":{"mode":"full_access"}}
+    });
+    call(&tools, "threads_turn_start", "no-effort", arguments.clone()).await;
+    let db = processor.crud_store.database_connection();
+    let action_id = crate::authorization::action_id_for_call("no-effort");
+    let persisted = pioneer_crud::load_agent_action_outbox(&db, action_id.as_str())
+        .await
+        .unwrap()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&persisted.payload_json).unwrap();
+    let start: TurnStartParams =
+        serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+    assert_eq!(start.model.as_deref(), Some("catalog-no-effort"));
+    assert_eq!(start.model_provider.as_deref(), Some("openai"));
+    assert!(start.reasoning.is_none());
+    let replay = call(&tools, "threads_turn_start", "no-effort", arguments).await;
+    assert_eq!(replay["outcome"], "agent_action_already_committed");
+    assert_eq!(
+        pioneer_crud::load_agent_action_outbox(&db, action_id.as_str())
+            .await
+            .unwrap()
+            .unwrap()
+            .payload_json,
+        persisted.payload_json
+    );
+    // A real model launch with no explicit effort must retain NULL; it must
+    // not recover the earlier high effort from the parent's configuration.
+    let thread_id = payload["dispatch"]["thread_id"].as_str().unwrap();
+    call(
+        &tools,
+        "thread_message_send",
+        "post-no-effort",
+        json!({
+            "targetOptionId":target.id, "input":[{"type":"text","text":"Keep native defaults"}]
+        }),
+    )
+    .await;
+    let reloaded = processor
+        .crud_store
+        .get_thread_model(thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(reloaded.reasoning_effort.is_none());
+    let listed = processor
+        .crud_store
+        .list_threads_for_workspace(&context.workspace_id, 100)
+        .await
+        .unwrap();
+    assert!(
+        listed
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .unwrap()
+            .reasoning_effort
+            .is_none()
+    );
+    // task_create uses the same resolver and persists its canonical default
+    // selection in the actor contract rather than re-inheriting at execution.
+    use pioneer_agent::TaskToolProvider;
+    let task_tools = crate::task_tools::GatewayTaskToolProvider::new(Arc::downgrade(&processor))
+        .materialize_task_tools(pioneer_agent::TaskTurnContext {
+            workspace_id: context.workspace_id.clone(),
+            thread_id: context.thread_id.clone(),
+            turn_id: context.turn_id.clone(),
+        })
+        .await
+        .unwrap();
+    let task_tools = pioneer_agent::TurnToolMaterialization {
+        bundles: task_tools.bundles,
+        ..Default::default()
+    };
+    let task = call(&task_tools, "task_create", "task-no-effort", json!({
+        "title":"Model without effort", "goal":"Use the selected model's defaults",
+        "launch":{"profile":{"kind":"model","providerId":"openai","modelId":"catalog-no-effort"},
+            "useDefaultReasoning":true}
+    })).await;
+    let actor = processor
+        .crud_store
+        .get_task_actor_contract(task["taskId"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let launch = actor.launch.unwrap();
+    assert!(launch.execution.reasoning.is_none());
+    let task = processor
+        .crud_store
+        .get_task(task["taskId"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        task.agent_specs
+            .iter()
+            .any(|spec| spec.model.as_deref() == Some("catalog-no-effort")
+                && spec.model_provider.as_deref() == Some("openai"))
+    );
     let incompatible: AgentToolLaunchSelection = serde_json::from_value(json!({
-        "profile":{"kind":"model", "providerId":"openai", "modelId":"catalog-no-effort"}
+        "profile":{"kind":"model", "providerId":"openai", "modelId":"catalog-no-effort"},
+        "reasoning":{"effort":"high"}
     }))
     .unwrap();
     assert!(
@@ -444,6 +605,20 @@ async fn identity_models_catalog_exposes_model_reasoning_without_secrets_and_rej
             &context,
             incompatible,
             "incompatible"
+        )
+        .await
+        .is_err()
+    );
+    let conflicting: AgentToolLaunchSelection = serde_json::from_value(json!({
+        "useDefaultReasoning":true, "reasoning":{"effort":"high"}
+    }))
+    .unwrap();
+    assert!(
+        crate::message::agent_action_tools::resolve_tool_launch(
+            &processor,
+            &context,
+            conflicting,
+            "conflicting-reasoning"
         )
         .await
         .is_err()

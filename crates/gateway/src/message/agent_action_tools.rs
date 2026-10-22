@@ -1454,6 +1454,11 @@ pub(crate) async fn resolve_tool_launch(
         .agent_action_binding(&context.turn_id)
         .await
         .ok_or_else(|| ToolError::execution_failed("agent_execution_stale"))?;
+    if selection.use_default_reasoning && selection.reasoning.is_some() {
+        return Err(ToolError::invalid_arguments(
+            "agent_execution_selection_not_allowed",
+        ));
+    }
     if let Some(reasoning) = &mut selection.reasoning {
         reasoning.effort = pioneer_protocol::normalize_metadata_reasoning_effort(&reasoning.effort)
             .ok_or_else(|| ToolError::invalid_arguments("agent_execution_selection_not_allowed"))?;
@@ -1472,7 +1477,10 @@ pub(crate) async fn resolve_tool_launch(
     }
     .map_err(|_| ToolError::invalid_arguments("agent_execution_selection_not_allowed"))?;
     drop(adapter);
-    if selection.reasoning.is_none() && (identity.id == facts.identity.id || ephemeral) {
+    if !selection.use_default_reasoning
+        && selection.reasoning.is_none()
+        && (identity.id == facts.identity.id || ephemeral)
+    {
         let runtime = processor
             .crud_store
             .get_turn_runtime_snapshot(&context.turn_id)

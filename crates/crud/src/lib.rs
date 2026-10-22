@@ -3569,8 +3569,15 @@ fn completed_message_turn_events(
             sandbox_mode: write.sandbox_mode,
             turn: write.started_turn.clone(),
             input: write.input.to_vec(),
+            // An agent-authored Message does not select or run a model. Preserve
+            // the destination's configuration, including an intentional None,
+            // so single-thread and list snapshots restore the same selection.
+            reasoning_effort: if matches!(&write.actor, PersistedActorRef::AgentExecution(_)) {
+                write.thread.reasoning_effort.clone()
+            } else {
+                None
+            },
             actor: Some(write.actor),
-            reasoning_effort: None,
             work_owner: Default::default(),
         }),
         TurnEventPayload::TurnCompleted(write.completed),

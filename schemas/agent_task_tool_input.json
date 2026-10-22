@@ -150,6 +150,10 @@
           "items": {
             "$ref": "#/$defs/SkillId"
           }
+        },
+        "useDefaultReasoning": {
+          "description": "Use the selected model's native default, without inheriting an effort.\nMutually exclusive with reasoning. Omitted/false retains inheritance;\nlegacy reasoning:null also retains inheritance.",
+          "type": "boolean"
         }
       },
       "additionalProperties": false
