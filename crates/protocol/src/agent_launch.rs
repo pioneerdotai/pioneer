@@ -145,6 +145,49 @@ pub struct AgentExecutionProfileProjection {
     pub fingerprint: String,
 }
 
+/// Compare durable source membership, not a particular configuration snapshot.
+/// Workspace/source-id ownership is additionally checked against the identity
+/// repository at admission. CLI role_label records the runtime kind, so a
+/// different engine cannot be smuggled through an existing runtime instance.
+pub fn agent_identity_has_same_launch_source(
+    candidate: &AgentIdentityProjection,
+    ceiling: &AgentIdentityProjection,
+) -> bool {
+    candidate.id == ceiling.id
+        && candidate.source_kind == ceiling.source_kind
+        && match candidate.source_kind {
+            crate::AgentIdentitySourceKind::Ephemeral => candidate == ceiling,
+            crate::AgentIdentitySourceKind::CliRuntimeInstance => {
+                candidate.role_label == ceiling.role_label
+            }
+            crate::AgentIdentitySourceKind::NativeAgent => true,
+        }
+}
+
+/// Real launch capabilities may only narrow across catalog generations. Profile
+/// ids, generations, labels and fingerprints identify snapshots, not authority.
+pub fn agent_execution_profile_is_no_wider(
+    candidate: &AgentExecutionProfileProjection,
+    ceiling: &AgentExecutionProfileProjection,
+) -> bool {
+    candidate.backend == ceiling.backend
+        && candidate.provider_id == ceiling.provider_id
+        && candidate.model_id == ceiling.model_id
+        && !candidate.compatible_agent_identity_ids.is_empty()
+        && candidate
+            .compatible_agent_identity_ids
+            .iter()
+            .all(|id| ceiling.compatible_agent_identity_ids.contains(id))
+        && candidate
+            .allowed_reasoning
+            .iter()
+            .all(|reasoning| ceiling.allowed_reasoning.contains(reasoning))
+        && candidate
+            .allowed_permission_profiles
+            .iter()
+            .all(|mode| ceiling.allowed_permission_profiles.contains(mode))
+}
+
 /// Canonical exact reasoning selections that remain delegable by an admitted
 /// execution. Effort labels are backend-owned opaque values, so ordering them
 /// by presumed strength would be unsafe; the ceiling is an allow-set.
@@ -1420,6 +1463,24 @@ mod tests {
             crate::migrate_task_derived_child_launch_grant_json_to_current(&migrated)
                 .expect("current task child launch should be accepted");
         assert_eq!(migrated_again, migrated);
+        let crate::TaskDerivedChildLaunchGrant::ResolvedTaskLaunch {
+            identity,
+            profile,
+            child_launch_grant,
+            ..
+        } = serde_json::from_str(&migrated).unwrap();
+        let mut current = identity.clone();
+        current.source_revision += 1;
+        current.source_fingerprint = "updated-connection".to_owned();
+        assert!(agent_identity_has_same_launch_source(&current, &identity));
+        assert!(agent_execution_profile_is_no_wider(
+            &profile,
+            &child_launch_grant.profiles[0]
+        ));
+        assert!(
+            child_launch_grant.validate().is_ok(),
+            "reading legacy allowances never rewrites their authenticated snapshot"
+        );
     }
 
     #[test]

@@ -601,6 +601,40 @@ impl GatewaySettings {
         )
     }
 
+    /// Compare normalized common settings by stable ID. List order and
+    /// workspace compaction overrides do not change CLI probe configuration.
+    pub(crate) fn changed_cli_runtime_ids(
+        &self,
+        previous: &Self,
+        config: &GatewayConfig,
+    ) -> std::collections::BTreeSet<String> {
+        let by_id = |settings: &Self| {
+            let effective = settings.apply_to_gateway_config(config.clone());
+            let mut launch = effective
+                .effective_cli_agent_runtime_instances()
+                .into_iter()
+                .map(|instance| (instance.id.clone(), instance))
+                .collect::<BTreeMap<_, _>>();
+            cli_runtime_settings_from_gateway_config(&effective, settings.cli_runtimes.as_ref())
+                .instances
+                .into_iter()
+                .map(|instance| {
+                    let id = instance.id.clone();
+                    let effective = launch.remove(&id);
+                    (id, (instance, effective))
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let before = by_id(previous);
+        let after = by_id(self);
+        before
+            .keys()
+            .chain(after.keys())
+            .filter(|id| before.get(*id) != after.get(*id))
+            .cloned()
+            .collect()
+    }
+
     pub fn remote_access_secret_ref(&self) -> Option<&str> {
         if self.remote_access.enabled.unwrap_or(false)
             || self.remote_access.server.is_some()
@@ -1041,9 +1075,16 @@ impl GatewaySettings {
             self.apply_to_gateway_thread_episodic_config(config.thread_episodic);
         config.voice = self.effective_voice_input_config(&config.voice);
         if let Some(cli_runtimes) = &self.cli_runtimes {
+            // Settings expose only presentation, paths and enabled. Preserve
+            // the native launch fields of matching configured instances so a
+            // full-list save does not silently change their probe/session spec.
+            if config.cli_agent_runtimes.is_empty() {
+                config.cli_agent_runtime.enabled = true;
+            }
+            let inherited = config.effective_cli_agent_runtime_instances();
             config.cli_agent_runtime.enabled = false;
             config.cli_agent_runtimes =
-                cli_runtimes.to_gateway_cli_agent_runtime_instances_config();
+                cli_runtimes.to_gateway_cli_agent_runtime_instances_config(&inherited);
         } else if config.cli_agent_runtimes.is_empty() && !config.cli_agent_runtime.enabled {
             config.cli_agent_runtime.enabled = true;
         }
@@ -2067,11 +2108,19 @@ impl GatewayCliRuntimeSettingsOverride {
 
     fn to_gateway_cli_agent_runtime_instances_config(
         &self,
+        inherited: &[pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig],
     ) -> GatewayCliAgentRuntimeInstancesConfig {
+        let inherited = inherited
+            .iter()
+            .map(|instance| (instance.id.as_str(), instance))
+            .collect::<BTreeMap<_, _>>();
         let instances = self
             .instances
             .iter()
             .map(|instance| {
+                let base = inherited
+                    .get(instance.id.as_str())
+                    .filter(|base| base.kind == instance.kind);
                 (
                     instance.id.clone(),
                     GatewayCliAgentRuntimeInstanceConfig {
@@ -2082,14 +2131,18 @@ impl GatewayCliRuntimeSettingsOverride {
                         binary_path: Some(instance.binary_path.clone()),
                         home_path: Some(instance.home_path.clone()),
                         shadow_home_path: instance.shadow_home_path.clone(),
-                        custom_models: Vec::new(),
-                        app_server_args: Vec::new(),
-                        startup_probe_timeout_ms: None,
-                        request_timeout_ms: None,
-                        idle_session_ttl_secs: None,
-                        event_channel_capacity: None,
-                        stderr_ring_lines: None,
-                        debug_native_events: None,
+                        custom_models: base
+                            .map(|base| base.custom_models.clone())
+                            .unwrap_or_default(),
+                        app_server_args: base
+                            .map(|base| base.app_server_args.clone())
+                            .unwrap_or_default(),
+                        startup_probe_timeout_ms: base.map(|base| base.startup_probe_timeout_ms),
+                        request_timeout_ms: base.map(|base| base.request_timeout_ms),
+                        idle_session_ttl_secs: base.map(|base| base.idle_session_ttl_secs),
+                        event_channel_capacity: base.map(|base| base.event_channel_capacity),
+                        stderr_ring_lines: base.map(|base| base.stderr_ring_lines),
+                        debug_native_events: base.map(|base| base.debug_native_events),
                     },
                 )
             })
@@ -2435,6 +2488,22 @@ fn load_gateway_settings(
     expected_version: u32,
     _settings_file_name: &str,
 ) -> Result<GatewaySettings> {
+    let settings = read_gateway_settings(path, expected_version)?;
+    if settings.migrated {
+        save_gateway_settings(path, &settings).with_context(|| {
+            format!(
+                "failed to save migrated gateway settings `{}`",
+                path.display()
+            )
+        })?;
+    }
+    Ok(settings)
+}
+
+/// Read and validate the existing file without creating or rewriting it.
+/// Failure reconciliation must observe the writer's actual outcome, including
+/// an error returned after rename, without introducing another write attempt.
+pub(crate) fn read_gateway_settings(path: &Path, expected_version: u32) -> Result<GatewaySettings> {
     let path_display = path.display().to_string();
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read gateway settings `{path_display}`"))?;
@@ -2458,15 +2527,12 @@ fn load_gateway_settings(
         );
     }
 
-    if settings.migrated {
-        save_gateway_settings(path, &settings).with_context(|| {
-            format!("failed to save migrated gateway settings `{path_display}`")
-        })?;
-    }
-
     Ok(settings)
 }
 
+/// An error can follow a successful rename if the final permissions check
+/// fails. Callers must not infer that the previous configuration is still on
+/// disk from `Err` alone.
 pub fn save_gateway_settings(path: &Path, settings: &GatewaySettings) -> Result<()> {
     let mut settings = settings.clone();
     settings.migrate_legacy_active_recall_model();
@@ -4937,6 +5003,95 @@ model = "legacy-model"
             .as_nanos();
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("pioneer-settings-tests-{nanos}-{id}"))
+    }
+
+    #[test]
+    fn cli_full_list_update_preserves_unexposed_launch_settings_and_compares_effective_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut settings = load_or_create_gateway_settings(&path, 1, "settings.toml").unwrap();
+        // Model a legacy file whose CLI catalog still comes from AppConfig.
+        settings.cli_runtimes = None;
+        let mut config = gateway_config_with_keepawake(false);
+        config.cli_agent_runtimes = toml::from_str(
+            r#"
+[codex]
+kind = "codex"
+custom_models = ["private-codex"]
+app_server_args = ["--config", "model=private-codex"]
+request_timeout_ms = 12345
+[claude]
+kind = "claude"
+custom_models = ["private-claude"]
+app_server_args = ["--verbose"]
+startup_probe_timeout_ms = 23456
+[opencode]
+kind = "opencode"
+stderr_ring_lines = 73
+"#,
+        )
+        .unwrap();
+        let previous = settings.clone();
+        let before = settings
+            .apply_to_gateway_config(config.clone())
+            .effective_cli_agent_runtime_instances();
+        let mut runtimes = settings.effective_cli_runtime_settings(&config);
+        runtimes.instances.reverse();
+        settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                cli_runtimes: Some(runtimes.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            settings
+                .changed_cli_runtime_ids(&previous, &config)
+                .is_empty()
+        );
+        assert_eq!(
+            settings
+                .apply_to_gateway_config(config.clone())
+                .effective_cli_agent_runtime_instances(),
+            before
+        );
+        let previous = settings.clone();
+        runtimes
+            .instances
+            .iter_mut()
+            .find(|instance| instance.id == "codex")
+            .unwrap()
+            .enabled = false;
+        settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                cli_runtimes: Some(runtimes),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            settings.changed_cli_runtime_ids(&previous, &config),
+            std::collections::BTreeSet::from(["codex".to_owned()])
+        );
+        let after = settings
+            .apply_to_gateway_config(config)
+            .effective_cli_agent_runtime_instances();
+        for id in ["claude", "opencode"] {
+            assert_eq!(
+                before.iter().find(|instance| instance.id == id),
+                after.iter().find(|instance| instance.id == id)
+            );
+        }
+        assert_eq!(
+            before
+                .iter()
+                .find(|instance| instance.id == "codex")
+                .unwrap()
+                .app_server_args,
+            after
+                .iter()
+                .find(|instance| instance.id == "codex")
+                .unwrap()
+                .app_server_args
+        );
     }
 
     #[test]

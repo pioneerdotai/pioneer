@@ -16353,6 +16353,12 @@ async fn composer_reuses_late_mixed_checkpoint_before_attached_child_policy() {
         }
     }
     async fn assistant(f: &Fixture, thread: &str, turn: &str, id: &str, text: &str) {
+        let created_at = match turn {
+            "mixed-producer-turn" => "2021-01-01T00:00:00Z",
+            "mixed-delivery-turn" => "2022-01-01T00:00:00Z",
+            "mixed-tail-turn" => "2023-01-01T00:00:00Z",
+            _ => panic!("unexpected fixture turn: {turn}"),
+        };
         f.store
             .materialize_item_completed(
                 ItemCompletedNotification {
@@ -16367,7 +16373,9 @@ async fn composer_reuses_late_mixed_checkpoint_before_attached_child_policy() {
                         markdown_version: None,
                     },
                 },
-                chrono::Utc::now().timestamp(),
+                chrono::DateTime::parse_from_rfc3339(created_at)
+                    .unwrap()
+                    .timestamp(),
             )
             .await
             .unwrap();
@@ -16442,9 +16450,12 @@ async fn composer_reuses_late_mixed_checkpoint_before_attached_child_policy() {
 
     let f = fixture("raw accepted H", vec![], true, false).await;
     let db = f.store.database_connection();
+    // Context selection orders original source rows, not turn or delivery
+    // timestamps. Keep their chronology explicit even across second boundaries.
     for sql in [
         "UPDATE turn SET status='completed',created_at='2020-01-01T00:00:00Z' WHERE id='turn'",
-        r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('mixed-original','turn',0,'text','accepted question','{"type":"text","text":"accepted question"}',CURRENT_TIMESTAMP)"#,
+        "UPDATE turn_event SET created_at='2020-01-01T00:00:00Z' WHERE id='source'",
+        r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('mixed-original','turn',0,'text','accepted question','{"type":"text","text":"accepted question"}','2020-01-01T00:00:00Z')"#,
     ] {
         db.execute_unprepared(sql).await.unwrap();
     }
@@ -16478,7 +16489,7 @@ async fn composer_reuses_late_mixed_checkpoint_before_attached_child_policy() {
         .unwrap();
 
     install_child(&f, "producer", "turn").await;
-    db.execute_unprepared(r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('mixed-copy','mixed-producer-turn',0,'text','accepted question','{"type":"text","text":"accepted question"}',CURRENT_TIMESTAMP)"#).await.unwrap();
+    db.execute_unprepared(r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('mixed-copy','mixed-producer-turn',0,'text','accepted question','{"type":"text","text":"accepted question"}','2021-01-01T00:00:00Z')"#).await.unwrap();
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "UPDATE task SET metadata_json=? WHERE id='mixed-producer-task'",
@@ -16538,7 +16549,7 @@ async fn composer_reuses_late_mixed_checkpoint_before_attached_child_policy() {
         "INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES ('mixed-delivery','ws','mixed-producer-task','mixed-producer-run','mixed-delivery','thread','origin_thread','thread','delivered',1,1,'mixed-delivery-turn')",
         "INSERT INTO compaction_delivery_output(delivery_id,candidate_id,task_run_turn_id) VALUES ('mixed-delivery','mixed-candidate','mixed-producer-run-turn')",
         "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('mixed-tail-turn','thread','completed','conversation','user','2023-01-01T00:00:00Z',CURRENT_TIMESTAMP)",
-        r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('mixed-tail','mixed-tail-turn',0,'text','uncovered tail question','{"type":"text","text":"uncovered tail question"}',CURRENT_TIMESTAMP)"#,
+        r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('mixed-tail','mixed-tail-turn',0,'text','uncovered tail question','{"type":"text","text":"uncovered tail question"}','2023-01-01T00:00:00Z')"#,
         "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('mixed-composer-current','thread','in_progress','conversation','user','2024-01-01T00:00:00Z',CURRENT_TIMESTAMP)",
     ] {
         db.execute_unprepared(sql).await.unwrap();
@@ -16607,7 +16618,7 @@ async fn composer_reuses_late_mixed_checkpoint_before_attached_child_policy() {
     ] {
         db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES(?,'mixed-tail-turn',?,?,?,?,'{}',CURRENT_TIMESTAMP)",
+            "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES(?,'mixed-tail-turn',?,?,?,?,'{}','2023-01-01T00:00:00Z')",
             [id.into(), item.into(), sequence.into(), kind.into(), payload.into()],
         )).await.unwrap();
     }
@@ -17074,25 +17085,11 @@ async fn composer_reuses_late_mixed_checkpoint_before_attached_child_policy() {
             )
             .await
             .unwrap();
-            // Without summaries, the raw composition ends with the delivered
-            // branch's shared logical turn. The projected basis instead ends
-            // with the uncovered tail. Last-N selects from each representation.
-            let expected_ids = if thread == "mixed-raw-consumer"
-                && mode == TaskAgentContextMode::LastNTurns
-                && !include
-            {
-                let mut ids = sources(&accepted);
-                ids.extend(
-                    output_manifest
-                        .iter()
-                        .flat_map(|entry| &entry.sources)
-                        .filter(|source| source.scope.starts_with("event:"))
-                        .map(|source| source.id.clone()),
-                );
-                ids
-            } else {
-                expected_ids.clone()
-            };
+            // Raw and projected bases both end with the uncovered tail;
+            // Last-N must retain its complete tool round in either case.
+            if mode == TaskAgentContextMode::LastNTurns {
+                assert_tail_round(&selected.messages, &tail_sources);
+            }
             assert_eq!(
                 sources(&selected.messages),
                 expected_ids,

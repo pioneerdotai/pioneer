@@ -4,6 +4,10 @@ mod cli_task_tools;
 #[path = "tests/cli_runtime_active_bindings.rs"]
 mod cli_runtime_active_bindings;
 
+#[cfg(unix)]
+#[path = "tests/opencode_startup.rs"]
+mod opencode_startup;
+
 #[path = "tests/recovered_turn_stop.rs"]
 mod recovered_turn_stop;
 
@@ -33,6 +37,9 @@ mod memory_post_turn_response;
 
 #[path = "tests/task_capsule.rs"]
 mod task_capsule;
+
+#[path = "tests/task_launch_continuity.rs"]
+mod task_launch_continuity;
 
 #[path = "tests/reconciliation_workers.rs"]
 mod reconciliation_workers;
@@ -248,7 +255,7 @@ async fn assert_admitted_turn_owner(processor: &MessageProcessor, thread_id: &st
     );
 }
 
-async fn registered_request_context(
+pub(super) async fn registered_request_context(
     processor: &MessageProcessor,
     connection_id: ConnectionId,
     canonical_method: &'static str,
@@ -20982,6 +20989,16 @@ async fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_
         Some("turn_parent_task_test"),
         "immediate attached subagent should stay under the live parent turn"
     );
+    task_launch_continuity::assert_materialized_child_security(
+        &processor,
+        &run,
+        &lineage,
+        "turn_parent_task_test",
+        crate::turn_security::TurnSecurityResolverExecutionBackend::NativeApiProvider {
+            provider: "openai".to_owned(),
+        },
+    )
+    .await;
     let binding = crud_store
         .get_task_run_primary_thread_binding(run.id.as_str())
         .await
@@ -24791,6 +24808,16 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn_impl() 
         lineage.created_by_turn_id.as_deref(),
         Some(creation_turn_id)
     );
+    task_launch_continuity::assert_materialized_child_security(
+        &processor,
+        run,
+        &lineage,
+        run.id.as_str(),
+        crate::turn_security::TurnSecurityResolverExecutionBackend::NativeApiProvider {
+            provider: "openai".to_owned(),
+        },
+    )
+    .await;
     let occurrence_actor = turn::Entity::find_by_id(run.id.as_str())
         .one(&crud_store.database_connection())
         .await
@@ -30511,6 +30538,26 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             Some(run.id.as_str()),
             "the child security snapshot must inherit through the durable Task occurrence anchor"
         );
+        task_launch_continuity::assert_materialized_child_security(
+            &processor,
+            &run,
+            &lineage,
+            run.id.as_str(),
+            match runtime_kind {
+                CLIAgentRuntimeKind::Codex => {
+                    crate::turn_security::TurnSecurityResolverExecutionBackend::CodexCli {
+                        runtime_id: runtime_id.to_owned(),
+                    }
+                }
+                CLIAgentRuntimeKind::Claude => {
+                    crate::turn_security::TurnSecurityResolverExecutionBackend::ClaudeCli {
+                        runtime_id: runtime_id.to_owned(),
+                    }
+                }
+                CLIAgentRuntimeKind::OpenCode => unreachable!(),
+            },
+        )
+        .await;
         assert_eq!(
             security.backend.execution_backend,
             match runtime_kind {
@@ -33851,6 +33898,29 @@ async fn cancelling_detached_native_task_interrupts_only_its_child_continuation_
     let starts = wait_for_cli_runtime_turn_starts(&cli_session, 1).await;
     assert_eq!(starts.len(), 1);
     let native_thread_id = starts[0].native_thread_id.clone();
+    // The fake records entry into start_turn before the gateway persists the
+    // returned native turn and releases its startup transition. Cancel only
+    // after that handoff: this test covers cancellation of an active turn.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(binding) = crud_store
+                .get_cli_runtime_turn_binding(first_lineage.child_turn_id.as_str())
+                .await
+                .expect("native cancellation binding should load")
+                && binding.native_turn_id.as_deref() == Some("native_cancel_turn_1")
+                && let Some(transition) = processor
+                    .try_cli_runtime_turn_transition(&binding)
+                    .await
+                    .expect("native startup transition should be observable")
+            {
+                drop(transition);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("native turn must finish its startup handoff before cancellation");
 
     cancel_task_for_test(
         &processor,
@@ -46776,6 +46846,23 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
         })
         .expect("native Agent work must execute in an exact Composer child")
         .clone();
+    let admission = harness
+        .crud_store
+        .get_task_execution_admission(&native_task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let saved_authority =
+        crate::authorization::ExecutionAuthorizationContext::load_for_task_admission(
+            harness.crud_store.as_ref(),
+            &admission,
+        )
+        .await
+        .unwrap();
+    assert!(
+        saved_authority.granted_skill_ids().contains(&skill_id_text),
+        "the Agent skill must already belong to the saved Task allowance"
+    );
     let native_run_id =
         wait_for_task_run_id(harness.crud_store.clone(), native_task.id.as_str()).await;
     let native_child =
@@ -72989,7 +73076,7 @@ async fn setup_workspace_manager_with_connection(
     (workspace_manager, crud_store, workspace_id)
 }
 
-async fn setup_workspace_message_processor() -> (
+pub(super) async fn setup_workspace_message_processor() -> (
     MessageProcessor,
     Arc<SessionManager>,
     crate::session::ConnectionId,

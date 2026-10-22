@@ -83,6 +83,7 @@ pub use agent_launch::{
     AgentIdentitySelection, AgentLaunchSelection, AgentLaunchSelectionError,
     AgentStartOptionsProjection, AgentStartTarget, ChildAgentLaunchGrantMigrationError,
     ChildAgentLaunchGrantSet, ChildAgentLaunchGrantSetError, ReasoningCeiling, StartAgentIntent,
+    agent_execution_profile_is_no_wider, agent_identity_has_same_launch_source,
     migrate_embedded_child_launch_grant_json_to_current,
 };
 pub use agent_route::{

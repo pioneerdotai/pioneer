@@ -1991,6 +1991,60 @@ impl MessageProcessor {
             };
             let materialized_phase =
                 message_future(scope_current_stage(Stage::ComposerMaterialize, async {
+                    // Capture the native Agent-skill allowance when the Task is
+                    // admitted. The message-only parent owns no runtime pins;
+                    // later executions may only narrow this saved skill set.
+                    let overlay = if !matches!(
+                        launch.execution_backend.as_ref(),
+                        Some(AgentExecutionBackend::CLIAgentRuntime { .. })
+                            | Some(AgentExecutionBackend::ACPAgentRuntime { .. })
+                    ) && self.native_api_provider_supports_agent_skill_overlay(
+                        &thread.workspace_id,
+                        &outcome.materialization.thread.model_provider,
+                    ) {
+                        if execution_admission.uses_scoped_collaboration_policy() {
+                            match self
+                                .load_agent_skill_overlay_for_scoped_turn(
+                                    execution_admission.initiating_principal_id(),
+                                    &thread.workspace_id,
+                                    &turn_id,
+                                )
+                                .await
+                            {
+                                Ok(overlay) => overlay,
+                                Err(error) => {
+                                    self.thread_manager
+                                        .rollback_turn_start(outcome.rollback_context.clone())
+                                        .await;
+                                    self.send_turn_start_failure(
+                                        connection_id,
+                                        request_id.clone(),
+                                        &success_response,
+                                        &thread.id,
+                                        &turn_id,
+                                        TurnStartFailure::unavailable(format!(
+                                            "Agent skill allowance is unavailable: {error:#}"
+                                        )),
+                                    )
+                                    .await;
+                                    return None;
+                                }
+                            }
+                        } else {
+                            self.load_agent_skill_overlay_for_new_native_turn(
+                                &thread.workspace_id,
+                                &turn_id,
+                            )
+                            .await
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    let grant_capabilities =
+                        crate::authorization::execution_grant_capabilities_with_agent_skills(
+                            outcome.materialization.capabilities.as_slice(),
+                            overlay.into_iter().map(|entry| entry.skill_id),
+                        );
                     if let Err(message) = self
                         .admit_composite_execution_request(
                             &mut execution_admission,
@@ -2001,7 +2055,7 @@ impl MessageProcessor {
                             outcome.materialization.thread.model_provider.as_str(),
                             outcome.materialization.thread.model.as_str(),
                             &launch,
-                            outcome.materialization.capabilities.as_slice(),
+                            grant_capabilities.as_slice(),
                         )
                         .await
                     {

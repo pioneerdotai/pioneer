@@ -55,13 +55,14 @@ use reqwest::{Method, StatusCode};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::ChildStdin;
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout as tokio_timeout};
+use tokio::time::{Instant, sleep, timeout as tokio_timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 const OPENCODE_SERVER_USERNAME: &str = "opencode";
@@ -724,6 +725,174 @@ impl OpenCodeServerProcess {
     }
 }
 
+impl Drop for OpenCodeServerProcess {
+    fn drop(&mut self) {
+        self.stdout_reader.abort();
+        self.process.get_mut().abort_service();
+    }
+}
+
+// Startup owns the process before it can be published to a session/service.
+// Dropping a caller's future must kill its group and stop both pipe readers.
+struct OpenCodeStartupOwner {
+    process: Option<CLIAgentProcess>,
+    stdout_reader: Option<JoinHandle<()>>,
+}
+
+impl Drop for OpenCodeStartupOwner {
+    fn drop(&mut self) {
+        if let Some(reader) = &self.stdout_reader {
+            reader.abort();
+        }
+        if let Some(process) = &mut self.process {
+            process.abort_service();
+        }
+    }
+}
+
+const OPENCODE_STARTUP_MAX_ATTEMPTS: usize = 3;
+const OPENCODE_STARTUP_EXIT_DRAIN: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenCodeStartupStage {
+    Stdio,
+    AddressEof,
+    AddressRead,
+    AddressInvalid,
+    Timeout,
+    Health,
+}
+
+#[derive(Debug)]
+struct OpenCodeStartupFailure {
+    stage: OpenCodeStartupStage,
+    detail: String,
+    status: Option<ExitStatus>,
+    stderr: Vec<String>,
+    sqlite_busy: bool,
+    cleanup_error: Option<String>,
+}
+
+impl std::fmt::Display for OpenCodeStartupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let status = self
+            .status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "exit status unavailable".into());
+        let busy = if self.sqlite_busy {
+            "; SQLite database contention"
+        } else {
+            ""
+        };
+        let cleanup = self.cleanup_error.as_deref().unwrap_or("complete");
+        f.write_str(&bounded_safe_detail(&format!(
+            "OpenCode server startup failed ({:?}; {status}{busy}); {}; cleanup: {cleanup}; stderr: {}",
+            self.stage, self.detail, self.stderr.join(" | ")
+        )))
+    }
+}
+
+impl std::error::Error for OpenCodeStartupFailure {}
+
+#[derive(Debug)]
+struct OpenCodeStartupPreparationTimeout(&'static str);
+
+impl std::fmt::Display for OpenCodeStartupPreparationTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "OpenCode startup deadline exhausted {}; no process was spawned for this attempt",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for OpenCodeStartupPreparationTimeout {}
+
+fn opencode_sqlite_startup_conflict(
+    stage: OpenCodeStartupStage,
+    natural_status: Option<ExitStatus>,
+    stderr: &[String],
+) -> bool {
+    // Require an unsuccessful natural exit, before any usable endpoint. A
+    // timeout/health/boundary failure must never become retryable from stderr.
+    stage == OpenCodeStartupStage::AddressEof
+        && natural_status.is_some_and(|status| !status.success() && status.code().is_some())
+        && stderr
+            .iter()
+            .any(|line| line.trim() == "SQLiteError: database is locked")
+}
+
+fn opencode_startup_safe_detail(value: &str, env: &SensitiveEnvironment) -> String {
+    // In addition to StderrRing's exact secret redactions, hide launch values
+    // if the child echoes its environment/config. Never attach raw error chains.
+    let mut value = value.to_owned();
+    let mut values = env
+        .expose_iter()
+        .map(|(_, value)| value)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    values.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
+    for secret in values {
+        value = value.replace(secret, "[REDACTED]");
+    }
+    pioneer_protocol::sanitize_runtime_diagnostic_line(&value)
+}
+
+async fn opencode_startup_failure(
+    process: &mut CLIAgentProcess,
+    stage: OpenCodeStartupStage,
+    error: anyhow::Error,
+    env: &SensitiveEnvironment,
+    deadline: Instant,
+) -> OpenCodeStartupFailure {
+    // stdout EOF can win the race against the stderr reader and child reaping.
+    // wait() joins stderr; a descendant holding that pipe cannot block forever.
+    let mut natural_status = process.try_wait().ok().flatten();
+    if stage == OpenCodeStartupStage::AddressEof {
+        let drain_deadline = deadline.min(Instant::now() + OPENCODE_STARTUP_EXIT_DRAIN);
+        if let Ok(Ok(status)) = timeout_at(drain_deadline, process.wait()).await {
+            natural_status = Some(status);
+        } else if natural_status.is_none() {
+            natural_status = process.try_wait().ok().flatten();
+        }
+    }
+    let cleanup_error = match timeout_at(deadline, async {
+        terminate_opencode_process(process, Duration::from_secs(2)).await?;
+        // Parent exit and drained pipes are insufficient: descendants may
+        // have closed all their channels and still hold the shared store.
+        process.terminate_service_group(deadline).await?;
+        #[cfg(all(test, unix))]
+        startup_tests::pause_at(startup_tests::StartupPhase::GroupCleanupConfirmed).await;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(opencode_startup_safe_detail(&format!("{error:#}"), env)),
+        Err(_) => {
+            process.abort_service();
+            Some("startup deadline exhausted during process cleanup; owned process group force-termination requested".into())
+        }
+    };
+    let stderr = process.stderr().lines().await;
+    let sqlite_busy = opencode_sqlite_startup_conflict(stage, natural_status, &stderr);
+    let status = natural_status.or_else(|| process.try_wait().ok().flatten());
+    OpenCodeStartupFailure {
+        stage,
+        detail: opencode_startup_safe_detail(&format!("{error:#}"), env),
+        status,
+        stderr: pioneer_protocol::sanitize_runtime_diagnostic_lines(
+            stderr
+                .into_iter()
+                .map(|line| opencode_startup_safe_detail(&line, env))
+                .collect(),
+        ),
+        sqlite_busy,
+        cleanup_error,
+    }
+}
+
 async fn terminate_opencode_process(process: &mut CLIAgentProcess, grace: Duration) -> Result<()> {
     match tokio_timeout(
         grace + Duration::from_secs(2),
@@ -774,6 +943,77 @@ async fn spawn_opencode_server(
     process_generation: Option<u64>,
     managed_data_home: &Path,
 ) -> Result<OpenCodeServerProcess> {
+    // One budget covers preparation, all attempts, health, draining/cleanup and
+    // backoff. Outer readiness (60s) and compaction deadlines may cancel sooner.
+    let deadline = Instant::now() + Duration::from_millis(instance.startup_probe_timeout_ms.max(1));
+    let mut last_confirmed_error: Option<anyhow::Error> = None;
+    for attempt in 1..=OPENCODE_STARTUP_MAX_ATTEMPTS {
+        let error = match spawn_opencode_server_attempt(
+            instance,
+            cwd,
+            environment,
+            process_generation,
+            managed_data_home,
+            deadline,
+        )
+        .await
+        {
+            Ok(server) => return Ok(server),
+            Err(error) => error,
+        };
+        if error.is::<OpenCodeStartupPreparationTimeout>()
+            && let Some(previous) = last_confirmed_error.take()
+        {
+            // Keep just the last completed process failure, explicitly scoped
+            // to its attempt. Preparation itself has neither exit nor stderr.
+            return Err(previous).with_context(|| {
+                format!(
+                    "{error} (attempt {attempt}); last completed process attempt {} follows",
+                    attempt - 1
+                )
+            });
+        }
+        let retry = error
+            .downcast_ref::<OpenCodeStartupFailure>()
+            .is_some_and(|failure| failure.sqlite_busy && failure.cleanup_error.is_none());
+        if !retry || attempt == OPENCODE_STARTUP_MAX_ATTEMPTS {
+            return Err(error)
+                .with_context(|| format!("OpenCode startup failed after {attempt} attempt(s)"));
+        }
+        // Independent jitter prevents simultaneous probes repeating in lockstep.
+        let delay = Duration::from_millis(rand::random_range(100..=250) * attempt as u64);
+        if Instant::now() + delay >= deadline {
+            return Err(error).context("OpenCode startup deadline exhausted before SQLite retry");
+        }
+        if timeout_at(deadline, async {
+            let delay = sleep(delay);
+            #[cfg(all(test, unix))]
+            startup_tests::pause_at(startup_tests::StartupPhase::RetryDelay).await;
+            delay.await;
+        })
+        .await
+        .is_err()
+            || Instant::now() >= deadline
+        {
+            return Err(error)
+                .context("OpenCode startup deadline exhausted during SQLite retry delay");
+        }
+        last_confirmed_error = Some(error);
+    }
+    unreachable!("OpenCode startup attempt limit is nonzero")
+}
+
+async fn spawn_opencode_server_attempt(
+    instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
+    cwd: &Path,
+    environment: &SensitiveEnvironment,
+    process_generation: Option<u64>,
+    managed_data_home: &Path,
+    deadline: Instant,
+) -> Result<OpenCodeServerProcess> {
+    if Instant::now() >= deadline {
+        return Err(OpenCodeStartupPreparationTimeout("before preparation").into());
+    }
     validate_opencode_custom_args(&instance.app_server_args)
         .context("invalid OpenCode custom launch arguments")?;
     let password = SecretString::new(format!(
@@ -818,16 +1058,22 @@ async fn spawn_opencode_server(
         .prefix("pioneer-opencode-catalog-")
         .tempdir()?;
     let catalog_rpc_id = format!("pioneer.catalog.{}", uuid::Uuid::new_v4().simple());
-    tokio::fs::write(
-        catalog_plugin.path().join("package.json"),
-        r#"{"name":"pioneer-opencode-catalog","type":"module","main":"server.js"}"#,
-    )
-    .await?;
-    tokio::fs::write(
-        catalog_plugin.path().join("server.js"),
-        include_str!("opencode_catalog.js").replace("__PIONEER_CATALOG_ID__", &catalog_rpc_id),
-    )
-    .await?;
+    timeout_at(deadline, async {
+        #[cfg(all(test, unix))]
+        startup_tests::pause_at(startup_tests::StartupPhase::PreparingPlugin).await;
+        tokio::fs::write(
+            catalog_plugin.path().join("package.json"),
+            r#"{"name":"pioneer-opencode-catalog","type":"module","main":"server.js"}"#,
+        )
+        .await?;
+        tokio::fs::write(
+            catalog_plugin.path().join("server.js"),
+            include_str!("opencode_catalog.js").replace("__PIONEER_CATALOG_ID__", &catalog_rpc_id),
+        )
+        .await
+    })
+    .await
+    .map_err(|_| OpenCodeStartupPreparationTimeout("preparing catalog plugin"))??;
     let plugin_url = reqwest::Url::from_directory_path(catalog_plugin.path())
         .map_err(|_| anyhow!("OpenCode V2 catalog plugin path is invalid"))?;
     // Native V2 inline config. Global/project MCP entries are removed before
@@ -873,29 +1119,50 @@ async fn spawn_opencode_server(
     process_config
         .args
         .extend(instance.app_server_args.iter().cloned());
-    let mut process = spawn_cli_agent_process(&process_config)
+    if Instant::now() >= deadline {
+        return Err(OpenCodeStartupPreparationTimeout("before spawn").into());
+    }
+    let process = spawn_cli_agent_process(&process_config)
         .with_context(|| format!("failed to spawn OpenCode server `{}`", instance.binary_path))?;
+    let mut owner = OpenCodeStartupOwner {
+        process: Some(process),
+        stdout_reader: None,
+    };
+    let process = owner.process.as_mut().expect("startup owns process");
     let stderr = process.stderr();
     let (stdout, stdin) = match process.take_stdio() {
         Ok(stdio) => stdio,
         Err(error) => {
-            let _ = terminate_opencode_process(&mut process, Duration::from_secs(2)).await;
-            return Err(error).context("failed to capture OpenCode server stdio");
+            return Err(opencode_startup_failure(
+                process,
+                OpenCodeStartupStage::Stdio,
+                error,
+                &process_config.env,
+                deadline,
+            )
+            .await
+            .into());
         }
     };
     let mut reader = BufReader::new(stdout);
-    let startup_timeout = Duration::from_millis(instance.startup_probe_timeout_ms.max(1));
-    let base_url = tokio_timeout(startup_timeout, async {
+    let mut failure_stage = OpenCodeStartupStage::AddressRead;
+    let base_url = timeout_at(deadline, async {
         let mut line = String::new();
         loop {
             line.clear();
-            let read = reader.read_line(&mut line).await?;
+            let read = reader.read_line(&mut line);
+            #[cfg(all(test, unix))]
+            let read = startup_tests::observe_address_read(read).await?;
+            #[cfg(not(all(test, unix)))]
+            let read = read.await?;
             if read == 0 {
+                failure_stage = OpenCodeStartupStage::AddressEof;
                 bail!("OpenCode server exited before publishing its listen address");
             }
             if let Ok(address) = serde_json::from_str::<JsonValue>(line.trim())
                 && let Some(url) = address["url"].as_str()
             {
+                failure_stage = OpenCodeStartupStage::AddressInvalid;
                 let parsed =
                     reqwest::Url::parse(url).context("invalid OpenCode V2 stdio listen URL")?;
                 if parsed.scheme() != "http"
@@ -914,15 +1181,25 @@ async fn spawn_opencode_server(
         }
     })
     .await
-    .map_err(|_| anyhow!("OpenCode server startup timed out"));
+    .map_err(|_| {
+        failure_stage = OpenCodeStartupStage::Timeout;
+        anyhow!("OpenCode server startup timed out waiting for listen address")
+    });
     let base_url = match base_url {
         Ok(Ok(base_url)) => base_url,
         Ok(Err(error)) | Err(error) => {
-            let _ = terminate_opencode_process(&mut process, Duration::from_secs(2)).await;
-            return Err(error).context("OpenCode server did not publish a usable listen address");
+            return Err(opencode_startup_failure(
+                process,
+                failure_stage,
+                error,
+                &process_config.env,
+                deadline,
+            )
+            .await
+            .into());
         }
     };
-    let stdout_reader = tokio::spawn(async move {
+    owner.stdout_reader = Some(tokio::spawn(async move {
         let mut line = String::new();
         loop {
             line.clear();
@@ -931,7 +1208,7 @@ async fn spawn_opencode_server(
                 Ok(_) => {}
             }
         }
-    });
+    }));
     let api = OpenCodeApiClient {
         client: http_client,
         base_url,
@@ -940,7 +1217,21 @@ async fn spawn_opencode_server(
         password,
         catalog_rpc_id,
     };
-    let version = match api.health(startup_timeout).await.and_then(|health| {
+    let health = timeout_at(
+        deadline,
+        api.health(deadline.saturating_duration_since(Instant::now())),
+    )
+    .await;
+    let (health, health_stage) = match health {
+        Ok(health) if Instant::now() < deadline => (health, OpenCodeStartupStage::Health),
+        _ => (
+            Err(anyhow!(
+                "OpenCode server startup timed out during health probe"
+            )),
+            OpenCodeStartupStage::Timeout,
+        ),
+    };
+    let version = match health.and_then(|health| {
         anyhow::ensure!(
             health["pid"].as_u64() == process.id().map(u64::from),
             "OpenCode V2 info belongs to another process"
@@ -949,18 +1240,29 @@ async fn spawn_opencode_server(
     }) {
         Ok(version) => version,
         Err(error) => {
-            stdout_reader.abort();
-            let _ = terminate_opencode_process(&mut process, Duration::from_secs(2)).await;
-            return Err(error).context("OpenCode server health probe failed");
+            owner
+                .stdout_reader
+                .as_ref()
+                .expect("startup stdout reader")
+                .abort();
+            return Err(opencode_startup_failure(
+                process,
+                health_stage,
+                error,
+                &process_config.env,
+                deadline,
+            )
+            .await
+            .into());
         }
     };
     Ok(OpenCodeServerProcess {
         closed: std::sync::atomic::AtomicBool::new(false),
         api,
         version,
-        process: Mutex::new(process),
+        process: Mutex::new(owner.process.take().expect("startup owns process")),
         stdin: Mutex::new(Some(stdin)),
-        stdout_reader,
+        stdout_reader: owner.stdout_reader.take().expect("startup stdout reader"),
         stderr,
         shutdown_grace: Duration::from_secs(5),
         _catalog_plugin: catalog_plugin,
@@ -1174,6 +1476,10 @@ pub(crate) async fn probe_opencode_instance(
                 OpenCodeProbeStatus::SpawnFailed
             };
             let message = bounded_safe_detail(format!("{error:#}").as_str());
+            let stderr = error
+                .downcast_ref::<OpenCodeStartupFailure>()
+                .map(|failure| failure.stderr.clone())
+                .unwrap_or_default();
             return OpenCodeProbeSnapshot {
                 status,
                 message: Some(message.clone()),
@@ -1189,7 +1495,7 @@ pub(crate) async fn probe_opencode_instance(
                     .to_owned(),
                     message,
                 }],
-                stderr: Vec::new(),
+                stderr,
                 models: Vec::new(),
             };
         }
@@ -5385,6 +5691,10 @@ fn bounded_safe_detail(value: &str) -> String {
     }
     format!("{}…", &value[..end])
 }
+
+#[cfg(all(test, unix))]
+#[path = "opencode_startup_tests.rs"]
+pub(crate) mod startup_tests;
 
 #[cfg(test)]
 mod tests {
