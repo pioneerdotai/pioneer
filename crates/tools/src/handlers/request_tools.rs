@@ -222,7 +222,9 @@ mod tests {
             threads.added.get("threads"),
             Some(&vec!["threads_search".to_owned()])
         );
-        assert!(snapshot.contains_name("threads_search").await);
+        // The handler reports expansion; the agent loop applies it after the
+        // call completes. Resolving a request must not mutate its turn snapshot.
+        assert!(!snapshot.contains_name("threads_search").await);
 
         let blocked_snapshot = visibility(&["request_tools", "threads_search"]);
         let blocked =

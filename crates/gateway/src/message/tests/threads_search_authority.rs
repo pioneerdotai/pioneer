@@ -192,7 +192,12 @@ async fn admit(
         artifacts: Vec::new(),
         has_local_attachment_sources: false,
         has_url_attachment_sources: false,
-        provider_authority_fingerprint: Some("a".repeat(64)),
+        provider_authority_fingerprint: Some(
+            processor
+                .provider_registry
+                .authority_fingerprint_for_workspace(WORKSPACE_RED_ID, "openai")
+                .expect("test provider authority should resolve"),
+        ),
     };
     let envelope = ExecutionAdmissionService::new(store.as_ref().clone())
         .admit_context(&principal, generation, &request, None)

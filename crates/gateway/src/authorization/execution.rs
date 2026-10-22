@@ -4140,7 +4140,14 @@ mod tests {
             ExecutionAuthorizationContext::from_persisted_json(&old.to_persisted_json().unwrap())
                 .unwrap();
         let continued = restored
-            .derive_continuation("openai", "model-a", None, &[], &profile, None)
+            .derive_continuation(
+                "openai",
+                "model-a",
+                None,
+                &[],
+                &profile,
+                request.provider_authority_fingerprint.as_deref(),
+            )
             .unwrap();
         assert!(!continued.grants_action(ResourceAction::ThreadObserveWorkspace));
     }

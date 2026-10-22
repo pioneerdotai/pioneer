@@ -204,6 +204,15 @@ const INTERNAL_TOOL_RECORDS: &[AuthorizationCatalogRecord] = &[
     ),
     record(
         AuthorizationCatalogSurface::InternalTool,
+        "threads_search",
+        "thread_read",
+        "execution_approved_thread",
+        "not_found",
+        "read",
+        true,
+    ),
+    record(
+        AuthorizationCatalogSurface::InternalTool,
         "threads_list",
         "thread_read",
         "execution_approved_thread",

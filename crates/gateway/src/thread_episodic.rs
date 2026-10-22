@@ -9978,7 +9978,7 @@ mod tests {
         let other_workspace_item = seed_active_thread_episodic_item(
             crud_store.as_ref(),
             other_workspace_id,
-            thread_id,
+            "thread_hybrid_scope_other_workspace",
             "turn_hybrid_scope_other_workspace",
             "item_hybrid_scope_other_workspace",
             "other workspace hybrid scope memory",
@@ -17540,6 +17540,57 @@ mod tests {
             thread_id: &str,
             fixture: &EvalItemFixture,
         ) -> ThreadEpisodicItemRecord {
+            let canonical_item = match fixture.source_runtime_kind {
+                ThreadEpisodicSourceRuntimeKind::UserTurn => TurnItem::UserMessage {
+                    id: fixture.item_id.clone(),
+                    text: fixture.text.clone(),
+                    attachments: Vec::new(),
+                },
+                ThreadEpisodicSourceRuntimeKind::AssistantTurn
+                | ThreadEpisodicSourceRuntimeKind::CompactionSummary => TurnItem::AgentMessage {
+                    id: fixture.item_id.clone(),
+                    text: fixture.text.clone(),
+                    phase: AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                },
+                ThreadEpisodicSourceRuntimeKind::TaskResult => TurnItem::Task {
+                    item: TaskTurnItem {
+                        id: fixture.item_id.clone(),
+                        task_id: format!("task_{}", fixture.item_id),
+                        created_by_turn_id: None,
+                        run_id: None,
+                        parent_task_id: None,
+                        root_task_id: None,
+                        title: String::new(),
+                        status: TaskStatus::Completed,
+                        attachment: pioneer_protocol::TaskAttachmentMode::Attached,
+                        trigger_kind: TaskTriggerKind::Immediate,
+                        executor_kind: TaskExecutorKind::Agent,
+                        child_thread_id: None,
+                        child_turn_id: None,
+                        agent_role: None,
+                        depth: 0,
+                        max_depth: 3,
+                        next_fire_at: None,
+                        progress_preview: None,
+                        result_preview: Some(fixture.text.clone()),
+                        error_preview: None,
+                        started_at: Some(1_700_000_000),
+                        created_at: 1_700_000_000,
+                        updated_at: 1_700_000_001,
+                    },
+                },
+            };
+            materialize_thread_with_item(
+                crud_store,
+                workspace_id,
+                thread_id,
+                &fixture.turn_id,
+                canonical_item,
+                1_700_000_000,
+            )
+            .await;
             let capsule = crud_store
                 .resolve_thread_episodic_workspace_active_write_segment(
                     ThreadEpisodicWorkspaceActiveWriteSegmentRequest {

@@ -34426,6 +34426,10 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
             ..Default::default()
         })
         .await;
+    harness
+        .processor
+        .reinstall_memory_hook_runtime_if_bound()
+        .await;
     harness.processor.bind_task_bridge().await;
     harness.processor.start_task_event_listener().await;
 
@@ -34711,6 +34715,10 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
             recall_enabled: false,
             ..Default::default()
         })
+        .await;
+    harness
+        .processor
+        .reinstall_memory_hook_runtime_if_bound()
         .await;
     harness.processor.bind_task_bridge().await;
     harness.processor.start_task_event_listener().await;
