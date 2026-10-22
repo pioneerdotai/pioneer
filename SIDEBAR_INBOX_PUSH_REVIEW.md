@@ -1,5 +1,14 @@
 # Sidebar / inbox addressed push — повторное source review
 
+## Publication handoff
+
+The user accepted the source candidate in the original thread on October 22, 2026 and authorized commits, pushes, and GitHub pull requests. The review snapshots, old HEADs, and dirty statuses below are historical records of that candidate.
+
+Before publication, the Rust feature branch merged `origin/main` at `4c45193c78291583f3c2fc2ea3a55d1e61763fb1` in merge commit `0dbb66cb03699601d4dd3c8af229f38d3c863196`. Git resolved the merge without conflicts. Mobile `origin/main` was already an ancestor of the feature branch at `32609e4cb5431f0efc3e0573db7c5354d474cc5a`. The primary checkouts were not changed.
+
+The merged Rust main includes task finish contracts. Canonical schema/type generation brings those definitions into the generated documents alongside the sidebar/inbox contracts. The mobile source contract is refreshed against this merged Rust worktree. Commit messages and PR titles use `type(scope): description`; PR descriptions are edited with the humanizer skill.
+
+
 ## Isolation and allowed work
 
 Rust worktree `/Users/alexander/Code/pioneer/pioneer/.worktrees/sidebar-inbox-push`, branch `feature/sidebar-inbox-push`, fixed base `adb446a542e4c0c24e2d011fe73b184c9af1fb29`.
