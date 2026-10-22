@@ -150,6 +150,9 @@ pub struct AskResponse {
     /// The bounded native vector candidate window filled before fusion.
     #[serde(default)]
     pub vector_candidates_saturated: bool,
+    /// Native candidate fusion/filtering omitted at least one vector candidate.
+    #[serde(default)]
+    pub vector_candidates_omitted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

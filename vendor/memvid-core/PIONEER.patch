@@ -28,21 +28,51 @@
 -required-features = ["hnsw_bench"]
 --- a/src/memvid/ask.rs
 +++ b/src/memvid/ask.rs
-@@ -213,0 +214 @@
+@@ -43,0 +44,4 @@
++        // Timeline sampling has a global limit and cannot provide scoped
++        // candidates. Scoped queries must keep lexical/vector retrieval even
++        // when analytical wording would otherwise substitute the timeline.
++        let use_analytical_timeline = is_analytical && request.scope.is_none();
+@@ -196 +200 @@
+-            if retrieval.hits.is_empty() {
++            if retrieval.hits.is_empty() && request.scope.is_none() {
+@@ -213,0 +218,2 @@
 +        let mut vector_candidates_saturated = false;
-@@ -264,0 +266 @@
++        let mut vector_candidate_ids = HashSet::new();
+@@ -218 +224 @@
+-        if is_analytical {
++        if use_analytical_timeline {
+@@ -239 +245 @@
+-            // For non-analytical questions, add search hits to candidate list
++            // Scoped analytical questions also retain their scoped search hits.
+@@ -244,2 +250,2 @@
+-        // Skip for analytical questions - they use timeline directly with full text
+-        if !is_analytical {
++        // Skip only when using the unscoped analytical timeline substitution.
++        if !use_analytical_timeline {
+@@ -264,0 +271 @@
 +                let vector_limit = effective_top_k.max(24).min(64);
-@@ -269 +271 @@
+@@ -269 +276 @@
 -                    effective_top_k.max(24).min(64),
 +                    vector_limit,
-@@ -270,0 +273 @@
+@@ -270,0 +278,2 @@
 +                vector_candidates_saturated = vec_hits.len() >= vector_limit;
-@@ -431,0 +435 @@
++                vector_candidate_ids.extend(vec_hits.iter().map(|hit| hit.frame_id));
+@@ -378,0 +388,7 @@
++        // Fusion/diversification can omit a semantic-only candidate even when
++        // the vector window itself did not fill. Lexical continuation cannot
++        // recover it, so expose that separate loss to scoped retrieval callers.
++        for hit in &retrieval.hits {
++            vector_candidate_ids.remove(&hit.frame_id);
++        }
++        let vector_candidates_omitted = !vector_candidate_ids.is_empty();
+@@ -431,0 +448,2 @@
 +            vector_candidates_saturated,
-@@ -722 +726 @@
++            vector_candidates_omitted,
+@@ -722 +740 @@
 -    sorted_semantic.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 +    sorted_semantic.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-@@ -1418,0 +1423 @@
+@@ -1418,0 +1437 @@
 +            .then(a.0.cmp(&b.0))
 --- a/src/memvid/search/api.rs
 +++ b/src/memvid/search/api.rs
@@ -137,10 +167,13 @@
 +            clauses.push((Occur::Must, Box::new(query)));
 --- a/src/types/ask.rs
 +++ b/src/types/ask.rs
-@@ -149,0 +150,3 @@
+@@ -149,0 +150,6 @@
 +    /// The bounded native vector candidate window filled before fusion.
 +    #[serde(default)]
 +    pub vector_candidates_saturated: bool,
++    /// Native candidate fusion/filtering omitted at least one vector candidate.
++    #[serde(default)]
++    pub vector_candidates_omitted: bool,
 --- a/src/vec.rs
 +++ b/src/vec.rs
 @@ -416 +416,4 @@

@@ -29,3 +29,11 @@ to [0, 0.5), so raw BM25 cannot override a native-ranked copy during source dedu
 These scores are ordering keys, not relevance probabilities. Original lexical/
 semantic relevance is retained separately for the configured cutoff. Native
 semantic/RRF ties use frame IDs so a repeated query does not depend on HashMap order.
+
+For URI-scoped ask requests, global timeline sampling/substitution is disabled
+before candidate fusion. Analytical wording retains scoped lexical/vector retrieval
+and the existing native fusion/reranking instead of replacing it with the timeline.
+Unscoped timeline behavior is retained. `vector_candidates_omitted` separately
+reports vector candidates lost by native fusion/filtering; Pioneer marks coverage
+incomplete for this loss as well as vector-window saturation. Neither flag changes
+the approximate nature of HNSW retrieval.

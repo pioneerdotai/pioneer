@@ -2,8 +2,10 @@
 
 Дата: 2026-10-22. Статус: шесть замечаний внешнего аудита к commit
 65a23239a48da56118eda3f8358354378610235b исправлены; выполнено повторное самостоятельное
-статическое ревью. Повторная внешняя приёмка и разрешение на исполнение проверок ещё
-не получены.
+статическое ревью. После подтверждения этих исправлений устранён дополнительный P2
+к commit 7783a4ecedf6871265bcfdd37c83c4e321d37cc0: глобальная timeline вытесняла
+scoped candidates. Внешняя приёмка этой правки и разрешение на исполнение проверок
+ещё не получены.
 
 - Worktree: `/Users/alexander/Code/pioneer/pioneer/.worktrees/threads-search-recall`.
 - Ветка: `feat/threads-search-recall`.
@@ -368,3 +370,69 @@ ordering key не является вероятностью релевантно
 движком. Старые executions без persisted Agent observation grant не получают broad
 recall автоматически. Следующий этап — повторное внешнее ревью до разрешения запуска
 каких-либо тестов или сборок.
+
+## Дополнительный P2: scoped timeline candidate selection
+
+Начальный HEAD этого исправления: `7783a4ecedf6871265bcfdd37c83c4e321d37cc0`,
+ветка/worktree сохранены; начальный статус был чистым. Изменены только scoped
+retrieval/coverage, регрессия и эта документация с воспроизводимым vendor patch.
+Permissions, Member observation grants, logical deletion/source validation,
+hybrid ordering, query embedding и проверка saturation не ослаблены.
+
+В `vendor/memvid-core/src/memvid/ask.rs` обе глобальные timeline-подстановки
+разрешены только при `scope=None`. Для scoped аналитического запроса сохранены
+существующие query expansion/candidate budgets, lexical/vector candidate lists,
+native RRF и semantic reranking. Аналитическая эвристика больше не выключает
+scoped vector retrieval. Глобальные timeline entries не поступают в ограниченную
+fusion, поэтому последующая adapter scope-фильтрация не должна восстанавливать
+уже вытесненные ими источники. Поведение unscoped timeline сохранено.
+
+Остаётся штатный native candidate cutoff при fusion/diversification. Даже при
+ненасыщенном vector window он может удалить semantic-only источник, который не
+вернётся через lexical continuation. Добавлен узкий native diagnostic
+`AskResponse.vector_candidates_omitted` (`serde(default)`): bounded set полученных
+vector frame IDs сравнивается с конечными native hits. Adapter передаёт
+`saturated || omitted` как `incomplete`; алгоритмы fusion/reranking не заменены.
+HNSW остаётся `approximate` независимо от этих operational coverage flags.
+
+Одна табличная регрессия на настоящем native/adapter boundary:
+`scoped_hybrid_keeps_semantic_candidates_outside_foreign_timeline_windows`
+в `crates/memory/src/thread_episodic.rs`. Общий временный индекс содержит первые
+100 глобальных timeline entries другого scope, затем 31 scoped semantic-only
+источник и 32 lexical-only источника без embeddings. Native индекс заполняется
+одним commit с явными timestamps; никаких моков retrieval или новых test seams.
+
+- Обычный lexical miss при top_k=32 сохраняет все 31 semantic источника.
+- `compare zzzxylophone over time` также сохраняет все 31 источника за пределами
+  глобального аналитического timeline window.
+- Native hits до adapter filtering принадлежат нужному scope; первые два случая
+  имеют `approximate=true`, `incomplete=false`, lexical `next_cursor=None`.
+- Контроль со scoped lexical matches создаёт реальный fusion cutoff при
+  ненасыщенном vector window: потеря semantic candidates отражается как
+  `vector_candidates_omitted=true` и adapter `incomplete=true`.
+- Query-only provider и prepared embedding переиспользуются на native/adapter
+  вызовах; document embedding в этой fixture запрещён самим provider.
+
+Регрессия только написана. Сравнение исполнения до/после, компиляция и успешное
+прохождение не заявляются. Статически прежний обычный путь смешивает глобальные
+timeline и scoped vectors перед top-32 fusion, аналитический путь пропускает vectors;
+именно эти две ветки проверяет новая fixture.
+
+Самоаудит охватил оба call site `build_timeline_fallback_response`, scoped поисковые
+variants/correction candidates, native fusion/reranking и конечную scope-фильтрацию,
+lexical continuation, coverage flags и общий `retrieve_authorized_quantum` /
+`scan_shared` для `search_threads` и `recall_authorized_workspace`. Просмотрены новый
+diff и совокупный diff от `adb446a542e4c0c24e2d011fe73b184c9af1fb29`, включая исходные
+контракты/authority/recall wiring; файлы предыдущих security-исправлений не менялись.
+
+Фактически выполненные проверки этой правки: чтение/поиск (`rg`, `sed`, `cat`),
+`git status`, `git rev-parse`, `git branch`, `git diff`, `git diff --check`,
+`rustfmt --edition 2024 --config skip_children=true` затронутых Rust-файлов,
+`cargo fmt -p pioneer-memory -- --check --config skip_children=true` и статическое
+сравнение vendor SHA-256/diff стандартной библиотекой Python. `PIONEER.patch`
+обновлён как точный diff к закреплённому upstream; зависимости не обновлялись,
+общий Cargo cache не менялся. Новые attached tasks не создавались.
+
+Тесты, cargo check/build/test/clippy/run/nextest, иные сборки, generators,
+приложение, Gateway и CLI-агенты для проверки не запускались. Следующий этап —
+повторное внешнее ревью; commit и чистота worktree указаны в передаче.

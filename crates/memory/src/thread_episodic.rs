@@ -981,10 +981,11 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
                     let response = index
                         .ask(ask, Some(embedder.as_ref()))
                         .map_err(classify_memvid_error)?;
-                    // Native vectors have no continuation. A saturated native
-                    // candidate window cannot establish semantic exhaustion, even
-                    // though the independent lexical traversal will continue.
-                    incomplete = response.vector_candidates_saturated;
+                    // Native vectors have no continuation. Window saturation or
+                    // vector candidates lost by fusion cannot establish semantic
+                    // exhaustion, even if the lexical traversal continues.
+                    incomplete =
+                        response.vector_candidates_saturated || response.vector_candidates_omitted;
                     let engine = response.retrieval.engine;
                     let mut native = response.retrieval.hits;
                     // Encode native final order without replacing query relevance by
@@ -3603,6 +3604,197 @@ mod tests {
             repeated_ids, expected_ids,
             "same snapshot must preserve pagination ordering"
         );
+    }
+
+    #[tokio::test]
+    async fn scoped_hybrid_keeps_semantic_candidates_outside_foreign_timeline_windows() {
+        use std::collections::BTreeSet;
+        use std::num::NonZeroU64;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("scoped-timeline.mv2");
+        let identity = ThreadEpisodicEmbeddingIdentity::new("test", "test-embedding", 3, true);
+        let scope = "mv2://workspace/ws/thread/target/";
+        let mut native = open_or_create_memvid(&path, true).unwrap();
+        native.enable_vec().unwrap();
+        native.set_vec_model(&identity.memvid_model_id()).unwrap();
+        // The global timeline's first 100 entries are foreign. All 31 scoped
+        // vectors lie beyond both the ordinary 32 and analytical 100 windows.
+        // Another 32 scoped lexical-only documents exercise fusion truncation
+        // separately from vector-window saturation, without a second index.
+        for n in 0..163 {
+            let thread = if n < 100 { "foreign" } else { "target" };
+            let id = format!("source-{n}");
+            let vector = if n < 100 {
+                Some(vec![0.0, 1.0, 0.0])
+            } else if n < 131 {
+                Some(vec![1.0, 0.0, 0.0])
+            } else {
+                None
+            };
+            let request = ThreadEpisodicMemvidIndexRequest {
+                storage_uri: thread_episodic_storage_uri_from_path(&path),
+                capsule_id: "capsule".into(),
+                capsule_ref: "capsule-ref".into(),
+                workspace_capsule: true,
+                index_item_id: id.clone(),
+                frame_uri: format!(
+                    "mv2://workspace/ws/thread/{thread}/turn/turn/item/{id}/index/{id}"
+                ),
+                text: if n < 131 {
+                    format!("violet apricot luminescence {id}")
+                } else {
+                    format!("needle {id}")
+                },
+                metadata: thread_episodic_memvid_metadata(
+                    "ws",
+                    thread,
+                    "turn",
+                    &id,
+                    "user",
+                    "agent",
+                    "user_visible_thread_item",
+                    "hash",
+                    "hash",
+                ),
+                embedding: vector.clone().map(|vector| {
+                    ThreadEpisodicMemvidIndexEmbedding::new(identity.clone(), vector).unwrap()
+                }),
+            };
+            let mut options = index_put_options(&request);
+            options.timestamp = Some(1_700_000_000 + n);
+            if let Some(vector) = vector {
+                native
+                    .put_with_embedding_and_options(request.text.as_bytes(), vector, options)
+                    .unwrap();
+            } else {
+                native
+                    .put_bytes_with_options(request.text.as_bytes(), options)
+                    .unwrap();
+            }
+        }
+        native.commit().unwrap();
+        let timeline = native
+            .timeline(
+                memvid_core::TimelineQueryBuilder::default()
+                    .limit(NonZeroU64::new(100).unwrap())
+                    .build(),
+            )
+            .unwrap();
+        assert_eq!(timeline.len(), 100);
+        assert!(timeline.iter().all(|entry| {
+            entry
+                .uri
+                .as_deref()
+                .unwrap()
+                .starts_with("mv2://workspace/ws/thread/foreign/")
+        }));
+        drop(native);
+
+        let expected: BTreeSet<_> = (100..131).map(|n| format!("source-{n}")).collect();
+        let backend = MemvidThreadEpisodicBackend::new();
+        for (query, fusion_truncated) in [
+            ("zzzxylophone", false),
+            ("compare zzzxylophone over time", false),
+            ("needle", true),
+        ] {
+            let mut profile = ThreadEpisodicSearchProfile::for_kind(
+                ThreadEpisodicSearchProfileKind::DefaultContext,
+            );
+            profile.max_candidates = 32;
+            let request = ThreadEpisodicMemvidSearchRequest {
+                workspace_id: "ws".into(),
+                thread_id: "target".into(),
+                query: query.into(),
+                scope: Some(scope.into()),
+                profile,
+                segments: vec![ThreadEpisodicMemvidSearchSegment {
+                    capsule_id: "capsule".into(),
+                    capsule_ref: "capsule-ref".into(),
+                    storage_uri: thread_episodic_storage_uri_from_path(&path),
+                    segment_index: 1,
+                }],
+                exact_source: None,
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let embedder = Arc::new(
+                ThreadEpisodicMemvidEmbedder::new(Arc::new(QueryOnlyProvider(calls.clone())))
+                    .prepare_query(query)
+                    .unwrap(),
+            );
+            let mut native = Memvid::open_read_only(&path).unwrap();
+            let lexical = native
+                .search(memvid_thread_episodic_search_request(
+                    &request.profile,
+                    query,
+                    Some(scope),
+                ))
+                .unwrap();
+            assert_eq!(lexical.hits.len(), if fusion_truncated { 32 } else { 0 });
+            let response = native
+                .ask(
+                    memvid_thread_episodic_ask_request(
+                        &request.profile,
+                        query,
+                        Some(scope),
+                        ThreadEpisodicMemvidAskRetrievalMode::Hybrid,
+                    ),
+                    Some(embedder.as_ref()),
+                )
+                .unwrap();
+            assert!(!response.vector_candidates_saturated, "{query}");
+            assert_eq!(
+                response.vector_candidates_omitted, fusion_truncated,
+                "{query}"
+            );
+            assert!(
+                response
+                    .retrieval
+                    .hits
+                    .iter()
+                    .all(|hit| hit.uri.starts_with(scope)),
+                "foreign entries must not consume native fusion budget: {query}"
+            );
+            if !fusion_truncated {
+                assert_eq!(response.retrieval.hits.len(), 31, "{query}");
+            }
+            drop(native);
+            let page = backend
+                .retrieve_segment(request, None, Some(embedder))
+                .await
+                .unwrap();
+            assert!(
+                page.approximate,
+                "HNSW coverage is still approximate: {query}"
+            );
+            assert_eq!(page.incomplete, fusion_truncated, "{query}");
+            assert!(
+                page.next_cursor.is_none(),
+                "lexical traversal ended: {query}"
+            );
+            let ids: BTreeSet<_> = page
+                .hits
+                .iter()
+                .map(|hit| hit.hit.index_item_id.clone())
+                .collect();
+            if fusion_truncated {
+                let semantic_count = ids.intersection(&expected).count();
+                assert!(
+                    semantic_count > 0 && semantic_count < 31,
+                    "fixture must lose semantic candidates at fusion, not the vector window"
+                );
+            } else {
+                assert_eq!(
+                    ids, expected,
+                    "all scoped semantic-only sources must survive: {query}"
+                );
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "prepared query reused: {query}"
+            );
+        }
     }
 
     fn test_hit(

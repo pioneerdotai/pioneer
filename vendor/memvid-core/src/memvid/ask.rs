@@ -41,6 +41,10 @@ impl Memvid {
         let is_recency = is_recency_question(&request.question);
         // Detect analytical/comparative questions that need comprehensive context
         let is_analytical = is_analytical_question(&request.question);
+        // Timeline sampling has a global limit and cannot provide scoped
+        // candidates. Scoped queries must keep lexical/vector retrieval even
+        // when analytical wording would otherwise substitute the timeline.
+        let use_analytical_timeline = is_analytical && request.scope.is_none();
 
         let effective_top_k = if is_analytical {
             // Analytical questions require comprehensive context across all time periods
@@ -193,7 +197,7 @@ impl Memvid {
                 }
             }
             // Timeline fallback: if still no hits, sample from timeline to provide context
-            if retrieval.hits.is_empty() {
+            if retrieval.hits.is_empty() && request.scope.is_none() {
                 tracing::debug!("ask: no search hits, falling back to timeline sampling");
                 if let Ok(timeline_response) = self.build_timeline_fallback_response(
                     &request,
@@ -212,11 +216,12 @@ impl Memvid {
         let mut candidate_lists: Vec<Vec<SearchHit>> = Vec::new();
         let mut vector_used = false;
         let mut vector_candidates_saturated = false;
+        let mut vector_candidate_ids = HashSet::new();
 
         // For analytical questions, use timeline directly (skip RRF mixing with search)
         // This ensures full-text hits are preserved - search hits are truncated and would
         // replace timeline hits in RRF due to rank comparison
-        if is_analytical {
+        if use_analytical_timeline {
             // Create a modified request with a large top_k to retrieve the full timeline
             // Analytical questions need to see ALL time periods to detect changes/reversions
             let mut analytical_request = request.clone();
@@ -237,13 +242,13 @@ impl Memvid {
                 }
             }
         } else {
-            // For non-analytical questions, add search hits to candidate list
+            // Scoped analytical questions also retain their scoped search hits.
             candidate_lists.push(retrieval.hits.clone());
         }
 
         // OR-expanded lexical query even when base has hits to widen recall.
-        // Skip for analytical questions - they use timeline directly with full text
-        if !is_analytical {
+        // Skip only when using the unscoped analytical timeline substitution.
+        if !use_analytical_timeline {
             if let Some(or_query) = build_disjunctive_query(&primary_tokens) {
                 if or_query != search_request.query {
                     let mut or_request = search_request.clone();
@@ -271,6 +276,7 @@ impl Memvid {
                     vector_limit,
                 )?;
                 vector_candidates_saturated = vec_hits.len() >= vector_limit;
+                vector_candidate_ids.extend(vec_hits.iter().map(|hit| hit.frame_id));
                 if !vec_hits.is_empty() {
                     candidate_lists.push(vec_hits);
                     vector_used = true;
@@ -379,6 +385,13 @@ impl Memvid {
         if request.acl_enforcement_mode == crate::types::AclEnforcementMode::Enforce {
             retrieval.total_hits = retrieval.hits.len();
         }
+        // Fusion/diversification can omit a semantic-only candidate even when
+        // the vector window itself did not fill. Lexical continuation cannot
+        // recover it, so expose that separate loss to scoped retrieval callers.
+        for hit in &retrieval.hits {
+            vector_candidate_ids.remove(&hit.frame_id);
+        }
+        let vector_candidates_omitted = !vector_candidate_ids.is_empty();
 
         retrieval.context = build_context(&retrieval.hits);
 
@@ -433,6 +446,7 @@ impl Memvid {
             context_only: request.context_only,
             retrieval,
             vector_candidates_saturated,
+            vector_candidates_omitted,
             answer,
             citations,
             context_fragments,
