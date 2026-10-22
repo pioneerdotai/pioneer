@@ -6,7 +6,9 @@ param(
 
     [string]$OutDir,
 
-    [string]$WixPath
+    [string]$WixPath,
+
+    [switch]$SkipBuild
 )
 
 Set-StrictMode -Version Latest
@@ -302,15 +304,9 @@ if ($Target -eq "aarch64-pc-windows-msvc") {
     $env:GGML_CCACHE = "OFF"
 }
 
-cargo build --locked --release -p pioneer-desktop --target $Target
-cargo build --locked --release -p pioneer-app-updater --target $Target
-if ($env:PIONEER_REUSE_GATEWAY_RUN_ID) {
-    if (-not $env:PIONEER_SYMBOL_INPUTS_DIR) { throw "Gateway reuse requires retained symbol inputs" }
-    python scripts/packaging/symbol-inputs.py export --target $Target "$env:PIONEER_SYMBOL_INPUTS_DIR" "target/$Target/release/pioneer-app.exe" "target/$Target/release/pioneer-app-updater.exe"
-    if ($LASTEXITCODE -ne 0) { throw "Symbol input preservation failed" }
-    python scripts/packaging/release-inputs.py gateway --run-id "$env:PIONEER_REUSE_GATEWAY_RUN_ID" --target $Target --out "$env:PIONEER_SYMBOL_INPUTS_DIR/gateway" --binary "target/$Target/release/pioneer.exe"
-    if ($LASTEXITCODE -ne 0) { throw "Exact Gateway reuse failed" }
-} else {
+if (-not $SkipBuild) {
+    cargo build --locked --release -p pioneer-desktop --target $Target
+    cargo build --locked --release -p pioneer-app-updater --target $Target
     cargo build --locked --release -p pioneer-cli --features computer-use --target $Target
     if ($env:PIONEER_SYMBOL_INPUTS_DIR) {
         python scripts/packaging/symbol-inputs.py export --target $Target "$env:PIONEER_SYMBOL_INPUTS_DIR" "target/$Target/release/pioneer-app.exe" "target/$Target/release/pioneer.exe" "target/$Target/release/pioneer-app-updater.exe"
