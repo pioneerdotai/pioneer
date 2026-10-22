@@ -689,6 +689,12 @@ mod tests {
                 "pioneer/memory",
             ),
             (
+                "6V8zjRNsuABtUUbHV6Gzo",
+                "pioneer",
+                "runtime-diagnostics",
+                "pioneer/runtime-diagnostics",
+            ),
+            (
                 "7Ejrf61g4oqigkv3LMNE9",
                 "pioneer",
                 "subagents",
