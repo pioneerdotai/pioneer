@@ -486,6 +486,33 @@ impl ClientCore {
             )
             .checked_add(1)
             .expect("provider runtime revision exhausted");
+        // Runtime -> collection is the lock order. Collection completion never
+        // acquires the runtime owner. Fence old catalog RPCs before publishing
+        // evidence that can wake model consumers on another thread.
+        let changed = scope
+            .publication
+            .runtimes
+            .iter()
+            .map(|row| row.runtime_id.clone())
+            .chain(next.runtimes.iter().map(|row| row.runtime_id.clone()))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|id| {
+                super::list::cli_runtime_catalog_changed(
+                    scope
+                        .publication
+                        .runtimes
+                        .iter()
+                        .find(|row| &row.runtime_id == id)
+                        .map(|row| row.runtime()),
+                    next.runtimes
+                        .iter()
+                        .find(|row| &row.runtime_id == id)
+                        .map(|row| row.runtime()),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.invalidate_cli_runtime_model_collections(&next.workspace_id, &changed);
         let revision = next.revision;
         let workspace_id = next.workspace_id.clone();
         scope.publication = Arc::new(next);
@@ -503,6 +530,30 @@ impl ClientCore {
             vec![],
         )
     }
+    /// Guard buffered consumer responses too, including the interval between
+    /// runtime publication and reconciliation of that consumer's generation.
+    pub(crate) fn cli_catalog_matches_runtime_publication(
+        &self,
+        workspace: &str,
+        provider: Option<&str>,
+        known: &[RuntimeSummary],
+    ) -> bool {
+        let Some(id) = provider.and_then(super::list::runtime_id_from_cli_runtime_provider_key)
+        else {
+            return true;
+        };
+        let snapshot = self.provider_runtime_snapshot(workspace);
+        !super::list::cli_runtime_catalog_changed(
+            known.iter().find(|runtime| runtime.runtime_id == id),
+            snapshot.as_ref().and_then(|p| {
+                p.runtimes()
+                    .iter()
+                    .find(|row| row.runtime().runtime_id == id)
+                    .map(|row| row.runtime())
+            }),
+        )
+    }
+
     pub fn provider_runtime_intent(&self, intent: ProviderRuntimeIntent) -> ClientTransition {
         let workspace = match &intent {
             ProviderRuntimeIntent::Observe { workspace_id }

@@ -1473,9 +1473,7 @@ mod tests {
         }
 
         #[gpui_kit::test]
-        fn initializing_selected_runtime_waits_for_ready_and_native_application(
-            cx: &mut TestAppContext,
-        ) {
+        fn selected_runtime_waits_for_capabilities_and_native_application(cx: &mut TestAppContext) {
             use pioneer_client::providers::types::{RuntimeStatus, RuntimeSummary};
             use pioneer_client::{
                 composer::state_machine::ComposerDomainAction, navigation::NavigationIntent,
@@ -1559,10 +1557,37 @@ mod tests {
             fixture.composer.read_with(fixture.cx, |view, _| {
                 assert_eq!(view.startup_outcome(), Some(DesktopStartupOutcome::Ready))
             });
+            // Diagnostic status alone must not invalidate a usable selection.
             runtime.status = RuntimeStatus::NeedsAuth;
             authority.provider_runtime_status_changed_for_test(
                 &fixture.client,
                 serde_json::from_value(json!({"workspace_id":"workspace","revision":3,"runtime":runtime,"removed":false})).unwrap(),
+            );
+            fixture.synchronize();
+            fixture.composer.read_with(fixture.cx, |view, _| {
+                assert_eq!(view.startup_outcome(), Some(DesktopStartupOutcome::Ready));
+            });
+            let selected = fixture.client.composer_snapshot("a").unwrap();
+            assert_eq!(
+                selected.domain().selected_provider.as_deref(),
+                Some("cli_runtime:codex")
+            );
+            assert_eq!(selected.domain().selected_model.as_deref(), Some("model"));
+            assert!(matches!(
+                &fixture
+                    .client
+                    .provider_runtime_snapshot("workspace")
+                    .unwrap()
+                    .runtimes()[0]
+                    .runtime()
+                    .status,
+                RuntimeStatus::NeedsAuth
+            ));
+            // Explicit disablement and removal still block this runtime.
+            runtime.enabled = false;
+            authority.provider_runtime_status_changed_for_test(
+                &fixture.client,
+                serde_json::from_value(json!({"workspace_id":"workspace","revision":4,"runtime":runtime,"removed":false})).unwrap(),
             );
             fixture.synchronize();
             fixture.composer.read_with(fixture.cx, |view, _| {
@@ -1573,7 +1598,7 @@ mod tests {
             });
             authority.provider_runtime_status_changed_for_test(
                 &fixture.client,
-                serde_json::from_value(json!({"workspace_id":"workspace","revision":4,"runtime":runtime,"removed":true})).unwrap(),
+                serde_json::from_value(json!({"workspace_id":"workspace","revision":5,"runtime":runtime,"removed":true})).unwrap(),
             );
             fixture.synchronize();
             fixture.composer.read_with(fixture.cx, |view, _| {

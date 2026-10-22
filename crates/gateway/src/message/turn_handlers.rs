@@ -4069,38 +4069,29 @@ impl MessageProcessor {
                     let injected = self.task_cli_readiness_failure.lock().unwrap().take();
                     injected.map_or(readiness, Err)
                 };
-                readiness
-                    .map_err(|error| {
-                        TurnStartFailure::internal_typed(
-                            pioneer_tasks::TaskStartStage::CliAdmission,
-                            error.context("failed to load CLI runtime readiness snapshot"),
-                        )
-                    })?
-                    .ok_or_else(|| {
-                        TurnStartFailure::internal(format!(
-                            "CLI runtime `{runtime_id}` is absent from the readiness snapshot"
-                        ))
-                        .with_task_reason(pioneer_tasks::TaskStartReason::ReadinessSnapshotMissing)
-                    })?
+                readiness.map_err(|error| {
+                    TurnStartFailure::internal_typed(
+                        pioneer_tasks::TaskStartStage::CliAdmission,
+                        error.context("failed to load CLI runtime readiness snapshot"),
+                    )
+                })?
             };
-            let readiness_summary = readiness_snapshot.summary;
-            let max_input_tokens = readiness_snapshot.models.as_ref().and_then(|snapshot| {
-                let selected_model = params.model.as_deref().unwrap_or(thread.model.as_str());
-                snapshot
-                    .result
-                    .models
-                    .iter()
-                    .find(|model| model.id == selected_model)
-                    .and_then(|model| model.max_input_tokens)
-            });
-            let cached_mcp_readiness = readiness_snapshot.mcp_readiness;
-            if !matches!(readiness_summary.status, RuntimeStatus::Ready) {
-                return Err(TurnStartFailure::invalid_input(format!(
-                    "CLI runtime `{runtime_id}` is not ready: {}",
-                    cli_runtime_unavailable_reason(&readiness_summary.status)
-                ))
-                .with_task_reason(pioneer_tasks::TaskStartReason::RuntimeNotReady));
-            }
+            // Discovery metadata is optional and never grants execution rights.
+            // Admission uses the configured backend and current authorization;
+            // technical MCP evidence is acquired below for this launch.
+            let max_input_tokens = readiness_snapshot
+                .as_ref()
+                .filter(|snapshot| snapshot.summary.kind == runtime_kind)
+                .and_then(|snapshot| snapshot.models.as_ref())
+                .and_then(|snapshot| {
+                    let selected_model = params.model.as_deref().unwrap_or(thread.model.as_str());
+                    snapshot
+                        .result
+                        .models
+                        .iter()
+                        .find(|model| model.id == selected_model)
+                        .and_then(|model| model.max_input_tokens)
+                });
 
             let (max_tools, max_total_schema_bytes) = self.mcp_service.projection_limit_values();
             let mut projection_limits = crate::turn_mcp::McpProjectionLimits {
@@ -4321,6 +4312,32 @@ impl MessageProcessor {
                     || !projection.tools.is_empty()
                     || runtime_kind == CLIAgentRuntimeKind::Claude;
                 if has_mcp_projection {
+                    let proxy_url = self
+                        .prepare_cli_runtime_proxy_url(thread.workspace_id.as_str(), runtime_id)
+                        .await
+                        .map_err(|error| {
+                            TurnStartFailure::internal(format!(
+                                "failed to load CLI runtime proxy configuration: {error:#}"
+                            ))
+                        })?;
+                    let readiness = self
+                        .cli_runtime_mcp_readiness_for_instance(
+                            runtime_config,
+                            readiness_snapshot
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.summary.version.as_deref()),
+                            proxy_url.as_deref(),
+                        )
+                        .await;
+                    let runtime_snapshot_current = self
+                        .load_cli_runtime_instances()
+                        .map_err(|error| {
+                            TurnStartFailure::internal(format!(
+                                "failed to revalidate CLI runtime configuration: {error:#}"
+                            ))
+                        })?
+                        .iter()
+                        .any(|current| current == runtime_config);
                     let validation =
                         crate::cli_mcp_client_validation::validate_cli_mcp_client_request_durably(
                             &self.crud_store,
@@ -4334,10 +4351,8 @@ impl MessageProcessor {
                                 target: cli_mcp_client_target(runtime_kind),
                                 has_mcp_projection,
                                 provider_claim_matches,
-                                runtime_snapshot_current: true,
-                                runtime_supports_mcp_tools: readiness_summary
-                                    .capabilities
-                                    .supports_mcp_tools,
+                                runtime_snapshot_current,
+                                runtime_supports_mcp_tools: readiness.supported,
                                 projection_workspace_matches: projection.workspace_id
                                     == thread.workspace_id,
                                 explicit_capabilities_resolved:
@@ -4349,10 +4364,11 @@ impl MessageProcessor {
                         )
                         .await;
                     if let Err(rejection) = validation {
-                        let diagnostic = readiness_summary
-                            .diagnostics
-                            .iter()
-                            .find(|diagnostic| diagnostic.code.starts_with("cli_runtime.mcp."));
+                        let diagnostic = readiness.diagnostics.iter().find(|diagnostic| {
+                            !readiness.supported
+                                && diagnostic.code.starts_with("cli_runtime.mcp.")
+                                && diagnostic.code != "cli_runtime.mcp.ready"
+                        });
                         let code = diagnostic
                             .map(|diagnostic| diagnostic.code.as_str())
                             .unwrap_or_else(|| rejection.code.as_str());
@@ -4370,11 +4386,6 @@ impl MessageProcessor {
                         );
                         return Err(TurnStartFailure::internal(format!("{code}: {message}")));
                     }
-                    let readiness = cached_mcp_readiness.clone().ok_or_else(|| {
-                        TurnStartFailure::unavailable(
-                            "cli_runtime.mcp.readiness_unavailable: Gateway MCP readiness snapshot is not available",
-                        )
-                    })?;
                     if !readiness.supported {
                         let diagnostic = readiness
                             .diagnostics
@@ -4428,6 +4439,20 @@ impl MessageProcessor {
                         );
                     }
                 }
+            }
+            if !self
+                .load_cli_runtime_instances()
+                .map_err(|error| {
+                    TurnStartFailure::internal(format!(
+                        "failed to revalidate CLI runtime configuration: {error:#}"
+                    ))
+                })?
+                .iter()
+                .any(|current| current == runtime_config)
+            {
+                return Err(TurnStartFailure::invalid_input(
+                    "CLI runtime configuration changed during preparation; submit again",
+                ));
             }
             Ok(PreparedCliRuntimeCombinedPreflight {
                 plan,
@@ -11849,9 +11874,7 @@ impl MessageProcessor {
                 return None;
             }
         };
-        if runtime_snapshot.summary.kind != runtime_kind
-            || !matches!(runtime_snapshot.summary.status, RuntimeStatus::Ready)
-        {
+        if runtime_snapshot.summary.kind != runtime_kind || !runtime_snapshot.summary.enabled {
             debug!(
                 workspace_id,
                 runtime_id,
@@ -12311,20 +12334,6 @@ fn cli_runtime_binding_timestamp() -> sea_orm::entity::prelude::DateTimeWithTime
         .timestamp_opt(now_timestamp_secs(), 0)
         .single()
         .expect("current timestamp should be valid")
-}
-
-fn cli_runtime_unavailable_reason(status: &RuntimeStatus) -> &'static str {
-    match status {
-        RuntimeStatus::Disabled => "runtime is disabled",
-        RuntimeStatus::MissingBinary { .. } => "runtime binary is unavailable",
-        RuntimeStatus::SpawnFailed { .. } => "runtime failed to start",
-        RuntimeStatus::Initializing => "Gateway readiness check is still running",
-        RuntimeStatus::NeedsAuth => "runtime authentication is required",
-        RuntimeStatus::Ready => "runtime is ready",
-        RuntimeStatus::Degraded { .. } => "runtime readiness is degraded",
-        RuntimeStatus::UnsupportedVersion { .. } => "runtime version is unsupported",
-        RuntimeStatus::Error { .. } => "runtime readiness check failed",
-    }
 }
 
 #[cfg(test)]

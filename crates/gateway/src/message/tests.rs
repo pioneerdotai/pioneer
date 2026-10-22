@@ -1,3 +1,6 @@
+#[path = "tests/cli_provider_probe_isolation.rs"]
+mod cli_provider_probe_isolation;
+
 #[path = "tests/cli_task_tools.rs"]
 mod cli_task_tools;
 
@@ -704,6 +707,7 @@ struct RecordingCliRuntimeSession {
     thread_resumes: TokioMutex<Vec<(String, CLIAgentRuntimeThreadOpenParams)>>,
     turn_starts: TokioMutex<Vec<CLIAgentRuntimeTurnStartParams>>,
     turn_start_pause: TokioMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    next_turn_start_error: TokioMutex<Option<String>>,
     provider_history: TokioMutex<HashMap<String, Vec<String>>>,
     provider_boundaries: TokioMutex<HashMap<(String, String), usize>>,
     claude_record_boundaries: TokioMutex<HashMap<uuid::Uuid, (String, usize)>>,
@@ -932,6 +936,9 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
             .or_default()
             .push(format!("user:{}", params.input));
         self.turn_starts.lock().await.push(params.clone());
+        if let Some(error) = self.next_turn_start_error.lock().await.take() {
+            anyhow::bail!(error);
+        }
         let native_turn_id = self
             .next_native_turn_id
             .lock()
@@ -1539,6 +1546,7 @@ fn codex_readiness_shares_one_account_read_and_process_and_preserves_auth_failur
             let processor = &harness.processor;
             let temp = tempfile::tempdir().unwrap();
             let script = temp.path().join("fake-codex");
+            std::fs::write(temp.path().join("probe-response"), response).unwrap();
             std::fs::write(&script, format!(r#"#!/bin/sh
 cd "$(dirname "$0")" || exit 1
 printf '%s\n' started >> probe-starts
@@ -1549,7 +1557,8 @@ printf '%s\n' '{{"id":0,"result":{{"userAgent":"codex/1.2.3 test"}}}}'
 read initialized
 read account
 printf '%s\n' "$account" >> probe-requests
-printf '%s\n' '{response}'
+cat probe-response
+printf '\n'
 while read line; do
   printf '%s\n' "$line" >> probe-requests
   case "$line" in
@@ -1624,10 +1633,43 @@ done
                 );
                 assert!(probe.summary.capabilities.supports_mcp_tools);
                 assert!(probe.mcp_readiness.is_some());
+                // Reconcile without configuration invalidation. The same
+                // account source now fails independently of the working runtime.
+                std::fs::write(temp.path().join("probe-response"),
+                    r#"{"id":1,"error":{"code":-32603,"message":"workspace routing discovery failed"}}"#).unwrap();
+                processor
+                    .reconcile_cli_readiness_for_tests(&harness.workspace_id)
+                    .await
+                    .unwrap();
+                let failed = processor
+                    .cli_runtime_probe_snapshot(&harness.workspace_id, "codex")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(
+                    failed.summary.status,
+                    pioneer_protocol::RuntimeStatus::Error { .. }
+                ));
+                assert_eq!(failed.models.unwrap().result.models[0].id, "test-model");
+                assert_eq!(
+                    std::fs::read_to_string(temp.path().join("probe-starts"))
+                        .unwrap()
+                        .lines()
+                        .count(),
+                    2
+                );
+                assert_eq!(
+                    std::fs::read_to_string(temp.path().join("probe-requests"))
+                        .unwrap()
+                        .matches("model/list")
+                        .count(),
+                    1
+                );
             } else {
                 assert!(!requests.contains("model/list"));
                 assert!(probe.models.is_none());
-                assert!(!probe.summary.capabilities.supports_mcp_tools);
+                // The fake technical attestation is independent of account diagnostics.
+                assert!(probe.summary.capabilities.supports_mcp_tools);
                 assert!(!probe.summary.diagnostics.is_empty());
             }
         }
@@ -2110,6 +2152,8 @@ fn cli_runtime_turn_start_request_with_capabilities(
     ))
     .unwrap();
     request["params"]["capabilities"] = JsonValue::Array(capabilities);
+    serde_json::from_value::<pioneer_protocol::JsonRpcRequest>(request.clone())
+        .expect("CLI turn/start fixture must match the JSON-RPC envelope, including request ID");
     serde_json::from_value::<pioneer_protocol::TurnStartParams>(request["params"].clone())
         .expect("proposal 51 turn/start fixture must match protocol");
     request.to_string()

@@ -229,7 +229,7 @@ fn collaborator_safe_runtime_diagnostics(
 }
 
 fn cli_runtime_ready_for_model_discovery(runtime: &RuntimeSummary) -> bool {
-    runtime.enabled && matches!(runtime.status, RuntimeStatus::Ready)
+    runtime.enabled
 }
 
 pub(super) struct CliTaskFinalizationState {
@@ -697,22 +697,27 @@ impl MessageProcessor {
         // Model discovery is part of the Gateway-owned readiness probe. This
         // endpoint must remain a cache read so any number of clients share the
         // same bounded process/network work.
-        let Some(model_snapshot) = runtime_snapshot.models else {
-            self.send_error(
-                connection_id,
-                cli_runtime_discovery_error(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!(
-                        "CLI runtime `{}` model catalog is not ready",
-                        params.runtime_id
-                    ),
-                ),
-            )
-            .await;
-            return;
+        let (mut model_list, refreshed_at_unix_ms) = match runtime_snapshot.models {
+            Some(snapshot) => (snapshot.result, Some(snapshot.refreshed_at_unix_ms)),
+            None => (
+                RuntimeModelListResult {
+                    models: Vec::new(),
+                    diagnostics: vec![RuntimeDiagnostic {
+                        level: RuntimeDiagnosticLevel::Warning,
+                        code: "cli_runtime.model_catalog_unavailable".into(),
+                        message: "No applicable model catalog is available for this runtime".into(),
+                    }],
+                    error_message: None,
+                },
+                None,
+            ),
         };
-        let mut model_list = model_snapshot.result;
+        // An empty catalog with no refresh timestamp explicitly replaces rows
+        // from an invalidated source. A transport error would leave those old
+        // client rows intact. Neither response establishes execution readiness.
+        model_list
+            .diagnostics
+            .extend(runtime_snapshot.summary.diagnostics);
         if Self::uses_collaborator_cli_disclosure(request_context) {
             model_list.diagnostics = collaborator_safe_runtime_diagnostics(model_list.diagnostics);
             if model_list.error_message.is_some() {
@@ -754,7 +759,7 @@ impl MessageProcessor {
                 runtime_id: params.runtime_id,
                 models: model_list.models,
                 diagnostics: model_list.diagnostics,
-                refreshed_at_unix_ms: Some(model_snapshot.refreshed_at_unix_ms),
+                refreshed_at_unix_ms,
             },
         )
         .await;
@@ -11668,6 +11673,59 @@ impl MessageProcessor {
         }
     }
 
+    /// Technical MCP admission is independent of account/model diagnostics.
+    /// This path rechecks the current executable/cache key and launch contract;
+    /// it never trusts a supported flag from an older readiness snapshot.
+    pub(super) async fn cli_runtime_mcp_readiness_for_instance(
+        &self,
+        instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
+        provider_version: Option<&str>,
+        proxy_url: Option<&str>,
+    ) -> pioneer_protocol::CliMcpAdapterReadiness {
+        #[cfg(test)]
+        if let Some(readiness) = self.cli_mcp_readiness_override_for_tests(match instance.kind {
+            GatewayCliAgentRuntimeKindConfig::Codex => CLIAgentRuntimeKind::Codex,
+            GatewayCliAgentRuntimeKindConfig::Claude => CLIAgentRuntimeKind::Claude,
+            GatewayCliAgentRuntimeKindConfig::OpenCode => CLIAgentRuntimeKind::OpenCode,
+        }) {
+            return readiness;
+        }
+        let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
+        match instance.kind {
+            GatewayCliAgentRuntimeKindConfig::Codex => {
+                crate::cli_runtime::mcp::readiness::codex_mcp_readiness_for_instance(
+                    instance,
+                    self.artifact_runtime_home.as_path(),
+                    provider_version,
+                    proxy_url,
+                    max_tools,
+                    max_schema_bytes,
+                )
+                .await
+            }
+            GatewayCliAgentRuntimeKindConfig::Claude => {
+                crate::cli_runtime::mcp::readiness::claude_mcp_readiness_for_instance(
+                    instance,
+                    self.artifact_runtime_home.as_path(),
+                    provider_version,
+                    proxy_url,
+                    max_tools,
+                    max_schema_bytes,
+                )
+                .await
+            }
+            GatewayCliAgentRuntimeKindConfig::OpenCode => {
+                crate::cli_runtime::mcp::readiness::opencode_mcp_readiness_for_instance(
+                    instance,
+                    provider_version,
+                    max_tools,
+                    max_schema_bytes,
+                )
+                .await
+            }
+        }
+    }
+
     pub(super) async fn cli_runtime_live_summary_from_instance_with_trace(
         &self,
         workspace_id: &str,
@@ -11720,7 +11778,6 @@ impl MessageProcessor {
                 }
                 // Account identity and models belong to this same probe session.
                 let account = probe.account_probe_snapshot();
-                let normal_runtime_ready = account.status == CodexAccountProbeStatus::Ready;
                 let provider_version = account.version.clone();
                 let mut summary = apply_codex_account_probe_to_summary(summary, account);
                 let result = runtime_model_list_from_codex_probe(probe, &instance.custom_models);
@@ -11730,46 +11787,23 @@ impl MessageProcessor {
                     stage.succeed();
                 }
                 models = Some(result);
-                let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
-                #[cfg(test)]
-                let readiness_override = self.cli_mcp_readiness_override_for_tests(
-                    pioneer_protocol::CLIAgentRuntimeKind::Codex,
-                );
-                #[cfg(not(test))]
-                let readiness_override: Option<
-                    pioneer_protocol::CliMcpAdapterReadiness,
-                > = None;
-                let readiness = match readiness_override {
-                    Some(readiness) => readiness,
-                    None => {
-                        let mcp_stage = refresh_trace.map(|trace| {
-                            trace.runtime_stage(
-                                GatewayProviderWarmupStage::RuntimeMcpReadiness,
-                                runtime_kind,
-                            )
-                        });
-                        let readiness =
-                            crate::cli_runtime::mcp::readiness::codex_mcp_readiness_for_instance(
-                                &instance,
-                                self.artifact_runtime_home.as_path(),
-                                normal_runtime_ready,
-                                provider_version.as_deref(),
-                                proxy_url.as_deref(),
-                                max_tools,
-                                max_schema_bytes,
-                            )
-                            .await;
-                        if let Some(stage) = mcp_stage {
-                            stage.succeed();
-                        }
-                        readiness
-                    }
-                };
-                let policy = CliRuntimeCapabilityPolicy::from_readiness(
-                    true,
-                    normal_runtime_ready,
-                    Some(&readiness),
-                );
+                let mcp_stage = refresh_trace.map(|trace| {
+                    trace.runtime_stage(
+                        GatewayProviderWarmupStage::RuntimeMcpReadiness,
+                        runtime_kind,
+                    )
+                });
+                let readiness = self
+                    .cli_runtime_mcp_readiness_for_instance(
+                        &instance,
+                        provider_version.as_deref(),
+                        proxy_url.as_deref(),
+                    )
+                    .await;
+                if let Some(stage) = mcp_stage {
+                    stage.succeed();
+                }
+                let policy = CliRuntimeCapabilityPolicy::from_readiness(true, Some(&readiness));
                 summary.capabilities =
                     cli_runtime_capabilities_for_kind_with_policy(instance.kind, policy);
                 summary.diagnostics.extend(readiness.diagnostics.clone());
@@ -11792,49 +11826,25 @@ impl MessageProcessor {
                 if let Some(stage) = account_stage {
                     stage.succeed();
                 }
-                let normal_runtime_ready = probe.status == ClaudeAccountProbeStatus::Ready;
                 let provider_version = probe.version.clone();
                 let mut summary = apply_claude_account_probe_to_summary(summary, probe);
-                let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
-                #[cfg(test)]
-                let readiness_override = self.cli_mcp_readiness_override_for_tests(
-                    pioneer_protocol::CLIAgentRuntimeKind::Claude,
-                );
-                #[cfg(not(test))]
-                let readiness_override: Option<
-                    pioneer_protocol::CliMcpAdapterReadiness,
-                > = None;
-                let readiness = match readiness_override {
-                    Some(readiness) => readiness,
-                    None => {
-                        let mcp_stage = refresh_trace.map(|trace| {
-                            trace.runtime_stage(
-                                GatewayProviderWarmupStage::RuntimeMcpReadiness,
-                                runtime_kind,
-                            )
-                        });
-                        let readiness =
-                            crate::cli_runtime::mcp::readiness::claude_mcp_readiness_for_instance(
-                                &instance,
-                                self.artifact_runtime_home.as_path(),
-                                normal_runtime_ready,
-                                provider_version.as_deref(),
-                                proxy_url.as_deref(),
-                                max_tools,
-                                max_schema_bytes,
-                            )
-                            .await;
-                        if let Some(stage) = mcp_stage {
-                            stage.succeed();
-                        }
-                        readiness
-                    }
-                };
-                let policy = CliRuntimeCapabilityPolicy::from_readiness(
-                    true,
-                    normal_runtime_ready,
-                    Some(&readiness),
-                );
+                let mcp_stage = refresh_trace.map(|trace| {
+                    trace.runtime_stage(
+                        GatewayProviderWarmupStage::RuntimeMcpReadiness,
+                        runtime_kind,
+                    )
+                });
+                let readiness = self
+                    .cli_runtime_mcp_readiness_for_instance(
+                        &instance,
+                        provider_version.as_deref(),
+                        proxy_url.as_deref(),
+                    )
+                    .await;
+                if let Some(stage) = mcp_stage {
+                    stage.succeed();
+                }
+                let policy = CliRuntimeCapabilityPolicy::from_readiness(true, Some(&readiness));
                 summary.capabilities =
                     cli_runtime_capabilities_for_kind_with_policy(instance.kind, policy);
                 summary.diagnostics.extend(readiness.diagnostics.clone());
@@ -11859,7 +11869,6 @@ impl MessageProcessor {
                 if let Some(stage) = account_stage {
                     stage.succeed();
                 }
-                let normal_runtime_ready = probe.status == OpenCodeProbeStatus::Ready;
                 let provider_version = probe.version.clone();
                 // The account probe already fetched this catalog from its owned server.
                 // Pass it through live readiness so warmup does not launch serve again.
@@ -11872,43 +11881,23 @@ impl MessageProcessor {
                 }
                 models = Some(result);
                 let mut summary = apply_opencode_probe_to_summary(summary, probe);
-                let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
-                #[cfg(test)]
-                let readiness_override = self.cli_mcp_readiness_override_for_tests(
-                    pioneer_protocol::CLIAgentRuntimeKind::OpenCode,
-                );
-                #[cfg(not(test))]
-                let readiness_override: Option<
-                    pioneer_protocol::CliMcpAdapterReadiness,
-                > = None;
-                let readiness = match readiness_override {
-                    Some(readiness) => readiness,
-                    None => {
-                        let mcp_stage = refresh_trace.map(|trace| {
-                            trace.runtime_stage(
-                                GatewayProviderWarmupStage::RuntimeMcpReadiness,
-                                runtime_kind,
-                            )
-                        });
-                        let readiness = crate::cli_runtime::mcp::readiness::opencode_mcp_readiness_for_instance(
-                            &instance,
-                            normal_runtime_ready,
-                            provider_version.as_deref(),
-                            max_tools,
-                            max_schema_bytes,
-                        )
-                        .await;
-                        if let Some(stage) = mcp_stage {
-                            stage.succeed();
-                        }
-                        readiness
-                    }
-                };
-                let policy = CliRuntimeCapabilityPolicy::from_readiness(
-                    true,
-                    normal_runtime_ready,
-                    Some(&readiness),
-                );
+                let mcp_stage = refresh_trace.map(|trace| {
+                    trace.runtime_stage(
+                        GatewayProviderWarmupStage::RuntimeMcpReadiness,
+                        runtime_kind,
+                    )
+                });
+                let readiness = self
+                    .cli_runtime_mcp_readiness_for_instance(
+                        &instance,
+                        provider_version.as_deref(),
+                        proxy_url.as_deref(),
+                    )
+                    .await;
+                if let Some(stage) = mcp_stage {
+                    stage.succeed();
+                }
+                let policy = CliRuntimeCapabilityPolicy::from_readiness(true, Some(&readiness));
                 summary.capabilities =
                     cli_runtime_capabilities_for_kind_with_policy(instance.kind, policy);
                 summary.diagnostics.extend(readiness.diagnostics.clone());
@@ -14657,7 +14646,7 @@ mod tests {
     }
 
     #[test]
-    fn model_discovery_requires_authoritative_ready_snapshot() {
+    fn cached_model_discovery_is_independent_of_probe_status() {
         let mut runtime = cli_runtime_summary_from_instance(effective_instance("codex", true));
         runtime.status = RuntimeStatus::Ready;
         assert!(cli_runtime_ready_for_model_discovery(&runtime));
@@ -14665,7 +14654,7 @@ mod tests {
         runtime.status = RuntimeStatus::Degraded {
             message: "probe degraded".to_owned(),
         };
-        assert!(!cli_runtime_ready_for_model_discovery(&runtime));
+        assert!(cli_runtime_ready_for_model_discovery(&runtime));
 
         runtime.status = RuntimeStatus::Ready;
         runtime.enabled = false;
