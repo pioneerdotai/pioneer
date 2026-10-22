@@ -421,6 +421,7 @@ pub(crate) fn project_task(task: &Task) -> PublicTask {
         created_at: task.created_at,
         updated_at: task.updated_at,
         completed_at: task.completed_at,
+        finish_request: task.finish_request().cloned(),
     }
 }
 

@@ -297,6 +297,7 @@ async fn seed_failed_collaborative_context(
     let metadata = TaskMetadata {
         labels: vec!["composer".to_owned()],
         data: None,
+        finish_request: None,
         composer_work: Some(TaskComposerWork::v1(TurnStartParams {
             agent_delegation_routes: Vec::new(),
             thread_id: parent_thread.id.clone(),
@@ -978,6 +979,7 @@ async fn collaborative_canonical_history_contains_only_the_verified_causal_bundl
     let metadata = TaskMetadata {
         labels: vec!["composer".to_owned()],
         data: None,
+        finish_request: None,
         composer_work: Some(TaskComposerWork::v1(TurnStartParams {
             agent_delegation_routes: Vec::new(),
             thread_id: parent_thread.id.clone(),

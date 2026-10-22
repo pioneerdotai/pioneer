@@ -499,3 +499,33 @@ pub(crate) async fn find_delivery_task_facts<C: ConnectionTrait>(
         .await
         .context("failed to read Task delivery ownership facts")
 }
+
+/// Read the server-owned admission fence without decoding potentially large metadata.
+pub(crate) async fn finish_requested<C: ConnectionTrait>(db: &C, task_id: &str) -> Result<bool> {
+    Ok(task::Entity::find_by_id(task_id.to_owned())
+        .select_only()
+        .column(task::Column::Id)
+        .filter(Expr::cust(
+            "json_extract(metadata_json, '$.finishRequest') IS NOT NULL",
+        ))
+        .into_tuple::<String>()
+        .one(db)
+        .await?
+        .is_some())
+}
+
+pub(crate) async fn finish_first_run<C: ConnectionTrait>(
+    db: &C,
+    task_id: &str,
+) -> Result<Option<i64>> {
+    Ok(task::Entity::find_by_id(task_id.to_owned())
+        .select_only()
+        .expr_as(
+            Expr::cust("json_extract(metadata_json, '$.finishRequest.firstRunNumber')"),
+            "first_run",
+        )
+        .into_tuple::<Option<i64>>()
+        .one(db)
+        .await?
+        .flatten())
+}

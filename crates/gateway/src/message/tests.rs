@@ -8240,6 +8240,7 @@ fn detached_cli_task_create_params(
     params.metadata = Some(pioneer_protocol::TaskMetadata {
         labels: vec!["native-cli-runtime".to_owned()],
         data: None,
+        finish_request: None,
         composer_work: Some(pioneer_protocol::TaskComposerWork::v1(
             pioneer_protocol::TurnStartParams {
                 agent_delegation_routes: Vec::new(),
@@ -25893,6 +25894,7 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
     params.metadata = Some(pioneer_protocol::TaskMetadata {
         labels: vec!["composer-work".to_owned()],
         data: None,
+        finish_request: None,
         composer_work: Some(pioneer_protocol::TaskComposerWork::v1(exact_launch.clone())),
     });
 
@@ -34538,6 +34540,7 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
     params.metadata = Some(pioneer_protocol::TaskMetadata {
         labels: vec!["prompt-parity".to_owned()],
         data: None,
+        finish_request: None,
         composer_work: Some(pioneer_protocol::TaskComposerWork::v1(exact_launch)),
     });
 
@@ -34965,6 +34968,7 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
     params.metadata = Some(pioneer_protocol::TaskMetadata {
         labels: vec!["full-prompt-parity".to_owned()],
         data: None,
+        finish_request: None,
         composer_work: Some(pioneer_protocol::TaskComposerWork::v1(task_launch)),
     });
 
