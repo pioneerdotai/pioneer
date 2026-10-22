@@ -411,7 +411,8 @@ mod tests {
             .await
             .expect("both domains resolve");
         assert_eq!(both.added["threads"].len(), 5);
-        assert!(snapshot.contains_name("threads_identity_odels_list").await);
+        assert!(both.added["threads"].contains(&"threads_identity_odels_list".to_owned()));
+        assert!(!snapshot.contains_name("threads_identity_odels_list").await);
         assert!(!both.added.contains_key("task"));
         assert_eq!(
             both.already_visible["task"],

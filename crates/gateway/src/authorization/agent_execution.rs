@@ -127,14 +127,19 @@ fn select_profile(
         {
             let inherited =
                 inherited_profile.ok_or(ExecutionMaterializationError::MissingProfile)?;
-            if let Some(profile) = options.profiles.iter().find(|current| {
-                (current.id == inherited.id
-                    || (current.backend == inherited.backend
-                        && current.provider_id == inherited.provider_id
-                        && current.model_id == inherited.model_id))
-                    && (identity.source_kind == AgentIdentitySourceKind::Ephemeral
-                        || current.compatible_agent_identity_ids.contains(&identity.id))
-            }) {
+            if let Some(profile) = options
+                .profiles
+                .iter()
+                .filter(|current| {
+                    (current.id == inherited.id
+                        || (current.backend == inherited.backend
+                            && current.provider_id == inherited.provider_id
+                            && current.model_id == inherited.model_id))
+                        && (identity.source_kind == AgentIdentitySourceKind::Ephemeral
+                            || current.compatible_agent_identity_ids.contains(&identity.id))
+                })
+                .min_by_key(|current| current.id != inherited.id)
+            {
                 profile.clone()
             } else {
                 // Changing identity must never carry a model from an unrelated

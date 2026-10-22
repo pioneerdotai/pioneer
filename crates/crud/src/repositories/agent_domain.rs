@@ -2217,6 +2217,37 @@ pub(crate) async fn empty_agent_thread_reasoning<C: ConnectionTrait>(
     Ok(selection.reasoning.map(|reasoning| reasoning.effort))
 }
 
+/// Bounded list projection counterpart of empty_agent_thread_reasoning. The
+/// caller already read the immutable thread creators in its list query.
+pub(crate) async fn agent_thread_creator_reasoning<C: ConnectionTrait>(
+    db: &C,
+    execution_ids: &[&str],
+) -> Result<BTreeMap<String, (String, Option<String>)>> {
+    if execution_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let executions = agent_execution::Entity::find()
+        .filter(agent_execution::Column::Id.is_in(execution_ids.iter().copied()))
+        .all(db)
+        .await?;
+    // The query released its reader before parsing the saved selections.
+    executions
+        .into_iter()
+        .map(|execution| {
+            let selection: pioneer_protocol::AgentExecutionSelection =
+                serde_json::from_str(&execution.requested_profile_selection_json)
+                    .context("thread creator execution selection is invalid")?;
+            Ok((
+                execution.id,
+                (
+                    execution.workspace_id,
+                    selection.reasoning.map(|reasoning| reasoning.effort),
+                ),
+            ))
+        })
+        .collect()
+}
+
 /// Atomically materialize a server-resolved thread and its execution-scoped
 /// continuation route. Callers pass a DatabaseTransaction when this is part
 /// of an AgentAction commit; no user-selected participant/ACL data is accepted

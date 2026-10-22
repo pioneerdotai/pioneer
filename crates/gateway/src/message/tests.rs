@@ -494,31 +494,38 @@ async fn ensure_test_superuser_execution_turn(
             .await
             .unwrap()
             .unwrap();
+        let history = processor
+            .load_prepared_conversation_history_for_workspace(workspace_id, thread_id, turn_id)
+            .await
+            .expect("test runtime snapshot should retain the accepted history");
         let now = pioneer_crud::utc_now();
         processor
             .crud_store
-            .upsert_turn_runtime_snapshot(pioneer_crud::NewTurnRuntimeSnapshot {
-                turn_id: turn_id.into(),
-                thread_id: thread_id.into(),
-                workspace_id: workspace_id.into(),
-                mode_json: serde_json::to_string(&ThreadMode::Agent).unwrap(),
-                model: thread.model,
-                provider_name: thread.model_provider,
-                reasoning_effort: thread.reasoning_effort,
-                agent_skill_versions_json: None,
-                hook_runtime_context_json: serde_json::to_string(
-                    &pioneer_agent::AgentTurnHookRuntimeContext::default(),
-                )
-                .unwrap(),
-                workspace_skill_policies_json: "[]".into(),
-                input_json: "[]".into(),
-                capabilities_json: "[]".into(),
-                resolved_artifacts_json: "[]".into(),
-                runtime_environment_json: "{}".into(),
-                history_json: "[]".into(),
-                created_at: now,
-                updated_at: now,
-            })
+            .upsert_turn_runtime_snapshot_with_source_epochs(
+                pioneer_crud::NewTurnRuntimeSnapshot {
+                    turn_id: turn_id.into(),
+                    thread_id: thread_id.into(),
+                    workspace_id: workspace_id.into(),
+                    mode_json: serde_json::to_string(&ThreadMode::Agent).unwrap(),
+                    model: thread.model,
+                    provider_name: thread.model_provider,
+                    reasoning_effort: thread.reasoning_effort,
+                    agent_skill_versions_json: None,
+                    hook_runtime_context_json: serde_json::to_string(
+                        &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+                    )
+                    .unwrap(),
+                    workspace_skill_policies_json: "[]".into(),
+                    input_json: "[]".into(),
+                    capabilities_json: "[]".into(),
+                    resolved_artifacts_json: "[]".into(),
+                    runtime_environment_json: "{}".into(),
+                    history_json: serde_json::to_string(&history.descriptor).unwrap(),
+                    created_at: now,
+                    updated_at: now,
+                },
+                &history.source_epochs,
+            )
             .await
             .unwrap();
     }

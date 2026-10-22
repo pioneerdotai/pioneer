@@ -183,7 +183,10 @@ impl AgentActionRuntimeBinding {
         .await?
         .ok_or_else(|| anyhow::anyhow!("launch catalog graph root is missing"))?;
         if authority.workspace_id() != execution.workspace_id
-            || authority.root_thread_id() != graph_root.home_root_thread_id
+            || graph_root.workspace_id != execution.workspace_id
+            // A routed child has its own destination capsule while retaining
+            // the parent's work graph for resource accounting.
+            || authority.root_thread_id() != execution.home_root_thread_id
         {
             anyhow::bail!("launch catalog authority differs from its AgentExecution");
         }

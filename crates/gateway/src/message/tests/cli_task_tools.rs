@@ -92,10 +92,11 @@ fn cli_explicit_model_and_reasoning_reach_native_launch_and_survive_mcp_replay()
         .await
         .unwrap();
         assert!(!options.is_error, "{options:?}");
-        let options: pioneer_protocol::AgentToolOptionsProjection =
-            serde_json::from_value(options.structured_content.unwrap()).unwrap();
-        let identity = options
-            .identities
+        // The MCP envelope adds transport metadata beside the domain fields.
+        let identities: Vec<pioneer_protocol::AgentToolIdentityOption> =
+            serde_json::from_value(options.structured_content.unwrap()["identities"].clone())
+                .unwrap();
+        let identity = identities
             .iter()
             .find(|identity| {
                 identity.source_kind

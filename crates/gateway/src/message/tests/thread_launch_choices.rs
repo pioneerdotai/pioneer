@@ -186,8 +186,8 @@ async fn call(
             ToolEventBus::new(8).start_trace("choices-parent", id, name),
         )
         .await
-        .unwrap();
-    assert!(output.success(), "{}", output.raw_text());
+        .unwrap_or_else(|error| panic!("{name} ({id}) failed: {error}"));
+    assert!(output.success(), "{name} ({id}): {}", output.raw_text());
     output.raw_json()
 }
 
@@ -275,6 +275,18 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
         ("openai", "gpt-5.4", Some("high"))
     );
     assert!(thread.turns.is_empty());
+    let empty_list = processor
+        .crud_store
+        .list_threads_for_workspace(&context.workspace_id, 100)
+        .await
+        .unwrap();
+    let empty_list = empty_list
+        .iter()
+        .find(|thread| thread.id == thread_id)
+        .unwrap();
+    assert_eq!(empty_list.model_provider, "openai");
+    assert_eq!(empty_list.model, "gpt-5.4");
+    assert_eq!(empty_list.reasoning_effort.as_deref(), Some("high"));
     call(&tools, "thread_message_send", "post-only", json!({"targetOptionId": target.id, "input": [{"type":"text","text":"A message, without a model launch"}]})).await;
     let message_thread = processor
         .crud_store
