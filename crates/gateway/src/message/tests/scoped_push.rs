@@ -572,6 +572,7 @@ async fn inbox_reset_keeps_delivered_coverage_and_point_ack_cannot_hide_reset() 
     let hold = processor
         .begin_push_mutation(connection, &workspace, false)
         .unwrap();
+    eprintln!("inbox coverage: committed terminal fanout");
     let summary = processor
         .scoped_for_background_reconciliation()
         .task_event_fanout_quantum()
@@ -595,19 +596,24 @@ async fn inbox_reset_keeps_delivered_coverage_and_point_ack_cannot_hide_reset() 
     assert_eq!(terminal.upserts[0].run_id, RUN);
     assert_eq!(terminal.unread_count, 31);
 
-    // Exercise a frontier established by the existing row/byte cap, rather
-    // than by the immutable empty registration. The next reset must use it.
-    let large_title = "z".repeat(600);
+    // Wide, bounded summaries exercise the byte frontier with a small inbox.
+    // Keep the title within admission's 512-byte limit and the summary within
+    // the canonical 1024-character inbox projection. The next reset must use
+    // this retained frontier, rather than the immutable empty registration.
+    let large_title = "z".repeat(512);
+    let result = json!({"summary":"🙂".repeat(1024),"artifacts":[]}).to_string();
     store.database_connection().execute_unprepared(&format!(
-        "UPDATE task SET title='{large_title}' WHERE id='K0000000000000000000I'; WITH RECURSIVE n(i) AS (SELECT 100 UNION ALL SELECT i+1 FROM n WHERE i<4195) INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,completed_at,created_at,updated_at) SELECT printf('R%020d',i),'K0000000000000000000I',printf('R%020d',i),1,i,'succeeded','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM n"
+        "UPDATE task SET title='{large_title}' WHERE id='K0000000000000000000I'; UPDATE task_run SET result_json='{result}' WHERE task_id='K0000000000000000000I'; WITH RECURSIVE n(i) AS (SELECT 100 UNION ALL SELECT i+1 FROM n WHERE i<399) INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,result_json,completed_at,created_at,updated_at) SELECT printf('R%020d',i),'K0000000000000000000I',printf('R%020d',i),1,i,'succeeded','system','{result}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM n"
     )).await.unwrap();
+    eprintln!("inbox coverage: byte-capped replacement");
     processor.dirty_push_inbox(&workspace, None, None);
     let capped = recv_notification_by_method(&mut rx, events::WORKSPACE_PUSH_CHANGED).await;
     let capped: pioneer_protocol::WorkspacePushNotification =
         serde_json::from_value(capped.params.unwrap()).unwrap();
     assert!(!capped.resync_required);
     let capped = capped.inbox.unwrap();
-    assert!(capped.replace && !capped.upserts.is_empty() && capped.upserts.len() < 4096);
+    assert_eq!(capped.unread_count, 331);
+    assert!(capped.replace && !capped.upserts.is_empty() && capped.upserts.len() < 331);
     let frontier = capped
         .next_cursor
         .clone()
@@ -617,11 +623,13 @@ async fn inbox_reset_keeps_delivered_coverage_and_point_ack_cannot_hide_reset() 
         "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,completed_at,created_at,updated_at) VALUES('{NEW}','K0000000000000000000I','{NEW}',1,99999,'succeeded','system',datetime('now','+1 second'),CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
     )).await.unwrap();
     processor.dirty_push(&workspace, None, None, Some(NEW), false, None);
+    eprintln!("inbox coverage: new entry beyond retained frontier");
     let added = recv_notification_by_method(&mut rx, events::WORKSPACE_PUSH_CHANGED).await;
     let added: pioneer_protocol::WorkspacePushNotification =
         serde_json::from_value(added.params.unwrap()).unwrap();
     assert!(!added.inbox.unwrap().replace);
     processor.dirty_push_inbox(&workspace, None, None);
+    eprintln!("inbox coverage: reset retains delivered frontier");
     let retained = recv_notification_by_method(&mut rx, events::WORKSPACE_PUSH_CHANGED).await;
     let retained: pioneer_protocol::WorkspacePushNotification =
         serde_json::from_value(retained.params.unwrap()).unwrap();
