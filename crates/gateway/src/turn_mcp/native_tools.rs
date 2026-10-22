@@ -52,6 +52,7 @@ impl NativeToolFamily {
             Self::Html => HTML.get_or_init(pioneer_tools::html::html_tool_specs),
             Self::Tasks => TASKS.get_or_init(|| {
                 let mut specs = crate::task_tools::task_tool_specs();
+                specs.push(pioneer_tools::threads_search::threads_search_tool_spec());
                 let options = pioneer_protocol::agent_start_options_catalog_entry();
                 specs.push(ConfiguredToolSpec::new(
                     ToolSpec::new(
@@ -74,7 +75,9 @@ impl NativeToolFamily {
             // Reading the already capability-filtered launch catalog is not a
             // child-start mutation. ChildStart belongs to the Agent action
             // envelope, not the Turn execution's resource-action grant.
-            Self::Tasks if name == "threads_start_options" => Ok(ResourceAction::ThreadRead),
+            Self::Tasks if matches!(name, "threads_start_options" | "threads_search") => {
+                Ok(ResourceAction::ThreadRead)
+            }
             Self::Tasks => crate::task_tools::task_tool_resource_action(name),
         }
     }
@@ -113,7 +116,10 @@ pub(crate) fn requires_extended_provider_deadline(tool: &ResolvedMcpTurnTool) ->
 
 pub(crate) fn is_task_operation(tool: &ResolvedMcpTurnTool) -> bool {
     exact_definition(tool) == Some(NativeToolFamily::Tasks)
-        && tool.raw_tool_name != "threads_start_options"
+        && !matches!(
+            tool.raw_tool_name.as_str(),
+            "threads_start_options" | "threads_search"
+        )
 }
 
 pub(crate) fn projection_allowance(
@@ -218,6 +224,11 @@ pub(crate) async fn materialize_task_tools(
             .handlers
             .retain(|(name, _)| name == "threads_start_options");
     }
+    if let Some(search) =
+        super::threads_search::materialize(processor.clone(), context.clone()).await
+    {
+        actions.bundles.push(search);
+    }
     let provider =
         crate::task_tools::GatewayTaskToolProvider::for_cli(std::sync::Arc::downgrade(&processor));
     let tasks = provider
@@ -276,6 +287,18 @@ mod tests {
             let native_count = definitions.len();
             let projection = projection.with_native_tools(definitions, limits).unwrap();
             assert_eq!(projection.native_tool_count(), native_count);
+            let search = projection
+                .tools
+                .iter()
+                .find(|tool| tool.raw_tool_name == "threads_search")
+                .unwrap();
+            assert_eq!(exact_definition(search), Some(NativeToolFamily::Tasks));
+            assert_eq!(
+                NativeToolFamily::Tasks.action("threads_search").unwrap(),
+                ResourceAction::ThreadRead
+            );
+            assert!(!is_task_operation(search));
+
             let budget =
                 crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits::transport_bounded(
                     external,

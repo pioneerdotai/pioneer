@@ -1,3 +1,4 @@
+mod search;
 use crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget;
 use crate::thread_episodic_embedding::{
     LocalEmbeddingProvider, RemoteEmbeddingProvider, local_embedding_model_files,
@@ -46,6 +47,7 @@ use pioneer_protocol::{
     ThreadHistoryEventPayload,
 };
 use pioneer_provider::ProviderRegistry;
+pub(crate) use search::EpisodicSearchAuthority;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1224,6 +1226,18 @@ pub(crate) struct WorkspaceEpisodicRecallService {
 }
 
 impl WorkspaceEpisodicRecallService {
+    pub(crate) async fn recall_authorized_workspace(
+        &self,
+        authority: EpisodicSearchAuthority,
+        query: &str,
+        max_hits: usize,
+        max_chars: usize,
+    ) -> Result<ThreadEpisodicRecallOutput> {
+        self.current_thread_recall
+            .recall_authorized_workspace(authority, query, max_hits, max_chars)
+            .await
+    }
+
     #[allow(dead_code)]
     pub(crate) fn new(
         crud_store: Arc<CrudStore>,
@@ -1531,6 +1545,10 @@ fn workspace_recall_invalid(message: impl Into<String>) -> WorkspaceEpisodicReca
 }
 
 fn validate_workspace_recall_request(request: &WorkspaceEpisodicRecallRequest) -> Option<String> {
+    if request.accessible_thread_ids.is_none() {
+        return Some("authorized thread scope is required".to_owned());
+    }
+
     if !request.policy_context.context_recall_allowed {
         return Some("context recall disabled by policy".to_owned());
     }
@@ -1712,6 +1730,17 @@ pub(crate) struct ThreadEpisodicRecallService {
 }
 
 impl ThreadEpisodicRecallService {
+    pub(crate) fn shared_recall_enabled(&self) -> bool {
+        self.config
+            .read()
+            .map(|config| config.enabled)
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn crud_store_for_search(&self) -> Arc<CrudStore> {
+        self.crud_store.clone()
+    }
+
     #[allow(dead_code)]
     pub(crate) fn new(
         crud_store: Arc<CrudStore>,
@@ -2489,16 +2518,73 @@ impl ThreadEpisodicRecallService {
         ranked: &ThreadEpisodicRankedSearchHit,
         backend_output: &ThreadEpisodicMemvidSearchOutput,
     ) -> std::result::Result<Option<HydratedThreadEpisodicHit>, String> {
+        let mut hydrated = self
+            .hydrate_search_source(workspace_id, thread_id, ranked)
+            .await?;
+        if let Some(hit) = hydrated.as_mut() {
+            hit.hit.adaptive_diagnostics = Some(adaptive_diagnostics_from_backend(backend_output));
+        }
+        Ok(hydrated)
+    }
+
+    async fn hydrate_search_source(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        ranked: &ThreadEpisodicRankedSearchHit,
+    ) -> std::result::Result<Option<HydratedThreadEpisodicHit>, String> {
         let hit = &ranked.hit;
+        let Some((item, text)) = self
+            .validate_search_source(workspace_id, thread_id, &hit.index_item_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if hit.turn_id != item.turn_id
+            || hit.item_id != item.item_id
+            || hit
+                .metadata
+                .get("pioneer.thread_episodic.source_text_hash")
+                .is_none_or(|hash| hash != &item.source_text_hash)
+        {
+            return Ok(None);
+        }
+        let excerpt_start = text.find(hit.text.trim()).unwrap_or(0);
+        let max_hit_chars = self.config.read().map(|c| c.max_hit_chars).unwrap_or(1200);
+        let text = cap_string_chars(&text[excerpt_start..], max_hit_chars);
+        Ok(Some(HydratedThreadEpisodicHit {
+            excerpt_start,
+            hit: ThreadEpisodicHit {
+                provenance: provenance_from_item(&item),
+                text,
+                score: ranked.score_breakdown.final_score,
+                score_breakdown: ranked.score_breakdown.clone(),
+                adaptive_diagnostics: None,
+                created_at: Some(item.created_at.timestamp()),
+            },
+            frame_uri: item
+                .frame_uri
+                .clone()
+                .or_else(|| (!hit.frame_uri.trim().is_empty()).then(|| hit.frame_uri.clone())),
+        }))
+    }
+
+    /// Shared canonical boundary for recall, fresh retrieval and cursor hydration.
+    async fn validate_search_source(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        index_item_id: &str,
+    ) -> std::result::Result<Option<(ThreadEpisodicItemRecord, String)>, String> {
         let item = self
             .crud_store
-            .find_thread_episodic_item(hit.index_item_id.as_str())
+            .find_thread_episodic_item(index_item_id)
             .await
             .map_err(|error| format!("failed to hydrate thread episodic item: {error:#}"))?
             .ok_or_else(|| {
                 format!(
                     "suppressed stale thread episodic hit `{}`: item missing",
-                    hit.index_item_id
+                    index_item_id
                 )
             })?;
         if item.workspace_id != workspace_id {
@@ -2542,39 +2628,18 @@ impl ThreadEpisodicRecallService {
             ));
         }
 
-        let mut text = self.hydrate_hit_text(&item, hit.text.as_str()).await?;
+        let text = self.reconstruct_item_text(&item).await?;
         if looks_secret_like(text.as_str()) {
             return Err(format!(
                 "suppressed thread episodic hit `{}`: secret-like text",
                 item.id
             ));
         }
-        let config = self
-            .config
-            .read()
-            .map(|config| config.clone())
-            .unwrap_or_default();
-        text = cap_string_chars(text.as_str(), config.max_hit_chars);
         if text.trim().is_empty() {
             return Ok(None);
         }
 
-        let text_hash = stable_text_hash(text.as_str());
-        Ok(Some(HydratedThreadEpisodicHit {
-            hit: ThreadEpisodicHit {
-                provenance: provenance_from_item(&item),
-                text,
-                score: ranked.score_breakdown.final_score,
-                score_breakdown: ranked.score_breakdown.clone(),
-                adaptive_diagnostics: Some(adaptive_diagnostics_from_backend(backend_output)),
-                created_at: Some(item.created_at.timestamp()),
-            },
-            frame_uri: item
-                .frame_uri
-                .clone()
-                .or_else(|| (!hit.frame_uri.trim().is_empty()).then(|| hit.frame_uri.clone())),
-            text_hash,
-        }))
+        Ok(Some((item, text)))
     }
 
     async fn reconstruct_item_text(
@@ -2594,25 +2659,6 @@ impl ThreadEpisodicRecallService {
         }
         Ok(source_text)
     }
-
-    async fn hydrate_hit_text(
-        &self,
-        item: &ThreadEpisodicItemRecord,
-        fallback_text: &str,
-    ) -> std::result::Result<String, String> {
-        match self.reconstruct_item_text(item).await {
-            Ok(source_text) => Ok(source_text),
-            Err(message) if can_fallback_to_memvid_hit_text(message.as_str()) => {
-                Ok(fallback_text.trim().to_owned())
-            }
-            Err(message) => Err(message),
-        }
-    }
-}
-
-fn can_fallback_to_memvid_hit_text(message: &str) -> bool {
-    message.contains("turn item events are not available")
-        || message.contains("canonical thread item is missing")
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2623,9 +2669,9 @@ struct HydratedThreadEpisodicHits {
 
 #[derive(Debug, Clone)]
 struct HydratedThreadEpisodicHit {
+    excerpt_start: usize,
     hit: ThreadEpisodicHit,
     frame_uri: Option<String>,
-    text_hash: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2753,10 +2799,12 @@ fn dedup_keys(hit: &HydratedThreadEpisodicHit) -> Vec<String> {
         format!("item:{}", hit.hit.provenance.index_item_id.0),
         format!("source:{}", hit.hit.provenance.source_id),
         format!(
-            "source_ref:{}/{}",
-            hit.hit.provenance.turn_id.0, hit.hit.provenance.item_id.0
+            "source_ref:{}/{}/{}/{}",
+            hit.hit.provenance.workspace_id.0,
+            hit.hit.provenance.thread_id.0,
+            hit.hit.provenance.turn_id.0,
+            hit.hit.provenance.item_id.0
         ),
-        format!("text:{}", hit.text_hash),
     ];
     if let Some(frame_uri) = hit
         .frame_uri
@@ -6074,7 +6122,7 @@ mod tests {
         }
     }
 
-    fn ranked_hit_for_item(
+    pub(super) fn ranked_hit_for_item(
         item: &ThreadEpisodicItemRecord,
         text: &str,
         score: f32,
@@ -6112,7 +6160,16 @@ mod tests {
                 semantic_score: None,
                 temporal_score: None,
                 created_at_unix: Some(item.created_at.timestamp()),
-                metadata: BTreeMap::new(),
+                metadata: BTreeMap::from([
+                    (
+                        "pioneer.thread_episodic.source_text_hash".into(),
+                        item.source_text_hash.clone(),
+                    ),
+                    (
+                        "pioneer.thread_episodic.text_hash".into(),
+                        item.text_hash.clone(),
+                    ),
+                ]),
             },
             score_breakdown: pioneer_protocol::ThreadEpisodicScoreBreakdown {
                 final_score: score,
@@ -6169,7 +6226,7 @@ mod tests {
         }
     }
 
-    async fn seed_active_thread_episodic_item(
+    pub(super) async fn seed_active_thread_episodic_item(
         crud_store: &CrudStore,
         workspace_id: &str,
         thread_id: &str,
@@ -6177,6 +6234,28 @@ mod tests {
         item_id: &str,
         source_text: &str,
     ) -> ThreadEpisodicItemRecord {
+        // An active searchable projection needs a canonical source. Keep the
+        // low-level state helper for deliberately missing/stale-source fixtures.
+        if crud_store
+            .get_turn_item(turn_id, item_id)
+            .await
+            .expect("canonical lookup")
+            .is_none()
+        {
+            materialize_thread_with_item(
+                crud_store,
+                workspace_id,
+                thread_id,
+                turn_id,
+                TurnItem::UserMessage {
+                    id: item_id.to_owned(),
+                    text: source_text.to_owned(),
+                    attachments: Vec::new(),
+                },
+                1_700_000_000,
+            )
+            .await;
+        }
         seed_thread_episodic_item_with_state(
             crud_store,
             workspace_id,
@@ -6190,7 +6269,7 @@ mod tests {
         .await
     }
 
-    async fn seed_thread_episodic_item_with_state(
+    pub(super) async fn seed_thread_episodic_item_with_state(
         crud_store: &CrudStore,
         workspace_id: &str,
         thread_id: &str,
@@ -9816,11 +9895,17 @@ mod tests {
         assert_eq!(output_a.hits.len(), 1);
         assert_eq!(output_a.hits[0].provenance.thread_id.0, thread_a);
         assert_eq!(output_a.hits[0].provenance.index_item_id.0, item_a.id);
-        assert!(output_a.hits[0].text.contains("thread A alpha memory"));
+        assert_eq!(
+            output_a.hits[0].text,
+            "lower scoring alpha workspace capsule memory"
+        );
         assert_eq!(output_b.hits.len(), 1);
         assert_eq!(output_b.hits[0].provenance.thread_id.0, thread_b);
         assert_eq!(output_b.hits[0].provenance.index_item_id.0, item_b.id);
-        assert!(output_b.hits[0].text.contains("thread B alpha memory"));
+        assert_eq!(
+            output_b.hits[0].text,
+            "higher scoring alpha workspace capsule memory"
+        );
         assert!(
             !serde_json::to_string(&output_a)
                 .expect("output A should serialize")
@@ -10008,7 +10093,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thread_episodic_recall_service_hydrates_memvid_text_with_provenance() {
+    async fn thread_episodic_recall_service_hydrates_canonical_text_with_provenance() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_recall_memvid";
         let item = seed_active_thread_episodic_item(
@@ -10033,7 +10118,7 @@ mod tests {
             .await;
 
         assert_eq!(output.hits.len(), 1);
-        assert_eq!(output.hits[0].text, "memvid text");
+        assert_eq!(output.hits[0].text, "canonical text");
         assert_eq!(
             output.hits[0].provenance.source_id,
             format!("thread:turn_memvid/item_memvid/{}", item.id)
@@ -10381,7 +10466,7 @@ mod tests {
             thread_id,
             "turn_secret",
             "item_secret",
-            "token source text",
+            "OPENAI_API_KEY=sk-test-secret-value",
         )
         .await;
         let backend = Arc::new(FakeThreadEpisodicMemvidBackend::with_search(vec![Ok(
@@ -14773,7 +14858,7 @@ mod tests {
         );
     }
 
-    async fn setup_thread_episodic_store() -> (Arc<CrudStore>, String) {
+    pub(super) async fn setup_thread_episodic_store() -> (Arc<CrudStore>, String) {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
@@ -14801,7 +14886,7 @@ mod tests {
         (crud_store, workspace_id)
     }
 
-    async fn mark_thread_episodic_workspace_refill_complete_for_test(
+    pub(super) async fn mark_thread_episodic_workspace_refill_complete_for_test(
         crud_store: &CrudStore,
         workspace_id: &str,
     ) {
@@ -14813,7 +14898,7 @@ mod tests {
         .await;
     }
 
-    async fn mark_thread_episodic_workspace_vector_refill_complete_for_test(
+    pub(super) async fn mark_thread_episodic_workspace_vector_refill_complete_for_test(
         crud_store: &CrudStore,
         workspace_id: &str,
         config: &pioneer_config::GatewayThreadEpisodicVectorSearchConfig,
@@ -15000,7 +15085,7 @@ mod tests {
         }
     }
 
-    async fn materialize_thread_with_item(
+    pub(super) async fn materialize_thread_with_item(
         crud_store: &CrudStore,
         workspace_id: &str,
         thread_id: &str,
@@ -18222,6 +18307,7 @@ mod tests {
             );
             request.project_affinity_json = Some(r#"{"project":"memory"}"#.to_owned());
             request.max_threads = 1;
+            request.accessible_thread_ids = Some(BTreeSet::from([related_thread_id.to_owned()]));
 
             let output = service.search_related_threads(request).await;
 
@@ -18298,6 +18384,7 @@ mod tests {
                 "workspace recall explicit intent",
             );
             missing_intent.intent_source = None;
+            missing_intent.accessible_thread_ids = Some(BTreeSet::new());
 
             let skipped = service.search_workspace_threads(missing_intent).await;
 
@@ -18319,6 +18406,7 @@ mod tests {
             );
             request.intent_source = Some(WorkspaceEpisodicRecallIntentSource::UserExplicit);
             request.max_threads = 1;
+            request.accessible_thread_ids = Some(BTreeSet::from([workspace_thread_id.to_owned()]));
             let mut denied_request = request.clone();
             denied_request.accessible_thread_ids = Some(BTreeSet::new());
             let output = service.search_workspace_threads(request).await;

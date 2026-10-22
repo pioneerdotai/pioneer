@@ -54,7 +54,7 @@ impl HookHandler for ActiveMemoryRecallHook {
             &episodic_capabilities,
         );
         let mut response = HookHandlerResponse::default();
-        let decision = match &input.active_memory_recall_plan {
+        let mut decision = match &input.active_memory_recall_plan {
             Some(plan) => match serde_json::from_value::<ActiveRecallPlan>(plan.clone()) {
                 Ok(plan) => match validate_active_recall_preflight_plan_shape(&plan) {
                     Ok(()) => active_memory_decision_from_preflight_plan(
@@ -113,6 +113,34 @@ impl HookHandler for ActiveMemoryRecallHook {
                 thread_episodic.clone(),
             ),
         };
+        // The earlier host-owned full-input path already covers this corpus,
+        // including an empty or incomplete result. Keep task/durable work, but
+        // do not issue another current/related/workspace search for this turn.
+        if request
+            .prompt_context_set
+            .diagnostics
+            .iter()
+            .any(|diagnostic| {
+                diagnostic.code.as_str() == "thread_context.workspace_recall_attempted"
+            })
+        {
+            decision.episodic.queries.retain(|query| {
+                !matches!(
+                    query.mode,
+                    ActiveRecallMode::ThreadEpisodic
+                        | ActiveRecallMode::CurrentThread
+                        | ActiveRecallMode::RelatedThread
+                        | ActiveRecallMode::WorkspaceThread
+                )
+            });
+            if decision.episodic.queries.is_empty() {
+                decision.episodic = EpisodicMemoryRecallPlan::skip(
+                    ActiveMemoryDecisionReasonCode::ProviderSkip,
+                    1.0,
+                    vec!["workspace_recall_already_performed".to_owned()],
+                );
+            }
+        }
         response
             .diagnostics
             .extend(hook_diagnostics_from_strings(&decision.all_diagnostics()));

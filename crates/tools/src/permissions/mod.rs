@@ -689,6 +689,7 @@ fn extract_internal_permission_intent(invocation: &ToolInvocation) -> Option<Per
         tool_name if ARTIFACT_DOMAIN_TOOL_NAMES.contains(&tool_name) => {
             Some("artifact bookkeeping")
         }
+        "threads_search" => Some("search accessible threads"),
         tool_name if THREADS_DOMAIN_TOOL_NAMES.contains(&tool_name) => {
             Some("read thread tool result")
         }
@@ -2350,7 +2351,7 @@ mod tests {
             .map(str::to_owned),
         );
 
-        assert_eq!(registered.len(), 38, "native tool inventory changed");
+        assert_eq!(registered.len(), 39, "native tool inventory changed");
         let unknown = registered
             .iter()
             .filter(|name| {
@@ -2406,6 +2407,7 @@ mod tests {
             ("artifact_register", PermissionActionKind::Internal),
             ("artifact_read", PermissionActionKind::Internal),
             ("threads_tools_result_read", PermissionActionKind::Internal),
+            ("threads_search", PermissionActionKind::Internal),
             ("computer_use", PermissionActionKind::ComputerUse),
             ("read_skill", PermissionActionKind::Internal),
             ("threads_start_options", PermissionActionKind::Internal),
@@ -2432,7 +2434,7 @@ mod tests {
             .map(str::to_owned),
         );
 
-        assert_eq!(registered.len(), 38, "native tool inventory changed");
+        assert_eq!(registered.len(), 39, "native tool inventory changed");
         assert_eq!(
             registered,
             expected_actions

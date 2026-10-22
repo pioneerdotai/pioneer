@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["vendor/memvid-core"]
 members = [
   "crates/agent",
   "crates/compaction",
@@ -222,3 +223,6 @@ process-wrap = { version = "10", features = ["tokio1"] }
 gpui-fast = { git = "https://github.com/pioneerdotai/gpui-fast", branch = "cargo/composition-input" }
 gpui-fast-linux = { git = "https://github.com/pioneerdotai/gpui-fast", branch = "cargo/composition-input" }
 gpui-fast-macos = { git = "https://github.com/pioneerdotai/gpui-fast", branch = "cargo/composition-input" }
+
+[patch."https://github.com/pioneerdotai/memory"]
+memvid-core = { path = "vendor/memvid-core" }

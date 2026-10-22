@@ -83,6 +83,14 @@ impl MessageProcessor {
                 ..AgentTurnHookRuntimeContext::default()
             }
         };
+        let runtime_context = self
+            .bind_episodic_runtime_context(
+                &binding.workspace_id,
+                &binding.thread_id,
+                &binding.turn_id,
+                runtime_context,
+            )
+            .await;
         let limits = TurnPostTurnHookInputLimits::default();
         let (user_text, user_text_truncated) = self
             .crud_store

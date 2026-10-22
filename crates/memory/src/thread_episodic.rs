@@ -608,9 +608,41 @@ pub struct ThreadEpisodicRankingContext {
     pub now_unix: Option<i64>,
 }
 
+/// One retrieval quantum. Cursor continues lexical candidates, never final hybrid order.
+/// Hybrid native candidates are emitted on the first quantum; subsequent lexical
+/// quanta use their own native scores. Consumers rank by maximum source score,
+/// with a fixed ranking context, after validating all sources.
+#[derive(Debug, Clone)]
+pub struct ThreadEpisodicSegmentRetrieval {
+    pub hits: Vec<ThreadEpisodicRankedSearchHit>,
+    pub next_cursor: Option<String>,
+    pub approximate: bool,
+    pub incomplete: bool,
+}
+
 #[async_trait]
 pub trait ThreadEpisodicMemvidBackend: Send + Sync {
     fn capabilities(&self) -> ThreadEpisodicMemvidBackendCapabilities;
+
+    async fn segment_generation(
+        &self,
+        _segment: ThreadEpisodicMemvidSearchSegment,
+    ) -> Result<u64, ThreadEpisodicMemvidError> {
+        Err(ThreadEpisodicMemvidError::non_retryable(
+            "segment generation unsupported",
+        ))
+    }
+
+    async fn retrieve_segment(
+        &self,
+        _request: ThreadEpisodicMemvidSearchRequest,
+        _cursor: Option<String>,
+        _embedder: Option<Arc<ThreadEpisodicMemvidEmbedder>>,
+    ) -> Result<ThreadEpisodicSegmentRetrieval, ThreadEpisodicMemvidError> {
+        Err(ThreadEpisodicMemvidError::non_retryable(
+            "segment retrieval unsupported",
+        ))
+    }
 
     async fn index_item(
         &self,
@@ -860,6 +892,124 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
             .with_workspace_ownership(ownership)
             .index_item(request)
             .await
+    }
+
+    async fn segment_generation(
+        &self,
+        segment: ThreadEpisodicMemvidSearchSegment,
+    ) -> Result<u64, ThreadEpisodicMemvidError> {
+        let path = path_from_storage_uri(&segment.storage_uri)?;
+        let owned_path = path.clone();
+        self.run_blocking(&path, move || {
+            Memvid::open_read_only(&owned_path)
+                .map(|index| index.generation())
+                .map_err(classify_memvid_error)
+        })
+        .await
+        .map_err(|error| ThreadEpisodicMemvidError::retryable(error.to_string()))?
+    }
+
+    async fn retrieve_segment(
+        &self,
+        request: ThreadEpisodicMemvidSearchRequest,
+        cursor: Option<String>,
+        embedder: Option<Arc<ThreadEpisodicMemvidEmbedder>>,
+    ) -> Result<ThreadEpisodicSegmentRetrieval, ThreadEpisodicMemvidError> {
+        request.profile.validate()?;
+        if request.segments.len() != 1 {
+            return Err(ThreadEpisodicMemvidError::non_retryable(
+                "exactly one segment required",
+            ));
+        }
+        if cursor
+            .as_ref()
+            .is_some_and(|value| value.parse::<usize>().is_err())
+        {
+            return Err(ThreadEpisodicMemvidError::non_retryable(
+                "invalid segment cursor",
+            ));
+        }
+        let segment = request.segments[0].clone();
+        let path = path_from_storage_uri(&segment.storage_uri)?;
+        let owned_path = path.clone();
+        self.run_blocking(&path, move || {
+            let mut index = Memvid::open_read_only(&owned_path).map_err(classify_memvid_error)?;
+            let mut lexical_request = memvid_thread_episodic_search_request(
+                &request.profile,
+                &request.query,
+                request.scope.as_deref(),
+            );
+            lexical_request.cursor = cursor.clone();
+            let lexical = index
+                .search(lexical_request)
+                .map_err(classify_memvid_error)?;
+            let next_cursor = lexical.next_cursor;
+            let mut raw = lexical
+                .hits
+                .into_iter()
+                .filter_map(|mut hit| {
+                    hydrate_search_hit_metadata(&index, &mut hit);
+                    search_hit_to_thread_episodic_hit(
+                        hit,
+                        lexical.engine.clone(),
+                        &segment,
+                        &request.workspace_id,
+                        &request.thread_id,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let approximate = embedder.is_some();
+            let mut incomplete = false;
+            if cursor.is_none() {
+                if let Some(embedder) = embedder {
+                    let ask = memvid_thread_episodic_ask_request(
+                        &request.profile,
+                        &request.query,
+                        request.scope.as_deref(),
+                        ThreadEpisodicMemvidAskRetrievalMode::Hybrid,
+                    );
+                    let response = index
+                        .ask(ask, Some(embedder.as_ref()))
+                        .map_err(classify_memvid_error)?;
+                    // Native vectors have no continuation. A saturated final
+                    // hybrid window cannot establish semantic exhaustion, even
+                    // though the independent lexical traversal will continue.
+                    incomplete =
+                        response.retrieval.hits.len() >= request.profile.max_candidates as usize;
+                    let engine = response.retrieval.engine;
+                    raw.extend(response.retrieval.hits.into_iter().filter_map(|mut hit| {
+                        hydrate_search_hit_metadata(&index, &mut hit);
+                        search_hit_to_thread_episodic_hit(
+                            hit,
+                            engine.clone(),
+                            &segment,
+                            &request.workspace_id,
+                            &request.thread_id,
+                        )
+                    }));
+                }
+            }
+            // No adaptive cutoff here: canonical source checks belong to the caller.
+            let filtered = filter_thread_episodic_search_candidates(
+                &request.workspace_id,
+                &request.thread_id,
+                raw,
+            );
+            Ok(ThreadEpisodicSegmentRetrieval {
+                hits: rank_thread_episodic_search_hits(
+                    filtered.hits,
+                    ThreadEpisodicRankingContext {
+                        exact_source: request.exact_source,
+                        now_unix: None,
+                    },
+                ),
+                next_cursor,
+                approximate,
+                incomplete,
+            })
+        })
+        .await
+        .map_err(|error| ThreadEpisodicMemvidError::retryable(error.to_string()))?
     }
 
     async fn search(
@@ -1300,7 +1450,7 @@ fn search_hit_to_thread_episodic_hit(
         capsule_ref: segment.capsule_ref.clone(),
         frame_id: hit.frame_id,
         frame_uri: hit.uri,
-        text: hit.chunk_text.unwrap_or(hit.text),
+        text: hit.text,
         memvid_score: score,
         lexical_score,
         semantic_score: None,
@@ -3065,6 +3215,198 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(returned_ids.contains(&"index_item_one"));
         assert!(returned_ids.contains(&"index_item_two"));
+    }
+
+    struct QueryOnlyProvider(Arc<AtomicUsize>);
+    impl ThreadEpisodicEmbeddingProvider for QueryOnlyProvider {
+        fn provider_id(&self) -> &str {
+            "test"
+        }
+        fn model(&self) -> &str {
+            "test-embedding"
+        }
+        fn dimension(&self) -> usize {
+            3
+        }
+        fn normalized(&self) -> bool {
+            true
+        }
+        fn embed_text(&self, _: &str) -> Result<Vec<f32>, crate::ThreadEpisodicEmbeddingError> {
+            panic!("search must use query preprocessing, never document preprocessing")
+        }
+        fn embed_query(&self, _: &str) -> Result<Vec<f32>, crate::ThreadEpisodicEmbeddingError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![1.0, 0.0, 0.0])
+        }
+    }
+
+    #[tokio::test]
+    async fn segment_retrieval_reuses_query_path_and_reaches_semantic_scope_past_global_top_k() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("semantic-scope.mv2");
+        let identity = ThreadEpisodicEmbeddingIdentity::new("test", "test-embedding", 3, true);
+        for n in 0..=130 {
+            let thread = if n == 0 || n == 130 {
+                "target"
+            } else {
+                "foreign"
+            };
+            let id = format!("source-{n}");
+            index_item_blocking(
+                path.clone(),
+                ThreadEpisodicMemvidIndexRequest {
+                    storage_uri: thread_episodic_storage_uri_from_path(&path),
+                    capsule_id: "capsule".into(),
+                    capsule_ref: "capsule-ref".into(),
+                    workspace_capsule: true,
+                    index_item_id: id.clone(),
+                    frame_uri: format!(
+                        "mv2://workspace/ws/thread/{thread}/turn/turn/item/{id}/index/{id}"
+                    ),
+                    text: "violet apricot luminescence".into(),
+                    metadata: thread_episodic_memvid_metadata(
+                        "ws",
+                        thread,
+                        "turn",
+                        &id,
+                        "user",
+                        "agent",
+                        "user_visible_thread_item",
+                        "hash",
+                        "hash",
+                    ),
+                    embedding: Some(
+                        ThreadEpisodicMemvidIndexEmbedding::new(
+                            identity.clone(),
+                            if n == 130 {
+                                vec![0.8, 0.6, 0.0]
+                            } else {
+                                vec![1.0, 0.0, 0.0]
+                            },
+                        )
+                        .unwrap(),
+                    ),
+                },
+            )
+            .unwrap();
+        }
+        let scope = "mv2://workspace/ws/thread/target/";
+        let mut native = Memvid::open_read_only(&path).unwrap();
+        let scoped = native
+            .vec_search_with_embedding("zzzxylophone", &[1.0, 0.0, 0.0], 32, 360, Some(scope))
+            .unwrap();
+        assert_eq!(
+            scoped.hits.len(),
+            2,
+            "foreign global candidates must not crowd out this URI scope"
+        );
+        drop(native);
+        let backend = MemvidThreadEpisodicBackend::new();
+        let request = ThreadEpisodicMemvidSearchRequest {
+            workspace_id: "ws".into(),
+            thread_id: "target".into(),
+            query: "zzzxylophone".into(),
+            scope: Some(scope.into()),
+            profile: ThreadEpisodicSearchProfile::for_kind(
+                ThreadEpisodicSearchProfileKind::DefaultContext,
+            ),
+            segments: vec![ThreadEpisodicMemvidSearchSegment {
+                capsule_id: "capsule".into(),
+                capsule_ref: "capsule-ref".into(),
+                storage_uri: thread_episodic_storage_uri_from_path(&path),
+                segment_index: 1,
+            }],
+            exact_source: None,
+        };
+        let mut lexical_request = request.clone();
+        lexical_request.thread_id = "foreign".into();
+        lexical_request.scope = Some("mv2://workspace/ws/thread/foreign/".into());
+        lexical_request.query = "violet".into();
+        lexical_request.profile.max_candidates = 4;
+        let mut cursor = None;
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..100 {
+            let page = backend
+                .retrieve_segment(lexical_request.clone(), cursor, None)
+                .await
+                .unwrap();
+            for hit in page.hits {
+                assert!(
+                    seen.insert(hit.hit.index_item_id),
+                    "native lexical continuation repeated a source"
+                );
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert!(cursor.is_none());
+        assert_eq!(
+            seen.len(),
+            129,
+            "lexical continuation must reach beyond its first document window"
+        );
+        // The two target documents straddle a large unrelated global window.
+        // The second page must not stall after repeatedly post-filtering it.
+        let mut sparse_request = request.clone();
+        sparse_request.query = "violet".into();
+        sparse_request.profile.max_candidates = 1;
+        let first = backend
+            .retrieve_segment(sparse_request.clone(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(first.hits.len(), 1);
+        let second = backend
+            .retrieve_segment(sparse_request, first.next_cursor, None)
+            .await
+            .unwrap();
+        assert_eq!(second.hits.len(), 1);
+        assert_ne!(
+            first.hits[0].hit.index_item_id,
+            second.hits[0].hit.index_item_id
+        );
+        assert!(second.next_cursor.is_none());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let lexical = backend
+            .retrieve_segment(request.clone(), None, None)
+            .await
+            .unwrap();
+        assert!(lexical.hits.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let embedder = Arc::new(
+            ThreadEpisodicMemvidEmbedder::new(Arc::new(QueryOnlyProvider(calls.clone())))
+                .prepare_query("zzzxylophone")
+                .unwrap(),
+        );
+        for _ in 0..2 {
+            let hybrid = backend
+                .retrieve_segment(request.clone(), None, Some(embedder.clone()))
+                .await
+                .unwrap();
+            assert!(hybrid.approximate);
+            assert!(
+                hybrid
+                    .hits
+                    .iter()
+                    .any(|hit| hit.hit.index_item_id == "source-130")
+            );
+        }
+        let mut saturated_request = request.clone();
+        saturated_request.thread_id = "foreign".into();
+        saturated_request.scope = Some("mv2://workspace/ws/thread/foreign/".into());
+        saturated_request.profile.max_candidates = 4;
+        let saturated = backend
+            .retrieve_segment(saturated_request, None, Some(embedder))
+            .await
+            .unwrap();
+        assert!(saturated.approximate && saturated.incomplete);
+        assert!(saturated.next_cursor.is_none());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one prepared query is reused across segment operations"
+        );
     }
 
     fn test_hit(

@@ -8080,7 +8080,6 @@ dependencies = [
 [[package]]
 name = "memvid-core"
 version = "3.1.8"
-source = "git+https://github.com/pioneerdotai/memory?tag=v3.1.8#fe0b3d9ac883c667587c262f7b372bf06eb605d5"
 dependencies = [
  "atomic-write-file",
  "base64 0.22.1",

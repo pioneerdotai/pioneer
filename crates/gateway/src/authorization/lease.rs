@@ -725,7 +725,7 @@ async fn project_lease(store: &CrudStore, mut lease: ExecutionLease) -> Result<E
     Ok(lease)
 }
 
-async fn collaboration_authority_principal(
+pub(crate) async fn collaboration_authority_principal(
     store: &CrudStore,
     principal_id: &PrincipalId,
 ) -> Result<AuthenticatedSessionPrincipal> {

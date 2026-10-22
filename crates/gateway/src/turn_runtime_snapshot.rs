@@ -214,8 +214,32 @@ pub(crate) async fn restored_conversation_scope_projection_from_snapshot(
     AgentTurnHookRuntimeContext,
     crate::compaction::frozen::RestoredAcceptedHistory,
 )> {
-    let context: AgentTurnHookRuntimeContext =
+    let mut context: AgentTurnHookRuntimeContext =
         from_snapshot_json(&snapshot.hook_runtime_context_json, "hook runtime context")?;
+    // Runtime metadata is not authority. Recovery validates the exact Turn
+    // envelope again, including derived child/task lineage.
+    context.initiating_principal_id = None;
+    match crate::authorization::ExecutionAuthorizationContext::load_for_turn(
+        store,
+        &snapshot.turn_id,
+    )
+    .await
+    {
+        Ok(authority)
+            if authority
+                .verify_turn_scope(
+                    store,
+                    &snapshot.workspace_id,
+                    &snapshot.thread_id,
+                    &snapshot.turn_id,
+                )
+                .await
+                .is_ok() =>
+        {
+            context.initiating_principal_id = Some(authority.initiating_principal_id().to_string());
+        }
+        _ => context.episodic_recall_capabilities = None,
+    }
     let _frozen_hold = crate::compaction::frozen::acquire_history_json(
         store,
         &snapshot.workspace_id,

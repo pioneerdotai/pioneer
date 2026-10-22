@@ -22,6 +22,7 @@ impl Drop for CliHistoryMonitorDrop {
 }
 
 pub(super) struct PreparedApiProviderTurnStart {
+    hook_runtime_context: pioneer_agent::AgentTurnHookRuntimeContext,
     outcome: crate::thread::TurnStartOutcome,
     user_message_capability_attachments: Vec<pioneer_protocol::UserMessageAttachment>,
     workspace_skill_policies:
@@ -3183,6 +3184,14 @@ impl MessageProcessor {
                 ..pioneer_agent::AgentTurnHookRuntimeContext::default()
             },
         );
+        let hook_runtime_context = self
+            .bind_episodic_runtime_context(
+                &outcome.started_notification.workspace_id,
+                &outcome.started_notification.thread_id,
+                &outcome.started_notification.turn.id,
+                hook_runtime_context,
+            )
+            .await;
         let snapshot_result = self
             .persist_turn_runtime_snapshot_with_optional_agent_overlay(
                 outcome.started_notification.thread_id.as_str(),
@@ -3232,6 +3241,7 @@ impl MessageProcessor {
 
         Ok(ApiProviderTurnAdmission::New(
             PreparedApiProviderTurnStart {
+                hook_runtime_context,
                 outcome,
                 user_message_capability_attachments,
                 workspace_skill_policies,
@@ -3285,10 +3295,11 @@ impl MessageProcessor {
         let outcome = prepared.outcome;
         let start_result = self
             .agent_manager
-            .start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_security_snapshot_and_agent_skill_overlay(
+            .start_turn_with_hook_context_reasoning_permission_profile_security_snapshot_and_agent_skill_overlay(
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
                 outcome.materialization.turn.mode,
+                prepared.hook_runtime_context,
                 &outcome.materialization.thread.model,
                 &outcome.materialization.thread.model_provider,
                 prepared.workspace_skill_policies,
@@ -3483,12 +3494,20 @@ impl MessageProcessor {
             .into_iter()
             .collect::<HashMap<_, _>>();
         let mut agent_skill_overlay = Vec::new();
+        let hook_runtime_context = self
+            .bind_episodic_runtime_context(
+                &outcome.started_notification.workspace_id,
+                &outcome.started_notification.thread_id,
+                &outcome.started_notification.turn.id,
+                pioneer_agent::AgentTurnHookRuntimeContext::default(),
+            )
+            .await;
         self.persist_turn_runtime_snapshot_with_optional_agent_overlay(
             outcome.started_notification.thread_id.as_str(),
             outcome.started_notification.workspace_id.as_str(),
             outcome.started_notification.turn.id.as_str(),
             outcome.materialization.turn.mode,
-            &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+            &hook_runtime_context,
             &outcome.materialization.thread.model,
             &outcome.materialization.thread.model_provider,
             effective_reasoning_effort.as_deref(),
@@ -3508,6 +3527,7 @@ impl MessageProcessor {
             .map_err(|error| format!("failed to resolve permission profile: {error:#}"))?;
 
         Ok(PreparedApiProviderTurnStart {
+            hook_runtime_context,
             outcome,
             user_message_capability_attachments: Vec::new(),
             workspace_skill_policies,
@@ -3924,7 +3944,9 @@ impl MessageProcessor {
                 continue;
             }
             if let Some(binding) = binding.as_ref() {
-                let visible = if spec.spec.name == "threads_start_options" {
+                let visible = if spec.spec.name == "threads_search" {
+                    true // ThreadRead was checked above; no child-start capability is needed.
+                } else if spec.spec.name == "threads_start_options" {
                     binding
                         .capabilities
                         .contains(&pioneer_protocol::AgentToolCapability::ChildStart)

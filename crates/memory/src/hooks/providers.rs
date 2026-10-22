@@ -237,6 +237,8 @@ pub struct MemoryCurrentThreadRecallRequest {
 #[serde(rename_all = "camelCase")]
 pub struct MemoryRelatedThreadRecallRequest {
     pub workspace_id: String,
+    #[serde(default)]
+    pub turn_id: String,
     pub current_thread_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal_id: Option<String>,
@@ -251,6 +253,8 @@ pub struct MemoryRelatedThreadRecallRequest {
 #[serde(rename_all = "camelCase")]
 pub struct MemoryWorkspaceThreadRecallRequest {
     pub workspace_id: String,
+    #[serde(default)]
+    pub turn_id: String,
     pub current_thread_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal_id: Option<String>,

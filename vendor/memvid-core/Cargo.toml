@@ -1,0 +1,140 @@
+[package]
+name = "memvid-core"
+version = "3.1.8"
+edition = "2024"
+rust-version = "1.85.0"
+license = "Apache-2.0"
+description = "Core library for Memvid v2, a crash-safe, deterministic, single-file AI memory."
+repository = "https://github.com/memvid/memvid"
+documentation = "https://docs.memvid.com"
+readme = "README.md"
+keywords = ["ai", "memory", "search", "vector", "embeddings"]
+categories = ["database", "data-structures"]
+include = ["src/**/*", "data/**/*", "Cargo.toml", "README.md"]
+
+[dependencies]
+once_cell = "1.19.0"
+serde = { version = "1.0.228", features = ["derive"] }
+bincode = { version = "2.0.1", features = ["serde"] }
+blake3 = "1.5.1"
+uuid = { version = "1.10.0", features = ["v4", "serde"] }
+log = "0.4.22"
+thiserror = "2.0.17"
+fs2 = "0.4.3"
+zstd = "0.13.1"
+lz4_flex = "0.12.0"
+tracing = "0.1.41"
+serde_json = "1.0.145"
+ed25519-dalek = { version = "2.2.0", features = ["std"] }
+base64 = "0.22.1"
+sha2 = "0.10.9"
+hex = "0.4.3"
+# extractous uses GraalVM native compilation which doesn't work on Windows ARM or WSL2 on ARM
+# Enable with --features extractous for full document extraction (PDF, DOCX, etc.)
+extractous = { version = "0.3", optional = true }
+regex = "1.11.1"
+time = { version = "0.3.36", features = ["formatting", "parsing"] }
+chrono = { version = "0.4.42", features = ["serde"] }
+interim = { version = "0.2.1", optional = true }
+lopdf = "0.39"
+# Pure Rust PDF text extraction - used as primary extractor when extractous is disabled
+pdf-extract = { version = "0.10", optional = true }
+# High-accuracy PDF text extraction with perfect word spacing (2025)
+pdf_oxide = { version = "0.3", optional = true }
+unicode-normalization = "0.1"
+unicode-segmentation = "1.11"
+zip = { version = "7.1", default-features = false, features = ["deflate"] }
+quick-xml = "0.31"
+calamine = "0.22"
+pdfium-render = { version = "0.8.28", optional = true }
+tempfile = "3.10.1"
+num_cpus = { version = "1.17", optional = true }
+crossbeam-channel = { version = "0.5.13", optional = true }
+memmap2 = "0.9"
+memchr = "2.7"
+same-file = "1.0"
+fs-err = "3.2"
+atomic-write-file = "0.3"
+dirs-next = "2.0"
+smallvec = { version = "1.13", features = ["serde", "union", "const_generics", "write"] }
+tantivy = { version = "0.25.0", optional = true, default-features = false, features = ["mmap"] }
+ort = { version = "=2.0.0-rc.12", optional = true }
+hnsw = { version = "0.11.0", optional = true, features = ["serde"] }
+jsonwebtoken = { version = "10.0.0", optional = true, features = ["rust_crypto"] }
+image = { version = "0.25", optional = true, default-features = false, features = ["jpeg", "png", "webp"] }
+ndarray = { version = "0.16", optional = true }
+rayon = { version = "1.10", optional = true }
+tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
+symphonia = { version = "0.5.3", optional = true, default-features = false, features = ["aac", "mp3", "flac", "isomp4", "ogg", "wav", "pcm"] }
+rubato = { version = "0.15", optional = true }
+rustfft = { version = "6.2", optional = true }
+
+# Encryption capsules (.mv2e) - feature-gated
+argon2 = { version = "0.5", optional = true }
+aes-gcm = { version = "0.10", optional = true }
+rand = { version = "0.8", optional = true, features = ["serde1"] }
+rand_pcg = { version = "0.3", optional = true, features = ["serde1"] }
+zeroize = { version = "1.7", optional = true }
+
+# Candle ML framework for Whisper transcription
+candle-core = { version = "0.9", optional = true }
+candle-nn = { version = "0.9", optional = true }
+candle-transformers = { version = "0.9", optional = true }
+hf-hub = { version = "0.4", optional = true, features = ["tokio"] }
+byteorder = { version = "1.5", optional = true }
+
+# SymSpell for PDF text cleanup - fixes broken word spacing from PDF extraction
+symspell = { version = "0.4", optional = true }
+# SIMD acceleration for vector distance calculations
+wide = { version = "1.1", optional = true }
+space = { version = "0.17", optional = true }
+
+# HTTP client for API-based embedding providers (OpenAI, etc.)
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
+# Platform-specific: libc for stderr suppression on macOS
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[features]
+default = ["lex", "pdf_extract", "simd"]
+# pdf_oxide disabled - cff-parser panics on ligature fonts (uniFB01/uniFB02)
+# symspell_cleanup - enables robust PDF text repair (requires `make download-models` for dictionaries)
+lex = ["dep:tantivy"]
+extractous = ["dep:extractous"]
+# Pure Rust PDF extraction - faster than lopdf for text extraction, cross-platform
+pdf_extract = ["dep:pdf-extract"]
+# High-accuracy PDF extraction with perfect word spacing (recommended for 2025+)
+pdf_oxide = ["dep:pdf_oxide"]
+vec = ["dep:ort", "dep:hnsw", "dep:ndarray", "dep:tokenizers", "dep:space", "dep:rand", "dep:rand_pcg"]
+clip = ["vec", "dep:image", "dep:ndarray", "dep:rayon", "dep:tokenizers"]
+tokenizers_esaxx_fast = ["dep:tokenizers", "tokenizers/esaxx_fast"]
+mmap = []
+pdfium = ["dep:pdfium-render"]
+temporal_track = []
+temporal_enrich = ["dep:interim"]
+parallel_segments = ["dep:num_cpus", "dep:crossbeam-channel"]
+# Logic-Mesh: entity-relationship graph with NER extraction using DistilBERT-NER ONNX
+logic_mesh = ["dep:ort", "dep:ndarray", "dep:tokenizers"]
+# Whisper: audio transcription with Candle inference
+whisper = ["dep:symphonia", "dep:rubato", "dep:tokenizers", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:hf-hub", "dep:byteorder"]
+# GPU acceleration for Whisper (optional)
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
+# Time-travel replay for agent sessions
+replay = []
+# Password-based encryption capsules (.mv2e)
+encryption = ["dep:argon2", "dep:aes-gcm", "dep:rand", "dep:zeroize"]
+# SymSpell-based PDF text cleanup - fixes broken word spacing
+symspell_cleanup = ["dep:symspell"]
+# API-based embedding providers (OpenAI, Anthropic, etc.) - requires network
+api_embed = ["dep:reqwest"]
+# SIMD acceleration for vector distance calculations
+simd = ["dep:wide"]
+hnsw_bench = ["dep:hnsw", "dep:rand", "dep:space", "dep:rand_pcg"]
+
+[dev-dependencies]
+fastrand = "2.0"
+tempfile = "3.10.1"
+criterion = { version = "0.8.1", features = ["html_reports"] }

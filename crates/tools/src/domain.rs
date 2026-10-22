@@ -26,6 +26,7 @@ pub const TASK_DOMAIN_TOOL_NAMES: &[&str] = &[
 pub const ARTIFACT_DOMAIN_TOOL_NAMES: &[&str] =
     &["artifact_prepare", "artifact_register", "artifact_read"];
 pub const THREADS_DOMAIN_TOOL_NAMES: &[&str] = &[
+    "threads_search",
     "threads_tools_result_read",
     "threads_start_options",
     "thread_message_send",
@@ -259,6 +260,7 @@ mod tests {
         assert_eq!(
             BuiltinToolDomain::Threads.tool_names(),
             [
+                "threads_search",
                 "threads_tools_result_read",
                 "threads_start_options",
                 "thread_message_send",

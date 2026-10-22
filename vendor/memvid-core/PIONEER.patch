@@ -1,0 +1,127 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -141,25 +140,0 @@
+-
+-[[example]]
+-name = "text_embedding"
+-required-features = ["vec"]
+-
+-[[example]]
+-name = "text_embed_cache_bench"
+-required-features = ["vec"]
+-
+-[[example]]
+-name = "openai_embedding"
+-required-features = ["api_embed"]
+-
+-[[example]]
+-name = "simd_benchmark"
+-required-features = ["simd"]
+-
+-[[bench]]
+-name = "search_precision_benchmark"
+-harness = false
+-
+-[[bench]]
+-name = "vec_search_benchmark"
+-harness = false
+-required-features = ["hnsw_bench"]
+--- a/src/memvid/ticket.rs
++++ b/src/memvid/ticket.rs
+@@ -7,0 +8,5 @@
++    /// Committed capsule generation used to reject stale search continuations.
++    pub fn generation(&self) -> u64 {
++        self.generation
++    }
++
+--- a/src/memvid/search/tantivy.rs
++++ b/src/memvid/search/tantivy.rs
+@@ -99,0 +100,2 @@
++    let candidate_window_full = search_hits.len() == doc_limit
++        && candidate_filter.is_none_or(|filter| doc_limit < filter.len());
+@@ -191 +193 @@
+-    if evaluated.len() > 1 {
++    if evaluated.len() > 1 && request.scope.is_none() {
+@@ -353 +355,8 @@
+-    let next_cursor = if produced < total_slices {
++    // A full document window is not proof of corpus exhaustion. If source
++    // evaluation made no cursor progress, fail explicitly instead of false EOF.
++    if candidate_window_full && produced <= offset_hint && produced >= total_slices {
++        return Err(crate::MemvidError::InvalidCursor {
++            reason: "lexical candidate window exhausted without progress",
++        });
++    }
++    let next_cursor = if produced < total_slices || candidate_window_full {
+--- a/src/memvid/search/api.rs
++++ b/src/memvid/search/api.rs
+@@ -353 +353,41 @@
+-        let vec_hits = vec_index.search(query_embedding, top_k * 2);
++        // Count only metadata, never materialize embeddings to construct a
++        // second scoped index. A small thread need not fill an impossible k.
++        let wanted = scope.map_or(top_k, |prefix| {
++            self.toc
++                .frames
++                .iter()
++                .filter(|frame| {
++                    frame.status == FrameStatus::Active
++                        && frame
++                            .uri
++                            .as_deref()
++                            .is_some_and(|uri| uri.starts_with(prefix))
++                })
++                .count()
++                .min(top_k)
++        });
++        let mut window = top_k.saturating_mul(2).max(1);
++        let vec_hits = loop {
++            let candidates = vec_index.search(query_embedding, window);
++            let scoped = candidates
++                .iter()
++                .filter(|hit| {
++                    self.toc
++                        .frames
++                        .get(hit.frame_id as usize)
++                        .is_some_and(|frame| {
++                            frame.status == FrameStatus::Active
++                                && scope.is_none_or(|prefix| {
++                                    frame
++                                        .uri
++                                        .as_deref()
++                                        .is_some_and(|uri| uri.starts_with(prefix))
++                                })
++                        })
++                })
++                .count();
++            if scoped >= wanted || candidates.len() < window || window >= self.toc.frames.len() {
++                break candidates;
++            }
++            window = window.saturating_mul(2).min(self.toc.frames.len());
++        };
+@@ -397,0 +438,4 @@
++            }
++
++            if frame.status != FrameStatus::Active {
++                continue;
+--- a/src/vec.rs
++++ b/src/vec.rs
+@@ -416 +416,4 @@
+-        let ef_search = 50;
++        // Scoped retrieval widens its candidate request progressively. Keep the
++        // graph search width at least that large so an initial global top-k
++        // cannot permanently hide a thread outside that first window.
++        let ef_search = limit.max(50);
+--- a/src/search/tantivy/query.rs
++++ b/src/search/tantivy/query.rs
+@@ -48,2 +48,10 @@
+-        } else if scope_filter.is_some() {
+-            // Scope filters are evaluated after fetching the documents.
++        } else if let Some(scope) = scope_filter {
++            // Apply URI scope before TopDocs. Post-filtering a global window
++            // can hide later scoped matches and prevent lexical cursor progress.
++            let pattern = format!("{}.*", regex::escape(&to_search_value(scope)));
++            let query = RegexQuery::from_pattern(&pattern, self.engine.uri).map_err(|err| {
++                MemvidError::Tantivy {
++                    reason: err.to_string(),
++                }
++            })?;
++            clauses.push((Occur::Must, Box::new(query)));

@@ -3173,7 +3173,7 @@ impl TurnMcpValidatedExecution for McpService {
             };
             let result = match outcome {
                 Ok(result) => result,
-                Err(error) if native_tasks && validated.binding.raw_tool_name != "threads_start_options"
+                Err(error) if native_tasks && !matches!(validated.binding.raw_tool_name.as_str(), "threads_start_options" | "threads_search")
                     && !matches!(error, pioneer_tools::ToolError::Cancelled(_)) => {
                     return Ok(canonical_task_error_result(error, started.elapsed()));
                 }

@@ -304,11 +304,24 @@ pub trait ThreadEpisodicEmbeddingProvider: Send + Sync {
 #[derive(Clone)]
 pub struct ThreadEpisodicMemvidEmbedder {
     provider: Arc<dyn ThreadEpisodicEmbeddingProvider>,
+    prepared_query: Option<Arc<(String, Vec<f32>)>>,
 }
 
 impl ThreadEpisodicMemvidEmbedder {
     pub fn new(provider: Arc<dyn ThreadEpisodicEmbeddingProvider>) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            prepared_query: None,
+        }
+    }
+
+    /// Prepare once per execution using the provider's query preprocessing.
+    pub fn prepare_query(&self, query: &str) -> Result<Self, ThreadEpisodicEmbeddingError> {
+        let vector = self.provider.embed_query_checked(query)?;
+        Ok(Self {
+            provider: self.provider.clone(),
+            prepared_query: Some(Arc::new((query.to_owned(), vector))),
+        })
     }
 
     pub fn provider(&self) -> &dyn ThreadEpisodicEmbeddingProvider {
@@ -318,10 +331,21 @@ impl ThreadEpisodicMemvidEmbedder {
     pub fn identity(&self) -> ThreadEpisodicEmbeddingIdentity {
         self.provider.identity()
     }
+
+    /// Allows stateless continuation to bind to the actual query vector,
+    /// rejecting provider drift without another embedding request.
+    pub fn prepared_query_vector(&self) -> Option<&[f32]> {
+        self.prepared_query.as_ref().map(|query| query.1.as_slice())
+    }
 }
 
 impl VecEmbedder for ThreadEpisodicMemvidEmbedder {
     fn embed_query(&self, text: &str) -> memvid_core::Result<Vec<f32>> {
+        if let Some(prepared) = &self.prepared_query {
+            if prepared.0 == text {
+                return Ok(prepared.1.clone());
+            }
+        }
         self.provider
             .embed_query_checked(text)
             .map_err(ThreadEpisodicEmbeddingError::into_memvid_error)
@@ -341,6 +365,43 @@ impl VecEmbedder for ThreadEpisodicMemvidEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_query_reuses_query_preprocessing_without_document_embedding() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct QueryProvider(Arc<AtomicUsize>);
+        impl ThreadEpisodicEmbeddingProvider for QueryProvider {
+            fn provider_id(&self) -> &str {
+                "query-provider"
+            }
+            fn model(&self) -> &str {
+                "query-model"
+            }
+            fn dimension(&self) -> usize {
+                2
+            }
+            fn normalized(&self) -> bool {
+                false
+            }
+            fn embed_text(&self, _: &str) -> Result<Vec<f32>, ThreadEpisodicEmbeddingError> {
+                panic!("document path must not prepare query embeddings")
+            }
+            fn embed_query(&self, _: &str) -> Result<Vec<f32>, ThreadEpisodicEmbeddingError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![0.25, 0.75])
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let embedder = ThreadEpisodicMemvidEmbedder::new(Arc::new(QueryProvider(calls.clone())));
+        let prepared = embedder.prepare_query("search instructions").unwrap();
+        for segment in [prepared.clone(), prepared.clone(), prepared] {
+            assert_eq!(
+                VecEmbedder::embed_query(&segment, "search instructions").unwrap(),
+                vec![0.25, 0.75]
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     struct MockEmbeddingProvider {
         provider_id: &'static str,

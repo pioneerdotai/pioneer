@@ -808,6 +808,7 @@ async fn execute_episodic_active_recall_mode(
             tokio::time::timeout(
                 timeout,
                 provider.recall_related_threads(MemoryRelatedThreadRecallRequest {
+                    turn_id: context.turn_id.clone(),
                     workspace_id: context.workspace_id.clone(),
                     current_thread_id: context.effective_conversation_thread_id().to_owned(),
                     principal_id: context.principal_id.clone(),
@@ -823,6 +824,7 @@ async fn execute_episodic_active_recall_mode(
             tokio::time::timeout(
                 timeout,
                 provider.recall_workspace_threads(MemoryWorkspaceThreadRecallRequest {
+                    turn_id: context.turn_id.clone(),
                     workspace_id: context.workspace_id.clone(),
                     current_thread_id: context.effective_conversation_thread_id().to_owned(),
                     principal_id: context.principal_id.clone(),
@@ -1348,7 +1350,6 @@ fn merge_active_recall_mode_results(
     let mut seen_ids = BTreeSet::new();
     let mut seen_lines = BTreeSet::new();
     let mut seen_episodic_ids = BTreeSet::new();
-    let mut seen_episodic_lines = BTreeSet::new();
     let mut items = Vec::new();
     let mut episodic_items = Vec::new();
     let mut diagnostics = Vec::new();
@@ -1402,12 +1403,6 @@ fn merge_active_recall_mode_results(
             }
             let item_id = item.id.trim();
             if item_id.is_empty() || !seen_episodic_ids.insert(item_id.to_owned()) {
-                duplicate_count += 1;
-                continue;
-            }
-            if let Some(fingerprint) = rendered_line_fingerprint(item.content.as_str())
-                && !seen_episodic_lines.insert(fingerprint)
-            {
                 duplicate_count += 1;
                 continue;
             }
@@ -1777,10 +1772,16 @@ pub(super) fn deterministic_active_recall_plan(
         }
         diagnostics.push("structured_task_context_available".to_owned());
     }
-    if input.thread_episodic.current_thread_recall_available {
+    if input.thread_episodic.current_thread_recall_available
+        || input.thread_episodic.workspace_thread_recall_available
+    {
         if let Some(query) = deterministic_episodic_query_for_input(input) {
             episodic_queries.push(EpisodicMemoryRecallQuery {
-                mode: ActiveRecallMode::CurrentThread,
+                mode: if input.episodic_capabilities.workspace_thread_search {
+                    ActiveRecallMode::WorkspaceThread
+                } else {
+                    ActiveRecallMode::CurrentThread
+                },
                 query,
                 targets: Vec::new(),
                 top_k: None,

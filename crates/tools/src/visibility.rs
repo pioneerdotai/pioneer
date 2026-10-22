@@ -359,6 +359,7 @@ mod tests {
             spec("task_create"),
             spec("artifact_prepare"),
             spec("computer_use"),
+            spec("threads_search"),
             spec("threads_start_options"),
             spec("threads_turn_start"),
             spec("thread_create"),
@@ -394,6 +395,7 @@ mod tests {
         assert!(!snapshot.contains_name("artifact_prepare").await);
         assert!(!snapshot.contains_name("computer_use").await);
         for name in [
+            "threads_search",
             "threads_start_options",
             "threads_turn_start",
             "thread_create",
@@ -401,7 +403,7 @@ mod tests {
         ] {
             assert!(!snapshot.contains_name(name).await);
         }
-        assert_eq!(snapshot.all_specs().len(), 16);
+        assert_eq!(snapshot.all_specs().len(), 17);
     }
 
     fn visibility_input() -> FinalToolVisibilityInput {

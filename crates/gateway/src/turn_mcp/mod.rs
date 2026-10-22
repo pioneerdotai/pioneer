@@ -5,6 +5,7 @@ pub(crate) mod native_tools;
 pub(crate) mod persistence;
 pub(crate) mod projection;
 pub(crate) mod result;
+pub(crate) mod threads_search;
 
 pub(crate) use projection::{
     DEFAULT_MCP_TURN_TOOL_TIMEOUT_MS, MCP_TURN_PROJECTION_VERSION, McpProjectionLimits,

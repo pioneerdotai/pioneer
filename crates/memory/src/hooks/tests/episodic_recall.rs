@@ -1101,3 +1101,141 @@ async fn prompt_contract_separates_durable_thread_and_task_context() {
     assert!(thread_content.contains("broad recall requires explicit intent."));
     assert!(!thread_content.contains("Relevant memory context for this turn:"));
 }
+
+#[tokio::test]
+async fn default_workspace_recall_keeps_current_and_other_thread_provenance() {
+    let mut input = episodic_planner_input_for_test();
+    input.episodic_capabilities.current_thread_search = true;
+    input.episodic_capabilities.workspace_thread_search = true;
+    input.episodic_capabilities.full_input_query = true;
+    input.thread_episodic.current_thread_recall_available = true;
+    input.thread_episodic.workspace_thread_recall_available = true;
+    let plan = deterministic_active_recall_plan(&input);
+    assert_eq!(plan.episodic.queries.len(), 1);
+    assert_eq!(
+        plan.episodic.queries[0].mode,
+        ActiveRecallMode::WorkspaceThread
+    );
+    assert_eq!(plan.episodic.queries[0].query, None);
+
+    let mut provider =
+        FakeEpisodicRecallProvider::with_capabilities(input.episodic_capabilities.clone());
+    provider.workspace_threads.items = vec![
+        episodic_item(
+            "current",
+            MemoryEpisodicRecallSourceKind::CurrentThread,
+            "Decision from this conversation.",
+        ),
+        episodic_item(
+            "other",
+            MemoryEpisodicRecallSourceKind::WorkspaceThread,
+            "Decision from another conversation.",
+        ),
+    ];
+    let provider = Arc::new(provider);
+    let durable = TestRecallMemoryProvider::with_recall(MemoryRecallSnapshot::empty());
+    let result = execute_active_recall_plan(
+        &durable,
+        ActiveRecallExecutionInput {
+            context: test_memory_turn_context(),
+            plan,
+            deterministic: DeterministicRecallContextSummary::default(),
+            config: MemoryActiveRecallConfig::default(),
+            episodic_provider: Some(provider.clone()),
+            episodic_capabilities: input.episodic_capabilities.clone(),
+        },
+    )
+    .await;
+    assert_eq!(provider.calls(), vec!["workspace_threads"]);
+    assert_eq!(provider.queries(), vec!["remember my preference"]);
+    assert_eq!(result.episodic_items.len(), 2);
+    let contributions = memory_episodic_recall_prompt_context_contributions(
+        result.episodic_items,
+        false,
+        &MemoryActiveRecallConfig::default(),
+    );
+    let domains = contributions
+        .iter()
+        .map(|entry| entry.domain.as_str())
+        .collect::<Vec<_>>();
+    assert!(domains.contains(&"current_thread_context"));
+    assert!(domains.contains(&"workspace_thread_context"));
+
+    input.explicit_no_memory = true;
+    let disabled = deterministic_active_recall_plan(&input);
+    assert_eq!(
+        disabled.effective_status(),
+        ActiveMemoryDecisionStatus::Skip
+    );
+    assert!(disabled.episodic.queries.is_empty());
+}
+
+#[tokio::test]
+async fn host_workspace_attempt_prevents_a_second_search_even_when_no_context_was_found() {
+    let durable = Arc::new(TestRecallMemoryProvider::with_recall(
+        MemoryRecallSnapshot::empty(),
+    ));
+    let episodic = Arc::new(FakeEpisodicRecallProvider::with_capabilities(
+        MemoryEpisodicRecallCapabilities {
+            current_thread_search: true,
+            related_thread_search: true,
+            workspace_thread_search: true,
+            ..Default::default()
+        },
+    ));
+    let hook = ActiveMemoryRecallHook {
+        memory_provider: durable.clone(),
+        episodic_provider: Some(episodic.clone()),
+        config: MemoryActiveRecallConfig::default(),
+    };
+    let mut contexts = HookPromptContextSet::default();
+    contexts.diagnostics.push(memory_safe_info_diagnostic(
+        "thread_context.workspace_recall_attempted",
+        "host search completed",
+    ));
+    let request = test_active_prompt_context_hook_request(
+        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+        contexts,
+        "continue the earlier discussion",
+    );
+    hook.execute(request).await.unwrap();
+    assert!(episodic.calls().is_empty());
+}
+
+#[tokio::test]
+async fn episodic_equal_text_in_independent_threads_is_not_deduplicated() {
+    let mut provider =
+        FakeEpisodicRecallProvider::with_capabilities(MemoryEpisodicRecallCapabilities {
+            workspace_thread_search: true,
+            ..Default::default()
+        });
+    let mut a = episodic_item(
+        "thread:turn_a/item_a/index_a",
+        MemoryEpisodicRecallSourceKind::WorkspaceThread,
+        "same decision",
+    );
+    a.provenance.thread_id = Some("thread_a".into());
+    let mut b = episodic_item(
+        "thread:turn_b/item_b/index_b",
+        MemoryEpisodicRecallSourceKind::WorkspaceThread,
+        "same decision",
+    );
+    b.provenance.thread_id = Some("thread_b".into());
+    provider.workspace_threads.items = vec![a, b];
+    let provider = Arc::new(provider);
+    let plan = parse_active_memory_decision_json(r#"{"durable":{"status":"skip","reasonCode":"provider_skip","confidence":1,"modes":[],"targets":[]},"episodic":{"status":"run","reasonCode":"provider_run","confidence":1,"queries":[{"mode":"workspace_thread","query":"earlier decision","targets":[]}]}}"#).unwrap();
+    let result = execute_active_recall_plan(
+        &TestRecallMemoryProvider::with_recall(MemoryRecallSnapshot::empty()),
+        ActiveRecallExecutionInput {
+            context: test_memory_turn_context(),
+            plan,
+            deterministic: DeterministicRecallContextSummary::default(),
+            config: MemoryActiveRecallConfig::default(),
+            episodic_provider: Some(provider.clone()),
+            episodic_capabilities: provider.capabilities.clone(),
+        },
+    )
+    .await;
+    assert_eq!(result.episodic_items.len(), 2);
+    assert_eq!(result.duplicate_count, 0);
+}

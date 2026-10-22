@@ -45,14 +45,13 @@ use crate::{
 use chrono::Local;
 use futures_util::{StreamExt, stream};
 use pioneer_hooks::{
-    HookActorKind, HookPhase, HookRuntime, HookToolName, TurnPostPreflightPromptContextHookInput,
+    HookPhase, HookRuntime, HookToolName, TurnPostPreflightPromptContextHookInput,
     TurnPostTurnDomain, TurnPostTurnDomainEventSummary, TurnPostTurnToolEventSummary,
     TurnPostTurnToolStatus, TurnPrePolicyHookInput, TurnPrePromptCompileHookInput,
     TurnPrePromptContextHookInput,
 };
 use pioneer_memory::hooks::{
-    MemoryEpisodicRecallCapabilities, MemoryTurnContext, MemoryTurnPolicy,
-    active_recall_thread_episodic_summary,
+    MemoryTurnContext, MemoryTurnPolicy, active_recall_thread_episodic_summary,
     build_active_recall_local_preflight_plan_with_thread_summary,
     deterministic_recall_context_summary, memory_turn_policy_from_hook_policy_set,
 };
@@ -2129,24 +2128,12 @@ async fn run_agent_turn_preflight_stage(
         input_text: input_text.to_owned(),
         task_id: hook_runtime_context.task_id.clone(),
         agent_id: hook_runtime_context.agent_id.clone(),
-        principal_id: (hook_runtime_context.actor_kind == HookActorKind::User)
-            .then(|| hook_runtime_context.actor_id.clone())
-            .flatten(),
+        principal_id: hook_runtime_context.initiating_principal_id.clone(),
     };
-    let episodic_capabilities = MemoryEpisodicRecallCapabilities {
-        current_thread_search: !memory_context
-            .effective_conversation_thread_id()
-            .trim()
-            .is_empty(),
-        related_thread_search: false,
-        workspace_thread_search: false,
-        full_input_query: false,
-        current_task_context: hook_runtime_context
-            .task_id
-            .as_ref()
-            .is_some_and(|task_id| !task_id.trim().is_empty()),
-        completed_task_summary: false,
-    };
+    let episodic_capabilities = hook_runtime_context
+        .episodic_recall_capabilities
+        .clone()
+        .unwrap_or_default();
     let thread_episodic_summary = active_recall_thread_episodic_summary(
         &hook_prompt_context_set,
         &memory_context,

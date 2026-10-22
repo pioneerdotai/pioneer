@@ -200,6 +200,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_search_opens_only_through_threads_and_respects_host_policy() {
+        let snapshot = visibility(&["request_tools", "threads_search"]);
+        assert!(!snapshot.contains_name("threads_search").await);
+        let handler = RequestToolsHandler::new(snapshot.clone(), ["threads_search".to_owned()]);
+        let task = handler
+            .resolve(&serde_json::json!({
+                "domains": ["task"], "reason": "Need task operations."
+            }))
+            .await
+            .unwrap();
+        assert!(task.added.is_empty());
+        assert!(!snapshot.contains_name("threads_search").await);
+        let threads = handler
+            .resolve(&serde_json::json!({
+                "domains": ["threads"], "reason": "Find a previous conversation."
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            threads.added.get("threads"),
+            Some(&vec!["threads_search".to_owned()])
+        );
+        assert!(snapshot.contains_name("threads_search").await);
+
+        let blocked_snapshot = visibility(&["request_tools", "threads_search"]);
+        let blocked =
+            RequestToolsHandler::new(blocked_snapshot.clone(), ["threads_search".to_owned()])
+                .with_blocked_tool_names([(
+                    "threads_search".to_owned(),
+                    "execution_policy".to_owned(),
+                )])
+                .resolve(&serde_json::json!({"domains": ["threads"], "reason": "Search."}))
+                .await
+                .unwrap();
+        assert!(blocked.added.is_empty());
+        assert_eq!(blocked.blocked[0].tools, vec!["threads_search"]);
+        assert!(!blocked_snapshot.contains_name("threads_search").await);
+    }
+
+    #[tokio::test]
     async fn request_tools_result_reports_added_visible_and_unavailable_tools() {
         let visibility = visibility(&["request_tools", "artifact_prepare"]);
         visibility

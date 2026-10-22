@@ -947,6 +947,74 @@ pub async fn list_capsules_for_thread<C: ConnectionTrait>(
         })
 }
 
+/// Compact index projection metadata only; no canonical message payloads.
+pub async fn list_search_source_versions<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    after: Option<&str>,
+    limit: u64,
+) -> Result<Vec<thread_episodic_items::Model>> {
+    let mut query = thread_episodic_items::Entity::find()
+        .filter(thread_episodic_items::Column::WorkspaceId.eq(workspace_id.to_owned()));
+    if let Some(after) = after {
+        query = query.filter(thread_episodic_items::Column::Id.gt(after.to_owned()));
+    }
+    query
+        .order_by_asc(thread_episodic_items::Column::Id)
+        .limit(limit.clamp(1, 128))
+        .all(db)
+        .await
+        .context("failed to read episodic projection versions")
+}
+
+/// Keyset discovery of the indexed corpus. Directory recency, titles and sidebar
+/// placement do not restrict search; the gateway authorizes each thread before I/O.
+pub async fn list_search_thread_ids<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    after: Option<&str>,
+    limit: u64,
+) -> Result<Vec<String>> {
+    let mut query = thread_episodic_items::Entity::find()
+        .select_only()
+        .column(thread_episodic_items::Column::ThreadId)
+        .distinct()
+        .filter(thread_episodic_items::Column::WorkspaceId.eq(workspace_id.to_owned()));
+    if let Some(after) = after {
+        query = query.filter(thread_episodic_items::Column::ThreadId.gt(after.to_owned()));
+    }
+    query
+        .order_by_asc(thread_episodic_items::Column::ThreadId)
+        .limit(limit.clamp(1, 128))
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("failed to discover episodic search threads")
+}
+
+pub async fn list_workspace_capsules_after<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    after: Option<i64>,
+    limit: u64,
+) -> Result<Vec<thread_episodic_capsules::Model>> {
+    let mut query = thread_episodic_capsules::Entity::find()
+        .filter(thread_episodic_capsules::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(
+            thread_episodic_capsules::Column::ThreadId
+                .eq(THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID),
+        );
+    if let Some(after) = after {
+        query = query.filter(thread_episodic_capsules::Column::SegmentIndex.gt(after));
+    }
+    query
+        .order_by_asc(thread_episodic_capsules::Column::SegmentIndex)
+        .limit(limit.clamp(1, 128))
+        .all(db)
+        .await
+        .context("failed to page episodic workspace capsules")
+}
+
 pub async fn list_workspace_capsules<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,

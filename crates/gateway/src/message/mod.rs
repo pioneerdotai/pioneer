@@ -45,6 +45,7 @@ mod thread_agents_doc_handlers;
 mod thread_file_handlers;
 mod thread_handlers;
 mod thread_tool_results;
+mod threads_search;
 mod timeline_cursor;
 mod timeline_handlers;
 mod timeline_notifications;
@@ -147,7 +148,7 @@ use crate::thread_episodic::{
     RuntimeVectorThreadEpisodicIndexPayloadProvider, StoreThreadEpisodicIndexPayloadProvider,
     StoreThreadEpisodicIngestor, ThreadEpisodicIndexEmbeddingProviderResolver,
     ThreadEpisodicIndexExecutor, ThreadEpisodicIngestor, ThreadEpisodicRecallService,
-    ThreadEpisodicRuntimeConfig,
+    ThreadEpisodicRuntimeConfig, WorkspaceEpisodicRecallService,
 };
 use crate::thread_episodic_hooks::{
     ThreadContextRecallHookConfig, ThreadEpisodicMemoryRecallProvider,
@@ -2044,10 +2045,16 @@ impl MessageProcessor {
                 Some(bridge.memory_provider.clone()),
                 Some(bridge.memory_provider.clone()),
                 Some(bridge.memory_policy_provider),
-                Some(Arc::new(ThreadEpisodicMemoryRecallProvider::new(
-                    self.thread_episodic_recall_service.clone(),
-                    self.crud_store.clone(),
-                ))),
+                Some(Arc::new(
+                    ThreadEpisodicMemoryRecallProvider::with_workspace_service(
+                        self.thread_episodic_recall_service.clone(),
+                        Arc::new(WorkspaceEpisodicRecallService::new(
+                            self.crud_store.clone(),
+                            self.thread_episodic_recall_service.clone(),
+                        )),
+                        self.crud_store.clone(),
+                    ),
+                )),
                 self.agent_manager.memory_tool_bundle_artifact_store(),
                 self.memory_loop_config(),
             ))
@@ -4232,6 +4239,61 @@ impl MessageProcessor {
         Ok(resolved)
     }
 
+    /// Enrich the actual dispatch value, not only the serialized snapshot. An
+    /// old snapshot or a task actor ID is never a substitute for turn authority.
+    pub(crate) async fn bind_episodic_runtime_context(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        mut context: pioneer_agent::AgentTurnHookRuntimeContext,
+    ) -> pioneer_agent::AgentTurnHookRuntimeContext {
+        context.initiating_principal_id = None;
+        context.episodic_recall_capabilities = None;
+        let Ok(authority) = self
+            .load_turn_execution_authorization_context(turn_id)
+            .await
+        else {
+            return context;
+        };
+        if authority
+            .verify_turn_scope(self.crud_store.as_ref(), workspace_id, thread_id, turn_id)
+            .await
+            .is_err()
+        {
+            return context;
+        }
+        context.initiating_principal_id = Some(authority.initiating_principal_id().to_string());
+        let enabled = self
+            .thread_episodic_runtime_config
+            .read()
+            .map(|config| config.enabled && config.recall_enabled && config.recall_service.enabled)
+            .unwrap_or(false);
+        let enabled = enabled
+            && crate::thread_episodic::EpisodicSearchAuthority::resolve(
+                self.crud_store.as_ref(),
+                workspace_id,
+                thread_id,
+                turn_id,
+                Some(authority.initiating_principal_id().as_str()),
+            )
+            .await
+            .is_ok();
+        context.episodic_recall_capabilities =
+            Some(pioneer_memory::hooks::MemoryEpisodicRecallCapabilities {
+                current_thread_search: enabled,
+                related_thread_search: enabled,
+                workspace_thread_search: enabled,
+                full_input_query: enabled
+                    && self
+                        .thread_episodic_recall_service
+                        .full_input_query_enabled_for_workspace(workspace_id),
+                current_task_context: false,
+                completed_task_summary: false,
+            });
+        context
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn persist_turn_runtime_snapshot(
         &self,
@@ -4255,6 +4317,15 @@ impl MessageProcessor {
         agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
         accepted_history: Option<&crate::compaction::frozen::PreparedHistory>,
     ) -> anyhow::Result<()> {
+        let bound_hook_context = self
+            .bind_episodic_runtime_context(
+                workspace_id,
+                thread_id,
+                turn_id,
+                hook_runtime_context.clone(),
+            )
+            .await;
+        let hook_runtime_context = &bound_hook_context;
         let canonical = history.iter().all(|message| message.provenance.is_some());
         let mut snapshot = crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
             thread_id,

@@ -2946,6 +2946,14 @@ mod tests {
         deterministic: DeterministicRecallContextSummary,
         full_input_query: bool,
     ) -> MemoryActiveRecallLocalPlan {
+        sample_memory_local_plan_with_episodic_scope(deterministic, full_input_query, false)
+    }
+
+    fn sample_memory_local_plan_with_episodic_scope(
+        deterministic: DeterministicRecallContextSummary,
+        full_input_query: bool,
+        workspace: bool,
+    ) -> MemoryActiveRecallLocalPlan {
         build_active_recall_local_preflight_plan_with_thread_summary(
             &MemoryTurnContext {
                 workspace_id: "ws_1".to_owned(),
@@ -2969,7 +2977,7 @@ mod tests {
             MemoryEpisodicRecallCapabilities {
                 current_thread_search: true,
                 related_thread_search: false,
-                workspace_thread_search: false,
+                workspace_thread_search: workspace,
                 full_input_query,
                 current_task_context: false,
                 completed_task_summary: false,
@@ -2978,7 +2986,7 @@ mod tests {
                 current_thread_id_present: true,
                 current_thread_recall_available: true,
                 related_thread_recall_available: false,
-                workspace_thread_recall_available: false,
+                workspace_thread_recall_available: workspace,
                 prompt_context_source_count: 0,
                 prompt_context_chars: 0,
                 source_ids: Vec::new(),
@@ -3906,54 +3914,61 @@ mod tests {
 
     #[test]
     fn preflight_compose_merges_provider_durable_with_host_owned_full_input_episodic() {
-        let modules = build_local_preflight_module_plans(
-            sample_tool_index(),
-            sample_deterministic_summary(),
-            sample_memory_local_plan_with_current_thread_episodic_capability(
+        for workspace in [false, true] {
+            let modules = build_local_preflight_module_plans(
+                sample_tool_index(),
                 sample_deterministic_summary(),
-                true,
-            ),
-        );
-        let mut provider_value = sample_provider_plan_json();
-        provider_value["memory"]["activeRecall"]
-            .as_object_mut()
-            .expect("activeRecall object")
-            .remove("episodic");
-        let provider_plan = parse_provider_turn_preflight_plan_json(
-            serde_json::to_string(&provider_value)
-                .expect("provider plan serializes")
-                .as_str(),
-        )
-        .expect("provider plan without episodic section parses by shape");
+                sample_memory_local_plan_with_episodic_scope(
+                    sample_deterministic_summary(),
+                    true,
+                    workspace,
+                ),
+            );
+            let mut provider_value = sample_provider_plan_json();
+            provider_value["memory"]["activeRecall"]
+                .as_object_mut()
+                .expect("activeRecall object")
+                .remove("episodic");
+            let provider_plan = parse_provider_turn_preflight_plan_json(
+                serde_json::to_string(&provider_value)
+                    .expect("provider plan serializes")
+                    .as_str(),
+            )
+            .expect("provider plan without episodic section parses by shape");
 
-        let plan = compose_turn_preflight_plan(
-            &modules,
-            TurnPreflightProviderCallResult::Success(TurnPreflightProviderSuccess {
-                plan: provider_plan,
-                provider_call: sample_provider_call_metadata(1),
-                diagnostics: Vec::new(),
-            }),
-        );
+            let plan = compose_turn_preflight_plan(
+                &modules,
+                TurnPreflightProviderCallResult::Success(TurnPreflightProviderSuccess {
+                    plan: provider_plan,
+                    provider_call: sample_provider_call_metadata(1),
+                    diagnostics: Vec::new(),
+                }),
+            );
 
-        assert_eq!(plan.source, TurnPreflightPlanSource::Provider);
-        assert_eq!(
-            plan.memory.active_recall.decision.durable.reason_code,
-            ActiveMemoryDecisionReasonCode::MemoryLikely
-        );
-        assert_eq!(
-            plan.memory.active_recall.decision.episodic.status,
-            ActiveMemoryDecisionStatus::Run
-        );
-        assert_eq!(plan.memory.active_recall.decision.episodic.queries.len(), 1);
-        assert_eq!(
-            plan.memory.active_recall.decision.episodic.queries[0].mode,
-            ActiveRecallMode::CurrentThread
-        );
-        assert_eq!(
-            plan.memory.active_recall.decision.episodic.queries[0].query,
-            None
-        );
-        assert!(plan.memory.active_recall.decision.provider_used);
+            assert_eq!(plan.source, TurnPreflightPlanSource::Provider);
+            assert_eq!(
+                plan.memory.active_recall.decision.durable.reason_code,
+                ActiveMemoryDecisionReasonCode::MemoryLikely
+            );
+            assert_eq!(
+                plan.memory.active_recall.decision.episodic.status,
+                ActiveMemoryDecisionStatus::Run
+            );
+            assert_eq!(plan.memory.active_recall.decision.episodic.queries.len(), 1);
+            assert_eq!(
+                plan.memory.active_recall.decision.episodic.queries[0].mode,
+                if workspace {
+                    ActiveRecallMode::WorkspaceThread
+                } else {
+                    ActiveRecallMode::CurrentThread
+                }
+            );
+            assert_eq!(
+                plan.memory.active_recall.decision.episodic.queries[0].query,
+                None
+            );
+            assert!(plan.memory.active_recall.decision.provider_used);
+        }
     }
 
     #[test]

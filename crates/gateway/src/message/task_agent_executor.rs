@@ -2876,6 +2876,9 @@ impl TaskAgentExecutor {
             .await;
             return Ok(TaskExecutorStartOutcome::Started);
         }
+        let hook_runtime_context = processor.bind_episodic_runtime_context(
+            &task.workspace_id, child_thread_id.as_str(), child_turn_id.as_str(), hook_runtime_context,
+        ).await;
         let runtime_permission_profile = turn_permission_profile;
         if let Err(error) = processor
             .agent_manager
@@ -3905,6 +3908,14 @@ impl TaskAgentExecutor {
             .await?;
             return Ok(());
         }
+        let hook_runtime_context = processor
+            .bind_episodic_runtime_context(
+                &task.workspace_id,
+                child_thread_id.as_str(),
+                child_turn_id.as_str(),
+                hook_runtime_context,
+            )
+            .await;
         let runtime_permission_profile = turn_permission_profile;
         if let Err(error) = processor
             .agent_manager
@@ -4508,6 +4519,14 @@ impl TaskAgentExecutor {
             )
             .await
             .context("failed to restore exact pinned Agent skills for task turn")?;
+        let hook_runtime_context = processor
+            .bind_episodic_runtime_context(
+                &task.workspace_id,
+                child_thread_id,
+                child_turn_id,
+                hook_runtime_context,
+            )
+            .await;
         let runtime_permission_profile = processor
             .materialized_turn_permission_profile(&turn_outcome.materialization.turn)
             .context("failed to resolve restored task permission profile")?;
@@ -6163,6 +6182,14 @@ impl TaskAgentExecutor {
             .await;
             return Ok(());
         }
+        let hook_runtime_context = processor
+            .bind_episodic_runtime_context(
+                &task.workspace_id,
+                task_run_turn.thread_id.as_str(),
+                task_run_turn.turn_id.as_str(),
+                hook_runtime_context,
+            )
+            .await;
         let runtime_permission_profile = turn_permission_profile;
         if let Err(error) = processor
             .agent_manager

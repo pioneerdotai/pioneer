@@ -30,6 +30,7 @@ mod web;
 mod windows_restricted_token_backend;
 
 pub mod handlers;
+pub mod threads_search;
 
 pub use argument_normalizer::{
     ToolArgumentCoercion, ToolArgumentNormalization, normalize_tool_arguments_for_tool,

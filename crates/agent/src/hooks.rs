@@ -147,6 +147,12 @@ pub struct AgentTurnHookRuntimeContext {
     pub actor_kind: HookActorKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor_id: Option<String>,
+    /// Server projection from the validated durable execution envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiating_principal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episodic_recall_capabilities:
+        Option<pioneer_memory::hooks::MemoryEpisodicRecallCapabilities>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -166,6 +172,8 @@ impl Default for AgentTurnHookRuntimeContext {
             mode: HookContextMode::Agent,
             actor_kind: HookActorKind::Agent,
             actor_id: None,
+            initiating_principal_id: None,
+            episodic_recall_capabilities: None,
             task_id: None,
             agent_id: None,
             conversation_thread_id: None,
@@ -198,6 +206,8 @@ impl AgentTurnHookRuntimeContext {
             mode: HookContextMode::Task,
             actor_kind: HookActorKind::Task,
             actor_id: Some(task_id.clone()),
+            initiating_principal_id: None,
+            episodic_recall_capabilities: None,
             task_id: Some(task_id),
             agent_id: None,
             conversation_thread_id: None,
@@ -2457,6 +2467,8 @@ mod tests {
         )
         .expect("legacy hook context should deserialize");
         assert_eq!(legacy.conversation_thread_id, None);
+        assert_eq!(legacy.initiating_principal_id, None);
+        assert_eq!(legacy.episodic_recall_capabilities, None);
         assert_eq!(
             legacy.post_turn_dispatch_mode,
             AgentTurnPostTurnDispatchMode::Immediate

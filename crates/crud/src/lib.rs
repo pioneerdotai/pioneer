@@ -11137,6 +11137,57 @@ impl CrudStore {
         .collect()
     }
 
+    pub async fn list_thread_episodic_search_source_versions(
+        &self,
+        workspace_id: &str,
+        after: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<ThreadEpisodicItemRecord>> {
+        thread_episodic_repository::list_search_source_versions(
+            &self.connection,
+            workspace_id,
+            after,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(crate::thread_episodic::thread_episodic_item_record_from_model)
+        .collect()
+    }
+
+    pub async fn list_thread_episodic_search_thread_ids(
+        &self,
+        workspace_id: &str,
+        after: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<String>> {
+        thread_episodic_repository::list_search_thread_ids(
+            &self.connection,
+            workspace_id,
+            after,
+            limit,
+        )
+        .await
+    }
+
+    pub async fn list_thread_episodic_workspace_capsules_after(
+        &self,
+        workspace_id: &str,
+        after: Option<i64>,
+        limit: u64,
+    ) -> Result<Vec<ThreadEpisodicCapsuleRecord>> {
+        thread_episodic_repository::list_workspace_capsules_after(
+            &self.connection,
+            workspace_id,
+            after,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(crate::thread_episodic::thread_episodic_capsule_record_from_model)
+        .collect()
+    }
+
     pub async fn list_thread_episodic_workspace_capsules(
         &self,
         workspace_id: &str,
