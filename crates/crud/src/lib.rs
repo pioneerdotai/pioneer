@@ -23491,6 +23491,12 @@ impl CrudStore {
             // using the same snapshot conversion as the single-thread caller.
             for thread in batch {
                 let Some(model) = latest.remove(thread.id.as_str()) else {
+                    thread.reasoning_effort =
+                        repositories::agent_domain::empty_agent_thread_reasoning(
+                            &self.connection,
+                            &thread.id,
+                        )
+                        .await?;
                     continue;
                 };
                 let reasoning_effort = if model.turn_kind == turn_kind_to_db(TurnKind::Conversation)
@@ -23512,6 +23518,11 @@ impl CrudStore {
         let Some(turn_model) =
             turn::find_latest_turn_for_thread(&self.connection, thread.id.as_str()).await?
         else {
+            thread.reasoning_effort = repositories::agent_domain::empty_agent_thread_reasoning(
+                &self.connection,
+                &thread.id,
+            )
+            .await?;
             return Ok(());
         };
 

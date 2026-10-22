@@ -1034,8 +1034,7 @@ impl MessageProcessor {
                         params.workspace_id.as_str(),
                         identity,
                         profile,
-                        root_thread.model_provider.as_str(),
-                        root_thread.model.as_str(),
+                        &admitted_context,
                         true,
                         child_skill_ids,
                         admitted_context

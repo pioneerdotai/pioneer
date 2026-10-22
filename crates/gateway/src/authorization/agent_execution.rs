@@ -125,17 +125,34 @@ fn select_profile(
         pioneer_protocol::AgentExecutionProfileSelection::InheritParent
             if options.inherit_parent_profile_available =>
         {
-            inherited_profile
-                .and_then(|inherited| {
-                    options.profiles.iter().find(|current| {
-                        current.id == inherited.id
-                            && pioneer_protocol::agent_execution_profile_is_no_wider(
-                                current, inherited,
-                            )
-                    })
-                })
-                .cloned()
-                .ok_or(ExecutionMaterializationError::MissingProfile)?
+            let inherited =
+                inherited_profile.ok_or(ExecutionMaterializationError::MissingProfile)?;
+            if let Some(profile) = options.profiles.iter().find(|current| {
+                (current.id == inherited.id
+                    || (current.backend == inherited.backend
+                        && current.provider_id == inherited.provider_id
+                        && current.model_id == inherited.model_id))
+                    && (identity.source_kind == AgentIdentitySourceKind::Ephemeral
+                        || current.compatible_agent_identity_ids.contains(&identity.id))
+            }) {
+                profile.clone()
+            } else {
+                // Changing identity must never carry a model from an unrelated
+                // executor. A unique compatible choice is the only safe default.
+                let mut compatible = options
+                    .profiles
+                    .iter()
+                    .filter(|profile| profile.compatible_agent_identity_ids.contains(&identity.id));
+                let profile = compatible
+                    .next()
+                    .ok_or(ExecutionMaterializationError::MissingProfile)?;
+                if compatible.next().is_some() {
+                    return Err(ExecutionMaterializationError::InvalidLaunchSelection(
+                        "identity requires an explicit model; inspect threads_identity_odels_list",
+                    ));
+                }
+                profile.clone()
+            }
         }
         pioneer_protocol::AgentExecutionProfileSelection::InheritParent => {
             return Err(ExecutionMaterializationError::MissingProfile);
@@ -146,6 +163,36 @@ fn select_profile(
             .find(|profile| &profile.id == profile_id)
             .cloned()
             .ok_or(ExecutionMaterializationError::MissingProfile)?,
+        pioneer_protocol::AgentExecutionProfileSelection::Model {
+            provider_id,
+            model_id,
+        } => {
+            let inherited_provider = inherited_profile
+                .filter(|profile| profile.compatible_agent_identity_ids.contains(&identity.id))
+                .map(|profile| profile.provider_id.as_str());
+            let selected_provider = provider_id.as_deref().or(inherited_provider);
+            let mut candidates = options.profiles.iter().filter(|profile| {
+                (profile.compatible_agent_identity_ids.contains(&identity.id)
+                    || (identity.source_kind == AgentIdentitySourceKind::Ephemeral
+                        && inherited_profile.is_some_and(|parent| {
+                            parent
+                                .compatible_agent_identity_ids
+                                .iter()
+                                .any(|id| profile.compatible_agent_identity_ids.contains(id))
+                        })))
+                    && profile.model_id == *model_id
+                    && selected_provider.is_none_or(|provider| profile.provider_id == provider)
+            });
+            let profile = candidates
+                .next()
+                .ok_or(ExecutionMaterializationError::MissingProfile)?;
+            if candidates.next().is_some() {
+                return Err(ExecutionMaterializationError::InvalidLaunchSelection(
+                    "model requires an explicit providerId",
+                ));
+            }
+            profile.clone()
+        }
     };
     if identity.source_kind != AgentIdentitySourceKind::Ephemeral
         && !selected
@@ -175,6 +222,16 @@ fn select_profile(
         (AgentIdentitySourceKind::CliRuntimeInstance, _) => {
             return Err(ExecutionMaterializationError::CliRuntimeMismatch);
         }
+    }
+    if selection
+        .execution
+        .reasoning
+        .as_ref()
+        .is_some_and(|reasoning| !selected.allowed_reasoning.contains(reasoning))
+    {
+        return Err(ExecutionMaterializationError::InvalidLaunchSelection(
+            "reasoning is not available for the selected model",
+        ));
     }
     Ok(selected)
 }
@@ -650,6 +707,119 @@ mod tests {
                 selected_capabilities: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn explicit_models_resolve_within_identity_and_model_reasoning_grants() {
+        let api = identity(
+            "A12345678901234567890",
+            AgentIdentitySourceKind::NativeAgent,
+        );
+        let cli = identity(
+            "A12345678901234567891",
+            AgentIdentitySourceKind::CliRuntimeInstance,
+        );
+        let mut original = profile("P12345678901234567890", &api);
+        original.allowed_reasoning = vec![pioneer_protocol::TurnReasoningSelection {
+            effort: "low".into(),
+        }];
+        let mut other = profile("P12345678901234567891", &api);
+        other.model_id = "other-model".into();
+        other.allowed_reasoning = vec![pioneer_protocol::TurnReasoningSelection {
+            effort: "high".into(),
+        }];
+        let mut cli_profile = profile("P12345678901234567892", &cli);
+        cli_profile.backend = AgentExecutionProfileBackend::CliRuntime {
+            runtime_instance_id: "configured-cli".into(),
+        };
+        cli_profile.provider_id = "cli_runtime:configured-cli".into();
+        cli_profile.model_id = "cli-model".into();
+        cli_profile.allowed_reasoning = vec![pioneer_protocol::TurnReasoningSelection {
+            effort: "runtime-effort".into(),
+        }];
+        let options = AgentStartOptionsProjection {
+            agents: vec![api.clone(), cli.clone()],
+            profiles: vec![original.clone(), other.clone(), cli_profile.clone()],
+            inherit_parent_agent_available: true,
+            inherit_parent_profile_available: true,
+            derived_ephemeral_available: false,
+            allowed_skill_ids: vec![],
+            allowed_mcp_server_ids: vec![],
+            max_permission_profile: pioneer_protocol::task_permission_cap_for_mode(
+                pioneer_protocol::TurnPermissionMode::Supervised,
+            ),
+            generation_fingerprint: "selection-options".into(),
+        };
+        for (identity, selected, effort) in [
+            (&api, &other, "high"),
+            (&cli, &cli_profile, "runtime-effort"),
+        ] {
+            let mut launch = selection();
+            launch.agent = AgentIdentitySelection::Exact {
+                agent_identity_id: identity.id.clone(),
+            };
+            launch.execution.profile = AgentExecutionProfileSelection::Model {
+                provider_id: Some(selected.provider_id.clone()),
+                model_id: selected.model_id.clone(),
+            };
+            launch.execution.reasoning = Some(pioneer_protocol::TurnReasoningSelection {
+                effort: effort.into(),
+            });
+            let resolved =
+                resolve_agent_launch_selection(&launch, &options, Some(&api), Some(&original))
+                    .unwrap();
+            assert_eq!(resolved, (identity.clone(), selected.clone()));
+            launch.execution.reasoning = Some(pioneer_protocol::TurnReasoningSelection {
+                effort: "unsupported".into(),
+            });
+            assert!(
+                resolve_agent_launch_selection(&launch, &options, Some(&api), Some(&original))
+                    .is_err()
+            );
+            launch.execution.reasoning = None;
+            launch.execution.profile = AgentExecutionProfileSelection::Model {
+                provider_id: Some("unavailable-executor".into()),
+                model_id: selected.model_id.clone(),
+            };
+            assert!(
+                resolve_agent_launch_selection(&launch, &options, Some(&api), Some(&original))
+                    .is_err()
+            );
+            launch.execution.profile = AgentExecutionProfileSelection::Model {
+                provider_id: None,
+                model_id: "unavailable-model".into(),
+            };
+            assert!(
+                resolve_agent_launch_selection(&launch, &options, Some(&api), Some(&original))
+                    .is_err()
+            );
+        }
+        let mut launch = selection();
+        launch.agent = AgentIdentitySelection::Exact {
+            agent_identity_id: cli.id.clone(),
+        };
+        launch.execution.profile = AgentExecutionProfileSelection::InheritParent;
+        assert_eq!(
+            resolve_agent_launch_selection(&launch, &options, Some(&api), Some(&original))
+                .unwrap()
+                .1,
+            cli_profile
+        );
+        let mut ambiguous = options.clone();
+        let mut another_cli = cli_profile.clone();
+        another_cli.id = AgentExecutionProfileId::new("P12345678901234567893").unwrap();
+        another_cli.model_id = "another-cli-model".into();
+        ambiguous.profiles.push(another_cli);
+        assert!(
+            resolve_agent_launch_selection(&launch, &ambiguous, Some(&api), Some(&original))
+                .is_err()
+        );
+        launch.agent = AgentIdentitySelection::Exact {
+            agent_identity_id: AgentIdentityId::new("A12345678901234567899").unwrap(),
+        };
+        assert!(
+            resolve_agent_launch_selection(&launch, &options, Some(&api), Some(&original)).is_err()
+        );
     }
 
     #[test]

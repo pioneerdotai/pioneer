@@ -108,7 +108,10 @@
       "type": "object",
       "properties": {
         "identity": {
-          "$ref": "#/$defs/AgentToolIdentityChoice"
+          "$ref": "#/$defs/AgentToolIdentityChoice",
+          "default": {
+            "kind": "inherit_parent"
+          }
         },
         "mcpServerIds": {
           "type": "array",
@@ -127,7 +130,10 @@
           ]
         },
         "profile": {
-          "$ref": "#/$defs/AgentToolProfileChoice"
+          "$ref": "#/$defs/AgentToolProfileChoice",
+          "default": {
+            "kind": "inherit_parent"
+          }
         },
         "reasoning": {
           "anyOf": [
@@ -146,11 +152,7 @@
           }
         }
       },
-      "additionalProperties": false,
-      "required": [
-        "identity",
-        "profile"
-      ]
+      "additionalProperties": false
     },
     "AgentToolProfileChoice": {
       "oneOf": [
@@ -182,6 +184,30 @@
           "required": [
             "kind",
             "id"
+          ]
+        },
+        {
+          "description": "Direct, catalog-validated selection. Omitting providerId inherits the\ncurrent executor when compatible; otherwise selection must be unique.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "model"
+            },
+            "modelId": {
+              "type": "string"
+            },
+            "providerId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "modelId"
           ]
         }
       ]

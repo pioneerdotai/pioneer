@@ -94,14 +94,16 @@ pub use agent_route::{
     AgentRouteStatus, AgentRouteValidationError, validate_agent_route_graph,
 };
 pub use agent_tools::{
-    AgentControlTaskToolInput, AgentCreateThreadToolInput, AgentModelToolCatalogEntry,
-    AgentModelToolName, AgentPublicOutcome, AgentResultToolInput, AgentReviewTaskToolInput,
-    AgentScheduleTaskToolInput, AgentSendMessageToolInput, AgentStartOptionsToolInput,
-    AgentStartToolInput, AgentTaskToolInput, AgentToolBackendKind, AgentToolCapability,
-    AgentToolIdentityChoice, AgentToolIdentityOption, AgentToolLaunchSelection,
+    AgentControlTaskToolInput, AgentCreateThreadToolInput, AgentIdentityModelsToolInput,
+    AgentIdentityModelsToolResult, AgentModelToolCatalogEntry, AgentModelToolName,
+    AgentPublicOutcome, AgentResultToolInput, AgentReviewTaskToolInput, AgentScheduleTaskToolInput,
+    AgentSendMessageToolInput, AgentStartOptionsToolInput, AgentStartToolInput, AgentTaskToolInput,
+    AgentToolBackendKind, AgentToolCapability, AgentToolExecutorModels, AgentToolIdentityChoice,
+    AgentToolIdentityOption, AgentToolLaunchSelection, AgentToolModelOption,
     AgentToolOptionsProjection, AgentToolProfileChoice, AgentToolProfileOption,
     AgentToolResultStatus, AgentToolSafeResult, AgentToolTargetOption,
-    AgentToolThreadCreationOption, AgentWaitToolInput, agent_start_options_catalog_entry,
+    AgentToolThreadCreationOption, AgentWaitToolInput, agent_identity_models_catalog_entry,
+    agent_start_options_catalog_entry, agent_turn_start_catalog_entry,
     project_agent_model_tool_catalog,
 };
 pub use app_url::{

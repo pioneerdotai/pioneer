@@ -228,6 +228,24 @@ impl BoundAgentActionAdapter {
         self.root.options_generation_fingerprint = start_options.generation_fingerprint.clone();
         self.start_options = start_options;
         let mut safe = self.start_options.clone().safe_tool_projection();
+        // Detailed models belong to threads_identity_odels_list. Keep only
+        // legacy default-profile options here; the immutable internal catalog
+        // still validates every explicit model selection.
+        safe.profiles.retain(|profile| {
+            self.start_options.profiles.iter().any(|full| {
+                full.id == profile.id
+                    && full.backend == self.root.profile.backend
+                    && full.provider_id == self.root.profile.provider_id
+                    && full.model_id == self.root.profile.model_id
+            }) || profile.compatible_identity_ids.iter().any(|id| {
+                self.start_options
+                    .profiles
+                    .iter()
+                    .filter(|full| full.compatible_agent_identity_ids.contains(id))
+                    .count()
+                    == 1
+            })
+        });
         let capabilities = task_agent_capabilities(&self.envelope);
         populate_binding_options(
             &self.root,
@@ -624,7 +642,9 @@ impl BoundAgentActionAdapter {
         let idempotency_key = idempotency_key_for_call(call_id, tool);
         let execution_id = self.root.execution_id.clone();
         let intent = match tool {
-            AgentModelToolName::AgentStartOptions => return Ok(None),
+            AgentModelToolName::AgentStartOptions | AgentModelToolName::IdentityModelsList => {
+                return Ok(None);
+            }
             AgentModelToolName::SendMessage => {
                 let input: AgentSendMessageToolInput = decode(arguments)?;
                 AgentActionIntent::SendMessage {
@@ -656,10 +676,7 @@ impl BoundAgentActionAdapter {
             }
             AgentModelToolName::StartAgent => {
                 let input: AgentStartToolInput = decode(arguments)?;
-                validate_tool_launch(
-                    &input.launch,
-                    options.ok_or(AgentToolAdapterError::OptionsUnavailable)?,
-                )?;
+                validate_tool_launch(&input.launch, &self.start_options.safe_tool_projection())?;
                 AgentActionIntent::StartAgent {
                     action_id,
                     execution_id,
@@ -676,10 +693,7 @@ impl BoundAgentActionAdapter {
             }
             AgentModelToolName::CreateTask => {
                 let input: AgentTaskToolInput = decode(arguments)?;
-                validate_tool_launch(
-                    &input.launch,
-                    options.ok_or(AgentToolAdapterError::OptionsUnavailable)?,
-                )?;
+                validate_tool_launch(&input.launch, &self.start_options.safe_tool_projection())?;
                 let selection = AgentTaskActionSelection {
                     task_template_id: input.task_template_id,
                     launch: input.launch.into_server_selection(),
@@ -697,10 +711,7 @@ impl BoundAgentActionAdapter {
             }
             AgentModelToolName::ScheduleTask => {
                 let input: AgentScheduleTaskToolInput = decode(arguments)?;
-                validate_tool_launch(
-                    &input.launch,
-                    options.ok_or(AgentToolAdapterError::OptionsUnavailable)?,
-                )?;
+                validate_tool_launch(&input.launch, &self.start_options.safe_tool_projection())?;
                 AgentActionIntent::ScheduleTask {
                     action_id,
                     execution_id,
@@ -867,6 +878,7 @@ impl BoundAgentActionAdapter {
             receipt_id: Some(projection.receipt_id.clone()),
             outbox_id: Some(projection.outbox_id.clone()),
             public_message: None,
+            target_options: Vec::new(),
         }
     }
 }
@@ -916,7 +928,9 @@ fn validate_tool_launch(
     };
     let profile = match &selection.profile {
         AgentToolProfileChoice::InheritParent if options.inherit_parent_profile_available => None,
-        AgentToolProfileChoice::Exact(id) => {
+        // The internal catalog resolves this against the immutable profile set.
+        AgentToolProfileChoice::Model { .. } => None,
+        AgentToolProfileChoice::Exact { id } => {
             let profile = options
                 .profiles
                 .iter()
@@ -1537,6 +1551,7 @@ mod tests {
         let adapter = test_adapter();
         for tool in [
             AgentModelToolName::AgentStartOptions,
+            AgentModelToolName::IdentityModelsList,
             AgentModelToolName::Wait,
             AgentModelToolName::Result,
         ] {
@@ -1632,9 +1647,9 @@ mod tests {
             id: AgentIdentityId::new("A99999999999999999999").unwrap(),
         };
         let mut profile = exact_tool_launch();
-        profile.profile = AgentToolProfileChoice::Exact(
-            pioneer_protocol::AgentExecutionProfileId::new("P99999999999999999999").unwrap(),
-        );
+        profile.profile = AgentToolProfileChoice::Exact {
+            id: pioneer_protocol::AgentExecutionProfileId::new("P99999999999999999999").unwrap(),
+        };
         let current_target = adapter.current_target_option_id();
         for (launch, target_option_id) in [
             (permission, current_target.clone()),
@@ -1895,9 +1910,9 @@ mod tests {
             identity: AgentToolIdentityChoice::Exact {
                 id: AgentIdentityId::new("A12345678901234567890").unwrap(),
             },
-            profile: AgentToolProfileChoice::Exact(
-                AgentExecutionProfileId::new("P12345678901234567890").unwrap(),
-            ),
+            profile: AgentToolProfileChoice::Exact {
+                id: AgentExecutionProfileId::new("P12345678901234567890").unwrap(),
+            },
             reasoning: Some(TurnReasoningSelection {
                 effort: "medium".to_owned(),
             }),

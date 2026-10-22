@@ -28,6 +28,7 @@ pub const ARTIFACT_DOMAIN_TOOL_NAMES: &[&str] =
 pub const THREADS_DOMAIN_TOOL_NAMES: &[&str] = &[
     "threads_tools_result_read",
     "threads_start_options",
+    "threads_identity_odels_list",
     "thread_message_send",
     "thread_create",
     "threads_turn_start",
@@ -261,6 +262,7 @@ mod tests {
             [
                 "threads_tools_result_read",
                 "threads_start_options",
+                "threads_identity_odels_list",
                 "thread_message_send",
                 "thread_create",
                 "threads_turn_start",

@@ -2,6 +2,23 @@ use super::*;
 use crate::authorization::AuthorizationExternalError;
 
 impl MessageProcessor {
+    /// Shared model discovery for RPC and execution-bound launch catalogs.
+    pub(super) async fn provider_models_catalog(
+        &self,
+        workspace_id: &str,
+        provider_id: &str,
+    ) -> anyhow::Result<Vec<ProviderModelInfo>> {
+        let provider = self
+            .provider_registry
+            .get_or_create_for_workspace(workspace_id, provider_id)?;
+        Ok(provider
+            .list_models()
+            .await?
+            .into_iter()
+            .map(provider_model_info_to_protocol)
+            .collect())
+    }
+
     pub(super) async fn provider_list(
         &self,
         request_context: &RequestContext,
@@ -282,31 +299,13 @@ impl MessageProcessor {
             return;
         }
 
-        let provider = match self
-            .provider_registry
-            .get_or_create_for_workspace(workspace_id.as_str(), &params.provider)
+        match self
+            .provider_models_catalog(workspace_id.as_str(), &params.provider)
+            .await
         {
-            Ok(p) => p,
-            Err(error) => {
-                let message = if member {
-                    "provider model catalog is unavailable".to_owned()
-                } else {
-                    format!("failed to create provider `{}`: {error:#}", params.provider)
-                };
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
-                )
-                .await;
-                return;
-            }
-        };
-
-        match provider.list_models().await {
             Ok(models) => {
                 let protocol_models = models
                     .into_iter()
-                    .map(provider_model_info_to_protocol)
                     .filter(|model| {
                         crate::authorization::AuthorizationService::new().provider_model_allowed(
                             request_context.principal().kind,

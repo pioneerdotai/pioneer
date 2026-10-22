@@ -2181,6 +2181,42 @@ pub(crate) async fn apply_prepared_agent_delegation_route_expiry_batch(
     Ok(expected_updated)
 }
 
+/// An empty agent-created thread has no Conversation turn from which to
+/// restore composer reasoning. Its creator execution stores the immutable
+/// applied selection; reading it neither creates identity nor grants authority.
+pub(crate) async fn empty_agent_thread_reasoning<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+) -> Result<Option<String>> {
+    let Some(thread) = thread::Entity::find_by_id(thread_id.to_owned())
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(PersistedActorRef::AgentExecution(execution_id)) =
+        crate::repositories::identity::actor_ref_from_db(
+            thread.created_by_actor_kind.as_deref(),
+            thread.created_by_actor_id.as_deref(),
+        )?
+    else {
+        return Ok(None);
+    };
+    let Some(execution) = agent_execution::Entity::find_by_id(execution_id.to_string())
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if execution.workspace_id != thread.workspace_id {
+        bail!("thread creator execution workspace differs");
+    }
+    let selection: pioneer_protocol::AgentExecutionSelection =
+        serde_json::from_str(&execution.requested_profile_selection_json)
+            .context("thread creator execution selection is invalid")?;
+    Ok(selection.reasoning.map(|reasoning| reasoning.effort))
+}
+
 /// Atomically materialize a server-resolved thread and its execution-scoped
 /// continuation route. Callers pass a DatabaseTransaction when this is part
 /// of an AgentAction commit; no user-selected participant/ACL data is accepted

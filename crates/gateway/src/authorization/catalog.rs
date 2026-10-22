@@ -222,6 +222,15 @@ const INTERNAL_TOOL_RECORDS: &[AuthorizationCatalogRecord] = &[
     ),
     record(
         AuthorizationCatalogSurface::InternalTool,
+        "threads_identity_odels_list",
+        "child_observe",
+        "execution_agent_options",
+        "not_found",
+        "read",
+        true,
+    ),
+    record(
+        AuthorizationCatalogSurface::InternalTool,
         "thread_message_send",
         "message_create",
         "execution_approved_message_target",

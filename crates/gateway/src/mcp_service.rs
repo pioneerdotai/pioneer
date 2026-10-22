@@ -3057,7 +3057,7 @@ impl TurnMcpValidatedExecution for McpService {
             }
             let native_tasks = crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(
                 &validated.binding.server_installation_id,
-            ) == Some(crate::turn_mcp::native_tools::NativeToolFamily::Tasks);
+            ).is_some_and(|family| matches!(family, crate::turn_mcp::native_tools::NativeToolFamily::Tasks | crate::turn_mcp::native_tools::NativeToolFamily::Threads));
             let bundles = if native_tasks {
                 self.materialize_cli_task_tools(&validated).await?
             } else {

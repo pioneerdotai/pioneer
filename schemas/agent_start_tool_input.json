@@ -7,8 +7,16 @@
       "$ref": "#/$defs/AgentAuthoredInput"
     },
     "launch": {
-      "description": "Both fields are required; the server still validates them against the\nimmutable launch grant and the current runtime capability snapshot.",
-      "$ref": "#/$defs/AgentToolLaunchSelection"
+      "description": "Omission inherits the current execution without an options lookup.",
+      "$ref": "#/$defs/AgentToolLaunchSelection",
+      "default": {
+        "identity": {
+          "kind": "inherit_parent"
+        },
+        "profile": {
+          "kind": "inherit_parent"
+        }
+      }
     },
     "targetOptionId": {
       "type": "string"
@@ -17,8 +25,7 @@
   "additionalProperties": false,
   "required": [
     "targetOptionId",
-    "input",
-    "launch"
+    "input"
   ],
   "$defs": {
     "AgentAuthoredInput": {
@@ -116,7 +123,10 @@
       "type": "object",
       "properties": {
         "identity": {
-          "$ref": "#/$defs/AgentToolIdentityChoice"
+          "$ref": "#/$defs/AgentToolIdentityChoice",
+          "default": {
+            "kind": "inherit_parent"
+          }
         },
         "mcpServerIds": {
           "type": "array",
@@ -135,7 +145,10 @@
           ]
         },
         "profile": {
-          "$ref": "#/$defs/AgentToolProfileChoice"
+          "$ref": "#/$defs/AgentToolProfileChoice",
+          "default": {
+            "kind": "inherit_parent"
+          }
         },
         "reasoning": {
           "anyOf": [
@@ -154,11 +167,7 @@
           }
         }
       },
-      "additionalProperties": false,
-      "required": [
-        "identity",
-        "profile"
-      ]
+      "additionalProperties": false
     },
     "AgentToolProfileChoice": {
       "oneOf": [
@@ -190,6 +199,30 @@
           "required": [
             "kind",
             "id"
+          ]
+        },
+        {
+          "description": "Direct, catalog-validated selection. Omitting providerId inherits the\ncurrent executor when compatible; otherwise selection must be unique.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "model"
+            },
+            "modelId": {
+              "type": "string"
+            },
+            "providerId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "modelId"
           ]
         }
       ]
