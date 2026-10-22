@@ -844,6 +844,46 @@ impl ProviderRegistry {
         Ok(fingerprint)
     }
 
+    /// Resolve current connection authority for a new durable execution.
+    /// Unlike an immutable execution's fingerprint check, this must also
+    /// reject a removed credential or retired/unconfigured endpoint before
+    /// creating a fresh lease. Injected adapters own their availability.
+    pub fn available_authority_fingerprint_for_workspace(
+        &self,
+        workspace_id: &str,
+        provider_name: &str,
+    ) -> Result<ProviderAuthorityFingerprint> {
+        let provider_name = normalize_provider_name(provider_name);
+        let expected = {
+            let _scope = self.lock_authority_scope(Some(workspace_id), &provider_name);
+            let (key, proxy, base_url, fingerprint) =
+                self.resolve_authority(Some(workspace_id), &provider_name)?;
+            let injected = self
+                .injected
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&provider_name);
+            if !injected
+                && !crate::provider_definition(&provider_name).is_some_and(|definition| {
+                    crate::provider_is_available(
+                        !key.is_empty(),
+                        proxy.is_some(),
+                        base_url.is_some(),
+                        definition,
+                    )
+                })
+            {
+                return Err(ProviderAuthorityRevoked.into());
+            }
+            fingerprint
+        };
+        let current = self.authority_fingerprint_for_workspace(workspace_id, &provider_name)?;
+        if current != expected {
+            return Err(ProviderAuthorityRevoked.into());
+        }
+        Ok(current)
+    }
+
     /// Build and immediately discard a candidate adapter before its
     /// credential/configuration is published. This catches unsupported
     /// providers, malformed proxy configuration, and local client-construction
@@ -1290,6 +1330,41 @@ mod tests {
     use crate::providers::EchoProvider;
     use crate::{ProviderTermination, TokenUsage};
     use futures_util::stream;
+
+    #[test]
+    fn new_durable_authority_rotates_key_but_refuses_removed_credentials_and_retired_provider() {
+        let key = Arc::new(RwLock::new("first-key".to_owned()));
+        let registry = ProviderRegistry::new({
+            let key = key.clone();
+            move |_| key.read().unwrap().clone()
+        });
+        let first = registry
+            .available_authority_fingerprint_for_workspace("workspace", "openai")
+            .unwrap();
+        *key.write().unwrap() = "second-key".to_owned();
+        let second = registry
+            .available_authority_fingerprint_for_workspace("workspace", "openai")
+            .unwrap();
+        assert_ne!(first, second);
+        assert_ne!(
+            second,
+            registry
+                .available_authority_fingerprint_for_workspace("other-workspace", "openai")
+                .unwrap()
+        );
+        *key.write().unwrap() = String::new();
+        assert!(
+            registry
+                .available_authority_fingerprint_for_workspace("workspace", "openai")
+                .is_err()
+        );
+        *key.write().unwrap() = "saved-key".to_owned();
+        assert!(
+            registry
+                .available_authority_fingerprint_for_workspace("workspace", "hyperbolic")
+                .is_err()
+        );
+    }
 
     fn chat_request() -> ChatRequest {
         ChatRequest {

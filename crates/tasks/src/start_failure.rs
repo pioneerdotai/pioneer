@@ -56,6 +56,8 @@ pub enum TaskStartReason {
     RuntimeNotReady,
     ReadinessSnapshotMissing,
     CapabilityProjectionInvalid,
+    LaunchSourceUnavailable,
+    ProviderAuthorityUnavailable,
 }
 impl TaskStartReason {
     pub const fn label(self) -> &'static str {
@@ -63,6 +65,8 @@ impl TaskStartReason {
             Self::RuntimeNotReady => "runtime_not_ready",
             Self::ReadinessSnapshotMissing => "readiness_snapshot_missing",
             Self::CapabilityProjectionInvalid => "capability_projection_invalid",
+            Self::LaunchSourceUnavailable => "launch_source_unavailable",
+            Self::ProviderAuthorityUnavailable => "provider_authority_unavailable",
         }
     }
 }

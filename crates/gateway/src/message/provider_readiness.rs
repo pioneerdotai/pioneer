@@ -44,74 +44,129 @@ type ProviderWarmupTaskOutcome =
     Result<anyhow::Result<Option<ProviderWarmupScope>>, Box<dyn std::any::Any + Send + 'static>>;
 type ProviderWarmupTaskCompletion = (String, ProviderWarmupScope, ProviderWarmupTaskOutcome);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum CliRuntimeWarmupOutcome {
     Ready,
-    Retry,
+    Retry(BTreeSet<String>),
     Superseded,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ProviderWarmupExecution {
     retry_scope: Option<ProviderWarmupScope>,
     superseded: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProviderWarmupScope {
-    ApiOnly,
-    CliOnly,
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CliProbeScope {
+    None,
     All,
+    Instances(BTreeSet<String>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProviderWarmupScope {
+    api: bool,
+    cli: CliProbeScope,
 }
 
 impl ProviderWarmupScope {
-    const fn includes_api(self) -> bool {
-        matches!(self, Self::ApiOnly | Self::All)
-    }
+    #[allow(non_upper_case_globals)]
+    const ApiOnly: Self = Self {
+        api: true,
+        cli: CliProbeScope::None,
+    };
+    #[allow(non_upper_case_globals)]
+    const CliOnly: Self = Self {
+        api: false,
+        cli: CliProbeScope::All,
+    };
+    #[allow(non_upper_case_globals)]
+    const All: Self = Self {
+        api: true,
+        cli: CliProbeScope::All,
+    };
 
-    const fn includes_cli(self) -> bool {
-        matches!(self, Self::CliOnly | Self::All)
-    }
-
-    const fn merge(self, other: Self) -> Self {
-        if matches!(
-            (self, other),
-            (Self::ApiOnly, Self::ApiOnly)
-                | (Self::CliOnly, Self::CliOnly)
-                | (Self::All, Self::All)
-        ) {
-            self
-        } else {
-            Self::All
+    fn cli_instances(ids: BTreeSet<String>) -> Self {
+        Self {
+            api: false,
+            cli: CliProbeScope::Instances(ids),
         }
     }
 
-    const fn telemetry_scope(self) -> GatewayProviderWarmupScope {
-        match self {
-            Self::ApiOnly => GatewayProviderWarmupScope::Api,
-            Self::CliOnly => GatewayProviderWarmupScope::Cli,
-            Self::All => GatewayProviderWarmupScope::All,
+    fn includes_api(&self) -> bool {
+        self.api
+    }
+    fn includes_cli(&self) -> bool {
+        self.cli != CliProbeScope::None
+    }
+
+    fn includes_runtime(&self, id: &str) -> bool {
+        match &self.cli {
+            CliProbeScope::None => false,
+            CliProbeScope::All => true,
+            CliProbeScope::Instances(ids) => ids.contains(id),
         }
     }
 
-    const fn subtract(self, completed: Self) -> Option<Self> {
-        match (self, completed) {
-            (_, Self::All) | (Self::ApiOnly, Self::ApiOnly) | (Self::CliOnly, Self::CliOnly) => {
-                None
+    fn merge(&self, other: Self) -> Self {
+        let cli = match (&self.cli, &other.cli) {
+            (CliProbeScope::All, _) | (_, CliProbeScope::All) => CliProbeScope::All,
+            (CliProbeScope::None, cli) | (cli, CliProbeScope::None) => cli.clone(),
+            (CliProbeScope::Instances(left), CliProbeScope::Instances(right)) => {
+                CliProbeScope::Instances(left.union(right).cloned().collect())
             }
-            (Self::All, Self::ApiOnly) => Some(Self::CliOnly),
-            (Self::All, Self::CliOnly) => Some(Self::ApiOnly),
-            (remaining, _) => Some(remaining),
+        };
+        Self {
+            api: self.api || other.api,
+            cli,
         }
     }
 
-    const fn from_retry_needs(api: bool, cli: bool) -> Option<Self> {
-        match (api, cli) {
-            (true, true) => Some(Self::All),
-            (true, false) => Some(Self::ApiOnly),
-            (false, true) => Some(Self::CliOnly),
-            (false, false) => None,
+    fn telemetry_scope(&self) -> GatewayProviderWarmupScope {
+        match (self.includes_api(), self.includes_cli()) {
+            (true, true) => GatewayProviderWarmupScope::All,
+            (false, true) => GatewayProviderWarmupScope::Cli,
+            _ => GatewayProviderWarmupScope::Api,
         }
+    }
+
+    fn subtract(&self, completed: Self) -> Option<Self> {
+        let cli = match (&self.cli, &completed.cli) {
+            (_, CliProbeScope::All) => CliProbeScope::None,
+            (CliProbeScope::Instances(left), CliProbeScope::Instances(right)) => {
+                let remaining = left.difference(right).cloned().collect::<BTreeSet<_>>();
+                if remaining.is_empty() {
+                    CliProbeScope::None
+                } else {
+                    CliProbeScope::Instances(remaining)
+                }
+            }
+            // A selected completion does not discharge an independently
+            // requested full reconciliation.
+            (cli, _) => cli.clone(),
+        };
+        Self {
+            api: self.api && !completed.api,
+            cli,
+        }
+        .nonempty()
+    }
+
+    fn nonempty(self) -> Option<Self> {
+        (self.includes_api() || self.includes_cli()).then_some(self)
+    }
+
+    fn retry_scope(&self, api: bool, cli: bool) -> Option<Self> {
+        Self {
+            api: self.api && api,
+            cli: if cli {
+                self.cli.clone()
+            } else {
+                CliProbeScope::None
+            },
+        }
+        .nonempty()
     }
 }
 
@@ -119,25 +174,45 @@ impl ProviderWarmupScope {
 enum ProviderWarmupCommand {
     AllWorkspaces {
         scope: ProviderWarmupScope,
-        force_if_running: bool,
+        force_scope: Option<ProviderWarmupScope>,
     },
     Workspace {
         workspace_id: String,
         scope: ProviderWarmupScope,
-        force_if_running: bool,
+        force_scope: Option<ProviderWarmupScope>,
     },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct PendingProviderWarmup {
     scope: ProviderWarmupScope,
-    force_if_running: bool,
+    // A full non-forced request can merge with a forced selected request.
+    // Only the selected subset then needs a rerun behind an in-flight full probe.
+    force_scope: Option<ProviderWarmupScope>,
 }
 
 impl PendingProviderWarmup {
-    fn merge(&mut self, scope: ProviderWarmupScope, force_if_running: bool) {
+    fn merge(&mut self, scope: ProviderWarmupScope, force_scope: Option<ProviderWarmupScope>) {
         self.scope = self.scope.merge(scope);
-        self.force_if_running |= force_if_running;
+        if let Some(force_scope) = force_scope {
+            merge_optional_scope(&mut self.force_scope, force_scope);
+        }
+    }
+
+    fn subtract_scheduled(self, scheduled: &Self) -> Option<Self> {
+        let mut scope = self.scope.subtract(scheduled.scope.clone());
+        // Being covered by an old in-flight full probe is sufficient for an
+        // ordinary request, but only explicit force can discharge a forced rerun.
+        let force_scope = self
+            .force_scope
+            .and_then(|forced| match &scheduled.force_scope {
+                Some(scheduled_force) => forced.subtract(scheduled_force.clone()),
+                None => Some(forced),
+            });
+        if let Some(forced) = &force_scope {
+            merge_optional_scope(&mut scope, forced.clone());
+        }
+        scope.map(|scope| Self { scope, force_scope })
     }
 }
 
@@ -155,32 +230,23 @@ struct ProviderWarmupInbox {
 impl ProviderWarmupInbox {
     fn push(&mut self, command: ProviderWarmupCommand) {
         match command {
-            ProviderWarmupCommand::AllWorkspaces {
-                scope,
-                force_if_running,
-            } => match self.all_workspaces.as_mut() {
-                Some(pending) => pending.merge(scope, force_if_running),
-                None => {
-                    self.all_workspaces = Some(PendingProviderWarmup {
-                        scope,
-                        force_if_running,
-                    });
+            ProviderWarmupCommand::AllWorkspaces { scope, force_scope } => {
+                match self.all_workspaces.as_mut() {
+                    Some(pending) => pending.merge(scope, force_scope),
+                    None => {
+                        self.all_workspaces = Some(PendingProviderWarmup { scope, force_scope });
+                    }
                 }
-            },
+            }
             ProviderWarmupCommand::Workspace {
                 workspace_id,
                 scope,
-                force_if_running,
+                force_scope,
             } => match self.workspaces.get_mut(workspace_id.as_str()) {
-                Some(pending) => pending.merge(scope, force_if_running),
+                Some(pending) => pending.merge(scope, force_scope),
                 None => {
-                    self.workspaces.insert(
-                        workspace_id,
-                        PendingProviderWarmup {
-                            scope,
-                            force_if_running,
-                        },
-                    );
+                    self.workspaces
+                        .insert(workspace_id, PendingProviderWarmup { scope, force_scope });
                 }
             },
         }
@@ -191,14 +257,14 @@ impl ProviderWarmupInbox {
         if let Some(pending) = self.all_workspaces.take() {
             commands.push(ProviderWarmupCommand::AllWorkspaces {
                 scope: pending.scope,
-                force_if_running: pending.force_if_running,
+                force_scope: pending.force_scope,
             });
         }
         commands.extend(self.workspaces.drain().map(|(workspace_id, pending)| {
             ProviderWarmupCommand::Workspace {
                 workspace_id,
                 scope: pending.scope,
-                force_if_running: pending.force_if_running,
+                force_scope: pending.force_scope,
             }
         }));
         commands
@@ -247,14 +313,38 @@ struct CliRuntimeProbeResult {
     mcp_readiness: Option<pioneer_protocol::CliMcpAdapterReadiness>,
 }
 
+#[cfg(test)]
+type CliRuntimeProbeFake = dyn Fn(pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig) -> CliRuntimeProbeResult
+    + Send
+    + Sync;
+
+/// One supervisor epoch fences catalog seeds and overlapping probes. Per-ID
+/// fences retain unaffected results of an older full probe. Epochs come from
+/// the supervisor sequence so retiring/recreating a workspace cannot reuse one.
+struct CliConfigurationGeneration {
+    current: u64,
+    full_fence: u64,
+    instances: HashMap<String, u64>,
+}
+
+impl CliConfigurationGeneration {
+    fn accepts(&self, generation: u64, runtime_id: &str) -> bool {
+        generation >= self.full_fence
+            && generation >= self.instances.get(runtime_id).copied().unwrap_or_default()
+    }
+}
+
 #[derive(Default)]
 pub(super) struct ProviderReadinessSupervisor {
     cli_snapshots: RwLock<HashMap<String, CliRuntimeReadinessSnapshot>>,
-    cli_generations: RwLock<HashMap<String, u64>>,
+    cli_generations: RwLock<HashMap<String, CliConfigurationGeneration>>,
+    cli_generation_sequence: std::sync::atomic::AtomicU64,
     cli_seed_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
     pending_commands: StdMutex<ProviderWarmupInbox>,
     command_tx: StdMutex<Option<mpsc::Sender<()>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(test)]
+    cli_probe_fake: StdMutex<Option<Arc<CliRuntimeProbeFake>>>,
 }
 
 impl ProviderReadinessSupervisor {
@@ -306,16 +396,56 @@ impl ProviderReadinessSupervisor {
         })
     }
 
+    fn new_cli_generation(&self) -> CliConfigurationGeneration {
+        let current = self.next_cli_generation();
+        CliConfigurationGeneration {
+            current,
+            full_fence: current,
+            instances: HashMap::new(),
+        }
+    }
+
+    fn next_cli_generation(&self) -> u64 {
+        self.cli_generation_sequence
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |epoch| epoch.checked_add(1),
+            )
+            .expect("CLI readiness epoch exhausted")
+    }
+
     async fn cli_generation(&self, workspace_id: &str) -> u64 {
         // Register the workspace even before its first snapshot is published.
         // A global configuration invalidation can then fence an in-flight
         // first probe just as reliably as a later reconciliation.
-        *self
-            .cli_generations
+        self.cli_generations
             .write()
             .await
             .entry(workspace_id.to_owned())
-            .or_default()
+            .or_insert_with(|| self.new_cli_generation())
+            .current
+    }
+
+    async fn begin_cli_probe(&self, workspace_id: &str, scope: &ProviderWarmupScope) -> u64 {
+        let mut generations = self.cli_generations.write().await;
+        let state = generations
+            .entry(workspace_id.to_owned())
+            .or_insert_with(|| self.new_cli_generation());
+        state.current = self.next_cli_generation();
+        match &scope.cli {
+            CliProbeScope::All => {
+                state.full_fence = state.current;
+                state.instances.clear();
+            }
+            CliProbeScope::Instances(ids) => {
+                for id in ids {
+                    state.instances.insert(id.clone(), state.current);
+                }
+            }
+            CliProbeScope::None => {}
+        }
+        state.current
     }
 
     async fn cli_seed_lock(&self, workspace_id: &str) -> Arc<Mutex<()>> {
@@ -337,7 +467,7 @@ impl ProviderReadinessSupervisor {
         // can race a settings mutation before the supervisor has published
         // anything; a stale catalog seed must not win that race.
         let generations = self.cli_generations.read().await;
-        if generations.get(workspace_id).copied() != Some(generation) {
+        if generations.get(workspace_id).map(|state| state.current) != Some(generation) {
             return None;
         }
         let mut snapshots = self.cli_snapshots.write().await;
@@ -362,12 +492,13 @@ impl ProviderReadinessSupervisor {
         // generation write guard until the replacement snapshot is visible
         // makes invalidation atomic for every concurrent reader/probe.
         let mut generations = self.cli_generations.write().await;
-        let generation = generations
-            .get(workspace_id)
-            .copied()
-            .unwrap_or_default()
-            .saturating_add(1);
-        generations.insert(workspace_id.to_owned(), generation);
+        let state = generations
+            .entry(workspace_id.to_owned())
+            .or_insert_with(|| self.new_cli_generation());
+        state.current = self.next_cli_generation();
+        state.full_fence = state.current;
+        state.instances.clear();
+        let generation = state.current;
 
         let runtimes = self
             .cli_snapshots
@@ -409,6 +540,22 @@ impl ProviderReadinessSupervisor {
         mcp_readiness: HashMap<String, pioneer_protocol::CliMcpAdapterReadiness>,
     ) -> (CliRuntimeReadinessSnapshot, Vec<CliRuntimeReadinessChange>) {
         let mut snapshots = self.cli_snapshots.write().await;
+        Self::replace_snapshot_locked(
+            &mut snapshots,
+            workspace_id,
+            runtimes,
+            models,
+            mcp_readiness,
+        )
+    }
+
+    fn replace_snapshot_locked(
+        snapshots: &mut HashMap<String, CliRuntimeReadinessSnapshot>,
+        workspace_id: &str,
+        runtimes: Vec<RuntimeSummary>,
+        models: HashMap<String, CliRuntimeModelSnapshot>,
+        mcp_readiness: HashMap<String, pioneer_protocol::CliMcpAdapterReadiness>,
+    ) -> (CliRuntimeReadinessSnapshot, Vec<CliRuntimeReadinessChange>) {
         let had_previous = snapshots.contains_key(workspace_id);
         let previous = snapshots.get(workspace_id).cloned().unwrap_or_default();
         if previous.runtimes == runtimes {
@@ -489,12 +636,13 @@ impl ProviderReadinessSupervisor {
         // so a forced invalidation cannot interleave between the freshness
         // check and publication.
         let generations = self.cli_generations.read().await;
-        if generations.get(workspace_id).copied() != Some(generation) {
+        if generations.get(workspace_id).map(|state| state.current) != Some(generation) {
             return None;
         }
         Some(self.replace_snapshot(workspace_id, runtimes).await)
     }
 
+    #[cfg(test)]
     async fn replace_probe_results_if_generation(
         &self,
         workspace_id: &str,
@@ -507,7 +655,7 @@ impl ProviderReadinessSupervisor {
         // workspace value while the generation guard fences invalidation. A
         // reader can never combine artifacts from different probes.
         let generations = self.cli_generations.read().await;
-        if generations.get(workspace_id).copied() != Some(generation) {
+        if generations.get(workspace_id).map(|state| state.current) != Some(generation) {
             return None;
         }
         Some(
@@ -518,6 +666,121 @@ impl ProviderReadinessSupervisor {
                 mcp_readiness,
             )
             .await,
+        )
+    }
+
+    async fn invalidate_instances(
+        &self,
+        workspace_id: &str,
+        ids: &BTreeSet<String>,
+        replacements: Vec<RuntimeSummary>,
+    ) -> Vec<CliRuntimeReadinessChange> {
+        let mut generations = self.cli_generations.write().await;
+        let state = generations
+            .entry(workspace_id.to_owned())
+            .or_insert_with(|| self.new_cli_generation());
+        state.current = self.next_cli_generation();
+        for id in ids {
+            state.instances.insert(id.clone(), state.current);
+        }
+        let mut snapshots = self.cli_snapshots.write().await;
+        // Do not turn a first targeted update into an incomplete catalog.
+        // The ordinary seed will read the committed configuration under the
+        // new workspace epoch before any targeted probe publishes.
+        let Some(previous) = snapshots.get(workspace_id).cloned() else {
+            return Vec::new();
+        };
+        Self::merge_instances_locked(
+            &mut snapshots,
+            workspace_id,
+            previous,
+            ids,
+            replacements,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .1
+    }
+
+    async fn accepts_cli_probe(&self, workspace_id: &str, generation: u64, id: &str) -> bool {
+        self.cli_generations
+            .read()
+            .await
+            .get(workspace_id)
+            .is_some_and(|state| state.accepts(generation, id))
+    }
+
+    async fn merge_probe_results_if_generation(
+        &self,
+        workspace_id: &str,
+        generation: u64,
+        scope: &ProviderWarmupScope,
+        runtimes: Vec<RuntimeSummary>,
+        models: HashMap<String, CliRuntimeModelSnapshot>,
+        mcp_readiness: HashMap<String, pioneer_protocol::CliMcpAdapterReadiness>,
+    ) -> Option<(
+        CliRuntimeReadinessSnapshot,
+        Vec<CliRuntimeReadinessChange>,
+        BTreeSet<String>,
+    )> {
+        let generations = self.cli_generations.read().await;
+        let state = generations.get(workspace_id)?;
+        if generation < state.full_fence {
+            return None;
+        }
+        let mut snapshots = self.cli_snapshots.write().await;
+        let previous = snapshots.get(workspace_id).cloned().unwrap_or_default();
+        let ids = previous
+            .runtimes
+            .iter()
+            .chain(runtimes.iter())
+            .map(|runtime| runtime.runtime_id.clone())
+            .filter(|id| scope.includes_runtime(id) && state.accepts(generation, id))
+            .collect::<BTreeSet<_>>();
+        let (snapshot, changes) = Self::merge_instances_locked(
+            &mut snapshots,
+            workspace_id,
+            previous,
+            &ids,
+            runtimes,
+            models,
+            mcp_readiness,
+        );
+        Some((snapshot, changes, ids))
+    }
+
+    fn merge_instances_locked(
+        snapshots: &mut HashMap<String, CliRuntimeReadinessSnapshot>,
+        workspace_id: &str,
+        mut previous: CliRuntimeReadinessSnapshot,
+        ids: &BTreeSet<String>,
+        replacements: Vec<RuntimeSummary>,
+        models: HashMap<String, CliRuntimeModelSnapshot>,
+        mcp_readiness: HashMap<String, pioneer_protocol::CliMcpAdapterReadiness>,
+    ) -> (CliRuntimeReadinessSnapshot, Vec<CliRuntimeReadinessChange>) {
+        previous
+            .runtimes
+            .retain(|runtime| !ids.contains(&runtime.runtime_id));
+        previous.runtimes.extend(
+            replacements
+                .into_iter()
+                .filter(|runtime| ids.contains(&runtime.runtime_id)),
+        );
+        super::cli_runtime::sort_cli_runtime_summary_display_order(&mut previous.runtimes);
+        previous.models.retain(|id, _| !ids.contains(id));
+        previous
+            .models
+            .extend(models.into_iter().filter(|(id, _)| ids.contains(id)));
+        previous.mcp_readiness.retain(|id, _| !ids.contains(id));
+        previous
+            .mcp_readiness
+            .extend(mcp_readiness.into_iter().filter(|(id, _)| ids.contains(id)));
+        Self::replace_snapshot_locked(
+            snapshots,
+            workspace_id,
+            previous.runtimes,
+            previous.models,
+            previous.mcp_readiness,
         )
     }
 
@@ -600,7 +863,7 @@ impl MessageProcessor {
             .send(ProviderWarmupCommand::Workspace {
                 workspace_id: workspace_id.into(),
                 scope: ProviderWarmupScope::ApiOnly,
-                force_if_running: true,
+                force_scope: Some(ProviderWarmupScope::ApiOnly),
             });
     }
 
@@ -609,7 +872,7 @@ impl MessageProcessor {
             .send(ProviderWarmupCommand::Workspace {
                 workspace_id: workspace_id.into(),
                 scope: ProviderWarmupScope::All,
-                force_if_running: false,
+                force_scope: None,
             });
     }
 
@@ -618,7 +881,7 @@ impl MessageProcessor {
             .send(ProviderWarmupCommand::Workspace {
                 workspace_id: workspace_id.into(),
                 scope: ProviderWarmupScope::CliOnly,
-                force_if_running: true,
+                force_scope: Some(ProviderWarmupScope::CliOnly),
             });
     }
 
@@ -626,15 +889,7 @@ impl MessageProcessor {
         self.provider_readiness
             .send(ProviderWarmupCommand::AllWorkspaces {
                 scope: ProviderWarmupScope::All,
-                force_if_running: false,
-            });
-    }
-
-    fn request_all_cli_runtime_warmup(&self) {
-        self.provider_readiness
-            .send(ProviderWarmupCommand::AllWorkspaces {
-                scope: ProviderWarmupScope::CliOnly,
-                force_if_running: true,
+                force_scope: None,
             });
     }
 
@@ -658,9 +913,34 @@ impl MessageProcessor {
         self.request_cli_runtime_warmup(workspace_id);
     }
 
-    /// Applies the same fail-closed fence to every known/active workspace for
-    /// a Gateway-wide CLI configuration mutation.
-    pub(super) async fn invalidate_and_request_all_cli_runtime_warmup(&self) {
+    pub(super) async fn invalidate_and_request_cli_runtime_instances(
+        &self,
+        ids: &BTreeSet<String>,
+        instances: &[pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig],
+    ) {
+        if ids.is_empty() {
+            return;
+        }
+        self.invalidate_cli_runtime_instances(ids, instances, false)
+            .await;
+        self.provider_readiness
+            .send(ProviderWarmupCommand::AllWorkspaces {
+                scope: ProviderWarmupScope::cli_instances(ids.clone()),
+                force_scope: Some(ProviderWarmupScope::cli_instances(ids.clone())),
+            });
+    }
+
+    /// Caller holds the settings application lock. A failed write fences old
+    /// evidence without scheduling probes as if the settings operation succeeded.
+    pub(super) async fn invalidate_cli_runtime_instances(
+        &self,
+        ids: &BTreeSet<String>,
+        instances: &[pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig],
+        readiness_failed: bool,
+    ) {
+        if ids.is_empty() {
+            return;
+        }
         let mut workspace_ids = self.provider_readiness.cli_workspace_ids().await;
         match self.workspace_manager.list_workspaces().await {
             Ok(workspaces) => workspace_ids.extend(
@@ -669,24 +949,33 @@ impl MessageProcessor {
                     .filter(|workspace| workspace.is_active)
                     .map(|workspace| workspace.id),
             ),
-            Err(error) => warn!(
-                error = %error,
-                "failed to list active workspaces while invalidating CLI readiness"
-            ),
-        }
-        for workspace_id in workspace_ids {
-            if let Err(error) = self
-                .invalidate_cli_runtime_readiness_snapshot(workspace_id.as_str())
-                .await
-            {
-                warn!(
-                    workspace_id,
-                    error = %format!("{error:#}"),
-                    "failed to publish invalidated CLI readiness snapshot"
-                );
+            Err(error) => {
+                warn!(error = %error, "failed to list workspaces for CLI configuration change")
             }
         }
-        self.request_all_cli_runtime_warmup();
+        let affected = instances
+            .iter()
+            .filter(|instance| ids.contains(&instance.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for workspace_id in workspace_ids {
+            // Only configuration/secret lookups: no provider process is started.
+            let mut replacements = self
+                .initializing_cli_runtime_snapshot_from_instances(&workspace_id, &affected)
+                .await;
+            if readiness_failed {
+                replacements = replacements
+                    .into_iter()
+                    .map(cli_runtime_readiness_error_summary)
+                    .collect();
+            }
+            let changes = self
+                .provider_readiness
+                .invalidate_instances(&workspace_id, ids, replacements)
+                .await;
+            self.publish_cli_runtime_readiness_changes(&workspace_id, changes)
+                .await;
+        }
     }
 
     pub(super) async fn cli_runtime_readiness_snapshot_or_seed(
@@ -709,6 +998,7 @@ impl MessageProcessor {
             return Ok(snapshot);
         }
 
+        let _settings_guard = self.gateway_settings_update_lock.lock().await;
         loop {
             let generation = self.provider_readiness.cli_generation(workspace_id).await;
             let runtimes = self.initializing_cli_runtime_snapshot(workspace_id).await?;
@@ -799,12 +1089,11 @@ impl MessageProcessor {
         workspace_id: &str,
     ) -> anyhow::Result<()> {
         let trace = GatewayProviderWarmupTrace::start(GatewayProviderWarmupScope::Cli);
-        let generation = self.provider_readiness.cli_generation(workspace_id).await;
         self.perform_cli_runtime_warmup(
             workspace_id,
             &trace,
             &Arc::new(Semaphore::new(1)),
-            generation,
+            &ProviderWarmupScope::CliOnly,
         )
         .await?;
         Ok(())
@@ -1010,21 +1299,8 @@ impl MessageProcessor {
             Err(error) => return Err(anyhow::anyhow!(error.to_string())),
         };
         workspace_stage.succeed();
-        let cli_generation = if scope.includes_cli() {
-            Some(
-                self.provider_readiness
-                    .cli_generation(workspace_id.as_str())
-                    .await,
-            )
-        } else {
-            None
-        };
-
         let (api_ready, cli_outcome) = match (scope.includes_api(), scope.includes_cli()) {
             (true, true) => {
-                let cli_generation = cli_generation.ok_or_else(|| {
-                    anyhow::anyhow!("CLI warm-up started without a configuration generation")
-                })?;
                 let (api_result, cli_result) = tokio::join!(
                     self.perform_api_provider_warmup(
                         workspace_id.as_str(),
@@ -1035,7 +1311,7 @@ impl MessageProcessor {
                         workspace_id.as_str(),
                         &trace,
                         provider_concurrency,
-                        cli_generation,
+                        &scope,
                     ),
                 );
                 (api_result?, Some(cli_result?))
@@ -1051,15 +1327,12 @@ impl MessageProcessor {
                 (ready, None)
             }
             (false, true) => {
-                let cli_generation = cli_generation.ok_or_else(|| {
-                    anyhow::anyhow!("CLI warm-up started without a configuration generation")
-                })?;
                 let ready = self
                     .perform_cli_runtime_warmup(
                         workspace_id.as_str(),
                         &trace,
                         provider_concurrency,
-                        cli_generation,
+                        &scope,
                     )
                     .await?;
                 (true, Some(ready))
@@ -1070,11 +1343,15 @@ impl MessageProcessor {
                 ));
             }
         };
+        let mut retry_scope = scope.retry_scope(!api_ready, false);
+        if let Some(CliRuntimeWarmupOutcome::Retry(ids)) = &cli_outcome {
+            merge_optional_scope(
+                &mut retry_scope,
+                ProviderWarmupScope::cli_instances(ids.clone()),
+            );
+        }
         Ok(ProviderWarmupExecution {
-            retry_scope: ProviderWarmupScope::from_retry_needs(
-                scope.includes_api() && !api_ready,
-                matches!(cli_outcome, Some(CliRuntimeWarmupOutcome::Retry)),
-            ),
+            retry_scope,
             superseded: matches!(cli_outcome, Some(CliRuntimeWarmupOutcome::Superseded)),
         })
     }
@@ -1211,10 +1488,24 @@ impl MessageProcessor {
         workspace_id: &str,
         trace: &GatewayProviderWarmupTrace,
         provider_concurrency: &Arc<Semaphore>,
-        generation: u64,
+        scope: &ProviderWarmupScope,
     ) -> anyhow::Result<CliRuntimeWarmupOutcome> {
         let cli_catalog_stage = trace.stage(GatewayProviderWarmupStage::CliCatalogLoad);
-        let instances = self.load_cli_runtime_instances()?;
+        let (generation, instances) = {
+            let _settings_guard = self.gateway_settings_update_lock.lock().await;
+            let generation = self
+                .provider_readiness
+                .begin_cli_probe(workspace_id, scope)
+                .await;
+            let instances = self
+                .load_cli_runtime_instances()?
+                .into_iter()
+                .filter(|instance| scope.includes_runtime(&instance.id))
+                .collect::<Vec<_>>();
+            (generation, instances)
+        };
+        self.cli_runtime_readiness_snapshot_or_seed(workspace_id)
+            .await?;
         cli_catalog_stage.succeed();
 
         let previous = self
@@ -1226,6 +1517,15 @@ impl MessageProcessor {
             let previous_models = previous.models.get(instance.id.as_str()).cloned();
             let provider_concurrency = provider_concurrency.clone();
             async move {
+                if !instance.enabled {
+                    return Some(CliRuntimeProbeResult {
+                        summary: super::cli_runtime::cli_runtime_summary_from_instance(
+                            instance, None,
+                        ),
+                        models: None,
+                        mcp_readiness: None,
+                    });
+                }
                 let runtime_kind = instance.kind;
                 let fallback_instance = instance.clone();
                 let proxy_url = self
@@ -1239,6 +1539,25 @@ impl MessageProcessor {
                         .acquire_owned()
                         .await
                         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                    if !self
+                        .provider_readiness
+                        .accepts_cli_probe(workspace_id, generation, &instance.id)
+                        .await
+                    {
+                        return Ok(None);
+                    }
+                    #[cfg(test)]
+                    {
+                        let fake = self
+                            .provider_readiness
+                            .cli_probe_fake
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone();
+                        if let Some(fake) = fake {
+                            return Ok(Some(fake(instance.clone())));
+                        }
+                    }
                     tokio::time::timeout(CLI_RUNTIME_READINESS_PROBE_TIMEOUT, async {
                         let live_readiness = self
                             .cli_runtime_live_summary_from_instance_with_trace(
@@ -1284,18 +1603,19 @@ impl MessageProcessor {
                         } else {
                             None
                         };
-                        Ok::<_, anyhow::Error>(CliRuntimeProbeResult {
+                        Ok::<_, anyhow::Error>(Some(CliRuntimeProbeResult {
                             summary,
                             models,
                             mcp_readiness: live_readiness.mcp_readiness,
-                        })
+                        }))
                     })
                     .await
                     .map_err(|_| anyhow::anyhow!("CLI runtime readiness check timed out"))?
                 }
                 .await;
                 let mut result = match result {
-                    Ok(result) => result,
+                    Ok(Some(result)) => result,
+                    Ok(None) => return None,
                     Err(error) => {
                         warn!(
                             runtime_kind = ?runtime_kind,
@@ -1339,10 +1659,13 @@ impl MessageProcessor {
                     .models
                     .as_ref()
                     .map(|models| models.refreshed_at_unix_ms);
-                result
+                Some(result)
             }
         }))
-        .await;
+        .await
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
         let mut runtimes = probe_results
             .iter()
             .map(|result| result.summary.clone())
@@ -1365,11 +1688,12 @@ impl MessageProcessor {
             })
             .collect::<HashMap<_, _>>();
         super::cli_runtime::sort_cli_runtime_summary_display_order(runtimes.as_mut_slice());
-        let Some((snapshot, changed)) = self
+        let Some((snapshot, changed, accepted_ids)) = self
             .provider_readiness
-            .replace_probe_results_if_generation(
+            .merge_probe_results_if_generation(
                 workspace_id,
                 generation,
+                scope,
                 runtimes,
                 model_snapshots,
                 mcp_snapshots,
@@ -1381,11 +1705,22 @@ impl MessageProcessor {
             // process/account/MCP/model evidence over the invalidated snapshot.
             return Ok(CliRuntimeWarmupOutcome::Superseded);
         };
-        let all_ready = snapshot.runtimes.iter().all(|runtime| {
-            !runtime.enabled
-                || telemetry_cli_runtime_readiness(runtime) == GatewayProviderReadinessState::Ready
-        });
-        for runtime in &snapshot.runtimes {
+        let retry_ids = snapshot
+            .runtimes
+            .iter()
+            .filter(|runtime| {
+                accepted_ids.contains(&runtime.runtime_id)
+                    && runtime.enabled
+                    && telemetry_cli_runtime_readiness(runtime)
+                        != GatewayProviderReadinessState::Ready
+            })
+            .map(|runtime| runtime.runtime_id.clone())
+            .collect::<BTreeSet<_>>();
+        for runtime in snapshot
+            .runtimes
+            .iter()
+            .filter(|runtime| accepted_ids.contains(&runtime.runtime_id))
+        {
             trace.record_cli_readiness(
                 telemetry_cli_runtime_kind(runtime.kind),
                 telemetry_cli_runtime_readiness(runtime),
@@ -1396,10 +1731,10 @@ impl MessageProcessor {
         self.publish_cli_runtime_readiness_changes(workspace_id, changed)
             .await;
         publish_stage.succeed();
-        Ok(if all_ready {
+        Ok(if retry_ids.is_empty() {
             CliRuntimeWarmupOutcome::Ready
         } else {
-            CliRuntimeWarmupOutcome::Retry
+            CliRuntimeWarmupOutcome::Retry(retry_ids)
         })
     }
 
@@ -1407,6 +1742,7 @@ impl MessageProcessor {
         &self,
         workspace_id: &str,
     ) -> anyhow::Result<()> {
+        let _settings_guard = self.gateway_settings_update_lock.lock().await;
         let (generation, invalidated_changes) = self
             .provider_readiness
             .invalidate_snapshot(workspace_id)
@@ -1450,15 +1786,16 @@ impl MessageProcessor {
         workspace_id: &str,
     ) -> anyhow::Result<Vec<RuntimeSummary>> {
         let instances = self.load_cli_runtime_instances()?;
-        self.initializing_cli_runtime_snapshot_from_instances(workspace_id, instances.as_slice())
-            .await
+        Ok(self
+            .initializing_cli_runtime_snapshot_from_instances(workspace_id, instances.as_slice())
+            .await)
     }
 
     async fn initializing_cli_runtime_snapshot_from_instances(
         &self,
         workspace_id: &str,
         instances: &[pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig],
-    ) -> anyhow::Result<Vec<RuntimeSummary>> {
+    ) -> Vec<RuntimeSummary> {
         let mut summaries = join_all(instances.iter().cloned().map(|instance| async move {
             match self
                 .prepare_cli_runtime_proxy_url(workspace_id, instance.id.as_str())
@@ -1479,7 +1816,7 @@ impl MessageProcessor {
         }))
         .await;
         super::cli_runtime::sort_cli_runtime_summary_display_order(summaries.as_mut_slice());
-        Ok(summaries)
+        summaries
     }
 
     async fn publish_cli_runtime_readiness_changes(
@@ -1570,6 +1907,8 @@ struct ProviderProbeScheduler {
     processor: Weak<MessageProcessor>,
     workspace_concurrency: Arc<Semaphore>,
     provider_concurrency: Arc<Semaphore>,
+    #[cfg(test)]
+    workspace_list_failures: usize,
 }
 
 impl ProviderProbeScheduler {
@@ -1582,16 +1921,68 @@ impl ProviderProbeScheduler {
             processor,
             workspace_concurrency: Arc::new(Semaphore::new(MAX_CONCURRENT_WORKSPACE_WARMUPS)),
             provider_concurrency: Arc::new(Semaphore::new(MAX_CONCURRENT_PROVIDER_PROBES)),
+            #[cfg(test)]
+            workspace_list_failures: 0,
         }
     }
 
+    /// The command, retry tick and periodic reconcile share this decision so
+    /// a workspace-list failure cannot lose the forced subset of the request.
+    async fn schedule_all_or_defer(
+        &mut self,
+        pending: &mut Option<PendingProviderWarmup>,
+        backoff: &mut ProviderRetrySchedule,
+        request: PendingProviderWarmup,
+        now: tokio::time::Instant,
+        retry_attempt: bool,
+    ) -> Option<HashSet<String>> {
+        let scheduled = self
+            .schedule_all_request(request.scope.clone(), request.force_scope.clone(), None)
+            .await;
+        if scheduled.is_some() {
+            *pending = pending
+                .take()
+                .and_then(|pending| pending.subtract_scheduled(&request));
+            if pending.is_none() {
+                *backoff = ProviderRetrySchedule::default();
+            }
+        } else {
+            match pending {
+                Some(pending) => pending.merge(request.scope, request.force_scope),
+                None => *pending = Some(request),
+            }
+            if retry_attempt {
+                backoff.record_attempt(now);
+            } else {
+                backoff.ensure_scheduled(now);
+            }
+        }
+        scheduled
+    }
+
+    #[cfg(test)]
     async fn schedule_all(
         &mut self,
         scope: ProviderWarmupScope,
         force_if_running: bool,
         only: Option<&HashSet<String>>,
     ) -> Option<HashSet<String>> {
+        self.schedule_all_request(scope.clone(), force_if_running.then_some(scope), only)
+            .await
+    }
+
+    async fn schedule_all_request(
+        &mut self,
+        scope: ProviderWarmupScope,
+        force_scope: Option<ProviderWarmupScope>,
+        only: Option<&HashSet<String>>,
+    ) -> Option<HashSet<String>> {
         let message_processor = self.processor.upgrade()?.for_background_reconciliation();
+        #[cfg(test)]
+        if self.workspace_list_failures > 0 {
+            self.workspace_list_failures -= 1;
+            return None;
+        }
         let workspaces = match message_processor.workspace_manager.list_workspaces().await {
             Ok(workspaces) => workspaces,
             Err(error) => {
@@ -1607,17 +1998,21 @@ impl ProviderProbeScheduler {
             .iter()
             .map(|workspace| workspace.id.clone())
             .collect::<HashSet<_>>();
-        message_processor
-            .provider_readiness
-            .retain_workspaces(&active_workspace_ids)
-            .await;
+        // Targeted configuration propagation also updates known catalogs;
+        // leave their retirement to an independent full reconciliation.
+        if !matches!(&scope.cli, CliProbeScope::Instances(_)) {
+            message_processor
+                .provider_readiness
+                .retain_workspaces(&active_workspace_ids)
+                .await;
+        }
         drop(message_processor);
 
         for workspace in active_workspaces {
             if only.is_some_and(|only| !only.contains(workspace.id.as_str())) {
                 continue;
             }
-            self.schedule_workspace(workspace.id, scope, force_if_running);
+            self.schedule_workspace_request(workspace.id, scope.clone(), force_scope.clone());
         }
         Some(active_workspace_ids)
     }
@@ -1628,12 +2023,25 @@ impl ProviderProbeScheduler {
         scope: ProviderWarmupScope,
         force_if_running: bool,
     ) -> bool {
-        if !register_workspace_probe(
+        self.schedule_workspace_request(
+            workspace_id,
+            scope.clone(),
+            force_if_running.then_some(scope),
+        )
+    }
+
+    fn schedule_workspace_request(
+        &mut self,
+        workspace_id: String,
+        scope: ProviderWarmupScope,
+        force_scope: Option<ProviderWarmupScope>,
+    ) -> bool {
+        if !register_workspace_probe_request(
             &mut self.in_flight,
             &mut self.rerun,
             workspace_id.as_str(),
-            scope,
-            force_if_running,
+            scope.clone(),
+            force_scope,
         ) {
             return false;
         }
@@ -1658,7 +2066,7 @@ impl ProviderProbeScheduler {
                     processor
                         .perform_provider_warmup(
                             workspace_id.as_str(),
-                            scope,
+                            scope.clone(),
                             &provider_concurrency,
                             &trace,
                         )
@@ -1710,7 +2118,7 @@ async fn run_provider_readiness_worker(
     let mut scheduler = ProviderProbeScheduler::new(processor.clone());
     let mut pending_retries = HashMap::<String, ProviderWarmupScope>::new();
     let mut retry_schedule = HashMap::<String, ProviderRetrySchedule>::new();
-    let mut pending_all_workspaces_retry = None::<ProviderWarmupScope>;
+    let mut pending_all_workspaces_retry = None::<PendingProviderWarmup>;
     let mut all_workspaces_retry_schedule = ProviderRetrySchedule::default();
     let mut retry = tokio::time::interval_at(
         tokio::time::Instant::now() + PROVIDER_READINESS_RETRY_INTERVAL,
@@ -1737,35 +2145,31 @@ async fn run_provider_readiness_worker(
                 drop(message_processor);
                 for command in commands {
                     match command {
-                    ProviderWarmupCommand::Workspace { workspace_id, scope, force_if_running } => {
-                        if force_if_running {
+                    ProviderWarmupCommand::Workspace { workspace_id, scope, force_scope } => {
+                        if force_scope.as_ref().is_some_and(|forced| !matches!(&forced.cli, CliProbeScope::Instances(_))) {
                             retry_schedule.remove(workspace_id.as_str());
                         }
-                        scheduler.schedule_workspace(workspace_id, scope, force_if_running);
+                        scheduler.schedule_workspace_request(workspace_id, scope, force_scope);
                     }
-                    ProviderWarmupCommand::AllWorkspaces { scope, force_if_running } => {
-                        if force_if_running {
+                    ProviderWarmupCommand::AllWorkspaces { scope, force_scope } => {
+                        if force_scope.as_ref().is_some_and(|forced| !matches!(&forced.cli, CliProbeScope::Instances(_))) {
                             retry_schedule.clear();
                             all_workspaces_retry_schedule = ProviderRetrySchedule::default();
                         }
                         if let Some(active_workspace_ids) = scheduler
-                            .schedule_all(scope, force_if_running, None)
-                            .await
+                            .schedule_all_or_defer(
+                                &mut pending_all_workspaces_retry,
+                                &mut all_workspaces_retry_schedule,
+                                PendingProviderWarmup { scope, force_scope },
+                                tokio::time::Instant::now(), false,
+                            ).await
                         {
-                            pending_all_workspaces_retry = pending_all_workspaces_retry
-                                .and_then(|pending| pending.subtract(scope));
                             pending_retries.retain(|workspace_id, _| {
                                 active_workspace_ids.contains(workspace_id)
                             });
                             retry_schedule.retain(|workspace_id, _| {
                                 active_workspace_ids.contains(workspace_id)
                             });
-                        } else {
-                            merge_optional_scope(&mut pending_all_workspaces_retry, scope);
-                            if all_workspaces_retry_schedule.next_attempt.is_none() {
-                                all_workspaces_retry_schedule
-                                    .record_attempt(tokio::time::Instant::now());
-                            }
                         }
                     }
                     }
@@ -1791,7 +2195,7 @@ async fn run_provider_readiness_worker(
                             warn!(task_id = ?task_id, error = %join_error, "unregistered provider warm-up task stopped");
                             continue;
                         };
-                        let Some(requested_scope) = scheduler.in_flight.get(workspace_id.as_str()).copied() else {
+                        let Some(requested_scope) = scheduler.in_flight.get(workspace_id.as_str()).cloned() else {
                             warn!(workspace_id, task_id = ?task_id, error = %join_error, "provider warm-up task stopped without an in-flight registration");
                             continue;
                         };
@@ -1810,14 +2214,14 @@ async fn run_provider_readiness_worker(
                         error = %format!("{error:#}"),
                         "Gateway provider warm-up failed"
                         );
-                        Some(requested_scope)
+                        Some(requested_scope.clone())
                     }
                     Err(_) => {
                         warn!(
                             workspace_id,
                             "Gateway provider warm-up panicked; workspace scheduling recovered"
                         );
-                        Some(requested_scope)
+                        Some(requested_scope.clone())
                     }
                 };
                 complete_retry_scope(
@@ -1840,29 +2244,29 @@ async fn run_provider_readiness_worker(
             }
             _ = retry.tick() => {
                 let now = tokio::time::Instant::now();
-                if let Some(scope) = pending_all_workspaces_retry
+                if let Some(request) = pending_all_workspaces_retry.clone()
                     && all_workspaces_retry_schedule
                         .next_attempt
                         .is_none_or(|next_attempt| next_attempt <= now)
                 {
                         if let Some(active_workspace_ids) =
-                            scheduler.schedule_all(scope, false, None).await
+                            scheduler.schedule_all_or_defer(
+                                &mut pending_all_workspaces_retry,
+                                &mut all_workspaces_retry_schedule,
+                                request, now, true,
+                            ).await
                         {
-                            pending_all_workspaces_retry = None;
-                            all_workspaces_retry_schedule = ProviderRetrySchedule::default();
                             pending_retries.retain(|workspace_id, _| {
                                 active_workspace_ids.contains(workspace_id)
                             });
                             retry_schedule.retain(|workspace_id, _| {
                                 active_workspace_ids.contains(workspace_id)
                             });
-                        } else {
-                            all_workspaces_retry_schedule.record_attempt(now);
                         }
                 }
                 let retry_workspaces = pending_retries
                     .iter()
-                    .map(|(workspace_id, scope)| (workspace_id.clone(), *scope))
+                    .map(|(workspace_id, scope)| (workspace_id.clone(), scope.clone()))
                     .collect::<Vec<_>>();
                 retry_schedule.retain(|workspace_id, _| {
                     pending_retries.contains_key(workspace_id)
@@ -1880,8 +2284,12 @@ async fn run_provider_readiness_worker(
             }
             _ = reconcile.tick() => {
                 if let Some(active_workspace_ids) = scheduler
-                    .schedule_all(ProviderWarmupScope::All, false, None)
-                    .await
+                    .schedule_all_or_defer(
+                        &mut pending_all_workspaces_retry,
+                        &mut all_workspaces_retry_schedule,
+                        PendingProviderWarmup { scope: ProviderWarmupScope::All, force_scope: None },
+                        tokio::time::Instant::now(), false,
+                    ).await
                 {
                     pending_retries.retain(|workspace_id, _| {
                         active_workspace_ids.contains(workspace_id)
@@ -1889,12 +2297,6 @@ async fn run_provider_readiness_worker(
                     retry_schedule.retain(|workspace_id, _| {
                         active_workspace_ids.contains(workspace_id)
                     });
-                } else {
-                    merge_optional_scope(
-                        &mut pending_all_workspaces_retry,
-                        ProviderWarmupScope::All,
-                    );
-                    all_workspaces_retry_schedule.ensure_scheduled(tokio::time::Instant::now());
                 }
             }
         }
@@ -1923,7 +2325,10 @@ impl ProviderRetrySchedule {
 }
 
 fn merge_optional_scope(target: &mut Option<ProviderWarmupScope>, scope: ProviderWarmupScope) {
-    *target = Some(target.map_or(scope, |pending| pending.merge(scope)));
+    *target = Some(match target.take() {
+        Some(pending) => pending.merge(scope),
+        None => scope,
+    });
 }
 
 fn complete_retry_scope(
@@ -1951,6 +2356,7 @@ fn provider_retry_delay(attempts: u32) -> Duration {
         .min(PROVIDER_READINESS_RETRY_MAX_DELAY)
 }
 
+#[cfg(test)]
 fn register_workspace_probe(
     in_flight: &mut HashMap<String, ProviderWarmupScope>,
     rerun: &mut HashMap<String, ProviderWarmupScope>,
@@ -1958,15 +2364,35 @@ fn register_workspace_probe(
     scope: ProviderWarmupScope,
     force_if_running: bool,
 ) -> bool {
-    let Some(running_scope) = in_flight.get(workspace_id).copied() else {
+    register_workspace_probe_request(
+        in_flight,
+        rerun,
+        workspace_id,
+        scope.clone(),
+        force_if_running.then_some(scope),
+    )
+}
+
+fn register_workspace_probe_request(
+    in_flight: &mut HashMap<String, ProviderWarmupScope>,
+    rerun: &mut HashMap<String, ProviderWarmupScope>,
+    workspace_id: &str,
+    scope: ProviderWarmupScope,
+    force_scope: Option<ProviderWarmupScope>,
+) -> bool {
+    let Some(running_scope) = in_flight.get(workspace_id).cloned() else {
         in_flight.insert(workspace_id.to_owned(), scope);
         return true;
     };
-    if force_if_running || running_scope.merge(scope) != running_scope {
+    let mut pending = scope.subtract(running_scope);
+    if let Some(forced) = force_scope {
+        merge_optional_scope(&mut pending, forced);
+    }
+    if let Some(pending) = pending {
         rerun
             .entry(workspace_id.to_owned())
-            .and_modify(|pending| *pending = pending.merge(scope))
-            .or_insert(scope);
+            .and_modify(|queued| *queued = queued.merge(pending.clone()))
+            .or_insert(pending);
     }
     false
 }
@@ -2066,7 +2492,7 @@ fn retained_cli_models(
 mod tests {
     use super::*;
 
-    fn runtime_summary(runtime_id: &str, status: RuntimeStatus) -> RuntimeSummary {
+    pub(super) fn runtime_summary(runtime_id: &str, status: RuntimeStatus) -> RuntimeSummary {
         RuntimeSummary {
             runtime_id: runtime_id.to_owned(),
             kind: CLIAgentRuntimeKind::Codex,
@@ -2087,7 +2513,7 @@ mod tests {
         }
     }
 
-    fn model_snapshot(model_id: &str) -> CliRuntimeModelSnapshot {
+    pub(super) fn model_snapshot(model_id: &str) -> CliRuntimeModelSnapshot {
         CliRuntimeModelSnapshot {
             result: super::super::cli_runtime::RuntimeModelListResult {
                 models: vec![RuntimeModelInfo {
@@ -2114,7 +2540,7 @@ mod tests {
         }
     }
 
-    fn mcp_readiness() -> pioneer_protocol::CliMcpAdapterReadiness {
+    pub(super) fn mcp_readiness() -> pioneer_protocol::CliMcpAdapterReadiness {
         pioneer_protocol::CliMcpAdapterReadiness {
             supported: true,
             injection: pioneer_protocol::CliMcpInjectionKind::CodexManagedStdioMcp,
@@ -2332,13 +2758,13 @@ mod tests {
             inbox.push(ProviderWarmupCommand::Workspace {
                 workspace_id: "ws_default".to_owned(),
                 scope: ProviderWarmupScope::CliOnly,
-                force_if_running: false,
+                force_scope: None,
             });
         }
         inbox.push(ProviderWarmupCommand::Workspace {
             workspace_id: "ws_default".to_owned(),
             scope: ProviderWarmupScope::ApiOnly,
-            force_if_running: true,
+            force_scope: Some(ProviderWarmupScope::ApiOnly),
         });
 
         let commands = inbox.drain();
@@ -2347,9 +2773,10 @@ mod tests {
             &commands[0],
             ProviderWarmupCommand::Workspace {
                 workspace_id,
-                scope: ProviderWarmupScope::All,
-                force_if_running: true,
-            } if workspace_id == "ws_default"
+                scope,
+                force_scope,
+            } if workspace_id == "ws_default" && *scope == ProviderWarmupScope::All
+                && *force_scope == Some(ProviderWarmupScope::ApiOnly)
         ));
     }
 
@@ -2749,7 +3176,7 @@ mod tests {
             ProviderWarmupScope::All,
             false,
         ));
-        assert_eq!(rerun["ws_default"], ProviderWarmupScope::All);
+        assert_eq!(rerun["ws_default"], ProviderWarmupScope::CliOnly);
     }
 
     #[test]
@@ -2797,3 +3224,7 @@ mod tests {
         assert!(retries.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "provider_readiness_toggle_tests.rs"]
+mod toggle_isolation_tests;

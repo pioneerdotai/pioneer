@@ -370,6 +370,8 @@ pub struct AgentResourceStateInput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentExecutionGraphCommitInput {
+    /// Current source fence checked atomically at commit. On replay this may
+    /// be newer than the immutable execution/presentation source below.
     pub identity: AgentIdentityInput,
     pub presentation: PresentationSnapshotInput,
     pub root_execution_id: String,
@@ -796,6 +798,8 @@ pub async fn ensure_agent_identity<C: ConnectionTrait>(
     if identity.id != input.id
         || identity.source_revision != input.source_revision
         || identity.source_fingerprint != input.source_fingerprint
+        || identity.status != "active"
+        || identity.retired_at.is_some()
     {
         bail!("agent identity source was reused with different immutable facts");
     }
@@ -4061,7 +4065,10 @@ async fn revalidate_agent_execution_for_commit(
         .await
         .context("failed to revalidate committing Agent identity")?
         .context("committing Agent identity disappeared")?;
-    if identity.workspace_id != execution.workspace_id || identity.status != "active" {
+    if identity.workspace_id != execution.workspace_id
+        || identity.status != "active"
+        || identity.retired_at.is_some()
+    {
         bail!("committing Agent identity is unavailable");
     }
     if identity.source_revision != input.expected_current_identity_source_revision
@@ -5581,10 +5588,137 @@ pub async fn commit_agent_execution_graph(
     }
     let (grant_identity, grant_profile, child_launch_grant) =
         parse_agent_execution_launch_grant(input.grant.grant_json.as_str())?;
+    let existing = load_agent_execution(db, &input.child_execution.id).await?;
     let identity = ensure_agent_identity(db, &input.identity).await?;
+    if identity.workspace_id != input.child_execution.workspace_id
+        || agent_identity_source_kind(&identity.source_kind)? != grant_identity.source_kind
+        || match (&grant_identity.source_kind, &grant_profile.backend) {
+            (
+                AgentIdentitySourceKind::NativeAgent,
+                pioneer_protocol::AgentExecutionProfileBackend::ApiProvider,
+            ) => false,
+            (
+                AgentIdentitySourceKind::CliRuntimeInstance,
+                pioneer_protocol::AgentExecutionProfileBackend::CliRuntime {
+                    runtime_instance_id,
+                },
+            ) => {
+                runtime_instance_id != &identity.source_id
+                    || grant_profile.provider_id != format!("cli_runtime:{runtime_instance_id}")
+            }
+            (AgentIdentitySourceKind::Ephemeral, _) => false,
+            _ => true,
+        }
+    {
+        bail!("execution graph changed its workspace or launch source");
+    }
+    if identity.source_kind == SOURCE_NATIVE_AGENT {
+        let config = load_native_agent_config(db, &identity.source_id)
+            .await?
+            .context("native Agent source disappeared before graph commit")?;
+        if config.workspace_id != identity.workspace_id
+            || !config.enabled
+            || config.config_revision != identity.source_revision
+        {
+            bail!("native Agent source changed before graph commit");
+        }
+    }
+    // An ephemeral actor has no CLI kind of its own. Its profile must retain
+    // the registered runtime source from the admitted ceiling, rather than
+    // treating an execution-local identity as authority to change engines.
+    if grant_identity.source_kind == AgentIdentitySourceKind::Ephemeral
+        && let pioneer_protocol::AgentExecutionProfileBackend::CliRuntime {
+            runtime_instance_id,
+        } = &grant_profile.backend
+    {
+        let source = load_agent_identity_by_source(
+            db,
+            &identity.workspace_id,
+            SOURCE_CLI_RUNTIME_INSTANCE,
+            runtime_instance_id,
+        )
+        .await?
+        .context("ephemeral CLI profile source disappeared before commit")?;
+        let backing = child_launch_grant
+            .identities
+            .iter()
+            .find(|candidate| {
+                candidate.id.as_str() == source.id
+                    && candidate.source_kind == AgentIdentitySourceKind::CliRuntimeInstance
+                    && grant_profile
+                        .compatible_agent_identity_ids
+                        .contains(&candidate.id)
+            })
+            .context("ephemeral CLI profile has no admitted registered source")?;
+        if source.status != "active"
+            || source.retired_at.is_some()
+            || grant_profile.provider_id != format!("cli_runtime:{runtime_instance_id}")
+            || (existing.is_none()
+                && (u64::try_from(source.source_revision).ok() != Some(backing.source_revision)
+                    || source.source_fingerprint != backing.source_fingerprint))
+        {
+            bail!("ephemeral CLI profile source changed before commit");
+        }
+        let historical = load_current_agent_presentation_snapshot(
+            db,
+            &source.id,
+            i64::try_from(backing.source_revision).unwrap_or(-1),
+            &backing.source_fingerprint,
+        )
+        .await?
+        .context("ephemeral CLI profile source snapshot is missing")?;
+        let current = load_current_agent_presentation_snapshot(
+            db,
+            &source.id,
+            source.source_revision,
+            &source.source_fingerprint,
+        )
+        .await?
+        .context("ephemeral CLI profile current source snapshot is missing")?;
+        if historical.display_name != backing.display_name
+            || historical.nickname != backing.nickname
+            || historical.avatar_revision != backing.avatar_revision
+            || historical.role_label != backing.role_label
+            || current.role_label != backing.role_label
+        {
+            bail!("ephemeral CLI profile changed its admitted runtime kind");
+        }
+    }
+    let presentation_matches_source = if let Some(existing) = existing.as_ref() {
+        existing.agent_identity_id == identity.id
+            && existing.presentation_snapshot_id.as_deref() == Some(input.presentation.id.as_str())
+            && existing.identity_source_revision == input.presentation.source_revision
+            && existing.identity_source_fingerprint == input.presentation.source_fingerprint
+    } else {
+        identity.source_revision == input.presentation.source_revision
+            && identity.source_fingerprint == input.presentation.source_fingerprint
+    };
+    if identity.source_kind == SOURCE_CLI_RUNTIME_INSTANCE && existing.is_some() {
+        // Replay keeps its historical presentation, but the registered source
+        // must still implement the admitted CLI engine. Technical revisions
+        // and display-name changes do not change that engine.
+        let current = load_current_agent_presentation_snapshot(
+            db,
+            &identity.id,
+            identity.source_revision,
+            &identity.source_fingerprint,
+        )
+        .await?
+        .context("CLI execution current source snapshot is missing")?;
+        if current.role_label.is_none() || current.role_label != input.presentation.role_label {
+            bail!("CLI execution source changed its admitted runtime kind");
+        }
+    }
     if identity.id != input.presentation.agent_identity_id
-        || identity.source_revision != input.presentation.source_revision
-        || identity.source_fingerprint != input.presentation.source_fingerprint
+        || !presentation_matches_source
+        || grant_identity.id.as_str() != input.presentation.agent_identity_id
+        || i64::try_from(grant_identity.source_revision).ok()
+            != Some(input.presentation.source_revision)
+        || grant_identity.source_fingerprint != input.presentation.source_fingerprint
+        || grant_identity.display_name != input.presentation.display_name
+        || grant_identity.nickname != input.presentation.nickname
+        || grant_identity.avatar_revision != input.presentation.avatar_revision
+        || grant_identity.role_label != input.presentation.role_label
     {
         bail!("agent presentation snapshot is not pinned to the exact identity source");
     }
@@ -5596,15 +5730,17 @@ pub async fn commit_agent_execution_graph(
     } else {
         (NICKNAME_OWNER_AGENT, identity.id.clone())
     };
-    claim_actor_nickname(
-        db,
-        input.identity.workspace_id.as_str(),
-        input.presentation.nickname.as_str(),
-        nickname_owner_kind,
-        nickname_owner_id.as_str(),
-        input.presentation.now.clone(),
-    )
-    .await?;
+    if existing.is_none() {
+        claim_actor_nickname(
+            db,
+            input.identity.workspace_id.as_str(),
+            input.presentation.nickname.as_str(),
+            nickname_owner_kind,
+            nickname_owner_id.as_str(),
+            input.presentation.now.clone(),
+        )
+        .await?;
+    }
     let _presentation = insert_presentation_snapshot(db, &input.presentation).await?;
 
     if input.root_execution_id != input.child_execution.work_graph_root_execution_id {
@@ -5678,18 +5814,14 @@ pub async fn commit_agent_execution_graph(
                 &grant_identity.id,
             );
         let identity_ceiling_is_monotonic = child_launch_grant.identities.iter().all(|candidate| {
-            parent_launch_grant
-                .identities
-                .iter()
-                .any(|parent| parent == candidate)
-                || (ephemeral_child && candidate == &grant_identity)
+            parent_launch_grant.identities.iter().any(|parent| {
+                pioneer_protocol::agent_identity_has_same_launch_source(candidate, parent)
+            }) || (ephemeral_child && candidate == &grant_identity)
         });
         let profile_ceiling_is_monotonic = child_launch_grant.profiles.iter().all(|candidate| {
-            parent_launch_grant
-                .profiles
-                .iter()
-                .any(|parent| parent == candidate)
-                || (ephemeral_profile_is_monotonic && candidate == &grant_profile)
+            parent_launch_grant.profiles.iter().any(|parent| {
+                pioneer_protocol::agent_execution_profile_is_no_wider(candidate, parent)
+            }) || (ephemeral_profile_is_monotonic && candidate == &grant_profile)
         });
         let capability_ceiling_is_monotonic = child_launch_grant
             .skill_ids
@@ -7136,6 +7268,10 @@ pub fn canonical_agent_id(prefix: char, key: &str) -> String {
 pub fn utc_now() -> DateTimeWithTimeZone {
     DateTime::<Utc>::from(Utc::now()).into()
 }
+
+#[cfg(test)]
+#[path = "agent_domain_launch_continuity_tests.rs"]
+mod launch_continuity_tests;
 
 #[cfg(test)]
 mod tests {
