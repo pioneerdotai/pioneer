@@ -350,7 +350,7 @@ async fn persist_test_execution_authorization_context(
     .await;
 }
 
-async fn persist_test_execution_authorization_context_for_principal(
+pub(super) async fn persist_test_execution_authorization_context_for_principal(
     processor: &MessageProcessor,
     principal: &crate::auth::AuthenticatedSessionPrincipal,
     workspace_id: &str,
@@ -2481,7 +2481,7 @@ async fn capability_persistence_order_impl() {
             } if committed_turn_id == turn_id
                 && accepted.is_empty()
                 && rejected.is_empty()
-                && mcp_bindings.len() == 2 + crate::turn_mcp::native_tools::NativeToolFamily::Tasks.definitions().len()
+                && mcp_bindings.len() == 2 + crate::turn_mcp::native_tools::NativeToolFamily::Tasks.definitions().len() + crate::turn_mcp::native_tools::NativeToolFamily::Threads.definitions().len()
                 && mcp_bindings.iter().all(|binding| crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(&binding.server_installation_id).is_some())
                 && mcp_bindings.iter().any(|binding| binding.raw_tool_name == "task_wait")
         ));
@@ -3693,7 +3693,7 @@ impl pioneer_tasks::TaskExecutor for FailingSystemExecutor {
     }
 }
 
-fn test_provider() -> Arc<pioneer_provider::ProviderRegistry> {
+pub(super) fn test_provider() -> Arc<pioneer_provider::ProviderRegistry> {
     Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         Arc::new(EchoProvider::new()),
@@ -6971,7 +6971,7 @@ impl Provider for DirectAgentSandboxProvider {
     }
 }
 
-fn test_gateway_secrets() -> Arc<GatewaySecrets> {
+pub(super) fn test_gateway_secrets() -> Arc<GatewaySecrets> {
     Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())))
 }
 

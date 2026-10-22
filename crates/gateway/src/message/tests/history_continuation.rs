@@ -737,6 +737,36 @@ async fn durable_final_case(
             "UI event must remain available"
         );
     }
+    // The observation reader traverses the retained canonical UI records even
+    // when the model's accepted context now contains only a checkpoint summary.
+    let mut reading_cursor = None;
+    let mut saved_events = Vec::new();
+    loop {
+        let page = processor
+            .read_saved_thread_history(&workspace, thread, 2, reading_cursor, |_| async {
+                Ok(false)
+            })
+            .await
+            .unwrap();
+        saved_events.extend(page.events);
+        if page.eof {
+            break;
+        }
+        reading_cursor = page.next_cursor;
+    }
+    let saved_final = saved_events
+        .iter()
+        .find(|event| event["content"]["item"]["id"] == "final-item")
+        .expect("saved final remains readable after compaction");
+    assert_eq!(saved_final["content"]["item"]["text"], ui_final);
+    if phased {
+        assert!(
+            saved_events
+                .iter()
+                .any(|event| event["content"]["item"]["id"] == "commentary-item"
+                    && event["content"]["item"]["text"] == "working")
+        );
+    }
     let accepted = frozen::restore_accepted_history_for_execution(
         &store,
         &workspace,

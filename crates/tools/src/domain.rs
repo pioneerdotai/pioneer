@@ -28,6 +28,9 @@ pub const ARTIFACT_DOMAIN_TOOL_NAMES: &[&str] =
     &["artifact_prepare", "artifact_register", "artifact_read"];
 pub const THREADS_DOMAIN_TOOL_NAMES: &[&str] = &[
     "threads_tools_result_read",
+    "threads_list",
+    "threads_history_read",
+    "threads_children_list",
     "threads_start_options",
     "thread_message_send",
     "thread_create",
@@ -262,6 +265,9 @@ mod tests {
             BuiltinToolDomain::Threads.tool_names(),
             [
                 "threads_tools_result_read",
+                "threads_list",
+                "threads_history_read",
+                "threads_children_list",
                 "threads_start_options",
                 "thread_message_send",
                 "thread_create",
