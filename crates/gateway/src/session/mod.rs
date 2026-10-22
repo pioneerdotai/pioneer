@@ -663,7 +663,8 @@ mod tests {
         TEST_SUPERUSER_PRINCIPAL_ID, authenticated_test_superuser,
         register_authenticated_test_connection,
     };
-    use super::{SessionManager, TERMINATED_SESSION_TOMBSTONE_TTL};
+    use super::{SessionManager, SessionOutbound, TERMINATED_SESSION_TOMBSTONE_TTL};
+    use anyhow::anyhow;
     use axum::extract::ws::Message;
     use std::sync::Arc;
     use tokio::sync::mpsc;
