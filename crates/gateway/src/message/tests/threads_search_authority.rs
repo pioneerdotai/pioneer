@@ -178,11 +178,7 @@ async fn admit(
         collaboration_authority_principal(store, &PrincipalId::new(MEMBER_A_ID).unwrap())
             .await
             .unwrap();
-    let generation = processor
-        .current_authorization_revision()
-        .await
-        .unwrap()
-        .max(1);
+    let generation = std::cmp::max(processor.current_authorization_revision().await.unwrap(), 1);
     let request = ExecutionAdmissionRequest {
         entry_point: ExecutionAdmissionEntryPoint::InteractiveTurn,
         required_root_action: ResourceAction::AgentTurnStart,

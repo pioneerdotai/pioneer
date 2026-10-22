@@ -648,7 +648,7 @@ impl ThreadEpisodicRecallService {
         if !searchable_capsules && source_after.is_some() {
             bail!("episodic index unavailable");
         }
-        Ok((format!("{:x}", digest.finalize()), incomplete))
+        Ok((hex::encode(digest.finalize()), incomplete))
     }
 
     async fn restore_frontier(&self, workspace_id: &str, state: &mut SearchCursor) -> Result<()> {
