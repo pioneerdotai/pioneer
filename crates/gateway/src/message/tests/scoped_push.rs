@@ -103,13 +103,31 @@ async fn scoped_push_delivers_committed_answer_and_read_without_tree_hint() {
     assert_eq!(packet.indicators[0].has_running_tasks, None);
     assert!(packet.inbox.is_none());
 
+    // A turn-only read stops at the user message. Obtain the exact viewed
+    // assistant position so this read also covers the late completion.
+    let timeline = request_thread_timeline_page_for_test(
+        &processor,
+        observer,
+        &mut observer_rx,
+        THREAD,
+        &generate_test_request_id("pushtest", "timeline"),
+    )
+    .await;
+    let answer_id = pioneer_protocol::task_delivery_result_item_id("push-completion");
+    let answer_block = timeline
+        .blocks
+        .iter()
+        .find(|block| matches!(&block.kind,
+            pioneer_protocol::TimelineBlockKind::AssistantMessage { item_id, .. } if item_id == &answer_id))
+        .expect("completed answer is visible in the canonical timeline");
     let read = generate_test_request_id("pushtest", "read");
     processor
         .process_request_for_connection(
             observer,
             &json!({
                 "jsonrpc":"2.0", "id":read, "method":"thread/read",
-                "params":{"thread_id":THREAD,"through_turn_id":TURN}
+                "params":{"thread_id":THREAD,"through_turn_id":TURN,
+                    "through_block":{"block_id":answer_block.block_id,"sort_key":answer_block.sort_key}}
             })
             .to_string(),
         )
@@ -201,6 +219,19 @@ async fn private_dirty_during_bootstrap_does_not_disclose_or_retire_member_scope
             .await;
         let response = recv_response_by_id(&mut source_rx, &id).await;
         assert_eq!(response.result["thread"]["id"], thread);
+        if thread == PUBLIC {
+            // thread/start owns an ephemeral draft; the subscribed public ID
+            // needs a real durable commit before the publisher can authorize it.
+            send_epic6_test_message(
+                &processor,
+                source,
+                &mut source_rx,
+                PUBLIC,
+                "T0000000000000000000F",
+                "public bootstrap message",
+            )
+            .await;
+        }
     }
     send_epic6_test_message(
         &processor,
@@ -482,11 +513,15 @@ async fn inbox_reset_keeps_delivered_coverage_and_point_ack_cannot_hide_reset() 
     let mutation = processor
         .begin_push_mutation(connection, &workspace, false)
         .unwrap();
-    mutation.finish(None, Some(update.clone()));
+    // The earlier replacement already removed this identity from the scope.
+    // A fresh authoritative replacement carries only the retained membership.
+    let mut expected_replacement = update;
+    expected_replacement.removes.clear();
+    mutation.finish(None, Some(expected_replacement.clone()));
     let replacement = recv_notification_by_method(&mut rx, events::WORKSPACE_PUSH_CHANGED).await;
     let replacement: pioneer_protocol::WorkspacePushNotification =
         serde_json::from_value(replacement.params.unwrap()).unwrap();
-    assert_eq!(replacement.inbox, Some(update));
+    assert_eq!(replacement.inbox, Some(expected_replacement));
 
     // Real storage terminal orchestration appends both RunCompleted and its
     // TaskCompleted companion; drive the durable fanout, not hand-written DTOs.

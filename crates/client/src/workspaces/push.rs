@@ -628,6 +628,10 @@ pub(super) mod tests {
     fn push_fixture() -> Arc<ClientCore> {
         let core = crate::catalog_test_support::settings_client();
         let mut authorization = core.authorization_snapshot(None, None).unwrap();
+        let resources = AuthorizationOperationalResourceProjection {
+            fingerprint: "tree-test-resources".into(),
+            ..Default::default()
+        };
         authorization.workspace = Some(AuthorizationWorkspaceCapabilitySnapshot {
             workspace_id: "ws".into(),
             capabilities: AuthorizationWorkspaceCapabilities {
@@ -635,17 +639,20 @@ pub(super) mod tests {
                 can_acknowledge_own_notifications: true,
                 ..Default::default()
             },
-            operational_resources: Default::default(),
+            operational_resources: resources.clone(),
             execution_draft_policy: AuthorizationExecutionDraftPolicyProjection {
                 fingerprint: "tree-test".into(),
-                resources: Default::default(),
+                resources,
                 permission_options: vec![],
                 can_attach_artifacts: false,
                 mcp_invocation_limits: Default::default(),
             },
         });
         let (generation, connection) = core.current_auth_ticket();
-        core.accept_authorization_projection(generation, connection, authorization);
+        assert_eq!(
+            core.accept_authorization_projection(generation, connection, authorization),
+            crate::authorization::AuthorizationProjectionAcceptance::Accepted
+        );
         core.transport_runtime()
             .ws_command_sender()
             .set_http_session_access_for_test(Some(crate::transport::http::GatewayHttpAccess {

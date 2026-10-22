@@ -845,8 +845,17 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
         // the directory, so the next zero must arrive through production ingress.
         let client = core.0.clone();
         let ack = tokio::task::spawn_blocking(move || {
-            client.transport_runtime().ws_command_sender().thread_read(pioneer_protocol::ThreadReadParams {
-                thread_id: THREAD.into(), through_turn_id: RENEWED_TURN.into(), through_block: None,
+            let sender = client.transport_runtime().ws_command_sender();
+            let timeline = sender.thread_timeline_page(pioneer_protocol::ThreadTimelinePageParams {
+                thread_id: THREAD.into(), anchor: pioneer_protocol::TimelinePageAnchor::Newest, limit: Some(12),
+            }).unwrap();
+            let answer_id = pioneer_protocol::task_delivery_result_item_id("post-renewal");
+            let block = timeline.blocks.iter().find(|block| matches!(&block.kind,
+                pioneer_protocol::TimelineBlockKind::AssistantMessage { item_id, .. } if item_id == &answer_id))
+                .expect("viewed post-renewal answer");
+            sender.thread_read(pioneer_protocol::ThreadReadParams {
+                thread_id: THREAD.into(), through_turn_id: RENEWED_TURN.into(),
+                through_block: Some(pioneer_protocol::ThreadReadPosition {block_id:block.block_id.clone(),sort_key:block.sort_key.clone()}),
             }).unwrap()
         }).await.unwrap();
         assert_eq!(ack.unread_count, 0);
