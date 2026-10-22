@@ -2398,6 +2398,20 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
+            "task_finish_params.json",
+            pioneer_protocol::TaskFinishParams,
+            Domain::Tasks,
+            Kind::Command,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_finish_response.json",
+            pioneer_protocol::TaskFinishResponse,
+            Domain::Tasks,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
             "task_completion_inbox_entry.json",
             pioneer_protocol::TaskCompletionInboxEntry,
             Domain::Tasks,

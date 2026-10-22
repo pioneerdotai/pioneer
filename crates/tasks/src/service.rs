@@ -1940,6 +1940,13 @@ impl TaskService {
         mut context: TaskCreateContext,
         params: TaskCreateParams,
     ) -> TaskRuntimeResult<TaskCreateResponse> {
+        if params
+            .metadata
+            .as_ref()
+            .is_some_and(|m| m.finish_request.is_some())
+        {
+            bail!("finishRequest is server-owned; use task_finish");
+        }
         validate_create_params(&params)?;
         self.validate_review_policy_create_gate(&params)?;
         match (
@@ -2456,6 +2463,67 @@ impl TaskService {
         self.collect_wait_state_for_plan(&plan).await
     }
 
+    pub async fn finish_task(
+        &self,
+        context: TaskMutationContext,
+        params: pioneer_protocol::TaskFinishParams,
+    ) -> TaskRuntimeResult<pioneer_protocol::TaskFinishResponse> {
+        self.ensure_execution_can_finish_task(&context, &params.task_id)
+            .await?;
+        let now = now_timestamp_secs();
+        let (already_finished, events) = self
+            .store
+            .request_task_finish(
+                &params.task_id,
+                params.reason,
+                now,
+                context.agent_action_commit,
+            )
+            .await?;
+        self.publish_and_wake(events).await;
+        loop {
+            let events = self
+                .store
+                .discard_finished_task_queue(&params.task_id, now)
+                .await?;
+            if events.is_empty() {
+                break;
+            }
+            self.publish_and_wake(events).await;
+        }
+        let task = self
+            .store
+            .get_task(&params.task_id)
+            .await?
+            .context("Task disappeared after finish")?
+            .task;
+        Ok(pioneer_protocol::TaskFinishResponse {
+            task,
+            already_finished,
+        })
+    }
+
+    async fn ensure_execution_can_finish_task(
+        &self,
+        context: &TaskMutationContext,
+        target_task_id: &str,
+    ) -> TaskRuntimeResult<()> {
+        if let (Some(thread_id), Some(turn_id)) =
+            (context.thread_id.as_deref(), context.turn_id.as_deref())
+            && let Some(turn) = self
+                .store
+                .get_task_run_turn_by_turn(thread_id, turn_id)
+                .await?
+            && turn.task_id == target_task_id
+        {
+            return Ok(());
+        }
+        // Preserve the complete ancestor guard; only exact self-finish gets
+        // an exception. Capsule/action/current-user authorization is upstream.
+        self.ensure_execution_can_cancel_task(context, target_task_id)
+            .await
+    }
+
     pub async fn cancel_task(
         &self,
         context: TaskMutationContext,
@@ -2748,6 +2816,11 @@ impl TaskService {
         let Some(response) = self.store.get_task(params.task_id.as_str()).await? else {
             bail!("task `{}` not found", params.task_id);
         };
+        if response.task.finish_request().is_some() {
+            return Err(anyhow::Error::new(crate::TaskOperationError::StateConflict)
+                .context("task_finish_requested: final stop cannot be reopened or updated"));
+        }
+
         if is_terminal_task(response.task.status) {
             return Err(
                 anyhow::Error::new(crate::TaskOperationError::StateConflict).context(format!(
@@ -2767,6 +2840,13 @@ impl TaskService {
             );
         }
 
+        if params
+            .metadata
+            .as_ref()
+            .is_some_and(|m| m.finish_request.is_some())
+        {
+            bail!("finishRequest is server-owned; use task_finish");
+        }
         let now = now_timestamp_secs();
         let wants_agent_update = update_has_agent_patch(&params);
         let mut task = response.task.clone();
@@ -3123,6 +3203,11 @@ impl TaskService {
         let Some(response) = self.store.get_task(params.task_id.as_str()).await? else {
             bail!("task `{}` not found", params.task_id);
         };
+        if response.task.finish_request().is_some() {
+            return Err(anyhow::Error::new(crate::TaskOperationError::StateConflict)
+                .context("task_finish_requested: final stop cannot be reopened or updated"));
+        }
+
         if is_terminal_task(response.task.status) {
             return Err(
                 anyhow::Error::new(crate::TaskOperationError::StateConflict).context(format!(
@@ -3238,6 +3323,11 @@ impl TaskService {
         let Some(response) = self.store.get_task(params.task_id.as_str()).await? else {
             bail!("task `{}` not found", params.task_id);
         };
+        if response.task.finish_request().is_some() {
+            return Err(anyhow::Error::new(crate::TaskOperationError::StateConflict)
+                .context("task_finish_requested: final stop cannot be reopened or updated"));
+        }
+
         let was_blocked = response.task.status == TaskStatus::Blocked;
         if is_terminal_task(response.task.status) && !was_blocked {
             return Err(

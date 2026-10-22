@@ -752,6 +752,7 @@ fn extract_task_permission_intent(invocation: &ToolInvocation) -> Option<Permiss
         "task_accept" => "accept task/subagent result",
         "task_revise" => "revise task/subagent result",
         "task_cancel" => "cancel task/subagent",
+        "task_finish" => "finish task gracefully",
         "task_update" => "update task/subagent",
         "task_detach" => "detach task/subagent",
         "task_list" => "list task/subagent state",
@@ -780,6 +781,7 @@ fn extract_task_permission_intent(invocation: &ToolInvocation) -> Option<Permiss
                 | "task_accept"
                 | "task_revise"
                 | "task_cancel"
+                | "task_finish"
                 | "task_update"
                 | "task_detach"
                 | "task_reschedule"
@@ -796,8 +798,8 @@ fn extract_task_permission_intent(invocation: &ToolInvocation) -> Option<Permiss
             // lifecycle/review control, consumes the profile's explicit
             // task/subagent authority; otherwise `Internal` would bypass
             // supervised consent for durable task graph changes.
-            "task_create" | "task_accept" | "task_revise" | "task_cancel" | "task_update"
-            | "task_detach" | "task_reschedule" | "task_pause" | "task_resume" => {
+            "task_create" | "task_accept" | "task_revise" | "task_cancel" | "task_finish"
+            | "task_update" | "task_detach" | "task_reschedule" | "task_pause" | "task_resume" => {
                 PermissionActionKind::TaskSubagent
             }
             _ => PermissionActionKind::Internal,
@@ -2351,7 +2353,7 @@ mod tests {
             .map(str::to_owned),
         );
 
-        assert_eq!(registered.len(), 39, "native tool inventory changed");
+        assert_eq!(registered.len(), 40, "native tool inventory changed");
         let unknown = registered
             .iter()
             .filter(|name| {
@@ -2396,6 +2398,7 @@ mod tests {
             ("task_accept", PermissionActionKind::TaskSubagent),
             ("task_revise", PermissionActionKind::TaskSubagent),
             ("task_cancel", PermissionActionKind::TaskSubagent),
+            ("task_finish", PermissionActionKind::TaskSubagent),
             ("task_update", PermissionActionKind::TaskSubagent),
             ("task_detach", PermissionActionKind::TaskSubagent),
             ("task_list", PermissionActionKind::Internal),
@@ -2434,7 +2437,7 @@ mod tests {
             .map(str::to_owned),
         );
 
-        assert_eq!(registered.len(), 39, "native tool inventory changed");
+        assert_eq!(registered.len(), 40, "native tool inventory changed");
         assert_eq!(
             registered,
             expected_actions
@@ -3903,6 +3906,12 @@ mod tests {
                 },
             ),
             invocation_for_tool(
+                "task_finish",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({ "taskId": "task_a" }),
+                },
+            ),
+            invocation_for_tool(
                 "task_detach",
                 ToolPayload::Function {
                     arguments: serde_json::json!({ "taskId": "task_a" }),
@@ -3936,6 +3945,7 @@ mod tests {
                     | "task_accept"
                     | "task_revise"
                     | "task_cancel"
+                    | "task_finish"
                     | "task_update"
                     | "task_detach"
                     | "task_reschedule"

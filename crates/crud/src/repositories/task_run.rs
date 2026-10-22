@@ -225,6 +225,33 @@ pub async fn list_due_retry_runs<C: ConnectionTrait>(
         .context("failed to list due retry task runs")
 }
 
+/// Cleanup after an accepted finish is independent of dispatch eligibility,
+/// including the retry delay and the Task's possibly terminal status.
+pub async fn list_task_finish_queue_candidates<C: ConnectionTrait>(
+    db: &C,
+    limit: u64,
+) -> Result<Vec<String>> {
+    let finishing_tasks = Query::select()
+        .column(pioneer_entity::task::Column::Id)
+        .from(pioneer_entity::task::Entity)
+        .and_where(Expr::cust(
+            "json_extract(metadata_json, '$.finishRequest') IS NOT NULL",
+        ))
+        .to_owned();
+    task_run::Entity::find()
+        .select_only()
+        .column(task_run::Column::TaskId)
+        .distinct()
+        .filter(task_run::Column::Status.eq(task_run_status_to_db(TaskRunStatus::Queued)))
+        .filter(task_run::Column::TaskId.in_subquery(finishing_tasks))
+        .order_by_asc(task_run::Column::TaskId)
+        .limit(limit)
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("failed to list Task finish queue cleanup candidates")
+}
+
 pub async fn claim_run_for_dispatch<C: ConnectionTrait>(
     db: &C,
     run_id: &str,

@@ -2295,6 +2295,7 @@ impl MessageProcessor {
                     metadata: Some(pioneer_protocol::TaskMetadata {
                         labels: vec!["composer".to_owned()],
                         data: None,
+                        finish_request: None,
                         composer_work: Some(pioneer_protocol::TaskComposerWork::v1(launch.clone())),
                     }),
                 };
