@@ -55,7 +55,6 @@ jobs:
       PIONEER_APP_URL_SCHEME: pioneer
       PIONEER_SYMBOL_INPUTS_DIR: ${{ github.workspace }}/desktop-symbol-inputs
       PIONEER_BUNDLED_MODEL_CATALOG: ${{ github.workspace }}/release-model-catalog/catalog.json
-    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
