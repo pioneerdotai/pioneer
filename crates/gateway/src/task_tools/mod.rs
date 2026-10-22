@@ -16,14 +16,15 @@ use pioneer_protocol::{
     TaskAgentResultContract, TaskAgentSpec, TaskAgentSpecInput, TaskAttachmentMode,
     TaskCancelParams, TaskCancelScope, TaskCompletionBehavior, TaskCreateParams,
     TaskCreateResponse, TaskDeliveryMode, TaskDeliveryPolicy, TaskDependencyTriggerPolicy,
-    TaskDetachParams, TaskError, TaskExecutorKind, TaskExternalTriggerFilter, TaskGetParams,
-    TaskGetResponse, TaskLifecyclePolicy, TaskListParams, TaskManualActor, TaskMetadata,
-    TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams, TaskRescheduleParams, TaskResult,
-    TaskResultCandidateStatus, TaskResultReviewerKind, TaskResumeParams, TaskRetryPolicy,
-    TaskReviseParams, TaskReviseResponse, TaskRun, TaskRunStatus, TaskRunThreadBindingKind,
-    TaskStatus, TaskTimeoutPolicy, TaskTrigger, TaskTriggerCatchUpPolicy, TaskTriggerInput,
-    TaskTriggerKind, TaskTriggerSpec, TaskTurnItem, TaskUpdateParams, TaskUpdateResponse,
-    TaskWaitMode, TaskWaitParams, ToolCallStatus, ToolStoragePayload, TurnItem, constants::events,
+    TaskDetachParams, TaskError, TaskExecutorKind, TaskExternalTriggerFilter, TaskFinishParams,
+    TaskGetParams, TaskGetResponse, TaskLifecyclePolicy, TaskListParams, TaskManualActor,
+    TaskMetadata, TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams, TaskRescheduleParams,
+    TaskResult, TaskResultCandidateStatus, TaskResultReviewerKind, TaskResumeParams,
+    TaskRetryPolicy, TaskReviseParams, TaskReviseResponse, TaskRun, TaskRunStatus,
+    TaskRunThreadBindingKind, TaskStatus, TaskTimeoutPolicy, TaskTrigger, TaskTriggerCatchUpPolicy,
+    TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec, TaskTurnItem, TaskUpdateParams,
+    TaskUpdateResponse, TaskWaitMode, TaskWaitParams, ToolCallStatus, ToolStoragePayload, TurnItem,
+    constants::events,
 };
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
@@ -47,6 +48,7 @@ const TASK_WAIT_TOOL: &str = "task_wait";
 const TASK_ACCEPT_TOOL: &str = "task_accept";
 const TASK_REVISE_TOOL: &str = "task_revise";
 const TASK_CANCEL_TOOL: &str = "task_cancel";
+const TASK_FINISH_TOOL: &str = "task_finish";
 const TASK_UPDATE_TOOL: &str = "task_update";
 const TASK_DETACH_TOOL: &str = "task_detach";
 const TASK_LIST_TOOL: &str = "task_list";
@@ -700,8 +702,8 @@ pub(crate) fn agent_bound_task_tool_visible(
         TASK_ACCEPT_TOOL | TASK_REVISE_TOOL => {
             capabilities.contains(&AgentToolCapability::TaskReview)
         }
-        TASK_CANCEL_TOOL | TASK_DETACH_TOOL | TASK_RESUME_TOOL | TASK_UPDATE_TOOL
-        | TASK_RESCHEDULE_TOOL | TASK_PAUSE_TOOL => {
+        TASK_CANCEL_TOOL | TASK_FINISH_TOOL | TASK_DETACH_TOOL | TASK_RESUME_TOOL
+        | TASK_UPDATE_TOOL | TASK_RESCHEDULE_TOOL | TASK_PAUSE_TOOL => {
             capabilities.contains(&AgentToolCapability::TaskControl)
         }
         _ => false,
@@ -1206,9 +1208,8 @@ pub(crate) fn task_tool_resource_action(
         TASK_ACCEPT_TOOL | TASK_REVISE_TOOL => ResourceAction::TaskReview,
         TASK_CANCEL_TOOL => ResourceAction::TaskCancel,
         TASK_DETACH_TOOL => ResourceAction::TaskDetach,
-        TASK_UPDATE_TOOL | TASK_PAUSE_TOOL | TASK_RESUME_TOOL | TASK_RESCHEDULE_TOOL => {
-            ResourceAction::TaskScheduleManage
-        }
+        TASK_FINISH_TOOL | TASK_UPDATE_TOOL | TASK_PAUSE_TOOL | TASK_RESUME_TOOL
+        | TASK_RESCHEDULE_TOOL => ResourceAction::TaskScheduleManage,
         _ => return Err(ToolError::NotFound(name.to_owned())),
     })
 }
@@ -1391,6 +1392,9 @@ impl TaskToolHandler {
             }
             TASK_CANCEL_TOOL => {
                 task_tool_future(self.handle_cancel(invocation, &authorization)).await
+            }
+            TASK_FINISH_TOOL => {
+                task_tool_future(self.handle_finish(invocation, &authorization)).await
             }
             TASK_UPDATE_TOOL => {
                 task_tool_future(self.handle_update(invocation, &authorization)).await
@@ -2410,6 +2414,81 @@ impl TaskToolHandler {
             .await
             .map_err(task_runtime_tool_error)?;
         let mut output = json!({ "task": task_summary(&response.task) });
+        Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
+        self.cache_mutation_output(cache_key.as_deref(), &output)
+            .await;
+        Ok(function_output(output))
+    }
+
+    async fn handle_finish(
+        &self,
+        invocation: ToolInvocation,
+        authorization: &TaskToolAuthorizationScope,
+    ) -> Result<Box<dyn ToolOutput>, ToolError> {
+        let input: TaskFinishToolInput = decode_tool_args(invocation.clone())?;
+        let params = input.into_params()?;
+        authorization
+            .authorize_task(
+                self.processor.crud_store.as_ref(),
+                params.task_id.as_str(),
+                crate::authorization::ResourceAction::TaskScheduleManage,
+            )
+            .await?;
+        let cache_key = self.mutation_cache_key(&invocation);
+        let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
+        if let Some(mut output) = self
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .await?
+        {
+            // Durable CLI receipts survive handler reconstruction but carry
+            // only mutation references. Preserve that receipt and restore the
+            // finish response from the exact task authorized above, without
+            // repeating the mutation or its queue cleanup.
+            if output.get("alreadyCommitted").and_then(JsonValue::as_bool) == Some(true)
+                && output.get("task").is_none()
+            {
+                let response = self
+                    .processor
+                    .crud_store
+                    .get_task(params.task_id.as_str())
+                    .await
+                    .map_err(task_runtime_tool_error)?
+                    .ok_or_else(task_tool_authorization_error)?;
+                output["task"] = task_summary(&response.task);
+                output["alreadyFinished"] = json!(response.task.status.is_terminal());
+                self.cache_mutation_output(cache_key.as_deref(), &output)
+                    .await;
+            }
+            return Ok(function_output(output));
+        }
+        let action_plan = self
+            .prepare_bound_task_action(
+                &invocation,
+                AgentModelToolName::ControlTask,
+                serde_json::to_value(AgentControlTaskToolInput {
+                    task_id: params.task_id.clone(),
+                    control: AgentTaskControl::Finish,
+                })
+                .map_err(|error| {
+                    ToolError::internal(format!("failed to encode task_finish action: {error}"))
+                })?,
+                AgentToolCapability::TaskControl,
+                std::slice::from_ref(&params.task_id),
+            )
+            .await?;
+        let mut mutation_context = authorization.mutation_context(&self.context);
+        mutation_context.agent_action_commit = action_plan.as_ref().map(|plan| plan.input.clone());
+        let response = self
+            .processor
+            .task_runtime
+            .service()
+            .finish_task(mutation_context, params)
+            .await
+            .map_err(task_runtime_tool_error)?;
+        let mut output = json!({
+            "task": task_summary(&response.task),
+            "alreadyFinished": response.already_finished,
+        });
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
         self.cache_mutation_output(cache_key.as_deref(), &output)
             .await;
@@ -3780,6 +3859,34 @@ impl TaskCancelToolInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Model-facing input for task_finish.
+struct TaskFinishToolInput {
+    /// Task id to finish. Pioneer entity ids are exactly 21 characters.
+    #[schemars(length(min = 21, max = 21))]
+    task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional human-readable finish reason.
+    reason: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "idempotency_key"
+    )]
+    /// Optional mutation idempotency key. Omit in normal model calls; runtime derives one from the tool call id.
+    idempotency_key: Option<String>,
+}
+
+impl TaskFinishToolInput {
+    fn into_params(self) -> Result<TaskFinishParams, ToolError> {
+        Ok(TaskFinishParams {
+            task_id: validate_entity_id(self.task_id, "taskId")?,
+            reason: clean_optional_string(self.reason),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// Model-facing input for task_update. Patch only the fields that should change; omitted fields keep their current value. Use clear* flags to explicitly remove optional values.
 struct TaskUpdateToolInput {
     /// Task id to update. Pioneer entity ids are exactly 21 characters.
@@ -4105,6 +4212,12 @@ pub(crate) fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
             safe_mutation_recovery(),
         ),
         task_tool_spec(
+            TASK_FINISH_TOOL,
+            "Permanently stop a task gently at the user's request: prohibit new runs and let all already-started work finish with results, required review/revisions, and configured delivery. Use only when the user asks to stop while finishing current work, including an explicitly specified stop condition. Ordinary run completion or a final answer does not call for task_finish. The response distinguishes an accepted stop request from an already-finished task; acceptance does not mean work or delivery has finished. Use task_pause for a temporary stop and task_cancel to interrupt work under the existing cancellation rules.",
+            task_finish_schema(),
+            safe_mutation_recovery(),
+        ),
+        task_tool_spec(
             TASK_UPDATE_TOOL,
             "Update a non-terminal task through the task service. Patch only fields that should change; use existing prompt fields instructions, inputText/input, and outputInstructions. inputText and input may be supplied together: inputText fills input.text when input.text is absent; different values are rejected. For scheduled, interval, and cron agent tasks, instructions and outputInstructions must remain self-contained and valid for future runs. Pass trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec.",
             task_update_schema(),
@@ -4124,7 +4237,7 @@ pub(crate) fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         task_tool_spec(
             TASK_GET_TOOL,
-            "Get durable task status, runs, triggers, and dependencies by stable taskId within the authorized root-thread capsule, including tasks from earlier executions. Each run has an execution observation with its status, heartbeatAt, lastActivityAt when confirmed task progress was recorded for the current attempt, and observedAt. A null execution status means no execution row was observed; null activity means unknown, not stalled. A heartbeat shows periodic liveness, not meaningful work progress. A running run has not finished; an unchanged updatedAt or missing result does not prove it is stuck. Do not cancel or repeat work solely because task_get stays the same or a result takes time. An access error does not mean the task is absent or cancelled. When the current execution may manage the exact task, the response also includes a safe configuration view with exact ordinary schedules, executor instructions, output instructions, and lifecycle/delivery/retry/timeout/concurrency settings. Secret webhook URLs, task input, external-trigger filters, internal host paths, raw diagnostics, and execution-security snapshots are never returned; executor instructions are returned exactly as authored.",
+            "Get durable task status, runs, triggers, and dependencies by stable taskId within the authorized root-thread capsule, including tasks from earlier executions. task.finishRequest records an accepted permanent gentle stop; it does not mean active work or delivery is complete. Each run has an execution observation with its status, heartbeatAt, lastActivityAt when confirmed task progress was recorded for the current attempt, and observedAt. A null execution status means no execution row was observed; null activity means unknown, not stalled. A heartbeat shows periodic liveness, not meaningful work progress. A running run has not finished; an unchanged updatedAt or missing result does not prove it is stuck. Do not cancel or repeat work solely because task_get stays the same or a result takes time. An access error does not mean the task is absent or cancelled. When the current execution may manage the exact task, the response also includes a safe configuration view with exact ordinary schedules, executor instructions, output instructions, and lifecycle/delivery/retry/timeout/concurrency settings. Secret webhook URLs, task input, external-trigger filters, internal host paths, raw diagnostics, and execution-security snapshots are never returned; executor instructions are returned exactly as authored.",
             task_id_schema(),
             safe_read_recovery(),
         ),
@@ -4207,6 +4320,10 @@ fn task_cancel_schema() -> JsonValue {
     tool_input_schema::<TaskCancelToolInput>()
 }
 
+fn task_finish_schema() -> JsonValue {
+    tool_input_schema::<TaskFinishToolInput>()
+}
+
 fn task_update_schema() -> JsonValue {
     tool_input_schema::<TaskUpdateToolInput>()
 }
@@ -4287,6 +4404,7 @@ fn task_tool_schema_for_name(tool_name: &str) -> JsonValue {
         TASK_ACCEPT_TOOL => task_accept_schema(),
         TASK_REVISE_TOOL => task_revise_schema(),
         TASK_CANCEL_TOOL => task_cancel_schema(),
+        TASK_FINISH_TOOL => task_finish_schema(),
         TASK_UPDATE_TOOL => task_update_schema(),
         TASK_DETACH_TOOL | TASK_GET_TOOL => task_id_schema(),
         TASK_LIST_TOOL => task_list_schema(),
@@ -4320,8 +4438,8 @@ fn task_tool_argument_hint(tool_name: &str) -> &'static str {
         TASK_REVISE_TOOL => {
             "Expected fields: taskId, runId, candidateId, and feedback. Use candidate ids returned by task_wait reviewRequired and provide concrete fix instructions."
         }
-        TASK_CANCEL_TOOL | TASK_DETACH_TOOL | TASK_GET_TOOL | TASK_PAUSE_TOOL
-        | TASK_RESUME_TOOL => {
+        TASK_CANCEL_TOOL | TASK_FINISH_TOOL | TASK_DETACH_TOOL | TASK_GET_TOOL
+        | TASK_PAUSE_TOOL | TASK_RESUME_TOOL => {
             "Expected field: taskId. The value must be a 21-character Pioneer entity id."
         }
         TASK_LIST_TOOL => {
@@ -5975,6 +6093,7 @@ mod tests {
                 assert!(!agent_bound_task_tool_visible(name, &observer));
             }
             if [
+                TASK_FINISH_TOOL,
                 TASK_UPDATE_TOOL,
                 TASK_PAUSE_TOOL,
                 TASK_RESCHEDULE_TOOL,

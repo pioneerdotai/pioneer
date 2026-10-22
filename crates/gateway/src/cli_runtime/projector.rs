@@ -975,7 +975,7 @@ fn mcp_tool_item(item_id: &str, metadata: Option<&JsonValue>, status: ToolCallSt
     // Claude already normalizes before its earlier typed metadata conversion.
     if matches!(
         tool_name.as_str(),
-        "task_wait" | "task_get" | "task_cancel" | "task_accept"
+        "task_wait" | "task_get" | "task_cancel" | "task_finish" | "task_accept"
     ) && metadata_json["serverInstallationId"] == "pioneer-task-tools-v1"
         && metadata_json["rawToolName"].as_str() == Some(tool_name.as_str())
         && metadata_json.get("taskResult").is_none()

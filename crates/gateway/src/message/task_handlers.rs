@@ -1638,6 +1638,51 @@ impl MessageProcessor {
         }
     }
 
+    pub(super) async fn task_finish(
+        &self,
+        request_context: &RequestContext,
+        authorized_task: Option<&crate::authorization::AuthorizedTask>,
+        request_id: RequestId,
+        params: TaskFinishParams,
+    ) {
+        if !self
+            .require_scoped_task_proof(
+                request_context,
+                &request_id,
+                authorized_task,
+                params.task_id.as_str(),
+                ResourceAction::TaskScheduleManage,
+            )
+            .await
+        {
+            return;
+        }
+        let connection_id = request_context.connection_id();
+        match message_future(
+            self.task_runtime
+                .service()
+                .finish_task(Self::task_mutation_context(request_context), params),
+        )
+        .await
+        {
+            Ok(response_payload) => {
+                self.send_task_response(connection_id, request_id, &response_payload)
+                    .await
+            }
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    task_public_error(
+                        Some(request_id),
+                        pioneer_protocol::PublicErrorStage::Persistence,
+                        format!("failed to finish task: {error:#}"),
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+
     pub(super) async fn task_detach(
         &self,
         request_context: &RequestContext,

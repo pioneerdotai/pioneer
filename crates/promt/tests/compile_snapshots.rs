@@ -369,7 +369,7 @@ A tool listed in more than one domain becomes visible when any of those domains 
 Domains:
 - threads: threads_tools_result_read, threads_start_options, threads_identity_odels_list, thread_message_send, thread_create, threads_turn_start.
 - memory: memory_search, memory_list, memory_get, memory_remember, memory_forget.
-- task: threads_start_options, task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
+- task: threads_start_options, task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_finish, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
 - artifact: artifact_prepare, artifact_register, artifact_read.
 - computer_use: computer_use.
 
@@ -420,7 +420,7 @@ A tool listed in more than one domain becomes visible when any of those domains 
 Domains:
 - threads: threads_tools_result_read, threads_start_options, threads_identity_odels_list, thread_message_send, thread_create, threads_turn_start.
 - memory: memory_search, memory_list, memory_get, memory_remember, memory_forget.
-- task: threads_start_options, task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
+- task: threads_start_options, task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_finish, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
 - artifact: artifact_prepare, artifact_register, artifact_read.
 - computer_use: computer_use.
 

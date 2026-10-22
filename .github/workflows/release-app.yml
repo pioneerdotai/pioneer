@@ -1,18 +1,25 @@
 name: Release App
+run-name: Release App (${{ github.ref_name }})
 
 on:
   workflow_dispatch:
+    inputs:
+      gateway_run_id:
+        description: Optional exact Release Gateway producer on the same ref and commit
+        type: string
   push:
-    tags:
-      - "*"
+    tags: ["*"]
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   generate-model-catalog:
-    name: generate-model-catalog
+    name: select-shared-gateway-model-catalog
     runs-on: ubuntu-latest
+    outputs:
+      gateway_run_id: ${{ steps.gateway.outputs.run_id }}
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -21,16 +28,13 @@ jobs:
           ref: ${{ github.sha }}
           submodules: recursive
 
-      - name: setup-rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: generate-and-validate-model-catalog
+      - name: reuse-gateway-model-catalog
+        id: gateway
         shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p release-model-catalog
-          cargo run --locked --release -p pioneer-provider --bin pioneer-model-catalog -- \
-            release-model-catalog/catalog.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATEWAY_RUN_ID: ${{ inputs.gateway_run_id }}
+        run: python scripts/packaging/release-inputs.py catalog --run-id "$GATEWAY_RUN_ID" --out release-model-catalog
 
       - name: upload-model-catalog
         uses: actions/upload-artifact@v6
@@ -40,7 +44,7 @@ jobs:
           if-no-files-found: error
 
   package-desktop:
-    name: package-${{ matrix.target }}
+    name: desktop-${{ matrix.target }}-reuse-computer-use-gateway
     needs: generate-model-catalog
     runs-on: ${{ matrix.os }}
     env:
@@ -55,7 +59,8 @@ jobs:
       PIONEER_APP_URL_SCHEME: pioneer
       PIONEER_SYMBOL_INPUTS_DIR: ${{ github.workspace }}/desktop-symbol-inputs
       PIONEER_BUNDLED_MODEL_CATALOG: ${{ github.workspace }}/release-model-catalog/catalog.json
-    timeout-minutes: 90
+      PIONEER_REUSE_GATEWAY_RUN_ID: ${{ needs.generate-model-catalog.outputs.gateway_run_id }}
+      GH_TOKEN: ${{ github.token }}
     strategy:
       fail-fast: false
       matrix:
@@ -235,6 +240,18 @@ jobs:
           echo "ORT_LIB_LOCATION=$ORT_DIR/lib" >> "$GITHUB_ENV"
           echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
           echo "PIONEER_ONNXRUNTIME_DYLIB_DIR=$ORT_DIR/lib" >> "$GITHUB_ENV"
+          existing_rustflags="${RUSTFLAGS:-}"
+          echo "RUSTFLAGS=${existing_rustflags:+$existing_rustflags }-C link-arg=-Wl,-rpath,@executable_path" >> "$GITHUB_ENV"
+
+      - name: configure-native-release-environment
+        shell: bash
+        run: python scripts/packaging/build-gateway.py --target "${{ matrix.target }}" --configure
+
+      - name: restore-desktop-release-dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-desktop-${{ matrix.target }}-v1
+          cache-workspace-crates: false
 
       - name: package-linux-appimage
         if: matrix.package_kind == 'linux_appimage'
@@ -541,6 +558,7 @@ jobs:
           gh release upload "${GITHUB_REF_NAME}" "${files[@]}" --clobber
 
   queue-debug-symbols:
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     name: queue-independent-debug-symbols
     needs: package-desktop
     runs-on: ubuntu-latest

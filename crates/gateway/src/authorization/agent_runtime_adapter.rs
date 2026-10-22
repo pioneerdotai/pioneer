@@ -1763,6 +1763,7 @@ mod tests {
     #[test]
     fn task_management_intents_require_the_exact_current_action_not_just_control_capability() {
         for control in [
+            pioneer_protocol::AgentTaskControl::Finish,
             pioneer_protocol::AgentTaskControl::Update,
             pioneer_protocol::AgentTaskControl::Pause,
             pioneer_protocol::AgentTaskControl::Reschedule,
