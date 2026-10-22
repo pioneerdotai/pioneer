@@ -70,12 +70,12 @@ jobs:
           if-no-files-found: error
 
   build-gateway:
-    name: gateway-${{ matrix.target }}-default-and-computer-use
+    name: gateway-${{ matrix.platform.target }}-${{ matrix.variant }}
     needs: generate-model-catalog
     defaults:
       run:
-        shell: ${{ startsWith(matrix.os, 'windows') && 'pwsh' || 'bash' }}
-    runs-on: ${{ matrix.os }}
+        shell: ${{ startsWith(matrix.platform.os, 'windows') && 'pwsh' || 'bash' }}
+    runs-on: ${{ matrix.platform.os }}
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       PIONEER_SENTRY_DSN: ${{ secrets.PIONEER_SENTRY_DSN }}
@@ -83,12 +83,13 @@ jobs:
       # Exact release inputs only; ordinary CI/local release profiles stay unchanged.
       CARGO_PROFILE_RELEASE_DEBUG: "2"
       CARGO_PROFILE_RELEASE_STRIP: "none"
-      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: ${{ contains(matrix.target, 'apple-darwin') && 'unpacked' || 'off' }}
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: ${{ contains(matrix.platform.target, 'apple-darwin') && 'unpacked' || 'off' }}
       PIONEER_BUNDLED_MODEL_CATALOG: ${{ github.workspace }}/release-model-catalog/catalog.json
     strategy:
       fail-fast: false
       matrix:
-        include:
+        variant: [default, computer-use]
+        platform:
           - {os: ubuntu-latest, target: x86_64-unknown-linux-gnu, asset: pioneer-gateway-linux-x86_64.gz, computer_asset: pioneer-gateway-linux-x86_64-computer-use.gz}
           - {os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, asset: pioneer-gateway-linux-aarch64.gz, computer_asset: pioneer-gateway-linux-aarch64-computer-use.gz}
           - {os: macos-latest, target: aarch64-apple-darwin, asset: pioneer-gateway-macos-aarch64.gz, computer_asset: pioneer-gateway-macos-aarch64-computer-use.gz}
@@ -108,9 +109,9 @@ jobs:
       - name: setup-rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.platform.target }}
       - name: configure-native-release-environment
-        run: python scripts/packaging/build-gateway.py --target "${{ matrix.target }}" --configure
+        run: python scripts/packaging/build-gateway.py --target "${{ matrix.platform.target }}" --configure
       - name: install-linux-build-dependencies
         if: runner.os == 'Linux'
         shell: bash
@@ -130,7 +131,7 @@ jobs:
           multiarch="$(gcc -print-multiarch)"
           echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
       - name: install-onnx-runtime-macos-x86_64
-        if: matrix.target == 'x86_64-apple-darwin'
+        if: matrix.platform.target == 'x86_64-apple-darwin'
         shell: bash
         run: |
           set -euo pipefail
@@ -151,54 +152,32 @@ jobs:
       - name: restore-release-dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-gateway-${{ matrix.target }}-v1
+          shared-key: release-gateway-${{ matrix.platform.target }}-${{ matrix.variant }}-v1
           cache-workspace-crates: false
 
-      - name: build-default
+      - name: build-gateway-variant
         run: >-
-          python scripts/packaging/build-gateway.py --target "${{ matrix.target }}"
-          --variant default --asset "${{ matrix.asset }}"
-          --out release-gateway/default
+          python scripts/packaging/build-gateway.py --target "${{ matrix.platform.target }}"
+          --variant "${{ matrix.variant }}"
+          --asset "${{ matrix.variant == 'computer-use' && matrix.platform.computer_asset || matrix.platform.asset }}"
+          --out "release-gateway/${{ matrix.variant }}"
 
-      - name: retain-default-symbol-inputs
+      - name: retain-symbol-inputs
         uses: actions/upload-artifact@v6
         with:
-          name: symbol-inputs-gateway-${{ matrix.target }}-default
-          path: release-gateway/default/symbol-inputs/
+          name: symbol-inputs-gateway-${{ matrix.platform.target }}-${{ matrix.variant }}
+          path: release-gateway/${{ matrix.variant }}/symbol-inputs/
           compression-level: 0
           retention-days: 7
           if-no-files-found: error
-      - name: retain-default-release-asset
+      - name: retain-release-asset
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ matrix.asset }}
-          path: release-gateway/default/assets/
+          name: ${{ matrix.variant == 'computer-use' && matrix.platform.computer_asset || matrix.platform.asset }}
+          path: release-gateway/${{ matrix.variant }}/assets/
           if-no-files-found: error
-      - name: remove-uploaded-default-transfer-copy
-        run: python -c 'import shutil; shutil.rmtree("release-gateway/default")'
-
-      - name: build-computer-use
-        run: >-
-          python scripts/packaging/build-gateway.py --target "${{ matrix.target }}"
-          --variant computer-use --asset "${{ matrix.computer_asset }}"
-          --out release-gateway/computer-use
-
-      - name: retain-computer-use-symbol-inputs
-        uses: actions/upload-artifact@v6
-        with:
-          name: symbol-inputs-gateway-${{ matrix.target }}-computer-use
-          path: release-gateway/computer-use/symbol-inputs/
-          compression-level: 0
-          retention-days: 7
-          if-no-files-found: error
-      - name: retain-computer-use-release-asset
-        uses: actions/upload-artifact@v6
-        with:
-          name: ${{ matrix.computer_asset }}
-          path: release-gateway/computer-use/assets/
-          if-no-files-found: error
-      - name: remove-uploaded-computer-use-transfer-copy
-        run: python -c 'import shutil; shutil.rmtree("release-gateway/computer-use")'
+      - name: remove-uploaded-transfer-copy
+        run: python -c 'import shutil; shutil.rmtree("release-gateway/${{ matrix.variant }}")'
 
   build-desktop:
     name: desktop-${{ matrix.target }}-compile
