@@ -196,7 +196,9 @@ async fn admit(
             processor
                 .provider_registry
                 .authority_fingerprint_for_workspace(WORKSPACE_RED_ID, "openai")
-                .expect("test provider authority should resolve"),
+                .expect("test provider authority should resolve")
+                .as_str()
+                .to_owned(),
         ),
     };
     let envelope = ExecutionAdmissionService::new(store.as_ref().clone())
