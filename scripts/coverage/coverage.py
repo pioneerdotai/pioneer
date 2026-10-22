@@ -294,7 +294,7 @@ def tools():
         "rustc": command("rustc", "-vV"),
         "cargo": command("cargo", "--version"),
         "nextest": command("cargo-nextest", "--version"),
-        "cargo_llvm_cov": command("cargo-llvm-cov", "--version"),
+        "cargo_llvm_cov": command("cargo", "llvm-cov", "--version"),
         "python": platform.python_version(),
         "tree_sitter": importlib.metadata.version("tree-sitter"),
         "tree_sitter_rust": importlib.metadata.version("tree-sitter-rust"),
