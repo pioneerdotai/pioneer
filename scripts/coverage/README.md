@@ -45,6 +45,12 @@ summaries differ from unique file lines. Packing uses every `DA` record, includi
 zero hits, and recomputes `LF`/`LH` when writing normalized shard artifacts. Raw
 records still require valid totals and complete line data; merge requires exact
 agreement between normalized totals and their `DA` records.
+Packing resolves LLVM source paths before checking the measured scope. Module
+paths such as `src/../tests/desktop_architecture.rs` normalize to `tests/` and stay
+outside that scope. Aliases of a measured file merge under one repository-relative
+path, retaining zero-hit lines. Absolute paths outside the checkout are ignored as
+external code; relative paths that escape the checkout are rejected. Normalized
+shard artifacts must still use repository-relative paths without `..`.
 Platform-disabled or never-instantiated code for which LLVM emits no line record
 is outside this measurement. Each crate appears in the breakdown, including crates
 with no measurable production lines.

@@ -221,13 +221,13 @@ def relative_sources(files, sources):
     result = {}
     for raw, lines in files.items():
         path = Path(raw)
-        if path.is_absolute():
-            try:
-                path = path.relative_to(ROOT)
-            except ValueError:
-                continue  # rustc, registry, git dependencies and other external code
-        require(".." not in path.parts, f"noncanonical LCOV path: {raw}")
-        name = path.as_posix()
+        # Rust #[path] modules can leave ../ in LLVM's source filenames.
+        # Resolve before checking scope or combining aliases of the same file.
+        try:
+            name = (ROOT / path).resolve().relative_to(ROOT).as_posix()
+        except ValueError:
+            require(path.is_absolute(), f"relative LCOV path escapes repository: {raw}")
+            continue  # rustc, registry, git dependencies and other external code
         if name not in sources:
             continue  # build scripts, generated target output, tests/ and non-workspace sources
         target = result.setdefault(name, {})

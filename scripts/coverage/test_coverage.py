@@ -157,6 +157,31 @@ class ReportTests(unittest.TestCase):
                 parsed = RustSources(sources, roots, POLICY, measured, packages, configuration())
                 self.assertEqual(parsed.filter(files), {"crates/sample/src/authored.rs": {1: 1}})
 
+    def test_lcov_source_aliases_normalize_before_scope_filtering(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            source = "crates/desktop/src/main.rs"
+            files = {
+                source: {1: 0, 2: 0},
+                str(root / "crates/desktop/src/module/../main.rs"): {1: 3, 3: 0},
+                "crates/desktop/src/module/../main.rs": {1: 2},
+                str(root / "crates/desktop/src/../tests/desktop_architecture.rs"): {1: 7},
+                "crates/desktop/src/../tests/desktop_architecture.rs": {1: 11},
+                str(root / "../external.rs"): {1: 13},
+                str(root.parent / (root.name + "-sibling") / source): {1: 17},
+            }
+            with patch("coverage.ROOT", root):
+                self.assertEqual(relative_sources(files, {source}),
+                                 {source: {1: 5, 2: 0, 3: 0}})
+
+    def test_relative_lcov_paths_cannot_escape_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            source = "crates/desktop/src/main.rs"
+            files = {source: {1: 1}, "../external.rs": {1: 3}}
+            with patch("coverage.ROOT", root), self.assertRaisesRegex(CoverageError, "escapes repository"):
+                relative_sources(files, {source})
+
     def test_compiler_artifacts_capture_actual_feature_variants(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
