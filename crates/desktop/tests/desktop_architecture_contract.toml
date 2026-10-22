@@ -39,7 +39,7 @@ path = "desktop-update"
 root = "DesktopUpdateView"
 constructor = "DesktopUpdateView::new"
 public_modules = []
-edges = ["pioneer-client", "pioneer-app-updater"]
+edges = ["pioneer-client", "pioneer-app-updater", "pioneer-observability"]
 [[features]]
 package = "pioneer-desktop-task-notifications"
 path = "desktop-task-notifications"

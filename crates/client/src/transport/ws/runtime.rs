@@ -73,16 +73,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
-use super::client::{GatewayWsCommand, spawn_worker};
+use super::client::{GatewayWsCommand, WsSender, spawn_worker, work_channel};
 use super::{GatewayWsConnectSpec, GatewayWsEvent};
+use pioneer_observability::work::Boundary;
 
 const UPLOAD_CHUNK_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct GatewayWsCommandSender {
-    command_tx: UnboundedSender<GatewayWsCommand>,
+    command_tx: WsSender<GatewayWsCommand>,
     next_connection_id: Arc<AtomicU64>,
     session_access: Arc<Mutex<Option<GatewayHttpAccess>>>,
     connection_generations: Arc<Mutex<GatewayConnectionGenerations>>,
@@ -94,9 +94,9 @@ pub struct GatewayWsCommandSender {
 #[derive(Clone)]
 pub struct GatewayWsClient {
     command_sender: GatewayWsCommandSender,
-    event_rx: Arc<Mutex<Receiver<GatewayWsEvent>>>,
+    event_rx: Arc<Mutex<Receiver<pioneer_observability::work::WorkItem<GatewayWsEvent>>>>,
     #[cfg(test)]
-    test_event_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<GatewayWsEvent>>>>,
+    test_event_tx: Arc<Mutex<Option<super::client::GatewayWsEventSender>>>,
 }
 
 #[derive(Default)]

@@ -1,8 +1,9 @@
+use pioneer_observability::queues::{QueueBytes, QueueKind, QueueObserver, QueueOutcome};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use pioneer_protocol::{AgentDurableEvent, AgentProgressEvent, TurnItemType};
@@ -104,6 +105,7 @@ impl Error for ExecutionEventHubError {}
 
 #[derive(Debug)]
 struct DurableEventEnvelope {
+    work: pioneer_observability::work::WorkCarrier,
     event: Box<AgentDurableEvent>,
     committed_tx: Option<oneshot::Sender<Result<(), DurableCommitRejection>>>,
     enqueued_at: Instant,
@@ -115,6 +117,8 @@ struct DurableEventEnvelope {
 /// be acknowledged explicitly after their durable projection succeeds.
 #[derive(Debug)]
 pub struct DurableEventReceiver {
+    pending_work: pioneer_observability::work::WorkCarrier,
+    pending_queue: Option<QueueObserver>,
     lane: Arc<DurableLane>,
     pending_commit: Option<oneshot::Sender<Result<(), DurableCommitRejection>>>,
     pending_enqueue_age: Option<Duration>,
@@ -128,7 +132,45 @@ impl DurableEventReceiver {
             "consumer_missing_ack",
             "durable event consumer requested the next event without acknowledging the previous commit",
         )));
-        let envelope = self.lane.receiver.lock().await.recv().await?;
+        let (envelope, observer) = {
+            let mut receiver = self.lane.receiver.lock().await;
+            // Tokio recv itself is poll_fn(poll_recv). Couple only the native
+            // nonblocking poll/mutation to send+current publication. The depth
+            // guard is dropped on EVERY Pending; no observation lock survives
+            // an await, channel-capacity wait, ACK or application handler.
+            std::future::poll_fn(|cx| {
+                let mut depth = self
+                    .lane
+                    .depth
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match receiver.poll_recv(cx) {
+                    std::task::Poll::Ready(Some(envelope)) => {
+                        *depth -= 1;
+                        let observer = self.lane.observer.in_current_epoch();
+                        observer.current(*depth, QueueBytes::Unsupported);
+                        std::task::Poll::Ready(Some((envelope, observer)))
+                    }
+                    std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+                    std::task::Poll::Pending => std::task::Poll::Pending,
+                }
+            })
+            .await?
+        };
+        #[cfg(test)]
+        AFTER_DURABLE_POP.with(|hook| {
+            let callback = hook.borrow_mut().take();
+            if let Some(callback) = callback {
+                callback();
+            }
+        });
+        observer.dequeued(QueueBytes::Unsupported);
+        self.pending_queue = Some(observer);
+        self.pending_work = envelope.work.received(
+            pioneer_observability::work::Boundary::EventLane,
+            pioneer_observability::work::WorkKind::Event,
+            pioneer_observability::work::ExecutorRole::Event,
+        );
         self.pending_commit = envelope.committed_tx;
         self.pending_turn_transition = envelope.turn_transition;
         self.pending_cli_blocked_guard = envelope.cli_blocked_guard;
@@ -138,6 +180,10 @@ impl DurableEventReceiver {
 
     /// Queue residence measured when the current durable envelope was
     /// received. It contains no identifiers and is cleared with the ACK.
+    pub fn pending_work(&self) -> pioneer_observability::work::WorkCarrier {
+        self.pending_work.clone()
+    }
+
     pub fn pending_enqueue_age(&self) -> Option<Duration> {
         self.pending_enqueue_age
     }
@@ -155,6 +201,18 @@ impl DurableEventReceiver {
     }
 
     pub fn acknowledge_last(&mut self, result: Result<(), DurableCommitRejection>) {
+        if let Some(observer) = self.pending_queue.take() {
+            observer.outcome(
+                if result.is_ok() {
+                    QueueOutcome::Committed
+                } else {
+                    QueueOutcome::CommitRejected
+                },
+                1,
+            );
+            observer.outcome(QueueOutcome::Processed, 1);
+        }
+        self.pending_work = Default::default();
         self.pending_enqueue_age = None;
         if let Some(committed_tx) = self.pending_commit.take() {
             let _ = committed_tx.send(result);
@@ -180,6 +238,10 @@ impl Drop for DurableEventReceiver {
 /// queued envelopes; a replacement listener resumes from the same queue.
 #[derive(Debug)]
 struct DurableLane {
+    // Fixed owner metadata, including backlog created while recording is off.
+    // Never held over reserve/recv await, ACK or handler execution.
+    depth: StdMutex<usize>,
+    observer: QueueObserver,
     receiver: Mutex<mpsc::Receiver<DurableEventEnvelope>>,
     receiver_claimed: AtomicBool,
 }
@@ -219,6 +281,12 @@ impl ExecutionEventHub {
         let (committed_tx, _) = broadcast::channel(live_capacity.max(1));
         let snapshot = SnapshotCoalescer::new();
         let durable_lane = Arc::new(DurableLane {
+            depth: StdMutex::new(0),
+            observer: QueueObserver::new(
+                QueueKind::EventDurable,
+                Some(durable_capacity.max(1)),
+                "unsupported: durable domain payload not serialized for observation",
+            ),
             receiver: Mutex::new(durable_rx),
             receiver_claimed: AtomicBool::new(false),
         });
@@ -294,16 +362,41 @@ impl ExecutionEventHub {
         // The duration still includes bounded-channel backpressure, but not
         // unrelated pre-enqueue projection work.
         let enqueued_at = Instant::now();
-        self.durable_tx
-            .send(DurableEventEnvelope {
-                event,
-                committed_tx,
-                enqueued_at,
-                turn_transition,
-                cli_blocked_guard,
-            })
-            .await
-            .map_err(|_| ExecutionEventHubError::DurableLaneClosed)
+        let mut send_wait = self.durable_lane.observer.send_wait();
+        let permit = pioneer_observability::live::waiting(
+            pioneer_observability::live::WaitKind::ChannelCapacity,
+            self.durable_tx.reserve(),
+        )
+        .await
+        .map_err(|_| ExecutionEventHubError::DurableLaneClosed)?;
+        send_wait.complete();
+        let envelope = DurableEventEnvelope {
+            work: pioneer_observability::work::WorkCarrier::child(
+                pioneer_observability::work::Boundary::EventLane,
+                pioneer_observability::work::WorkKind::Event,
+                pioneer_observability::work::Trigger::Event,
+                pioneer_observability::work::ExecutorRole::Event,
+            )
+            .queued(),
+            event,
+            committed_tx,
+            enqueued_at,
+            turn_transition,
+            cli_blocked_guard,
+        };
+        {
+            let mut depth = self
+                .durable_lane
+                .depth
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let observer = self.durable_lane.observer.in_current_epoch();
+            observer.enqueued(QueueBytes::Unsupported);
+            *depth += 1;
+            permit.send(envelope); // nonblocking; reserve and handler are outside
+            observer.current(*depth, QueueBytes::Unsupported);
+        }
+        Ok(())
     }
 
     pub fn publish_progress(&self, event: AgentProgressEvent) {
@@ -395,7 +488,7 @@ impl ExecutionEventHub {
         );
     }
 
-    pub fn subscribe_live(&self) -> broadcast::Receiver<AgentProgressEvent> {
+    pub fn subscribe_live(&self) -> crate::ProgressEventReceiver {
         self.progress.subscribe_live()
     }
 
@@ -413,6 +506,8 @@ impl ExecutionEventHub {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()?;
         Some(DurableEventReceiver {
+            pending_work: Default::default(),
+            pending_queue: None,
             lane: self.durable_lane.clone(),
             pending_commit: None,
             pending_enqueue_age: None,
@@ -445,5 +540,133 @@ impl Default for ExecutionEventHub {
 impl AsRef<ExecutionEventHub> for ExecutionEventHub {
     fn as_ref(&self) -> &ExecutionEventHub {
         self
+    }
+}
+
+#[cfg(test)]
+thread_local! { pub(crate) static AFTER_DURABLE_POP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None); }
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+    use std::{
+        future::Future,
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
+    #[tokio::test]
+    async fn durable_receipt_delayed_by_new_send_keeps_depth_ack_and_epoch() {
+        let _lock = crate::OBSERVATION_TEST_LOCK.lock().unwrap();
+        let old = pioneer_observability::telemetry_enabled();
+        pioneer_observability::set_telemetry_enabled(false);
+        pioneer_observability::set_telemetry_enabled(true);
+        let mut hub = ExecutionEventHub::with_capacity(2, 2);
+        Arc::get_mut(&mut hub.durable_lane).unwrap().observer = QueueObserver::new(
+            QueueKind::EventDurable,
+            Some(2),
+            "fixture durable current order",
+        );
+        let hub = Arc::new(hub);
+        let mut receiver = hub.take_durable_receiver().await.unwrap();
+        {
+            let mut idle = pin!(receiver.recv());
+            assert!(
+                idle.as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            assert!(hub.durable_lane.depth.try_lock().is_ok()); // no owner observation lock through Pending
+        } // cancelling an empty receive removes no event or permit
+        hub.publish_durable(crate::tests::completed("A"))
+            .await
+            .unwrap();
+        let during = hub.clone();
+        let latest_stamp = std::rc::Rc::new(std::cell::Cell::new(0));
+        let stamp = latest_stamp.clone();
+        AFTER_DURABLE_POP.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                // The native receive already removed A; the actual publish factory
+                // can complete without waiting because capacity is available.
+                let mut send = pin!(during.publish_durable(crate::tests::completed("B")));
+                assert!(matches!(
+                    send.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                    Poll::Ready(Ok(()))
+                ));
+                stamp.set(
+                    pioneer_observability::live::snapshot()
+                        .unwrap()
+                        .queues
+                        .iter()
+                        .find(|q| q.byte_definition == "fixture durable current order")
+                        .unwrap()
+                        .last_observed_ms,
+                );
+            }))
+        });
+        assert_eq!(receiver.recv().await, Some(crate::tests::completed("A")));
+        let read = || {
+            pioneer_observability::live::snapshot()
+                .unwrap()
+                .queues
+                .into_iter()
+                .find(|q| q.byte_definition == "fixture durable current order")
+                .unwrap()
+        };
+        assert_eq!(hub.durable_lane.receiver.lock().await.len(), 1);
+        let q = read();
+        assert_eq!((q.depth, q.enqueued, q.dequeued, q.processed), (1, 2, 1, 0));
+        assert!(q.initial_depth_known);
+        assert!(q.last_observed_ms <= q.snapshot_ms);
+        assert_eq!(q.last_observed_ms, latest_stamp.get()); // late A milestone cannot replace B source time
+        receiver.acknowledge_last(Ok(()));
+        assert_eq!((read().processed, read().committed), (1, 1));
+        assert_eq!(receiver.recv().await, Some(crate::tests::completed("B")));
+        let stamp = read().last_observed_ms;
+        receiver.acknowledge_last(Err(DurableCommitRejection::retryable("fixture", "fixture")));
+        let q = read();
+        assert_eq!(
+            (
+                q.depth,
+                q.enqueued,
+                q.dequeued,
+                q.processed,
+                q.commit_rejected
+            ),
+            (0, 2, 2, 2, 1)
+        );
+        assert_eq!(q.last_observed_ms, stamp); // ACK is a milestone, not a new depth sample
+        // An old pending ACK must not register/mutate E2; real backlog survives.
+        hub.publish_durable(crate::tests::completed("old"))
+            .await
+            .unwrap();
+        receiver.recv().await.unwrap();
+        pioneer_observability::set_telemetry_enabled(false);
+        hub.publish_durable(crate::tests::completed("off"))
+            .await
+            .unwrap();
+        pioneer_observability::set_telemetry_enabled(true);
+        receiver.acknowledge_last(Ok(()));
+        assert!(
+            pioneer_observability::live::snapshot()
+                .unwrap()
+                .queues
+                .iter()
+                .all(|q| q.byte_definition != "fixture durable current order")
+        );
+        hub.publish_durable(crate::tests::completed("new"))
+            .await
+            .unwrap();
+        assert_eq!(
+            read().depth,
+            hub.durable_lane.receiver.lock().await.len() as u64
+        );
+        assert_eq!(read().depth, 2);
+        assert_eq!(receiver.recv().await, Some(crate::tests::completed("off")));
+        assert_eq!(read().depth, 1);
+        receiver.acknowledge_last(Ok(()));
+        assert_eq!(receiver.recv().await, Some(crate::tests::completed("new")));
+        receiver.acknowledge_last(Ok(()));
+        assert_eq!(read().depth, 0);
+        pioneer_observability::set_telemetry_enabled(old);
     }
 }

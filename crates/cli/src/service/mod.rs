@@ -185,8 +185,12 @@ where
         .enable_all()
         .build()
         .context("failed to build tokio runtime")?;
+    let _runtime_observer = pioneer_observability::runtime::register(
+        runtime.handle(),
+        pioneer_observability::runtime::RuntimeRole::CliHelper,
+    );
 
-    runtime.block_on(future)
+    _runtime_observer.block_on(&runtime, future)
 }
 
 fn load_service_settings_from_config(config: &AppConfig) -> Result<ServiceSettings> {

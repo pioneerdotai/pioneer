@@ -1637,6 +1637,11 @@ async fn run_initialize_probe(
             message: format!("failed to spawn Claude CLI initialize probe: {error}"),
             stderr: Vec::new(),
         })?;
+    let mut observation = pioneer_observability::resources::ChildRegistration::register(
+        child.id(),
+        pioneer_observability::resources::ChildRole::CliAgent,
+        None,
+    );
     if let Some(mut stdin) = child.stdin.take() {
         let initialize_line = serde_json::json!({
             "type": "control_request",
@@ -1672,6 +1677,7 @@ async fn run_initialize_probe(
             });
         }
     };
+    observation.exited(output.status.success());
     let stderr = stderr_lines(
         config
             .env

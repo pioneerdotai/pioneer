@@ -902,7 +902,8 @@ impl MessageProcessor {
                         let terminal_enqueue_age =
                             durable_receiver.pending_enqueue_age().unwrap_or_default();
                         let projection_started = Instant::now();
-                        let (commit_result, listener_failed) = match AssertUnwindSafe(async {
+                        let work=durable_receiver.pending_work();
+                        let (commit_result, listener_failed) = match AssertUnwindSafe(work.scope_result(async {
                             if let Some(weak) = &this {
                                 let Some(this) = weak.upgrade() else {
                                     return Err(DurableCommitRejection::permanent(
@@ -921,7 +922,7 @@ impl MessageProcessor {
                                     "gateway message processor is no longer available",
                                 )) }
                             }
-                        })
+                        }))
                         .catch_unwind()
                         .await
                         {
@@ -978,7 +979,8 @@ impl MessageProcessor {
                     }, if live_receiver.is_some() => {
                         match live {
                             Some(Ok(event)) => {
-                                if AssertUnwindSafe(async {
+                                let work=live_receiver.as_ref().map(|receiver|receiver.pending_work()).unwrap_or_default();
+                                if AssertUnwindSafe(work.scope(async {
                                     if let Some(weak) = &this {
                                         let Some(this) = weak.upgrade() else { return; };
                                         let this = this.with_database_class(SqliteWriteClass::Critical);
@@ -987,7 +989,7 @@ impl MessageProcessor {
                                         #[cfg(test)]
                                         { test_this.as_ref().expect("test listener owner").handle_progress_agent_event(event).await; }
                                     }
-                                })
+                                }))
                                     .catch_unwind()
                                     .await
                                     .is_err()

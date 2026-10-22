@@ -1531,10 +1531,12 @@ where
         .with_description("Current and configured SQLite connection pool size")
         .with_unit("{connection}")
         .with_callback(move |gauge| {
-            if !super::telemetry_enabled() {
+            let (enabled, epoch) = super::telemetry_consent_snapshot();
+            if !enabled {
                 return;
             }
             let snapshot = observer();
+            crate::live::record_pool_snapshot(epoch, role, max_connections, snapshot);
             let size = snapshot.size.min(max_connections);
             let idle = snapshot.idle.min(size);
             let in_use = size.saturating_sub(idle);

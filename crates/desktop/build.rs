@@ -1,4 +1,8 @@
+#[path = "../observability/build_support.rs"]
+mod build_support;
+
 fn main() {
+    build_support::manifest();
     #[cfg(target_os = "windows")]
     {
         let manifest_dir = std::path::PathBuf::from(

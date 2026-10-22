@@ -760,7 +760,7 @@ where
     F: FnOnce() -> T + Send + 'static,
 {
     let guard = lock_for_capsule_path(path).await.lock_owned().await;
-    tokio::task::spawn_blocking(move || {
+    pioneer_observability::work::spawn_blocking(move || {
         // Keep ownership inside the blocking task. Cancelling the async waiter detaches the
         // task but cannot expose the capsule to another operation while this closure is running.
         let _guard = guard;

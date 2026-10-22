@@ -61,6 +61,7 @@ struct Catalog {
 }
 #[derive(Default)]
 pub(crate) struct SkillsStore {
+    queue: Option<pioneer_observability::queues::QueueObserver>,
     binding_gate: Arc<std::sync::Mutex<()>>,
     suspended: bool,
     binding_demands: std::collections::HashMap<ClientScope, u64>,
@@ -75,8 +76,27 @@ impl SkillsStore {
         self.catalogs.clear();
     }
     fn wake(&self) {
+        let queue = self
+            .queue
+            .as_ref()
+            .map(pioneer_observability::queues::QueueObserver::in_current_epoch);
         if let Some(wake) = &self.wake {
-            let _ = wake.try_send(());
+            if let Some(queue) = &queue {
+                queue.enqueued(pioneer_observability::queues::QueueBytes::Known(0));
+            }
+            match wake.try_send(()) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(_)) => {
+                    if let Some(queue) = &queue {
+                        queue.coalesced_send(pioneer_observability::queues::QueueBytes::Known(0));
+                    }
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    if let Some(queue) = &queue {
+                        queue.rejected_send(pioneer_observability::queues::QueueBytes::Known(0));
+                    }
+                }
+            }
         }
     }
 }
@@ -715,11 +735,26 @@ impl ClientCore {
     }
     pub(crate) fn start_skills_controller(self: &Arc<Self>) {
         let (wake, receiver) = mpsc::sync_channel(1);
+        let queue = pioneer_observability::queues::QueueObserver::new(
+            pioneer_observability::queues::QueueKind::ClientController,
+            Some(1),
+            "coalescing wake tokens only; zero payload bytes; domain state is reconciled separately",
+        );
+        let receiver_queue = queue.clone();
         let weak = Arc::downgrade(self);
         let task = std::thread::Builder::new()
             .name("client-skills-catalog".into())
             .spawn(move || {
                 loop {
+                    let cycle = pioneer_observability::work::WorkCarrier::independent(
+                        pioneer_observability::work::Boundary::Timer,
+                        pioneer_observability::work::WorkKind::ClientCommand,
+                        pioneer_observability::work::Trigger::Reconcile,
+                        pioneer_observability::work::ExecutorRole::ClientController,
+                    );
+                    let _cycle_scope = cycle.enter();
+                    let mut cycle_guard =
+                        pioneer_observability::live::WorkGuard::start(cycle.context(), false);
                     let Some(core) = weak.upgrade() else {
                         return;
                     };
@@ -738,6 +773,7 @@ impl ClientCore {
                         if let Some(core) = weak.upgrade() {
                             core.complete_skills_catalog(request, response);
                         }
+                        cycle_guard.finish(pioneer_observability::work::Outcome::Completed);
                         continue;
                     }
                     let Some(core) = weak.upgrade() else {
@@ -745,17 +781,38 @@ impl ClientCore {
                     };
                     let wait = core.skills_wait_duration();
                     drop(core);
+                    cycle_guard.finish(pioneer_observability::work::Outcome::Completed);
                     match wait {
                         Some(wait) => {
                             if matches!(
-                                receiver.recv_timeout(wait),
+                                receiver.recv_timeout(wait).map(|()| {
+                                    receiver_queue.dequeued(
+                                        pioneer_observability::queues::QueueBytes::Known(0),
+                                    );
+                                    receiver_queue.outcome(
+                                        pioneer_observability::queues::QueueOutcome::Processed,
+                                        1,
+                                    );
+                                }),
                                 Err(mpsc::RecvTimeoutError::Disconnected)
                             ) {
                                 return;
                             }
                         }
                         None => {
-                            if receiver.recv().is_err() {
+                            if receiver
+                                .recv()
+                                .map(|()| {
+                                    receiver_queue.dequeued(
+                                        pioneer_observability::queues::QueueBytes::Known(0),
+                                    );
+                                    receiver_queue.outcome(
+                                        pioneer_observability::queues::QueueOutcome::Processed,
+                                        1,
+                                    );
+                                })
+                                .is_err()
+                            {
                                 return;
                             }
                         }
@@ -764,6 +821,7 @@ impl ClientCore {
             })
             .expect("Skills controller could not start");
         let mut owner = self.skills_store.lock().expect("Skills store poisoned");
+        owner.queue = Some(queue);
         owner.wake = Some(wake);
         owner.task = Some(task);
     }

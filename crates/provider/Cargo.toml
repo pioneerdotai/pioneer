@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+pioneer-observability.workspace = true
 pioneer-protocol.workspace = true
 anyhow.workspace = true
 chrono.workspace = true

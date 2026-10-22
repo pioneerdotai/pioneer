@@ -159,7 +159,7 @@ impl ToolHandler for ReadFileHandler {
             (None, None) => (0, None, args.cursor),
         };
         let requested_path = file_path.clone();
-        let page = tokio::task::spawn_blocking(move || {
+        let page = pioneer_observability::work::spawn_blocking(move || {
             let _filesystem_slot = filesystem_slot;
             let file = capability
                 .open_regular_file()
@@ -320,7 +320,7 @@ impl ToolHandler for ListDirHandler {
         let include_hidden = args.include_hidden.unwrap_or(false);
         let scan_root = root.clone();
         let capability = resolved.capability.clone();
-        let (items, truncated) = tokio::task::spawn_blocking(move || {
+        let (items, truncated) = pioneer_observability::work::spawn_blocking(move || {
             let _filesystem_slot = filesystem_slot;
             list_directory_tree_secure_with_capability(
                 scan_root.as_path(),

@@ -73,6 +73,10 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       PIONEER_SENTRY_DSN: ${{ secrets.PIONEER_SENTRY_DSN }}
       PIONEER_SENTRY_ENVIRONMENT: production
+      # Exact release inputs only; ordinary CI/local release profiles stay unchanged.
+      CARGO_PROFILE_RELEASE_DEBUG: "2"
+      CARGO_PROFILE_RELEASE_STRIP: "none"
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: ${{ contains(matrix.target, 'apple-darwin') && 'unpacked' || 'off' }}
       PIONEER_BUNDLED_MODEL_CATALOG: ${{ github.workspace }}/release-model-catalog/catalog.json
     strategy:
       fail-fast: false
@@ -255,6 +259,30 @@ jobs:
           $cargoArgs += @("--target", $target)
           cargo @cargoArgs
 
+      - name: preserve-symbol-inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix=""
+          if [[ "${{ runner.os }}" == "Windows" ]]; then suffix=".exe"; fi
+          binary="target/${{ matrix.target }}/release/pioneer${suffix}"
+          python3 scripts/packaging/symbol-inputs.py export --target "${{ matrix.target }}" release-symbol-inputs "$binary"
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            strip -S "$binary"
+          elif [[ "${{ runner.os }}" == "Linux" ]]; then
+            strip --strip-debug "$binary"
+          fi
+          python3 scripts/packaging/symbol-inputs.py record "$binary" release-symbol-inputs/packaged.json
+
+      - name: upload-symbol-inputs
+        uses: actions/upload-artifact@v6
+        with:
+          name: symbol-inputs-gateway-${{ matrix.target }}-${{ matrix.cargo_features || 'default' }}
+          path: release-symbol-inputs/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+
       - name: package-unix-artifact
         if: runner.os != 'Windows'
         shell: bash
@@ -314,6 +342,7 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           path: dist
+          pattern: pioneer-gateway-*
           merge-multiple: true
 
       - name: assemble-release-assets
@@ -361,3 +390,20 @@ jobs:
           else
             gh release edit "${GITHUB_REF_NAME}" --draft=false --prerelease=false --latest
           fi
+
+  queue-debug-symbols:
+    name: queue-independent-debug-symbols
+    needs: build-gateway
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner, repo: context.repo.repo,
+              workflow_id: 'build-debug-symbols.yml',
+              ref: context.ref.replace(/^refs\/(heads|tags)\//, ''),
+              inputs: {source_run_id: String(context.runId)},
+            });

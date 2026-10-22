@@ -18,7 +18,7 @@ use super::{
     TurnFinalizationProvider, TurnToolContext, TurnToolMaterialization, TurnToolProvider,
     WorkspaceSkillPolicy,
 };
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use pioneer_hooks::{
     AuditContribution, HookActorKind, HookAuditEventKind, HookAwaitPolicy, HookCapabilities,
     HookCapability, HookContextMode, HookContribution, HookDiagnosticCode, HookDiagnosticMessage,
@@ -16464,6 +16464,213 @@ async fn cancellation_context_freezes_interrupted_policy_request_handlers_and_cl
         assert_eq!(calls.lock().unwrap().len(), usize::from(enabled));
         receiver.acknowledge_last(Ok(()));
         manager.remove_thread(thread).await;
+    }
+}
+
+// Actual manager command -> actor -> fresh native task contract. The fake
+// provider blocks at the first preflight call; it never starts native tools.
+#[derive(Clone, Copy, Debug)]
+enum ObservedTurnFinish {
+    Completed,
+    RootlessCompleted,
+    Failed,
+    Panicked,
+    Cancelled,
+    Aborted,
+    Revoked,
+}
+
+struct ObservedTurnProvider {
+    first: std::sync::Mutex<
+        Option<
+            tokio::sync::oneshot::Sender<(Option<pioneer_observability::work::WorkContext>, bool)>,
+        >,
+    >,
+    release: tokio::sync::Semaphore,
+    finish: ObservedTurnFinish,
+    inner: CaptureAgentProvider,
+}
+#[async_trait::async_trait]
+impl Provider for ObservedTurnProvider {
+    fn name(&self) -> &str {
+        "observed-turn"
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.inner.capabilities()
+    }
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let first = self.first.lock().unwrap().take();
+        if let Some(first) = first {
+            let _ = first.send((
+                pioneer_observability::work::current(),
+                is_turn_preflight_request(&request),
+            ));
+            self.release.acquire().await.unwrap().forget();
+        }
+        if matches!(self.finish, ObservedTurnFinish::Panicked) {
+            panic!("observed turn fixture panic");
+        }
+        if matches!(self.finish, ObservedTurnFinish::Failed) && !is_turn_preflight_request(&request)
+        {
+            anyhow::bail!("HTTP 400 Bad Request: fixture rejection");
+        }
+        self.inner.chat(request).await
+    }
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        Ok(futures_util::stream::iter(vec![
+            Ok(StreamChunk::delta(response.text)),
+            Ok(StreamChunk::final_chunk_with(response.termination)),
+        ])
+        .boxed())
+    }
+}
+
+#[tokio::test]
+async fn native_turn_command_handoff_is_live_during_preflight_and_retires_real_outcome() {
+    use pioneer_observability::{
+        live::{self, JournalPayload, WorkState},
+        work::{self, Boundary, ExecutorRole, Outcome, Trigger, WorkCarrier, WorkKind},
+    };
+    let _lock = crate::TURN_OBSERVATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            pioneer_observability::set_telemetry_enabled(self.0);
+        }
+    }
+    let _restore = Restore(pioneer_observability::telemetry_enabled());
+    for finish in [
+        ObservedTurnFinish::Completed,
+        ObservedTurnFinish::RootlessCompleted,
+        ObservedTurnFinish::Failed,
+        ObservedTurnFinish::Panicked,
+        ObservedTurnFinish::Cancelled,
+        ObservedTurnFinish::Aborted,
+        ObservedTurnFinish::Revoked,
+    ] {
+        pioneer_observability::set_telemetry_enabled(false);
+        pioneer_observability::set_telemetry_enabled(true);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let provider = Arc::new(ObservedTurnProvider {
+            first: std::sync::Mutex::new(Some(started_tx)),
+            release: tokio::sync::Semaphore::new(0),
+            finish,
+            inner: CaptureAgentProvider::default(),
+        });
+        let manager = AgentManager::new(
+            Arc::new(ProviderRegistry::with_provider(
+                "observed-turn",
+                provider.clone(),
+            )),
+            test_tool_loop_config(),
+        );
+        let thread = "observed-native-turn";
+        manager
+            .ensure_thread(thread, "observed-workspace")
+            .await
+            .unwrap();
+        let mut receiver = manager.take_durable_receiver(thread).await.unwrap();
+        let terminal_context = Arc::new(std::sync::Mutex::new(None));
+        let terminal_started = Arc::new(tokio::sync::Notify::new());
+        let terminal_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let drain = {
+            let observed = terminal_context.clone();
+            let started = terminal_started.clone();
+            let release = terminal_release.clone();
+            tokio::spawn(async move {
+                while let Some(event) = receiver.recv().await {
+                    if matches!(finish, ObservedTurnFinish::Completed)
+                        && matches!(event, AgentDurableEvent::TurnCompleted { .. })
+                    {
+                        *observed.lock().unwrap() = receiver.pending_work().context();
+                        started.notify_one();
+                        release.acquire().await.unwrap().forget();
+                    }
+                    receiver.acknowledge_last(Ok(()));
+                }
+            })
+        };
+        // Always run owner cleanup before propagating a fixture assertion panic.
+        let checked = std::panic::AssertUnwindSafe(async {
+            let parent = WorkCarrier::independent(Boundary::Rpc, WorkKind::RpcTurn, Trigger::Rpc, ExecutorRole::Gateway);
+            let parent_context = parent.context().unwrap();
+            let start = manager.start_test_turn_with_default_profile(thread, "observed-turn", ThreadMode::Agent, "test-model", "observed-turn", HashMap::new(), vec![UserInput::Text { text: "fixture".into(), text_elements: Vec::new() }], Vec::new());
+            if matches!(finish, ObservedTurnFinish::RootlessCompleted) { start.await.unwrap(); }
+            else { parent.scope(start).await.unwrap(); }
+            assert!(work::current().is_none(), "ACK scope restores the poll-local parent");
+            let (context, preflight) = timeout(Duration::from_secs(5), started_rx).await.expect("preflight reached").unwrap();
+            assert!(preflight, "the real preflight is independently blocked");
+            let context = context.expect("fresh task receives the command carrier");
+            assert_eq!(context.parent, if matches!(finish, ObservedTurnFinish::RootlessCompleted) { None } else { Some(parent_context.token) });
+            if matches!(finish, ObservedTurnFinish::RootlessCompleted) { assert_eq!(context.origin, work::ContextOrigin::MissingLocalParent); }
+            assert_eq!(context.consent_generation, parent_context.consent_generation);
+            let snapshot = live::snapshot().unwrap();
+            let own = snapshot.active.iter().find(|a| a.context.token == context.token).expect("turn remains active after RPC ACK");
+            assert!(!own.worker_lifetime);
+            assert_ne!(own.state, WorkState::Queued, "queued lease handed to the fresh execution");
+            assert_eq!(snapshot.active.iter().filter(|a| a.context.token == context.token).count(),1,"one native execution owner");
+            match finish {
+                ObservedTurnFinish::Cancelled => manager.cancel_turn(thread, "observed-turn", "fixture cancellation").await.unwrap(),
+                ObservedTurnFinish::Aborted => manager.state.read().await.threads.get(thread).unwrap().loop_handle.abort(),
+                ObservedTurnFinish::Revoked => {
+                    pioneer_observability::set_telemetry_enabled(false);
+                    pioneer_observability::set_telemetry_enabled(true);
+                    provider.release.add_permits(1);
+                }
+                _ => provider.release.add_permits(1),
+            }
+            if matches!(finish, ObservedTurnFinish::Completed) {
+                timeout(Duration::from_secs(5),terminal_started.notified()).await.expect("real durable terminal is waiting for its ACK");
+                let terminal_context = terminal_context.lock().unwrap().expect("actual durable terminal carries context");
+                assert_eq!(terminal_context.parent, Some(context.token), "actor terminal publication retains turn lineage");
+                assert_eq!(terminal_context.consent_generation, context.consent_generation);
+                let pending_terminal=live::snapshot().unwrap();
+                assert!(pending_terminal.active.iter().any(|entry|entry.context.token==context.token),"provider completion is not the durable turn terminal");
+                assert!(!pending_terminal.journal.iter().any(|r|matches!(&r.payload,JournalPayload::Work(entry) if entry.context.token==context.token && matches!(entry.state,WorkState::Terminal(_)))));
+                terminal_release.add_permits(1);
+            }
+            if matches!(finish, ObservedTurnFinish::Revoked) {
+                // Drive cleanup after the old in-flight future resumes in E2.
+                manager.remove_thread(thread).await;
+                let next = live::snapshot().unwrap();
+                assert_ne!(next.consent_generation, context.consent_generation);
+                assert!(next.active.iter().all(|a| a.context.token != context.token));
+                assert!(next.journal.iter().all(|r| !matches!(&r.payload, JournalPayload::Work(a) if a.context.token == context.token)));
+            } else {
+                let expected = match finish {
+                    ObservedTurnFinish::Completed | ObservedTurnFinish::RootlessCompleted => Outcome::Completed,
+                    ObservedTurnFinish::Failed => Outcome::Failed,
+                    ObservedTurnFinish::Panicked => Outcome::Panicked,
+                    ObservedTurnFinish::Cancelled | ObservedTurnFinish::Aborted => Outcome::Cancelled,
+                    ObservedTurnFinish::Revoked => unreachable!(),
+                };
+                timeout(Duration::from_secs(5), async {
+                    loop {
+                        let snapshot = live::snapshot().unwrap();
+                        if !snapshot.active.iter().any(|a| a.context.token == context.token) {
+                            let terminals: Vec<_> = snapshot.journal.iter().filter_map(|r| match &r.payload { JournalPayload::Work(a) if a.context.token == context.token => match a.state { WorkState::Terminal(o) => Some(o), _ => None }, _ => None }).collect();
+                            assert_eq!(terminals, vec![expected], "exactly one actual terminal for {finish:?}");
+                            break;
+                        }
+                        yield_now().await;
+                    }
+                }).await.expect("native execution retires after real completion/cancellation");
+            }
+            assert!(work::current().is_none());
+        }).catch_unwind().await;
+        terminal_release.add_permits(1);
+        manager.remove_thread(thread).await;
+        drain.abort();
+        let _ = drain.await;
+        if let Err(panic) = checked {
+            std::panic::resume_unwind(panic);
+        }
     }
 }
 

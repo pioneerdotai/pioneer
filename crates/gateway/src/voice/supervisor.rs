@@ -408,9 +408,11 @@ impl VoiceInputSupervisor {
 
         let installer = self.installer.clone();
         let protected_model_id = self.cleanup_protected_model_id.clone();
-        tokio::task::spawn_blocking(move || installer.cleanup_disabled(protected_model_id.as_ref()))
-            .await
-            .context("disabled Voice Input model cleanup task failed")?
+        pioneer_observability::work::spawn_blocking(move || {
+            installer.cleanup_disabled(protected_model_id.as_ref())
+        })
+        .await
+        .context("disabled Voice Input model cleanup task failed")?
     }
 
     pub(crate) fn mark_downloading(
@@ -634,10 +636,12 @@ impl VoiceInputSupervisor {
         let loader = self.engine_loader.clone();
         let load_entry = entry;
         let load_layout = layout;
-        let loaded = tokio::task::spawn_blocking(move || loader.load(&load_entry, &load_layout))
-            .await
-            .context("voice engine loader task failed")
-            .and_then(|result| result.map_err(anyhow::Error::new));
+        let loaded = pioneer_observability::work::spawn_blocking(move || {
+            loader.load(&load_entry, &load_layout)
+        })
+        .await
+        .context("voice engine loader task failed")
+        .and_then(|result| result.map_err(anyhow::Error::new));
         let engine = match loaded {
             Ok(engine) => engine,
             Err(error) => {
@@ -658,7 +662,7 @@ impl VoiceInputSupervisor {
                 // Reaching Ready commits this replacement. A later disable or model change must
                 // not interrupt removal of models superseded by this committed selection.
                 let cancellation = CancellationToken::new();
-                match tokio::task::spawn_blocking(move || {
+                match pioneer_observability::work::spawn_blocking(move || {
                     installer.cleanup_non_selected(
                         cleanup_model_id.as_str(),
                         &cancellation,

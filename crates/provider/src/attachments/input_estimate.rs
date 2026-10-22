@@ -83,7 +83,7 @@ async fn prepare_with_profile(
     let provider = provider.to_owned();
     // Header/document parsing and base64 encoding remain outside async workers
     // and outside every DB scope. The pipeline bounds both count and bytes.
-    tokio::task::spawn_blocking(move || {
+    pioneer_observability::work::spawn_blocking(move || {
         let mut media = Vec::with_capacity(prepared.attachments.len());
         for attachment in prepared.attachments {
             let tokens = estimate(&provider, &request.model, &attachment)?;

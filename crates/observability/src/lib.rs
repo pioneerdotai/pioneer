@@ -22,17 +22,26 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 
+pub use telemetry::stop_local_observers;
 mod database_workload;
 mod desktop_gateway;
+pub mod diagnostics;
+pub mod identity;
+pub mod live;
 mod metrics;
 mod operations;
 mod patch_telemetry;
 mod performance;
 #[cfg(feature = "qualification-diagnostics")]
 mod qualification_diagnostics;
+pub mod queues;
+pub mod resources;
+pub mod runtime;
 mod startup;
+pub mod symbols;
 mod telemetry;
 pub mod turn_startup;
+pub mod work;
 
 pub use database_workload::{
     DatabaseQueryKind, DatabaseWorkload, DatabaseWorkloadContext, DatabaseWorkloadOutcome,
@@ -364,6 +373,9 @@ fn set_telemetry_gate(enabled: bool) {
     TELEMETRY_CONSENT.store(next, Ordering::Release);
     if !enabled {
         turn_startup::discard_on_opt_out();
+        resources::discard(generation);
+        live::discard(generation);
+        runtime::discard();
     }
 }
 
@@ -371,7 +383,10 @@ pub fn telemetry_enabled() -> bool {
     TELEMETRY_CONSENT.load(Ordering::Acquire) & 1 == 1
 }
 
-pub(crate) fn telemetry_consent_snapshot() -> (bool, u64) {
+/// Atomic recording gate and generation for native owner snapshots. Consumers
+/// must fence this same generation at mutation/delivery; observing it is not a
+/// lock or authorization to transmit after a later consent change.
+pub fn telemetry_consent_snapshot() -> (bool, u64) {
     let state = TELEMETRY_CONSENT.load(Ordering::Acquire);
     (state & 1 == 1, state >> 1)
 }
@@ -1381,4 +1396,13 @@ mod tests {
             Some("HttpClient.ExportStarted"),
         ));
     }
+}
+
+// Sampling/capture emission is infrequent. Serialize ONLY its SDK recording
+// against consent transitions, never poll/query/channel hot paths or FS/tool IO.
+pub(crate) fn record_in_epoch<T>(epoch: u64, callback: impl FnOnce() -> T) -> Option<T> {
+    let _transition = TELEMETRY_CONSENT_TRANSITION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    telemetry_sample_allowed(Some(epoch)).then(callback)
 }

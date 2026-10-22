@@ -16,6 +16,147 @@ use crate::request_context::ConnectionContext;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+use pioneer_observability::{
+    queues::{QueueBytes, QueueKind, QueueObserver, QueueOutcome},
+    work::{Boundary, ExecutorRole, WorkItem, WorkKind},
+};
+
+#[derive(Clone)]
+enum OutboundChannel {
+    Plain(mpsc::Sender<Message>),
+    Observed(mpsc::Sender<WorkItem<Message>>),
+}
+/// Observer at the existing session-owned outbound lane, not a new transport.
+#[derive(Clone)]
+pub(crate) struct SessionOutbound {
+    channel: OutboundChannel,
+    observer: QueueObserver,
+}
+impl SessionOutbound {
+    pub(crate) fn observed(sender: mpsc::Sender<WorkItem<Message>>) -> Self {
+        let observer = QueueObserver::new(
+            QueueKind::GatewayOutbound,
+            Some(sender.max_capacity()),
+            "WebSocket text/binary payload bytes; framing/envelope excluded",
+        );
+        Self {
+            channel: OutboundChannel::Observed(sender),
+            observer,
+        }
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        match &self.channel {
+            OutboundChannel::Plain(tx) => tx.capacity(),
+            OutboundChannel::Observed(tx) => tx.capacity(),
+        }
+    }
+    pub(crate) async fn send(
+        &self,
+        message: Message,
+    ) -> Result<(), mpsc::error::SendError<Message>> {
+        let mut wait = self.observer.send_wait();
+        let _live_wait = pioneer_observability::live::WaitGuard::new(
+            pioneer_observability::live::WaitKind::ChannelCapacity,
+        );
+        let bytes = message_bytes(&message);
+        match &self.channel {
+            OutboundChannel::Observed(tx) => {
+                let permit = match tx.reserve().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        self.observer.outcome(QueueOutcome::Rejected, 1);
+                        return Err(mpsc::error::SendError(message));
+                    }
+                };
+                wait.complete();
+                permit.send(
+                    WorkItem::new(
+                        message,
+                        Boundary::EventLane,
+                        WorkKind::Event,
+                        ExecutorRole::Gateway,
+                    )
+                    .observed(self.observer.clone(), bytes),
+                );
+            }
+            OutboundChannel::Plain(tx) => {
+                let permit = match tx.reserve().await {
+                    Ok(p) => p,
+                    Err(_) => return Err(mpsc::error::SendError(message)),
+                };
+                wait.complete();
+                self.observer.enqueued(bytes);
+                permit.send(message);
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn try_send(
+        &self,
+        message: Message,
+    ) -> Result<(), mpsc::error::TrySendError<Message>> {
+        let bytes = message_bytes(&message);
+        match &self.channel {
+            OutboundChannel::Observed(tx) => match tx.try_reserve() {
+                Ok(p) => {
+                    p.send(
+                        WorkItem::new(
+                            message,
+                            Boundary::EventLane,
+                            WorkKind::Event,
+                            ExecutorRole::Gateway,
+                        )
+                        .observed(self.observer.clone(), bytes),
+                    );
+                    Ok(())
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.observer.outcome(QueueOutcome::Rejected, 1);
+                    Err(mpsc::error::TrySendError::Full(message))
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.observer.outcome(QueueOutcome::Rejected, 1);
+                    Err(mpsc::error::TrySendError::Closed(message))
+                }
+            },
+            OutboundChannel::Plain(tx) => match tx.try_reserve() {
+                Ok(p) => {
+                    self.observer.enqueued(bytes);
+                    p.send(message);
+                    Ok(())
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    Err(mpsc::error::TrySendError::Full(message))
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    Err(mpsc::error::TrySendError::Closed(message))
+                }
+            },
+        }
+    }
+}
+impl From<mpsc::Sender<Message>> for SessionOutbound {
+    fn from(sender: mpsc::Sender<Message>) -> Self {
+        let observer = QueueObserver::new(
+            QueueKind::GatewayOutbound,
+            Some(sender.max_capacity()),
+            "compatibility sender; payload bytes; receiver coverage unavailable",
+        );
+        Self {
+            channel: OutboundChannel::Plain(sender),
+            observer,
+        }
+    }
+}
+fn message_bytes(message: &Message) -> QueueBytes {
+    QueueBytes::Known(match message {
+        Message::Text(text) => text.len(),
+        Message::Binary(bytes) | Message::Ping(bytes) | Message::Pong(bytes) => bytes.len(),
+        Message::Close(frame) => frame.as_ref().map_or(0, |f| f.reason.len() + 2),
+    } as u64)
+}
+
 pub type ConnectionId = u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +196,7 @@ const TERMINATED_SESSION_TOMBSTONE_TTL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone)]
 struct SessionConnection {
-    sender: mpsc::Sender<Message>,
+    sender: SessionOutbound,
     termination_tx: watch::Sender<Option<AuthSessionTerminationReason>>,
     workspace_id: Option<String>,
     principal: Arc<AuthenticatedSessionPrincipal>,
@@ -84,6 +225,14 @@ impl SessionManager {
     pub async fn register_connection(
         &self,
         sender: mpsc::Sender<Message>,
+        principal: Arc<AuthenticatedSessionPrincipal>,
+    ) -> Result<ConnectionId> {
+        self.register_outbound_connection(sender.into(), principal)
+            .await
+    }
+    pub(crate) async fn register_outbound_connection(
+        &self,
+        sender: SessionOutbound,
         principal: Arc<AuthenticatedSessionPrincipal>,
     ) -> Result<ConnectionId> {
         // Serialize registration against post-commit revocation. Without this

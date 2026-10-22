@@ -535,7 +535,7 @@ pub(crate) fn spawn_local_embedding_model_download_if_needed(
     };
 
     let files_for_task = files;
-    tokio::task::spawn_blocking(move || {
+    pioneer_observability::work::spawn_blocking(move || {
         let cancellation = download_lease.cancellation();
         let result =
             download_local_embedding_model_files(&files_for_task, info, None, &cancellation);
@@ -557,7 +557,7 @@ pub(crate) async fn ensure_local_embedding_model_downloaded_if_needed(
         return Ok(false);
     };
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = pioneer_observability::work::spawn_blocking(move || {
         let cancellation = download_lease.cancellation();
         let result = download_local_embedding_model_files(
             &files,
@@ -768,9 +768,11 @@ pub(crate) async fn remove_local_embedding_model_install(
         .ok_or_else(|| format!("unknown local embedding model `{model}`"))?;
     cancel_active_local_embedding_model_download(&files).await?;
 
-    tokio::task::spawn_blocking(move || remove_local_embedding_model_files_with_retry(&files))
-        .await
-        .map_err(|error| format!("local embedding model cleanup task failed: {error}"))?
+    pioneer_observability::work::spawn_blocking(move || {
+        remove_local_embedding_model_files_with_retry(&files)
+    })
+    .await
+    .map_err(|error| format!("local embedding model cleanup task failed: {error}"))?
 }
 
 fn remove_local_embedding_model_files_with_retry(
@@ -1716,7 +1718,11 @@ impl RemoteEmbeddingProvider {
                         format!("failed to create embedding runtime bridge: {error}"),
                     )
                 })?;
-            runtime.block_on(provider.embed(request))
+            let _runtime_observer = pioneer_observability::runtime::register(
+                runtime.handle(),
+                pioneer_observability::runtime::RuntimeRole::GatewayPatch,
+            );
+            _runtime_observer.block_on(&runtime, provider.embed(request))
         };
 
         result.map_err(|error| Self::map_provider_error(provider_id, model, provider, error))

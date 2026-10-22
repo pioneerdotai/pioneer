@@ -115,7 +115,8 @@ pub(crate) struct CLIAgentRuntimeSessionStartOptions {
 
 pub(crate) struct CLIAgentRuntimeCodexEventReceivers {
     pub process_instance: CliSessionInstanceId,
-    pub notifications: mpsc::Receiver<CodexJsonlRpcNotificationEvent>,
+    pub notifications:
+        mpsc::Receiver<pioneer_observability::work::WorkItem<CodexJsonlRpcNotificationEvent>>,
     pub server_requests: mpsc::Receiver<CodexJsonlRpcServerRequest>,
     pub diagnostics: mpsc::Receiver<CodexJsonlRpcClientDiagnostic>,
 }
@@ -123,7 +124,7 @@ pub(crate) struct CLIAgentRuntimeCodexEventReceivers {
 pub(crate) struct CLIAgentRuntimeEventReceivers {
     pub process_instance: CliSessionInstanceId,
     pub runtime_kind: String,
-    pub events: mpsc::Receiver<RuntimeEvent>,
+    pub events: mpsc::Receiver<pioneer_observability::work::WorkItem<RuntimeEvent>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

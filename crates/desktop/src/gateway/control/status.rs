@@ -28,20 +28,22 @@ pub(crate) fn is_configured_service_active(service_name: &str) -> Result<bool> {
 fn is_service_active_macos(service_name: &str) -> Result<bool> {
     let uid = current_uid_macos()?;
     let target = format!("gui/{uid}/{service_name}");
-    let output = Command::new("launchctl")
-        .args(["print", &target])
-        .output()
-        .context(t!("errors.command.launchctl_print_failed").to_string())?;
+    let output = pioneer_observability::resources::captured_output(
+        Command::new("launchctl").args(["print", &target]),
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+    )
+    .context(t!("errors.command.launchctl_print_failed").to_string())?;
 
     Ok(output.status.success())
 }
 
 #[cfg(target_os = "macos")]
 fn current_uid_macos() -> Result<String> {
-    let output = Command::new("id")
-        .arg("-u")
-        .output()
-        .context(t!("errors.command.launchctl_print_failed").to_string())?;
+    let output = pioneer_observability::resources::captured_output(
+        Command::new("id").arg("-u"),
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+    )
+    .context(t!("errors.command.launchctl_print_failed").to_string())?;
     if !output.status.success() {
         return Ok("0".to_owned());
     }
@@ -51,10 +53,11 @@ fn current_uid_macos() -> Result<String> {
 #[cfg(target_os = "linux")]
 fn is_service_active_linux(service_name: &str) -> Result<bool> {
     let service_unit = service_unit_name_linux(service_name);
-    let output = Command::new("systemctl")
-        .args(["--user", "is-active", service_unit.as_str()])
-        .output()
-        .context(t!("errors.command.systemctl_is_active_failed").to_string())?;
+    let output = pioneer_observability::resources::captured_output(
+        Command::new("systemctl").args(["--user", "is-active", service_unit.as_str()]),
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+    )
+    .context(t!("errors.command.systemctl_is_active_failed").to_string())?;
 
     Ok(output.status.success())
 }
@@ -82,17 +85,18 @@ fn is_service_active_windows(service_name: &str) -> Result<bool> {
         exit 2"#
     );
 
-    let output = Command::new("powershell")
-        .args([
+    let output = pioneer_observability::resources::captured_output(
+        Command::new("powershell").args([
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
             &script,
-        ])
-        .output()
-        .context(t!("errors.command.powershell_task_status_failed").to_string())?;
+        ]),
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+    )
+    .context(t!("errors.command.powershell_task_status_failed").to_string())?;
 
     Ok(output.status.success())
 }

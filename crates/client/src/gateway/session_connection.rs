@@ -1493,14 +1493,21 @@ pub fn exchange_refresh(
             code: None,
             message: "failed to initialize session refresh runtime".into(),
         })?;
-    runtime.block_on(AuthExchangeClient::new(timeout).refresh(
-        base,
-        credential,
-        pioneer_protocol::AuthRefreshParams {
-            refresh_request_id: request_id.into(),
-            client_version: Some(env!("CARGO_PKG_VERSION").into()),
-        },
-    ))
+    let _runtime_observer = pioneer_observability::runtime::register(
+        runtime.handle(),
+        pioneer_observability::runtime::RuntimeRole::ClientHttp,
+    );
+    _runtime_observer.block_on(
+        &runtime,
+        AuthExchangeClient::new(timeout).refresh(
+            base,
+            credential,
+            pioneer_protocol::AuthRefreshParams {
+                refresh_request_id: request_id.into(),
+                client_version: Some(env!("CARGO_PKG_VERSION").into()),
+            },
+        ),
+    )
 }
 fn cleanup_session(
     base: &GatewayBaseUrl,
@@ -1511,12 +1518,15 @@ fn cleanup_session(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime
-        .block_on(AuthExchangeClient::new(timeout).cleanup_session_once(
-            base,
-            access,
-            session.clone(),
-        ))
+    let _runtime_observer = pioneer_observability::runtime::register(
+        runtime.handle(),
+        pioneer_observability::runtime::RuntimeRole::ClientHttp,
+    );
+    _runtime_observer
+        .block_on(
+            &runtime,
+            AuthExchangeClient::new(timeout).cleanup_session_once(base, access, session.clone()),
+        )
         .map(|_| ())
         .map_err(anyhow::Error::new)
 }

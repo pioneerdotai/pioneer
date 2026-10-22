@@ -112,7 +112,15 @@ where
 pub struct CodexJsonlRpcClient {
     command_tx: mpsc::Sender<CodexJsonlRpcCommand>,
     next_request_id: Arc<AtomicI64>,
-    notification_rx: Arc<StdMutex<Option<mpsc::Receiver<CodexJsonlRpcNotificationEvent>>>>,
+    notification_rx: Arc<
+        StdMutex<
+            Option<
+                mpsc::Receiver<
+                    pioneer_observability::work::WorkItem<CodexJsonlRpcNotificationEvent>,
+                >,
+            >,
+        >,
+    >,
     server_request_rx: Arc<StdMutex<Option<mpsc::Receiver<CodexJsonlRpcServerRequest>>>>,
     diagnostic_rx: Arc<StdMutex<Option<mpsc::Receiver<CodexJsonlRpcClientDiagnostic>>>>,
 }
@@ -433,7 +441,8 @@ impl CodexJsonlRpcClient {
 
     pub fn take_notification_receiver(
         &self,
-    ) -> Option<mpsc::Receiver<CodexJsonlRpcNotificationEvent>> {
+    ) -> Option<mpsc::Receiver<pioneer_observability::work::WorkItem<CodexJsonlRpcNotificationEvent>>>
+    {
         self.notification_rx
             .lock()
             .expect("notification receiver mutex should not be poisoned")
@@ -4963,7 +4972,9 @@ async fn wait_for_codex_login_completion(
     stderr_ring: crate::process::StderrRing,
     shutdown_grace: Duration,
     login_id: Option<String>,
-    mut notifications: Option<mpsc::Receiver<CodexJsonlRpcNotificationEvent>>,
+    mut notifications: Option<
+        mpsc::Receiver<pioneer_observability::work::WorkItem<CodexJsonlRpcNotificationEvent>>,
+    >,
 ) {
     if let Some(notifications) = notifications.as_mut() {
         let wait = async {
@@ -5526,7 +5537,7 @@ async fn run_codex_jsonl_rpc_reader<R>(
                 }
             }
             Ok(Some(crate::native_event::SpooledNativeFrame::Oversized { file, total_bytes })) => {
-                let decoded = tokio::task::spawn_blocking(move || {
+                let decoded = pioneer_observability::work::spawn_blocking(move || {
                     decode_oversized_codex_frame(file, total_bytes)
                 })
                 .await;
@@ -7991,7 +8002,7 @@ async fn resolve_oversized_codex_response(
     if kind == OversizedCodexResponseKind::Success {
         match pending_request.oversized_success_recovery {
             Some(OversizedSuccessRecovery::ThreadOpenSnapshot { method }) => {
-                let recovered = tokio::task::spawn_blocking(move || {
+                let recovered = pioneer_observability::work::spawn_blocking(move || {
                     extract_thread_open_snapshot_from_spooled_response(file, method)
                 })
                 .await
@@ -8008,7 +8019,7 @@ async fn resolve_oversized_codex_response(
                 native_thread_id,
                 native_turn_id,
             }) => {
-                let recovered = tokio::task::spawn_blocking(move || {
+                let recovered = pioneer_observability::work::spawn_blocking(move || {
                     extract_thread_turn_snapshot_from_spooled_response(
                         file,
                         native_thread_id.as_str(),
@@ -8031,7 +8042,7 @@ async fn resolve_oversized_codex_response(
     if total_bytes > CODEX_MAX_MATERIALIZED_FRAME_BYTES {
         if kind == OversizedCodexResponseKind::Error {
             let expected_id = id.clone();
-            let recovered = tokio::task::spawn_blocking(move || {
+            let recovered = pioneer_observability::work::spawn_blocking(move || {
                 extract_oversized_codex_error_response(file, &expected_id)
             })
             .await
@@ -8063,7 +8074,7 @@ async fn resolve_oversized_codex_response(
         return;
     }
 
-    let decoded = tokio::task::spawn_blocking(move || {
+    let decoded = pioneer_observability::work::spawn_blocking(move || {
         file.seek(SeekFrom::Start(0)).map_err(|error| {
             JsonlRpcDecodeError::new(
                 JsonlRpcDecodeErrorKind::InvalidMessage,
@@ -11482,7 +11493,7 @@ while read line; do :; done
             .expect("notification channel should remain open");
         assert_eq!(notification.method, "item/completed");
         assert_eq!(
-            notification.params.expect("notification params")["item"]["aggregatedOutput"],
+            notification.value.params.expect("notification params")["item"]["aggregatedOutput"],
             json!(output)
         );
 
@@ -11539,7 +11550,7 @@ while read line; do :; done
             .expect("oversized notification should arrive")
             .expect("notification channel should remain open");
         assert_eq!(notification.method, "item/completed");
-        let params = notification.params.expect("notification params");
+        let params = notification.value.params.expect("notification params");
         assert_eq!(params["threadId"], json!("thread-control"));
         assert_eq!(params["turnId"], json!("turn-control"));
         assert_eq!(params["item"]["id"], json!("item-control"));
@@ -11600,7 +11611,7 @@ while read line; do :; done
             .expect("file-change notification should arrive")
             .expect("notification channel should remain open");
         assert_eq!(notification.method, "item/completed");
-        let params = notification.params.expect("notification params");
+        let params = notification.value.params.expect("notification params");
         assert_eq!(params["threadId"], json!("thread-control"));
         assert_eq!(params["turnId"], json!("turn-control"));
         let item = &params["item"];
@@ -11665,7 +11676,7 @@ while read line; do :; done
             .expect("oversized diff notification should arrive")
             .expect("notification channel should remain open");
         assert_eq!(notification.method, "turn/diff/updated");
-        let params = notification.params.expect("diff params");
+        let params = notification.value.params.expect("diff params");
         assert_eq!(params["threadId"], json!("thread-control"));
         assert_eq!(params["turnId"], json!("turn-control"));
         assert_eq!(params["revision"], json!(7));
@@ -11893,7 +11904,7 @@ while read line; do :; done
             .expect("oversized terminal notification should arrive")
             .expect("notification channel should remain open");
         assert_eq!(notification.method, "turn/completed");
-        let params = notification.params.expect("terminal params");
+        let params = notification.value.params.expect("terminal params");
         assert_eq!(params["threadId"], json!("thread-terminal"));
         assert_eq!(params["turn"]["id"], json!("turn-terminal"));
         assert_eq!(params["turn"]["status"], json!("completed"));

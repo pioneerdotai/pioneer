@@ -285,12 +285,15 @@ pub fn activate_device_session(
         .enable_all()
         .build()
         .context("failed to initialize Gateway auth exchange runtime")?;
-    runtime
-        .block_on(AuthExchangeClient::new(timeout).activate_device(
-            gateway_base_url,
-            credential,
-            params,
-        ))
+    let _runtime_observer = pioneer_observability::runtime::register(
+        runtime.handle(),
+        pioneer_observability::runtime::RuntimeRole::ClientHttp,
+    );
+    _runtime_observer
+        .block_on(
+            &runtime,
+            AuthExchangeClient::new(timeout).activate_device(gateway_base_url, credential, params),
+        )
         .map_err(anyhow::Error::new)
 }
 
@@ -304,12 +307,19 @@ pub fn revoke_session_best_effort(
         .enable_all()
         .build()
         .context("failed to initialize Gateway session cleanup runtime")?;
-    runtime
-        .block_on(AuthExchangeClient::new(timeout).cleanup_session_once(
-            gateway_base_url,
-            access_token,
-            session_id.clone(),
-        ))
+    let _runtime_observer = pioneer_observability::runtime::register(
+        runtime.handle(),
+        pioneer_observability::runtime::RuntimeRole::ClientHttp,
+    );
+    _runtime_observer
+        .block_on(
+            &runtime,
+            AuthExchangeClient::new(timeout).cleanup_session_once(
+                gateway_base_url,
+                access_token,
+                session_id.clone(),
+            ),
+        )
         .map(|_| ())
         .map_err(anyhow::Error::new)
 }

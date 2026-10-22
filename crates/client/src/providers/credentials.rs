@@ -53,6 +53,7 @@ impl ProviderCredentialRead {
     }
 }
 pub(super) struct CredentialRequest {
+    work_context: pioneer_observability::work::WorkCarrier,
     identity: u64,
     epoch: (u64, u64, Option<u64>),
     workspace: String,
@@ -64,6 +65,7 @@ pub(super) struct CredentialRequests {
     generation: u64,
     active: BTreeMap<u64, Weak<()>>,
     sender: Option<mpsc::SyncSender<CredentialRequest>>,
+    observer: Option<pioneer_observability::queues::QueueObserver>,
     task: Option<std::thread::JoinHandle<()>>,
 }
 impl CredentialRequests {
@@ -120,17 +122,26 @@ impl ClientCore {
         let (reply, receiver) = mpsc::sync_channel(1);
         owner.active.insert(identity, demand.clone());
         let request = CredentialRequest {
+            work_context: pioneer_observability::work::WorkCarrier::child(
+                pioneer_observability::work::Boundary::StdThread,
+                pioneer_observability::work::WorkKind::ClientCommand,
+                pioneer_observability::work::Trigger::Event,
+                pioneer_observability::work::ExecutorRole::ClientController,
+            ),
             identity,
             epoch,
             workspace,
             target,
             reply,
         };
-        if !owner
-            .sender
-            .as_ref()
-            .is_some_and(|sender| sender.try_send(request).is_ok())
-        {
+        if !owner.sender.as_ref().is_some_and(|sender| {
+            pioneer_observability::queues::observe_try_send(
+                owner.observer.as_ref(),
+                pioneer_observability::queues::QueueBytes::Unsupported,
+                || sender.try_send(request),
+            )
+            .is_ok()
+        }) {
             owner.active.remove(&identity);
             anyhow::bail!("provider_credential_unavailable");
         }
@@ -154,10 +165,28 @@ impl ClientCore {
     pub(crate) fn start_provider_credential_controller(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         let (sender, receiver) = mpsc::sync_channel::<CredentialRequest>(64);
+        let queue_observer = pioneer_observability::queues::QueueObserver::new(
+            pioneer_observability::queues::QueueKind::ClientController,
+            Some(64),
+            "unsupported: controller request payload/shared references are not serialized",
+        );
+        let worker_queue = queue_observer.clone();
         let task = std::thread::Builder::new()
             .name("client-provider-credentials".into())
             .spawn(move || {
                 while let Ok(request) = receiver.recv() {
+                    worker_queue.dequeued(pioneer_observability::queues::QueueBytes::Unsupported);
+                    let mut processing = worker_queue.processing();
+                    let carrier = request.work_context.clone().received(
+                        pioneer_observability::work::Boundary::StdThread,
+                        pioneer_observability::work::WorkKind::ClientCommand,
+                        pioneer_observability::work::ExecutorRole::ClientController,
+                    );
+                    let _scope = carrier.enter();
+                    let mut active_work = pioneer_observability::live::WorkGuard::start(
+                        pioneer_observability::work::current(),
+                        false,
+                    );
                     let Some(core) = weak.upgrade() else {
                         return;
                     };
@@ -210,6 +239,11 @@ impl ClientCore {
                             }),
                     }
                     .map_err(|_| anyhow::anyhow!("provider_credential_unavailable"));
+                    let outcome = if result.is_ok() {
+                        pioneer_observability::work::Outcome::Completed
+                    } else {
+                        pioneer_observability::work::Outcome::Failed
+                    };
                     if let Some(core) = weak.upgrade() {
                         if core.provider_credential_current(&request) {
                             let _ = request.reply.try_send(result);
@@ -221,6 +255,8 @@ impl ClientCore {
                             .active
                             .remove(&request.identity);
                     }
+                    processing.processed();
+                    active_work.finish(outcome);
                 }
             })
             .expect("provider credential worker");
@@ -228,6 +264,7 @@ impl ClientCore {
             .provider_controller
             .lock()
             .expect("provider controller poisoned");
+        owner.credentials.observer = Some(queue_observer);
         owner.credentials.sender = Some(sender);
         owner.credentials.task = Some(task);
     }

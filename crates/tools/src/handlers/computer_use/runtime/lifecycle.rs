@@ -56,7 +56,7 @@ impl ComputerUseHandler {
         let retention_hours = self.config.retention_hours;
         let max_total_bytes = self.config.max_total_bytes;
 
-        tokio::task::spawn_blocking(move || {
+        pioneer_observability::work::spawn_blocking(move || {
             cleanup_artifacts_sync(root.as_path(), retention_hours, max_total_bytes)
         })
         .await
@@ -587,7 +587,7 @@ impl ComputerUseHandler {
             };
             let artifacts_dir = root.join(session_id.to_string());
             let reserve_path = artifacts_dir.clone();
-            let reservation = tokio::task::spawn_blocking(move || {
+            let reservation = pioneer_observability::work::spawn_blocking(move || {
                 ActiveArtifactLease::reserve_directory(reserve_path)
             })
             .await

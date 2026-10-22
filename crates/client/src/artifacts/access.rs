@@ -89,6 +89,7 @@ fn download_artifact(
     target: ArtifactDownloadTarget,
     operation: &ArtifactDownloadOperation,
     runtime: &tokio::runtime::Runtime,
+    runtime_observer: &pioneer_observability::runtime::RuntimeRegistration,
 ) -> Result<(String, ArtifactHttpDownloadResult), ArtifactAccessError> {
     let artifact = resolve_artifact(sender, target)?;
     let access = sender
@@ -105,8 +106,11 @@ fn download_artifact(
     let session = GatewayHttpSession::from_access(&access, authority).map_err(map_http_error)?;
     let service = ArtifactHttpDownloadService::new(session, runtime_home);
     let progress = |progress| operation.update_progress(progress);
-    let result = runtime
-        .block_on(service.download(request, operation.cancellation(), Some(&progress)))
+    let result = runtime_observer
+        .block_on(
+            runtime,
+            service.download(request, operation.cancellation(), Some(&progress)),
+        )
         .map_err(map_download_error)?;
     if operation.cancellation().is_cancelled() {
         return Err(map_download_error(ArtifactHttpDownloadError::Cancelled));
@@ -407,8 +411,15 @@ impl crate::core::ClientCore {
                     "artifact_download_unavailable",
                 )
             })?;
-        let operation = runtime
-            .block_on(self.admit_artifact_action_download(identity, operation_id))
+        let _runtime_observer = pioneer_observability::runtime::register(
+            runtime.handle(),
+            pioneer_observability::runtime::RuntimeRole::ClientHttp,
+        );
+        let operation = _runtime_observer
+            .block_on(
+                &runtime,
+                self.admit_artifact_action_download(identity, operation_id),
+            )
             .map_err(|error| {
                 self.fail_artifact_preparation(identity, error.code.clone());
                 error
@@ -419,6 +430,7 @@ impl crate::core::ClientCore {
             action.target,
             &operation,
             &runtime,
+            &_runtime_observer,
         );
         match result {
             Ok(result) => {

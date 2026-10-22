@@ -373,6 +373,10 @@ mkdir -p "$OUT_DIR"
 cargo build --release -p pioneer-desktop --target "$TARGET"
 cargo build --release -p pioneer-app-updater --target "$TARGET"
 cargo build --release -p pioneer-cli --features computer-use --target "$TARGET"
+if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
+  python3 scripts/packaging/symbol-inputs.py export --target "$TARGET" "$PIONEER_SYMBOL_INPUTS_DIR" \
+    "target/$TARGET/release/pioneer-app" "target/$TARGET/release/pioneer" "target/$TARGET/release/pioneer-app-updater"
+fi
 
 WORK_DIR="$(mktemp -d)"
 DMG_MOUNT_DIR=""
@@ -410,8 +414,10 @@ fi
 cp "$MACOS_ICON_SOURCE" "$RESOURCES_DIR/$MACOS_ICON_NAME"
 
 cp "target/$TARGET/release/pioneer-app" "$MACOS_DIR/${DESKTOP_EXECUTABLE_NAME}"
+strip -S "$MACOS_DIR/${DESKTOP_EXECUTABLE_NAME}"
 chmod 0755 "$MACOS_DIR/${DESKTOP_EXECUTABLE_NAME}"
 cp "target/$TARGET/release/pioneer-app-updater" "$MACOS_DIR/${DESKTOP_UPDATER_EXECUTABLE_NAME}"
+strip -S "$MACOS_DIR/${DESKTOP_UPDATER_EXECUTABLE_NAME}"
 chmod 0755 "$MACOS_DIR/${DESKTOP_UPDATER_EXECUTABLE_NAME}"
 
 if [[ ! -x "$MACOS_DIR/${DESKTOP_UPDATER_EXECUTABLE_NAME}" ]]; then
@@ -431,6 +437,7 @@ fi
 GATEWAY_ASSET_PATH="$GATEWAY_BUNDLE_DIR/$GATEWAY_ASSET_NAME"
 GATEWAY_BINARY_RAW="$WORK_DIR/pioneer-gateway-${ARCH}"
 cp "target/$TARGET/release/pioneer" "$GATEWAY_BINARY_RAW"
+strip -S "$GATEWAY_BINARY_RAW"
 chmod 0755 "$GATEWAY_BINARY_RAW"
 
 if [[ -n "${MACOS_DESKTOP_SIGN_IDENTITY:-}" ]]; then
@@ -439,6 +446,10 @@ if [[ -n "${MACOS_DESKTOP_SIGN_IDENTITY:-}" ]]; then
   codesign --verify --strict "$GATEWAY_BINARY_RAW"
 fi
 
+# The archive and the bootstrap may later receive different signing envelopes.
+if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
+  python3 scripts/packaging/symbol-inputs.py record "$GATEWAY_BINARY_RAW" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
+fi
 cp "$GATEWAY_BINARY_RAW" "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap"
 chmod 0755 "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap"
 
@@ -525,6 +536,13 @@ if [[ -n "${MACOS_DESKTOP_SIGN_IDENTITY:-}" ]]; then
 fi
 
 APP_ZIP_NAME="Pioneer-${ARCH}.app.zip"
+if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
+  python3 scripts/packaging/symbol-inputs.py record "$MACOS_DIR/${DESKTOP_EXECUTABLE_NAME}" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
+  python3 scripts/packaging/symbol-inputs.py record "$MACOS_DIR/${DESKTOP_UPDATER_EXECUTABLE_NAME}" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
+fi
+if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
+  python3 scripts/packaging/symbol-inputs.py record "$GATEWAY_BUNDLE_DIR/pioneer-bootstrap" "$PIONEER_SYMBOL_INPUTS_DIR/packaged.json"
+fi
 APP_ZIP_PATH="$OUT_DIR/$APP_ZIP_NAME"
 rm -f "$APP_ZIP_PATH"
 ditto -c -k --keepParent "$APP_DIR" "$APP_ZIP_PATH"

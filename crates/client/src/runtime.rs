@@ -171,11 +171,11 @@ impl ClientRuntime {
     pub(crate) fn close_test_ingress(&self) {
         self.ws_client.close_test_events();
     }
-    pub fn recv_ws_event(&self) -> Option<GatewayWsEvent> {
+    pub fn recv_ws_event(&self) -> Option<pioneer_observability::work::WorkItem<GatewayWsEvent>> {
         self.ws_client.recv_event()
     }
 
-    pub fn drain_ws_events(&self) -> Vec<GatewayWsEvent> {
+    pub fn drain_ws_events(&self) -> Vec<pioneer_observability::work::WorkItem<GatewayWsEvent>> {
         self.ws_client.drain_events()
     }
 }

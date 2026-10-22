@@ -653,7 +653,11 @@ fn macos_bundle_plist_value(
         .args(["-extract", key, "raw", "-o", "-"])
         .arg(info_plist.as_path());
     environment.apply_to_std_command(&mut command);
-    let output = command.output().ok()?;
+    let output = pioneer_observability::resources::captured_output(
+        &mut command,
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -672,7 +676,11 @@ fn run_command_plan(
         let mut command = Command::new(plan.program.as_str());
         command.args(plan.args.iter().map(String::as_str));
         environment.apply_to_std_command(&mut command);
-        let output = command.output().map_err(|error| {
+        let output = pioneer_observability::resources::captured_output(
+            &mut command,
+            pioneer_observability::resources::ChildRole::PlatformHelper,
+        )
+        .map_err(|error| {
             ToolError::execution_failed(format!(
                 "failed to {purpose} computer_use target with `{} {}`: {error}",
                 plan.program,
@@ -712,7 +720,15 @@ fn run_command_plan(
             plan.args.join(" ")
         ))
     })?;
-    let _ = child.try_wait();
+    let mut observation = pioneer_observability::resources::ChildRegistration::register(
+        Some(child.id()),
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+        None,
+    );
+    if let Ok(Some(status)) = child.try_wait() {
+        observation.exited(status.success());
+    }
+    // This owner intentionally does not wait; Drop reports exit-unknown.
     Ok(())
 }
 
@@ -721,7 +737,10 @@ fn macos_running_app_info(environment: &ProcessEnvironmentPlan) -> Vec<RunningAp
     let mut command = Command::new("/usr/bin/lsappinfo");
     command.arg("visibleProcessList");
     environment.apply_to_std_command(&mut command);
-    let output = command.output();
+    let output = pioneer_observability::resources::captured_output(
+        &mut command,
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+    );
     let Ok(output) = output else {
         return Vec::new();
     };
@@ -749,7 +768,11 @@ fn macos_running_app_info_for_asn(
         asn,
     ]);
     environment.apply_to_std_command(&mut command);
-    let output = command.output().ok()?;
+    let output = pioneer_observability::resources::captured_output(
+        &mut command,
+        pioneer_observability::resources::ChildRole::PlatformHelper,
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
