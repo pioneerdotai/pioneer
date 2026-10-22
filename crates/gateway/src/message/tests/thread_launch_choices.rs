@@ -1,8 +1,9 @@
 //! Execution-bound thread actions: fixture catalogs never start real providers.
 use super::*;
 use pioneer_agent::TurnToolContext;
-use pioneer_protocol::{AgentToolLaunchSelection, AgentToolProfileChoice};
+use pioneer_protocol::{AgentToolLaunchSelection, AgentToolProfileChoice, TurnStartParams};
 use pioneer_tools::{ToolEventBus, ToolInvocation, ToolPayload};
+use std::path::PathBuf;
 
 struct ChoiceModelsProvider(PromptParityCaptureProvider);
 #[async_trait::async_trait]
