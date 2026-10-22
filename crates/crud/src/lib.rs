@@ -18305,6 +18305,27 @@ impl CrudStore {
         Ok(row.map(task_thread_lineage_from_db_model))
     }
 
+    /// Bounded direct edges for child listing and resumable subtree traversal.
+    /// Callers must authorize each child and guard cycles along the DFS path.
+    pub async fn list_thread_child_lineage_page(
+        &self,
+        parent_thread_id: &str,
+        after_child_thread_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<TaskThreadLineage>> {
+        let rows = thread_lineage::list_children_page(
+            &self.connection,
+            parent_thread_id,
+            after_child_thread_id,
+            limit,
+        )
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(task_thread_lineage_from_db_model)
+            .collect())
+    }
+
     pub async fn list_task_thread_lineage_for_parent(
         &self,
         parent_thread_id: &str,
@@ -23536,6 +23557,18 @@ impl CrudStore {
         self.attach_latest_thread_turn_snapshots(&mut threads)
             .await?;
         Ok(threads)
+    }
+
+    /// Unfiltered storage candidates for authorized thread observation.
+    /// Does not hydrate turns or change read cursors/subscriptions.
+    pub async fn list_thread_read_candidates_page(
+        &self,
+        workspace_id: &str,
+        after_thread_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<String>> {
+        thread::list_read_candidates_page(&self.connection, workspace_id, after_thread_id, limit)
+            .await
     }
 
     pub async fn list_threads_for_workspace(
@@ -34728,6 +34761,8 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 
 #[cfg(test)]
 mod tests {
+    mod saved_history_read;
+    mod thread_read_pages;
     mod unread_start;
     use crate::{
         NewThreadEpisodicExclusionRecord, PROJECTION_META_STATUS_PENDING,
@@ -60735,3 +60770,97 @@ pub use repositories::html_preview_retention::HtmlPreviewRetentionProgress;
 pub use repositories::html_preview_retention::archive_result as archive_html_preview_result;
 
 pub use repositories::html_preview_retention::HtmlPreviewArchiveWitness;
+
+pub use repositories::thread_history_read::{
+    SavedHistoryKey, SavedHistoryRow, SavedHistorySnapshot,
+};
+
+impl CrudStore {
+    pub async fn saved_history_snapshot(&self, thread_id: &str) -> Result<SavedHistorySnapshot> {
+        repositories::thread_history_read::snapshot(&self.connection, thread_id).await
+    }
+
+    pub async fn saved_history_page_at_snapshot(
+        &self,
+        thread_id: &str,
+        boundary: Option<&SavedHistoryKey>,
+        before: Option<&SavedHistoryKey>,
+        limit: u64,
+        snapshot: &SavedHistorySnapshot,
+    ) -> Result<Vec<SavedHistoryRow>> {
+        repositories::thread_history_read::page(
+            &self.connection,
+            thread_id,
+            boundary,
+            before,
+            limit,
+            snapshot,
+        )
+        .await
+    }
+
+    /// Directional metadata-only keyset page within the frozen saved set.
+    pub async fn saved_history_page_direction_at_snapshot(
+        &self,
+        thread_id: &str,
+        boundary: Option<&SavedHistoryKey>,
+        position: Option<&SavedHistoryKey>,
+        inclusive: bool,
+        newer: bool,
+        limit: u64,
+        snapshot: &SavedHistorySnapshot,
+    ) -> Result<Vec<SavedHistoryRow>> {
+        repositories::thread_history_read::page_direction(
+            &self.connection,
+            thread_id,
+            boundary,
+            position,
+            inclusive,
+            newer,
+            limit,
+            snapshot,
+        )
+        .await
+    }
+
+    pub async fn saved_history_anchor(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: Option<&str>,
+        snapshot: &SavedHistorySnapshot,
+    ) -> Result<Option<SavedHistoryRow>> {
+        repositories::thread_history_read::anchor(
+            &self.connection,
+            thread_id,
+            turn_id,
+            item_id,
+            snapshot,
+        )
+        .await
+    }
+
+    pub async fn saved_history_revision_at_snapshot(
+        &self,
+        thread_id: &str,
+        boundary: &SavedHistoryKey,
+        snapshot: &SavedHistorySnapshot,
+    ) -> Result<String> {
+        repositories::thread_history_read::revision(&self.connection, thread_id, boundary, snapshot)
+            .await
+    }
+
+    pub async fn saved_history_input(
+        &self,
+        turn_id: &str,
+        input_id: &str,
+    ) -> Result<Option<UserInput>> {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        pioneer_entity::turn_input::Entity::find_by_id(input_id.to_owned())
+            .filter(pioneer_entity::turn_input::Column::TurnId.eq(turn_id))
+            .one(&self.connection)
+            .await?
+            .map(decode_turn_input_model)
+            .transpose()
+    }
+}

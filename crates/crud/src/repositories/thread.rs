@@ -625,6 +625,35 @@ pub async fn update_user_thread_management(
     }))
 }
 
+/// Raw observation candidates, including hidden and archived (Closed) threads.
+/// Authorization belongs to the caller. Advance by the last *candidate* ID,
+/// including rows the caller cannot disclose; a filtered empty page is not EOF.
+pub async fn list_read_candidates_page<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    after_thread_id: Option<&str>,
+    limit: u64,
+) -> Result<Vec<String>> {
+    anyhow::ensure!(
+        (1..=200).contains(&limit),
+        "thread candidate page limit must be 1..=200"
+    );
+    let mut query = thread::Entity::find()
+        .select_only()
+        .column(thread::Column::Id)
+        .filter(thread::Column::WorkspaceId.eq(workspace_id.to_owned()));
+    if let Some(after) = after_thread_id {
+        query = query.filter(thread::Column::Id.gt(after.to_owned()));
+    }
+    query
+        .order_by_asc(thread::Column::Id)
+        .limit(limit)
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("failed to list thread read candidates")
+}
+
 pub async fn list_threads_by_workspace<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,

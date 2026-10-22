@@ -289,7 +289,7 @@ PY
 usage() {
   cat <<'USAGE'
 Usage:
-  package-macos.sh --target <rust-target> [--out-dir <dir>]
+  package-macos.sh --target <rust-target> [--out-dir <dir>] [--skip-build]
 
 Examples:
   package-macos.sh --target aarch64-apple-darwin
@@ -299,9 +299,13 @@ USAGE
 
 TARGET=""
 OUT_DIR=""
+SKIP_BUILD=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --skip-build)
+      SKIP_BUILD=true
+      ;;
     --target)
       shift
       [[ $# -gt 0 ]] || {
@@ -358,7 +362,7 @@ case "$PIONEER_APP_URL_SCHEME" in
 esac
 export PIONEER_APP_URL_SCHEME
 
-require_cmd cargo
+if [[ "$SKIP_BUILD" != true ]]; then require_cmd cargo; fi
 require_cmd hdiutil
 require_cmd gzip
 require_cmd ditto
@@ -370,16 +374,9 @@ if [[ -z "$OUT_DIR" ]]; then
 fi
 mkdir -p "$OUT_DIR"
 
-cargo build --locked --release -p pioneer-desktop --target "$TARGET"
-cargo build --locked --release -p pioneer-app-updater --target "$TARGET"
-if [[ -n "${PIONEER_REUSE_GATEWAY_RUN_ID:-}" ]]; then
-  : "${PIONEER_SYMBOL_INPUTS_DIR:?Gateway reuse requires retained symbol inputs}"
-  python3 scripts/packaging/symbol-inputs.py export --target "$TARGET" "$PIONEER_SYMBOL_INPUTS_DIR" \
-    "target/$TARGET/release/pioneer-app" "target/$TARGET/release/pioneer-app-updater"
-  python3 scripts/packaging/release-inputs.py gateway --run-id "$PIONEER_REUSE_GATEWAY_RUN_ID" \
-    --target "$TARGET" --out "$PIONEER_SYMBOL_INPUTS_DIR/gateway" \
-    --binary "target/$TARGET/release/pioneer"
-else
+if [[ "$SKIP_BUILD" != true ]]; then
+  cargo build --locked --release -p pioneer-desktop --target "$TARGET"
+  cargo build --locked --release -p pioneer-app-updater --target "$TARGET"
   cargo build --locked --release -p pioneer-cli --features computer-use --target "$TARGET"
   if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
     python3 scripts/packaging/symbol-inputs.py export --target "$TARGET" "$PIONEER_SYMBOL_INPUTS_DIR" \

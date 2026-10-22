@@ -16,6 +16,7 @@ use pioneer_tools::{
 pub(crate) enum NativeToolFamily {
     Html,
     Tasks,
+    Threads,
 }
 
 impl NativeToolFamily {
@@ -23,6 +24,7 @@ impl NativeToolFamily {
         match id {
             pioneer_tools::html::HTML_SERVER_ID => Some(Self::Html),
             "pioneer-task-tools-v1" => Some(Self::Tasks),
+            "pioneer-thread-tools-v1" => Some(Self::Threads),
             _ => None,
         }
     }
@@ -31,6 +33,7 @@ impl NativeToolFamily {
         match self {
             Self::Html => pioneer_tools::html::HTML_SERVER_ID,
             Self::Tasks => "pioneer-task-tools-v1",
+            Self::Threads => "pioneer-thread-tools-v1",
         }
     }
 
@@ -38,6 +41,7 @@ impl NativeToolFamily {
         match self {
             Self::Html => pioneer_tools::html::HTML_SERVER_NAME,
             Self::Tasks => "pioneer_tasks",
+            Self::Threads => "pioneer_threads",
         }
     }
 
@@ -47,9 +51,15 @@ impl NativeToolFamily {
 
     fn catalog(self) -> &'static [ConfiguredToolSpec] {
         static HTML: std::sync::OnceLock<Vec<ConfiguredToolSpec>> = std::sync::OnceLock::new();
+        static THREADS: std::sync::OnceLock<Vec<ConfiguredToolSpec>> = std::sync::OnceLock::new();
         static TASKS: std::sync::OnceLock<Vec<ConfiguredToolSpec>> = std::sync::OnceLock::new();
         match self {
             Self::Html => HTML.get_or_init(pioneer_tools::html::html_tool_specs),
+            Self::Threads => THREADS.get_or_init(|| {
+                let mut specs = crate::message::thread_read_tools::thread_read_tool_specs();
+                specs.extend(crate::message::thread_tool_results::thread_result_tool_specs());
+                specs
+            }),
             Self::Tasks => TASKS.get_or_init(|| {
                 let mut specs = crate::task_tools::task_tool_specs();
                 specs.push(pioneer_tools::threads_search::threads_search_tool_spec());
@@ -72,6 +82,7 @@ impl NativeToolFamily {
     pub(crate) fn action(self, name: &str) -> Result<ResourceAction, pioneer_tools::ToolError> {
         match self {
             Self::Html => Ok(ResourceAction::McpUse),
+            Self::Threads => Ok(ResourceAction::ThreadRead),
             // Reading the already capability-filtered launch catalog is not a
             // child-start mutation. ChildStart belongs to the Agent action
             // envelope, not the Turn execution's resource-action grant.
@@ -242,6 +253,16 @@ pub(crate) async fn materialize_task_tools(
     Ok(actions.bundles)
 }
 
+pub(crate) fn materialize_thread_tools(
+    processor: std::sync::Arc<crate::message::MessageProcessor>,
+    context: pioneer_agent::TurnToolContext,
+) -> Vec<pioneer_tools::ToolExtensionBundle> {
+    vec![
+        processor.thread_read_tools(context.clone()),
+        processor.thread_result_tools(context),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,15 +296,19 @@ mod tests {
                     capability_id: None,
                 });
             }
-            let definitions = [NativeToolFamily::Html, NativeToolFamily::Tasks]
-                .into_iter()
-                .flat_map(|family| {
-                    family
-                        .definitions()
-                        .into_iter()
-                        .map(move |spec| (family, spec))
-                })
-                .collect::<Vec<_>>();
+            let definitions = [
+                NativeToolFamily::Html,
+                NativeToolFamily::Tasks,
+                NativeToolFamily::Threads,
+            ]
+            .into_iter()
+            .flat_map(|family| {
+                family
+                    .definitions()
+                    .into_iter()
+                    .map(move |spec| (family, spec))
+            })
+            .collect::<Vec<_>>();
             let native_count = definitions.len();
             let projection = projection.with_native_tools(definitions, limits).unwrap();
             assert_eq!(projection.native_tool_count(), native_count);
@@ -336,7 +361,11 @@ mod tests {
                 opencode.facade_projection(budget).unwrap().tools().len(),
                 external + native_count
             );
-            for family in [NativeToolFamily::Html, NativeToolFamily::Tasks] {
+            for family in [
+                NativeToolFamily::Html,
+                NativeToolFamily::Tasks,
+                NativeToolFamily::Threads,
+            ] {
                 for definition in family.definitions() {
                     let actual = projection
                         .tools

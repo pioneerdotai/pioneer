@@ -1943,13 +1943,79 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
                 .list_turn_mcp_bindings(&turn_id)
                 .await
                 .unwrap();
-            for definition in crate::turn_mcp::native_tools::NativeToolFamily::Tasks.definitions() {
-                assert!(
-                    bindings
-                        .iter()
-                        .any(|binding| binding.raw_tool_name == definition.spec.name)
-                );
+            for family in [
+                crate::turn_mcp::native_tools::NativeToolFamily::Tasks,
+                crate::turn_mcp::native_tools::NativeToolFamily::Threads,
+            ] {
+                for definition in family.definitions() {
+                    assert!(
+                        bindings
+                            .iter()
+                            .any(|binding| binding.raw_tool_name == definition.spec.name)
+                    );
+                }
             }
+            // The fixed CLI binding must reach the shared observation handlers,
+            // rather than only publishing a schema with no native dispatcher.
+            let listed = invoke_task(
+                &processor,
+                &turn_id,
+                "read-list",
+                "threads_list",
+                json!({"limit":100}),
+            )
+            .await
+            .unwrap();
+            assert!(!listed.is_error, "{kind:?}: {listed:?}");
+            let thread_id = processor
+                .crud_store
+                .get_cli_runtime_turn_binding(&turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .thread_id;
+            assert!(
+                listed.structured_content.as_ref().unwrap()["threads"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["threadId"] == thread_id)
+            );
+            let history = invoke_task(
+                &processor,
+                &turn_id,
+                "read-history",
+                "threads_history_read",
+                json!({"threadId":thread_id,"limit":2}),
+            )
+            .await
+            .unwrap();
+            assert!(!history.is_error, "{kind:?}: {history:?}");
+            assert!(history.structured_content.as_ref().unwrap()["events"].is_array());
+            // Anchor schema and dispatch travel through the same frozen family
+            // for every provider, rather than a provider-specific history path.
+            let near = invoke_task(
+                &processor,
+                &turn_id,
+                "read-history-anchor",
+                "threads_history_read",
+                json!({"threadId":thread_id,"limit":1,"anchor":{"turnId":turn_id}}),
+            )
+            .await
+            .unwrap();
+            assert!(!near.is_error, "{kind:?}: {near:?}");
+            let near = near.structured_content.as_ref().unwrap();
+            assert_eq!(near["events"][0]["turnId"], turn_id);
+            assert_eq!(near["direction"], "older");
+            let newer = invoke_task(
+                &processor, &turn_id, "read-history-newer", "threads_history_read",
+                json!({"threadId":thread_id,"limit":1,"direction":"newer","cursor":near["reverseCursor"]}),
+            ).await.unwrap();
+            assert!(!newer.is_error, "{kind:?}: {newer:?}");
+            assert_eq!(
+                newer.structured_content.as_ref().unwrap()["direction"],
+                "newer"
+            );
             let skills = processor
                 .crud_store
                 .find_turn_skill_bindings(&turn_id)

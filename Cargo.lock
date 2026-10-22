@@ -10758,6 +10758,7 @@ dependencies = [
  "process-wrap",
  "rand 0.10.3",
  "reqwest",
+ "ring",
  "same-file",
  "schemars 1.2.3",
  "sea-orm",
