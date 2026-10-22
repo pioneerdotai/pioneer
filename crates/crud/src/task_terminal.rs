@@ -119,6 +119,15 @@ impl CrudStore {
         &self,
         terminal: TaskEventPayload,
     ) -> Result<PreparedTaskTerminalTransition> {
+        // Terminal orchestration is also polled from nested Gateway failure
+        // paths. Keep its database futures out of the caller's future frame.
+        Box::pin(self.prepare_task_terminal_transition_inner(terminal)).await
+    }
+
+    async fn prepare_task_terminal_transition_inner(
+        &self,
+        terminal: TaskEventPayload,
+    ) -> Result<PreparedTaskTerminalTransition> {
         let (at, result, error, lock_status, mut lock_reason) = terminal_facts(&terminal)?;
         let state = load_terminal_state(
             &self.connection,
@@ -336,6 +345,15 @@ impl CrudStore {
     }
 
     pub async fn commit_task_terminal_transition(
+        &self,
+        prepared: PreparedTaskTerminalTransition,
+    ) -> Result<TaskTerminalCommitOutcome> {
+        // Finish reconciliation includes both commit and fresh preparation;
+        // heap-allocate that state machine on ordinary Gateway worker stacks.
+        Box::pin(self.commit_task_terminal_transition_inner(prepared)).await
+    }
+
+    async fn commit_task_terminal_transition_inner(
         &self,
         prepared: PreparedTaskTerminalTransition,
     ) -> Result<TaskTerminalCommitOutcome> {

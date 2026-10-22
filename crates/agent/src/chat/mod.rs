@@ -9061,6 +9061,7 @@ mod tests {
                 "task_accept",
                 "task_revise",
                 "task_cancel",
+                "task_finish",
                 "task_update",
                 "task_detach",
                 "task_list",
