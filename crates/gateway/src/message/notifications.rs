@@ -1497,7 +1497,7 @@ impl MessageProcessor {
             .await
     }
 
-    async fn authorized_thread_connection_recipients(
+    pub(super) async fn authorized_thread_connection_recipients(
         &self,
         thread_id: &str,
         connection_ids: Vec<ConnectionId>,
@@ -1555,7 +1555,10 @@ impl MessageProcessor {
 
             if let Some(auth_service) = self.auth_service.as_ref()
                 && auth_service
-                    .validate_session_lease(principal.as_ref())
+                    .validate_session_lease_with_database(
+                        principal.as_ref(),
+                        &self.crud_store.database_connection(),
+                    )
                     .await
                     .is_err()
             {
@@ -1710,6 +1713,11 @@ impl MessageProcessor {
             .session_manager
             .connection_ids_for_workspace(workspace_id)
             .await;
+        let candidate_connection_ids = self.legacy_push_connections(
+            candidate_connection_ids,
+            method == events::THREAD_TREE_CHANGED,
+            method == events::TASK_COMPLETION_INBOX_CHANGED,
+        );
         let connection_ids = self
             .authorized_task_notification_recipients(
                 task_id,
@@ -1793,7 +1801,10 @@ impl MessageProcessor {
             };
             if let Some(auth_service) = self.auth_service.as_ref()
                 && auth_service
-                    .validate_session_lease(principal.as_ref())
+                    .validate_session_lease_with_database(
+                        principal.as_ref(),
+                        &self.crud_store.database_connection(),
+                    )
                     .await
                     .is_err()
             {
@@ -1871,7 +1882,11 @@ impl MessageProcessor {
             .await;
     }
 
-    fn serialize_notification<T: Serialize>(&self, method: &str, payload: &T) -> Option<String> {
+    pub(super) fn serialize_notification<T: Serialize>(
+        &self,
+        method: &str,
+        payload: &T,
+    ) -> Option<String> {
         let markdown_stream = markdown_notification_stream(method);
         let encode_started = markdown_stream.map(|_| Instant::now());
         let mut notification = match JsonRpcNotification::from_params(method, payload) {

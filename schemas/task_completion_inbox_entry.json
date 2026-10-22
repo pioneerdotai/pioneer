@@ -8,6 +8,10 @@
       "type": "integer",
       "format": "int64"
     },
+    "completedKey": {
+      "description": "Exact server keyset ordering key. Empty only for legacy servers.",
+      "type": "string"
+    },
     "error": {
       "type": [
         "string",

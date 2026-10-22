@@ -532,6 +532,14 @@ impl MessageProcessor {
             }
         };
 
+        self.dirty_push(
+            authorization.workspace_id(),
+            Some(authorization.thread_id()),
+            None,
+            None,
+            false,
+            None,
+        );
         log_message_mutation_outcome(
             authorization,
             operation,
@@ -562,7 +570,7 @@ impl MessageProcessor {
             authorization.turn_id(),
         )
         .await;
-        self.notify_thread_tree_changed(authorization.workspace_id().to_owned())
+        self.notify_thread_unread_legacy(authorization.workspace_id(), authorization.thread_id())
             .await;
     }
 
@@ -623,6 +631,16 @@ impl MessageProcessor {
                 return;
             }
         };
+        if result.event.is_some() {
+            self.dirty_push(
+                authorization.workspace_id(),
+                Some(authorization.thread_id()),
+                None,
+                None,
+                false,
+                None,
+            );
+        }
         let mutation_outcome = if result.event.is_some() {
             "accepted"
         } else {
@@ -654,8 +672,11 @@ impl MessageProcessor {
                 authorization.turn_id(),
             )
             .await;
-            self.notify_thread_tree_changed(authorization.workspace_id().to_owned())
-                .await;
+            self.notify_thread_unread_legacy(
+                authorization.workspace_id(),
+                authorization.thread_id(),
+            )
+            .await;
         }
     }
 

@@ -312,6 +312,14 @@ fn unread_condition(access: &TaskCompletionInboxAccess<'_>) -> Condition {
 }
 
 fn relation(access: &TaskCompletionInboxAccess<'_>, workspace_scan: bool) -> SelectStatement {
+    relation_with_access(access, workspace_scan, workspace_scan)
+}
+
+fn relation_with_access(
+    access: &TaskCompletionInboxAccess<'_>,
+    workspace_scan: bool,
+    unread_access: bool,
+) -> SelectStatement {
     use InboxAlias as A;
     let mut query = Query::select();
     if workspace_scan {
@@ -364,7 +372,7 @@ fn relation(access: &TaskCompletionInboxAccess<'_>, workspace_scan: bool) -> Sel
             ),
         )
         .and_where(Expr::col((S::Thread, thread::Column::Id)).is_not_null())
-        .cond_where(access_condition(access, workspace_scan));
+        .cond_where(access_condition(access, unread_access));
     query
 }
 
@@ -554,6 +562,32 @@ pub async fn count_unread_task_completion_inbox<C: ConnectionTrait>(
         .await?
         .context("inbox count missing")?;
     Ok(UnreadCount::from_query_result(&row, "")?.count as u64)
+}
+
+/// Exact unread membership, not broad history lookup. Missing requested IDs
+/// mean remove. Call with count on the same short read snapshot for one packet.
+/// Projection occurs only after the bounded canonical membership CTE.
+pub async fn find_unread_task_completion_inbox_entries<C: ConnectionTrait>(
+    db: &C,
+    access: &TaskCompletionInboxAccess<'_>,
+    run_ids: &[String],
+) -> Result<Vec<TaskCompletionInboxRow>> {
+    anyhow::ensure!(run_ids.len() <= 100, "inbox addressed batch exceeds limit");
+    if run_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut page = relation_with_access(access, false, true);
+    select_metadata(&mut page, access);
+    page.cond_where(unread_condition(access))
+        .and_where(
+            Expr::col((InboxAlias::Run, task_run::Column::Id)).is_in(run_ids.iter().cloned()),
+        )
+        .limit(100);
+    db.query_all(&project_page(page))
+        .await?
+        .iter()
+        .map(|row| InboxRow::from_query_result(row, "")?.try_into())
+        .collect()
 }
 
 pub async fn find_task_completion_inbox_entry<C: ConnectionTrait>(

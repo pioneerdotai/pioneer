@@ -992,6 +992,12 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("thread_start_params.json", ThreadStartParams),
         schema_doc!("thread_start_response.json", ThreadStartResponse),
         schema_doc!("thread_tree_params.json", ThreadTreeParams),
+        schema_doc!("workspace_push_params.json", crate::WorkspacePushParams),
+        schema_doc!("workspace_push_response.json", crate::WorkspacePushResponse),
+        schema_doc!(
+            "workspace_push_notification.json",
+            crate::WorkspacePushNotification
+        ),
         schema_doc!("thread_tree_response.json", ThreadTreeResponse),
         schema_doc!("thread_unread_summary.json", ThreadUnreadSummary),
         schema_doc!("thread_update_params.json", ThreadUpdateParams),

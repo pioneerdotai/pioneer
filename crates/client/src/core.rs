@@ -3005,6 +3005,7 @@ impl ClientCore {
                 .invalidate();
         }
         if evict_protected {
+            self.retire_workspace_push();
             self.task_notifications
                 .lock()
                 .expect("task inbox poisoned")

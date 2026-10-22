@@ -20,6 +20,7 @@ impl MessageProcessor {
         &self,
         signal: &AccessChangeSignal,
     ) {
+        self.retire_push_workspace(signal.workspace_id.as_str());
         let lease_reprojection = self
             .execution_leases
             .reproject_scope(self.crud_store.as_ref(), signal)

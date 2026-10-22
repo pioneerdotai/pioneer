@@ -29,6 +29,7 @@ mod permission_handlers;
 mod provider_handlers;
 mod provider_readiness;
 mod reconciliation_diagnostics;
+mod scoped_push;
 pub(crate) mod skills;
 mod summary;
 mod task_agent_executor;
@@ -568,6 +569,7 @@ pub struct MessageProcessor {
     agent_manager: Arc<AgentManager>,
     provider_registry: Arc<ProviderRegistry>,
     session_manager: Arc<SessionManager>,
+    push_scopes: Arc<scoped_push::PushScopes>,
     authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
     execution_leases: Arc<crate::authorization::ExecutionLeaseRegistry>,
     observation_governor: Arc<crate::authorization::ObservationAdmissionGovernor>,
@@ -1213,6 +1215,7 @@ impl MessageProcessor {
             agent_manager,
             provider_registry,
             session_manager,
+            push_scopes: Arc::new(scoped_push::PushScopes::default()),
             authorization_invalidation_hub,
             execution_leases,
             observation_governor,
@@ -4866,6 +4869,7 @@ impl MessageProcessor {
             agent_manager,
             provider_registry,
             session_manager,
+            push_scopes: Arc::new(scoped_push::PushScopes::default()),
             authorization_invalidation_hub,
             execution_leases,
             observation_governor,

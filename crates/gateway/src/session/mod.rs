@@ -198,6 +198,7 @@ const TERMINATED_SESSION_TOMBSTONE_TTL: Duration = Duration::from_secs(60 * 60);
 struct SessionConnection {
     sender: SessionOutbound,
     termination_tx: watch::Sender<Option<AuthSessionTerminationReason>>,
+    scope_change_tx: watch::Sender<()>,
     workspace_id: Option<String>,
     principal: Arc<AuthenticatedSessionPrincipal>,
 }
@@ -252,11 +253,13 @@ impl SessionManager {
         let session_id = principal.session_id.to_string();
         let device_id = principal.device_id.to_string();
         let (termination_tx, _) = watch::channel(None);
+        let (scope_change_tx, _) = watch::channel(());
         self.connections.write().await.insert(
             connection_id,
             SessionConnection {
                 sender,
                 termination_tx,
+                scope_change_tx,
                 workspace_id: None,
                 principal,
             },
@@ -375,6 +378,7 @@ impl SessionManager {
         if now >= expected.access_expires_at_unix {
             return Err(ConnectionRenewalError::AccessExpired);
         }
+        connection.scope_change_tx.send_replace(());
         connection.principal = next.clone();
         Ok(ConnectionContext::new(connection_id, next))
     }
@@ -438,6 +442,18 @@ impl SessionManager {
             .ok_or_else(|| anyhow!("connection `{connection_id}` is not registered"))
     }
 
+    pub(crate) async fn connection_scope_receiver(
+        &self,
+        id: ConnectionId,
+    ) -> Result<watch::Receiver<()>> {
+        self.connections
+            .read()
+            .await
+            .get(&id)
+            .map(|connection| connection.scope_change_tx.subscribe())
+            .ok_or_else(|| anyhow!("connection is not registered"))
+    }
+
     pub async fn set_connection_workspace(
         &self,
         connection_id: ConnectionId,
@@ -448,10 +464,14 @@ impl SessionManager {
             return;
         };
 
-        connection.workspace_id = workspace_id.and_then(|value| {
+        let workspace_id = workspace_id.and_then(|value| {
             let trimmed = value.trim();
             (!trimmed.is_empty()).then_some(trimmed.to_owned())
         });
+        if workspace_id != connection.workspace_id {
+            connection.scope_change_tx.send_replace(());
+            connection.workspace_id = workspace_id;
+        }
     }
 
     pub async fn send_text(&self, connection_id: ConnectionId, payload: String) -> Result<()> {
@@ -475,9 +495,31 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Best-effort notification delivery. Unlike request/response writes this
-    /// never waits for outbound capacity: a lagging socket is fenced so it
-    /// cannot apply backpressure to lifecycle persistence or other clients.
+    /// Run a synchronous final scope/generation gate at the existing outbound
+    /// lane. The callback cannot await or hold database capacity.
+    pub(crate) async fn with_notification_outbound<T>(
+        &self,
+        connection_id: ConnectionId,
+        expected: &AuthenticatedSessionPrincipal,
+        workspace: &str,
+        enqueue: impl FnOnce(&SessionOutbound) -> Result<T>,
+    ) -> Result<Option<T>> {
+        let connections = self.connections.read().await;
+        let connection = connections
+            .get(&connection_id)
+            .ok_or_else(|| anyhow!("connection is not registered"))?;
+        let now = crate::helpers::unix_timestamp_secs()?;
+        if connection.principal.as_ref() != expected
+            || connection.workspace_id.as_deref() != Some(workspace)
+            || connection.termination_tx.borrow().is_some()
+            || now >= expected.access_expires_at_unix
+        {
+            return Ok(None);
+        }
+        enqueue(&connection.sender).map(Some)
+    }
+
+    /// Best-effort delivery; a saturated socket is retired instead of queued.
     pub async fn try_send_notification_text(
         &self,
         connection_id: ConnectionId,
@@ -1116,5 +1158,91 @@ mod tests {
             Some(pioneer_protocol::AuthSessionTerminationReason::SessionRevoked)
         );
         assert!(manager.connection_principal(connection_id).await.is_err());
+    }
+    #[tokio::test]
+    async fn queued_derived_payload_checks_current_workspace_identity_and_expiry_at_enqueue() {
+        let manager = SessionManager::new();
+        let principal = authenticated_test_superuser();
+        let (tx, mut rx) = mpsc::channel(4);
+        let connection = manager
+            .register_connection(tx, principal.clone())
+            .await
+            .unwrap();
+        manager
+            .set_connection_workspace(connection, Some("first".into()))
+            .await;
+        let send = |outbound: &SessionOutbound| {
+            outbound
+                .try_send(Message::Text("derived value".into()))
+                .map_err(|error| anyhow!("{error}"))?;
+            Ok(())
+        };
+        assert!(
+            manager
+                .with_notification_outbound(connection, &principal, "first", send)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            rx.recv().await.unwrap().into_text().unwrap(),
+            "derived value"
+        );
+        manager
+            .set_connection_workspace(connection, Some("second".into()))
+            .await;
+        assert!(
+            manager
+                .with_notification_outbound(connection, &principal, "first", send)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let mut renewed = (*principal).clone();
+        renewed.access_jti = "new-access-token".into();
+        manager
+            .renew_connection_principal(connection, &principal, Arc::new(renewed.clone()))
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .with_notification_outbound(connection, &principal, "second", send)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            manager
+                .with_notification_outbound(connection, &renewed, "second", send)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let _ = rx.recv().await.unwrap();
+        let mut expired = renewed;
+        expired.access_expires_at_unix = 0;
+        let (expired_tx, mut expired_rx) = mpsc::channel(1);
+        let expired_connection = manager
+            .register_connection(expired_tx, Arc::new(expired.clone()))
+            .await
+            .unwrap();
+        manager
+            .set_connection_workspace(expired_connection, Some("second".into()))
+            .await;
+        assert!(
+            manager
+                .with_notification_outbound(expired_connection, &expired, "second", send)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            expired_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 }

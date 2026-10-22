@@ -1100,6 +1100,14 @@ impl MessageProcessor {
                         .await;
                     return Err(error);
                 }
+                self.dirty_push(
+                    &delivery.workspace_id,
+                    Some(thread_id),
+                    None,
+                    None,
+                    false,
+                    None,
+                );
                 self.send_notification_to_authorized_thread_connections(
                     thread_id,
                     events::TURN_STARTED,
@@ -1128,7 +1136,7 @@ impl MessageProcessor {
                     &item_completed,
                 )
                 .await;
-                self.notify_semantic_timeline_item_changed(
+                self.notify_semantic_timeline_item_changed_after_indicator_commit(
                     item_completed.workspace_id.as_str(),
                     item_completed.thread_id.as_str(),
                     item_completed.turn_id.as_str(),
@@ -1172,6 +1180,14 @@ impl MessageProcessor {
                         .await;
                     return Err(error);
                 }
+                self.dirty_push(
+                    &delivery.workspace_id,
+                    Some(thread_id),
+                    None,
+                    None,
+                    false,
+                    None,
+                );
                 self.send_notification_to_authorized_thread_connections(
                     thread_id,
                     events::TURN_STARTED,
@@ -1193,7 +1209,7 @@ impl MessageProcessor {
                 .await;
             }
         }
-        self.notify_thread_tree_changed(delivery.workspace_id.clone())
+        self.notify_thread_unread_legacy(&delivery.workspace_id, thread_id)
             .await;
         Ok(turn_id)
     }
@@ -1260,6 +1276,7 @@ impl MessageProcessor {
         self.crud_store
             .materialize_task_delivery_item(started.clone(), completed.clone(), now, agent_action)
             .await?;
+        self.dirty_push(workspace_id, Some(thread_id), None, None, false, None);
         self.send_notification_to_thread_subscribers(thread_id, events::ITEM_STARTED, &started)
             .await;
         self.notify_semantic_timeline_item_changed(
@@ -1276,7 +1293,7 @@ impl MessageProcessor {
         self.kick_native_turn_event_deliveries();
         self.send_notification_to_thread_subscribers(thread_id, events::ITEM_COMPLETED, &completed)
             .await;
-        self.notify_semantic_timeline_item_changed(
+        self.notify_semantic_timeline_item_changed_after_indicator_commit(
             completed.workspace_id.as_str(),
             completed.thread_id.as_str(),
             completed.turn_id.as_str(),
@@ -1284,6 +1301,8 @@ impl MessageProcessor {
             Some("completed"),
         )
         .await;
+        self.notify_thread_unread_legacy(workspace_id, thread_id)
+            .await;
         Ok(())
     }
 

@@ -42,6 +42,18 @@ pub fn internal_client_schema_exclusions() -> Vec<ClientSchemaInternalExclusion>
 pub fn client_schema_documents() -> Vec<SchemaDocument> {
     let mut documents = vec![
         schema_doc!(
+            "workspace_push_params.json",
+            pioneer_protocol::WorkspacePushParams
+        ),
+        schema_doc!(
+            "workspace_push_response.json",
+            pioneer_protocol::WorkspacePushResponse
+        ),
+        schema_doc!(
+            "workspace_push_notification.json",
+            pioneer_protocol::WorkspacePushNotification
+        ),
+        schema_doc!(
             "settings_model_picker_publication.json",
             crate::settings::model_picker::SettingsModelPickerPublication
         ),

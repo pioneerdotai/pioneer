@@ -1,0 +1,193 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkspacePushNotification",
+  "type": "object",
+  "properties": {
+    "epoch": {
+      "type": "string"
+    },
+    "inbox": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TaskInboxPatch"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "indicators": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ThreadIndicatorPatch"
+      }
+    },
+    "resyncRequired": {
+      "type": "boolean"
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "snapshot": {
+      "type": "boolean"
+    },
+    "workspaceId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspaceId",
+    "epoch",
+    "revision",
+    "snapshot",
+    "resyncRequired",
+    "indicators"
+  ],
+  "$defs": {
+    "TaskCompletionInboxEntry": {
+      "description": "One saved terminal run in the current user's workspace inbox. Contains no\nexecution-thread identity, raw failure, HTML, or full result payload.",
+      "type": "object",
+      "properties": {
+        "completedAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "completedKey": {
+          "description": "Exact server keyset ordering key. Empty only for legacy servers.",
+          "type": "string"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "readAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/TaskRunStatus"
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "threadTitle": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "workspaceId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "taskId",
+        "runId",
+        "title",
+        "threadId",
+        "threadTitle",
+        "status",
+        "completedAt"
+      ]
+    },
+    "TaskInboxPatch": {
+      "type": "object",
+      "properties": {
+        "nextCursor": {
+          "description": "Authoritative keyset frontier when snapshot or replace is true.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "removes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "replace": {
+          "description": "Authoritative inbox replacement, also used by a read-all mutation ack.",
+          "type": "boolean",
+          "default": false
+        },
+        "unreadCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "upserts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TaskCompletionInboxEntry"
+          }
+        }
+      },
+      "required": [
+        "upserts",
+        "removes",
+        "unreadCount"
+      ]
+    },
+    "TaskRunStatus": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "starting",
+        "running",
+        "waiting",
+        "waiting_review",
+        "succeeded",
+        "failed",
+        "blocked",
+        "cancelled",
+        "timed_out"
+      ]
+    },
+    "ThreadIndicatorPatch": {
+      "type": "object",
+      "properties": {
+        "hasRunningTasks": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "unreadCount": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "threadId"
+      ]
+    }
+  }
+}

@@ -10453,6 +10453,14 @@ impl MessageProcessor {
         outcome: &crate::thread::TurnStartOutcome,
         user_message_capability_attachments: &[pioneer_protocol::UserMessageAttachment],
     ) -> bool {
+        self.dirty_push(
+            &outcome.started_notification.workspace_id,
+            Some(&outcome.started_notification.thread_id),
+            None,
+            None,
+            false,
+            None,
+        );
         // Detached Composer published this lifecycle before Task creation.
         if !outcome
             .materialization
@@ -10484,8 +10492,11 @@ impl MessageProcessor {
             outcome.started_notification_connection_ids.clone(),
         )
         .await;
-        self.notify_thread_tree_changed(outcome.started_notification.workspace_id.clone())
-            .await;
+        self.notify_thread_unread_legacy(
+            &outcome.started_notification.workspace_id,
+            &outcome.started_notification.thread_id,
+        )
+        .await;
 
         // Spawn background title generation on first turn (fire-and-forget) only for user-origin threads.
         if outcome.materialization.thread.name.is_none()

@@ -329,6 +329,7 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         NotFound,
         Mutation,
     ),
+    method_entry(WORKSPACE_PUSH, WorkspaceRead, Workspace, NotFound, Read),
     method_entry(THREAD_TREE, WorkspaceRead, Workspace, NotFound, Read),
     method_entry(THREAD_UPDATE, ThreadManage, Thread, NotFound, Mutation),
     method_entry(THREAD_MOVE, ThreadMove, Thread, NotFound, Management),

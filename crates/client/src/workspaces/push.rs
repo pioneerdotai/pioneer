@@ -1,0 +1,725 @@
+//! Connection-owned push demand, using the existing workspace worker and socket.
+use crate::core::ClientCore;
+use pioneer_protocol::{WorkspacePushNotification, WorkspacePushParams, WorkspacePushResponse};
+use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Default)]
+pub(super) struct PushController {
+    pub(super) pending: BTreeSet<String>,
+    scopes: BTreeMap<String, Scope>,
+    serial: u64,
+    unsupported_identity: Option<(u64, (u64, u64), String)>,
+}
+struct Scope {
+    identity: (u64, (u64, u64), String),
+    params: WorkspacePushParams,
+    revision: u64,
+    // None until registration completes; packets may precede the RPC reply.
+    supported: Option<bool>,
+    recovering: bool,
+    bootstrap_retry: bool,
+}
+impl ClientCore {
+    pub(crate) fn retire_workspace_push(&self) {
+        let mut owner = self
+            .workspace_controller
+            .lock()
+            .expect("workspace controller poisoned");
+        owner.push.pending.clear();
+        owner.push.scopes.clear();
+        owner.push.unsupported_identity = None;
+    }
+    fn push_identity(&self) -> Option<(u64, (u64, u64), String)> {
+        Some((
+            self.gateway_http_generation()?,
+            self.authorization_operation_epoch(),
+            self.current_auth()?.principal.id.to_string(),
+        ))
+    }
+    pub(crate) fn queue_workspace_push(&self, workspace: &str) {
+        if self.is_stopped() {
+            return;
+        }
+        let mut owner = self
+            .workspace_controller
+            .lock()
+            .expect("workspace controller poisoned");
+        // Workspace demand is already bounded by retained subscriptions. Never
+        // turn malformed/unknown IDs into an unbounded controller queue.
+        if owner.push.pending.len() >= 256 && !owner.push.pending.contains(workspace) {
+            // One actual connection scope: overflow collapses queued identities
+            // to reconciliation of that scope and the newest demand, not backlog.
+            let active = owner.push.scopes.keys().next().cloned();
+            owner.push.pending.clear();
+            owner.push.pending.extend(active);
+        }
+        owner.push.pending.insert(workspace.to_owned());
+        owner.wake();
+    }
+    pub(crate) fn pause_workspace_push_for_page(&self, workspace: &str) {
+        let mut owner = self
+            .workspace_controller
+            .lock()
+            .expect("workspace controller poisoned");
+        if let Some(scope) = owner.push.scopes.get_mut(workspace) {
+            scope.recovering = true;
+            scope.supported = Some(false);
+            let mut inbox_owner = self.task_notifications.lock().expect("task inbox poisoned");
+            Self::pause_inbox_push_epoch(&mut inbox_owner.store, workspace);
+            // Existing tree counts remain protected from legacy acks. Packets
+            // of the retired epoch are ignored until the canonical page arrives;
+            // completion registers an authoritative new snapshot closing the gap.
+        }
+    }
+    pub(crate) fn workspace_push_inbox_active(&self, workspace: &str) -> bool {
+        let identity = self.push_identity();
+        let owner = self
+            .workspace_controller
+            .lock()
+            .expect("workspace controller poisoned");
+        owner.push.scopes.get(workspace).is_some_and(|scope| {
+            Some(&scope.identity) == identity.as_ref()
+                && scope.supported != Some(false)
+                && scope.params.inbox
+        })
+    }
+    pub(crate) fn reconcile_workspace_push(&self, workspace: &str) {
+        if self.inbox_push_page_pending(workspace) {
+            return;
+        }
+        let Some(identity) = self.push_identity() else {
+            return;
+        };
+        if self.authorization_snapshot(Some(workspace), None).is_none() {
+            return;
+        }
+        let mut thread_ids = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned")
+            .directory
+            .push_demand(workspace);
+        let mut inbox = self.inbox_push_demand(workspace);
+        if self
+            .navigation_snapshot()
+            .workspace_id()
+            .is_some_and(|selected| selected != workspace)
+        {
+            thread_ids = None;
+            inbox = None;
+        }
+        if thread_ids.as_ref().is_some_and(|ids| ids.len() > 4096) {
+            thread_ids = None;
+        }
+        if inbox.as_ref().is_some_and(|(ids, _)| ids.len() > 4096) {
+            inbox = None;
+        }
+        let mut tree = thread_ids.is_some();
+        let mut wants_inbox = inbox.is_some();
+        let mut thread_ids = thread_ids.unwrap_or_default();
+        thread_ids.sort();
+        let (mut run_ids, mut inbox_cursor) = inbox.unwrap_or_default();
+        run_ids.sort();
+        let params = {
+            let mut owner = self
+                .workspace_controller
+                .lock()
+                .expect("workspace controller poisoned");
+            if owner.push.unsupported_identity.as_ref() == Some(&identity) {
+                // A persistently failing bootstrap falls back once per identity.
+                // Retire a possibly live server registration on this worker,
+                // never by blocking the notification ingress on an RPC.
+                if !owner
+                    .push
+                    .scopes
+                    .get(workspace)
+                    .is_some_and(|scope| scope.params.tree || scope.params.inbox)
+                {
+                    return;
+                }
+                tree = false;
+                wants_inbox = false;
+                thread_ids.clear();
+                run_ids.clear();
+                inbox_cursor = None;
+            }
+            if let Some(scope) = owner.push.scopes.get(workspace) {
+                if !scope.recovering
+                    && scope.identity == identity
+                    && scope.params.tree == tree
+                    && scope.params.inbox == wants_inbox
+                    && scope.params.thread_ids == thread_ids
+                    && scope.params.run_ids == run_ids
+                    && scope.params.inbox_cursor == inbox_cursor
+                {
+                    return;
+                }
+            } else if (!tree && !wants_inbox) || owner.push.scopes.len() >= 256 {
+                return;
+            }
+            let bootstrap_retry = owner.push.scopes.get(workspace).is_some_and(|scope| {
+                scope.identity == identity && scope.recovering && scope.revision == 0
+            });
+            owner.push.serial = owner.push.serial.wrapping_add(1);
+            let epoch = format!(
+                "{}:{}:{}:{}:{}",
+                identity.0,
+                identity.1.0,
+                identity.1.1,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+                owner.push.serial
+            );
+            let params = WorkspacePushParams {
+                workspace_id: workspace.to_owned(),
+                epoch,
+                tree,
+                inbox: wants_inbox,
+                thread_ids,
+                run_ids,
+                inbox_cursor,
+            };
+            // Gateway owns one workspace scope per physical connection. Switching
+            // workspace replaces it; an old queued unsubscribe must not retire the
+            // new scope. Keep the same invariant in the shared client.
+            let retired = owner
+                .push
+                .scopes
+                .keys()
+                .filter(|id| id.as_str() != workspace)
+                .cloned()
+                .collect::<Vec<_>>();
+            owner.push.scopes.retain(|id, _| id == workspace);
+            owner.push.scopes.insert(
+                workspace.to_owned(),
+                Scope {
+                    identity: identity.clone(),
+                    params: params.clone(),
+                    revision: 0,
+                    supported: None,
+                    recovering: false,
+                    bootstrap_retry,
+                },
+            );
+            // Install before sending: the authoritative snapshot may arrive
+            // before the register RPC response on the same socket.
+            let mut inbox_owner = self.task_notifications.lock().expect("task inbox poisoned");
+            let mut registry = self
+                .thread_registry
+                .lock()
+                .expect("thread registry poisoned");
+            for old in retired {
+                registry.directory.push_revisions.remove(&old);
+                Self::set_inbox_push_epoch(&mut inbox_owner.store, &old, None);
+            }
+            if tree {
+                registry
+                    .directory
+                    .push_revisions
+                    .insert(workspace.to_owned(), (params.epoch.clone(), 0));
+            } else {
+                registry.directory.push_revisions.remove(workspace);
+            }
+            Self::set_inbox_push_epoch(
+                &mut inbox_owner.store,
+                workspace,
+                wants_inbox.then_some(params.epoch.as_str()),
+            );
+            params
+        };
+        let result: anyhow::Result<WorkspacePushResponse> = crate::rpc::send_json_rpc_request_typed(
+            &self.transport_runtime().ws_command_sender(),
+            pioneer_protocol::constants::methods::WORKSPACE_PUSH,
+            &params,
+            crate::rpc::RPC_REQUEST_TIMEOUT,
+        );
+        let current_identity = self.push_identity();
+        let mut owner = self
+            .workspace_controller
+            .lock()
+            .expect("workspace controller poisoned");
+        let Some(scope) = owner.push.scopes.get_mut(workspace) else {
+            return;
+        };
+        if scope.params.epoch != params.epoch
+            || scope.recovering
+            || current_identity.as_ref() != Some(&identity)
+        {
+            return;
+        }
+        let failed = result.is_err();
+        let supported = result.is_ok_and(|response| response.supported);
+        scope.supported = Some(supported);
+        if !supported || (!tree && !wants_inbox) {
+            self.thread_registry
+                .lock()
+                .expect("thread registry poisoned")
+                .directory
+                .push_revisions
+                .remove(workspace);
+            let mut inbox_owner = self.task_notifications.lock().expect("task inbox poisoned");
+            Self::set_inbox_push_epoch(&mut inbox_owner.store, workspace, None);
+            if !tree && !wants_inbox {
+                owner.push.scopes.remove(workspace);
+            }
+        }
+        if !supported {
+            owner.push.unsupported_identity = Some(identity);
+        }
+        drop(owner);
+        if !supported && (tree || wants_inbox) {
+            if failed {
+                // A lost reply can follow successful registration. One bounded
+                // cleanup attempt restores legacy hints on the same connection.
+                let mut unsubscribe = params;
+                unsubscribe.tree = false;
+                unsubscribe.inbox = false;
+                let _: anyhow::Result<WorkspacePushResponse> =
+                    crate::rpc::send_json_rpc_request_typed(
+                        &self.transport_runtime().ws_command_sender(),
+                        pioneer_protocol::constants::methods::WORKSPACE_PUSH,
+                        &unsubscribe,
+                        crate::rpc::RPC_REQUEST_TIMEOUT,
+                    );
+            }
+            if tree {
+                self.queue_directory_refresh(workspace);
+            }
+            if wants_inbox {
+                self.task_notification_intent(
+                    crate::tasks::notifications::TaskNotificationIntent::Refresh {
+                        workspace_id: workspace.to_owned(),
+                    },
+                );
+            }
+        }
+    }
+    pub(crate) fn recover_malformed_workspace_push(&self) {
+        let packet = {
+            let owner = self
+                .workspace_controller
+                .lock()
+                .expect("workspace controller poisoned");
+            owner
+                .push
+                .scopes
+                .iter()
+                // A malformed frame cannot supply a trusted scope identity.
+                // There is exactly one negotiated scope on this connection.
+                .next()
+                .map(|(workspace, scope)| WorkspacePushNotification {
+                    workspace_id: workspace.clone(),
+                    epoch: scope.params.epoch.clone(),
+                    revision: 0,
+                    snapshot: false,
+                    resync_required: true,
+                    indicators: vec![],
+                    inbox: None,
+                })
+        };
+        if let Some(packet) = packet {
+            self.observe_workspace_push(&packet);
+        }
+    }
+    pub(crate) fn observe_workspace_push(&self, packet: &WorkspacePushNotification) {
+        let identity = self.push_identity();
+        let recover = {
+            let mut owner = self
+                .workspace_controller
+                .lock()
+                .expect("workspace controller poisoned");
+            let Some(scope) = owner.push.scopes.get_mut(&packet.workspace_id) else {
+                return;
+            };
+            if self.is_stopped()
+                || Some(&scope.identity) != identity.as_ref()
+                || scope.params.epoch != packet.epoch
+                || scope.supported == Some(false)
+            {
+                return;
+            }
+            if packet.revision <= scope.revision && !packet.resync_required {
+                return;
+            }
+            let valid_revision = if scope.revision == 0 {
+                packet.snapshot && packet.revision == 1
+            } else {
+                !packet.snapshot && scope.revision.checked_add(1) == Some(packet.revision)
+            };
+            let mut inbox_owner = self.task_notifications.lock().expect("task inbox poisoned");
+            let mut registry = self
+                .thread_registry
+                .lock()
+                .expect("thread registry poisoned");
+            let valid_tree = !scope.params.tree
+                || (registry
+                    .directory
+                    .push_epoch_is_current(&packet.workspace_id, &packet.epoch)
+                    && packet.indicators.iter().all(|patch| {
+                        registry
+                            .directory
+                            .threads
+                            .get(&patch.thread_id)
+                            .is_some_and(|thread| thread.workspace_id == packet.workspace_id)
+                    }));
+            let valid = valid_revision
+                && !packet.resync_required
+                && packet.indicators.len() <= 4096
+                && valid_tree
+                && (scope.params.tree || packet.indicators.is_empty())
+                && (scope.params.inbox || packet.inbox.is_none())
+                && (!packet.snapshot || !scope.params.inbox || packet.inbox.is_some())
+                && Self::validate_inbox_push(&inbox_owner.store, packet);
+            if valid {
+                if scope.params.tree && !packet.indicators.is_empty() {
+                    registry.directory.apply_push_indicators(packet);
+                }
+                if !self.apply_inbox_push(&mut inbox_owner.store, packet) {
+                    return;
+                }
+                scope.revision = packet.revision;
+                scope.bootstrap_retry = false;
+                let authority = crate::core::ClientMutationAuthority { _private: () };
+                let mut drafts = Vec::new();
+                if packet.inbox.is_some() {
+                    drafts.extend(self.task_inbox_publication_draft(
+                        &mut inbox_owner.store,
+                        &packet.workspace_id,
+                    ));
+                }
+                if scope.params.tree && !packet.indicators.is_empty() {
+                    let draft = registry
+                        .navigation
+                        .drafts
+                        .get(&packet.workspace_id)
+                        .cloned();
+                    // Keep bootstrap receipt and loading state owned by metadata
+                    // request; indicator delivery never makes metadata Ready.
+                    let previous = registry.directory.snapshot(&packet.workspace_id);
+                    let loading = previous.as_ref().is_some_and(|p| p.is_loading());
+                    let error = previous.as_ref().and_then(|p| p.error().map(str::to_owned));
+                    if let Some(publication) = registry.directory.project(
+                        &packet.workspace_id,
+                        draft.as_deref(),
+                        loading,
+                        error,
+                    ) {
+                        drafts.push(authority.publication(
+                            crate::core::ClientScope::WorkspaceTree {
+                                workspace_id: Some(packet.workspace_id.clone()),
+                            },
+                            crate::threads::registry::revisions(publication.revision()),
+                            publication,
+                        ));
+                    }
+                }
+                self.transition(&authority, drafts, vec![]);
+                None
+            } else {
+                registry
+                    .directory
+                    .push_revisions
+                    .remove(&packet.workspace_id);
+                Self::set_inbox_push_epoch(&mut inbox_owner.store, &packet.workspace_id, None);
+                let domains = (scope.params.tree, scope.params.inbox);
+                let disable =
+                    (scope.revision == 0 && scope.bootstrap_retry).then(|| scope.identity.clone());
+                scope.recovering = true;
+                scope.supported = Some(false);
+                if let Some(identity) = disable {
+                    owner.push.unsupported_identity = Some(identity);
+                }
+                Some(domains)
+            }
+        };
+        if let Some((tree, inbox)) = recover {
+            // Retire once, no packet backlog/retry timer. Existing owners perform
+            // authoritative metadata/prefix recovery then register a fresh epoch.
+            if tree {
+                self.queue_directory_refresh(&packet.workspace_id);
+            }
+            if inbox {
+                self.task_notification_intent(
+                    crate::tasks::notifications::TaskNotificationIntent::Refresh {
+                        workspace_id: packet.workspace_id.clone(),
+                    },
+                );
+            }
+            self.queue_workspace_push(&packet.workspace_id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{core::ClientScope, rpc::JsonRpcRequestTransport};
+    use pioneer_protocol::*;
+    use std::sync::{Arc, Mutex, Weak};
+
+    struct RegisterReply {
+        core: Weak<ClientCore>,
+        first: Mutex<Option<WorkspacePushNotification>>,
+        fail_bootstrap: Mutex<bool>,
+    }
+    fn deliver(core: &ClientCore, packet: &WorkspacePushNotification) {
+        let wire =
+            JsonRpcNotification::from_params(constants::events::WORKSPACE_PUSH_CHANGED, packet)
+                .unwrap();
+        let event = GatewayNotification::from_jsonrpc(wire).unwrap();
+        assert!(core.observe_workspace_notification(&event));
+    }
+    impl JsonRpcRequestTransport for RegisterReply {
+        fn send_json_rpc_request(
+            &self,
+            _: String,
+            payload: String,
+            tx: crate::rpc::JsonRpcResponseSender,
+        ) -> Result<(), String> {
+            let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(request["method"], constants::methods::WORKSPACE_PUSH);
+            let params: WorkspacePushParams =
+                serde_json::from_value(request["params"].clone()).unwrap();
+            if !params.tree && !params.inbox {
+                tx.send(Ok(serde_json::json!({"supported":true}))).unwrap();
+                return Ok(());
+            }
+            let packet = WorkspacePushNotification {
+                workspace_id: params.workspace_id,
+                epoch: params.epoch,
+                revision: 1,
+                snapshot: true,
+                resync_required: *self.fail_bootstrap.lock().unwrap(),
+                indicators: ["a", "b"]
+                    .into_iter()
+                    .map(|id| ThreadIndicatorPatch {
+                        thread_id: id.into(),
+                        unread_count: Some(3),
+                        has_running_tasks: Some(true),
+                    })
+                    .collect(),
+                inbox: None,
+            };
+            // Real socket ordering permits this before the register RPC reply.
+            deliver(&self.core.upgrade().unwrap(), &packet);
+            *self.first.lock().unwrap() = Some(packet);
+            tx.send(Ok(serde_json::json!({"supported":true}))).unwrap();
+            Ok(())
+        }
+    }
+    struct TreeReply<'a> {
+        core: &'a ClientCore,
+        during: Option<WorkspacePushNotification>,
+    }
+    impl JsonRpcRequestTransport for TreeReply<'_> {
+        fn send_json_rpc_request(
+            &self,
+            _: String,
+            _: String,
+            tx: crate::rpc::JsonRpcResponseSender,
+        ) -> Result<(), String> {
+            if let Some(packet) = &self.during {
+                deliver(self.core, packet);
+            }
+            let threads = ["a", "b"]
+                .into_iter()
+                .map(|id| {
+                    serde_json::from_value(
+                        serde_json::json!({"id":id,"workspace_id":"ws","preview":"",
+                    "mode":"Chat","model":"model","model_provider":"provider","created_at":1,
+                    "updated_at":1,"status":"Idle","turns":[]}),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            tx.send(Ok(serde_json::to_value(ThreadTreeResponse {
+                workspace_id: "ws".into(),
+                threads,
+                unread: vec![],
+                running_task_thread_ids: vec![],
+                folders: [("first", "second"), ("second", "first")]
+                    .into_iter()
+                    .map(|(id, parent)| ThreadFolder {
+                        id: id.into(),
+                        workspace_id: "ws".into(),
+                        parent_folder_id: Some(parent.into()),
+                        name: id.into(),
+                        created_at: 1,
+                        updated_at: 1,
+                    })
+                    .collect(),
+                placements: [("a", "first"), ("b", "second")]
+                    .into_iter()
+                    .map(|(thread, folder)| ThreadPlacement {
+                        thread_id: thread.into(),
+                        workspace_id: "ws".into(),
+                        folder_id: Some(folder.into()),
+                    })
+                    .collect(),
+                agents_docs: vec![],
+            })
+            .unwrap()))
+                .unwrap();
+            Ok(())
+        }
+    }
+    #[test]
+    fn registered_batch_precedes_ack_and_fences_late_snapshot_duplicates_and_gaps() {
+        let core = crate::catalog_test_support::settings_client();
+        let mut authorization = core.authorization_snapshot(None, None).unwrap();
+        authorization.workspace = Some(AuthorizationWorkspaceCapabilitySnapshot {
+            workspace_id: "ws".into(),
+            capabilities: Default::default(),
+            operational_resources: Default::default(),
+            execution_draft_policy: AuthorizationExecutionDraftPolicyProjection {
+                fingerprint: "tree-test".into(),
+                resources: Default::default(),
+                permission_options: vec![],
+                can_attach_artifacts: false,
+                mcp_invocation_limits: Default::default(),
+            },
+        });
+        let (generation, connection) = core.current_auth_ticket();
+        core.accept_authorization_projection(generation, connection, authorization);
+        core.transport_runtime()
+            .ws_command_sender()
+            .set_http_session_access_for_test(Some(crate::transport::http::GatewayHttpAccess {
+                gateway_base_url: GatewayBaseUrl::parse_presentation("https://example.test")
+                    .unwrap(),
+                gateway_id: GatewayId::new("GAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                session_id: AuthSessionId::new("SAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                generation: 7,
+                access_expires_at_unix: 1000,
+                access_token: AuthSecretString::new("synthetic-token"),
+            }));
+        let scope = ClientScope::WorkspaceTree {
+            workspace_id: Some("ws".into()),
+        };
+        let _binding = core.subscribe(scope, std::num::NonZeroUsize::new(8).unwrap());
+        core.refresh_workspace_tree_with_transport(
+            "ws",
+            &TreeReply {
+                core: &core,
+                during: None,
+            },
+        )
+        .unwrap();
+        let before = core.workspace_tree("ws").unwrap().revision();
+        let navigation = core.navigation_snapshot();
+        let transport = Arc::new(RegisterReply {
+            core: Arc::downgrade(&core),
+            first: Mutex::new(None),
+            fail_bootstrap: Mutex::new(false),
+        });
+        *core.transport_runtime().test_requests.lock().unwrap() = Some(transport.clone());
+        core.reconcile_workspace_push("ws");
+        let first = transport.first.lock().unwrap().clone().unwrap();
+        let after = core.workspace_tree("ws").unwrap();
+        assert_eq!(after.revision(), before + 1);
+        assert_eq!(
+            after
+                .snapshot()
+                .unread
+                .iter()
+                .map(|u| u.unread_count)
+                .sum::<u64>(),
+            6
+        );
+        assert_eq!(after.snapshot().running_task_thread_ids.len(), 2);
+        for folder in ["first", "second"] {
+            assert_eq!(after.snapshot().unread_by_folder_id[folder], 6);
+            assert!(after.snapshot().running_task_folder_ids.contains(folder));
+        }
+        assert_eq!(core.navigation_snapshot(), navigation);
+        deliver(&core, &first);
+        assert_eq!(
+            core.workspace_tree("ws").unwrap().revision(),
+            after.revision()
+        );
+        let mut next = first.clone();
+        next.revision = 2;
+        next.snapshot = false;
+        next.indicators[0].unread_count = Some(9);
+        core.refresh_workspace_tree_with_transport(
+            "ws",
+            &TreeReply {
+                core: &core,
+                during: Some(next.clone()),
+            },
+        )
+        .unwrap();
+        let current = core.workspace_tree("ws").unwrap();
+        assert_eq!(
+            current
+                .snapshot()
+                .unread
+                .iter()
+                .find(|u| u.thread_id == "a")
+                .unwrap()
+                .unread_count,
+            9
+        );
+        assert!(current.snapshot().running_task_thread_ids.contains("a"));
+        assert_eq!(current.snapshot().unread_by_folder_id["first"], 12);
+        assert_eq!(current.snapshot().unread_by_folder_id["second"], 12);
+        next.revision = 4;
+        next.indicators[0].unread_count = Some(100);
+        deliver(&core, &next);
+        assert_eq!(
+            core.workspace_tree("ws").unwrap().revision(),
+            current.revision()
+        );
+        next.revision = 3;
+        deliver(&core, &next); // retired epoch cannot fill a gap later
+        assert_eq!(
+            core.workspace_tree("ws").unwrap().revision(),
+            current.revision()
+        );
+        for frame in [
+            serde_json::json!({"jsonrpc":"2.0", "method":constants::events::WORKSPACE_PUSH_CHANGED,
+                "params":{"workspaceId":"untrusted-other-workspace","revision":"invalid"}}),
+            serde_json::json!({"jsonrpc":"2.0", "method":constants::events::WORKSPACE_PUSH_CHANGED}),
+        ] {
+            core.reconcile_workspace_push("ws");
+            let restarted = transport.first.lock().unwrap().clone().unwrap();
+            let before_malformed = core.workspace_tree("ws").unwrap().revision();
+            let malformed = GatewayNotification::from_jsonrpc(
+                serde_json::from_value::<JsonRpcNotification>(frame).unwrap(),
+            )
+            .unwrap();
+            assert!(core.observe_workspace_notification(&malformed));
+            let mut stale = restarted;
+            stale.snapshot = false;
+            stale.revision = 2;
+            stale.indicators[0].unread_count = Some(555);
+            deliver(&core, &stale);
+            assert_eq!(
+                core.workspace_tree("ws").unwrap().revision(),
+                before_malformed
+            );
+        }
+        // Two failed bootstraps retire rich delivery for this identity rather
+        // than repeatedly querying an oversized/unavailable authoritative scope.
+        *transport.fail_bootstrap.lock().unwrap() = true;
+        core.reconcile_workspace_push("ws");
+        core.reconcile_workspace_push("ws");
+        core.reconcile_workspace_push("ws");
+        core.refresh_workspace_tree_with_transport(
+            "ws",
+            &TreeReply {
+                core: &core,
+                during: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            core.workspace_tree("ws")
+                .unwrap()
+                .snapshot()
+                .unread
+                .is_empty()
+        );
+    }
+}

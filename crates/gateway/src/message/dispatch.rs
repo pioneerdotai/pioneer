@@ -1566,7 +1566,8 @@ impl MessageProcessor {
             ResourceResolverKind::Workspace
                 if matches!(
                     request.method.as_str(),
-                    methods::ARTIFACT_CAPABILITIES
+                    methods::WORKSPACE_PUSH
+                        | methods::ARTIFACT_CAPABILITIES
                         | methods::ARTIFACT_LIST
                         | methods::SKILLS_LIST
                         | methods::CLI_RUNTIME_LIST
@@ -1594,6 +1595,11 @@ impl MessageProcessor {
                 };
                 let params = request.params.clone().unwrap_or_else(empty_object_value);
                 let workspace_id = match request.method.as_str() {
+                    methods::WORKSPACE_PUSH => {
+                        serde_json::from_value::<pioneer_protocol::WorkspacePushParams>(params)
+                            .map_err(|_| invalid_params())?
+                            .workspace_id
+                    }
                     methods::ARTIFACT_CAPABILITIES => {
                         serde_json::from_value::<ArtifactCapabilitiesParams>(params)
                             .map_err(|_| invalid_params())?
@@ -4444,6 +4450,12 @@ impl MessageProcessor {
                         request.params,
                     )
                     .await;
+                }
+                methods::WORKSPACE_PUSH => {
+                    match serde_json::from_value::<pioneer_protocol::WorkspacePushParams>(request.params.unwrap_or_else(empty_object_value)) {
+                        Ok(params) => self.workspace_push(&context, request.id, params).await,
+                        Err(_) => self.send_error(connection_id, JsonRpcErrorResponse::new(Some(request.id), INVALID_PARAMS_CODE, "invalid push params")).await,
+                    }
                 }
                 methods::THREAD_TREE => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);

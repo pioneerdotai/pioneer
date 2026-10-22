@@ -26,8 +26,48 @@ impl MessageProcessor {
         item: &TurnItem,
         db_status: Option<&str>,
     ) {
+        self.notify_semantic_timeline_item_changed_with_indicators(
+            workspace_id,
+            thread_id,
+            turn_id,
+            item,
+            db_status,
+            true,
+        )
+        .await;
+    }
+
+    pub(super) async fn notify_semantic_timeline_item_changed_after_indicator_commit(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        item: &TurnItem,
+        db_status: Option<&str>,
+    ) {
+        self.notify_semantic_timeline_item_changed_with_indicators(
+            workspace_id,
+            thread_id,
+            turn_id,
+            item,
+            db_status,
+            false,
+        )
+        .await;
+    }
+
+    async fn notify_semantic_timeline_item_changed_with_indicators(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        item: &TurnItem,
+        db_status: Option<&str>,
+        publish_indicators: bool,
+    ) {
         let classification = classify_turn_item_with_db_status(item, db_status);
-        if classification.placement == ProjectionPlacement::TopLevelAssistantMessage
+        if publish_indicators
+            && classification.placement == ProjectionPlacement::TopLevelAssistantMessage
             && db_status == Some("completed")
         {
             // Hidden execution replies never enter sidebar unread. Their root
@@ -50,7 +90,7 @@ impl MessageProcessor {
                             && lineage.origin_kind.as_deref() == Some("task_run")
                     });
             if !hidden_execution {
-                self.notify_thread_tree_changed(workspace_id.to_owned())
+                self.notify_thread_unread_changed(workspace_id, thread_id)
                     .await;
             }
         }

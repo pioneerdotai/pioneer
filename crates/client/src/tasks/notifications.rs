@@ -188,10 +188,13 @@ struct Request {
     viewed_epoch: u64,
     navigation_revision: Option<u64>,
     cursor: Option<String>,
+    push_revision: Option<(String, u64)>,
     refresh_range: Option<RefreshRange>,
 }
 #[derive(Default)]
 struct Inbox {
+    push_paused: bool,
+    push_revision: Option<(String, u64)>,
     publication: TaskInboxPublication,
     request: Option<Request>,
     refresh_again: bool,
@@ -211,6 +214,19 @@ pub struct TaskNotificationStore {
     // These are never treated as server-negative or confirmed evidence.
     viewed_failed: std::collections::HashSet<(String, String, String)>,
 }
+// New servers provide the exact SQLite key; the fallback is exclusively for
+// legacy servers whose entries predate the negotiated protocol.
+fn compare_inbox_entries(
+    a: &TaskCompletionInboxEntry,
+    b: &TaskCompletionInboxEntry,
+) -> std::cmp::Ordering {
+    if a.completed_key.is_empty() || b.completed_key.is_empty() {
+        (a.completed_at, &a.run_id).cmp(&(b.completed_at, &b.run_id))
+    } else {
+        (&a.completed_key, &a.run_id).cmp(&(&b.completed_key, &b.run_id))
+    }
+}
+
 impl TaskNotificationStore {
     pub(crate) fn invalidate(&mut self) {
         self.inboxes.clear();
@@ -338,6 +354,7 @@ impl TaskNotificationStore {
             viewed_epoch: 0,
             navigation_revision: None,
             cursor: None,
+            push_revision: inbox.push_revision.clone(),
             refresh_range,
         };
         inbox.request = Some(request.clone());
@@ -369,6 +386,17 @@ impl TaskNotificationStore {
         for item in &mut inbox.publication.items {
             item.dismissing = false;
         }
+        // The versioned stream owns mutation values. A later packet also fences
+        // legacy page responses started before it; releasing the request still
+        // drains actions and clears dismissing state.
+        let result = if inbox.push_revision != request.push_revision
+            || (inbox.push_revision.is_some()
+                && (request.notification.is_some() || request.read_all || request.viewed.is_some()))
+        {
+            result.map(|_| None)
+        } else {
+            result
+        };
         match result {
             Err(error) => {
                 // A failed revalidation must never preserve a closed result.
@@ -438,10 +466,7 @@ impl TaskNotificationStore {
                         .into_values()
                         .filter(|item| item.notification.read_at.is_none())
                         .collect::<Vec<_>>();
-                    items.sort_by(|a, b| {
-                        (b.notification.completed_at, &b.notification.run_id)
-                            .cmp(&(a.notification.completed_at, &a.notification.run_id))
-                    });
+                    items.sort_by(|a, b| compare_inbox_entries(&b.notification, &a.notification));
                     inbox.publication.items = items;
                     inbox.publication.next_cursor = response.next_cursor;
                 }
@@ -563,6 +588,7 @@ impl ClientCore {
         if suspended {
             self.task_inbox_demand_changed(scope, crate::core::ClientDemand::Suspended);
         }
+        self.queue_workspace_push(workspace_id);
     }
     pub(crate) fn task_inbox_demand_changed(
         &self,
@@ -573,6 +599,17 @@ impl ClientCore {
             return;
         };
         if demand != crate::core::ClientDemand::Suspended {
+            let needs_bootstrap = {
+                let owner = self.task_notifications.lock().expect("task inbox poisoned");
+                owner.store.subscriptions.contains_key(workspace_id)
+                    && !owner.store.inboxes.contains_key(workspace_id)
+            };
+            if needs_bootstrap {
+                self.task_notification_intent(TaskNotificationIntent::Refresh {
+                    workspace_id: workspace_id.clone(),
+                });
+            }
+            self.queue_workspace_push(workspace_id);
             return;
         }
         let mut owner = self.task_notifications.lock().expect("task inbox poisoned");
@@ -593,6 +630,8 @@ impl ClientCore {
                 vec![],
             );
         }
+        drop(owner);
+        self.queue_workspace_push(workspace_id);
     }
     pub(crate) fn start_task_notification_controller(self: &Arc<Self>) {
         let (sender, receiver) = mpsc::sync_channel::<Request>(64);
@@ -655,7 +694,7 @@ impl ClientCore {
                     .store
                     .record_viewed(request, result.as_ref().ok().map(Vec::as_slice));
             }
-            if result?.is_empty() {
+            if result?.is_empty() || self.workspace_push_inbox_active(&request.workspace) {
                 return Ok(None);
             }
         }
@@ -668,6 +707,7 @@ impl ClientCore {
                 })
             });
         }
+        self.pause_workspace_push_for_page(&request.workspace);
         load_task_inbox_pages(
             request,
             || self.task_inbox_request_is_current(request),
@@ -1100,6 +1140,17 @@ impl ClientCore {
         store: &mut TaskNotificationStore,
         workspace: &str,
     ) -> ClientTransition {
+        let drafts = self
+            .task_inbox_publication_draft(store, workspace)
+            .into_iter()
+            .collect();
+        self.transition(&ClientMutationAuthority { _private: () }, drafts, vec![])
+    }
+    pub(crate) fn task_inbox_publication_draft(
+        &self,
+        store: &mut TaskNotificationStore,
+        workspace: &str,
+    ) -> Option<crate::core::ClientPublicationDraft> {
         let inbox = store.inboxes.get_mut(workspace).expect("inbox exists");
         let scope = ClientScope::TaskInbox {
             workspace_id: workspace.into(),
@@ -1114,19 +1165,17 @@ impl ClientCore {
         next.revision = previous.as_ref().map_or(0, |p| p.revision);
         let authority = ClientMutationAuthority { _private: () };
         if previous.as_ref().is_some_and(|p| p.as_ref() == next) {
-            return self.transition(&authority, vec![], vec![]);
+            return None;
         }
         // Scope revisions survive protected publication eviction.
         next.revision = self
             .snapshot(&scope)
             .map_or(1, |p| p.revisions().scoped().get() + 1);
-        self.publish(
-            &authority,
+        Some(authority.publication(
             scope,
             crate::threads::registry::revisions(next.revision),
             Arc::new(next.clone()),
-            vec![],
-        )
+        ))
     }
     fn complete_task_inbox(
         &self,
@@ -1157,6 +1206,9 @@ impl ClientCore {
             self.publish_task_inbox(&mut owner.store, &request.workspace);
         }
         self.continue_task_inbox_actions(&request.workspace);
+        if request.notification.is_none() && !request.read_all && request.viewed.is_none() {
+            self.queue_workspace_push(&request.workspace);
+        }
     }
 
     pub(crate) fn observe_task_notification(
@@ -1186,7 +1238,8 @@ impl ClientCore {
             _ => None,
         };
         if let Some(workspace) = workspace {
-            if self.task_inbox(workspace).is_some() {
+            if self.task_inbox(workspace).is_some() && !self.workspace_push_inbox_active(workspace)
+            {
                 self.task_notification_intent(TaskNotificationIntent::Refresh {
                     workspace_id: workspace.to_owned(),
                 });
@@ -1309,6 +1362,191 @@ fn notification_thread_target(
     Ok(current.thread_id.clone())
 }
 
+impl ClientCore {
+    pub(crate) fn inbox_push_demand(
+        &self,
+        workspace: &str,
+    ) -> Option<(Vec<String>, Option<String>)> {
+        self.task_inbox_identity(workspace, false)?;
+        let owner = self.task_notifications.lock().expect("task inbox poisoned");
+        if !owner.store.subscriptions.contains_key(workspace) {
+            return None;
+        }
+        let inbox = owner.store.inboxes.get(workspace)?;
+        if (inbox.request.is_some() && inbox.push_revision.is_none())
+            || inbox.publication.error.is_some()
+        {
+            return None;
+        }
+        Some((
+            inbox
+                .publication
+                .items
+                .iter()
+                .map(|i| i.notification.run_id.clone())
+                .collect(),
+            inbox.publication.next_cursor.clone(),
+        ))
+    }
+    pub(crate) fn pause_inbox_push_epoch(store: &mut TaskNotificationStore, workspace: &str) {
+        if let Some(inbox) = store.inboxes.get_mut(workspace) {
+            inbox.push_paused = true;
+        }
+    }
+    pub(crate) fn inbox_push_page_pending(&self, workspace: &str) -> bool {
+        let owner = self.task_notifications.lock().expect("task inbox poisoned");
+        owner
+            .store
+            .inboxes
+            .get(workspace)
+            .is_some_and(|inbox| inbox.push_paused && inbox.request.is_some())
+    }
+    pub(crate) fn set_inbox_push_epoch(
+        store: &mut TaskNotificationStore,
+        workspace: &str,
+        epoch: Option<&str>,
+    ) {
+        if let Some(inbox) = store.inboxes.get_mut(workspace) {
+            inbox.push_revision = epoch.map(|epoch| (epoch.to_owned(), 0));
+            inbox.push_paused = false;
+        }
+    }
+    pub(crate) fn validate_inbox_push(
+        store: &TaskNotificationStore,
+        packet: &pioneer_protocol::WorkspacePushNotification,
+    ) -> bool {
+        let Some(patch) = &packet.inbox else {
+            return true;
+        };
+        let Some(inbox) = store.inboxes.get(&packet.workspace_id) else {
+            return false;
+        };
+        store.subscriptions.contains_key(&packet.workspace_id)
+            && inbox
+                .push_revision
+                .as_ref()
+                .is_some_and(|(epoch, _)| epoch == &packet.epoch)
+            && patch.upserts.len() <= 4096
+            && patch.removes.len() <= 4096
+            && patch.upserts.iter().all(|entry| {
+                entry.workspace_id == packet.workspace_id
+                    && entry.read_at.is_none()
+                    && !entry.completed_key.is_empty()
+            })
+            && inbox
+                .publication
+                .next_cursor
+                .as_deref()
+                .is_none_or(|cursor| serde_json::from_str::<(String, String)>(cursor).is_ok())
+            && patch
+                .next_cursor
+                .as_deref()
+                .is_none_or(|cursor| serde_json::from_str::<(String, String)>(cursor).is_ok())
+    }
+    pub(crate) fn apply_inbox_push(
+        &self,
+        store: &mut TaskNotificationStore,
+        packet: &pioneer_protocol::WorkspacePushNotification,
+    ) -> bool {
+        let Some(patch) = &packet.inbox else {
+            return true;
+        };
+        let Some(inbox) = store.inboxes.get_mut(&packet.workspace_id) else {
+            return false;
+        };
+        if inbox
+            .push_revision
+            .as_ref()
+            .is_none_or(|(epoch, _)| epoch != &packet.epoch)
+            || patch.upserts.len() > 4096
+            || patch.upserts.iter().any(|entry| {
+                entry.workspace_id != packet.workspace_id
+                    || entry.read_at.is_some()
+                    || entry.completed_key.is_empty()
+            })
+        {
+            return false;
+        }
+        let frontier: Option<(String, String)> = match inbox
+            .publication
+            .next_cursor
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+        {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        // Keep the previously loaded keyset range when a new completion arrives.
+        // Only the explicit retained-prefix cap may evict its oldest rows.
+        let budget = 4096;
+        store.generation += 1;
+        let generation = store.generation;
+        let inbox = store
+            .inboxes
+            .get_mut(&packet.workspace_id)
+            .expect("inbox exists");
+        let old = std::mem::take(&mut inbox.publication.items)
+            .into_iter()
+            .map(|item| (item.notification.run_id.clone(), item))
+            .collect::<HashMap<_, _>>();
+        let replace = packet.snapshot || patch.replace;
+        let mut next = if replace { HashMap::new() } else { old.clone() };
+        for id in &patch.removes {
+            next.remove(id);
+        }
+        for entry in &patch.upserts {
+            let key = (entry.completed_key.clone(), entry.run_id.clone());
+            if !replace
+                && !next.contains_key(&entry.run_id)
+                && frontier.as_ref().is_some_and(|frontier| &key < frontier)
+            {
+                continue;
+            }
+            let previous = old.get(&entry.run_id);
+            let revision = previous
+                .filter(|item| item.notification == *entry)
+                .map_or(generation, |item| item.revision);
+            next.insert(
+                entry.run_id.clone(),
+                TaskInboxItem {
+                    notification: entry.clone(),
+                    revision,
+                    dismissing: previous.is_some_and(|item| item.dismissing),
+                },
+            );
+        }
+        let mut items = next.into_values().collect::<Vec<_>>();
+        items.sort_by(|a, b| compare_inbox_entries(&b.notification, &a.notification));
+        if replace {
+            inbox.publication.next_cursor = patch.next_cursor.clone();
+        } else if items.len() > budget {
+            items.truncate(budget);
+            inbox.publication.next_cursor = items.last().and_then(|item| {
+                serde_json::to_string(&(
+                    item.notification.completed_key.as_str(),
+                    item.notification.run_id.as_str(),
+                ))
+                .ok()
+            });
+        }
+        inbox.publication.items = items;
+        inbox.publication.unread_count = patch.unread_count;
+        inbox.publication.error = None;
+        inbox.push_revision = Some((packet.epoch.clone(), packet.revision));
+        let actionable = inbox
+            .publication
+            .items
+            .iter()
+            .filter_map(TaskInboxItem::native_effect)
+            .collect::<std::collections::HashSet<_>>();
+        store.native_completed.retain(|effect| {
+            effect.workspace_id != packet.workspace_id || actionable.contains(effect)
+        });
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1331,6 +1569,190 @@ mod tests {
             next_cursor: None,
         })
     }
+    #[test]
+    fn new_completion_keeps_the_loaded_page_frontier() {
+        let core = ClientCore::new();
+        let mut store = TaskNotificationStore::default();
+        let entries = (0..30)
+            .map(|index| {
+                let mut entry = notification(&format!("run-{index:02}"), "a");
+                entry.completed_key = format!("2026-10-22 09:00:{index:02}.000000");
+                entry
+            })
+            .collect::<Vec<_>>();
+        let frontier =
+            serde_json::to_string(&(&entries[0].completed_key, &entries[0].run_id)).unwrap();
+        let request = store.begin(identity("p"), "a".into(), None).unwrap();
+        store.complete(
+            &request,
+            Ok(TaskCompletionInboxListResponse {
+                entries: entries.clone(),
+                unread_count: 50,
+                next_cursor: Some(frontier.clone()),
+            }),
+        );
+        store.subscriptions.insert("a".into(), 1);
+        ClientCore::set_inbox_push_epoch(&mut store, "a", Some("epoch"));
+        let mut newest = notification("newest", "a");
+        newest.completed_key = "2026-10-22 09:01:00.000000".into();
+        let mut packet = pioneer_protocol::WorkspacePushNotification {
+            workspace_id: "a".into(),
+            epoch: "epoch".into(),
+            revision: 1,
+            snapshot: true,
+            resync_required: false,
+            indicators: vec![],
+            inbox: Some(pioneer_protocol::TaskInboxPatch {
+                replace: false,
+                upserts: entries,
+                removes: vec![],
+                unread_count: 50,
+                next_cursor: Some(frontier.clone()),
+            }),
+        };
+        assert!(core.apply_inbox_push(&mut store, &packet));
+        packet.revision = 2;
+        packet.snapshot = false;
+        packet.inbox = Some(pioneer_protocol::TaskInboxPatch {
+            replace: false,
+            upserts: vec![newest],
+            removes: vec![],
+            unread_count: 51,
+            next_cursor: None,
+        });
+        assert!(core.apply_inbox_push(&mut store, &packet));
+        core.publish_task_inbox(&mut store, "a");
+        let inbox = core.task_inbox("a").unwrap();
+        assert_eq!(inbox.items().len(), 31);
+        assert_eq!(
+            inbox.items().last().unwrap().notification().run_id,
+            "run-00"
+        );
+        assert_eq!(inbox.next_cursor(), Some(frontier.as_str()));
+    }
+
+    #[test]
+    fn inbox_batch_preserves_exact_frontier_and_new_values_against_late_read_ack() {
+        let core = ClientCore::new();
+        let mut store = TaskNotificationStore::default();
+        let mut r2 = notification("r2", "a");
+        r2.completed_key = "2026-10-22 09:00:00.900000".into();
+        let mut r1 = notification("r1", "a");
+        r1.completed_key = "2026-10-22 09:00:00.100000".into();
+        let frontier = serde_json::to_string(&(r1.completed_key.as_str(), "r1")).unwrap();
+        let initial = store.begin(identity("p"), "a".into(), None).unwrap();
+        store.complete(
+            &initial,
+            Ok(TaskCompletionInboxListResponse {
+                entries: vec![r2.clone(), r1.clone()],
+                unread_count: 2,
+                next_cursor: Some(frontier.clone()),
+            }),
+        );
+        store.subscriptions.insert("a".into(), 1);
+        ClientCore::set_inbox_push_epoch(&mut store, "a", Some("epoch"));
+        let mut packet = pioneer_protocol::WorkspacePushNotification {
+            workspace_id: "a".into(),
+            epoch: "epoch".into(),
+            revision: 1,
+            snapshot: true,
+            resync_required: false,
+            indicators: vec![],
+            inbox: Some(pioneer_protocol::TaskInboxPatch {
+                replace: false,
+                upserts: vec![r2.clone(), r1],
+                removes: vec![],
+                unread_count: 2,
+                next_cursor: Some(frontier.clone()),
+            }),
+        };
+        assert!(ClientCore::validate_inbox_push(&store, &packet));
+        assert!(core.apply_inbox_push(&mut store, &packet));
+        core.publish_task_inbox(&mut store, "a");
+        let before = core.task_inbox("a").unwrap();
+        let r2_revision = before
+            .items()
+            .iter()
+            .find(|i| i.notification().run_id == "r2")
+            .unwrap()
+            .revision();
+        let r1_revision = before
+            .items()
+            .iter()
+            .find(|i| i.notification().run_id == "r1")
+            .unwrap()
+            .revision();
+        let read = store
+            .begin(identity("p"), "a".into(), Some(("r2".into(), r2_revision)))
+            .unwrap();
+        let mut newest = notification("r3", "a");
+        newest.completed_key = "2026-10-22 09:00:00.950000".into();
+        let mut outside = notification("r0", "a");
+        outside.completed_key = "2026-10-22 09:00:00.050000".into();
+        packet.revision = 2;
+        packet.snapshot = false;
+        packet.inbox = Some(pioneer_protocol::TaskInboxPatch {
+            replace: false,
+            upserts: vec![outside, newest],
+            removes: vec!["r2".into()],
+            unread_count: 8,
+            next_cursor: None,
+        });
+        assert!(ClientCore::validate_inbox_push(&store, &packet));
+        assert!(core.apply_inbox_push(&mut store, &packet));
+        core.publish_task_inbox(&mut store, "a");
+        let after = core.task_inbox("a").unwrap();
+        assert_eq!(
+            after
+                .items()
+                .iter()
+                .map(|i| i.notification().run_id.as_str())
+                .collect::<Vec<_>>(),
+            ["r3", "r1"]
+        );
+        assert_eq!(after.items()[1].revision(), r1_revision);
+        assert_eq!(after.next_cursor(), Some(frontier.as_str()));
+        assert_eq!(after.unread_count(), 8);
+        // Delayed mutation reply carries a stale absolute total. The stream's
+        // newer result remains authoritative, including the removed identity.
+        r2.read_at = Some(11);
+        store.complete(
+            &read,
+            Ok(TaskCompletionInboxListResponse {
+                entries: vec![r2],
+                unread_count: 999,
+                next_cursor: None,
+            }),
+        );
+        core.publish_task_inbox(&mut store, "a");
+        let final_state = core.task_inbox("a").unwrap();
+        assert_eq!(final_state.unread_count(), 8);
+        assert_eq!(
+            final_state
+                .items()
+                .iter()
+                .map(|i| i.notification().run_id.as_str())
+                .collect::<Vec<_>>(),
+            ["r3", "r1"]
+        );
+        packet.revision = 3;
+        packet.inbox = Some(pioneer_protocol::TaskInboxPatch {
+            replace: true,
+            upserts: vec![],
+            removes: vec![],
+            unread_count: 0,
+            next_cursor: None,
+        });
+        assert!(!packet.snapshot);
+        assert!(ClientCore::validate_inbox_push(&store, &packet));
+        assert!(core.apply_inbox_push(&mut store, &packet));
+        core.publish_task_inbox(&mut store, "a");
+        let read_all = core.task_inbox("a").unwrap();
+        assert!(read_all.items().is_empty());
+        assert_eq!(read_all.unread_count(), 0);
+        assert_eq!(read_all.next_cursor(), None);
+    }
+
     #[test]
     fn deferred_actions_are_drained_after_access_loss_and_last_binding_closes_inbox() {
         let core = Arc::new(ClientCore::new());
@@ -1866,6 +2288,57 @@ mod tests {
             .unwrap() = Some(Arc::new(WorkerTransport { requests }));
         core.start_task_notification_controller();
         (core, receiver)
+    }
+    #[test]
+    fn visible_inbox_reloads_after_suspend_without_shell_refresh() {
+        let (core, requests) = worker_fixture();
+        let scope = ClientScope::TaskInbox {
+            workspace_id: "a".into(),
+        };
+        let _binding = core.subscribe(scope.clone(), std::num::NonZeroUsize::new(8).unwrap());
+        core.task_notification_intent(TaskNotificationIntent::Refresh {
+            workspace_id: "a".into(),
+        });
+        worker_request(
+            &requests,
+            pioneer_protocol::constants::methods::TASK_COMPLETION_INBOX_LIST,
+        )
+        .send(Ok(serde_json::to_value(TaskCompletionInboxListResponse {
+            entries: vec![notification("old", "a")],
+            unread_count: 1,
+            next_cursor: None,
+        })
+        .unwrap()))
+        .unwrap();
+        wait_worker_idle(&core);
+        assert_eq!(
+            core.task_inbox("a").unwrap().items()[0]
+                .notification()
+                .run_id,
+            "old"
+        );
+        core.task_inbox_demand_changed(&scope, crate::core::ClientDemand::Suspended);
+        assert!(core.task_inbox("a").is_none());
+        core.task_inbox_demand_changed(&scope, crate::core::ClientDemand::Visible);
+        worker_request(
+            &requests,
+            pioneer_protocol::constants::methods::TASK_COMPLETION_INBOX_LIST,
+        )
+        .send(Ok(serde_json::to_value(TaskCompletionInboxListResponse {
+            entries: vec![notification("new", "a")],
+            unread_count: 1,
+            next_cursor: None,
+        })
+        .unwrap()))
+        .unwrap();
+        wait_worker_idle(&core);
+        assert_eq!(
+            core.task_inbox("a").unwrap().items()[0]
+                .notification()
+                .run_id,
+            "new"
+        );
+        core.shutdown();
     }
     fn worker_view_params() -> pioneer_protocol::TaskCompletionInboxViewedParams {
         pioneer_protocol::TaskCompletionInboxViewedParams {

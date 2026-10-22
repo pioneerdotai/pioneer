@@ -3468,6 +3468,9 @@ pub struct TaskCompletionInboxEntry {
     pub thread_title: String,
     pub status: TaskRunStatus,
     pub completed_at: i64,
+    /// Exact server keyset ordering key. Empty only for legacy servers.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub completed_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

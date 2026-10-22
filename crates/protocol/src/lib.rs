@@ -37,6 +37,11 @@ pub use recovery_diagnostic::{
     RecoveryStopReason,
 };
 mod schema;
+mod scoped_push;
+pub use scoped_push::{
+    TaskInboxPatch, ThreadIndicatorPatch, WorkspacePushNotification, WorkspacePushParams,
+    WorkspacePushResponse,
+};
 mod settings;
 mod skills;
 mod system_assets;
