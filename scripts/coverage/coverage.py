@@ -158,15 +158,23 @@ def measured_configuration(directory, packages):
     return configuration
 
 
-def read_lcov(data):
-    """Validate LCOV records; preserve every DA line, including zero-hit lines."""
+def read_lcov(data, *, llvm_export=False):
+    """Read DA records; LLVM's function-based summary differs from unique file lines."""
     files = {}
     path, lines, lf, lh = None, {}, None, None
     for raw in data.splitlines():
         if raw == "end_of_record":
             require(path is not None, "LCOV record without SF")
-            require(lf == len(lines) and lh == sum(h > 0 for h in lines.values()),
-                    f"inconsistent LCOV LF/LH: {path}")
+            require(lf is not None and lh is not None and lh <= lf, f"invalid LCOV LF/LH: {path}")
+            if llvm_export:
+                # LLVM sums per-function line summaries for LF/LH, but emits DA
+                # from the file-level mapping. Overlapping closures/functions can
+                # therefore make the summary differ from the unique DA lines.
+                require(lines or lf == 0, f"LCOV summary without DA records: {path}")
+            else:
+                # Our normalized artifacts always use unique file/line totals.
+                require(lf == len(lines) and lh == sum(h > 0 for h in lines.values()),
+                        f"inconsistent LCOV LF/LH: {path}")
             target = files.setdefault(path, {})
             for line, hits in lines.items():
                 target[line] = target.get(line, 0) + hits
@@ -315,7 +323,7 @@ def pack(shard):
     packages, roots, sources, measured = inventory()
     out = ROOT / "coverage-shard"
     configuration = measured_configuration(out, packages)
-    files = relative_sources(read_lcov((out / "raw.lcov").read_text()), measured)
+    files = relative_sources(read_lcov((out / "raw.lcov").read_text(), llvm_export=True), measured)
     junit = JUNIT.read_bytes()
     executed = junit_cases(junit)
     write_lcov(out / "shard.lcov", files)

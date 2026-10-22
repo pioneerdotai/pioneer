@@ -39,6 +39,12 @@ The denominator is the union of LLVM-measurable production lines, not the number
 of textual Rust lines and not the average of shard percentages. Hit counts are
 summed for each `(repository-relative path, line)`; any positive sum means covered.
 Zero-hit lines remain in the denominator even when no shard executes them.
+Raw LLVM LCOV uses file-level `DA` records for line data, while its `LF`/`LH`
+summaries sum function scopes. Overlapping functions and closures can make those
+summaries differ from unique file lines. Packing uses every `DA` record, including
+zero hits, and recomputes `LF`/`LH` when writing normalized shard artifacts. Raw
+records still require valid totals and complete line data; merge requires exact
+agreement between normalized totals and their `DA` records.
 Platform-disabled or never-instantiated code for which LLVM emits no line record
 is outside this measurement. Each crate appears in the breakdown, including crates
 with no measurable production lines.
@@ -139,4 +145,6 @@ References: [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov),
 [nextest Cargo messages](https://nexte.st/docs/running/#cargo-build-options),
 [Cargo JSON messages](https://doc.rust-lang.org/cargo/reference/external-tools.html#json-messages),
 [Rust cfg](https://doc.rust-lang.org/reference/conditional-compilation.html),
-[Rust module paths](https://doc.rust-lang.org/reference/items/modules.html#the-path-attribute).
+[Rust module paths](https://doc.rust-lang.org/reference/items/modules.html#the-path-attribute),
+[LLVM LCOV exporter](https://github.com/llvm/llvm-project/blob/release/22.x/llvm/tools/llvm-cov/CoverageExporterLcov.cpp),
+[LLVM file summaries](https://github.com/llvm/llvm-project/blob/release/22.x/llvm/tools/llvm-cov/CoverageSummaryInfo.h).

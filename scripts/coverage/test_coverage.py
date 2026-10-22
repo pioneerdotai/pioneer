@@ -181,12 +181,43 @@ class ReportTests(unittest.TestCase):
                 with self.assertRaises(CoverageError):
                     measured_configuration(root, {"crates/sample": "sample"})
 
+    def test_llvm_function_totals_normalize_to_unique_da_lines(self):
+        # Functions/closures may overlap; LF/LH describe function summaries,
+        # while DA is the file-level line inventory used by our metric.
+        for found, hit in ((4, 2), (2, 2)):
+            with self.subTest(found=found, hit=hit), tempfile.TemporaryDirectory() as tmp:
+                raw = ("SF:crates/example/src/lib.rs\nFN:1,outer\nFN:1,closure\n"
+                       "FNDA:3,outer\nFNDA:1,closure\nFNF:2\nFNH:2\n"
+                       f"DA:1,3\nDA:2,0\nLF:{found}\nLH:{hit}\nend_of_record\n")
+                files = read_lcov(raw, llvm_export=True)
+                self.assertEqual(files, {"crates/example/src/lib.rs": {1: 3, 2: 0}})
+                self.assertEqual(totals(files), {"covered_lines": 1, "measurable_lines": 2, "percent": 50.0})
+                output = Path(tmp) / "shard.lcov"
+                write_lcov(output, files)
+                self.assertEqual(output.read_text(), "TN:\nSF:crates/example/src/lib.rs\n"
+                                 "DA:1,3\nDA:2,0\nLF:2\nLH:1\nend_of_record\n")
+                self.assertEqual(read_lcov(output.read_text()), files)
+                # LLVM summary compatibility must not weaken normalized artifacts.
+                with self.assertRaisesRegex(CoverageError, "inconsistent LCOV LF/LH"):
+                    read_lcov(raw)
+
     def test_bad_line_totals_and_failed_junit_are_fatal(self):
-        for data in ("SF:src/lib.rs\nDA:1,-1\nLF:1\nLH:0\nend_of_record\n",
-                     "SF:src/lib.rs\nDA:1,0\nLF:2\nLH:0\nend_of_record\n",
-                     "SF:src/lib.rs\nDA:1,0\n"):
-            with self.assertRaises(CoverageError):
-                read_lcov(data)
+        malformed = (
+            "SF:src/lib.rs\nDA:1,-1\nLF:1\nLH:0\nend_of_record\n",
+            "SF:src/lib.rs\nDA:1,0\n",  # Truncated record.
+            "SF:src/lib.rs\nDA:1,0\nLF:1\nLH:2\nend_of_record\n",
+            "SF:src/lib.rs\nDA:1,0\nLF:1\nend_of_record\n",  # Missing LH.
+            "SF:src/lib.rs\nDA:1,0\nLH:0\nend_of_record\n",  # Missing LF.
+            "SF:src/lib.rs\nLF:1\nLH:0\nend_of_record\n",  # Summary-only data.
+            "SF:src/lib.rs\nDA:1,0\nDA:1,1\nLF:1\nLH:1\nend_of_record\n",
+            "SF:src/lib.rs\nDA:1,0\nLF:1\nLF:1\nLH:0\nend_of_record\n",
+        )
+        for data in malformed:
+            for llvm_export in (False, True):
+                with self.subTest(data=data, llvm_export=llvm_export), self.assertRaises(CoverageError):
+                    read_lcov(data, llvm_export=llvm_export)
+        with self.assertRaisesRegex(CoverageError, "inconsistent LCOV LF/LH"):
+            read_lcov("SF:src/lib.rs\nDA:1,0\nLF:2\nLH:0\nend_of_record\n")
         with self.assertRaises(CoverageError):
             junit_cases(b'<testsuites tests="1" failures="1" errors="0"/>')
 
