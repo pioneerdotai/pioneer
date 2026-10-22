@@ -23,3 +23,9 @@ skill_id = "AzBYfaNgS6u1tiPaSlwnm"
 owner = "pioneer"
 slug = "tasks"
 resource_path = "pioneer/tasks"
+
+[[skills]]
+skill_id = "6V8zjRNsuABtUUbHV6Gzo"
+owner = "pioneer"
+slug = "runtime-diagnostics"
+resource_path = "pioneer/runtime-diagnostics"
