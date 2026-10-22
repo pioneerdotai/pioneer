@@ -33,6 +33,8 @@ struct Pending {
     metadata: BTreeSet<String>,
     metadata_seen: BTreeSet<String>,
     known_inbox: BTreeSet<String>,
+    retained_cursor: Option<String>,
+    retained_initialized: bool,
     recovery: bool,
     inbox_reset: bool,
     mutation_holds: usize,
@@ -92,9 +94,11 @@ impl PushMutation {
         }
         if let Some(patch) = inbox {
             let covered = patch.replace
-                || pending.inbox.iter().all(|id| {
-                    patch.removes.contains(id) || patch.upserts.iter().any(|row| &row.run_id == id)
-                });
+                || (!pending.inbox_reset
+                    && pending.inbox.iter().all(|id| {
+                        patch.removes.contains(id)
+                            || patch.upserts.iter().any(|row| &row.run_id == id)
+                    }));
             if patch.replace {
                 pending.inbox_reset = true;
             }
@@ -166,6 +170,7 @@ impl MessageProcessor {
         }
         let pending = Pending {
             known_inbox: params.run_ids.iter().cloned().collect(),
+            retained_cursor: params.inbox_cursor.clone(),
             ..Default::default()
         };
         let scope = Arc::new(PushScope {
@@ -359,13 +364,19 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) fn retire_push_workspace(&self, workspace: &str) {
+    pub(super) fn retire_push_workspace(
+        &self,
+        workspace: &str,
+        principal: Option<&pioneer_protocol::PrincipalId>,
+    ) {
         self.push_scopes
             .0
             .lock()
             .expect("push scopes poisoned")
             .retain(|_, scope| {
-                if scope.params.workspace_id == workspace {
+                if scope.params.workspace_id == workspace
+                    && principal.is_none_or(|id| id == &scope.principal.principal_id)
+                {
                     scope.cancel.cancel();
                     false
                 } else {
@@ -375,6 +386,31 @@ impl MessageProcessor {
     }
 
     pub(super) async fn notify_thread_unread_changed(&self, workspace: &str, thread: &str) {
+        // Reuse loaded materialized metadata without cloning its timeline.
+        // Only an unloaded completion needs one persisted row, never per-peer
+        // metadata/history. Authorization remains the publisher's own gate.
+        let visible = match self
+            .thread_manager
+            .loaded_thread_sidebar_visibility(workspace, thread)
+            .await
+        {
+            Some(visibility) => visibility == pioneer_protocol::ThreadSidebarVisibility::Visible,
+            None => match self.crud_store.get_thread_by_id(thread).await {
+                Ok(Some(row)) if row.workspace_id == workspace => {
+                    row.sidebar_visibility == "visible"
+                }
+                _ => {
+                    // Missing/failed metadata cannot establish eligibility.
+                    // Recover without accumulating an unproven sidebar ID.
+                    self.dirty_push(workspace, None, None, None, true, None);
+                    self.notify_thread_unread_legacy(workspace, thread).await;
+                    return;
+                }
+            },
+        };
+        if !visible {
+            return;
+        }
         self.dirty_push(workspace, Some(thread), None, None, false, None);
         self.notify_thread_unread_legacy(workspace, thread).await;
     }
@@ -530,20 +566,18 @@ impl MessageProcessor {
                 continue;
             }
             retry_dirty = false;
-            let (mut packet, metadata) = match result {
+            let mut packet = match result {
                 Ok(packet) if !changed => packet,
-                _ => (
-                    WorkspacePushNotification {
-                        workspace_id: scope.params.workspace_id.clone(),
-                        epoch: scope.params.epoch.clone(),
-                        revision: 0,
-                        snapshot: false,
-                        resync_required: true,
-                        indicators: Vec::new(),
-                        inbox: None,
-                    },
-                    Vec::new(),
-                ),
+                _ => WorkspacePushNotification {
+                    workspace_id: scope.params.workspace_id.clone(),
+                    epoch: scope.params.epoch.clone(),
+                    revision: 0,
+                    snapshot: false,
+                    resync_required: true,
+                    thread_summaries: Vec::new(),
+                    indicators: Vec::new(),
+                    inbox: None,
+                },
             };
             if let Some(inbox) = packet.inbox.as_mut() {
                 let mut pending = scope.pending.lock().expect("push pending poisoned");
@@ -608,6 +642,7 @@ impl MessageProcessor {
                 text = smaller;
             }
             if text.len() > MAX_PACKET_BYTES {
+                packet.thread_summaries.clear();
                 packet.indicators.clear();
                 packet.inbox = None;
                 packet.resync_required = true;
@@ -618,26 +653,6 @@ impl MessageProcessor {
                 };
                 text = smaller;
             }
-            let mut metadata_frames = Vec::new();
-            for notification in &metadata {
-                match processor.serialize_notification(events::THREAD_UPDATED, notification) {
-                    Some(frame) => metadata_frames.push(frame),
-                    None => {
-                        packet.resync_required = true;
-                        break;
-                    }
-                }
-            }
-            let metadata = metadata_frames;
-            if metadata
-                .iter()
-                .map(String::len)
-                .sum::<usize>()
-                .saturating_add(text.len())
-                > MAX_PACKET_BYTES
-            {
-                packet.resync_required = true;
-            }
             let recovery_text = processor.serialize_notification(
                 events::WORKSPACE_PUSH_CHANGED,
                 &WorkspacePushNotification {
@@ -646,6 +661,7 @@ impl MessageProcessor {
                     revision,
                     snapshot: false,
                     resync_required: true,
+                    thread_summaries: Vec::new(),
                     indicators: Vec::new(),
                     inbox: None,
                 },
@@ -674,13 +690,6 @@ impl MessageProcessor {
                         } else {
                             text
                         };
-                        if !recover {
-                            for notification in metadata {
-                                outbound
-                                    .try_send(Message::Text(notification.into()))
-                                    .map_err(|_| anyhow!("push outbound full or closed"))?;
-                            }
-                        }
                         outbound
                             .try_send(Message::Text(payload.into()))
                             .map_err(|_| anyhow!("push outbound full or closed"))?;
@@ -688,6 +697,8 @@ impl MessageProcessor {
                             if let Some(inbox) = &packet.inbox {
                                 if inbox.replace || packet.snapshot {
                                     pending.known_inbox.clear();
+                                    pending.retained_cursor = inbox.next_cursor.clone();
+                                    pending.retained_initialized = true;
                                 }
                                 for id in &inbox.removes {
                                     pending.known_inbox.remove(id);
@@ -728,7 +739,7 @@ impl MessageProcessor {
         metadata_ids: BTreeSet<String>,
         inbox_reset: bool,
         ready: Option<ReadyValues>,
-    ) -> anyhow::Result<(WorkspacePushNotification, Vec<ThreadUpdatedNotification>)> {
+    ) -> anyhow::Result<WorkspacePushNotification> {
         let principal = self
             .session_manager
             .connection_principal(connection)
@@ -783,28 +794,66 @@ impl MessageProcessor {
         } else {
             activity
         };
-        let candidates: BTreeSet<_> = unread.union(&activity).cloned().collect();
+        let candidates: BTreeSet<_> = unread
+            .union(&activity)
+            .chain(metadata_ids.iter())
+            .cloned()
+            .collect();
+        let thread_gate = AuthorizationService::new().authorize_action(
+            principal.kind,
+            principal.role_key.as_ref(),
+            ResourceAction::ThreadRead,
+        );
         let mut authorized = Vec::new();
         for thread in candidates {
-            if self
-                .authorized_thread_connection_recipients(&thread, vec![connection])
-                .await
-                .is_empty()
-            {
-                anyhow::bail!("push thread scope changed");
+            // Resolve an explicit proof, retaining unavailable as an error:
+            // a transient SQL/auth failure is not a safely irrelevant denial.
+            let mut resolution = resolver
+                .authorize_thread(
+                    &principal,
+                    &thread_gate,
+                    ResourceAction::ThreadRead,
+                    &thread,
+                    Some(workspace),
+                )
+                .await?;
+            if matches!(
+                resolution.denial(),
+                Some(crate::authorization::AuthorizationDecision::Deny {
+                    reason: crate::authorization::DenyReason::MissingAuthoritativeResource,
+                    ..
+                })
+            ) {
+                resolution = resolver
+                    .authorize_internal_thread_via_root(
+                        &principal,
+                        &thread_gate,
+                        ResourceAction::ThreadRead,
+                        &thread,
+                        Some(workspace),
+                    )
+                    .await?;
+            }
+            if !matches!(resolution, ProofResolution::Authorized(_)) {
+                if scope.params.thread_ids.contains(&thread) {
+                    anyhow::bail!("push thread scope changed");
+                }
+                continue;
             }
             authorized.push(thread);
         }
         let mut metadata = Vec::new();
-        for thread_id in &metadata_ids {
+        for thread_id in metadata_ids.iter().filter(|id| authorized.contains(id)) {
             if let Some(thread) = self.crud_store.get_thread_model(thread_id).await? {
                 anyhow::ensure!(
                     thread.workspace_id == *workspace,
                     "metadata workspace changed"
                 );
-                metadata.push(ThreadUpdatedNotification {
-                    thread: thread.into_directory_summary(),
-                    placement: None,
+                let original_preview_len = thread.preview.len();
+                let thread = thread.into_directory_summary();
+                metadata.push(pioneer_protocol::ThreadMetadataPatch {
+                    preview_truncated: thread.preview.len() < original_preview_len,
+                    thread,
                 });
             } else {
                 anyhow::bail!("metadata removed");
@@ -838,6 +887,7 @@ impl MessageProcessor {
         };
         let indicators = authorized
             .into_iter()
+            .filter(|id| unread.contains(id) || activity.contains(id))
             .map(|thread_id| ThreadIndicatorPatch {
                 unread_count: unread
                     .contains(&thread_id)
@@ -857,7 +907,7 @@ impl MessageProcessor {
             && ready
                 .inbox
                 .as_ref()
-                .is_some_and(|patch| !snapshot || patch.replace)
+                .is_some_and(|patch| (!(snapshot || inbox_reset)) || patch.replace)
         {
             ready.inbox
         } else if scope.params.inbox && (snapshot || inbox_reset || !runs.is_empty()) {
@@ -885,27 +935,34 @@ impl MessageProcessor {
                 runs.into_iter().collect()
             };
             let reset = snapshot || inbox_reset;
+            let retained_cursor = scope
+                .pending
+                .lock()
+                .expect("push pending poisoned")
+                .retained_cursor
+                .clone();
             let (rows, total) = if !reset {
                 self.crud_store
                     .task_completion_inbox_patch(&access, &ids)
                     .await?
             } else {
+                let (retained_count, initialized) = {
+                    let pending = scope.pending.lock().expect("push pending poisoned");
+                    (pending.known_inbox.len(), pending.retained_initialized)
+                };
+                let frontier = retained_cursor
+                    .as_deref()
+                    .map(super::task_completion_inbox::decode_inbox_cursor)
+                    .transpose()?;
+                let cap = if !initialized && retained_count == 0 && frontier.is_none() {
+                    30
+                } else {
+                    MAX_METADATA_IDS
+                };
                 let read = db.begin_read().await?;
                 let mut rows = Vec::new();
                 {
-                    let frontier = scope
-                        .params
-                        .inbox_cursor
-                        .as_deref()
-                        .map(super::task_completion_inbox::decode_inbox_cursor)
-                        .transpose()?;
                     let mut before: Option<(String, String)> = None;
-                    let cap =
-                        if scope.params.run_ids.is_empty() && scope.params.inbox_cursor.is_none() {
-                            30
-                        } else {
-                            MAX_METADATA_IDS
-                        };
                     while rows.len() < cap {
                         let limit = (cap - rows.len()).min(100);
                         let page = pioneer_crud::list_task_completion_inbox(
@@ -938,8 +995,8 @@ impl MessageProcessor {
                 (rows, total)
             };
             let next_cursor = if reset && total > rows.len() as u64 {
-                if rows.len() < MAX_METADATA_IDS && scope.params.inbox_cursor.is_some() {
-                    scope.params.inbox_cursor.clone()
+                if rows.len() < MAX_METADATA_IDS && retained_cursor.is_some() {
+                    retained_cursor.clone()
                 } else {
                     rows.last()
                         .map(|row| serde_json::to_string(&(&row.completed_key, &row.run_id)))
@@ -989,17 +1046,15 @@ impl MessageProcessor {
                 == &scope.principal,
             "push identity changed"
         );
-        Ok((
-            WorkspacePushNotification {
-                workspace_id: workspace.clone(),
-                epoch: scope.params.epoch.clone(),
-                revision: 0,
-                snapshot,
-                resync_required: false,
-                indicators,
-                inbox,
-            },
-            metadata,
-        ))
+        Ok(WorkspacePushNotification {
+            workspace_id: workspace.clone(),
+            epoch: scope.params.epoch.clone(),
+            revision: 0,
+            snapshot,
+            resync_required: false,
+            thread_summaries: metadata,
+            indicators,
+            inbox,
+        })
     }
 }

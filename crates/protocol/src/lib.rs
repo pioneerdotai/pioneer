@@ -39,8 +39,8 @@ pub use recovery_diagnostic::{
 mod schema;
 mod scoped_push;
 pub use scoped_push::{
-    TaskInboxPatch, ThreadIndicatorPatch, WorkspacePushNotification, WorkspacePushParams,
-    WorkspacePushResponse,
+    TaskInboxPatch, ThreadIndicatorPatch, ThreadMetadataPatch, WorkspacePushNotification,
+    WorkspacePushParams, WorkspacePushResponse,
 };
 mod settings;
 mod skills;

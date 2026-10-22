@@ -511,6 +511,14 @@ impl MessageProcessor {
                 !matches!(
                     &event.payload,
                     TaskEventPayload::RunStarted { .. } | TaskEventPayload::TaskResumed { .. }
+                        // Task terminal projections change lifecycle only. Each
+                        // changed run has its own durable Run terminal event;
+                        // direct task terminal/cancel does not rewrite historical
+                        // run cards. Metadata/root/access events below still reset.
+                        | TaskEventPayload::TaskCompleted { .. }
+                        | TaskEventPayload::TaskFailed { .. }
+                        | TaskEventPayload::TaskBlocked { .. }
+                        | TaskEventPayload::TaskCancelled { .. }
                 ) && (!matches!(&event.payload, TaskEventPayload::RunCreated { .. })
                     || task_response
                         .run
@@ -1600,6 +1608,9 @@ async fn task_delivery_child_lineage(
 }
 
 fn task_event_changes_tree_activity(payload: &TaskEventPayload) -> bool {
+    // Active-run state owns this projection. Pure TaskCompleted/Failed/Blocked/
+    // Cancelled lifecycle mirrors do not change it; direct cancellation emits
+    // a separate event for each changed run just like terminal orchestration.
     matches!(
         payload,
         TaskEventPayload::RunStarting { .. }

@@ -228,7 +228,13 @@ fn mutation_policy(
 }
 
 impl MessageProcessor {
-    async fn sync_committed_message_mutation(&self, thread_id: &str, turn_id: &str) {
+    async fn sync_committed_message_mutation(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        publish_indicators: bool,
+    ) {
         let persisted_thread = match self.crud_store.get_thread_model(thread_id).await {
             Ok(Some(thread)) => thread,
             Ok(None) => {
@@ -236,6 +242,11 @@ impl MessageProcessor {
                     thread_id,
                     turn_id, "committed Message thread is unavailable"
                 );
+                if publish_indicators {
+                    self.dirty_push(workspace_id, None, None, None, true, None);
+                    self.notify_thread_unread_legacy(workspace_id, thread_id)
+                        .await;
+                }
                 return;
             }
             Err(error) => {
@@ -245,9 +256,32 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "failed to load committed Message thread"
                 );
+                if publish_indicators {
+                    self.dirty_push(workspace_id, None, None, None, true, None);
+                    self.notify_thread_unread_legacy(workspace_id, thread_id)
+                        .await;
+                }
                 return;
             }
         };
+        // Reuse this already-required persisted snapshot. Sidebar eligibility
+        // does not constrain the committed Message or its timeline notification.
+        if publish_indicators
+            && persisted_thread.workspace_id == workspace_id
+            && persisted_thread.sidebar_visibility
+                == pioneer_protocol::ThreadSidebarVisibility::Visible
+        {
+            self.dirty_push(
+                &persisted_thread.workspace_id,
+                Some(thread_id),
+                None,
+                None,
+                false,
+                None,
+            );
+            self.notify_thread_unread_legacy(&persisted_thread.workspace_id, thread_id)
+                .await;
+        }
         if let Err(error) = self
             .thread_manager
             .sync_message_mutation_from_persisted(&persisted_thread, turn_id)
@@ -532,14 +566,6 @@ impl MessageProcessor {
             }
         };
 
-        self.dirty_push(
-            authorization.workspace_id(),
-            Some(authorization.thread_id()),
-            None,
-            None,
-            false,
-            None,
-        );
         log_message_mutation_outcome(
             authorization,
             operation,
@@ -552,8 +578,13 @@ impl MessageProcessor {
         let response = pioneer_protocol::TurnMessageEditResponse {
             turn: event.turn.clone(),
         };
-        self.sync_committed_message_mutation(authorization.thread_id(), authorization.turn_id())
-            .await;
+        self.sync_committed_message_mutation(
+            authorization.workspace_id(),
+            authorization.thread_id(),
+            authorization.turn_id(),
+            true,
+        )
+        .await;
         match JsonRpcResponse::from_result(request_id, &response) {
             Ok(response) => {
                 if let Err(error) = self.send_json(context.connection_id(), &response).await {
@@ -570,8 +601,6 @@ impl MessageProcessor {
             authorization.turn_id(),
         )
         .await;
-        self.notify_thread_unread_legacy(authorization.workspace_id(), authorization.thread_id())
-            .await;
     }
 
     pub(super) async fn turn_message_delete(
@@ -631,16 +660,6 @@ impl MessageProcessor {
                 return;
             }
         };
-        if result.event.is_some() {
-            self.dirty_push(
-                authorization.workspace_id(),
-                Some(authorization.thread_id()),
-                None,
-                None,
-                false,
-                None,
-            );
-        }
         let mutation_outcome = if result.event.is_some() {
             "accepted"
         } else {
@@ -654,8 +673,13 @@ impl MessageProcessor {
             result.turn.message_revision,
             started,
         );
-        self.sync_committed_message_mutation(authorization.thread_id(), authorization.turn_id())
-            .await;
+        self.sync_committed_message_mutation(
+            authorization.workspace_id(),
+            authorization.thread_id(),
+            authorization.turn_id(),
+            result.event.is_some(),
+        )
+        .await;
         let response = pioneer_protocol::TurnMessageDeleteResponse { turn: result.turn };
         match JsonRpcResponse::from_result(request_id, &response) {
             Ok(response) => {
@@ -670,11 +694,6 @@ impl MessageProcessor {
                 authorization.workspace_id(),
                 authorization.thread_id(),
                 authorization.turn_id(),
-            )
-            .await;
-            self.notify_thread_unread_legacy(
-                authorization.workspace_id(),
-                authorization.thread_id(),
             )
             .await;
         }

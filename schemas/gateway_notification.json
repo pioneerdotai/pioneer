@@ -9995,6 +9995,23 @@
         "threadId"
       ]
     },
+    "ThreadMetadataPatch": {
+      "type": "object",
+      "properties": {
+        "previewTruncated": {
+          "description": "True only when directory projection actually shortened the preview.\nA real shorter/empty edit is authoritative when this is false.",
+          "type": "boolean"
+        },
+        "thread": {
+          "description": "Canonical thin directory metadata; never a full timeline/history snapshot.",
+          "$ref": "#/$defs/Thread"
+        }
+      },
+      "required": [
+        "thread",
+        "previewTruncated"
+      ]
+    },
     "ThreadMode": {
       "oneOf": [
         {
@@ -14718,6 +14735,13 @@
         },
         "snapshot": {
           "type": "boolean"
+        },
+        "threadSummaries": {
+          "description": "Compact metadata and indicators share one revision and atomic reduction.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ThreadMetadataPatch"
+          }
         },
         "workspaceId": {
           "type": "string"

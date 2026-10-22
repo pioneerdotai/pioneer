@@ -625,6 +625,16 @@ impl ClientCore {
 mod tests {
     use super::*;
     #[test]
+    fn paused_combined_scope_resumes_after_renewal_or_page_deferred_action() {
+        super::super::push::tests::paused_combined_scope_resumes_after_renewal_or_page_deferred_action(
+            |core| {
+                assert!(run_workspace_cycle(&Arc::downgrade(core), |core, request| {
+                    core.execute_workspace_request(request);
+                }));
+            },
+        );
+    }
+    #[test]
     fn actual_workspace_quantum_is_live_during_handlers_and_terminal_before_idle() {
         use pioneer_observability::{
             live::{self, JournalPayload, WorkState},

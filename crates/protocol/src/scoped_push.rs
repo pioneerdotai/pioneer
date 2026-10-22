@@ -57,12 +57,25 @@ pub struct TaskInboxPatch {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct ThreadMetadataPatch {
+    /// Canonical thin directory metadata; never a full timeline/history snapshot.
+    pub thread: crate::Thread,
+    /// True only when directory projection actually shortened the preview.
+    /// A real shorter/empty edit is authoritative when this is false.
+    pub preview_truncated: bool,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkspacePushNotification {
     pub workspace_id: String,
     pub epoch: String,
     pub revision: u64,
     pub snapshot: bool,
     pub resync_required: bool,
+    /// Compact metadata and indicators share one revision and atomic reduction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thread_summaries: Vec<ThreadMetadataPatch>,
     pub indicators: Vec<ThreadIndicatorPatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inbox: Option<TaskInboxPatch>,

@@ -389,9 +389,11 @@ impl TaskNotificationStore {
         // The versioned stream owns mutation values. A later packet also fences
         // legacy page responses started before it; releasing the request still
         // drains actions and clears dismissing state.
-        let result = if inbox.push_revision != request.push_revision
-            || (inbox.push_revision.is_some()
-                && (request.notification.is_some() || request.read_all || request.viewed.is_some()))
+        let result = if inbox.push_revision != request.push_revision {
+            // Neither success nor failure of an older RPC owns newer stream data.
+            Ok(None)
+        } else if inbox.push_revision.is_some()
+            && (request.notification.is_some() || request.read_all || request.viewed.is_some())
         {
             result.map(|_| None)
         } else {
@@ -639,7 +641,7 @@ impl ClientCore {
         let task = std::thread::Builder::new()
             .name("client-task-inbox".into())
             .spawn(move || {
-                while let Ok(request) = receiver.recv() {
+                while let Ok(mut request) = receiver.recv() {
                     let Some(core) = weak.upgrade() else {
                         return;
                     };
@@ -654,7 +656,7 @@ impl ClientCore {
                         core.open_task_notification(request);
                         continue;
                     }
-                    let result = core.execute_task_inbox_request(&request);
+                    let result = core.execute_task_inbox_request(&mut request);
                     core.complete_task_inbox(request, result.map_err(|e| format!("{e:#}")));
                 }
             })
@@ -665,7 +667,7 @@ impl ClientCore {
     }
     fn execute_task_inbox_request(
         &self,
-        request: &Request,
+        request: &mut Request,
     ) -> anyhow::Result<Option<TaskCompletionInboxListResponse>> {
         let sender = self.transport_runtime().ws_command_sender();
         if request.read_all {
@@ -708,6 +710,27 @@ impl ClientCore {
             });
         }
         self.pause_workspace_push_for_page(&request.workspace);
+        // Pause fences ingress first. Capture the actual RPC baseline afterwards,
+        // including packets accepted while this page waited in the worker queue.
+        // Revalidate exact ownership before changing either copy of the request.
+        {
+            let mut owner = self.task_notifications.lock().expect("task inbox poisoned");
+            anyhow::ensure!(
+                owner.store.identity.as_ref() == Some(&request.identity),
+                "Stale task inbox identity"
+            );
+            let inbox = owner
+                .store
+                .inboxes
+                .get_mut(&request.workspace)
+                .ok_or_else(|| anyhow::anyhow!("Stale task inbox request"))?;
+            anyhow::ensure!(
+                inbox.request.as_ref() == Some(&*request),
+                "Stale task inbox request"
+            );
+            request.push_revision = inbox.push_revision.clone();
+            inbox.request = Some(request.clone());
+        }
         load_task_inbox_pages(
             request,
             || self.task_inbox_request_is_current(request),
@@ -1037,6 +1060,9 @@ impl ClientCore {
                 .map(|item| item.notification.clone())
         });
         let Some(notification) = notification else {
+            // A push may have removed or revised the queued card. Finalize only
+            // this request and drain deferred actions without stale navigation.
+            self.complete_task_inbox(request, Ok(None));
             return;
         };
         let result = (|| -> anyhow::Result<pioneer_protocol::Thread> {
@@ -1098,6 +1124,10 @@ impl ClientCore {
                 }
             }
             Ok(_) => {}
+            Err(_) if inbox.push_revision != request.push_revision => {
+                // This Open RPC no longer owns the current stream's cards or
+                // total. Release its request, retaining newer authority.
+            }
             Err(error) => {
                 inbox.publication.items.clear();
                 inbox.publication.unread_count = 0;
@@ -1113,7 +1143,7 @@ impl ClientCore {
         // Skip stale deferred actions without stranding a later valid action.
         // A started request owns the remainder until its matching completion.
         loop {
-            let next = {
+            let (next, resume_push) = {
                 let mut owner = self.task_notifications.lock().expect("task inbox poisoned");
                 let Some(inbox) = owner.store.inboxes.get_mut(workspace) else {
                     return;
@@ -1121,15 +1151,23 @@ impl ClientCore {
                 if inbox.request.is_some() {
                     return;
                 }
-                inbox.pending_actions.pop_front().or_else(|| {
+                let next = inbox.pending_actions.pop_front().or_else(|| {
                     std::mem::take(&mut inbox.refresh_again).then(|| {
                         TaskNotificationIntent::Refresh {
                             workspace_id: workspace.to_owned(),
                         }
                     })
-                })
+                });
+                (next, inbox.push_paused)
             };
             let Some(intent) = next else {
+                // A workspace wake may have been consumed while this request
+                // blocked a paused scope. Both normal and Open completion drain
+                // here; retain the obligation until the last deferred action
+                // releases it, without requeuing while an RPC is still active.
+                if resume_push {
+                    self.queue_workspace_push(workspace);
+                }
                 return;
             };
             self.task_notification_intent(intent);
@@ -1185,7 +1223,9 @@ impl ClientCore {
         if self
             .task_inbox_identity(
                 &request.workspace,
-                request.notification.is_some() || request.read_all || request.viewed.is_some(),
+                (request.notification.is_some() && !request.open)
+                    || request.read_all
+                    || request.viewed.is_some(),
             )
             .as_ref()
             != Some(&request.identity)
@@ -1601,6 +1641,7 @@ mod tests {
             revision: 1,
             snapshot: true,
             resync_required: false,
+            thread_summaries: vec![],
             indicators: vec![],
             inbox: Some(pioneer_protocol::TaskInboxPatch {
                 replace: false,
@@ -1657,6 +1698,7 @@ mod tests {
             revision: 1,
             snapshot: true,
             resync_required: false,
+            thread_summaries: vec![],
             indicators: vec![],
             inbox: Some(pioneer_protocol::TaskInboxPatch {
                 replace: false,
@@ -2248,6 +2290,14 @@ mod tests {
         Arc<ClientCore>,
         mpsc::Receiver<(String, crate::rpc::JsonRpcResponseSender)>,
     ) {
+        let (core, receiver) = worker_fixture_before_start();
+        core.start_task_notification_controller();
+        (core, receiver)
+    }
+    fn worker_fixture_before_start() -> (
+        Arc<ClientCore>,
+        mpsc::Receiver<(String, crate::rpc::JsonRpcResponseSender)>,
+    ) {
         use pioneer_protocol::*;
         let core = crate::catalog_test_support::settings_client();
         let mut snapshot = core.authorization_snapshot(None, None).unwrap();
@@ -2286,8 +2336,288 @@ mod tests {
             .test_requests
             .lock()
             .unwrap() = Some(Arc::new(WorkerTransport { requests }));
-        core.start_task_notification_controller();
         (core, receiver)
+    }
+    struct InboxRegistrationTransport {
+        core: std::sync::Weak<ClientCore>,
+        delegate: Arc<dyn crate::rpc::JsonRpcRequestTransport + Send + Sync>,
+    }
+    impl crate::rpc::JsonRpcRequestTransport for InboxRegistrationTransport {
+        fn send_json_rpc_request(
+            &self,
+            id: String,
+            payload: String,
+            response: crate::rpc::JsonRpcResponseSender,
+        ) -> Result<(), String> {
+            let wire: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            if wire["method"] != pioneer_protocol::constants::methods::WORKSPACE_PUSH {
+                return self.delegate.send_json_rpc_request(id, payload, response);
+            }
+            let params: pioneer_protocol::WorkspacePushParams =
+                serde_json::from_value(wire["params"].clone()).unwrap();
+            if params.inbox {
+                let mut entry = notification("run", "a");
+                entry.completed_key = "2026-10-22 09:00:00.000000".into();
+                let cursor = serde_json::to_string(&(&entry.completed_key, &entry.run_id)).unwrap();
+                worker_ingress(
+                    &self.core.upgrade().unwrap(),
+                    serde_json::json!({
+                        "workspaceId":"a", "epoch":params.epoch, "revision":1,
+                        "snapshot":true, "resyncRequired":false, "indicators":[],
+                        "inbox":{"replace":true,"upserts":[entry],"removes":[],"unreadCount":8,"nextCursor":cursor}
+                    }),
+                );
+            }
+            response
+                .send(Ok(serde_json::json!({"supported":true})))
+                .unwrap();
+            Ok(())
+        }
+    }
+    fn worker_ingress(core: &ClientCore, params: serde_json::Value) {
+        let wire = pioneer_protocol::JsonRpcNotification::from_params(
+            pioneer_protocol::constants::events::WORKSPACE_PUSH_CHANGED,
+            &params,
+        )
+        .unwrap();
+        let event = pioneer_protocol::GatewayNotification::from_jsonrpc(wire).unwrap();
+        assert!(core.observe_workspace_notification(&event));
+    }
+    fn worker_push(
+        core: &ClientCore,
+        epoch: &str,
+        revision: u64,
+        entries: Vec<TaskCompletionInboxEntry>,
+        removes: Vec<String>,
+    ) {
+        worker_ingress(
+            core,
+            serde_json::json!({
+                "workspaceId":"a", "epoch":epoch, "revision":revision,
+                "snapshot":false, "resyncRequired":false, "indicators":[],
+                "inbox":{"upserts":entries,"removes":removes,"unreadCount":8}
+            }),
+        );
+    }
+    fn worker_seed_push(core: &Arc<ClientCore>) -> (crate::core::ClientSubscription, String) {
+        let identity = core.task_inbox_identity("a", true).unwrap();
+        let mut owner = core.task_notifications.lock().unwrap();
+        let request = owner.store.begin(identity, "a".into(), None).unwrap();
+        let mut entry = notification("run", "a");
+        entry.completed_key = "2026-10-22 09:00:00.000000".into();
+        let cursor = serde_json::to_string(&(&entry.completed_key, &entry.run_id)).unwrap();
+        owner.store.complete(
+            &request,
+            Ok(TaskCompletionInboxListResponse {
+                entries: vec![entry],
+                unread_count: 8,
+                next_cursor: Some(cursor),
+            }),
+        );
+        drop(owner);
+        let binding = core.subscribe(
+            ClientScope::TaskInbox {
+                workspace_id: "a".into(),
+            },
+            std::num::NonZeroUsize::new(8).unwrap(),
+        );
+        let sender = core.transport_runtime().ws_command_sender();
+        let requests = &sender.test_requests;
+        let delegate = requests.lock().unwrap().take().unwrap();
+        *requests.lock().unwrap() = Some(Arc::new(InboxRegistrationTransport {
+            core: Arc::downgrade(core),
+            delegate,
+        }));
+        core.reconcile_workspace_push("a");
+        assert!(core.workspace_push_inbox_active("a"));
+        let epoch = core.task_notifications.lock().unwrap().store.inboxes["a"]
+            .push_revision
+            .as_ref()
+            .unwrap()
+            .0
+            .clone();
+        (binding, epoch)
+    }
+    #[test]
+    fn worker_stale_open_releases_request_and_runs_next_action() {
+        for (remove, late_error) in [(true, false), (false, false), (true, true), (false, true)] {
+            let (core, requests) = worker_fixture_before_start();
+            let (_binding, epoch) = worker_seed_push(&core);
+            let navigation = core.navigation_snapshot();
+            let identity = core.task_inbox_identity("a", false).unwrap();
+            let request = {
+                // Plan the queued operation before starting the real worker:
+                // push can deterministically win before its transport turn.
+                let mut owner = core.task_notifications.lock().unwrap();
+                let revision = owner.store.inboxes["a"].publication.items[0].revision;
+                let mut request = owner
+                    .store
+                    .begin(identity, "a".into(), Some(("run".into(), revision)))
+                    .unwrap();
+                request.open = true;
+                let inbox = owner.store.inboxes.get_mut("a").unwrap();
+                inbox.request = Some(request.clone());
+                inbox
+                    .pending_actions
+                    .push_back(TaskNotificationIntent::ReadAll {
+                        workspace_id: "a".into(),
+                    });
+                request
+            };
+            let change = || {
+                let mut changed = notification("run", "a");
+                changed.completed_key = "2026-10-22 09:00:00.000000".into();
+                changed.summary = Some("changed while Open queued".into());
+                worker_push(
+                    &core,
+                    &epoch,
+                    2,
+                    if remove { vec![] } else { vec![changed] },
+                    if remove { vec!["run".into()] } else { vec![] },
+                );
+            };
+            if !late_error {
+                change();
+            }
+            core.start_task_notification_controller();
+            core.task_notifications
+                .lock()
+                .unwrap()
+                .sender
+                .as_ref()
+                .unwrap()
+                .try_send(request)
+                .unwrap();
+            if late_error {
+                let response = worker_request(
+                    &requests,
+                    pioneer_protocol::constants::methods::TASK_COMPLETION_INBOX_GET,
+                );
+                change();
+                response
+                    .send(Err(crate::rpc::JsonRpcResponseError::transport(
+                        "stale Open failure",
+                    )))
+                    .unwrap();
+            }
+            worker_request(
+                &requests,
+                pioneer_protocol::constants::methods::TASK_COMPLETION_INBOX_READ_ALL,
+            )
+            .send(Ok(serde_json::to_value(TaskCompletionInboxListResponse {
+                entries: vec![],
+                unread_count: 0,
+                next_cursor: None,
+            })
+            .unwrap()))
+            .unwrap();
+            wait_worker_idle(&core);
+            let inbox = core.task_inbox("a").unwrap();
+            assert!(!inbox.is_loading());
+            assert!(inbox.items().iter().all(|item| !item.dismissing));
+            assert!(inbox.opened.is_none());
+            assert!(inbox.error().is_none());
+            assert_eq!(inbox.unread_count(), 8);
+            assert_eq!(inbox.items().len(), if remove { 0 } else { 1 });
+            assert_eq!(core.navigation_snapshot(), navigation);
+            core.shutdown();
+        }
+    }
+    #[test]
+    fn worker_page_handoff_keeps_queued_push_and_accepts_requested_frontier() {
+        let (core, requests) = worker_fixture_before_start();
+        let (_binding, epoch) = worker_seed_push(&core);
+        let identity = core.task_inbox_identity("a", false).unwrap();
+        let request = {
+            let mut owner = core.task_notifications.lock().unwrap();
+            let cursor = owner.store.inboxes["a"].publication.next_cursor.clone();
+            let mut request = owner.store.begin(identity, "a".into(), None).unwrap();
+            request.cursor = cursor;
+            request.refresh_range = None;
+            owner.store.inboxes.get_mut("a").unwrap().request = Some(request.clone());
+            request
+        };
+        let mut newest = notification("new", "a");
+        newest.completed_key = "2026-10-22 09:01:00.000000".into();
+        worker_push(&core, &epoch, 2, vec![newest], vec![]);
+        core.start_task_notification_controller();
+        core.task_notifications
+            .lock()
+            .unwrap()
+            .sender
+            .as_ref()
+            .unwrap()
+            .try_send(request)
+            .unwrap();
+        let response = worker_request(
+            &requests,
+            pioneer_protocol::constants::methods::TASK_COMPLETION_INBOX_LIST,
+        );
+        assert!(!core.workspace_push_inbox_active("a"));
+        // Actual ingress of the retired epoch cannot race the page RPC.
+        worker_push(&core, &epoch, 3, vec![], vec!["new".into()]);
+        assert!(
+            core.task_inbox("a")
+                .unwrap()
+                .items()
+                .iter()
+                .any(|item| item.notification.run_id == "new")
+        );
+        let mut older = notification("older", "a");
+        older.completed_key = "2026-10-22 08:59:00.000000".into();
+        let frontier = serde_json::to_string(&(&older.completed_key, &older.run_id)).unwrap();
+        response
+            .send(Ok(serde_json::to_value(TaskCompletionInboxListResponse {
+                entries: vec![older],
+                unread_count: 8,
+                next_cursor: Some(frontier.clone()),
+            })
+            .unwrap()))
+            .unwrap();
+        wait_worker_idle(&core);
+        let inbox = core.task_inbox("a").unwrap();
+        assert_eq!(
+            inbox
+                .items()
+                .iter()
+                .map(|item| item.notification.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new", "run", "older"]
+        );
+        assert_eq!(inbox.next_cursor(), Some(frontier.as_str()));
+        core.shutdown();
+    }
+    #[test]
+    fn worker_late_mutation_error_does_not_erase_new_authority() {
+        let (core, requests) = worker_fixture();
+        let (_binding, epoch) = worker_seed_push(&core);
+        let revision = core.task_inbox("a").unwrap().items()[0].revision;
+        core.task_notification_intent(TaskNotificationIntent::Dismiss {
+            workspace_id: "a".into(),
+            notification_id: "run".into(),
+            revision,
+        });
+        let response = worker_request(
+            &requests,
+            pioneer_protocol::constants::methods::TASK_COMPLETION_INBOX_READ,
+        );
+        {
+            // A real accepted packet supersedes the mutation's RPC baseline.
+            let mut newest = notification("new", "a");
+            newest.completed_key = "2026-10-22 09:01:00.000000".into();
+            worker_push(&core, &epoch, 2, vec![newest], vec![]);
+        }
+        response
+            .send(Err(crate::rpc::JsonRpcResponseError::transport(
+                "stale transport failure",
+            )))
+            .unwrap();
+        wait_worker_idle(&core);
+        let inbox = core.task_inbox("a").unwrap();
+        assert_eq!(inbox.items().len(), 2);
+        assert_eq!(inbox.unread_count(), 8);
+        assert!(inbox.error().is_none());
+        core.shutdown();
     }
     #[test]
     fn visible_inbox_reloads_after_suspend_without_shell_refresh() {
