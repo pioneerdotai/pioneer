@@ -865,6 +865,10 @@ impl GatewayWsCommandSender {
         client_ws_commands::task_cancel(self, params)
     }
 
+    pub fn task_finish(&self, params: TaskFinishParams) -> Result<TaskFinishResponse> {
+        client_ws_commands::task_finish(self, params)
+    }
+
     pub fn skills_list(&self, params: SkillListParams) -> Result<SkillListResponse> {
         client_ws_commands::skills_list(self, params)
     }

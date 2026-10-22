@@ -34,12 +34,13 @@ require signing in with an account allowed to read repository Actions. Do not as
 for tokens to be pasted into chat or send the bundle to a public symbol server.
 
 The independent `.github/workflows/build-debug-symbols.yml` workflow is named
-**Build Debug Symbols**. Release Gateway and Release App queue it alongside
+**Build Debug Symbols**. The unified **Release** workflow queues it alongside
 publication. Publication can finish before symbols do; a published installer does
 not prove the symbol job succeeded. Jobs consume original release inputs instead
 of compiling another application binary.
 
-Identify the exact Release Gateway or Release App **run ID and commit**, target
+Identify the exact Release **run ID and commit** (or Release Gateway / Release App
+for older releases), target
 triple, and Gateway feature variant (`default` or `computer-use`). Use installed
 build provenance, the release tag, module ID and manifest hashes to disambiguate.
 Do not just download the newest successful run. The same commit may have multiple
@@ -110,6 +111,16 @@ Before using a directory, check:
    packaged hashes. Verify the actual local/captured executable, not an arbitrary
    other executable shipped in the same desktop artifact.
 5. Inventory files, byte sizes and checksums validate; retain the directory layout.
+
+Desktop packaging reuses the `computer-use` Gateway from the same Release run.
+Older releases can reference a separate Release Gateway run from the same commit.
+In both cases, `release-inputs.json.reused_gateway` and
+`gateway-release-inputs.json` identify its original producer. For its executable
+manifest, `source_run_id` must match that Gateway run; `packaged_by_run_id` must
+match the packaging run (both IDs are the same for the unified workflow).
+Use the Desktop artifact's packaged hashes because
+Desktop packaging may strip or sign the reused executable. The Desktop and
+Gateway inventories must agree on commit, target, catalog hash and module identity.
 
 Do not load an entire multi-GiB DWARF/PDB into a JSON/text tool or model context.
 Use streaming checksums and bounded native lookups. Copying just a dSYM without

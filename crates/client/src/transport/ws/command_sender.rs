@@ -51,7 +51,7 @@ use pioneer_protocol::{
     SkillsUpdateResponse, SkillsUploadAbortParams, SkillsUploadAbortResponse,
     SkillsUploadFinishParams, SkillsUploadFinishResponse, SkillsUploadStartParams,
     SkillsUploadStartResponse, TaskAcceptParams, TaskAcceptResponse, TaskCancelParams,
-    TaskCancelResponse, TaskReviseParams, TaskReviseResponse,
+    TaskCancelResponse, TaskFinishParams, TaskFinishResponse, TaskReviseParams, TaskReviseResponse,
     TaskUserNotificationAcknowledgeParams, TaskUserNotificationAcknowledgeResponse,
     TaskUserNotificationListParams, TaskUserNotificationListResponse, ThreadAgentsDocArchiveParams,
     ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse,
@@ -2550,6 +2550,23 @@ where
     send_json_rpc_request_typed(
         transport,
         methods::TASK_CANCEL,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn task_finish<TTransport>(
+    transport: &TTransport,
+    params: TaskFinishParams,
+) -> Result<TaskFinishResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(params.task_id.as_str(), "task_id", methods::TASK_FINISH)?;
+
+    send_json_rpc_request_typed(
+        transport,
+        methods::TASK_FINISH,
         &params,
         RPC_REQUEST_TIMEOUT,
     )

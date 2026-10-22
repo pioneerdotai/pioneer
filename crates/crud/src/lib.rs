@@ -29,6 +29,7 @@ pub use repositories::task_occurrence_reconcile::{
     TaskOccurrenceClaimFailure, TaskOccurrenceClaimFailurePhase, TaskOccurrenceClock,
     TaskOccurrenceReconcileCandidate, TaskOccurrenceReconcileClaim,
 };
+mod task_finish;
 mod task_terminal;
 pub use repositories::task_run_occurrence_reconcile::{
     OCCURRENCE_RECONCILE_BUDGET, OCCURRENCE_RECONCILE_INITIAL_BACKOFF_SECS,
@@ -17758,7 +17759,30 @@ impl CrudStore {
         claimed_at: i64,
     ) -> Result<Option<(TaskRun, AppendedTaskEvent)>> {
         self.run_serialized_write(|| {
-            self.claim_task_run_for_dispatch_once(run_id.to_owned(), claimed_at)
+            self.claim_task_run_for_dispatch_once(run_id.to_owned(), claimed_at, None)
+        })
+        .await
+    }
+
+    /// Retry occurrence rebinding and admission share one writer boundary.
+    /// A finish can observe either the failed source or an admitted successor,
+    /// never a queued retry that has already stolen the source's occurrence.
+    pub async fn claim_task_retry_for_dispatch_with_event(
+        &self,
+        run_id: &str,
+        claimed_at: i64,
+        occurrence: pioneer_protocol::TaskOccurrenceContract,
+    ) -> Result<Option<(TaskRun, AppendedTaskEvent)>> {
+        anyhow::ensure!(
+            occurrence.run_id == run_id,
+            "retry occurrence belongs to another run"
+        );
+        self.run_serialized_write(|| {
+            self.claim_task_run_for_dispatch_once(
+                run_id.to_owned(),
+                claimed_at,
+                Some(occurrence.clone()),
+            )
         })
         .await
     }
@@ -17767,6 +17791,7 @@ impl CrudStore {
         &self,
         run_id: String,
         claimed_at: i64,
+        retry_occurrence: Option<pioneer_protocol::TaskOccurrenceContract>,
     ) -> Result<Option<(TaskRun, AppendedTaskEvent)>> {
         // Prepare serialization before reserving the writer. Task identity is
         // revalidated inside the atomic claim + durable fanout write set.
@@ -17794,6 +17819,9 @@ impl CrudStore {
                 current.task_id == candidate.task_id,
                 "dispatch claim task identity changed"
             );
+            if task_repository::finish_requested(&transaction, &current.task_id).await? {
+                return Ok(None);
+            }
             let claimed = task_run::claim_run_for_dispatch(
                 &transaction,
                 run_id.as_str(),
@@ -17803,6 +17831,18 @@ impl CrudStore {
             .map(task_run_from_db_model)
             .transpose()?;
             let Some(run) = claimed else { return Ok(None) };
+            if let Some(occurrence) = retry_occurrence {
+                anyhow::ensure!(
+                    occurrence.task_id == current.task_id && current.retry_of_run_id.is_some(),
+                    "invalid retry admission"
+                );
+                task_actor_contract::upsert_task_occurrence_contract(
+                    &transaction,
+                    &occurrence,
+                    claimed_at,
+                )
+                .await?;
+            }
             let event = self
                 .append_task_events_in_connection(&transaction, prepared, claimed_at)
                 .await?
@@ -17887,6 +17927,13 @@ impl CrudStore {
                 .rollback()
                 .await
                 .context("failed to rollback non-startable task run started transaction")?;
+            return Ok(None);
+        }
+
+        if status == TaskRunStatus::Queued
+            && task_repository::finish_requested(&transaction, &run_model.task_id).await?
+        {
+            transaction.rollback().await?;
             return Ok(None);
         }
 
@@ -32590,6 +32637,9 @@ impl CrudStore {
                 return Ok(Vec::new());
             }
 
+            if task_repository::finish_requested(&transaction, &trigger.task_id).await? {
+                return Ok(Vec::new());
+            }
             let appended_events = self
                 .append_task_events_in_connection(&transaction, events, now)
                 .await?;
@@ -32912,6 +32962,25 @@ impl CrudStore {
             } else {
                 event
             };
+            let needs_open_task = match event.payload() {
+                TaskEventPayload::RunCreated { .. }
+                | TaskEventPayload::RunRetryScheduled { .. }
+                | TaskEventPayload::TaskQueued { .. }
+                | TaskEventPayload::TriggerCreated { .. }
+                | TaskEventPayload::TaskUpdated { .. }
+                | TaskEventPayload::TaskResumed { .. }
+                | TaskEventPayload::TaskPaused { .. } => true,
+                TaskEventPayload::TaskDetached { task, .. } => task.finish_request().is_none(),
+                TaskEventPayload::TaskRescheduled { trigger, .. } => {
+                    trigger.status != TaskTriggerStatus::Cancelled
+                }
+                _ => false,
+            };
+            if needs_open_task
+                && task_repository::finish_requested(db, event.payload().task_id()).await?
+            {
+                anyhow::bail!("task_finish_requested: task cannot admit new work or be reopened");
+            }
             // Only state-independent work (validation, serialization and CPU
             // projection preparation) is performed before writer admission.
             // Database-dependent preparation is deliberately sequential here:
@@ -46540,6 +46609,7 @@ mod tests {
                     "city".to_owned(),
                     TaskValue::String("Berlin".to_owned()),
                 )]))),
+                finish_request: None,
                 composer_work: None,
             }),
             result: None,

@@ -13,7 +13,7 @@ sha256_file() {
 usage() {
   cat <<'USAGE'
 Usage:
-  package-linux-appimage.sh --target <rust-target> [--out-dir <dir>] [--appimagetool <path>]
+  package-linux-appimage.sh --target <rust-target> [--out-dir <dir>] [--appimagetool <path>] [--skip-build]
 
 Examples:
   package-linux-appimage.sh --target x86_64-unknown-linux-gnu
@@ -24,9 +24,13 @@ USAGE
 TARGET=""
 OUT_DIR=""
 APPIMAGETOOL_BIN="${APPIMAGETOOL_BIN:-}"
+SKIP_BUILD=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --skip-build)
+      SKIP_BUILD=true
+      ;;
     --target)
       shift
       [[ $# -gt 0 ]] || {
@@ -105,12 +109,14 @@ if [[ ! -x "$APPIMAGETOOL_BIN" ]] && ! command -v "$APPIMAGETOOL_BIN" >/dev/null
   exit 1
 fi
 
-cargo build --release -p pioneer-desktop --target "$TARGET"
-cargo build --release -p pioneer-app-updater --target "$TARGET"
-cargo build --release -p pioneer-cli --features computer-use --target "$TARGET"
-if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
-  python3 scripts/packaging/symbol-inputs.py export --target "$TARGET" "$PIONEER_SYMBOL_INPUTS_DIR" \
-    "target/$TARGET/release/pioneer-app" "target/$TARGET/release/pioneer" "target/$TARGET/release/pioneer-app-updater"
+if [[ "$SKIP_BUILD" != true ]]; then
+  cargo build --locked --release -p pioneer-desktop --target "$TARGET"
+  cargo build --locked --release -p pioneer-app-updater --target "$TARGET"
+  cargo build --locked --release -p pioneer-cli --features computer-use --target "$TARGET"
+  if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
+    python3 scripts/packaging/symbol-inputs.py export --target "$TARGET" "$PIONEER_SYMBOL_INPUTS_DIR" \
+      "target/$TARGET/release/pioneer-app" "target/$TARGET/release/pioneer" "target/$TARGET/release/pioneer-app-updater"
+  fi
 fi
 
 WORK_DIR="$(mktemp -d)"

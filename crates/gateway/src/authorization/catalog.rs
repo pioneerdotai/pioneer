@@ -348,6 +348,15 @@ const INTERNAL_TOOL_RECORDS: &[AuthorizationCatalogRecord] = &[
     ),
     record(
         AuthorizationCatalogSurface::InternalTool,
+        "task_finish",
+        "task_schedule_manage",
+        "root_thread_task",
+        "not_found",
+        "mutation",
+        true,
+    ),
+    record(
+        AuthorizationCatalogSurface::InternalTool,
         "task_update",
         "task_schedule_manage",
         "root_thread_task",

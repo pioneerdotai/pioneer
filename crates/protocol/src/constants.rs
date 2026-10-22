@@ -126,6 +126,7 @@ pub mod methods {
     pub const TASK_ACCEPT: &str = "task/accept";
     pub const TASK_REVISE: &str = "task/revise";
     pub const TASK_CANCEL: &str = "task/cancel";
+    pub const TASK_FINISH: &str = "task/finish";
     pub const TASK_UPDATE: &str = "task/update";
     pub const TASK_RESCHEDULE: &str = "task/reschedule";
     pub const TASK_DETACH: &str = "task/detach";
@@ -295,6 +296,7 @@ pub mod methods {
         TASK_ACCEPT,
         TASK_REVISE,
         TASK_CANCEL,
+        TASK_FINISH,
         TASK_RESCHEDULE,
         TASK_DETACH,
         TASK_PAUSE,

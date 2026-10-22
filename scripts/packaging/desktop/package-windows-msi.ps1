@@ -6,7 +6,9 @@ param(
 
     [string]$OutDir,
 
-    [string]$WixPath
+    [string]$WixPath,
+
+    [switch]$SkipBuild
 )
 
 Set-StrictMode -Version Latest
@@ -302,12 +304,14 @@ if ($Target -eq "aarch64-pc-windows-msvc") {
     $env:GGML_CCACHE = "OFF"
 }
 
-cargo build --release -p pioneer-desktop --target $Target
-cargo build --release -p pioneer-app-updater --target $Target
-cargo build --release -p pioneer-cli --features computer-use --target $Target
-if ($env:PIONEER_SYMBOL_INPUTS_DIR) {
-    python scripts/packaging/symbol-inputs.py export --target $Target "$env:PIONEER_SYMBOL_INPUTS_DIR" "target/$Target/release/pioneer-app.exe" "target/$Target/release/pioneer.exe" "target/$Target/release/pioneer-app-updater.exe"
-    if ($LASTEXITCODE -ne 0) { throw "Symbol input preservation failed" }
+if (-not $SkipBuild) {
+    cargo build --locked --release -p pioneer-desktop --target $Target
+    cargo build --locked --release -p pioneer-app-updater --target $Target
+    cargo build --locked --release -p pioneer-cli --features computer-use --target $Target
+    if ($env:PIONEER_SYMBOL_INPUTS_DIR) {
+        python scripts/packaging/symbol-inputs.py export --target $Target "$env:PIONEER_SYMBOL_INPUTS_DIR" "target/$Target/release/pioneer-app.exe" "target/$Target/release/pioneer.exe" "target/$Target/release/pioneer-app-updater.exe"
+        if ($LASTEXITCODE -ne 0) { throw "Symbol input preservation failed" }
+    }
 }
 
 $workDir = Join-Path $env:TEMP ("pioneer-msi-" + [Guid]::NewGuid().ToString("N"))

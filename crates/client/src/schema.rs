@@ -1379,6 +1379,14 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             pioneer_protocol::TaskCancelResponse
         ),
         schema_doc!(
+            "task_finish_params.json",
+            pioneer_protocol::TaskFinishParams
+        ),
+        schema_doc!(
+            "task_finish_response.json",
+            pioneer_protocol::TaskFinishResponse
+        ),
+        schema_doc!(
             "task_completion_inbox_entry.json",
             pioneer_protocol::TaskCompletionInboxEntry
         ),

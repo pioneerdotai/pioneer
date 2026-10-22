@@ -1306,6 +1306,7 @@ fn composer_work_create_params(
     params.metadata = Some(pioneer_protocol::TaskMetadata {
         labels: vec!["composer-work".to_owned()],
         data: None,
+        finish_request: None,
         composer_work: Some(pioneer_protocol::TaskComposerWork {
             version: payload_version,
             launch: pioneer_protocol::TurnStartParams {
@@ -4959,6 +4960,32 @@ async fn failed_run_schedules_retry_and_defers_terminal_delivery_until_exhausted
         .await
         .expect("deliveries should read after first failure");
     assert!(deliveries.deliveries.is_empty());
+
+    assert_eq!(
+        runtime
+            .process_due_once(retry_ready_at - 1)
+            .await
+            .expect("ordinary retry must still wait for its scheduled time"),
+        0
+    );
+    let before_ready = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: response.task.id.clone(),
+        })
+        .await
+        .expect("task should read before retry becomes due");
+    assert_eq!(before_ready.runs.len(), 2);
+    assert_eq!(
+        before_ready
+            .runs
+            .iter()
+            .find(|run| run.id == retry_run.id)
+            .unwrap()
+            .status,
+        TaskRunStatus::Queued
+    );
+    assert!(before_ready.task.finish_request().is_none());
 
     assert_eq!(
         runtime
@@ -8648,6 +8675,8 @@ async fn reported_start_failure_does_not_swallow_failed_state_persistence_error(
 
 #[path = "tests_delivery_lifecycle.rs"]
 mod delivery_lifecycle;
+#[path = "tests_finish.rs"]
+mod finish;
 #[path = "tests/scheduler_catch_up.rs"]
 mod scheduler_catch_up;
 #[path = "tests/terminal_delivery.rs"]

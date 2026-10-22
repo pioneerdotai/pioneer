@@ -9061,6 +9061,7 @@ mod tests {
                 "task_accept",
                 "task_revise",
                 "task_cancel",
+                "task_finish",
                 "task_update",
                 "task_detach",
                 "task_list",
@@ -9381,6 +9382,7 @@ mod tests {
     #[test]
     fn native_terminal_observation_does_not_survive_same_run_reopen() {
         let mut task = pioneer_protocol::PublicTask {
+            finish_request: None,
             id: "A".into(),
             workspace_id: "workspace".into(),
             owner_kind: pioneer_protocol::TaskOwnerKind::User,

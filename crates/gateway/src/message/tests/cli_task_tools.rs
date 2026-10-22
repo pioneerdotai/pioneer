@@ -2568,7 +2568,7 @@ fn cli_task_tools_cannot_observe_or_control_an_existing_foreign_capsule() {
                 .as_str()
                 .unwrap()
                 .to_owned();
-            for name in ["task_get", "task_cancel", "task_detach"] {
+            for name in ["task_get", "task_cancel", "task_finish", "task_detach"] {
                 let denied =
                     invoke_task(&processor, &turn_id, name, name, json!({"taskId": task_id})).await;
                 assert!(
@@ -3032,5 +3032,115 @@ fn cli_task_wait_review_revise_accept_and_detach_use_the_existing_task_contract(
             .unwrap();
             assert!(!cancelled.is_error);
         }
+    });
+}
+
+#[test]
+fn cli_task_finish_round_trip_uses_the_existing_capsule_and_persisted_state() {
+    run_standard_stack_message_test("CLI task finish facade", async {
+        let (harness, processor, turn_id) =
+            start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
+        let created = invoke_task(
+            &processor,
+            &turn_id,
+            "finish-create",
+            "task_create",
+            json!({
+                "title": "Monitor until stopped", "goal": "Check for changes",
+                "instructions": ["Inspect and report changes."],
+                "outputInstructions": "Return findings.",
+                "trigger": {"kind": "cron", "cronExpr": "0 7 * * *", "timezone": "UTC"}
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!created.is_error, "{created:?}");
+        let task_id = created.structured_content.unwrap()["taskId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let finished = invoke_task(
+            &processor,
+            &turn_id,
+            "finish-stop",
+            "task_finish",
+            json!({"taskId": task_id, "reason": "User requested a permanent stop"}),
+        )
+        .await
+        .unwrap();
+        assert!(!finished.is_error, "{finished:?}");
+        let output = finished.structured_content.unwrap();
+        assert_eq!(output["alreadyFinished"], false);
+        assert_eq!(output["task"]["status"], "completed");
+        assert_eq!(
+            output["task"]["finishRequest"]["reason"],
+            "User requested a permanent stop"
+        );
+        let stored = harness
+            .crud_store
+            .get_task(&task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.task.status, TaskStatus::Completed);
+        assert!(
+            stored.runs.is_empty(),
+            "finish must not synthesize an agent run"
+        );
+        let recovered_receipt = invoke_task(
+            &processor,
+            &turn_id,
+            "finish-stop",
+            "task_finish",
+            json!({"taskId": task_id, "reason": "User requested a permanent stop"}),
+        )
+        .await
+        .unwrap();
+        assert!(!recovered_receipt.is_error, "{recovered_receipt:?}");
+        let recovered_receipt = recovered_receipt.structured_content.unwrap();
+        assert_eq!(recovered_receipt["alreadyCommitted"], true);
+        assert_eq!(recovered_receipt["alreadyFinished"], true);
+        assert_eq!(recovered_receipt["task"]["id"], task_id);
+        assert_eq!(recovered_receipt["task"]["status"], "completed");
+        assert_eq!(
+            harness
+                .crud_store
+                .get_task(&task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .task
+                .revision,
+            stored.task.revision,
+            "durable receipt replay must only read the stopped task"
+        );
+        let repeated = invoke_task(
+            &processor,
+            &turn_id,
+            "finish-repeat",
+            "task_finish",
+            json!({"taskId": task_id}),
+        )
+        .await
+        .unwrap();
+        assert!(!repeated.is_error, "{repeated:?}");
+        assert_eq!(
+            repeated.structured_content.unwrap()["alreadyFinished"],
+            true
+        );
+        let read = invoke_task(
+            &processor,
+            &turn_id,
+            "finish-read",
+            "task_get",
+            json!({"taskId": task_id}),
+        )
+        .await
+        .unwrap();
+        assert!(!read.is_error, "{read:?}");
+        assert_eq!(
+            read.structured_content.unwrap()["task"]["finishRequest"]["reason"],
+            "User requested a permanent stop"
+        );
     });
 }

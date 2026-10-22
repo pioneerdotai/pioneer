@@ -3280,7 +3280,7 @@ impl ClaudeStreamClient {
             );
             if matches!(
                 tool.binding.canonical_callable_name.as_str(),
-                "task_wait" | "task_get" | "task_cancel" | "task_accept"
+                "task_wait" | "task_get" | "task_cancel" | "task_finish" | "task_accept"
             ) && tool
                 .binding
                 .metadata
