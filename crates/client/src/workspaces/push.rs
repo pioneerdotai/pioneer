@@ -778,7 +778,12 @@ pub(super) mod tests {
                     requests: requests_tx,
                     registrations: registered_tx,
                 });
-                *core.transport_runtime().test_requests.lock().unwrap() = Some(transport.clone());
+                *core
+                    .transport_runtime()
+                    .ws_command_sender()
+                    .test_requests
+                    .lock()
+                    .unwrap() = Some(transport.clone());
                 core.start_task_notification_controller();
                 core.task_notification_intent(TaskNotificationIntent::Refresh {
                     workspace_id: "ws".into(),
@@ -1034,7 +1039,12 @@ pub(super) mod tests {
             first: Mutex::new(None),
             fail_bootstrap: Mutex::new(false),
         });
-        *core.transport_runtime().test_requests.lock().unwrap() = Some(transport.clone());
+        *core
+            .transport_runtime()
+            .ws_command_sender()
+            .test_requests
+            .lock()
+            .unwrap() = Some(transport.clone());
         core.reconcile_workspace_push("ws");
         let first = transport.first.lock().unwrap().clone().unwrap();
         let after = core.workspace_tree("ws").unwrap();
