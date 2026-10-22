@@ -39,9 +39,11 @@ pub(crate) enum ExecutionContinuityPolicy {
     StopOnAuthorityLoss,
 }
 
-/// Immutable resource ceiling carried by every execution grant. A role may
-/// narrow actions inside this boundary, but cannot widen a Turn beyond its
-/// admitted collaboration capsule.
+/// Immutable resource ceiling for execution and mutations. A role cannot widen
+/// writes beyond the admitted collaboration capsule. Observation of another
+/// conversation requires the separately admitted ThreadObserveWorkspace action
+/// and a fresh initiating-user ACL proof for that exact source; it never creates
+/// a write route or changes this boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ExecutionResourceBoundary {
@@ -902,6 +904,26 @@ impl ExecutionAdmissionService {
         // thread from exercising its own role actions.
         for action in EXECUTION_RUNTIME_ACTIONS {
             actions.insert(action.safe_name().to_owned());
+        }
+
+        // Cross-conversation observation is a separate, initiator-admitted grant.
+        // It is deliberately absent from the shared capsule's unconditional
+        // runtime actions: a later collaborator must not lend this authority.
+        if self
+            .require_root_action(
+                principal,
+                request,
+                ResourceAction::ThreadObserveWorkspace,
+                runtime_draft,
+            )
+            .await
+            .is_ok()
+        {
+            actions.insert(
+                ResourceAction::ThreadObserveWorkspace
+                    .safe_name()
+                    .to_owned(),
+            );
         }
 
         let operational_projection_fingerprint = self
@@ -3383,6 +3405,15 @@ pub(crate) struct RevalidatedExecutionAuthorization {
 impl RevalidatedExecutionAuthorization {
     pub(crate) fn principal(&self) -> &AuthenticatedSessionPrincipal {
         &self.principal
+    }
+
+    /// Read sources belong to the admitted initiating user, even when another
+    /// collaborator currently supplies backend continuation authority.
+    pub(crate) async fn initiating_principal(
+        &self,
+        store: &CrudStore,
+    ) -> Result<AuthenticatedSessionPrincipal> {
+        super::lease::collaboration_authority_principal(store, &self.admitted_principal_id).await
     }
 
     pub(crate) fn authorization(&self) -> &AuthorizedThread {
