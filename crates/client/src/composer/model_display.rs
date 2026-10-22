@@ -479,6 +479,51 @@ impl ClientCore {
 }
 
 #[cfg(test)]
+pub(super) mod test_support {
+    use super::*;
+
+    pub(in crate::composer) struct FakeModelDisplay(mpsc::Receiver<ModelWork>);
+    pub(in crate::composer) struct PendingModelDisplay(ModelRequest);
+
+    impl FakeModelDisplay {
+        pub(in crate::composer) fn install(core: &ClientCore) -> Self {
+            let (sender, receiver) = mpsc::sync_channel(64);
+            core.composer_models.lock().unwrap().sender = Some(sender);
+            Self(receiver)
+        }
+
+        pub(in crate::composer) fn take(&self) -> PendingModelDisplay {
+            PendingModelDisplay(self.next_request().expect("model display request"))
+        }
+
+        pub(in crate::composer) fn is_empty(&self) -> bool {
+            self.next_request().is_none()
+        }
+
+        fn next_request(&self) -> Option<ModelRequest> {
+            // Discard selection wakes without processing them: a fake must not
+            // repair runtime selection through an unrelated background refresh.
+            while let Ok(work) = self.0.try_recv() {
+                if let ModelWork::Resolve(request) = work {
+                    return Some(request);
+                }
+            }
+            None
+        }
+    }
+
+    impl PendingModelDisplay {
+        pub(in crate::composer) fn complete(
+            self,
+            core: &ClientCore,
+            response: ProviderListModelsResponse,
+        ) {
+            core.complete_composer_model_display(self.0, Ok(response));
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{

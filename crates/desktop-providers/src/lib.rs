@@ -5,6 +5,7 @@ rust_i18n::i18n!("locales", fallback = "en");
 mod actions;
 mod activity;
 mod assets;
+mod avatar;
 mod binding;
 mod buttons;
 mod catalog;
@@ -17,7 +18,7 @@ mod queries;
 mod sidebar;
 mod view;
 pub use ports::{
-    ProviderCredentialPort, ProviderEffectCompletion, ProviderEffectIdentity,
+    ProviderAvatarPort, ProviderCredentialPort, ProviderEffectCompletion, ProviderEffectIdentity,
     ProviderExternalNavigationPort, ProviderModelPickerPort, ProviderModelPickerRequest,
 };
 pub use providers::{ProviderCatalogConfig, ProviderCatalogView};
