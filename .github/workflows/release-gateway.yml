@@ -1,29 +1,12 @@
 name: Release Gateway
-run-name: ${{ ((github.event_name == 'push' && github.ref_type == 'branch') || inputs.cache_only) && 'Warm Gateway release cache' || format('Release Gateway ({0})', github.ref_name) }}
+run-name: Release Gateway (${{ github.ref_name }})
 
 on:
-  workflow_dispatch:
-    inputs:
-      cache_only:
-        description: Warm release dependencies without producing release artifacts
-        type: boolean
-        default: false
   push:
     tags: ["*"]
-    branches: [main]
-    paths:
-      - Cargo.lock
-      - '**/Cargo.toml'
-      - 'rust-toolchain*'
-      - '.cargo/**'
-      - '.github/workflows/release-gateway.yml'
-      - 'scripts/packaging/**'
 
 permissions:
   contents: write
-
-env:
-  PIONEER_RELEASE_CACHE_ONLY: ${{ ((github.event_name == 'push' && github.ref_type == 'branch') || inputs.cache_only) && '1' || '0' }}
 
 jobs:
   prepare-release:
@@ -71,7 +54,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-model-catalog-v1
-          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: generate-and-validate-model-catalog
         shell: bash
@@ -170,19 +152,15 @@ jobs:
         with:
           shared-key: release-gateway-${{ matrix.target }}-v1
           cache-workspace-crates: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: build-default
         shell: bash
         run: |
           set -euo pipefail
-          flags=()
-          if [[ "$PIONEER_RELEASE_CACHE_ONLY" == "1" ]]; then flags+=(--cache-only); fi
           python scripts/packaging/build-gateway.py --target "${{ matrix.target }}" \
             --variant default --asset "${{ matrix.asset }}" \
-            --out release-gateway/default "${flags[@]}"
+            --out release-gateway/default
       - name: retain-default-symbol-inputs
-        if: env.PIONEER_RELEASE_CACHE_ONLY != '1'
         uses: actions/upload-artifact@v6
         with:
           name: symbol-inputs-gateway-${{ matrix.target }}-default
@@ -191,14 +169,12 @@ jobs:
           retention-days: 7
           if-no-files-found: error
       - name: retain-default-release-asset
-        if: env.PIONEER_RELEASE_CACHE_ONLY != '1'
         uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.asset }}
           path: release-gateway/default/assets/
           if-no-files-found: error
       - name: remove-uploaded-default-transfer-copy
-        if: env.PIONEER_RELEASE_CACHE_ONLY != '1'
         shell: bash
         run: python -c 'import shutil; shutil.rmtree("release-gateway/default")'
 
@@ -206,13 +182,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          flags=()
-          if [[ "$PIONEER_RELEASE_CACHE_ONLY" == "1" ]]; then flags+=(--cache-only); fi
           python scripts/packaging/build-gateway.py --target "${{ matrix.target }}" \
             --variant computer-use --asset "${{ matrix.computer_asset }}" \
-            --out release-gateway/computer-use "${flags[@]}"
+            --out release-gateway/computer-use
       - name: retain-computer-use-symbol-inputs
-        if: env.PIONEER_RELEASE_CACHE_ONLY != '1'
         uses: actions/upload-artifact@v6
         with:
           name: symbol-inputs-gateway-${{ matrix.target }}-computer-use
@@ -221,14 +194,12 @@ jobs:
           retention-days: 7
           if-no-files-found: error
       - name: retain-computer-use-release-asset
-        if: env.PIONEER_RELEASE_CACHE_ONLY != '1'
         uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.computer_asset }}
           path: release-gateway/computer-use/assets/
           if-no-files-found: error
       - name: remove-uploaded-computer-use-transfer-copy
-        if: env.PIONEER_RELEASE_CACHE_ONLY != '1'
         shell: bash
         run: python -c 'import shutil; shutil.rmtree("release-gateway/computer-use")'
 
@@ -300,7 +271,7 @@ jobs:
           fi
 
   queue-debug-symbols:
-    if: ${{ !inputs.cache_only && (github.ref_type == 'tag' || github.event_name == 'workflow_dispatch') }}
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     name: queue-independent-debug-symbols
     needs: build-gateway
     runs-on: ubuntu-latest

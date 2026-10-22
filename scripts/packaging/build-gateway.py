@@ -31,8 +31,6 @@ def build(args):
     if args.variant == "computer-use":
         command += ["--features", "computer-use"]
     subprocess.run(command, check=True)
-    if args.cache_only:
-        return
     suffix = ".exe" if args.target.endswith("windows-msvc") else ""
     source = Path("target") / args.target / "release" / ("pioneer" + suffix)
     args.out.mkdir(parents=True, exist_ok=False)
@@ -71,11 +69,10 @@ if __name__ == "__main__":
     parser.add_argument("--variant", choices=("default", "computer-use"))
     parser.add_argument("--asset")
     parser.add_argument("--out", type=Path)
-    parser.add_argument("--cache-only", action="store_true")
     args = parser.parse_args()
     if args.configure:
         configure(args.target)
     else:
-        if not args.variant or (not args.cache_only and (not args.asset or not args.out)):
-            parser.error("build requires --variant and, unless --cache-only, --asset and --out")
+        if not args.variant or not args.asset or not args.out:
+            parser.error("build requires --variant, --asset and --out")
         build(args)

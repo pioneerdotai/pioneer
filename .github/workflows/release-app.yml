@@ -1,5 +1,5 @@
 name: Release App
-run-name: ${{ ((github.event_name == 'push' && github.ref_type == 'branch') || inputs.cache_only) && 'Warm Desktop release cache' || format('Release App ({0})', github.ref_name) }}
+run-name: Release App (${{ github.ref_name }})
 
 on:
   workflow_dispatch:
@@ -7,27 +7,12 @@ on:
       gateway_run_id:
         description: Optional exact Release Gateway producer on the same ref and commit
         type: string
-      cache_only:
-        description: Warm desktop release dependencies without packaging or publication
-        type: boolean
-        default: false
   push:
     tags: ["*"]
-    branches: [main]
-    paths:
-      - Cargo.lock
-      - '**/Cargo.toml'
-      - 'rust-toolchain*'
-      - '.cargo/**'
-      - '.github/workflows/release-app.yml'
-      - 'scripts/packaging/**'
 
 permissions:
   contents: write
   actions: read
-
-env:
-  PIONEER_RELEASE_CACHE_ONLY: ${{ ((github.event_name == 'push' && github.ref_type == 'branch') || inputs.cache_only) && '1' || '0' }}
 
 jobs:
   generate-model-catalog:
@@ -43,32 +28,13 @@ jobs:
           ref: ${{ github.sha }}
           submodules: recursive
 
-      - name: setup-rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        if: env.PIONEER_RELEASE_CACHE_ONLY == '1'
-        with:
-          shared-key: release-model-catalog-v1
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
       - name: reuse-gateway-model-catalog
         id: gateway
-        if: env.PIONEER_RELEASE_CACHE_ONLY != '1'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GATEWAY_RUN_ID: ${{ inputs.gateway_run_id }}
         run: python scripts/packaging/release-inputs.py catalog --run-id "$GATEWAY_RUN_ID" --out release-model-catalog
-
-      - name: generate-warmup-model-catalog
-        if: env.PIONEER_RELEASE_CACHE_ONLY == '1'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p release-model-catalog
-          cargo run --locked --release -p pioneer-provider --bin pioneer-model-catalog -- \
-            release-model-catalog/catalog.json
 
       - name: upload-model-catalog
         uses: actions/upload-artifact@v6
@@ -184,7 +150,7 @@ jobs:
           echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
 
       - name: setup-macos-signing-keychain
-        if: matrix.package_kind == 'macos_dmg' && github.event_name == 'push' && github.ref_type == 'tag' && !inputs.cache_only
+        if: matrix.package_kind == 'macos_dmg' && github.event_name == 'push' && github.ref_type == 'tag'
         shell: bash
         env:
           MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
@@ -286,7 +252,6 @@ jobs:
         with:
           shared-key: release-desktop-${{ matrix.target }}-v1
           cache-workspace-crates: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: package-linux-appimage
         if: matrix.package_kind == 'linux_appimage'
@@ -338,7 +303,6 @@ jobs:
           ./scripts/packaging/desktop/package-windows-msi.ps1 -Target "${{ matrix.target }}" -OutDir "dist"
 
       - name: upload-symbol-inputs
-        if: env.PIONEER_RELEASE_CACHE_ONLY != '1'
         uses: actions/upload-artifact@v6
         with:
           name: symbol-inputs-desktop-${{ matrix.target }}
@@ -348,7 +312,6 @@ jobs:
           if-no-files-found: error
 
       - name: upload-desktop-artifacts
-        if: env.PIONEER_RELEASE_CACHE_ONLY != '1'
         uses: actions/upload-artifact@v6
         with:
           name: desktop-${{ matrix.target }}
@@ -595,7 +558,7 @@ jobs:
           gh release upload "${GITHUB_REF_NAME}" "${files[@]}" --clobber
 
   queue-debug-symbols:
-    if: ${{ !inputs.cache_only && (github.ref_type == 'tag' || github.event_name == 'workflow_dispatch') }}
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     name: queue-independent-debug-symbols
     needs: package-desktop
     runs-on: ubuntu-latest

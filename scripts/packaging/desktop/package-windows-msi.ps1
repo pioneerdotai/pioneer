@@ -304,7 +304,6 @@ if ($Target -eq "aarch64-pc-windows-msvc") {
 
 cargo build --locked --release -p pioneer-desktop --target $Target
 cargo build --locked --release -p pioneer-app-updater --target $Target
-if ($env:PIONEER_RELEASE_CACHE_ONLY -eq "1") { exit 0 }
 if ($env:PIONEER_REUSE_GATEWAY_RUN_ID) {
     if (-not $env:PIONEER_SYMBOL_INPUTS_DIR) { throw "Gateway reuse requires retained symbol inputs" }
     python scripts/packaging/symbol-inputs.py export --target $Target "$env:PIONEER_SYMBOL_INPUTS_DIR" "target/$Target/release/pioneer-app.exe" "target/$Target/release/pioneer-app-updater.exe"

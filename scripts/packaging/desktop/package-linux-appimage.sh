@@ -107,8 +107,6 @@ fi
 
 cargo build --locked --release -p pioneer-desktop --target "$TARGET"
 cargo build --locked --release -p pioneer-app-updater --target "$TARGET"
-# Main-branch dependency warmup stops before packaging, signing or Gateway reuse.
-if [[ "${PIONEER_RELEASE_CACHE_ONLY:-}" == "1" ]]; then exit 0; fi
 if [[ -n "${PIONEER_REUSE_GATEWAY_RUN_ID:-}" ]]; then
   : "${PIONEER_SYMBOL_INPUTS_DIR:?Gateway reuse requires retained symbol inputs}"
   python3 scripts/packaging/symbol-inputs.py export --target "$TARGET" "$PIONEER_SYMBOL_INPUTS_DIR" \
