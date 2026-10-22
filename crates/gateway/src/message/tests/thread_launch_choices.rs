@@ -41,7 +41,8 @@ impl Provider for ChoiceModelsProvider {
         no_effort.capabilities.thinking = Some(false);
         models.push(no_effort);
         let mut other = models[0].clone();
-        other.id = "catalog-other".into();
+        // Discovery cannot give an unknown OpenAI family an effort contract.
+        other.id = "gpt-5.4-catalog-other".into();
         other.name = Some("Another selectable model".into());
         models.push(other);
         Ok(models)
@@ -372,7 +373,7 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
         "explicit-api",
         json!({
             "targetOptionId": target.id, "input": [{"type":"text", "text":"Use another model"}],
-            "launch": {"profile":{"kind":"model", "providerId":"openai", "modelId":"catalog-other"},
+            "launch": {"profile":{"kind":"model", "providerId":"openai", "modelId":"gpt-5.4-catalog-other"},
                 "reasoning":{"effort":"high"}, "permissionProfile":{"mode":"full_access"}}
         }),
     )
@@ -387,7 +388,7 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
     let explicit: serde_json::Value = serde_json::from_str(&explicit.payload_json).unwrap();
     let explicit: TurnStartParams =
         serde_json::from_value(explicit["dispatch"]["params"].clone()).unwrap();
-    assert_eq!(explicit.model.as_deref(), Some("catalog-other"));
+    assert_eq!(explicit.model.as_deref(), Some("gpt-5.4-catalog-other"));
     assert_eq!(explicit.reasoning.unwrap().effort, "high");
 }
 
@@ -417,7 +418,7 @@ async fn identity_models_catalog_exposes_model_reasoning_without_secrets_and_rej
     let model = executor
         .models
         .iter()
-        .find(|model| model.id == "gpt-5.4")
+        .find(|model| model.id == "gpt-5.4-catalog-other")
         .unwrap();
     assert!(!model.display_name.is_empty());
     assert!(
