@@ -88,6 +88,8 @@ def export(args):
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     metadata = dict(schema_version=1, commit=commit,
                     run_id=os.environ["GITHUB_RUN_ID"], target=args.target,
+                    catalog_sha256=(digest(Path(os.environ["PIONEER_BUNDLED_MODEL_CATALOG"]))
+                                    if os.environ.get("PIONEER_BUNDLED_MODEL_CATALOG") else None),
                     binaries=binaries, files=records)
     (args.out / "inputs.json").write_text(json.dumps(metadata, indent=2) + "\n")
 
@@ -103,11 +105,11 @@ def record(args):
     args.ledger.write_text(json.dumps(rows, indent=2) + "\n")
 
 
-def process(args):
+def process(args, expected_run_id=None, packaged_override=None, inventory_name="release-inputs.json"):
     metadata = json.loads((args.inputs / "inputs.json").read_text())
     if metadata["commit"] != os.environ["SYMBOL_SOURCE_SHA"]:
         raise ValueError("symbol inputs are from a different source commit")
-    if str(metadata["run_id"]) != os.environ["SYMBOL_SOURCE_RUN_ID"]:
+    if str(metadata["run_id"]) != (expected_run_id or os.environ["SYMBOL_SOURCE_RUN_ID"]):
         raise ValueError("symbol inputs are from a different workflow run")
     if metadata["target"] != os.environ["SYMBOL_TARGET"]:
         raise ValueError("symbol inputs are for a different target")
@@ -139,7 +141,8 @@ def process(args):
             raise ValueError("missing symbol input archive member")
     # Only this job's downloaded archive; release inputs remain in Actions storage.
     (args.inputs / "inputs.tar.gz").unlink()
-    packaged = json.loads((args.inputs / "packaged.json").read_text())
+    packaged = (packaged_override if packaged_override is not None
+                else json.loads((args.inputs / "packaged.json").read_text()))
     env = os.environ.copy()
     for key in ("MallocStackLogging", "MallocStackLoggingNoCompact", "MallocStackLoggingDirectory"):
         env.pop(key, None)
@@ -159,10 +162,28 @@ def process(args):
         manifest = args.out / f"{original.stem}-{module}" / "manifest.json"
         value = json.loads(manifest.read_text())
         value.update(source_run_id=metadata["run_id"], target=metadata["target"],
+                     packaged_by_run_id=os.environ["SYMBOL_SOURCE_RUN_ID"],
                      packaged_binary_sha256s=[row["binary_sha256"] for row in matches],
                      packaged_module_validated=True)
         manifest.write_text(json.dumps(value, indent=2) + "\n")
-    (args.out / "release-inputs.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    gateway = args.inputs / "gateway"
+    if gateway.exists():
+        if expected_run_id is not None:
+            raise ValueError("nested Gateway reuse is not supported")
+        receipt = json.loads((gateway / "reuse.json").read_text())
+        original = json.loads((gateway / "inputs.json").read_text())
+        if (receipt.get("schema_version") != 1 or receipt.get("variant") != "computer-use"
+                or receipt.get("commit") != metadata["commit"] or receipt.get("target") != metadata["target"]
+                or str(receipt.get("run_id")) != str(original["run_id"])
+                or len(original["binaries"]) != 1
+                or original.get("catalog_sha256") != metadata.get("catalog_sha256")
+                or receipt.get("module_id") != original["binaries"][0]["module_id"]
+                or receipt.get("binary_sha256") != original["binaries"][0]["sha256"]):
+            raise ValueError("reused Gateway provenance mismatch")
+        child = argparse.Namespace(inputs=gateway, work=args.work / "gateway", out=args.out)
+        process(child, str(receipt["run_id"]), packaged, "gateway-release-inputs.json")
+        metadata["reused_gateway"] = receipt
+    (args.out / inventory_name).write_text(json.dumps(metadata, indent=2) + "\n")
 
 
 def main():

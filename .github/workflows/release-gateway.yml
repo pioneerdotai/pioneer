@@ -1,15 +1,33 @@
 name: Release Gateway
+run-name: ${{ ((github.event_name == 'push' && github.ref_type == 'branch') || inputs.cache_only) && 'Warm Gateway release cache' || format('Release Gateway ({0})', github.ref_name) }}
 
 on:
+  workflow_dispatch:
+    inputs:
+      cache_only:
+        description: Warm release dependencies without producing release artifacts
+        type: boolean
+        default: false
   push:
-    tags:
-      - "*"
+    tags: ["*"]
+    branches: [main]
+    paths:
+      - Cargo.lock
+      - '**/Cargo.toml'
+      - 'rust-toolchain*'
+      - '.cargo/**'
+      - '.github/workflows/release-gateway.yml'
+      - 'scripts/packaging/**'
 
 permissions:
   contents: write
 
+env:
+  PIONEER_RELEASE_CACHE_ONLY: ${{ ((github.event_name == 'push' && github.ref_type == 'branch') || inputs.cache_only) && '1' || '0' }}
+
 jobs:
   prepare-release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     name: prepare-release
     runs-on: ubuntu-latest
     steps:
@@ -50,6 +68,11 @@ jobs:
       - name: setup-rust
         uses: dtolnay/rust-toolchain@stable
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-model-catalog-v1
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: generate-and-validate-model-catalog
         shell: bash
         run: |
@@ -66,7 +89,7 @@ jobs:
           if-no-files-found: error
 
   build-gateway:
-    name: build-${{ matrix.target }}
+    name: gateway-${{ matrix.target }}-default-and-computer-use
     needs: generate-model-catalog
     runs-on: ${{ matrix.os }}
     env:
@@ -82,90 +105,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            asset_name: pioneer-gateway-linux-x86_64.gz
-            archive: gz
-            cargo_features: ""
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            asset_name: pioneer-gateway-linux-x86_64-computer-use.gz
-            archive: gz
-            cargo_features: computer-use
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            asset_name: pioneer-gateway-linux-aarch64.gz
-            archive: gz
-            cargo_features: ""
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            asset_name: pioneer-gateway-linux-aarch64-computer-use.gz
-            archive: gz
-            cargo_features: computer-use
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            asset_name: pioneer-gateway-macos-aarch64.gz
-            archive: gz
-            cargo_features: ""
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            asset_name: pioneer-gateway-macos-aarch64-computer-use.gz
-            archive: gz
-            cargo_features: computer-use
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            asset_name: pioneer-gateway-macos-x86_64.zip
-            archive: zip
-            cargo_features: ""
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            asset_name: pioneer-gateway-macos-x86_64-computer-use.zip
-            archive: zip
-            cargo_features: computer-use
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            asset_name: pioneer-gateway-windows-x86_64.zip
-            archive: zip
-            cargo_features: ""
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            asset_name: pioneer-gateway-windows-x86_64-computer-use.zip
-            archive: zip
-            cargo_features: computer-use
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            asset_name: pioneer-gateway-windows-aarch64.zip
-            archive: zip
-            cargo_features: ""
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            asset_name: pioneer-gateway-windows-aarch64-computer-use.zip
-            archive: zip
-            cargo_features: computer-use
-
+          - {os: ubuntu-latest, target: x86_64-unknown-linux-gnu, asset: pioneer-gateway-linux-x86_64.gz, computer_asset: pioneer-gateway-linux-x86_64-computer-use.gz}
+          - {os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, asset: pioneer-gateway-linux-aarch64.gz, computer_asset: pioneer-gateway-linux-aarch64-computer-use.gz}
+          - {os: macos-latest, target: aarch64-apple-darwin, asset: pioneer-gateway-macos-aarch64.gz, computer_asset: pioneer-gateway-macos-aarch64-computer-use.gz}
+          - {os: macos-latest, target: x86_64-apple-darwin, asset: pioneer-gateway-macos-x86_64.zip, computer_asset: pioneer-gateway-macos-x86_64-computer-use.zip}
+          - {os: windows-latest, target: x86_64-pc-windows-msvc, asset: pioneer-gateway-windows-x86_64.zip, computer_asset: pioneer-gateway-windows-x86_64-computer-use.zip}
+          - {os: windows-11-arm, target: aarch64-pc-windows-msvc, asset: pioneer-gateway-windows-aarch64.zip, computer_asset: pioneer-gateway-windows-aarch64-computer-use.zip}
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.sha }}
           submodules: recursive
-
       - name: download-model-catalog
         uses: actions/download-artifact@v7
         with:
           name: pioneer-release-model-catalog
           path: release-model-catalog
-
       - name: setup-rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: setup-zig-for-linux-aarch64
-        if: runner.os == 'Linux' && matrix.target == 'aarch64-unknown-linux-gnu' && runner.arch != 'ARM64'
-        uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: 0.13.0
-
+      - name: configure-native-release-environment
+        shell: bash
+        run: python scripts/packaging/build-gateway.py --target "${{ matrix.target }}" --configure
       - name: install-linux-build-dependencies
         if: runner.os == 'Linux'
         shell: bash
@@ -174,23 +136,16 @@ jobs:
           packages=(
             pkg-config
             libssl-dev
+            libegl1-mesa-dev
+            libgbm-dev
+            libpipewire-0.3-dev
+            libwayland-dev
+            libxkbcommon-dev
           )
-          if [[ -n "${{ matrix.cargo_features }}" ]]; then
-            packages+=(
-              libegl1-mesa-dev
-              libgbm-dev
-              libpipewire-0.3-dev
-              libwayland-dev
-              libxkbcommon-dev
-            )
-          fi
           sudo apt-get update
           sudo apt-get install -y "${packages[@]}"
-          if [[ -n "${{ matrix.cargo_features }}" ]]; then
-            multiarch="$(gcc -print-multiarch)"
-            echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
-          fi
-
+          multiarch="$(gcc -print-multiarch)"
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
       - name: install-onnx-runtime-macos-x86_64
         if: matrix.target == 'x86_64-apple-darwin'
         shell: bash
@@ -210,122 +165,75 @@ jobs:
           existing_rustflags="${RUSTFLAGS:-}"
           echo "RUSTFLAGS=${existing_rustflags:+$existing_rustflags }-C link-arg=-Wl,-rpath,@executable_path" >> "$GITHUB_ENV"
 
-      - name: build-unix-target
-        if: runner.os != 'Windows'
+      - name: restore-release-dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-gateway-${{ matrix.target }}-v1
+          cache-workspace-crates: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: build-default
         shell: bash
         run: |
           set -euo pipefail
-
-          if [[ "${{ runner.os }}" == "Linux" && "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" && "${RUNNER_ARCH:-}" != "ARM64" ]]; then
-            cargo install cargo-zigbuild --locked --quiet
-            if [[ -n "${{ matrix.cargo_features }}" ]]; then
-              cargo zigbuild --locked --release -p pioneer-cli --features "${{ matrix.cargo_features }}" --target "${{ matrix.target }}"
-            else
-              cargo zigbuild --locked --release -p pioneer-cli --target "${{ matrix.target }}"
-            fi
-          else
-            if [[ -n "${{ matrix.cargo_features }}" ]]; then
-              cargo build --locked --release -p pioneer-cli --features "${{ matrix.cargo_features }}" --target "${{ matrix.target }}"
-            else
-              cargo build --locked --release -p pioneer-cli --target "${{ matrix.target }}"
-            fi
-          fi
-
-      - name: build-windows-target
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $target = "${{ matrix.target }}"
-          $env:BINDGEN_EXTRA_CLANG_ARGS = "--target=$target"
-
-          if ($target -eq "aarch64-pc-windows-msvc") {
-            # ggml's ARM backend requires clang. Ninja lets CMake honor the
-            # compiler selection instead of forcing the Visual Studio toolset.
-            $env:CMAKE_GENERATOR = "Ninja"
-            $env:CMAKE_C_COMPILER = "clang-cl"
-            $env:CMAKE_CXX_COMPILER = "clang-cl"
-            $env:CMAKE_C_COMPILER_TARGET = $target
-            $env:CMAKE_CXX_COMPILER_TARGET = $target
-            $env:CL = "/EHsc"
-            # ccache exited successfully without producing clang-cl ARM64
-            # object files in release builds, so invoke the compiler directly.
-            $env:GGML_CCACHE = "OFF"
-          }
-
-          $cargoArgs = @("build", "--locked", "--release", "-p", "pioneer-cli")
-          if (-not [string]::IsNullOrWhiteSpace("${{ matrix.cargo_features }}")) {
-            $cargoArgs += @("--features", "${{ matrix.cargo_features }}")
-          }
-          $cargoArgs += @("--target", $target)
-          cargo @cargoArgs
-
-      - name: preserve-symbol-inputs
-        shell: bash
-        run: |
-          set -euo pipefail
-          suffix=""
-          if [[ "${{ runner.os }}" == "Windows" ]]; then suffix=".exe"; fi
-          binary="target/${{ matrix.target }}/release/pioneer${suffix}"
-          python3 scripts/packaging/symbol-inputs.py export --target "${{ matrix.target }}" release-symbol-inputs "$binary"
-          if [[ "${{ runner.os }}" == "macOS" ]]; then
-            strip -S "$binary"
-          elif [[ "${{ runner.os }}" == "Linux" ]]; then
-            strip --strip-debug "$binary"
-          fi
-          python3 scripts/packaging/symbol-inputs.py record "$binary" release-symbol-inputs/packaged.json
-
-      - name: upload-symbol-inputs
+          flags=()
+          if [[ "$PIONEER_RELEASE_CACHE_ONLY" == "1" ]]; then flags+=(--cache-only); fi
+          python scripts/packaging/build-gateway.py --target "${{ matrix.target }}" \
+            --variant default --asset "${{ matrix.asset }}" \
+            --out release-gateway/default "${flags[@]}"
+      - name: retain-default-symbol-inputs
+        if: env.PIONEER_RELEASE_CACHE_ONLY != '1'
         uses: actions/upload-artifact@v6
         with:
-          name: symbol-inputs-gateway-${{ matrix.target }}-${{ matrix.cargo_features || 'default' }}
-          path: release-symbol-inputs/
+          name: symbol-inputs-gateway-${{ matrix.target }}-default
+          path: release-gateway/default/symbol-inputs/
           compression-level: 0
           retention-days: 7
           if-no-files-found: error
+      - name: retain-default-release-asset
+        if: env.PIONEER_RELEASE_CACHE_ONLY != '1'
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.asset }}
+          path: release-gateway/default/assets/
+          if-no-files-found: error
+      - name: remove-uploaded-default-transfer-copy
+        if: env.PIONEER_RELEASE_CACHE_ONLY != '1'
+        shell: bash
+        run: python -c 'import shutil; shutil.rmtree("release-gateway/default")'
 
-      - name: package-unix-artifact
-        if: runner.os != 'Windows'
+      - name: build-computer-use
         shell: bash
         run: |
           set -euo pipefail
-          binary_path="target/${{ matrix.target }}/release/pioneer"
-          cp "$binary_path" pioneer
-          chmod 0755 pioneer
-          if [[ "${{ matrix.archive }}" == "zip" ]]; then
-            if [[ -z "${PIONEER_ONNXRUNTIME_DYLIB_DIR:-}" ]]; then
-              echo "PIONEER_ONNXRUNTIME_DYLIB_DIR is required for zip gateway artifacts" >&2
-              exit 1
-            fi
-            shopt -s nullglob
-            dylibs=("$PIONEER_ONNXRUNTIME_DYLIB_DIR"/libonnxruntime*.dylib)
-            if [[ ${#dylibs[@]} -eq 0 ]]; then
-              echo "no libonnxruntime dylibs found in $PIONEER_ONNXRUNTIME_DYLIB_DIR" >&2
-              exit 1
-            fi
-            for dylib in "${dylibs[@]}"; do
-              cp -L "$dylib" .
-            done
-            zip -9 "${{ matrix.asset_name }}" pioneer libonnxruntime*.dylib
-          else
-            gzip -9 pioneer
-            mv pioneer.gz "${{ matrix.asset_name }}"
-          fi
-
-      - name: package-windows-artifact
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $binaryPath = "target/${{ matrix.target }}/release/pioneer.exe"
-          Copy-Item -Path $binaryPath -Destination "pioneer.exe" -Force
-          Compress-Archive -Path "pioneer.exe" -DestinationPath "${{ matrix.asset_name }}" -Force
-
-      - name: upload-asset
+          flags=()
+          if [[ "$PIONEER_RELEASE_CACHE_ONLY" == "1" ]]; then flags+=(--cache-only); fi
+          python scripts/packaging/build-gateway.py --target "${{ matrix.target }}" \
+            --variant computer-use --asset "${{ matrix.computer_asset }}" \
+            --out release-gateway/computer-use "${flags[@]}"
+      - name: retain-computer-use-symbol-inputs
+        if: env.PIONEER_RELEASE_CACHE_ONLY != '1'
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ matrix.asset_name }}
-          path: ${{ matrix.asset_name }}
+          name: symbol-inputs-gateway-${{ matrix.target }}-computer-use
+          path: release-gateway/computer-use/symbol-inputs/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+      - name: retain-computer-use-release-asset
+        if: env.PIONEER_RELEASE_CACHE_ONLY != '1'
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.computer_asset }}
+          path: release-gateway/computer-use/assets/
+          if-no-files-found: error
+      - name: remove-uploaded-computer-use-transfer-copy
+        if: env.PIONEER_RELEASE_CACHE_ONLY != '1'
+        shell: bash
+        run: python -c 'import shutil; shutil.rmtree("release-gateway/computer-use")'
 
   publish-release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     name: publish-release
     runs-on: ubuntu-latest
     needs: [prepare-release, build-gateway]
@@ -392,6 +300,7 @@ jobs:
           fi
 
   queue-debug-symbols:
+    if: ${{ !inputs.cache_only && (github.ref_type == 'tag' || github.event_name == 'workflow_dispatch') }}
     name: queue-independent-debug-symbols
     needs: build-gateway
     runs-on: ubuntu-latest

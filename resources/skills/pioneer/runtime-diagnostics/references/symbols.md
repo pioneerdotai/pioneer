@@ -111,6 +111,14 @@ Before using a directory, check:
    other executable shipped in the same desktop artifact.
 5. Inventory files, byte sizes and checksums validate; retain the directory layout.
 
+Desktop releases can reuse the `computer-use` Gateway from the same commit's
+Release Gateway run. In that case, `release-inputs.json.reused_gateway` and
+`gateway-release-inputs.json` identify its original producer. For its executable
+manifest, `source_run_id` must match that Gateway run; `packaged_by_run_id` must
+match the Desktop release run. Use the Desktop artifact's packaged hashes because
+Desktop packaging may strip or sign the reused executable. The Desktop and
+Gateway inventories must agree on commit, target, catalog hash and module identity.
+
 Do not load an entire multi-GiB DWARF/PDB into a JSON/text tool or model context.
 Use streaming checksums and bounded native lookups. Copying just a dSYM without
 its sibling manifest/executable loses the automatic validation path.
