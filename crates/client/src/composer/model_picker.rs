@@ -1443,13 +1443,18 @@ mod tests {
             }),
         );
         let runtime_snapshot = core.provider_runtime_snapshot("ws").unwrap();
+        // Catalog arrival refreshes the label for the old reasoning effort.
+        // Hold that response too, so validation must fence both stale requests.
+        let previous_effort_name = display.take();
         // The returned model has no reasoning options, so the non-deferred
         // response path must clear the previously selected effort.
         core.complete_composer_model_picker(model_work, models("cli_runtime:codex"));
         let applied = published_selection(&core, "cli_runtime:codex", true);
         assert!(applied.domain().selected_reasoning_effort.is_none());
-        old_name.complete(&core, model_response("cli_runtime:codex"));
-        assert!(Arc::ptr_eq(&applied, &core.composer_snapshot("a").unwrap()));
+        for stale_name in [old_name, previous_effort_name] {
+            stale_name.complete(&core, model_response("cli_runtime:codex"));
+            assert!(Arc::ptr_eq(&applied, &core.composer_snapshot("a").unwrap()));
+        }
         display
             .take()
             .complete(&core, model_response("cli_runtime:codex"));
