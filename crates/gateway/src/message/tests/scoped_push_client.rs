@@ -479,6 +479,15 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
         let inbox_subscription = hidden_cli_start.then(|| core.0.subscribe(ClientScope::TaskInbox {
             workspace_id: workspace.clone(),
         }, NonZeroUsize::new(32).unwrap()));
+        if hidden_cli_start {
+            // Subscription retains delivery; the shell's visible demand owns
+            // initial inbox loading before combined push can be negotiated.
+            core.0.dispatch(pioneer_client::core::ClientIntent::SetScopeDemand {
+                scope: ClientScope::TaskInbox { workspace_id: workspace.clone() },
+                demand: pioneer_client::core::ClientDemand::Visible,
+                generation: pioneer_client::core::ClientGeneration::new(1),
+            });
+        }
         stage.set("initial negotiated snapshot");
         let snapshot = loop {
             let packet = packets_rx.recv().await.expect("negotiated snapshot");
@@ -497,6 +506,7 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
             stage.set("hidden CLI activation and root activity");
             assert!(!core.0.workspace_tree(&workspace).unwrap().snapshot().threads_by_id.contains_key(&child.child_thread_id));
             let baseline_prefix = prefix_requests.load(Ordering::SeqCst);
+            assert!(baseline_prefix > 0, "visible inbox demand reached the Gateway bootstrap");
             let baseline_push = push_requests.load(Ordering::SeqCst);
             let source_epoch="hidden-source-combined";
             let register_source=generate_test_request_id("pushclient","source-combined");
