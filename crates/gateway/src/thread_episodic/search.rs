@@ -2,8 +2,9 @@
 //! See SEARCH_REVIEW.md for the continuation proof and cost model.
 use super::*;
 use crate::authorization::{
+    AgentAuthorizationFacts, AgentExecutionPersistenceFacts, AgentSecurityEnvelope,
     AuthorizationResolver, AuthorizationService, ExecutionAuthorizationContext, ProofResolution,
-    ResourceAction, RuntimePrincipalPolicy, collaboration_authority_principal,
+    ResourceAction, RoleDefinitionRegistry, collaboration_authority_principal,
 };
 use anyhow::{Context, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -23,6 +24,8 @@ pub(crate) struct EpisodicSearchAuthority {
     principal: crate::auth::AuthenticatedSessionPrincipal,
     root_thread_id: String,
     root_only: bool,
+    observe_children: bool,
+    agent: Option<SearchAgentAuthority>,
     only_thread_id: Option<String>,
     fingerprint: String,
     policy_generation: u64,
@@ -54,16 +57,39 @@ impl EpisodicSearchAuthority {
                 policy_generation,
             )
             .await?;
-        let policy = AuthorizationService::new();
-        let root_only = execution.runtime_principal_policy()? != RuntimePrincipalPolicy::Absolute
-            || policy.runtime_principal_policy(principal.kind, principal.role_key.as_ref())
-                != Some(RuntimePrincipalPolicy::Absolute);
+        let agent = SearchAgentAuthority::load(
+            store,
+            workspace_id,
+            turn_id,
+            execution.root_thread_id(),
+            policy_generation,
+        )
+        .await?;
+        if !agent.envelope.allows(ResourceAction::ThreadRead) {
+            bail!("episodic search authority unavailable");
+        }
+        let observe_workspace = agent
+            .envelope
+            .allows(ResourceAction::ThreadObserveWorkspace)
+            && execution.grants_action(ResourceAction::ThreadObserveWorkspace)
+            && execution
+                .revalidate_root_for_collaborator(
+                    store,
+                    &principal,
+                    ResourceAction::ThreadObserveWorkspace,
+                    policy_generation,
+                )
+                .await
+                .is_ok();
+        let root_only = !observe_workspace;
+        let observe_children = agent.envelope.allows(ResourceAction::ChildObserve);
         let fingerprint = stable_text_hash(&format!(
-            "threads_search:v1:{turn_id}:{}:{:?}:{:?}:{}",
+            "threads_search:v2:{turn_id}:{}:{:?}:{:?}:{}:{}",
             execution.to_persisted_json()?,
             principal.kind,
             principal.role_key,
-            policy_generation
+            policy_generation,
+            agent.envelope.fingerprint
         ));
         Ok(Self {
             workspace_id: workspace_id.to_owned(),
@@ -72,6 +98,8 @@ impl EpisodicSearchAuthority {
             principal,
             root_thread_id: execution.root_thread_id().to_owned(),
             root_only,
+            observe_children,
+            agent: Some(agent),
             only_thread_id: None,
             fingerprint,
             policy_generation,
@@ -107,6 +135,48 @@ impl EpisodicSearchAuthority {
         .await
     }
 
+    pub(crate) fn restrict_to_agent_binding(
+        mut self,
+        facts: &AgentExecutionPersistenceFacts,
+    ) -> Result<Self> {
+        let agent = self
+            .agent
+            .as_ref()
+            .context("episodic Agent authority unavailable")?;
+        if facts.execution_id.as_str() != agent.execution_id
+            || facts.home_root_thread_id != self.root_thread_id
+            || facts.identity.id != agent.envelope.identity_id
+            || facts.agent_authorization_role_key != agent.envelope.role_key
+        {
+            bail!("episodic Agent authority unavailable");
+        }
+        let policy = RoleDefinitionRegistry::new();
+        let allows = |action: ResourceAction| {
+            facts
+                .agent_authorization_allowed_actions
+                .iter()
+                .any(|name| name == action.safe_name())
+                && policy.agent_policy_allows(&facts.agent_authorization_role_key, action)
+        };
+        if !allows(ResourceAction::ThreadRead) {
+            bail!("episodic Agent authority unavailable");
+        }
+        self.root_only |= !allows(ResourceAction::ThreadObserveWorkspace);
+        self.observe_children &= allows(ResourceAction::ChildObserve);
+        self.fingerprint = stable_text_hash(
+            &serde_json::json!([
+                self.fingerprint,
+                facts.execution_id.as_str(),
+                facts.agent_authorization_role_key,
+                facts.agent_authorization_allowed_actions,
+                self.root_only,
+                self.observe_children
+            ])
+            .to_string(),
+        );
+        Ok(self)
+    }
+
     pub(crate) fn current_thread_only(mut self, thread_id: &str) -> Self {
         self.only_thread_id = Some(thread_id.to_owned());
         self
@@ -132,6 +202,24 @@ impl EpisodicSearchAuthority {
             .is_some_and(|only| only != thread_id)
         {
             return Ok(false);
+        }
+        if let Some(agent) = &self.agent {
+            let Ok(current) = SearchAgentAuthority::load(
+                store,
+                &self.workspace_id,
+                &self.turn_id,
+                &self.root_thread_id,
+                self.policy_generation,
+            )
+            .await
+            else {
+                return Ok(false);
+            };
+            if current.execution_id != agent.execution_id
+                || current.envelope.fingerprint != agent.envelope.fingerprint
+            {
+                return Ok(false);
+            }
         }
         let policy = AuthorizationService::new();
         let gate = policy.authorize_action(
@@ -165,7 +253,95 @@ impl EpisodicSearchAuthority {
                 .await?
         };
         Ok(matches!(proof, ProofResolution::Authorized(proof)
-            if !self.root_only || proof.collaboration_root_thread_id() == self.root_thread_id))
+            if (!self.root_only || proof.collaboration_root_thread_id() == self.root_thread_id)
+                && (proof.collaboration_root_thread_id() == proof.thread_id()
+                    || self.observe_children || thread_id == self.execution_thread_id)))
+    }
+}
+
+#[derive(Clone)]
+struct SearchAgentAuthority {
+    execution_id: String,
+    envelope: AgentSecurityEnvelope,
+}
+
+impl SearchAgentAuthority {
+    async fn load(
+        store: &CrudStore,
+        workspace_id: &str,
+        turn_id: &str,
+        root_thread_id: &str,
+        policy_generation: u64,
+    ) -> Result<Self> {
+        let database = store.database_connection();
+        let response = pioneer_crud::load_agent_turn_response(&database, turn_id)
+            .await?
+            .context("episodic Agent authority unavailable")?;
+        let execution = pioneer_crud::load_agent_execution(&database, &response.execution_id)
+            .await?
+            .context("episodic Agent authority unavailable")?;
+        // The canonical response mapping identifies this Turn's execution.
+        // Its parent_thread_id is the creator's thread for Task executions,
+        // not the child conversation. Turn scope/lineage was verified above.
+        if execution.workspace_id != workspace_id || execution.home_root_thread_id != root_thread_id
+        {
+            bail!("episodic Agent authority unavailable");
+        }
+        let identity = pioneer_crud::load_agent_identity(&database, &execution.agent_identity_id)
+            .await?
+            .context("episodic Agent authority unavailable")?;
+        if identity.workspace_id != workspace_id
+            || identity.status != "active"
+            || identity.retired_at.is_some()
+        {
+            bail!("episodic Agent authority unavailable");
+        }
+        let grant = pioneer_crud::load_agent_execution_grant(&database, &execution.id)
+            .await?
+            .context("episodic Agent authority unavailable")?;
+        if grant.child_identity_id != identity.id
+            || pioneer_crud::agent_execution_grant_fingerprint(&grant.grant_json)?
+                != grant.grant_fingerprint
+        {
+            bail!("episodic Agent authority unavailable");
+        }
+        let value: serde_json::Value = serde_json::from_str(&grant.grant_json)?;
+        let role_key = value
+            .get("role_key")
+            .and_then(serde_json::Value::as_str)
+            .context("episodic Agent authority unavailable")?;
+        let allowed: Vec<String> = serde_json::from_value(
+            value
+                .get("allowed_actions")
+                .cloned()
+                .context("episodic Agent authority unavailable")?,
+        )?;
+        let generation = value
+            .get("agent_policy_generation")
+            .and_then(serde_json::Value::as_u64)
+            .context("episodic Agent authority unavailable")?;
+        let fingerprint = value
+            .get("agent_authorization_fingerprint")
+            .and_then(serde_json::Value::as_str)
+            .context("episodic Agent authority unavailable")?;
+        let envelope = AgentAuthorizationFacts {
+            identity_id: pioneer_protocol::AgentIdentityId::new(identity.id)
+                .map_err(|_| anyhow::anyhow!("episodic Agent authority unavailable"))?,
+            identity_status: pioneer_protocol::AgentIdentityStatus::Active,
+            role_key: role_key.to_owned(),
+            root_capsule_id: root_thread_id.to_owned(),
+            parent_envelope: None,
+            policy_generation,
+        }
+        .derive_envelope(RoleDefinitionRegistry::new())
+        .and_then(|envelope| {
+            envelope.constrain_to_persisted_actions(&allowed, generation, fingerprint)
+        })
+        .context("episodic Agent authority unavailable")?;
+        Ok(Self {
+            execution_id: execution.id,
+            envelope,
+        })
     }
 }
 
@@ -460,7 +636,7 @@ impl ThreadEpisodicRecallService {
                 source_after = Some(item.id.clone());
                 if matches!(
                     item.status,
-                    ThreadEpisodicItemStatus::PendingIndex | ThreadEpisodicItemStatus::IndexFailed
+                    ThreadEpisodicItemStatus::PendingIndex | ThreadEpisodicItemStatus::Failed
                 ) || (item.status == ThreadEpisodicItemStatus::Active
                     && item.capsule_id.is_none())
                 {
@@ -573,7 +749,18 @@ impl ThreadEpisodicRecallService {
         }
         let filtered_all_candidates = !output.hits.is_empty() && hits.is_empty();
         hits.retain(|hit| {
-            hit.hit.score.is_finite() && hit.hit.score >= prepared.config.min_relevancy
+            let relevance = if output.approximate {
+                hit.hit
+                    .score_breakdown
+                    .semantic_score
+                    .or(hit.hit.score_breakdown.lexical_score)
+                    .unwrap_or(hit.hit.score)
+            } else {
+                hit.hit.score
+            };
+            hit.hit.score.is_finite()
+                && relevance.is_finite()
+                && relevance >= prepared.config.min_relevancy
         });
         Ok((
             deduplicate_thread_episodic_hits(hits).hits,
@@ -857,7 +1044,9 @@ impl ThreadEpisodicRecallService {
                 .total_cmp(&a.score)
                 .then_with(|| a.provenance.source_id.cmp(&b.provenance.source_id))
         });
-        hits.retain(|hit| hit.score.is_finite() && hit.score >= prepared.config.min_relevancy);
+        // The shared retrieval already applied the configured relevance gate
+        // before ordinal ordering scores were persisted in selection references.
+        hits.retain(|hit| hit.score.is_finite());
         hits.truncate(max_hits);
         let cap = max_chars.min(prepared.config.max_prompt_chars as usize);
         let original_chars: usize = hits.iter().map(|h| h.text.chars().count()).sum();
@@ -1154,4 +1343,4 @@ fn unavailable_page() -> ThreadSearchPage {
 
 #[cfg(test)]
 #[path = "search_tests.rs"]
-mod tests;
+pub(super) mod tests;

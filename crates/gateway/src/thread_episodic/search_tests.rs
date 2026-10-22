@@ -9,8 +9,8 @@ use pioneer_protocol::{PrincipalId, TurnItem};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 #[derive(Default)]
-struct PagedCandidates {
-    pages: StdMutex<BTreeMap<(String, usize), Vec<ThreadEpisodicRankedSearchHit>>>,
+pub(crate) struct PagedCandidates {
+    pub(crate) pages: StdMutex<BTreeMap<(String, usize), Vec<ThreadEpisodicRankedSearchHit>>>,
     generation: AtomicU64,
     only_segment: AtomicI64,
     unavailable: AtomicBool,
@@ -119,13 +119,15 @@ async fn authority(store: &CrudStore, workspace_id: &str) -> EpisodicSearchAutho
             .unwrap(),
         root_thread_id: "T00000000000000000001".into(),
         root_only: false,
+        observe_children: true,
+        agent: None,
         only_thread_id: None,
         fingerprint: format!("search-fixture:{workspace_id}"),
         policy_generation: crate::authorization::observed_policy_generation(),
     }
 }
 
-async fn source(
+pub(crate) async fn source(
     store: &CrudStore,
     workspace: &str,
     thread: &str,
@@ -648,6 +650,164 @@ async fn invalid_sources_do_not_hide_a_valid_hit_on_a_later_backend_page() {
 }
 
 #[tokio::test]
+async fn logically_deleted_turn_rejects_fresh_recall_and_saved_cursor_sources() {
+    use pioneer_protocol::{
+        ItemCompletedNotification, PersistedActorRef, SandboxMode, ThreadMode, Turn, TurnKind,
+        TurnOrigin, TurnStatus,
+    };
+    let (store, workspace) = setup_thread_episodic_store().await;
+    let thread_id = "T00000000000000000001";
+    // Materialize the root first, then create a user-authored Message turn so
+    // deletion goes through the real revision/author/mode checks.
+    source(
+        &store,
+        &workspace,
+        thread_id,
+        "unrelated",
+        "unrelated content",
+    )
+    .await;
+    let scope = authority(&store, &workspace).await;
+    let mut thread = store.get_thread_model(thread_id).await.unwrap().unwrap();
+    thread.mode = ThreadMode::Message;
+    let turn = Turn {
+        id: "turn-logical-delete".into(),
+        status: TurnStatus::Completed,
+        turn_kind: TurnKind::Conversation,
+        origin: TurnOrigin::User,
+        mode: ThreadMode::Message,
+        author: None,
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
+        error: None,
+        prompt_manifest: None,
+        permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+    };
+    let actor = PersistedActorRef::Principal(scope.principal.principal_id.clone());
+    store
+        .materialize_turn_start(&thread, SandboxMode::FullAccess, &turn, &[], actor.clone())
+        .await
+        .unwrap();
+    let item_id = "logical-delete-item";
+    let text = "provider settings logically deleted secret discussion";
+    store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: workspace.clone(),
+                thread_id: thread_id.into(),
+                turn_id: turn.id.clone(),
+                item: TurnItem::UserMessage {
+                    id: item_id.into(),
+                    text: text.into(),
+                    attachments: Vec::new(),
+                },
+            },
+            1_700_000_001,
+        )
+        .await
+        .unwrap();
+    let item =
+        seed_active_thread_episodic_item(&store, &workspace, thread_id, &turn.id, item_id, text)
+            .await;
+    let backend = Arc::new(PagedCandidates::default());
+    backend.pages.lock().unwrap().insert(
+        (thread_id.into(), 0),
+        vec![ranked_hit_for_item(&item, text, 0.9)],
+    );
+    let other = source(
+        &store,
+        &workspace,
+        "T00000000000000000002",
+        "retained-source",
+        "provider settings still readable",
+    )
+    .await;
+    backend.pages.lock().unwrap().insert(
+        (other.thread_id.clone(), 0),
+        vec![ranked_hit_for_item(&other, "provider settings", 0.8)],
+    );
+    let service = ThreadEpisodicRecallService::new(store.clone(), backend);
+    let page = next_page(&service, &scope, 1, None).await;
+    assert_eq!(page.threads[0].fragments[0].item_id, item_id);
+    let saved_cursor = page
+        .next_cursor
+        .expect("a real continuation keeps the emitted source boundary");
+    assert!(
+        !service
+            .recall_authorized_workspace(scope.clone(), "provider settings", 8, 2000)
+            .await
+            .unwrap()
+            .hits
+            .is_empty()
+    );
+    store
+        .delete_turn_message(pioneer_crud::DeleteTurnMessageRequest {
+            workspace_id: workspace.clone(),
+            thread_id: thread_id.into(),
+            turn_id: turn.id.clone(),
+            expected_revision: 0,
+            changed_by: actor,
+            changed_at_unix: 1_700_000_500,
+        })
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_turn_item(&turn.id, item_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "logical delete retains physical source"
+    );
+    assert!(
+        matches!(
+            store
+                .find_thread_episodic_item(&item.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ThreadEpisodicItemStatus::Active
+        ),
+        "this is not an episodic tombstone test"
+    );
+    let rejected = service
+        .validate_search_source(&workspace, thread_id, &item.id)
+        .await
+        .expect_err("physical item and active projection cannot override logical deletion");
+    assert!(rejected.contains("canonical turn unavailable"));
+    assert!(
+        service
+            .search_threads(scope.clone(), "provider settings", 1, Some(&saved_cursor))
+            .await
+            .is_err(),
+        "the real saved cursor must reject its logically deleted canonical boundary"
+    );
+    let page = next_page(&service, &scope, 1, None).await;
+    assert_eq!(page.threads.len(), 1);
+    assert_eq!(page.threads[0].thread_id, other.thread_id);
+    assert!(!serde_json::to_string(&page).unwrap().contains(text));
+    let recalled = service
+        .recall_authorized_workspace(scope, "provider settings", 8, 2000)
+        .await
+        .unwrap();
+    assert!(
+        recalled
+            .hits
+            .iter()
+            .all(|hit| hit.provenance.item_id.0 != item_id)
+    );
+    assert!(
+        recalled
+            .hits
+            .iter()
+            .any(|hit| hit.provenance.item_id.0 == other.item_id)
+    );
+}
+
+#[tokio::test]
 async fn missing_durable_initiator_does_not_produce_workspace_authority() {
     let (store, workspace) = setup_thread_episodic_store().await;
     assert!(
@@ -896,82 +1056,6 @@ async fn admitted_turn(store: &CrudStore, authority: &EpisodicSearchAuthority) -
         .await
         .unwrap();
     turn.id
-}
-
-#[tokio::test]
-async fn provider_workspace_recall_recovers_initiator_and_labels_current_and_other_thread() {
-    use crate::thread_episodic_hooks::ThreadEpisodicMemoryRecallProvider;
-    use pioneer_memory::hooks::{
-        AgentEpisodicRecallProvider, MemoryEpisodicRecallSourceKind,
-        MemoryWorkspaceThreadRecallRequest,
-    };
-    let (store, workspace) = setup_thread_episodic_store().await;
-    let backend = Arc::new(PagedCandidates::default());
-    for n in 1..=2 {
-        let item = source(
-            &store,
-            &workspace,
-            &format!("T{n:020}"),
-            &format!("source-{n}"),
-            "provider settings from an independent conversation",
-        )
-        .await;
-        backend.pages.lock().unwrap().insert(
-            (item.thread_id.clone(), 0),
-            vec![ranked_hit_for_item(&item, "index", 0.9)],
-        );
-    }
-    let scope = authority(&store, &workspace).await;
-    let turn_id = admitted_turn(&store, &scope).await;
-    let recovered = EpisodicSearchAuthority::resolve_for_turn(&store, &workspace, &turn_id, None)
-        .await
-        .unwrap();
-    assert_eq!(
-        recovered.principal.principal_id,
-        scope.principal.principal_id
-    );
-    assert!(
-        EpisodicSearchAuthority::resolve_for_turn(
-            &store,
-            &workspace,
-            &turn_id,
-            Some("P0000000000000000000X")
-        )
-        .await
-        .is_err()
-    );
-    let service = Arc::new(ThreadEpisodicRecallService::new(store.clone(), backend));
-    let provider = ThreadEpisodicMemoryRecallProvider::with_workspace_service(
-        service.clone(),
-        Arc::new(WorkspaceEpisodicRecallService::new(store.clone(), service)),
-        store,
-    );
-    let recalled = provider
-        .recall_workspace_threads(MemoryWorkspaceThreadRecallRequest {
-            workspace_id: workspace,
-            current_thread_id: scope.root_thread_id,
-            turn_id,
-            principal_id: None,
-            query: "provider settings".into(),
-            targets: Vec::new(),
-            top_k: 8,
-            max_chars: 2000,
-        })
-        .await
-        .unwrap();
-    let kinds = recalled
-        .items
-        .iter()
-        .map(|i| i.provenance.source)
-        .collect::<Vec<_>>();
-    assert!(kinds.contains(&MemoryEpisodicRecallSourceKind::CurrentThread));
-    assert!(kinds.contains(&MemoryEpisodicRecallSourceKind::WorkspaceThread));
-    assert!(
-        recalled
-            .items
-            .iter()
-            .all(|i| i.provenance.thread_id.is_some())
-    );
 }
 
 #[tokio::test]

@@ -211,6 +211,7 @@ impl Memvid {
         // Build multiple candidate lists (lexical variants + vector) and fuse with RRF.
         let mut candidate_lists: Vec<Vec<SearchHit>> = Vec::new();
         let mut vector_used = false;
+        let mut vector_candidates_saturated = false;
 
         // For analytical questions, use timeline directly (skip RRF mixing with search)
         // This ensures full-text hits are preserved - search hits are truncated and would
@@ -262,12 +263,14 @@ impl Memvid {
 
             // Vector-only candidate list.
             if self.vec_enabled && query_embedding.is_some() {
+                let vector_limit = effective_top_k.max(24).min(64);
                 let vec_hits = vector_hits(
                     self,
                     query_embedding.as_deref().unwrap_or(&[]),
                     &request,
-                    effective_top_k.max(24).min(64),
+                    vector_limit,
                 )?;
+                vector_candidates_saturated = vec_hits.len() >= vector_limit;
                 if !vec_hits.is_empty() {
                     candidate_lists.push(vec_hits);
                     vector_used = true;
@@ -429,6 +432,7 @@ impl Memvid {
             retriever,
             context_only: request.context_only,
             retrieval,
+            vector_candidates_saturated,
             answer,
             citations,
             context_fragments,
@@ -719,7 +723,7 @@ fn reorder_hits_with_semantic_scores(
         .iter()
         .map(|(frame_id, score)| (*frame_id, *score))
         .collect();
-    sorted_semantic.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    sorted_semantic.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     for (idx, (frame_id, _)) in sorted_semantic.iter().enumerate() {
         semantic_rank.insert(*frame_id, idx + 1);
     }
@@ -1416,6 +1420,7 @@ fn fuse_hits_rrf(mut lists: Vec<Vec<SearchHit>>, target: usize) -> Option<Vec<Se
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.2.rank.cmp(&b.2.rank))
+            .then(a.0.cmp(&b.0))
     });
 
     let mut result = Vec::new();

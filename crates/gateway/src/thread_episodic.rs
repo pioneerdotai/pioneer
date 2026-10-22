@@ -1,3 +1,11 @@
+#[cfg(test)]
+pub(crate) use search::tests::{
+    PagedCandidates as SearchTestBackend, source as seed_search_test_source,
+};
+#[cfg(test)]
+pub(crate) use tests::mark_thread_episodic_workspace_refill_complete_for_test as mark_search_test_ready;
+#[cfg(test)]
+pub(crate) use tests::ranked_hit_for_item as rank_search_test_hit;
 mod search;
 use crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget;
 use crate::thread_episodic_embedding::{
@@ -2624,6 +2632,24 @@ impl ThreadEpisodicRecallService {
         {
             return Err(format!(
                 "suppressed thread episodic hit `{}`: explicit exclusion",
+                item.id
+            ));
+        }
+
+        // Logical message deletion intentionally retains physical turn_items and
+        // can precede episodic tombstoning. Check the canonical turn guard on
+        // every hydration, including sources restored from a search cursor.
+        let guards = self
+            .crud_store
+            .get_turn_message_guards_by_thread_and_ids(thread_id, &[item.turn_id.clone()])
+            .await
+            .map_err(|error| format!("failed to check canonical turn visibility: {error:#}"))?;
+        if !guards
+            .iter()
+            .any(|guard| guard.id == item.turn_id && guard.message_deleted_at.is_none())
+        {
+            return Err(format!(
+                "suppressed thread episodic hit `{}`: canonical turn unavailable",
                 item.id
             ));
         }
@@ -6122,7 +6148,7 @@ mod tests {
         }
     }
 
-    pub(super) fn ranked_hit_for_item(
+    pub(crate) fn ranked_hit_for_item(
         item: &ThreadEpisodicItemRecord,
         text: &str,
         score: f32,
@@ -14886,7 +14912,7 @@ mod tests {
         (crud_store, workspace_id)
     }
 
-    pub(super) async fn mark_thread_episodic_workspace_refill_complete_for_test(
+    pub(crate) async fn mark_thread_episodic_workspace_refill_complete_for_test(
         crud_store: &CrudStore,
         workspace_id: &str,
     ) {

@@ -1,7 +1,9 @@
 # Передача threads_search и workspace episodic recall на внешнее ревью
 
-Дата: 2026-10-22. Статус: реализация и самостоятельное статическое ревью завершены;
-внешняя приёмка и разрешение на исполнение проверок ещё не получены.
+Дата: 2026-10-22. Статус: шесть замечаний внешнего аудита к commit
+65a23239a48da56118eda3f8358354378610235b исправлены; выполнено повторное самостоятельное
+статическое ревью. Повторная внешняя приёмка и разрешение на исполнение проверок ещё
+не получены.
 
 - Worktree: `/Users/alexander/Code/pioneer/pioneer/.worktrees/threads-search-recall`.
 - Ветка: `feat/threads-search-recall`.
@@ -84,7 +86,13 @@ embedding не вызывается. При совместимом готово�
 
 На первом quantum каждого thread/segment вызывается native hybrid ask с
 `context_only=true`; его fusion/reranking сохраняются. Последующие quanta продолжают
-lexical retrieval. Numeric lexical cursor не объявляется hybrid cursor. Оценка треда —
+lexical retrieval. Raw BM25 не сравнивается с semantic score: native final order
+кодируется отдельным монотонным ключом выше 1 (с сохранением различий query relevance
+между URI scopes); continuation BM25 отображается в [0,0.5). Более поздняя lexical
+копия не может вытеснить native-ranked источник. Исходная semantic/lexical relevance
+отдельно сохраняется для configured cutoff; дополнительный role boost не меняет
+native hybrid order. Native semantic/RRF ties имеют frame-ID tie-breaker.
+Numeric lexical cursor не объявляется hybrid cursor. Оценка треда —
 максимальная оценка проверенного источника по всем фиксированным quanta; порядок
 `relevance DESC, threadId ASC` не зависит от размера возвращаемой страницы.
 
@@ -116,11 +124,13 @@ HMAC-токен; запрещённые IDs не попадают даже в д
 scoped results. Lexical scope теперь входит в query по уже существующему URI index.
 
 `vendor/memvid-core/PIONEER.patch` содержит весь patch к исходному Cargo manifest
-и пяти исходным файлам. Добавлены generation getter, продолжение при полном
+и семи исходным файлам. Добавлены generation getter, продолжение при полном
 lexical document window (с учётом известного конечного frame filter), стабильный
 BM25 порядок scoped lexical pages, URI prefix в native Tantivy query, progressive
 scoped vector overfetch, растущий HNSW search width и исключение inactive frames до
-финального vector cutoff. Native RRF/semantic reranking не переписаны. HNSW остаётся
+финального vector cutoff. Native ask сообщает saturation фактического vector window
+до fusion (24..64), независимо от final output limit. Native RRF/semantic reranking
+сохранены; добавлены только стабильные tie-breakers и diagnostic. HNSW остаётся
 приближённым. Пустой quantum без cursor progress при полном candidate window —
 явная ошибка индекса, а не ложный EOF. Оригинальные исходники в Cargo cache не менялись.
 Vendor исключён из членов workspace; upstream examples/bench targets не копировались.
@@ -174,15 +184,26 @@ CLI post-turn и recovery snapshot consumers. DTO related/workspace recall те�
 восстановлен из валидного durable envelope; отсутствие самого authority закрывает доступ.
 
 Root action/manifest revalidates; текущий principal загружается заново при проверках.
-Для `ScopedCollaboration` действует дополнительный предел корневого execution capsule,
-для `Absolute` — доступный текущему инициатору workspace. Выход за эти ограничения
-не разрешается широкими правами другого collaborator. Private и sidebar-hidden треды
+Workspace observation определяется отдельным `ThreadObserveWorkspace`, а не
+`RuntimePrincipalPolicy::Absolute`. Новое admission выдаёт этот grant инициатору
+после проверки права; он не входит в unconditional `EXECUTION_RUNTIME_ACTIONS`.
+Member остаётся `ScopedCollaboration`, но новое разрешённое execution может искать
+по всем ACL-доступным roots workspace. Старые/root-only Turn или Agent manifests
+без observation grant сохраняют свой ceiling. Широкие права другого collaborator
+не добавляют observation authority. Private и sidebar-hidden треды
 проверяются обычным resolver; internal — `authorize_internal_thread_via_root`, с
 текущим правом на root и проверкой parent execution grant. Root/parent IDs отдельно
-не раскрываются. Membership/role/status/revocation проверяются на каждом вызове.
+не раскрываются. Для internal source вне текущего execution thread нужен Agent
+`ChildObserve`, как у history reader. Membership/role/status/revocation проверяются
+на каждом вызове. Общий service (включая recall) читает responding AgentExecution
+и его сохранённый grant, проверяет fingerprint/identity/root и пересекает allowed
+существующего envelope с текущей Agent policy. Отсутствующий Agent grant закрывает
+model-facing recall безопасно. Native/CLI materialization и dispatch дополнительно
+пересекают это с фактическим BoundAgentActionAdapter; reviewer/messenger не расширены.
 
 Source validation требует active projection, разрешённый source context/visibility,
-отсутствие exclusion, живой committed canonical source и совпадающий source hash,
+отсутствие exclusion, живой committed canonical source, отсутствие логического
+`turn.message_deleted_at` и совпадающий source hash,
 а также соответствие index metadata канонической identity/hash. Missing/deleted/stale
 source не восстанавливается из старого текста индекса. Названия/snippets/references
 и ошибки не раскрывают запрещённых кандидатов.
@@ -220,10 +241,12 @@ workspace-visible фильтра, больше не вызываемого produ
   grouping, independent equal text, private/sidebar-hidden, два Member одного workspace,
   internal root ACL, отзыв доступа и foreign cursor, cursor query/generation binding,
   missing authority, deleted/excluded/stale/missing canonical sources, prompt budget,
-  настоящий workspace provider с восстановлением инициатора и Current/Workspace labels,
   недоступный backend/work budget и конфиденциальность cursor frontier.
   Отдельный shared gateway сценарий проверяет vector readiness, ноль embedding
   calls при lexical, один query call на несколько тредов, vector drift и degradation.
+- `message/tests/threads_search_authority.rs`: production admission и реальный Agent
+  binding, Search/provider Recall с Current/Workspace labels, старый root-only ceiling,
+  reviewer/messenger, native/CLI materialization, обычные и summary anchors.
 - `memory/thread_episodic.rs`: реальный native lexical traversal за первым candidate
   window; scoped semantic-only источник за global top-k; hybrid adapter/query-only
   provider; отсутствие query call при lexical; reuse подготовленного query.
@@ -284,3 +307,64 @@ Gateway, CLI-агенты для проверки или schema generators не 
 и [pioneer-system-tasks](/Users/alexander/.codex/skills/pioneer-system-tasks/SKILL.md).
 Прикреплённые исполнители завершены; их изменения проверены и интегрированы родителем.
 Самостоятельное ревью не является внешней приёмкой.
+
+
+## Повторное ревью после внешнего аудита
+
+Проверенный ранее commit: `65a23239a48da56118eda3f8358354378610235b`.
+Исправления оформлены следующим commit этой же ветки (точный HEAD указан в передаче).
+
+| Замечание | Исправление и основное доказательство (тесты только написаны) |
+| --- | --- |
+| 1. Несуществующий enum variant | В snapshot используется CRUD `ThreadEpisodicItemStatus::Failed`; protocol enum не менялся. Call sites сверены статически. |
+| 2. User/Turn permissions обходят Agent ceiling | Общий `SearchAgentAuthority::load` восстанавливает persisted responding AgentExecution/grant через repositories; проверяет JSON fingerprint, identity/root/workspace и применяет `constrain_to_persisted_actions` текущей Agent policy. Tool materialization/dispatch используют `thread_search_authority` и реальный binding. Recall использует эту же persisted границу. |
+| 3. Logical Turn deletion | `validate_search_source` проверяет canonical Turn guards до reconstruction. Регрессия вызывает штатный `delete_turn_message`, доказывает сохранность physical turn_item и Active projection, затем исключение из Search/Recall и rejection реально выданного cursor с удалённой canonical boundary. Fallback отсутствует. |
+| 4. Member искусственно ограничен root | Отдельный `ThreadObserveWorkspace` совместим с reader. Новое user admission проверяет действие; новые Agent роли thread_agent/observer допускают observation; старые manifests не расширяются. Member остаётся ScopedCollaboration. |
+| 5. BM25 отменяет hybrid order | Native final order/RRF/promotion сохраняется монотонным adapter ordering key; raw query relevance отдельно от ordering key. Lexical continuation имеет нижнюю шкалу и не перезаписывает native source при max-score dedup. Нативные ties стабилизированы frame ID. |
+| 6. Saturation сравнивается с output limit | Native `AskResponse.vector_candidates_saturated` вычисляется на фактическом vector candidate window до fusion; adapter передаёт его как incomplete. Регрессия max_candidates=128, >64 semantic candidates и небольшое lexical подмножество. |
+
+Новая основная boundary fixture: `message/tests/threads_search_authority.rs`.
+Она использует реальный `ExecutionAdmissionService::admit_context`, canonical Agent
+execution graph commit и persisted binding factory; runtime/model не запускается.
+Покрыты Member roots A/B и недоступный root другого пользователя; positive Search
+и provider Recall с Current/Workspace provenance; old/root-only execution; настоящий
+reviewer без ThreadRead; messenger без ChildObserve; native/CLI materialization и
+реальный search dispatch callback. Проверяются канонические anchors обычных items,
+Task summary item и internal child. Старый положительный provider fixture на вручную
+расширенной authority заменён этим более сильным production-path доказательством.
+Прочие низкоуровневые pagination fixtures сохраняют узкую тестовую authority.
+
+Native regression сравнивает порядок с реальным `Memvid::ask`, отдельно доказывает,
+что он отличается от raw lexical order, проходит последующие lexical quanta и
+max-score source dedup, затем повторяет retrieval на том же snapshot. Это проверяет
+порядок, а не только наличие semantic hit. Source thresholds применяются до сохранения
+refs по исходной relevance, а не по adapter rank key.
+
+Статически сверены реальный native provider materialization, предварительный CLI
+catalog и его финальная фильтрация перед замораживанием, общий dispatch handler,
+provider/host-owned recall, immutable child derivation, source validation и cursor
+rehydration. Код соседнего reader читался только для совместимости, не менялся и не
+включён в эту ветку. Source refs пригодны для `{threadId,anchor:{turnId,itemId},limit:20}`;
+reader должен повторять свою авторизацию. Индексные frame IDs не подменяют anchors.
+
+При финальном самоаудите также исправлено ошибочное предположение нового Agent
+resolver о `AgentExecution.parent_thread_id`: у Task это создавшая задачу беседа,
+а не текущий child thread. Используется точный canonical Turn response mapping;
+существующие `verify_turn_scope`/durable lineage и workspace/root/grant checks
+сохранены. При отсутствии response mapping или grant model-facing поиск закрыт.
+Сверены native/direct-child и Task initial/reviewer/recovery call sites; их
+исполнение, как и остальные тесты, не проверялось.
+
+Фактически выполнялись только чтение/поиск, правки, обычные Git diff/status,
+`rustfmt --edition 2024 --config skip_children=true`,
+`cargo fmt -p pioneer-gateway -p pioneer-memory -- --check --config skip_children=true`,
+`git diff --check`, статическое сравнение vendor и обновление PIONEER.patch по diff
+с закреплённым исходником. Запрет тестов, cargo check и любых сборок сохранён.
+Ни компиляция, ни прохождение регрессий не подтверждены.
+
+Оставшиеся ограничения: стоимость stateless scan/select и snapshots не измерялась;
+HNSW/vector coverage остаётся approximate, насыщение окна явно incomplete; adapter
+ordering key не является вероятностью релевантности. Native fusion не заменён новым
+движком. Старые executions без persisted Agent observation grant не получают broad
+recall автоматически. Следующий этап — повторное внешнее ревью до разрешения запуска
+каких-либо тестов или сборок.

@@ -3945,7 +3945,17 @@ impl MessageProcessor {
             }
             if let Some(binding) = binding.as_ref() {
                 let visible = if spec.spec.name == "threads_search" {
-                    true // ThreadRead was checked above; no child-start capability is needed.
+                    let facts = binding.adapter.lock().await.persistence_facts();
+                    facts
+                        .agent_authorization_allowed_actions
+                        .iter()
+                        .any(|name| {
+                            name == crate::authorization::ResourceAction::ThreadRead.safe_name()
+                        })
+                        && crate::authorization::RoleDefinitionRegistry::new().agent_policy_allows(
+                            &facts.agent_authorization_role_key,
+                            crate::authorization::ResourceAction::ThreadRead,
+                        )
                 } else if spec.spec.name == "threads_start_options" {
                     binding
                         .capabilities

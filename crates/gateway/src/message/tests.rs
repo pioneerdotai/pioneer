@@ -1,3 +1,6 @@
+#[path = "tests/threads_search_authority.rs"]
+mod threads_search_authority;
+
 #[path = "tests/cli_provider_probe_isolation.rs"]
 mod cli_provider_probe_isolation;
 

@@ -39,9 +39,11 @@ pub(crate) enum ExecutionContinuityPolicy {
     StopOnAuthorityLoss,
 }
 
-/// Immutable resource ceiling carried by every execution grant. A role may
-/// narrow actions inside this boundary, but cannot widen a Turn beyond its
-/// admitted collaboration capsule.
+/// Immutable resource ceiling for execution and mutations. A role cannot widen
+/// writes beyond the admitted collaboration capsule. Observation of another
+/// conversation requires the separately admitted ThreadObserveWorkspace action
+/// and a fresh initiating-user ACL proof for that exact source; it never creates
+/// a write route or changes this boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ExecutionResourceBoundary {
@@ -902,6 +904,26 @@ impl ExecutionAdmissionService {
         // thread from exercising its own role actions.
         for action in EXECUTION_RUNTIME_ACTIONS {
             actions.insert(action.safe_name().to_owned());
+        }
+
+        // Cross-conversation observation is a separate, initiator-admitted grant.
+        // It is deliberately absent from the shared capsule's unconditional
+        // runtime actions: a later collaborator must not lend this authority.
+        if self
+            .require_root_action(
+                principal,
+                request,
+                ResourceAction::ThreadObserveWorkspace,
+                runtime_draft,
+            )
+            .await
+            .is_ok()
+        {
+            actions.insert(
+                ResourceAction::ThreadObserveWorkspace
+                    .safe_name()
+                    .to_owned(),
+            );
         }
 
         let operational_projection_fingerprint = self
@@ -3385,6 +3407,15 @@ impl RevalidatedExecutionAuthorization {
         &self.principal
     }
 
+    /// Read sources belong to the admitted initiating user, even when another
+    /// collaborator currently supplies backend continuation authority.
+    pub(crate) async fn initiating_principal(
+        &self,
+        store: &CrudStore,
+    ) -> Result<AuthenticatedSessionPrincipal> {
+        super::lease::collaboration_authority_principal(store, &self.admitted_principal_id).await
+    }
+
     pub(crate) fn authorization(&self) -> &AuthorizedThread {
         &self.authorization
     }
@@ -4044,6 +4075,75 @@ mod tests {
         DeviceId, GatewayId, PersistedActorRef, RoleKey, TurnPermissionProfileSelection,
     };
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn member_admission_grants_workspace_observation_without_widening_old_continuations() {
+        use crate::tests::authorization::{
+            IsolatedEpic4Harness, MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, WORKSPACE_RED_ID,
+        };
+        let harness = IsolatedEpic4Harness::new().await.unwrap();
+        let store = CrudStore::new(harness.database.clone());
+        let principal = super::super::lease::collaboration_authority_principal(
+            &store,
+            &PrincipalId::new(MEMBER_A_ID).unwrap(),
+        )
+        .await
+        .unwrap();
+        let request = ExecutionAdmissionRequest {
+            entry_point: ExecutionAdmissionEntryPoint::InteractiveTurn,
+            required_root_action: ResourceAction::AgentTurnStart,
+            additional_required_actions: Vec::new(),
+            workspace_id: WORKSPACE_RED_ID.into(),
+            root_thread_id: THREAD_RED_PRIVATE_A_ID.into(),
+            provider: "openai".into(),
+            model: "model-a".into(),
+            execution_backend: None,
+            capabilities: Vec::new(),
+            artifacts: Vec::new(),
+            has_local_attachment_sources: false,
+            has_url_attachment_sources: false,
+            provider_authority_fingerprint: Some("a".repeat(64)),
+        };
+        let manifest = ExecutionAdmissionService::new(store)
+            .admit(&principal, 1, &request)
+            .await
+            .unwrap();
+        assert!(
+            manifest
+                .actions
+                .iter()
+                .any(|action| action == "thread_observe_workspace")
+        );
+
+        // Old envelopes carry no observation grant. Current Member policy must
+        // not add it when resuming a previously admitted root-only execution.
+        let legacy_request = member_request();
+        let proof = authorized_thread(&legacy_request);
+        let admission =
+            ExecutionAuthorizationAdmission::from_authorized_thread(&legacy_request, &proof, 1)
+                .unwrap();
+        let profile = admission
+            .cap_permission_profile(&pioneer_protocol::default_turn_permission_profile_snapshot());
+        let old = admission
+            .finalize(
+                "workspace-a",
+                "thread-a",
+                "openai",
+                "model-a",
+                None,
+                &[],
+                &profile,
+            )
+            .unwrap();
+        assert!(!old.grants_action(ResourceAction::ThreadObserveWorkspace));
+        let restored =
+            ExecutionAuthorizationContext::from_persisted_json(&old.to_persisted_json().unwrap())
+                .unwrap();
+        let continued = restored
+            .derive_continuation("openai", "model-a", None, &[], &profile, None)
+            .unwrap();
+        assert!(!continued.grants_action(ResourceAction::ThreadObserveWorkspace));
+    }
 
     #[test]
     fn execution_manifest_preserves_scope_qualified_mcp_launch_authority() {

@@ -930,6 +930,7 @@ const fn resource_supports_action(access: ResolvedResourceAccess, action: Resour
         ResolvedResourceAccess::Thread(_) => matches!(
             action,
             ResourceAction::ThreadRead
+                | ResourceAction::ThreadObserveWorkspace
                 | ResourceAction::MessageCreate
                 | ResourceAction::MessageEditOwn
                 | ResourceAction::MessageDeleteOwn

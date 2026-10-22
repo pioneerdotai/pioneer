@@ -147,6 +147,9 @@ pub struct AskResponse {
     pub retriever: AskRetriever,
     pub context_only: bool,
     pub retrieval: SearchResponse,
+    /// The bounded native vector candidate window filled before fusion.
+    #[serde(default)]
+    pub vector_candidates_saturated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -943,22 +943,32 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
             let lexical = index
                 .search(lexical_request)
                 .map_err(classify_memvid_error)?;
+            let approximate = embedder.is_some();
             let next_cursor = lexical.next_cursor;
             let mut raw = lexical
                 .hits
                 .into_iter()
                 .filter_map(|mut hit| {
                     hydrate_search_hit_metadata(&index, &mut hit);
-                    search_hit_to_thread_episodic_hit(
+                    let raw_score = hit.score;
+                    if approximate {
+                        // Continuation-only BM25 lives below every native hybrid rank.
+                        let score = hit.score.unwrap_or(0.0).max(0.0);
+                        hit.score = Some(0.5 * score / (1.0 + score));
+                    }
+                    let mut converted = search_hit_to_thread_episodic_hit(
                         hit,
                         lexical.engine.clone(),
                         &segment,
                         &request.workspace_id,
                         &request.thread_id,
-                    )
+                    )?;
+                    if approximate {
+                        converted.lexical_score = raw_score;
+                    }
+                    Some(converted)
                 })
                 .collect::<Vec<_>>();
-            let approximate = embedder.is_some();
             let mut incomplete = false;
             if cursor.is_none() {
                 if let Some(embedder) = embedder {
@@ -971,22 +981,35 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
                     let response = index
                         .ask(ask, Some(embedder.as_ref()))
                         .map_err(classify_memvid_error)?;
-                    // Native vectors have no continuation. A saturated final
-                    // hybrid window cannot establish semantic exhaustion, even
+                    // Native vectors have no continuation. A saturated native
+                    // candidate window cannot establish semantic exhaustion, even
                     // though the independent lexical traversal will continue.
-                    incomplete =
-                        response.retrieval.hits.len() >= request.profile.max_candidates as usize;
+                    incomplete = response.vector_candidates_saturated;
                     let engine = response.retrieval.engine;
-                    raw.extend(response.retrieval.hits.into_iter().filter_map(|mut hit| {
-                        hydrate_search_hit_metadata(&index, &mut hit);
-                        search_hit_to_thread_episodic_hit(
-                            hit,
+                    let mut native = response.retrieval.hits;
+                    // Encode native final order without replacing query relevance by
+                    // rank 1 for every thread. This monotone majorant retains native
+                    // promotions/RRF order and the semantic scale across URI scopes.
+                    let mut floor = 0.0_f32;
+                    for hit in native.iter_mut().rev() {
+                        let relevance = hit.score.filter(|s| s.is_finite()).unwrap_or(0.0);
+                        let calibrated = 1.0 + (relevance.clamp(-1.0, 1.0) + 1.0) * 0.5;
+                        let score = calibrated.max(floor + 0.00001);
+                        floor = score;
+                        hit.score = Some(score);
+                        hydrate_search_hit_metadata(&index, hit);
+                        if let Some(mut converted) = search_hit_to_thread_episodic_hit(
+                            hit.clone(),
                             engine.clone(),
                             &segment,
                             &request.workspace_id,
                             &request.thread_id,
-                        )
-                    }));
+                        ) {
+                            converted.semantic_score = Some(relevance);
+                            converted.lexical_score = None;
+                            raw.push(converted);
+                        }
+                    }
                 }
             }
             // No adaptive cutoff here: canonical source checks belong to the caller.
@@ -996,13 +1019,17 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
                 raw,
             );
             Ok(ThreadEpisodicSegmentRetrieval {
-                hits: rank_thread_episodic_search_hits(
-                    filtered.hits,
-                    ThreadEpisodicRankingContext {
-                        exact_source: request.exact_source,
-                        now_unix: None,
-                    },
-                ),
+                hits: if approximate {
+                    rank_segment_hybrid_hits(filtered.hits)
+                } else {
+                    rank_thread_episodic_search_hits(
+                        filtered.hits,
+                        ThreadEpisodicRankingContext {
+                            exact_source: request.exact_source,
+                            now_unix: None,
+                        },
+                    )
+                },
                 next_cursor,
                 approximate,
                 incomplete,
@@ -1563,6 +1590,41 @@ pub fn filter_thread_episodic_search_candidates(
         hits: accepted,
         suppressions,
     }
+}
+
+// Adapter ordering scores are ordinal, not calibrated relevance probabilities.
+// No additional boosts may reorder native hybrid results or cross its tier boundary.
+fn rank_segment_hybrid_hits(
+    hits: Vec<ThreadEpisodicMemvidSearchHit>,
+) -> Vec<ThreadEpisodicRankedSearchHit> {
+    let mut ranked = hits
+        .into_iter()
+        .map(|mut hit| {
+            // The adapter score encodes final native rank, not lexical/semantic units.
+            hit.temporal_score = None;
+            let score_breakdown = ThreadEpisodicScoreBreakdown {
+                final_score: hit.memvid_score.unwrap_or(0.0),
+                memvid_score: hit.memvid_score,
+                lexical_score: hit.lexical_score,
+                semantic_score: hit.semantic_score,
+                temporal_score: None,
+                exact_source_boost: None,
+                recency_boost: None,
+                source_role_boost: None,
+            };
+            ThreadEpisodicRankedSearchHit {
+                hit,
+                score_breakdown,
+            }
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|a, b| {
+        b.score_breakdown
+            .final_score
+            .total_cmp(&a.score_breakdown.final_score)
+            .then_with(|| a.hit.index_item_id.cmp(&b.hit.index_item_id))
+    });
+    ranked
 }
 
 pub fn rank_thread_episodic_search_hits(
@@ -3263,7 +3325,13 @@ mod tests {
                     frame_uri: format!(
                         "mv2://workspace/ws/thread/{thread}/turn/turn/item/{id}/index/{id}"
                     ),
-                    text: "violet apricot luminescence".into(),
+                    text: if n == 1 {
+                        format!("{}violet apricot luminescence", "needle ".repeat(20))
+                    } else if (2..=5).contains(&n) {
+                        "needle violet apricot luminescence".into()
+                    } else {
+                        "violet apricot luminescence".into()
+                    },
                     metadata: thread_episodic_memvid_metadata(
                         "ws",
                         thread,
@@ -3280,6 +3348,10 @@ mod tests {
                             identity.clone(),
                             if n == 130 {
                                 vec![0.8, 0.6, 0.0]
+                            } else if n == 1 {
+                                vec![0.0, 1.0, 0.0]
+                            } else if (2..=5).contains(&n) {
+                                vec![0.1, 0.9949874, 0.0]
                             } else {
                                 vec![1.0, 0.0, 0.0]
                             },
@@ -3406,6 +3478,130 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "one prepared query is reused across segment operations"
+        );
+
+        // A native 64-vector window can saturate below a 128-hit output limit,
+        // even with only a few lexical matches. Inspect native diagnostic before fusion.
+        let mut wide = request.clone();
+        wide.thread_id = "foreign".into();
+        wide.scope = Some("mv2://workspace/ws/thread/foreign/".into());
+        wide.query = "needle".into();
+        wide.profile.max_candidates = 128;
+        let wide_embedder = Arc::new(
+            ThreadEpisodicMemvidEmbedder::new(Arc::new(QueryOnlyProvider(Arc::new(
+                AtomicUsize::new(0),
+            ))))
+            .prepare_query("needle")
+            .unwrap(),
+        );
+        let wide_page = backend
+            .retrieve_segment(wide, None, Some(wide_embedder))
+            .await
+            .unwrap();
+        assert!(
+            wide_page.approximate && wide_page.incomplete,
+            "native 64-candidate saturation must not be compared with output limit 128"
+        );
+        assert!(wide_page.hits.len() < 128);
+
+        // Compare the actual final native ordering, including rank contributions,
+        // with adapter output and all later lexical quanta. Max-score source dedup
+        // must retain the native order rather than replace it with raw BM25.
+        let mut ordered = lexical_request.clone();
+        ordered.query = "needle".into();
+        ordered.profile.max_candidates = 4;
+        let ordered_embedder = Arc::new(
+            ThreadEpisodicMemvidEmbedder::new(Arc::new(QueryOnlyProvider(Arc::new(
+                AtomicUsize::new(0),
+            ))))
+            .prepare_query(&ordered.query)
+            .unwrap(),
+        );
+        let mut native = Memvid::open_read_only(&path).unwrap();
+        let raw_lexical = native
+            .search(memvid_thread_episodic_search_request(
+                &ordered.profile,
+                &ordered.query,
+                ordered.scope.as_deref(),
+            ))
+            .unwrap();
+        let raw_first = raw_lexical.hits[0].frame_id;
+        let expected = native
+            .ask(
+                memvid_thread_episodic_ask_request(
+                    &ordered.profile,
+                    &ordered.query,
+                    ordered.scope.as_deref(),
+                    ThreadEpisodicMemvidAskRetrievalMode::Hybrid,
+                ),
+                Some(ordered_embedder.as_ref()),
+            )
+            .unwrap();
+        let expected_ids = expected
+            .retrieval
+            .hits
+            .iter()
+            .map(|hit| hit.frame_id)
+            .collect::<Vec<_>>();
+        assert_ne!(
+            expected_ids[0], raw_first,
+            "fixture must exercise a native semantic order different from raw BM25"
+        );
+        drop(native);
+        let mut continuation = None;
+        let mut best = std::collections::BTreeMap::<u64, f32>::new();
+        for quantum in 0..100 {
+            let page = backend
+                .retrieve_segment(
+                    ordered.clone(),
+                    continuation,
+                    Some(ordered_embedder.clone()),
+                )
+                .await
+                .unwrap();
+            if quantum == 0 {
+                assert_eq!(page.hits[0].hit.frame_id, expected_ids[0]);
+            } else {
+                assert!(
+                    page.hits
+                        .iter()
+                        .all(|hit| hit.score_breakdown.final_score < 0.5)
+                );
+            }
+            for hit in page.hits {
+                let score = hit.score_breakdown.final_score;
+                best.entry(hit.hit.frame_id)
+                    .and_modify(|old| *old = old.max(score))
+                    .or_insert(score);
+            }
+            continuation = page.next_cursor;
+            if continuation.is_none() {
+                break;
+            }
+        }
+        assert!(continuation.is_none());
+        let mut actual = best
+            .into_iter()
+            .filter(|(_, score)| *score >= 1.0)
+            .collect::<Vec<_>>();
+        actual.sort_by(|a, b| b.1.total_cmp(&a.1));
+        assert_eq!(
+            actual.into_iter().map(|(id, _)| id).collect::<Vec<_>>(),
+            expected_ids
+        );
+        let repeated = backend
+            .retrieve_segment(ordered, None, Some(ordered_embedder))
+            .await
+            .unwrap();
+        let repeated_ids = repeated
+            .hits
+            .iter()
+            .filter(|hit| hit.score_breakdown.final_score >= 1.0)
+            .map(|hit| hit.hit.frame_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            repeated_ids, expected_ids,
+            "same snapshot must preserve pagination ordering"
         );
     }
 

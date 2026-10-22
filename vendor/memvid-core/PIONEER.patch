@@ -26,32 +26,24 @@
 -name = "vec_search_benchmark"
 -harness = false
 -required-features = ["hnsw_bench"]
---- a/src/memvid/ticket.rs
-+++ b/src/memvid/ticket.rs
-@@ -7,0 +8,5 @@
-+    /// Committed capsule generation used to reject stale search continuations.
-+    pub fn generation(&self) -> u64 {
-+        self.generation
-+    }
-+
---- a/src/memvid/search/tantivy.rs
-+++ b/src/memvid/search/tantivy.rs
-@@ -99,0 +100,2 @@
-+    let candidate_window_full = search_hits.len() == doc_limit
-+        && candidate_filter.is_none_or(|filter| doc_limit < filter.len());
-@@ -191 +193 @@
--    if evaluated.len() > 1 {
-+    if evaluated.len() > 1 && request.scope.is_none() {
-@@ -353 +355,8 @@
--    let next_cursor = if produced < total_slices {
-+    // A full document window is not proof of corpus exhaustion. If source
-+    // evaluation made no cursor progress, fail explicitly instead of false EOF.
-+    if candidate_window_full && produced <= offset_hint && produced >= total_slices {
-+        return Err(crate::MemvidError::InvalidCursor {
-+            reason: "lexical candidate window exhausted without progress",
-+        });
-+    }
-+    let next_cursor = if produced < total_slices || candidate_window_full {
+--- a/src/memvid/ask.rs
++++ b/src/memvid/ask.rs
+@@ -213,0 +214 @@
++        let mut vector_candidates_saturated = false;
+@@ -264,0 +266 @@
++                let vector_limit = effective_top_k.max(24).min(64);
+@@ -269 +271 @@
+-                    effective_top_k.max(24).min(64),
++                    vector_limit,
+@@ -270,0 +273 @@
++                vector_candidates_saturated = vec_hits.len() >= vector_limit;
+@@ -431,0 +435 @@
++            vector_candidates_saturated,
+@@ -722 +726 @@
+-    sorted_semantic.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
++    sorted_semantic.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+@@ -1418,0 +1423 @@
++            .then(a.0.cmp(&b.0))
 --- a/src/memvid/search/api.rs
 +++ b/src/memvid/search/api.rs
 @@ -353 +353,41 @@
@@ -102,14 +94,32 @@
 +
 +            if frame.status != FrameStatus::Active {
 +                continue;
---- a/src/vec.rs
-+++ b/src/vec.rs
-@@ -416 +416,4 @@
--        let ef_search = 50;
-+        // Scoped retrieval widens its candidate request progressively. Keep the
-+        // graph search width at least that large so an initial global top-k
-+        // cannot permanently hide a thread outside that first window.
-+        let ef_search = limit.max(50);
+--- a/src/memvid/search/tantivy.rs
++++ b/src/memvid/search/tantivy.rs
+@@ -99,0 +100,2 @@
++    let candidate_window_full = search_hits.len() == doc_limit
++        && candidate_filter.is_none_or(|filter| doc_limit < filter.len());
+@@ -191 +193 @@
+-    if evaluated.len() > 1 {
++    if evaluated.len() > 1 && request.scope.is_none() {
+@@ -353 +355,8 @@
+-    let next_cursor = if produced < total_slices {
++    // A full document window is not proof of corpus exhaustion. If source
++    // evaluation made no cursor progress, fail explicitly instead of false EOF.
++    if candidate_window_full && produced <= offset_hint && produced >= total_slices {
++        return Err(crate::MemvidError::InvalidCursor {
++            reason: "lexical candidate window exhausted without progress",
++        });
++    }
++    let next_cursor = if produced < total_slices || candidate_window_full {
+--- a/src/memvid/ticket.rs
++++ b/src/memvid/ticket.rs
+@@ -7,0 +8,5 @@
++    /// Committed capsule generation used to reject stale search continuations.
++    pub fn generation(&self) -> u64 {
++        self.generation
++    }
++
 --- a/src/search/tantivy/query.rs
 +++ b/src/search/tantivy/query.rs
 @@ -48,2 +48,10 @@
@@ -125,3 +135,17 @@
 +                }
 +            })?;
 +            clauses.push((Occur::Must, Box::new(query)));
+--- a/src/types/ask.rs
++++ b/src/types/ask.rs
+@@ -149,0 +150,3 @@
++    /// The bounded native vector candidate window filled before fusion.
++    #[serde(default)]
++    pub vector_candidates_saturated: bool,
+--- a/src/vec.rs
++++ b/src/vec.rs
+@@ -416 +416,4 @@
+-        let ef_search = 50;
++        // Scoped retrieval widens its candidate request progressively. Keep the
++        // graph search width at least that large so an initial global top-k
++        // cannot permanently hide a thread outside that first window.
++        let ef_search = limit.max(50);

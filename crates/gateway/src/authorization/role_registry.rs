@@ -32,6 +32,7 @@ pub(crate) struct AgentRoleDefinition {
 
 const THREAD_AGENT_ACTIONS: &[ResourceAction] = &[
     ResourceAction::ThreadRead,
+    ResourceAction::ThreadObserveWorkspace,
     ResourceAction::ThreadCreatePrivate,
     ResourceAction::ThreadCreateWorkspace,
     ResourceAction::MessageCreate,
@@ -78,6 +79,7 @@ const THREAD_AGENT_ROLE: AgentRoleDefinition = AgentRoleDefinition {
 
 const AGENT_OBSERVER_ACTIONS: &[ResourceAction] = &[
     ResourceAction::ThreadRead,
+    ResourceAction::ThreadObserveWorkspace,
     ResourceAction::AgentExecutionObserve,
     ResourceAction::AgentRequestObserve,
     ResourceAction::ChildObserve,
@@ -536,6 +538,7 @@ const MEMBER_ACTIONS: &[ResourceAction] = &[
     ResourceAction::ThreadCreatePrivate,
     ResourceAction::ThreadCreateWorkspace,
     ResourceAction::ThreadRead,
+    ResourceAction::ThreadObserveWorkspace,
     ResourceAction::MessageCreate,
     ResourceAction::MessageEditOwn,
     ResourceAction::MessageDeleteOwn,
@@ -1128,6 +1131,32 @@ mod tests {
         assert!(scheduler.actions.allows(ResourceAction::TaskCreate));
         assert!(scheduler.actions.allows(ResourceAction::TaskScheduleManage));
         assert!(!scheduler.actions.allows(ResourceAction::TaskReview));
+    }
+
+    #[test]
+    fn workspace_observation_does_not_expand_reviewer_or_messenger() {
+        let registry = RoleDefinitionRegistry::new();
+        assert!(
+            registry.agent_policy_allows("thread_agent", ResourceAction::ThreadObserveWorkspace)
+        );
+        assert!(
+            registry.agent_policy_allows("agent_observer", ResourceAction::ThreadObserveWorkspace)
+        );
+        assert!(!registry.agent_policy_allows("agent_reviewer", ResourceAction::ThreadRead));
+        for role in ["agent_reviewer", "agent_messenger"] {
+            assert!(!registry.agent_policy_allows(role, ResourceAction::ThreadObserveWorkspace));
+            assert!(!registry.agent_policy_allows(role, ResourceAction::ChildObserve));
+        }
+        let member = registry.resolve_user_role(&RoleKey::member()).unwrap();
+        assert!(
+            member
+                .actions
+                .allows(ResourceAction::ThreadObserveWorkspace)
+        );
+        assert_eq!(
+            member.runtime_principal,
+            RuntimePrincipalPolicy::ScopedCollaboration
+        );
     }
 
     #[test]

@@ -46,3 +46,20 @@ only after the complete scan. URI-scoped vector candidates must be retrieved pas
 the initial global top-k; the dependency patch is reproducible in vendor.
 A saturated native hybrid window explicitly marks incomplete coverage, including
 when lexical traversal has ended; it is never represented as complete semantic EOF.
+
+
+## External-audit corrections
+
+Workspace scope now requires both immutable Turn and persisted Agent
+ThreadObserveWorkspace grants plus current initiating-user authority. Internal
+siblings require Agent ChildObserve. Source hydration checks logical Turn deletion.
+The common service resolves the persisted Agent ceiling for recall as well as tools;
+native/CLI materialization and dispatch also intersect the live bound adapter.
+
+Hybrid ordering uses disjoint adapter key ranges: native final order is encoded
+monotonically above 1 with its query relevance retained across scopes; lexical
+continuation maps BM25 into [0,0.5). Relevance cutoffs use the retained original
+scores, not these ordering keys. Native semantic/RRF ties are frame-ID stable.
+Saturation comes from the actual native vector candidate window before fusion,
+not final response length. Fixed lexical quanta and ranking configuration remain
+part of the snapshot/continuation contract.
