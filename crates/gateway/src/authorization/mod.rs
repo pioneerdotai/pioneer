@@ -79,7 +79,10 @@ pub(crate) use governor::{
 pub(crate) use invalidation::{
     AccessChangeKind, AccessChangeSignal, AuthorizationInvalidationHub, observed_policy_generation,
 };
-pub(crate) use lease::{ExecutionLeaseGuard, ExecutionLeaseRegistry, ExecutionTurnNotInProgress, collaboration_authority_principal};
+pub(crate) use lease::{
+    ExecutionLeaseGuard, ExecutionLeaseRegistry, ExecutionTurnNotInProgress,
+    collaboration_authority_principal,
+};
 pub(crate) use registry::{
     BinaryAuthorizationEntry, BinaryIngressKind, MethodAuthorizationEntry, RegistryLookupError,
     ResourceResolverKind, binary_ingress_entry, normal_method_entry,
