@@ -133,6 +133,15 @@ pub async fn upsert_task_occurrence_contract<C: ConnectionTrait>(
             .one(db)
             .await
             .context("failed to load task occurrence contract before upsert")?;
+    if super::task::finish_requested(db, &contract.task_id).await? {
+        anyhow::ensure!(
+            persisted_row
+                .as_ref()
+                .is_some_and(|row| row.run_id == contract.run_id
+                    && row.retry_attempt == i64::from(contract.retry_attempt)),
+            "task_finish_requested: occurrence cannot admit another run or retry"
+        );
+    }
     let updated_at = if let Some(row) = persisted_row.as_ref() {
         let persisted = task_occurrence_contract_from_model(row.clone())?;
         validate_occurrence_update(&persisted, contract)?;
@@ -1378,4 +1387,41 @@ pub(crate) fn task_occurrence_contract_from_model(
         .validate()
         .map_err(|error| anyhow!("persisted task occurrence contract is invalid: {error:?}"))?;
     Ok(contract)
+}
+
+/// A pre-upgrade scheduler could rebind an occurrence to a retry while it was
+/// still queued. Finish may settle the failed source through that exact frozen
+/// logical occurrence; it never invents one or authorizes an unrelated run.
+pub(crate) async fn find_terminal_occurrence_row<C: ConnectionTrait>(
+    db: &C,
+    run_id: &str,
+) -> Result<Option<task_occurrence_contract::Model>> {
+    if let Some(row) = find_task_occurrence_row_by_run(db, run_id).await? {
+        return Ok(Some(row));
+    }
+    let Some(source) = super::task_run::find_run_by_id(db, run_id).await? else {
+        return Ok(None);
+    };
+    if !matches!(source.status.as_str(), "failed" | "cancelled")
+        || !super::task::finish_requested(db, &source.task_id).await?
+    {
+        return Ok(None);
+    }
+    let Some(retry) = super::task_run::find_retry_successor(db, run_id).await? else {
+        return Ok(None);
+    };
+    if retry.task_id != source.task_id
+        || retry.started_at.is_some()
+        || !matches!(retry.status.as_str(), "queued" | "cancelled")
+    {
+        return Ok(None);
+    }
+    let row = find_task_occurrence_row_by_run(db, &retry.id).await?;
+    if let Some(row) = &row {
+        anyhow::ensure!(
+            row.task_id == source.task_id,
+            "retry occurrence crosses Task boundary"
+        );
+    }
+    Ok(row)
 }

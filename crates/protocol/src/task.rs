@@ -801,12 +801,26 @@ impl TaskComposerWork {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskMetadata {
+    /// Server-owned durable decision to stop future runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_request: Option<TaskFinishRequest>,
     #[serde(default)]
     pub labels: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<TaskValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composer_work: Option<TaskComposerWork>,
+}
+
+/// A user-directed final soft stop; this is not evidence that the goal succeeded.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskFinishRequest {
+    pub requested_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Earliest admitted run whose real outcome contributes to the final state.
+    pub first_run_number: i64,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
@@ -904,6 +918,12 @@ pub struct Task {
     pub updated_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<i64>,
+}
+
+impl Task {
+    pub fn finish_request(&self) -> Option<&TaskFinishRequest> {
+        self.metadata.as_ref()?.finish_request.as_ref()
+    }
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
@@ -2360,6 +2380,22 @@ pub struct TaskCancelParams {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct TaskFinishParams {
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskFinishResponse {
+    pub task: Task,
+    /// True only when the task was already terminal before this call.
+    pub already_finished: bool,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskCancelResponse {
     pub task: Task,
     #[serde(default)]
@@ -2750,6 +2786,8 @@ pub struct PublicTask {
     pub title: String,
     pub goal: String,
     pub priority: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_request: Option<TaskFinishRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<PublicTaskResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3741,6 +3779,7 @@ mod tests {
         let metadata = super::TaskMetadata {
             labels: vec!["composer".to_owned()],
             data: None,
+            finish_request: None,
             composer_work: Some(super::TaskComposerWork::v1(launch.clone())),
         };
 

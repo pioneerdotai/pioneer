@@ -72,7 +72,7 @@ pub fn observed_terminal_task_outcomes_from_payload(
             .flatten()
             .filter_map(|item| terminal_task(item.get("task")?))
             .collect(),
-        "task_get" | "task_cancel" => value
+        "task_get" | "task_cancel" | "task_finish" => value
             .get("task")
             .and_then(terminal_task)
             .into_iter()
