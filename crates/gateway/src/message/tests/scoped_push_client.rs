@@ -219,6 +219,7 @@ async fn invoke_hidden_agent_action(
 }
 
 async fn committed_push_client_fixture(hidden_cli_start: bool) {
+    let stage = std::cell::Cell::new("workspace setup");
     tokio::time::timeout(Duration::from_secs(30), async {
         let (workspaces, store, workspace) = setup_workspace_manager().await;
         prepare_post_access_unread_fixture(&store, &workspace).await;
@@ -285,6 +286,7 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
 
         // Establish the real child, lineage and admitted turn before observing
         // activation. Metadata/root/lineage events may legitimately reset inbox.
+        stage.set("prepare hidden task lineage");
         let hidden_task = if hidden_cli_start {
             cli.set_next_native_turn_id("hidden-sidebar-native-turn").await;
             processor.arm_completed_history_preparation_barrier("__task_cli_before_history__");
@@ -435,6 +437,7 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
         socket_owner.spawn(async move { socket.await.unwrap() });
         let _abort = AbortOnDrop(abort);
 
+        stage.set("connect shared client");
         let core = ClientOwner(ClientCore::shared());
         let initial_authorization = core.0.authorization_connection_generation();
         let mut connection_publications = core.0.watch_publications();
@@ -456,10 +459,12 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
         },session_storage.as_ref()).unwrap()).await.unwrap();
         // Public session ensure installs transport access; the ingress dispatcher
         // separately owns the authorization epoch. Bootstrap after that fence.
+        stage.set("connected authorization fence");
         while core.0.authorization_connection_generation() == initial_authorization {
             connection_publications.changed().await.expect("connected authorization publication");
         }
         let client = core.0.clone();
+        stage.set("bootstrap authorization and directory");
         let bootstrap_workspace = workspace.clone();
         tokio::task::spawn_blocking(move || {
             client.refresh_identity_authorization(pioneer_protocol::AuthorizationCapabilitiesParams {
@@ -474,6 +479,7 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
         let inbox_subscription = hidden_cli_start.then(|| core.0.subscribe(ClientScope::TaskInbox {
             workspace_id: workspace.clone(),
         }, NonZeroUsize::new(32).unwrap()));
+        stage.set("initial negotiated snapshot");
         let snapshot = loop {
             let packet = packets_rx.recv().await.expect("negotiated snapshot");
             assert!(!packet.resync_required);
@@ -488,6 +494,7 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
         assert!(baseline_requests > 0, "real tree bootstrap reached Gateway");
 
         if let Some((task_id, run_id, child)) = hidden_task {
+            stage.set("hidden CLI activation and root activity");
             assert!(!core.0.workspace_tree(&workspace).unwrap().snapshot().threads_by_id.contains_key(&child.child_thread_id));
             let baseline_prefix = prefix_requests.load(Ordering::SeqCst);
             let baseline_push = push_requests.load(Ordering::SeqCst);
@@ -541,6 +548,7 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
             // CLI task facade exports only task tools and launch options, so
             // these agent actions are exercised at their real handler boundary.
             let hold = processor.begin_push_mutation(observer, &workspace, true).unwrap();
+            stage.set("hidden agent actions and peer cursor");
             let action_binding = processor.agent_action_binding(&child.child_turn_id).await.unwrap();
             assert!(action_binding.capabilities.contains(&pioneer_protocol::AgentToolCapability::MessageCreate));
             let target = action_binding.options.target_options.iter()
@@ -563,6 +571,7 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
             // A real timeline query supplies the exact canonical viewed anchor.
             // This also proves Hidden timeline access remains legal; using the
             // legacy principal-authored anchor would not exercise agent messages.
+            stage.set("hidden timeline response");
             let timeline_id = generate_test_request_id("pushclient", "hidden-timeline");
             processor.process_request_for_connection(source, &json!({
                 "jsonrpc":"2.0","id":timeline_id,"method":"thread/timeline/page",
@@ -577,6 +586,7 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
             assert_eq!(message.mode,pioneer_protocol::ThreadMode::Message);
             assert_eq!(message.status,pioneer_protocol::TurnStatus::Completed);
             assert!(matches!(message.author.as_ref().unwrap().actor,pioneer_protocol::PersistedActorRef::AgentExecution(_)));
+            stage.set("hidden read response");
             let read_id = generate_test_request_id("pushclient", "hidden-read");
             processor.process_request_for_connection(source, &json!({
                 "jsonrpc":"2.0","id":read_id,"method":"thread/read",
@@ -592,6 +602,7 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
             assert_eq!(read.cursor.sort_key, block.sort_key);
             // The same-principal peer receives cursor synchronization over the
             // real socket even though the sidebar intentionally lacks the child.
+            stage.set("hidden peer cursor synchronization");
             let cursor = cursor_rx.recv().await.expect("peer Hidden cursor synchronization");
             assert_eq!(cursor.thread_id, child.child_thread_id);
             assert_eq!(cursor.cursor, read.cursor);
@@ -602,6 +613,7 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
             assert!(action_binding.capabilities.contains(&pioneer_protocol::AgentToolCapability::ChildStart));
             assert!(action_binding.options.inherit_parent_identity_available);
             assert!(action_binding.options.inherit_parent_profile_available);
+            stage.set("hidden agent start admission");
             let safe=invoke_hidden_agent_action(&processor,action_context,"hidden-sidebar-agent-start","threads_turn_start",
                 serde_json::to_value(pioneer_protocol::AgentStartToolInput {
                     target_option_id:target,input:pioneer_protocol::AgentAuthoredInput::new(vec![pioneer_protocol::UserInput::Text {
@@ -636,6 +648,7 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
             // start. Hidden-ID rejection would instead request tree/prefix and
             // replace the epoch before these addressed values can apply.
             let hold = processor.begin_push_mutation(observer, &workspace, true).unwrap();
+            stage.set("hidden CLI completion");
             complete_recorded_cli_task_turn(&processor, &cli, &cli_manager, &workspace, "codex", THREAD,
                 &starts[0].native_thread_id, "hidden-sidebar-native-turn",
                 r#"<task_result>{"summary":"hidden execution completed"}</task_result>"#).await;
@@ -644,6 +657,7 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
             assert_eq!(fanout.errors, 0);
             assert!(fanout.emitted > 0);
             hold.finish(None, None);
+            stage.set("root terminal and inbox ingress");
             let mut saw_terminal = false;
             let mut saw_inbox = false;
             let mut applied = core.0.watch_publications();
@@ -678,6 +692,7 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
             // Source owns a combined scope too, so read's ready-unread ack
             // bypass is covered in addition to the peer dirty path. Drain to a
             // real subsequent terminal/inbox event, never to an empty poll.
+            stage.set("source terminal and inbox barrier");
             let mut source_terminal=false;
             let mut source_inbox=false;
             while !source_terminal || !source_inbox {
@@ -697,6 +712,7 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
             // Seed canonical persisted metadata without a structural hint, then
             // use the ordinary committed Message producer. The accepted client
             // must recover membership from tree/list and negotiate a new epoch.
+            stage.set("unknown visible recovery control");
             const UNSEEN: &str = "T0000000000000000000V";
             const UNSEEN_TURN: &str = "T0000000000000000000W";
             let mut visible = store.get_thread_model(SECOND_THREAD).await.unwrap().unwrap();
@@ -747,6 +763,7 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
             return;
         }
 
+        stage.set("atomic metadata and indicator batch");
         while subscription.try_next().is_some() {}
         let before_batch = core.0.workspace_tree(&workspace).unwrap().revision();
         // The existing source mutation hold deterministically collects two real
@@ -805,6 +822,7 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
         let physical=core.0.authorization_connection_generation();
         let permissions=core.0.authorization_permissions_epoch();
 
+        stage.set("same-session renewal snapshot");
         let renewed=tokio::task::spawn_blocking(move || client.ensure_gateway_session(GatewaySessionRefreshRequest {
             endpoint:&session_endpoint,installation_id:"gateway-test-superuser",client_kind:pioneer_protocol::ClientKind::Desktop,
             now_unix:now+90,timeout:Duration::from_secs(5),ws_timings:GatewayWsTimings::from_millis(5000,60000,5000,1000,1000,0).unwrap(),retry_delays:&[],
@@ -818,6 +836,7 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
         let renewed_snapshot=packets_rx.recv().await.expect("renewal re-registration snapshot");
         assert!(renewed_snapshot.snapshot && !renewed_snapshot.resync_required);
         assert_ne!(renewed_snapshot.epoch,completed.epoch);
+        stage.set("post-renewal completion ingress");
         let renewal_hold=processor.begin_push_mutation(observer,&workspace,true).unwrap();
         send_epic6_test_message(&processor,source,&mut source_rx,THREAD,RENEWED_TURN,"renewed user question").await;
         let post=pioneer_protocol::TurnItem::AgentMessage {
@@ -833,17 +852,21 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
         assert!(!completed.snapshot && !completed.resync_required);
         assert_eq!(completed.epoch,renewed_snapshot.epoch);
         assert_eq!(completed.revision,renewed_snapshot.revision+1);
+        // Renewal and sending another user message do not read the earlier
+        // answer. Both completed answers remain unread until the exact read.
+        assert_eq!(completed.indicators.iter().find(|row|row.thread_id==THREAD).unwrap().unread_count,Some(2));
         let mut applied=core.0.watch_publications();
         loop {
             if core.0.workspace_tree(&workspace).unwrap().snapshot().threads_by_id[THREAD]
                 .turns.last().is_some_and(|turn| turn.id==RENEWED_TURN) {break;}
             applied.changed().await.expect("post renewal batch ingress");
         }
-        await_unread(&core.0,&workspace,1).await;
+        await_unread(&core.0,&workspace,2).await;
 
         // Use the same live client's read RPC. No test code applies its ack to
         // the directory, so the next zero must arrive through production ingress.
         let client = core.0.clone();
+        stage.set("exact viewed answer read");
         let ack = tokio::task::spawn_blocking(move || {
             let sender = client.transport_runtime().ws_command_sender();
             let timeline = sender.thread_timeline_page(pioneer_protocol::ThreadTimelinePageParams {
@@ -872,5 +895,5 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
         socket_owner.join_next().await.unwrap().unwrap();
         sessions.unregister_connection(source).await;
         assert_eq!(tree_requests.load(Ordering::SeqCst), baseline_requests);
-    }).await.expect("bounded committed-push integration");
+    }).await.unwrap_or_else(|_| panic!("bounded committed-push integration at {}", stage.get()));
 }
