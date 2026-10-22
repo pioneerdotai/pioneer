@@ -6,8 +6,18 @@ The user accepted the source candidate in the original thread on October 22, 202
 
 Before publication, the Rust feature branch merged `origin/main` at `4c45193c78291583f3c2fc2ea3a55d1e61763fb1` in merge commit `0dbb66cb03699601d4dd3c8af229f38d3c863196`. Git resolved the merge without conflicts. Mobile `origin/main` was already an ancestor of the feature branch at `32609e4cb5431f0efc3e0573db7c5354d474cc5a`. The primary checkouts were not changed.
 
+A subsequent update to main, `80787a5aea854bab51ebd0b90292336ef16ace94` (paginated thread history readers), was also merged without conflicts in `1da5abf4f6daf4543076293f3f1072be4b4c1c05`. Its protocol additions define separate reader types and do not change the exported sidebar/inbox schemas. The final source contract includes those merged Rust sources.
+
 The merged Rust main includes task finish contracts. Canonical schema/type generation brings those definitions into the generated documents alongside the sidebar/inbox contracts. The mobile source contract is refreshed against this merged Rust worktree. Commit messages and PR titles use `type(scope): description`; PR descriptions are edited with the humanizer skill.
 
+
+Publication generation completed successfully with these commands:
+
+- Rust: `PIONEER_RUST_ROOT=/Users/alexander/Code/pioneer/pioneer/.worktrees/sidebar-inbox-push cargo run --locked -p pioneer-protocol --bin schema -- schemas`.
+- Mobile: `PIONEER_RUST_ROOT=/Users/alexander/Code/pioneer/pioneer/.worktrees/sidebar-inbox-push bun run client:schema`, then `client:types`, then `client:contract`, all with the same explicit Rust root. A preliminary types pass ran while FFI export was still compiling; the complete types pass was repeated after both schema exporters finished.
+- The compiled and executed host exporters were protocol `schema`, client `schema` with its schema feature, and client-ffi `schema` with its schema feature, plus their required dependencies. The source contract generator used cargo metadata. These generator results describe their own targets.
+
+The generated diff was read against the merged source definitions. Additional task finish schemas/types come from main, not a new sidebar feature. No verification guards or source hashes were edited by hand.
 
 ## Isolation and allowed work
 
