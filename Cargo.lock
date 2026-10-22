@@ -2646,9 +2646,9 @@ dependencies = [
 
 [[package]]
 name = "crc32fast"
-version = "1.5.2"
+version = "1.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
+checksum = "0ba106e844045ddc02c20768ac4b0b7cb45f2cc2ecbd833ac9f5dacb183c2055"
 dependencies = [
  "cfg-if",
 ]
@@ -3511,9 +3511,9 @@ checksum = "b2972feb8dffe7bc8c5463b1dacda1b0dfbed3710e50f977d965429692d74cd8"
 
 [[package]]
 name = "ego-tree"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b04dc5a38e4f151a79d9f2451ae6037fb6eaf5cba34771f44781f80e508498e3"
+checksum = "7bd50d24b1b75aa817bb0339cb9f2e0e664bdfab1e160a69a0fda9145b77fab2"
 
 [[package]]
 name = "either"
@@ -7794,9 +7794,9 @@ dependencies = [
 
 [[package]]
 name = "lyon_algorithms"
-version = "1.0.21"
+version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdfa8785f95e57914ddb35e3b59994aeba6f5e79e9cfd03da1c269f010f36009"
+checksum = "f3a6b9d4e8b48acd531fbf1241ad9b270df6e60b6b92bdea1469f4f40899d805"
 dependencies = [
  "lyon_path",
  "num-traits",
@@ -7804,9 +7804,9 @@ dependencies = [
 
 [[package]]
 name = "lyon_geom"
-version = "1.0.19"
+version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4336502e29e32af93cf2dad2214ed6003c17ceb5bd499df77b1de663b9042b92"
+checksum = "d82dd26aa4dc0b5b70b9115de59824842bcb43cf4a28e1b1e6d0ad148c93f93e"
 dependencies = [
  "arrayvec",
  "euclid",
@@ -7825,9 +7825,9 @@ dependencies = [
 
 [[package]]
 name = "lyon_tessellation"
-version = "1.0.22"
+version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43b8dcf906637ecef61b3c0740c7a4e7f27caeb31257cfac0cc579ce15be6005"
+checksum = "fd4872650e70dc907dd4f7ebc449d7d657a0d2658e423b2e724970870bbbf75b"
 dependencies = [
  "float_next_after",
  "lyon_path",
@@ -8061,9 +8061,9 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memmap2"
-version = "0.9.11"
+version = "0.9.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+checksum = "6b0ca1155a9ecc25aa12e8313a119f32edf0255fea2f44839c4ac0a12b2ac157"
 dependencies = [
  "libc",
 ]
@@ -9444,9 +9444,9 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "open"
-version = "5.4.4"
+version = "5.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa576c76302b7b808eecc68061e67336c47833ef9d22caa74dda10fa9675eebc"
+checksum = "8d8c8b8e725ad26404d6896eb2f064294a0a7b4f1d9120210d85544684c4ca95"
 dependencies = [
  "is-wsl",
  "libc",
@@ -9908,6 +9908,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "peresil"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f658886ed52e196e850cfbbfddab9eaa7f6d90dd0929e264c31e5cec07e09e57"
+
+[[package]]
 name = "petgraph"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10166,7 +10172,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pioneer-agent"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10198,7 +10204,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-app-updater"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -10213,7 +10219,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-artifacts"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10240,7 +10246,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "dirs 7.0.0",
@@ -10266,7 +10272,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli-agent-runtime"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -10288,7 +10294,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli-mcp-bridge"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "async-trait",
  "libc",
@@ -10302,7 +10308,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10335,7 +10341,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client-ffi"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10354,7 +10360,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-compaction"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10367,7 +10373,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-config"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "config",
@@ -10378,7 +10384,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -10403,7 +10409,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -10453,7 +10459,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-administration"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -10467,7 +10473,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-agents-doc"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -10478,7 +10484,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-foundation"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -10486,7 +10492,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-mcp"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "chrono",
  "gpui-kit",
@@ -10498,7 +10504,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-onboarding"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -10511,7 +10517,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-providers"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -10523,7 +10529,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-settings"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -10539,7 +10545,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-skills"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "chrono",
  "gpui-kit",
@@ -10551,7 +10557,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-task-notifications"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -10563,7 +10569,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-thread"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -10589,7 +10595,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-update"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -10607,7 +10613,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-workspaces"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -10620,7 +10626,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-entity"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "sea-orm",
  "serde",
@@ -10628,7 +10634,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-gateway"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -10707,7 +10713,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-hooks"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "async-trait",
  "futures-timer",
@@ -10724,7 +10730,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-keystore"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "db-keystore",
  "keyring-core",
@@ -10737,7 +10743,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-mcp"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10762,7 +10768,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-mcp-oauth"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -10786,7 +10792,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-memory"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10811,7 +10817,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-migration"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -10824,7 +10830,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-observability"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10852,7 +10858,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-promt"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10871,7 +10877,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-protocol"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "base64 0.23.1",
  "hex",
@@ -10886,7 +10892,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-provider"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10922,7 +10928,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-runtime-events"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "pioneer-observability",
  "pioneer-protocol",
@@ -10933,7 +10939,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-skills"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -10952,7 +10958,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-sqlite"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10979,7 +10985,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tasks"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11003,7 +11009,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tools"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11046,7 +11052,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tunnel"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -12279,9 +12285,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "3.5.1"
+version = "3.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab5023804cbe0304cbe06197ac16e645a0a0d0ffa2953bf735c15c2fa0213350"
+checksum = "ceb42e9e47443cd83a834dea57b5816d35481417bae72ade5dc5615c59122e26"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -12290,6 +12296,7 @@ dependencies = [
  "futures",
  "http",
  "indexmap 2.14.2",
+ "libc",
  "oauth2",
  "pin-project-lite",
  "process-wrap",
@@ -12692,9 +12699,9 @@ checksum = "eec689c0bc40ff2458a5977b6619cb718087084a18e02a131c599b62d05e1a5f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -12861,7 +12868,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bdd0be4d296f048bfb06dd01bbc80ef789ddd2e55583e8d2e6b804942abfabc2"
 dependencies = [
  "cssparser 0.37.0",
- "ego-tree 0.11.0",
+ "ego-tree 0.11.1",
  "getopts",
  "html5ever 0.39.0",
  "precomputed-hash",
@@ -14001,9 +14008,9 @@ dependencies = [
 
 [[package]]
 name = "smol_str"
-version = "0.3.6"
+version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4aaa7368fcf4852a4c2dd92df0cace6a71f2091ca0a23391ce7f3a31833f1523"
+checksum = "eeb7109d23f319619d4cc0de5464613c8b7b1a09db2774a58101459cf6be2f10"
 dependencies = [
  "serde_core",
 ]
@@ -14026,17 +14033,6 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "socks"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0c3dbbd9ae980613c6dd8e28a9407b50509d3803b57624d5dfe8315218cd58b"
-dependencies = [
- "byteorder",
- "libc",
- "winapi",
 ]
 
 [[package]]
@@ -14531,6 +14527,27 @@ dependencies = [
  "skrifa 0.44.0",
  "yazi",
  "zeno",
+]
+
+[[package]]
+name = "sxd-document"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94d82f37be9faf1b10a82c4bd492b74f698e40082f0f40de38ab275f31d42078"
+dependencies = [
+ "peresil",
+ "typed-arena",
+]
+
+[[package]]
+name = "sxd-xpath"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36e39da5d30887b5690e29de4c5ebb8ddff64ebd9933f98a01daaa4fd11b36ea"
+dependencies = [
+ "peresil",
+ "quick-error 1.2.3",
+ "sxd-document",
 ]
 
 [[package]]
@@ -15405,9 +15422,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.54.0"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0c168a474b95bfecfe908a65d4bdffc523144b649a74c09c286afb35d53e0bc"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
@@ -16087,10 +16104,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "typed-path"
-version = "0.12.3"
+name = "typed-arena"
+version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
+checksum = "a9b2228007eba4120145f785df0f6c92ea538f5a3635a612ecf4e334c8c1446d"
+
+[[package]]
+name = "typed-path"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54ec2755506471f54baf5e4bb5499d8e510cc1caf271270e778a736bd2d7336c"
 
 [[package]]
 name = "typeid"
@@ -16342,9 +16365,9 @@ checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
 
 [[package]]
 name = "ureq"
-version = "3.4.2"
+version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a7ac20be9b7726e0bbdbf974c059676d9acb1cd414961f570a4e8231cacd7fc"
+checksum = "cde93ff05758a36a851a398a772b0b79a82fbe3c186a46f2696baaeaf84c966b"
 dependencies = [
  "base64 0.23.1",
  "der 0.8.2",
@@ -16352,7 +16375,6 @@ dependencies = [
  "native-tls",
  "percent-encoding",
  "rustls-pki-types",
- "socks",
  "ureq-proto",
  "utf8-zero",
  "webpki-root-certs",
@@ -16906,8 +16928,8 @@ dependencies = [
 
 [[package]]
 name = "webclaw-core"
-version = "0.6.24"
-source = "git+https://github.com/0xMassi/webclaw#3c32041967c2c5d5124a984b14a29e6845b77be6"
+version = "0.7.0"
+source = "git+https://github.com/0xMassi/webclaw#c023eb99aecbb98b78d25b352d82c757e3fe934d"
 dependencies = [
  "ego-tree 0.10.0",
  "regex",
@@ -16915,6 +16937,8 @@ dependencies = [
  "serde",
  "serde_json",
  "similar",
+ "sxd-document",
+ "sxd-xpath",
  "thiserror 2.0.21",
  "tracing",
  "url",
@@ -18174,9 +18198,9 @@ dependencies = [
 
 [[package]]
 name = "xa11y"
-version = "0.15.2"
+version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab1a8ec345ea8e9b58a3c24f56385906e9024b979938d3de1cc7a7036afccc17"
+checksum = "6bd7b8e8cd3ea7d7828e37e16119b7060076078596826fb8aeae10c04f73c3c1"
 dependencies = [
  "serde",
  "serde_json",
@@ -18188,9 +18212,9 @@ dependencies = [
 
 [[package]]
 name = "xa11y-core"
-version = "0.15.2"
+version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfed37d23cfb7a47937efc7b3e55ab44215cd1167f773bdeab45c699563b2e03"
+checksum = "e7465ca67a5da8037a9b301c70313e37ef1c61977a1360005c6e3f9cc604d427"
 dependencies = [
  "png 0.18.1",
  "serde",
@@ -18201,11 +18225,12 @@ dependencies = [
 
 [[package]]
 name = "xa11y-linux"
-version = "0.15.2"
+version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bb74449856072583738f4276345aa465990fefacb711cb1800aa65eeab6d204"
+checksum = "b3800152dc8eefcc4fdf6c9723afcc6754491d25b492f849ef1eb3acb094e1cc"
 dependencies = [
  "evdev",
+ "log",
  "nix 0.31.3",
  "png 0.18.1",
  "rayon",
@@ -18220,9 +18245,9 @@ dependencies = [
 
 [[package]]
 name = "xa11y-macos"
-version = "0.15.2"
+version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca41a13fa3473e70428fdf62fcb96a0c7d91df3b64faaf762ec6e9e248cbc1d5"
+checksum = "50bd56fcddf802ee266b01d90af29c406a8920d36e01d4aeaf91bbb352723aa6"
 dependencies = [
  "cc",
  "core-foundation 0.10.1",
@@ -18233,9 +18258,9 @@ dependencies = [
 
 [[package]]
 name = "xa11y-windows"
-version = "0.15.2"
+version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6c3d25f892391989395596ea1dfcbe439f35ccc599554f0a22eb5c136fac556"
+checksum = "7574dde34d9105b27f31211e44b53caaaa9b9984dec6ad69d9f5c8f14fce7db0"
 dependencies = [
  "serde_json",
  "windows 0.62.2",
