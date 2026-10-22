@@ -60678,6 +60678,47 @@ impl CrudStore {
         .await
     }
 
+    /// Directional metadata-only keyset page within the frozen saved set.
+    pub async fn saved_history_page_direction_at_snapshot(
+        &self,
+        thread_id: &str,
+        boundary: Option<&SavedHistoryKey>,
+        position: Option<&SavedHistoryKey>,
+        inclusive: bool,
+        newer: bool,
+        limit: u64,
+        snapshot: &SavedHistorySnapshot,
+    ) -> Result<Vec<SavedHistoryRow>> {
+        repositories::thread_history_read::page_direction(
+            &self.connection,
+            thread_id,
+            boundary,
+            position,
+            inclusive,
+            newer,
+            limit,
+            snapshot,
+        )
+        .await
+    }
+
+    pub async fn saved_history_anchor(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: Option<&str>,
+        snapshot: &SavedHistorySnapshot,
+    ) -> Result<Option<SavedHistoryRow>> {
+        repositories::thread_history_read::anchor(
+            &self.connection,
+            thread_id,
+            turn_id,
+            item_id,
+            snapshot,
+        )
+        .await
+    }
+
     pub async fn saved_history_revision_at_snapshot(
         &self,
         thread_id: &str,

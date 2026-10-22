@@ -1992,6 +1992,30 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
             .unwrap();
             assert!(!history.is_error, "{kind:?}: {history:?}");
             assert!(history.structured_content.as_ref().unwrap()["events"].is_array());
+            // Anchor schema and dispatch travel through the same frozen family
+            // for every provider, rather than a provider-specific history path.
+            let near = invoke_task(
+                &processor,
+                &turn_id,
+                "read-history-anchor",
+                "threads_history_read",
+                json!({"threadId":thread_id,"limit":1,"anchor":{"turnId":turn_id}}),
+            )
+            .await
+            .unwrap();
+            assert!(!near.is_error, "{kind:?}: {near:?}");
+            let near = near.structured_content.as_ref().unwrap();
+            assert_eq!(near["events"][0]["turnId"], turn_id);
+            assert_eq!(near["direction"], "older");
+            let newer = invoke_task(
+                &processor, &turn_id, "read-history-newer", "threads_history_read",
+                json!({"threadId":thread_id,"limit":1,"direction":"newer","cursor":near["reverseCursor"]}),
+            ).await.unwrap();
+            assert!(!newer.is_error, "{kind:?}: {newer:?}");
+            assert_eq!(
+                newer.structured_content.as_ref().unwrap()["direction"],
+                "newer"
+            );
             let skills = processor
                 .crud_store
                 .find_turn_skill_bindings(&turn_id)

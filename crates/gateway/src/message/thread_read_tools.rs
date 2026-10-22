@@ -10,7 +10,9 @@ use crate::{
 use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
 use pioneer_agent::TurnToolContext;
-use pioneer_protocol::{ThreadsChildrenListParams, ThreadsHistoryReadParams, ThreadsListParams};
+use pioneer_protocol::{
+    ThreadHistoryDirection, ThreadsChildrenListParams, ThreadsHistoryReadParams, ThreadsListParams,
+};
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
     ToolExtensionBundle, ToolHandler, ToolInvocation, ToolOutput, ToolPayload, ToolSpec,
@@ -40,8 +42,10 @@ pub(crate) fn thread_read_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         (
             "threads_history_read",
-            "Read one conversation's saved history, newest to oldest. Follow nextCursor until eof, including JSON fragments of oversized records. Child references identify separate histories: open a child with another threads_history_read call, then resume the parent with its original cursor. Children are never loaded automatically; threads_children_list is optional. Read large saved tool results with threads_tools_result_read using the exact supplied reference; output_log=true reads saved logs.",
-            json!({"threadId":{"type":"string"},"limit":limit,"cursor":cursor}),
+            "Read one conversation's saved history, newest to oldest by default. Optionally open near an exact saved anchor {turnId,itemId?}; omit itemId to anchor the turn. Initial pages include bounded neighboring context. Use direction=older (default) or newer with nextCursor, or reverseCursor and its reverseDirection to continue within the same snapshot; omit anchor on continuation and retain limit. nextCursor/eof apply to the requested direction. Every page is displayed newest to oldest. Follow nextCursor to finish JSON fragments of oversized records before changing direction. Child references identify separate histories: open a child with another threads_history_read call, then resume the parent with its original cursor. Children are never loaded automatically; threads_children_list is optional. Read large saved tool results with threads_tools_result_read using the exact supplied reference; output_log=true reads saved logs.",
+            json!({"threadId":{"type":"string"},"limit":limit,"cursor":cursor,
+                "anchor":{"type":["object","null"],"properties":{"turnId":{"type":"string"},"itemId":{"type":["string","null"]}},"required":["turnId"],"additionalProperties":false,"description":"Exact saved source in this thread; omit on cursor continuation."},
+                "direction":{"type":"string","enum":["older","newer"],"default":"older"}}),
             vec!["threadId", "limit"],
         ),
         (
@@ -565,7 +569,14 @@ impl ThreadReadHandler {
                         .await?,
                     "source unavailable or access denied"
                 );
-                let scope = authority.scope("history", &params.thread_id, false, params.limit);
+                let scope_for = |direction: ThreadHistoryDirection| {
+                    json!([
+                        authority.scope("history", &params.thread_id, false, params.limit),
+                        direction
+                    ])
+                    .to_string()
+                };
+                let scope = scope_for(params.direction);
                 let cursor = params
                     .cursor
                     .as_deref()
@@ -573,11 +584,13 @@ impl ThreadReadHandler {
                     .transpose()?;
                 let page = self
                     .processor
-                    .read_saved_thread_history(
+                    .read_saved_thread_history_near(
                         &authority.workspace_id,
                         &params.thread_id,
                         params.limit,
                         cursor,
+                        params.anchor,
+                        params.direction,
                         |child| {
                             let authority = &authority;
                             async move {
@@ -588,13 +601,30 @@ impl ThreadReadHandler {
                         },
                     )
                     .await?;
-                let next = page
-                    .next_cursor
+                let older = page
+                    .older_cursor
                     .as_ref()
-                    .map(|state| codec.encode(state, &scope))
+                    .map(|state| codec.encode(state, &scope_for(ThreadHistoryDirection::Older)))
                     .transpose()?;
+                let newer = page
+                    .newer_cursor
+                    .as_ref()
+                    .map(|state| codec.encode(state, &scope_for(ThreadHistoryDirection::Newer)))
+                    .transpose()?;
+                let next = if params.direction == ThreadHistoryDirection::Older {
+                    older.clone()
+                } else {
+                    newer.clone()
+                };
+                let (reverse, reverse_direction) =
+                    if params.direction == ThreadHistoryDirection::Older {
+                        (newer, ThreadHistoryDirection::Newer)
+                    } else {
+                        (older, ThreadHistoryDirection::Older)
+                    };
                 Ok(
-                    json!({"threadId":params.thread_id,"events":page.events,"nextCursor":next,"eof":page.eof}),
+                    json!({"threadId":params.thread_id,"events":page.events,"nextCursor":next,
+                    "eof":page.eof,"reverseCursor":reverse,"reverseDirection":reverse_direction,"direction":params.direction}),
                 )
             }
             _ => Err(anyhow!("unknown thread read operation")),
@@ -630,6 +660,24 @@ impl ThreadReadHandler {
                         {
                             row.as_object_mut().unwrap().remove(field);
                         }
+                    }
+                }
+            }
+        }
+        if let Some(events) = result.get("events").and_then(Value::as_array) {
+            for event in events {
+                for path in [
+                    "/childReference/threadId",
+                    "/sourceThreadReference/threadId",
+                    "/content/sourceThreadReference/threadId",
+                ] {
+                    if let Some(source) = event.pointer(path).and_then(Value::as_str) {
+                        ensure!(
+                            self.processor
+                                .thread_source_readable(&current, source)
+                                .await?,
+                            "source unavailable or access denied"
+                        );
                     }
                 }
             }

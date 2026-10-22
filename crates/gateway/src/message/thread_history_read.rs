@@ -3,7 +3,7 @@
 use super::MessageProcessor;
 use anyhow::{Result, bail, ensure};
 use pioneer_crud::{ProjectionVisibility, SavedHistoryKey, SavedHistoryRow, SavedHistorySnapshot};
-use pioneer_protocol::TurnItem;
+use pioneer_protocol::{ThreadHistoryAnchor, ThreadHistoryDirection, TurnItem};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -24,7 +24,9 @@ struct HistoryCursor {
     boundary: SavedHistoryKey,
     snapshot: SavedHistorySnapshot,
     revision: String,
-    before: Option<SavedHistoryKey>,
+    direction: ThreadHistoryDirection,
+    position: Option<SavedHistoryKey>,
+    inclusive: bool,
     fragment: Option<FragmentCursor>,
 }
 
@@ -43,15 +45,44 @@ pub(super) struct SavedHistoryPage {
     /// Internal state only. The tool handler MUST seal this before disclosure.
     pub next_cursor: Option<Value>,
     pub eof: bool,
+    pub older_cursor: Option<Value>,
+    pub newer_cursor: Option<Value>,
 }
 
 impl MessageProcessor {
+    #[cfg(test)]
     pub(super) async fn read_saved_thread_history<F, Fut>(
         &self,
         workspace_id: &str,
         thread_id: &str,
         limit: u32,
         cursor: Option<Value>,
+        authorize_child: F,
+    ) -> Result<SavedHistoryPage>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: Future<Output = Result<bool>>,
+    {
+        self.read_saved_thread_history_near(
+            workspace_id,
+            thread_id,
+            limit,
+            cursor,
+            None,
+            ThreadHistoryDirection::Older,
+            authorize_child,
+        )
+        .await
+    }
+
+    pub(super) async fn read_saved_thread_history_near<F, Fut>(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        limit: u32,
+        cursor: Option<Value>,
+        anchor: Option<ThreadHistoryAnchor>,
+        direction: ThreadHistoryDirection,
         mut authorize_child: F,
     ) -> Result<SavedHistoryPage>
     where
@@ -62,14 +93,23 @@ impl MessageProcessor {
             (1..=100).contains(&limit),
             "limit must be between 1 and 100"
         );
+        ensure!(
+            cursor.is_none() || anchor.is_none(),
+            "invalid history parameters"
+        );
+        ensure!(
+            cursor.is_some() || anchor.is_some() || direction == ThreadHistoryDirection::Older,
+            "invalid history parameters"
+        );
         let mut state: HistoryCursor = if let Some(cursor) = cursor {
             let state: HistoryCursor = serde_json::from_value(cursor)
                 .map_err(|_| anyhow::anyhow!("invalid history cursor"))?;
             ensure!(
-                state.version == 1
+                state.version == 2
                     && state.workspace_id == workspace_id
                     && state.thread_id == thread_id
-                    && state.limit == limit,
+                    && state.limit == limit
+                    && state.direction == direction,
                 "history cursor scope or parameters do not match"
             );
             ensure!(
@@ -87,37 +127,86 @@ impl MessageProcessor {
                 .saved_history_page_at_snapshot(thread_id, None, None, 1, &snapshot)
                 .await?;
             let Some(newest) = newest.first() else {
+                ensure!(anchor.is_none(), "history source unavailable");
                 return Ok(SavedHistoryPage {
                     events: Vec::new(),
                     next_cursor: None,
                     eof: true,
+                    older_cursor: None,
+                    newer_cursor: None,
                 });
             };
+            // Capture the logical revision before resolving/reading the anchor.
+            let revision = self
+                .crud_store
+                .saved_history_revision_at_snapshot(thread_id, &newest.key, &snapshot)
+                .await?;
+            let mut position = None;
+            if let Some(anchor) = anchor {
+                let row = self
+                    .crud_store
+                    .saved_history_anchor(
+                        thread_id,
+                        &anchor.turn_id,
+                        anchor.item_id.as_deref(),
+                        &snapshot,
+                    )
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("history source unavailable"))?;
+                ensure!(
+                    self.saved_history_record(workspace_id, thread_id, &row, &mut authorize_child)
+                        .await?
+                        .is_some(),
+                    "history source unavailable"
+                );
+                // A bounded key-only query chooses the near edge. No walk from
+                // newest history and no payload fetch for the neighboring rows.
+                let neighbors = self
+                    .crud_store
+                    .saved_history_page_direction_at_snapshot(
+                        thread_id,
+                        Some(&newest.key),
+                        Some(&row.key),
+                        false,
+                        direction == ThreadHistoryDirection::Older,
+                        (limit / 2).max(1) as u64,
+                        &snapshot,
+                    )
+                    .await?;
+                position = Some(if limit > 1 {
+                    neighbors.last().map_or(row.key.clone(), |n| n.key.clone())
+                } else {
+                    row.key
+                });
+            }
             HistoryCursor {
-                version: 1,
+                version: 2,
                 workspace_id: workspace_id.to_owned(),
                 thread_id: thread_id.to_owned(),
                 limit,
                 boundary: newest.key.clone(),
-                revision: self
-                    .crud_store
-                    .saved_history_revision_at_snapshot(thread_id, &newest.key, &snapshot)
-                    .await?,
                 snapshot,
-                before: None,
+                revision,
+                direction,
+                position,
+                inclusive: true,
                 fragment: None,
             }
         };
         let rows = self
             .crud_store
-            .saved_history_page_at_snapshot(
+            .saved_history_page_direction_at_snapshot(
                 thread_id,
                 Some(&state.boundary),
-                state.before.as_ref(),
+                state.position.as_ref(),
+                state.inclusive,
+                direction == ThreadHistoryDirection::Newer,
                 SCAN_QUANTUM as u64,
                 &state.snapshot,
             )
             .await?;
+        let mut reverse_edge = None;
+        let mut cursor_chars: usize = 0;
         let mut events = Vec::new();
         let mut exhausted = rows.len() < SCAN_QUANTUM;
         for (index, row) in rows.iter().enumerate() {
@@ -131,6 +220,7 @@ impl MessageProcessor {
                     "history cursor is stale; restart reading"
                 );
             }
+            reverse_edge.get_or_insert_with(|| row.key.clone());
             let record = self
                 .saved_history_record(workspace_id, thread_id, row, &mut authorize_child)
                 .await?;
@@ -139,7 +229,8 @@ impl MessageProcessor {
                     state.fragment.is_none(),
                     "history cursor is stale; restart reading"
                 );
-                state.before = Some(row.key.clone());
+                state.position = Some(row.key.clone());
+                state.inclusive = false;
                 continue;
             };
             let encoded = serde_json::to_string(&record)?;
@@ -154,10 +245,22 @@ impl MessageProcessor {
                 );
             }
             let source_reference = record.pointer("/content/sourceThreadReference").cloned();
+            // Opaque base64 ciphertext can tokenize poorly. Reserve a
+            // conservative token per character for both public cursor
+            // fields, including the largest fragment continuation state.
+            let mut budget_state = state.clone();
+            budget_state.position = Some(row.key.clone());
+            budget_state.fragment = Some(FragmentCursor {
+                key: row.key.clone(),
+                digest: digest.clone(),
+                offset: encoded.len(),
+            });
+            cursor_chars = cursor_chars
+                .max(2 * ((serde_json::to_vec(&budget_state)?.len() + 29).div_ceil(3) * 4));
             let mut event = record;
             let mut proposed = events.clone();
             proposed.push(event.clone());
-            if offset > 0 || !history_events_fit(&proposed)? {
+            if offset > 0 || !history_events_fit(&proposed, cursor_chars)? {
                 // Resume an oversize canonical record without dropping text or
                 // arguments. Every fragment's JSON envelope participates in the
                 // byte/token limits; UTF-8 boundaries are preserved.
@@ -181,12 +284,14 @@ impl MessageProcessor {
                         event["childReference"] =
                             json!({"threadId":row.key.id,"parentThreadId":thread_id});
                     }
-                    if history_events_fit(std::slice::from_ref(&event))? {
+                    if history_events_fit(std::slice::from_ref(&event), cursor_chars)? {
                         break;
                     }
                     end = offset + (end - offset) / 2;
                 }
                 if end < encoded.len() {
+                    state.position = Some(row.key.clone());
+                    state.inclusive = true;
                     state.fragment = Some(FragmentCursor {
                         key: row.key.clone(),
                         digest,
@@ -199,7 +304,8 @@ impl MessageProcessor {
             }
             events.push(event);
             state.fragment = None;
-            state.before = Some(row.key.clone());
+            state.position = Some(row.key.clone());
+            state.inclusive = false;
             if index + 1 < rows.len() {
                 exhausted = false;
             } else {
@@ -215,14 +321,38 @@ impl MessageProcessor {
                 == state.revision,
             "history cursor is stale; restart reading"
         );
+        let opposite = reverse_edge
+            .map(|key| {
+                let mut reverse = state.clone();
+                reverse.direction = if direction == ThreadHistoryDirection::Older {
+                    ThreadHistoryDirection::Newer
+                } else {
+                    ThreadHistoryDirection::Older
+                };
+                reverse.position = Some(key);
+                reverse.inclusive = false;
+                reverse.fragment = None;
+                serde_json::to_value(reverse)
+            })
+            .transpose()?;
+        let next = if exhausted {
+            None
+        } else {
+            Some(serde_json::to_value(state)?)
+        };
+        let (older_cursor, newer_cursor) = if direction == ThreadHistoryDirection::Older {
+            (next.clone(), opposite)
+        } else {
+            // Pages keep the same descending presentation in both directions.
+            events.reverse();
+            (opposite, next.clone())
+        };
         Ok(SavedHistoryPage {
             events,
-            next_cursor: if exhausted {
-                None
-            } else {
-                Some(serde_json::to_value(state)?)
-            },
+            next_cursor: next,
             eof: exhausted,
+            older_cursor,
+            newer_cursor,
         })
     }
 
@@ -349,10 +479,12 @@ impl MessageProcessor {
     }
 }
 
-fn history_events_fit(events: &[Value]) -> Result<bool> {
+fn history_events_fit(events: &[Value], cursor_chars: usize) -> Result<bool> {
     let encoded = serde_json::to_string(events)?;
     Ok(encoded.len() + 128 <= PAGE_BYTES
-        && pioneer_compaction::text_tokens(&encoded) <= PAGE_TOKENS)
+        && pioneer_compaction::text_tokens(&encoded) <= PAGE_TOKENS
+        && encoded.len() + cursor_chars + 256 <= 32768
+        && pioneer_compaction::text_tokens(&encoded) + cursor_chars as u64 + 256 <= 4096)
 }
 
 fn project_tool_record(
