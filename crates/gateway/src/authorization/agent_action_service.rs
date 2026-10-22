@@ -118,7 +118,8 @@ impl CanonicalAgentActionService {
                 } => ResourceAction::TaskDetach,
                 AgentActionIntent::ControlTask {
                     control:
-                        pioneer_protocol::AgentTaskControl::Resume
+                        pioneer_protocol::AgentTaskControl::Finish
+                        | pioneer_protocol::AgentTaskControl::Resume
                         | pioneer_protocol::AgentTaskControl::Pause
                         | pioneer_protocol::AgentTaskControl::Update
                         | pioneer_protocol::AgentTaskControl::Reschedule,

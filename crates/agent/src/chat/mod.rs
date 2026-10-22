@@ -9381,6 +9381,7 @@ mod tests {
     #[test]
     fn native_terminal_observation_does_not_survive_same_run_reopen() {
         let mut task = pioneer_protocol::PublicTask {
+            finish_request: None,
             id: "A".into(),
             workspace_id: "workspace".into(),
             owner_kind: pioneer_protocol::TaskOwnerKind::User,

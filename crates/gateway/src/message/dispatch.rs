@@ -24,8 +24,8 @@ use pioneer_protocol::{
     SkillsPackUpdateParams, SkillsPolicyListParams, SkillsPolicySetParams, SkillsUninstallParams,
     SkillsUpdateParams, TaskAcceptParams, TaskAgendaParams, TaskCancelParams,
     TaskCompletionInboxEntryParams, TaskCompletionInboxListParams, TaskCreateParams,
-    TaskDeliveriesParams, TaskDetachParams, TaskEventsParams, TaskGetParams, TaskListParams,
-    TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
+    TaskDeliveriesParams, TaskDetachParams, TaskEventsParams, TaskFinishParams, TaskGetParams,
+    TaskListParams, TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
     TaskTreeParams as TaskTreeTaskParams, TaskUserNotificationAcknowledgeParams,
     TaskUserNotificationListParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
     ThreadAgentsDocGetParams, ThreadAgentsDocResolveForThreadParams, ThreadAgentsDocSaveParams,
@@ -7042,6 +7042,29 @@ impl MessageProcessor {
                                     format!(
                                         "invalid params for `{}`: {error}",
                                         methods::TASK_CANCEL
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::TASK_FINISH => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<TaskFinishParams>(params_value) {
+                        Ok(params) => {
+                            self.task_finish(&context, admission.task(), request.id, params)
+                                .await
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::TASK_FINISH
                                     ),
                                 ),
                             )
