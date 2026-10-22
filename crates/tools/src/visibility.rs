@@ -359,6 +359,9 @@ mod tests {
             spec("task_create"),
             spec("artifact_prepare"),
             spec("computer_use"),
+            spec("threads_list"),
+            spec("threads_history_read"),
+            spec("threads_children_list"),
             spec("threads_start_options"),
             spec("threads_identity_odels_list"),
             spec("threads_turn_start"),
@@ -395,6 +398,9 @@ mod tests {
         assert!(!snapshot.contains_name("artifact_prepare").await);
         assert!(!snapshot.contains_name("computer_use").await);
         for name in [
+            "threads_list",
+            "threads_history_read",
+            "threads_children_list",
             "threads_start_options",
             "threads_identity_odels_list",
             "threads_turn_start",
@@ -403,7 +409,26 @@ mod tests {
         ] {
             assert!(!snapshot.contains_name(name).await);
         }
-        assert_eq!(snapshot.all_specs().len(), 17);
+        assert_eq!(snapshot.all_specs().len(), 20);
+        // Domain expansion must make the registered readers callable while
+        // keeping unrelated domains closed.
+        snapshot
+            .set_visible_by_name(
+                &crate::domain::THREADS_DOMAIN_TOOL_NAMES
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+            .await;
+        for name in [
+            "threads_list",
+            "threads_history_read",
+            "threads_children_list",
+            "threads_identity_odels_list",
+        ] {
+            assert!(snapshot.contains_name(name).await);
+        }
+        assert!(!snapshot.contains_name("task_create").await);
     }
 
     fn visibility_input() -> FinalToolVisibilityInput {

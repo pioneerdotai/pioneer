@@ -3055,10 +3055,14 @@ impl TurnMcpValidatedExecution for McpService {
                     .execute_first_party_file_tool(&validated, &security, cancellation.clone())
                     .await;
             }
-            let native_tasks = crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(
+            let native_family = crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(
                 &validated.binding.server_installation_id,
-            ).is_some_and(|family| matches!(family, crate::turn_mcp::native_tools::NativeToolFamily::Tasks | crate::turn_mcp::native_tools::NativeToolFamily::Threads));
-            let bundles = if native_tasks {
+            );
+            let native_tasks = native_family == Some(crate::turn_mcp::native_tools::NativeToolFamily::Tasks);
+            let native_shared = native_tasks || native_family == Some(crate::turn_mcp::native_tools::NativeToolFamily::Threads);
+            let native_stable_call = native_shared
+                && native_family.is_some_and(|family| !family.is_thread_reader(&validated.binding.raw_tool_name));
+            let bundles = if native_shared {
                 self.materialize_cli_task_tools(&validated).await?
             } else {
                 let annotations = serde_json::from_str::<pioneer_tools::McpDynamicToolAnnotations>(
@@ -3137,7 +3141,7 @@ impl TurnMcpValidatedExecution for McpService {
             let mut call = tools
                 .router
                 .build_tool_call(pioneer_tools::RawToolCall {
-                    call_id: if native_tasks {
+                    call_id: if native_stable_call {
                         crate::turn_mcp::native_tools::cli_task_call_id(
                             &validated.invocation.turn_id,
                             &validated.binding.raw_tool_name,
@@ -3151,7 +3155,7 @@ impl TurnMcpValidatedExecution for McpService {
                     arguments,
                 })
                 .map_err(map_shared_tool_error)?;
-            if native_tasks && call.idempotency_key.is_none() {
+            if native_stable_call && call.idempotency_key.is_none() {
                 call.idempotency_key = Some(format!("{}:{}", call.tool_name, call.call_id));
             }
             let started = std::time::Instant::now();
@@ -3188,10 +3192,10 @@ impl TurnMcpValidatedExecution for McpService {
                     "shared MCP tool result projection is unavailable",
                 )
             })?;
-            if native_tasks {
+            if native_shared {
                 let payload = projection.llm_payload();
                 let text = serde_json::to_string(&payload).map_err(|_| TurnMcpInvocationError::new(
-                    TurnMcpInvocationErrorCode::ResultInvalid, "task output cannot be serialized",
+                    TurnMcpInvocationErrorCode::ResultInvalid, "native output cannot be serialized",
                 ))?;
                 Ok(CanonicalMcpToolResult {
                     content: json!([{"type":"text", "text": text}]),
@@ -3233,11 +3237,27 @@ impl McpService {
             thread_id: validated.invocation.thread_id.clone(),
             turn_id: validated.invocation.turn_id.clone(),
         };
-        let bundles = crate::turn_mcp::native_tools::materialize_task_tools(processor, context)
-            .await
-            .map_err(|error| {
-                TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::PermissionDenied, error)
-            })?;
+        let bundles = match crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(
+            &validated.binding.server_installation_id,
+        ) {
+            Some(family) if family.is_thread_reader(&validated.binding.raw_tool_name) => {
+                crate::turn_mcp::native_tools::materialize_thread_tools(processor, context)
+            }
+            Some(
+                crate::turn_mcp::native_tools::NativeToolFamily::Tasks
+                | crate::turn_mcp::native_tools::NativeToolFamily::Threads,
+            ) => crate::turn_mcp::native_tools::materialize_task_tools(processor, context)
+                .await
+                .map_err(|error| {
+                    TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::PermissionDenied, error)
+                })?,
+            _ => {
+                return Err(TurnMcpInvocationError::new(
+                    TurnMcpInvocationErrorCode::ToolUnbound,
+                    "unknown native tool family",
+                ));
+            }
+        };
         if !bundles.iter().any(|bundle| {
             bundle
                 .specs

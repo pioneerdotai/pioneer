@@ -74,6 +74,8 @@ zstd.workspace = true
 subtle.workspace = true
 hex.workspace = true
 hmac.workspace = true
+# Confidential stateless read cursors must not disclose filtered candidate IDs.
+ring = "0.17.14"
 image.workspace = true
 fs4.workspace = true
 transcribe-rs.workspace = true

@@ -51,11 +51,13 @@ impl NativeToolFamily {
 
     fn catalog(self) -> &'static [ConfiguredToolSpec] {
         static HTML: std::sync::OnceLock<Vec<ConfiguredToolSpec>> = std::sync::OnceLock::new();
-        static TASKS: std::sync::OnceLock<Vec<ConfiguredToolSpec>> = std::sync::OnceLock::new();
         static THREADS: std::sync::OnceLock<Vec<ConfiguredToolSpec>> = std::sync::OnceLock::new();
+        static TASKS: std::sync::OnceLock<Vec<ConfiguredToolSpec>> = std::sync::OnceLock::new();
         match self {
             Self::Html => HTML.get_or_init(pioneer_tools::html::html_tool_specs),
             Self::Threads => THREADS.get_or_init(|| {
+                let mut specs = crate::message::thread_read_tools::thread_read_tool_specs();
+                specs.extend(crate::message::thread_tool_results::thread_result_tool_specs());
                 let capabilities = [
                     pioneer_protocol::AgentToolCapability::ChildStart,
                     pioneer_protocol::AgentToolCapability::ThreadCreate,
@@ -72,21 +74,19 @@ impl NativeToolFamily {
                     None,
                 ));
                 entries.push(pioneer_protocol::agent_turn_start_catalog_entry());
-                entries
-                    .into_iter()
-                    .map(|entry| {
-                        ConfiguredToolSpec::new(
-                            ToolSpec::new(
-                                entry.name.as_str(),
-                                entry.description,
-                                entry.parameters,
-                                PayloadKind::Function,
-                            ),
-                            ExecutionClass::Shared,
-                            dynamic_unknown_output_policy(),
-                        )
-                    })
-                    .collect()
+                specs.extend(entries.into_iter().map(|entry| {
+                    ConfiguredToolSpec::new(
+                        ToolSpec::new(
+                            entry.name.as_str(),
+                            entry.description,
+                            entry.parameters,
+                            PayloadKind::Function,
+                        ),
+                        ExecutionClass::Shared,
+                        dynamic_unknown_output_policy(),
+                    )
+                }));
+                specs
             }),
             Self::Tasks => TASKS.get_or_init(|| {
                 let mut specs = crate::task_tools::task_tool_specs();
@@ -109,8 +109,12 @@ impl NativeToolFamily {
     pub(crate) fn action(self, name: &str) -> Result<ResourceAction, pioneer_tools::ToolError> {
         match self {
             Self::Html => Ok(ResourceAction::McpUse),
+            Self::Threads
+                if self.is_thread_reader(name) || name == "threads_identity_odels_list" =>
+            {
+                Ok(ResourceAction::ThreadRead)
+            }
             Self::Threads => match name {
-                "threads_identity_odels_list" => Ok(ResourceAction::ThreadRead),
                 "thread_message_send" => Ok(ResourceAction::MessageCreate),
                 "thread_create" => Ok(ResourceAction::ThreadCreateWorkspace),
                 "threads_turn_start" => Ok(ResourceAction::AgentTurnStart),
@@ -124,6 +128,12 @@ impl NativeToolFamily {
             Self::Tasks if name == "threads_start_options" => Ok(ResourceAction::ThreadRead),
             Self::Tasks => crate::task_tools::task_tool_resource_action(name),
         }
+    }
+
+    pub(crate) fn is_thread_reader(self, name: &str) -> bool {
+        self == Self::Threads
+            && (crate::message::thread_read_tools::THREAD_READ_TOOL_NAMES.contains(&name)
+                || name == "threads_tools_result_read")
     }
 
     pub(crate) fn timeout_ms(self, name: &str) -> u64 {
@@ -276,6 +286,16 @@ pub(crate) async fn materialize_task_tools(
         .await?;
     actions.bundles.extend(tasks.bundles);
     Ok(actions.bundles)
+}
+
+pub(crate) fn materialize_thread_tools(
+    processor: std::sync::Arc<crate::message::MessageProcessor>,
+    context: pioneer_agent::TurnToolContext,
+) -> Vec<pioneer_tools::ToolExtensionBundle> {
+    vec![
+        processor.thread_read_tools(context.clone()),
+        processor.thread_result_tools(context),
+    ]
 }
 
 #[cfg(test)]

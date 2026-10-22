@@ -1,25 +1,44 @@
-name: Release App
-run-name: Release App (${{ github.ref_name }})
+name: Release
+run-name: Release (${{ github.ref_name }})
 
 on:
-  workflow_dispatch:
-    inputs:
-      gateway_run_id:
-        description: Optional exact Release Gateway producer on the same ref and commit
-        type: string
   push:
     tags: ["*"]
 
 permissions:
   contents: write
-  actions: read
 
 jobs:
-  generate-model-catalog:
-    name: select-shared-gateway-model-catalog
+  prepare-release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    name: prepare-release
     runs-on: ubuntu-latest
-    outputs:
-      gateway_run_id: ${{ steps.gateway.outputs.run_id }}
+    steps:
+      - name: keep-release-hidden-until-all-assets-are-ready
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          prerelease_flag=""
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            prerelease_flag="--prerelease"
+          fi
+
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --draft ${prerelease_flag}
+          else
+            if ! gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+              --title "${GITHUB_REF_NAME}" --draft ${prerelease_flag}; then
+              gh release edit "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+                --draft ${prerelease_flag}
+            fi
+          fi
+
+  generate-model-catalog:
+    name: generate-model-catalog
+    runs-on: ubuntu-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -28,13 +47,20 @@ jobs:
           ref: ${{ github.sha }}
           submodules: recursive
 
-      - name: reuse-gateway-model-catalog
-        id: gateway
+      - name: setup-rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-model-catalog-v1
+
+      - name: generate-and-validate-model-catalog
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GATEWAY_RUN_ID: ${{ inputs.gateway_run_id }}
-        run: python scripts/packaging/release-inputs.py catalog --run-id "$GATEWAY_RUN_ID" --out release-model-catalog
+        run: |
+          set -euo pipefail
+          mkdir -p release-model-catalog
+          cargo run --locked --release -p pioneer-provider --bin pioneer-model-catalog -- \
+            release-model-catalog/catalog.json
 
       - name: upload-model-catalog
         uses: actions/upload-artifact@v6
@@ -43,11 +69,124 @@ jobs:
           path: release-model-catalog/catalog.json
           if-no-files-found: error
 
-  package-desktop:
-    name: desktop-${{ matrix.target }}-reuse-computer-use-gateway
+  build-gateway:
+    name: gateway-${{ matrix.platform.target }}-${{ matrix.variant }}
     needs: generate-model-catalog
-    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: ${{ startsWith(matrix.platform.os, 'windows') && 'pwsh' || 'bash' }}
+    runs-on: ${{ matrix.platform.os }}
     env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      PIONEER_SENTRY_DSN: ${{ secrets.PIONEER_SENTRY_DSN }}
+      PIONEER_SENTRY_ENVIRONMENT: production
+      # Exact release inputs only; ordinary CI/local release profiles stay unchanged.
+      CARGO_PROFILE_RELEASE_DEBUG: "2"
+      CARGO_PROFILE_RELEASE_STRIP: "none"
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: ${{ contains(matrix.platform.target, 'apple-darwin') && 'unpacked' || 'off' }}
+      PIONEER_BUNDLED_MODEL_CATALOG: ${{ github.workspace }}/release-model-catalog/catalog.json
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [default, computer-use]
+        platform:
+          - {os: ubuntu-latest, target: x86_64-unknown-linux-gnu, asset: pioneer-gateway-linux-x86_64.gz, computer_asset: pioneer-gateway-linux-x86_64-computer-use.gz}
+          - {os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, asset: pioneer-gateway-linux-aarch64.gz, computer_asset: pioneer-gateway-linux-aarch64-computer-use.gz}
+          - {os: macos-latest, target: aarch64-apple-darwin, asset: pioneer-gateway-macos-aarch64.gz, computer_asset: pioneer-gateway-macos-aarch64-computer-use.gz}
+          - {os: macos-latest, target: x86_64-apple-darwin, asset: pioneer-gateway-macos-x86_64.zip, computer_asset: pioneer-gateway-macos-x86_64-computer-use.zip}
+          - {os: windows-latest, target: x86_64-pc-windows-msvc, asset: pioneer-gateway-windows-x86_64.zip, computer_asset: pioneer-gateway-windows-x86_64-computer-use.zip}
+          - {os: windows-11-arm, target: aarch64-pc-windows-msvc, asset: pioneer-gateway-windows-aarch64.zip, computer_asset: pioneer-gateway-windows-aarch64-computer-use.zip}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+      - name: download-model-catalog
+        uses: actions/download-artifact@v7
+        with:
+          name: pioneer-release-model-catalog
+          path: release-model-catalog
+      - name: setup-rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.target }}
+      - name: configure-native-release-environment
+        run: python scripts/packaging/build-gateway.py --target "${{ matrix.platform.target }}" --configure
+      - name: install-linux-build-dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=(
+            pkg-config
+            libssl-dev
+            libegl1-mesa-dev
+            libgbm-dev
+            libpipewire-0.3-dev
+            libwayland-dev
+            libxkbcommon-dev
+          )
+          sudo apt-get update
+          sudo apt-get install -y "${packages[@]}"
+          multiarch="$(gcc -print-multiarch)"
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
+      - name: install-onnx-runtime-macos-x86_64
+        if: matrix.platform.target == 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ORT_VERSION="1.24.2"
+          ORT_ARCHIVE="$RUNNER_TEMP/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+          ORT_DIR="$RUNNER_TEMP/onnxruntime-osx-x86_64-${ORT_VERSION}"
+          curl -fL --retry 3 --retry-delay 1 \
+            -o "$ORT_ARCHIVE" \
+            "https://blob.handy.computer/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+          tar -xzf "$ORT_ARCHIVE" -C "$RUNNER_TEMP"
+          test -d "$ORT_DIR/lib"
+          echo "ORT_LIB_LOCATION=$ORT_DIR/lib" >> "$GITHUB_ENV"
+          echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
+          echo "PIONEER_ONNXRUNTIME_DYLIB_DIR=$ORT_DIR/lib" >> "$GITHUB_ENV"
+          existing_rustflags="${RUSTFLAGS:-}"
+          echo "RUSTFLAGS=${existing_rustflags:+$existing_rustflags }-C link-arg=-Wl,-rpath,@executable_path" >> "$GITHUB_ENV"
+
+      - name: restore-release-dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-gateway-${{ matrix.platform.target }}-${{ matrix.variant }}-v1
+          cache-workspace-crates: false
+
+      - name: build-gateway-variant
+        run: >-
+          python scripts/packaging/build-gateway.py --target "${{ matrix.platform.target }}"
+          --variant "${{ matrix.variant }}"
+          --asset "${{ matrix.variant == 'computer-use' && matrix.platform.computer_asset || matrix.platform.asset }}"
+          --out "release-gateway/${{ matrix.variant }}"
+
+      - name: retain-symbol-inputs
+        uses: actions/upload-artifact@v6
+        with:
+          name: symbol-inputs-gateway-${{ matrix.platform.target }}-${{ matrix.variant }}
+          path: release-gateway/${{ matrix.variant }}/symbol-inputs/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+      - name: retain-release-asset
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.variant == 'computer-use' && matrix.platform.computer_asset || matrix.platform.asset }}
+          path: release-gateway/${{ matrix.variant }}/assets/
+          if-no-files-found: error
+      - name: remove-uploaded-transfer-copy
+        run: python -c 'import shutil; shutil.rmtree("release-gateway/${{ matrix.variant }}")'
+
+  build-desktop:
+    name: desktop-${{ matrix.target }}-compile
+    needs: generate-model-catalog
+    defaults:
+      run:
+        shell: ${{ startsWith(matrix.os, 'windows') && 'pwsh' || 'bash' }}
+    runs-on: ${{ matrix.os }}
+    env: &desktop-release-env
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       PIONEER_SENTRY_DSN: ${{ secrets.PIONEER_SENTRY_DSN }}
       PIONEER_DESKTOP_SENTRY_DSN: ${{ secrets.PIONEER_DESKTOP_SENTRY_DSN }}
@@ -59,11 +198,9 @@ jobs:
       PIONEER_APP_URL_SCHEME: pioneer
       PIONEER_SYMBOL_INPUTS_DIR: ${{ github.workspace }}/desktop-symbol-inputs
       PIONEER_BUNDLED_MODEL_CATALOG: ${{ github.workspace }}/release-model-catalog/catalog.json
-      PIONEER_REUSE_GATEWAY_RUN_ID: ${{ needs.generate-model-catalog.outputs.gateway_run_id }}
-      GH_TOKEN: ${{ github.token }}
     strategy:
       fail-fast: false
-      matrix:
+      matrix: &desktop-platforms
         # Desktop release assets have two roles:
         # - asset_name is the manual install artifact that remains published for users.
         # - update_asset_name is the v1 auto-update artifact included in desktop-update-manifest.json.
@@ -122,6 +259,106 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: install-linux-build-dependencies
+        if: matrix.package_kind == 'linux_appimage'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libasound2-dev \
+            libgbm-dev \
+            libssl-dev \
+            libpipewire-0.3-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libegl1-mesa-dev \
+            libfontconfig-dev \
+            libfreetype6-dev \
+            libwebkit2gtk-4.1-dev \
+            libx11-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libgl1-mesa-dev
+          multiarch="$(gcc -print-multiarch)"
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
+
+      - name: install-onnx-runtime-macos-x86_64
+        if: matrix.target == 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ORT_VERSION="1.24.2"
+          ORT_ARCHIVE="$RUNNER_TEMP/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+          ORT_DIR="$RUNNER_TEMP/onnxruntime-osx-x86_64-${ORT_VERSION}"
+          curl -fL --retry 3 --retry-delay 1 \
+            -o "$ORT_ARCHIVE" \
+            "https://blob.handy.computer/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+          tar -xzf "$ORT_ARCHIVE" -C "$RUNNER_TEMP"
+          test -d "$ORT_DIR/lib"
+          echo "ORT_LIB_LOCATION=$ORT_DIR/lib" >> "$GITHUB_ENV"
+          echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
+          echo "PIONEER_ONNXRUNTIME_DYLIB_DIR=$ORT_DIR/lib" >> "$GITHUB_ENV"
+          existing_rustflags="${RUSTFLAGS:-}"
+          echo "RUSTFLAGS=${existing_rustflags:+$existing_rustflags }-C link-arg=-Wl,-rpath,@executable_path" >> "$GITHUB_ENV"
+
+      - name: configure-native-release-environment
+        run: python scripts/packaging/build-gateway.py --target "${{ matrix.target }}" --configure
+
+      - name: restore-desktop-release-dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-desktop-${{ matrix.target }}-v1
+          cache-workspace-crates: false
+
+      - name: compile-desktop-and-updater
+        run: python scripts/packaging/build-desktop.py --target "${{ matrix.target }}"
+
+      - name: retain-compiled-desktop
+        uses: actions/upload-artifact@v6
+        with:
+          name: compiled-desktop-${{ matrix.target }}
+          path: desktop-symbol-inputs/
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+  package-desktop:
+    name: desktop-${{ matrix.target }}-package
+    needs: [build-gateway, build-desktop]
+    defaults:
+      run:
+        shell: ${{ startsWith(matrix.os, 'windows') && 'pwsh' || 'bash' }}
+    runs-on: ${{ matrix.os }}
+    env: *desktop-release-env
+    strategy:
+      fail-fast: false
+      matrix: *desktop-platforms
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+      - name: download-model-catalog
+        uses: actions/download-artifact@v7
+        with:
+          name: pioneer-release-model-catalog
+          path: release-model-catalog
+      - name: download-compiled-desktop
+        uses: actions/download-artifact@v7
+        with:
+          name: compiled-desktop-${{ matrix.target }}
+          path: desktop-symbol-inputs
+      - name: download-computer-use-gateway
+        uses: actions/download-artifact@v7
+        with:
+          name: symbol-inputs-gateway-${{ matrix.target }}-computer-use
+          path: desktop-symbol-inputs/gateway
+      - name: restore-exact-release-binaries
+        run: python scripts/packaging/release-inputs.py --target "${{ matrix.target }}" --inputs desktop-symbol-inputs
 
       - name: install-linux-build-dependencies
         if: matrix.package_kind == 'linux_appimage'
@@ -243,16 +480,6 @@ jobs:
           existing_rustflags="${RUSTFLAGS:-}"
           echo "RUSTFLAGS=${existing_rustflags:+$existing_rustflags }-C link-arg=-Wl,-rpath,@executable_path" >> "$GITHUB_ENV"
 
-      - name: configure-native-release-environment
-        shell: bash
-        run: python scripts/packaging/build-gateway.py --target "${{ matrix.target }}" --configure
-
-      - name: restore-desktop-release-dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-desktop-${{ matrix.target }}-v1
-          cache-workspace-crates: false
-
       - name: package-linux-appimage
         if: matrix.package_kind == 'linux_appimage'
         shell: bash
@@ -260,7 +487,7 @@ jobs:
           set -euo pipefail
           scripts/packaging/desktop/package-linux-appimage.sh \
             --target "${{ matrix.target }}" \
-            --out-dir dist \
+            --skip-build --out-dir dist \
             --appimagetool "$PWD/appimagetool"
 
       - name: package-macos-dmg
@@ -278,7 +505,7 @@ jobs:
           set -euo pipefail
           scripts/packaging/desktop/package-macos.sh \
             --target "${{ matrix.target }}" \
-            --out-dir dist
+            --skip-build --out-dir dist
 
       - name: setup-wix
         if: matrix.package_kind == 'windows_msi'
@@ -300,7 +527,7 @@ jobs:
           WINDOWS_SIGNING_FILE_DIGEST: ${{ secrets.WINDOWS_SIGNING_FILE_DIGEST }}
           WINDOWS_SIGNING_TIMESTAMP_DIGEST: ${{ secrets.WINDOWS_SIGNING_TIMESTAMP_DIGEST }}
         run: |
-          ./scripts/packaging/desktop/package-windows-msi.ps1 -Target "${{ matrix.target }}" -OutDir "dist"
+          ./scripts/packaging/desktop/package-windows-msi.ps1 -Target "${{ matrix.target }}" -OutDir "dist" -SkipBuild
 
       - name: upload-symbol-inputs
         uses: actions/upload-artifact@v6
@@ -329,10 +556,10 @@ jobs:
           security default-keychain -d user -s login.keychain-db || true
           security delete-keychain "$keychain_path" || true
 
-  publish-desktop-release:
-    name: publish-desktop-release
+  publish-release:
+    name: publish-release
     runs-on: ubuntu-latest
-    needs: package-desktop
+    needs: [prepare-release, package-desktop]
     if: github.event_name == 'push' && github.ref_type == 'tag'
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -343,12 +570,39 @@ jobs:
           ref: ${{ github.sha }}
           submodules: recursive
 
-      - name: download-artifacts
+      - name: download-gateway-artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          pattern: pioneer-gateway-*
+          merge-multiple: true
+
+      - name: download-desktop-artifacts
         uses: actions/download-artifact@v7
         with:
           path: dist
           pattern: desktop-*
           merge-multiple: true
+
+      - name: assemble-release-assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la dist
+          cd dist
+          rm -f SHA256SUMS
+          shopt -s nullglob
+          files=(pioneer-gateway-*.gz pioneer-gateway-*.zip)
+          if [[ ${#files[@]} -ne 12 ]]; then
+            echo "expected all 12 Gateway assets before publication, found ${#files[@]}"
+            exit 1
+          fi
+          for file in "${files[@]}"; do
+            sha="$(sha256sum "$file" | awk '{print $1}')"
+            printf 'sha256:%s %s\n' "$sha" "$file" >> SHA256SUMS
+          done
+          sort -o SHA256SUMS SHA256SUMS
+          cat SHA256SUMS
 
       - name: assemble-desktop-update-metadata
         shell: bash
@@ -531,7 +785,14 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
+          for arch in x86_64 aarch64; do
+            test -f "dist/Pioneer-${arch}.dmg"
+            test -f "dist/Pioneer-${arch}.msi"
+          done
           files=(
+            dist/pioneer-gateway-*.gz
+            dist/pioneer-gateway-*.zip
+            dist/SHA256SUMS
             dist/Pioneer-*.app.zip
             dist/Pioneer-*.dmg
             dist/Pioneer-*.exe
@@ -541,7 +802,7 @@ jobs:
             dist/DESKTOP_SHA256SUMS
           )
           if [[ ${#files[@]} -eq 0 ]]; then
-            echo "no desktop release assets found in dist/"
+            echo "no release assets found in dist/"
             exit 1
           fi
 
@@ -550,17 +811,19 @@ jobs:
             prerelease_flag="--prerelease"
           fi
 
-          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" \
-              --draft ${prerelease_flag} || gh release view "${GITHUB_REF_NAME}" >/dev/null
-          fi
-
           gh release upload "${GITHUB_REF_NAME}" "${files[@]}" --clobber
 
+          # This is the only publication point: both products are already uploaded.
+          if [[ -n "${prerelease_flag}" ]]; then
+            gh release edit "${GITHUB_REF_NAME}" --draft=false --prerelease
+          else
+            gh release edit "${GITHUB_REF_NAME}" --draft=false --prerelease=false --latest
+          fi
+
   queue-debug-symbols:
-    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     name: queue-independent-debug-symbols
-    needs: package-desktop
+    needs: [build-gateway, package-desktop]
     runs-on: ubuntu-latest
     permissions:
       actions: write

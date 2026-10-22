@@ -3926,10 +3926,12 @@ impl MessageProcessor {
                     .map(move |spec| (family, spec))
             })
         {
-            // CLI catalogs are fixed at admission. Hidden threads tools are
-            // exported only when explicitly selected in the admitted tool set;
-            // a later request_tools call cannot extend that frozen catalog.
+            let thread_reader = family.is_thread_reader(&spec.spec.name);
+            // Thread actions and model options require explicit tool selection.
+            // Readers use their separate ThreadRead grant. CLI catalogs freeze
+            // at admission; request_tools cannot extend them afterwards.
             if family == NativeToolFamily::Threads
+                && !thread_reader
                 && (!permission
                     .effective_policy
                     .allowed_tools
@@ -3954,7 +3956,9 @@ impl MessageProcessor {
                 continue;
             }
             if let Some(binding) = binding.as_ref() {
-                let visible = if matches!(
+                let visible = if thread_reader {
+                    true
+                } else if matches!(
                     spec.spec.name.as_str(),
                     "threads_start_options" | "threads_identity_odels_list" | "threads_turn_start"
                 ) {
@@ -3999,7 +4003,10 @@ impl MessageProcessor {
         if let Some(projection) = plan.mcp_projection.as_mut()
             && projection.tools.iter().any(|tool| {
                 NativeToolFamily::from_server_id(&tool.server_installation_id).is_some_and(
-                    |family| matches!(family, NativeToolFamily::Tasks | NativeToolFamily::Threads),
+                    |family| {
+                        matches!(family, NativeToolFamily::Tasks | NativeToolFamily::Threads)
+                            && !family.is_thread_reader(&tool.raw_tool_name)
+                    },
                 )
             })
         {
@@ -4015,7 +4022,10 @@ impl MessageProcessor {
             let previous_hash = projection.manifest_hash.clone();
             projection.tools.retain(|tool| {
                 !NativeToolFamily::from_server_id(&tool.server_installation_id).is_some_and(
-                    |family| matches!(family, NativeToolFamily::Tasks | NativeToolFamily::Threads),
+                    |family| {
+                        matches!(family, NativeToolFamily::Tasks | NativeToolFamily::Threads)
+                            && !family.is_thread_reader(&tool.raw_tool_name)
+                    },
                 ) || permitted.contains(&tool.raw_tool_name)
             });
             let (max_tools, max_total_schema_bytes) = self.mcp_service.projection_limit_values();
