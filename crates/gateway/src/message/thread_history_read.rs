@@ -231,6 +231,9 @@ impl MessageProcessor {
                 );
                 state.position = Some(row.key.clone());
                 state.inclusive = false;
+                // A filtered final candidate still exhausts a short scan. A
+                // preceding visible row must not leave EOF stuck at false.
+                exhausted = index + 1 == rows.len() && rows.len() < SCAN_QUANTUM;
                 continue;
             };
             let encoded = serde_json::to_string(&record)?;

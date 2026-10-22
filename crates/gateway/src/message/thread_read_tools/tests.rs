@@ -475,14 +475,16 @@ async fn legacy_tool_result_and_retained_log_are_readable_but_deleted_turn_is_no
         "INSERT INTO turn(id,thread_id,status,turn_kind,origin,initiated_by_actor_kind,initiated_by_actor_id,created_at,updated_at) VALUES ('legacy-tool-turn',?,'completed','conversation','user','principal',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         [THREAD_RED_PRIVATE_A_ID.into(), MEMBER_A_ID.into()])).await.unwrap();
     let text = "retained 🌍 output\n".repeat(1000);
+    // A legacy shell item can retain its typed display without a separate full
+    // result. Unknown external tools only allow summary display payloads.
     let item = TurnItem::DynamicToolCall {
         id: "legacy-tool".into(),
-        tool_name: "legacy".into(),
+        tool_name: "exec_command".into(),
         arguments: json!({"exact":42}),
         status: ToolCallStatus::Completed,
         execution_class: TurnItemExecutionClass::Standard,
         recovery_policy: None,
-        output_policy: ToolOutputPolicySnapshot::for_external_runtime_tool_name("legacy"),
+        output_policy: ToolOutputPolicySnapshot::for_external_runtime_tool_name("exec_command"),
         display: ToolDisplayPayload::Shell {
             stdout: Some(text.clone()),
             stderr: None,

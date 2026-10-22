@@ -113,7 +113,10 @@ async fn anchored_equal_time_neighbors_continue_both_directions_and_exclude_new_
         .await
         .unwrap();
     assert_eq!(ids(&newer.events), ["f", "e"]);
+    // The fixture's newer child reference is filtered by the callback. Consuming
+    // that final candidate must still end the short scan without another cursor.
     assert!(newer.eof);
+    assert!(newer.next_cursor.is_none());
     let mismatch = processor
         .read_saved_thread_history_near(
             WORKSPACE_RED_ID,
@@ -320,14 +323,38 @@ async fn anchored_handler_checks_source_acl_and_revalidates_membership_on_contin
         .execute_unprepared("UPDATE turn SET status='in_progress' WHERE id='anchor-turn'")
         .await
         .unwrap();
-    persist_test_execution_authorization_context_for_principal(
-        &processor,
+    // Member executions must stay within the role's supervised ceiling. The
+    // generic helper admits full access, so its lease is correctly fenced here.
+    let profile = pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+        pioneer_protocol::TurnPermissionMode::Supervised,
+        pioneer_protocol::TurnPermissionProfileSource::Composer,
+    );
+    let mut authorization = crate::authorization::ExecutionAuthorizationContext::for_test(
         &member(MEMBER_A_ID),
         WORKSPACE_RED_ID,
         THREAD_RED_PRIVATE_A_ID,
-        TURN,
-    )
-    .await;
+        &profile,
+        None,
+    );
+    authorization.bind_test_provider_authority(
+        "openai",
+        "test-model",
+        processor
+            .provider_registry
+            .authority_fingerprint_for_workspace(WORKSPACE_RED_ID, "openai")
+            .expect("test provider authority should resolve")
+            .as_str(),
+    );
+    assert!(
+        processor
+            .crud_store
+            .set_turn_execution_authorization_context(
+                TURN,
+                &authorization.to_persisted_json().unwrap(),
+            )
+            .await
+            .unwrap()
+    );
     let processor = Arc::new(processor);
     let handler = super::super::ThreadReadHandler {
         processor: processor.clone(),
