@@ -3909,6 +3909,24 @@ impl MessageProcessor {
         if mode == pioneer_protocol::ThreadMode::Message {
             return Ok(definitions);
         }
+        for spec in NativeToolFamily::Threads.definitions() {
+            let allowed = match authority {
+                TurnExecutionAuthority::Fresh(admission) => {
+                    admission
+                        .project_root_action(
+                            self.crud_store.as_ref(),
+                            crate::authorization::ResourceAction::ThreadRead,
+                        )
+                        .await?
+                }
+                TurnExecutionAuthority::Durable { context, .. } => {
+                    context.grants_action(crate::authorization::ResourceAction::ThreadRead)
+                }
+            };
+            if allowed {
+                definitions.push((NativeToolFamily::Threads, spec));
+            }
+        }
         let binding = self.agent_action_binding(&params.turn_id).await;
         for spec in NativeToolFamily::Tasks.definitions() {
             let action = NativeToolFamily::Tasks.action(&spec.spec.name)?;

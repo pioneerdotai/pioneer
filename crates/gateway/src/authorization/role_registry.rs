@@ -32,6 +32,7 @@ pub(crate) struct AgentRoleDefinition {
 
 const THREAD_AGENT_ACTIONS: &[ResourceAction] = &[
     ResourceAction::ThreadRead,
+    ResourceAction::ThreadObserveWorkspace,
     ResourceAction::ThreadCreatePrivate,
     ResourceAction::ThreadCreateWorkspace,
     ResourceAction::MessageCreate,
@@ -78,6 +79,7 @@ const THREAD_AGENT_ROLE: AgentRoleDefinition = AgentRoleDefinition {
 
 const AGENT_OBSERVER_ACTIONS: &[ResourceAction] = &[
     ResourceAction::ThreadRead,
+    ResourceAction::ThreadObserveWorkspace,
     ResourceAction::AgentExecutionObserve,
     ResourceAction::AgentRequestObserve,
     ResourceAction::ChildObserve,
@@ -536,6 +538,7 @@ const MEMBER_ACTIONS: &[ResourceAction] = &[
     ResourceAction::ThreadCreatePrivate,
     ResourceAction::ThreadCreateWorkspace,
     ResourceAction::ThreadRead,
+    ResourceAction::ThreadObserveWorkspace,
     ResourceAction::MessageCreate,
     ResourceAction::MessageEditOwn,
     ResourceAction::MessageDeleteOwn,
