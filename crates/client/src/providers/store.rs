@@ -199,12 +199,19 @@ impl ProviderCollectionPublication {
         Ok(())
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct Request {
+    work_context: pioneer_observability::work::WorkCarrier,
     key: ProviderCollectionKey,
     generation: u64,
     epoch: (u64, u64, Option<u64>),
 }
+impl PartialEq for Request {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.generation == other.generation && self.epoch == other.epoch
+    }
+}
+impl Eq for Request {}
 struct Collection {
     publication: Arc<ProviderCollectionPublication>,
     request: Option<Request>,
@@ -217,6 +224,7 @@ pub(crate) struct ProviderStore {
     generation: u64,
     waiter_generation: u64,
     sender: Option<mpsc::SyncSender<Request>>,
+    observer: Option<pioneer_observability::queues::QueueObserver>,
     task: Option<std::thread::JoinHandle<()>>,
 }
 impl ProviderStore {
@@ -468,14 +476,24 @@ impl ClientCore {
             .checked_add(1)
             .expect("provider request generation exhausted");
         let request = Request {
+            work_context: pioneer_observability::work::WorkCarrier::child(
+                pioneer_observability::work::Boundary::StdThread,
+                pioneer_observability::work::WorkKind::ClientCommand,
+                pioneer_observability::work::Trigger::Event,
+                pioneer_observability::work::ExecutorRole::ClientController,
+            ),
             key: key.clone(),
             generation: owner.generation,
             epoch,
         };
-        let queued = owner
-            .sender
-            .as_ref()
-            .is_some_and(|sender| sender.try_send(request.clone()).is_ok());
+        let queued = owner.sender.as_ref().is_some_and(|sender| {
+            pioneer_observability::queues::observe_try_send(
+                owner.observer.as_ref(),
+                pioneer_observability::queues::QueueBytes::Unsupported,
+                || sender.try_send(request.clone()),
+            )
+            .is_ok()
+        });
         let state = owner
             .collections
             .get_mut(&key)
@@ -804,11 +822,29 @@ impl ClientCore {
     }
     pub(crate) fn start_provider_controller(self: &Arc<Self>) {
         let (sender, receiver) = mpsc::sync_channel::<Request>(64);
+        let queue_observer = pioneer_observability::queues::QueueObserver::new(
+            pioneer_observability::queues::QueueKind::ClientController,
+            Some(64),
+            "unsupported: controller request payload/shared references are not serialized",
+        );
+        let worker_queue = queue_observer.clone();
         let weak = Arc::downgrade(self);
         let task = std::thread::Builder::new()
             .name("client-provider-catalog".into())
             .spawn(move || {
                 while let Ok(request) = receiver.recv() {
+                    worker_queue.dequeued(pioneer_observability::queues::QueueBytes::Unsupported);
+                    let mut processing = worker_queue.processing();
+                    let carrier = request.work_context.clone().received(
+                        pioneer_observability::work::Boundary::StdThread,
+                        pioneer_observability::work::WorkKind::ClientCommand,
+                        pioneer_observability::work::ExecutorRole::ClientController,
+                    );
+                    let _scope = carrier.enter();
+                    let mut active_work = pioneer_observability::live::WorkGuard::start(
+                        pioneer_observability::work::current(),
+                        false,
+                    );
                     let Some(core) = weak.upgrade() else {
                         return;
                     };
@@ -857,15 +893,23 @@ impl ClientCore {
                         );
                         Ok(response)
                     });
+                    let outcome = if result.is_ok() {
+                        pioneer_observability::work::Outcome::Completed
+                    } else {
+                        pioneer_observability::work::Outcome::Failed
+                    };
                     if let Some(core) = weak.upgrade() {
                         core.complete_provider_collection(request, result);
                     } else {
                         return;
                     }
+                    processing.processed();
+                    active_work.finish(outcome);
                 }
             })
             .expect("provider catalog worker");
         let mut owner = self.provider_store.lock().expect("provider store poisoned");
+        owner.observer = Some(queue_observer);
         owner.sender = Some(sender);
         owner.task = Some(task);
     }

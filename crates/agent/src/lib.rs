@@ -1882,9 +1882,13 @@ impl AgentControlAck {
     }
 }
 
+#[cfg(test)]
+static TURN_OBSERVATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Debug)]
 enum AgentCommand {
     StartTurn {
+        work: pioneer_observability::work::WorkCarrier,
         turn_id: String,
         mode: ThreadMode,
         hook_runtime_context: AgentTurnHookRuntimeContext,
@@ -1929,10 +1933,12 @@ enum AgentCommand {
         ack: oneshot::Sender<Result<Option<ExecutionTurnObservation>, AgentControlError>>,
     },
     StartRecoveryAttempt {
+        work: pioneer_observability::work::WorkCarrier,
         request: RecoveryAttemptRequest,
         ack: AgentControlAck,
     },
     StartRestoredRecoveryTurn {
+        work: pioneer_observability::work::WorkCarrier,
         turn_request: RestoredRecoveryTurnRequest,
         recovery_request: RecoveryAttemptRequest,
         ack: AgentControlAck,
@@ -3608,6 +3614,15 @@ impl AgentManager {
         }
         let (ack_tx, ack_rx) = oneshot::channel();
         let command = AgentCommand::StartTurn {
+            // Capture before mailbox ownership changes; the actor does not
+            // inherit the caller's poll-local context.
+            work: pioneer_observability::work::WorkCarrier::child(
+                pioneer_observability::work::Boundary::MessageFreshTask,
+                pioneer_observability::work::WorkKind::RpcTurn,
+                pioneer_observability::work::Trigger::Event,
+                pioneer_observability::work::ExecutorRole::Gateway,
+            )
+            .queued(),
             turn_id: turn_id.to_owned(),
             mode,
             hook_runtime_context,
@@ -3649,7 +3664,7 @@ impl AgentManager {
     pub async fn subscribe_progress(
         &self,
         thread_id: &str,
-    ) -> Option<broadcast::Receiver<AgentProgressEvent>> {
+    ) -> Option<pioneer_runtime_events::ProgressEventReceiver> {
         let state = self.state.read().await;
         state
             .threads
@@ -4140,6 +4155,21 @@ impl AgentManager {
         }
         let (ack_tx, ack_rx) = oneshot::channel();
         let command = AgentCommand::StartRecoveryAttempt {
+            // Capture before mailbox ownership changes; the actor does not
+            // inherit the caller's poll-local context.
+            // Tool-attempt recovery resumes the existing turn executor and
+            // creates no fresh turn; only a turn restart owns a queued lease.
+            work: if request.item_type.is_tool_item() {
+                pioneer_observability::work::WorkCarrier::default()
+            } else {
+                pioneer_observability::work::WorkCarrier::child(
+                    pioneer_observability::work::Boundary::MessageFreshTask,
+                    pioneer_observability::work::WorkKind::RpcTurn,
+                    pioneer_observability::work::Trigger::Event,
+                    pioneer_observability::work::ExecutorRole::Gateway,
+                )
+                .queued()
+            },
             request,
             ack: AgentControlAck {
                 sender: ack_tx,
@@ -4199,6 +4229,15 @@ impl AgentManager {
         }
         let (ack_tx, ack_rx) = oneshot::channel();
         let command = AgentCommand::StartRestoredRecoveryTurn {
+            // Capture before mailbox ownership changes; the actor does not
+            // inherit the caller's poll-local context.
+            work: pioneer_observability::work::WorkCarrier::child(
+                pioneer_observability::work::Boundary::MessageFreshTask,
+                pioneer_observability::work::WorkKind::RpcTurn,
+                pioneer_observability::work::Trigger::Event,
+                pioneer_observability::work::ExecutorRole::Gateway,
+            )
+            .queued(),
             turn_request,
             recovery_request,
             ack: AgentControlAck {

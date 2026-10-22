@@ -48,7 +48,12 @@ jobs:
       PIONEER_SENTRY_DSN: ${{ secrets.PIONEER_SENTRY_DSN }}
       PIONEER_DESKTOP_SENTRY_DSN: ${{ secrets.PIONEER_DESKTOP_SENTRY_DSN }}
       PIONEER_SENTRY_ENVIRONMENT: production
+      # Exact release inputs only; ordinary CI/local release profiles stay unchanged.
+      CARGO_PROFILE_RELEASE_DEBUG: "2"
+      CARGO_PROFILE_RELEASE_STRIP: "none"
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: ${{ contains(matrix.target, 'apple-darwin') && 'unpacked' || 'off' }}
       PIONEER_APP_URL_SCHEME: pioneer
+      PIONEER_SYMBOL_INPUTS_DIR: ${{ github.workspace }}/desktop-symbol-inputs
       PIONEER_BUNDLED_MODEL_CATALOG: ${{ github.workspace }}/release-model-catalog/catalog.json
     timeout-minutes: 90
     strategy:
@@ -280,6 +285,15 @@ jobs:
         run: |
           ./scripts/packaging/desktop/package-windows-msi.ps1 -Target "${{ matrix.target }}" -OutDir "dist"
 
+      - name: upload-symbol-inputs
+        uses: actions/upload-artifact@v6
+        with:
+          name: symbol-inputs-desktop-${{ matrix.target }}
+          path: desktop-symbol-inputs/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+
       - name: upload-desktop-artifacts
         uses: actions/upload-artifact@v6
         with:
@@ -316,6 +330,7 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           path: dist
+          pattern: desktop-*
           merge-multiple: true
 
       - name: assemble-desktop-update-metadata
@@ -524,3 +539,20 @@ jobs:
           fi
 
           gh release upload "${GITHUB_REF_NAME}" "${files[@]}" --clobber
+
+  queue-debug-symbols:
+    name: queue-independent-debug-symbols
+    needs: package-desktop
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner, repo: context.repo.repo,
+              workflow_id: 'build-debug-symbols.yml',
+              ref: context.ref.replace(/^refs\/(heads|tags)\//, ''),
+              inputs: {source_run_id: String(context.runId)},
+            });

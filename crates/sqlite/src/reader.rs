@@ -84,6 +84,8 @@ pub enum SqliteReadEvent {
 /// been snapshotted, although never while the limiter state lock is held.
 pub trait SqliteReadObserver: Send + Sync + 'static {
     fn observe(&self, event: SqliteReadEvent);
+    /// Source-ordered current state; milestone depths above remain historical.
+    fn observe_queue_snapshot(&self, _snapshot: crate::SqliteAdmissionSnapshot) {}
 }
 
 #[derive(Default)]
@@ -97,14 +99,16 @@ pub(crate) fn noop_read_observer() -> Arc<dyn SqliteReadObserver> {
     Arc::new(NoopSqliteReadObserver)
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ReadAdmissionSnapshot {
+    current: crate::SqliteAdmissionSnapshot,
     queue_depth: usize,
     active: usize,
 }
 
 #[derive(Default)]
 struct ReadAdmissionState {
+    observation_revision: u64,
     queue_depth: usize,
     active: usize,
 }
@@ -142,6 +146,7 @@ impl MaintenanceReadLimiter {
             queue_depth: snapshot.queue_depth,
             active: snapshot.active,
         });
+        self.observer.observe_queue_snapshot(snapshot.current);
 
         let mut registration = ReadWaitRegistration {
             limiter: self.clone(),
@@ -170,6 +175,7 @@ impl MaintenanceReadLimiter {
             queue_depth: snapshot.queue_depth,
             active: snapshot.active,
         });
+        self.observer.observe_queue_snapshot(snapshot.current);
         Ok(SqliteMaintenanceReadPermit {
             limiter: self.clone(),
             raw: Some(raw),
@@ -190,6 +196,7 @@ impl MaintenanceReadLimiter {
             queue_depth: snapshot.queue_depth,
             active: snapshot.active,
         });
+        self.observer.observe_queue_snapshot(snapshot.current);
     }
 
     fn release(&self, raw: &mut Option<OwnedSemaphorePermit>, acquired_at: Instant) {
@@ -210,6 +217,7 @@ impl MaintenanceReadLimiter {
             queue_depth: snapshot.queue_depth,
             active: snapshot.active,
         });
+        self.observer.observe_queue_snapshot(snapshot.current);
     }
 
     fn lock(&self) -> MutexGuard<'_, ReadAdmissionState> {
@@ -220,8 +228,14 @@ impl MaintenanceReadLimiter {
 }
 
 impl ReadAdmissionState {
-    fn snapshot(&self) -> ReadAdmissionSnapshot {
+    fn snapshot(&mut self) -> ReadAdmissionSnapshot {
+        self.observation_revision = self.observation_revision.saturating_add(1);
         ReadAdmissionSnapshot {
+            current: crate::SqliteAdmissionSnapshot::capture(
+                self.observation_revision,
+                self.queue_depth,
+                None,
+            ),
             queue_depth: self.queue_depth,
             active: self.active,
         }
@@ -303,5 +317,27 @@ pub(crate) fn reader_pool_span(class: SqliteReadClass) -> Span {
             target: "pioneer_sqlite::pool",
             "pioneer.sqlite.reader.maintenance"
         ),
+    }
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+    #[test]
+    fn native_reader_snapshot_has_source_revision_and_no_invented_head() {
+        let mut state = ReadAdmissionState {
+            queue_depth: 1,
+            ..Default::default()
+        };
+        let old = state.snapshot();
+        state.queue_depth = 0;
+        let new = state.snapshot();
+        assert_eq!((old.current.depth, new.current.depth), (1, 0));
+        assert!(new.current.revision > old.current.revision);
+        assert!(new.current.sampled_monotonic_ms >= old.current.sampled_monotonic_ms);
+        assert_eq!(old.current.oldest_waited_ms, None);
+        assert_eq!(new.current.oldest_waited_ms, None);
+        NoopSqliteReadObserver.observe_queue_snapshot(new.current);
+        NoopSqliteReadObserver.observe_queue_snapshot(old.current);
     }
 }

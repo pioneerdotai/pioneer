@@ -267,39 +267,54 @@ pub fn send_json_rpc_request_value<TTransport>(
 where
     TTransport: JsonRpcRequestTransport + ?Sized,
 {
-    let startup_key = if matches!(method, "turn/start" | "voice/session/finalize") {
-        pioneer_observability::turn_startup::request_key(&params)
-    } else {
-        None
-    };
-    let request = build_json_rpc_request_payload(method, params)?;
-    let (response_tx, response_rx) = std::sync::mpsc::channel();
+    use pioneer_observability::work::{Boundary, ExecutorRole, Trigger, WorkCarrier, WorkKind};
+    let executor =
+        pioneer_observability::work::current().map_or(ExecutorRole::Foreign, |c| c.executor);
+    let work = WorkCarrier::child(
+        Boundary::ClientRpc,
+        WorkKind::ClientRpc,
+        Trigger::Rpc,
+        executor,
+    );
+    work.run_result(|| {
+        let startup_key = if matches!(method, "turn/start" | "voice/session/finalize") {
+            pioneer_observability::turn_startup::request_key(&params)
+        } else {
+            None
+        };
+        let request = build_json_rpc_request_payload(method, params)?;
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
 
-    transport
-        .send_json_rpc_request(request.request_id, request.payload, response_tx)
-        .map_err(|error| {
+        transport
+            .send_json_rpc_request(request.request_id, request.payload, response_tx)
+            .map_err(|error| {
+                if let Some(key) = startup_key.as_deref() {
+                    pioneer_observability::turn_startup::finish(
+                        key,
+                        pioneer_observability::turn_startup::Outcome::ObservationLost,
+                    );
+                }
+                anyhow::Error::msg(error)
+            })?;
+
+        let _wait = pioneer_observability::live::WaitGuard::with_timeout(
+            pioneer_observability::live::WaitKind::Reply,
+            timeout,
+        );
+        let response = response_rx.recv_timeout(timeout).map_err(|error| {
             if let Some(key) = startup_key.as_deref() {
-                pioneer_observability::turn_startup::finish(
-                    key,
-                    pioneer_observability::turn_startup::Outcome::ObservationLost,
-                );
+                let outcome = if matches!(error, std::sync::mpsc::RecvTimeoutError::Timeout) {
+                    pioneer_observability::turn_startup::Outcome::DeadlineExceeded
+                } else {
+                    pioneer_observability::turn_startup::Outcome::ObservationLost
+                };
+                pioneer_observability::turn_startup::finish(key, outcome);
             }
-            anyhow::Error::msg(error)
+            anyhow!("{}", request_timeout_message(method))
         })?;
 
-    let response = response_rx.recv_timeout(timeout).map_err(|error| {
-        if let Some(key) = startup_key.as_deref() {
-            let outcome = if matches!(error, std::sync::mpsc::RecvTimeoutError::Timeout) {
-                pioneer_observability::turn_startup::Outcome::DeadlineExceeded
-            } else {
-                pioneer_observability::turn_startup::Outcome::ObservationLost
-            };
-            pioneer_observability::turn_startup::finish(key, outcome);
-        }
-        anyhow!("{}", request_timeout_message(method))
-    })?;
-
-    response.map_err(anyhow::Error::new)
+        response.map_err(anyhow::Error::new)
+    })
 }
 
 pub fn send_json_rpc_request_typed<TResponse, TParams, TTransport>(
@@ -646,5 +661,73 @@ mod tests {
                 value: "ok".to_owned()
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod work_boundary_tests {
+    use super::*;
+    #[test]
+    fn actual_sync_rpc_factory_records_failure_and_restores_parent() {
+        use pioneer_observability::work::{
+            self, Boundary, ExecutorRole, Trigger, WorkCarrier, WorkKind,
+        };
+        struct Transport(std::cell::RefCell<Option<work::WorkContext>>);
+        impl JsonRpcRequestTransport for Transport {
+            fn send_json_rpc_request(
+                &self,
+                _id: String,
+                _payload: String,
+                response: JsonRpcResponseSender,
+            ) -> std::result::Result<(), String> {
+                let context = work::current().expect("RPC owner");
+                assert_eq!(context.kind, WorkKind::ClientRpc);
+                assert!(
+                    pioneer_observability::live::snapshot()
+                        .unwrap()
+                        .active
+                        .iter()
+                        .any(|w| w.context.token == context.token)
+                );
+                *self.0.borrow_mut() = Some(context);
+                response
+                    .send(Err(JsonRpcResponseError::transport("fixture rejection")))
+                    .unwrap();
+                Ok(())
+            }
+        }
+        let _lock = crate::OBSERVABILITY_TEST_LOCK.lock().unwrap();
+        let old = pioneer_observability::telemetry_enabled();
+        pioneer_observability::set_telemetry_enabled(true);
+        let parent = WorkCarrier::independent(
+            Boundary::StdThread,
+            WorkKind::ClientCommand,
+            Trigger::Event,
+            ExecutorRole::ClientController,
+        );
+        let transport = Transport(Default::default());
+        parent.run(|| {
+            assert!(
+                send_json_rpc_request_value(
+                    &transport,
+                    "workspace/list",
+                    serde_json::json!({}),
+                    Duration::from_secs(1)
+                )
+                .is_err()
+            );
+            assert_eq!(work::current(), parent.context());
+        });
+        let child = transport.0.borrow().unwrap();
+        assert_eq!(child.parent, parent.context().map(|c| c.token));
+        let snapshot = pioneer_observability::live::snapshot().unwrap();
+        assert!(
+            !snapshot
+                .active
+                .iter()
+                .any(|w| w.context.token == child.token)
+        );
+        assert!(snapshot.journal.iter().any(|r|matches!(&r.payload,pioneer_observability::live::JournalPayload::Work(w) if w.context.token==child.token && w.state==pioneer_observability::live::WorkState::Terminal(work::Outcome::Failed))));
+        pioneer_observability::set_telemetry_enabled(old);
     }
 }

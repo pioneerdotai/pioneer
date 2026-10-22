@@ -119,20 +119,22 @@ pub(crate) fn start(
     // inbox without an engine lock, and is explicitly joined by the gateway's
     // tracker at shutdown. No task or second audio queue per network chunk.
     let store = store.worker_view();
-    workers.tasks.spawn_blocking(move || {
-        let outcome = catch_unwind(AssertUnwindSafe(|| {
-            process(
-                &store,
-                &session_id,
-                &cancellation,
-                &transcriber,
-                transcriber.is_moonshine_base,
-            )
-        }))
-        .unwrap_or_else(|_| Err(worker_error("voice processing worker panicked")));
-        store.processing_finished(&session_id);
-        let _ = sender.send(VoiceProcessingCompletion { outcome, lease });
-    });
+    workers
+        .tasks
+        .spawn_blocking(pioneer_observability::work::blocking(move || {
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                process(
+                    &store,
+                    &session_id,
+                    &cancellation,
+                    &transcriber,
+                    transcriber.is_moonshine_base,
+                )
+            }))
+            .unwrap_or_else(|_| Err(worker_error("voice processing worker panicked")));
+            store.processing_finished(&session_id);
+            let _ = sender.send(VoiceProcessingCompletion { outcome, lease });
+        }));
     Ok(())
 }
 

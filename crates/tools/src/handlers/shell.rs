@@ -73,6 +73,7 @@ pub struct UnifiedExecHandler {
 }
 
 struct ExecSession {
+    observation: pioneer_observability::resources::ChildRegistration,
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: Arc<Mutex<SessionBuffer>>,
@@ -252,6 +253,11 @@ impl UnifiedExecHandler {
             ToolError::execution_failed(format!("failed to spawn command: {error}"))
         })?;
 
+        let observation = pioneer_observability::resources::ChildRegistration::register(
+            child.id(),
+            pioneer_observability::resources::ChildRole::Shell,
+            None,
+        );
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let stdin = child.stdin.take();
@@ -269,6 +275,7 @@ impl UnifiedExecHandler {
         }
 
         let session = Arc::new(Mutex::new(ExecSession {
+            observation,
             child,
             stdin,
             stdout: stdout_buffer,
@@ -294,7 +301,9 @@ impl UnifiedExecHandler {
         if session_cancelled {
             {
                 let mut guard = session.lock().await;
-                if let Err(error) = terminate_child_process(&mut guard.child).await {
+                let terminated = terminate_child_process(&mut guard.child).await;
+                observe_shell_status(&mut guard.observation, terminated.as_ref().ok().copied());
+                if let Err(error) = terminated {
                     tracing::error!(
                         session_id,
                         error = %format!("{error:#}"),
@@ -320,7 +329,8 @@ impl UnifiedExecHandler {
         };
         if let Err(error) = output_commit {
             let mut guard = session.lock().await;
-            let _ = terminate_child_process(&mut guard.child).await;
+            let terminated = terminate_child_process(&mut guard.child).await;
+            observe_shell_status(&mut guard.observation, terminated.as_ref().ok().copied());
             drop(guard);
             self.sessions.lock().await.remove(&session_id);
             return Err(error);
@@ -330,6 +340,9 @@ impl UnifiedExecHandler {
             let status = guard.child.try_wait().map_err(|error| {
                 ToolError::execution_failed(format!("failed to poll process state: {error}"))
             })?;
+            if let Some(status) = status {
+                guard.observation.exited(status.success());
+            }
             ProcessState::from_status(status)
         };
 
@@ -415,7 +428,8 @@ impl UnifiedExecHandler {
         };
         if let Err(error) = output_commit {
             let mut guard = session.lock().await;
-            let _ = terminate_child_process(&mut guard.child).await;
+            let terminated = terminate_child_process(&mut guard.child).await;
+            observe_shell_status(&mut guard.observation, terminated.as_ref().ok().copied());
             drop(guard);
             self.sessions.lock().await.remove(&args.session_id);
             return Err(error);
@@ -427,6 +441,9 @@ impl UnifiedExecHandler {
             let status = guard.child.try_wait().map_err(|error| {
                 ToolError::execution_failed(format!("failed to poll process state: {error}"))
             })?;
+            if let Some(status) = status {
+                guard.observation.exited(status.success());
+            }
             (
                 ProcessState::from_status(status),
                 guard.command.clone(),
@@ -471,11 +488,15 @@ impl UnifiedExecHandler {
         for (session_id, session) in snapshot {
             let mut guard = session.lock().await;
             let expired = guard.last_touched.elapsed() >= Duration::from_millis(SESSION_TTL_MS);
-            let finished = guard.child.try_wait().ok().flatten().is_some();
+            let status = guard.child.try_wait().ok().flatten();
+            let finished = status.is_some();
+            observe_shell_status(&mut guard.observation, status);
 
             if finished || expired {
                 if !finished {
-                    if let Err(error) = terminate_child_process(&mut guard.child).await {
+                    let terminated = terminate_child_process(&mut guard.child).await;
+                    observe_shell_status(&mut guard.observation, terminated.as_ref().ok().copied());
+                    if let Err(error) = terminated {
                         tracing::error!(
                             session_id,
                             error = %format!("{error:#}"),
@@ -583,6 +604,16 @@ impl ProcessState {
     }
 }
 
+// Used at the first wait/poll/termination result, before drain or operation errors.
+fn observe_shell_status(
+    observation: &mut pioneer_observability::resources::ChildRegistration,
+    status: Option<ExitStatus>,
+) {
+    if let Some(status) = status {
+        observation.exited(status.success());
+    }
+}
+
 async fn run_one_shot(
     args: ExecCommandArgs,
     base_dir: &Path,
@@ -610,6 +641,11 @@ async fn run_one_shot(
     let mut child = command.spawn().map_err(|error| {
         ToolError::execution_failed(format!("failed to spawn command: {error}"))
     })?;
+    let mut observation = pioneer_observability::resources::ChildRegistration::register(
+        child.id(),
+        pioneer_observability::resources::ChildRole::Shell,
+        None,
+    );
     let process_id = child.id();
 
     let stdout_reader = child.stdout.take().ok_or_else(|| {
@@ -670,6 +706,7 @@ async fn run_one_shot(
                 cancelled = true;
                 if status_opt.is_none() {
                     status_opt = Some(terminate_child_process(&mut child).await?);
+                    observe_shell_status(&mut observation, status_opt);
                 } else {
                     kill_process_tree(process_id, true);
                 }
@@ -681,6 +718,7 @@ async fn run_one_shot(
             _ = &mut wait_deadline, if status_opt.is_none() => {
                 timed_out = true;
                 status_opt = Some(terminate_child_process(&mut child).await?);
+                observe_shell_status(&mut observation, status_opt);
                 pipe_drain_deadline.get_or_insert_with(|| {
                     TokioInstant::now() + Duration::from_millis(ONE_SHOT_PIPE_DRAIN_GRACE_MS)
                 });
@@ -690,6 +728,7 @@ async fn run_one_shot(
                     ToolError::execution_failed(format!("failed to wait for command: {error}"))
                 })?;
                 status_opt = Some(status);
+                observe_shell_status(&mut observation, status_opt);
                 // A one-shot invocation owns its whole process group. Do not
                 // let a detached descendant retain stdout/stderr indefinitely
                 // after the direct child exits.
@@ -733,6 +772,7 @@ async fn run_one_shot(
                         if status_opt.is_none() && !limit_termination_started {
                             limit_termination_started = true;
                             status_opt = Some(terminate_child_process(&mut child).await?);
+                            observe_shell_status(&mut observation, status_opt);
                             pipe_drain_deadline.get_or_insert_with(|| {
                                 TokioInstant::now()
                                     + Duration::from_millis(ONE_SHOT_PIPE_DRAIN_GRACE_MS)
@@ -2290,5 +2330,92 @@ mod tests {
                 "set -o pipefail; echo ok | cat".to_owned(),
             ]
         );
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod exit_observation_tests {
+    use super::*;
+    #[test]
+    fn first_shell_status_survives_cleanup_cancellation_drain_and_commit_errors() {
+        let old = pioneer_observability::telemetry_enabled();
+        pioneer_observability::set_telemetry_enabled(true);
+        for (index, source) in [
+            "finished_session",
+            "expired_session",
+            "one_shot_cancel",
+            "one_shot_reader",
+            "one_shot_commit",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let success = index % 2 == 0;
+            #[cfg(unix)]
+            let status = {
+                use std::os::unix::process::ExitStatusExt;
+                ExitStatus::from_raw(if success { 0 } else { 9 << 8 })
+            };
+            #[cfg(windows)]
+            let status = {
+                use std::os::windows::process::ExitStatusExt;
+                ExitStatus::from_raw(if success { 0 } else { 9 })
+            };
+            let id = 742100 + index as u64;
+            let mut observation = pioneer_observability::resources::ChildRegistration::register(
+                Some(std::process::id()),
+                pioneer_observability::resources::ChildRole::Shell,
+                Some(id),
+            );
+            observe_shell_status(&mut observation, Some(status)); // actual poll/termination/one-shot handoff seam
+            let snapshot = pioneer_observability::resources::resource_snapshot().unwrap();
+            let child = snapshot
+                .children
+                .iter()
+                .find(|c| c.owner_generation == Some(id))
+                .unwrap();
+            assert!(
+                child.exited_monotonic_ms.is_some(),
+                "must end before {source}"
+            );
+            let token = child.work.unwrap().token;
+            let _later_error: Result<(), ToolError> = Err(ToolError::execution_failed(source));
+            observe_shell_status(&mut observation, Some(status)); // later cached status is idempotent
+            drop(observation);
+            let snapshot = pioneer_observability::resources::resource_snapshot().unwrap();
+            let child = snapshot
+                .children
+                .iter()
+                .find(|c| c.owner_generation == Some(id))
+                .unwrap();
+            assert_eq!(
+                child.outcome,
+                if success {
+                    "exited_success"
+                } else {
+                    "exited_failure"
+                }
+            );
+            assert!(child.ownership_ended_monotonic_ms.is_some());
+            let live = pioneer_observability::live::snapshot().unwrap();
+            assert!(!live.active.iter().any(|w| w.context.token == token));
+            assert_eq!(live.journal.iter().filter(|r| matches!(&r.payload, pioneer_observability::live::JournalPayload::Work(w) if w.context.token == token && matches!(w.state, pioneer_observability::live::WorkState::Terminal(_)))).count(), 1);
+        }
+        let mut unknown = pioneer_observability::resources::ChildRegistration::register(
+            Some(std::process::id()),
+            pioneer_observability::resources::ChildRole::Shell,
+            Some(742199),
+        );
+        observe_shell_status(&mut unknown, None); // kill unit result / failed wait supplies no status
+        drop(unknown);
+        let snapshot = pioneer_observability::resources::resource_snapshot().unwrap();
+        let child = snapshot
+            .children
+            .iter()
+            .find(|c| c.owner_generation == Some(742199))
+            .unwrap();
+        assert_eq!(child.outcome, "owner_dropped_exit_unknown");
+        assert!(child.exited_monotonic_ms.is_none());
+        pioneer_observability::set_telemetry_enabled(old);
     }
 }

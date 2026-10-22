@@ -345,7 +345,7 @@ async fn prepare_messages_async(
     let model = model.to_owned();
     let capabilities = capabilities.clone();
     let messages = messages.to_vec();
-    tokio::task::spawn_blocking(move || {
+    pioneer_observability::work::spawn_blocking(move || {
         let _permit = permit;
         runtime::with_blocking_authority_scope(authority_fingerprint, || {
             admission::blocking_scope(state, || {

@@ -80,6 +80,7 @@ pub struct McpActionPublication {
     pub field_error: Option<super::actions::McpInstallFieldError>,
 }
 struct Work {
+    work_context: pioneer_observability::work::WorkCarrier,
     workspace: String,
     target: String,
     operation: u64,
@@ -95,6 +96,7 @@ pub(crate) struct McpController {
     next: u64,
     publications: BTreeMap<(String, String), Arc<McpActionPublication>>,
     sender: Option<mpsc::SyncSender<Work>>,
+    observer: Option<pioneer_observability::queues::QueueObserver>,
     task: Option<std::thread::JoinHandle<()>>,
 }
 impl McpController {
@@ -190,6 +192,12 @@ impl ClientCore {
             .expect("MCP operation identity exhausted");
         let operation = owner.next;
         let work = Work {
+            work_context: pioneer_observability::work::WorkCarrier::child(
+                pioneer_observability::work::Boundary::StdThread,
+                pioneer_observability::work::WorkKind::ClientCommand,
+                pioneer_observability::work::Trigger::Event,
+                pioneer_observability::work::ExecutorRole::ClientController,
+            ),
             workspace: workspace.into(),
             target: target.clone(),
             operation,
@@ -199,12 +207,18 @@ impl ClientCore {
             intent,
             previous_policy,
         };
-        owner
-            .sender
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("client_stopped"))?
-            .try_send(work)
-            .map_err(|_| anyhow::anyhow!("mcp_action_backpressure"))?;
+        pioneer_observability::queues::observe_try_send(
+            owner.observer.as_ref(),
+            pioneer_observability::queues::QueueBytes::Unsupported,
+            || {
+                owner
+                    .sender
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("client_stopped"))?
+                    .try_send(work)
+                    .map_err(|_| anyhow::anyhow!("mcp_action_backpressure"))
+            },
+        )?;
         self.publish_mcp_action(
             &mut owner,
             workspace,
@@ -497,11 +511,29 @@ impl ClientCore {
     }
     pub(crate) fn start_mcp_operation_controller(self: &Arc<Self>) {
         let (sender, receiver) = mpsc::sync_channel::<Work>(32);
+        let queue_observer = pioneer_observability::queues::QueueObserver::new(
+            pioneer_observability::queues::QueueKind::ClientController,
+            Some(32),
+            "unsupported: controller request payload/shared references are not serialized",
+        );
+        let worker_queue = queue_observer.clone();
         let weak = Arc::downgrade(self);
         let task = std::thread::Builder::new()
             .name("client-mcp-actions".into())
             .spawn(move || {
                 while let Ok(work) = receiver.recv() {
+                    worker_queue.dequeued(pioneer_observability::queues::QueueBytes::Unsupported);
+                    let mut processing = worker_queue.processing();
+                    let carrier = work.work_context.clone().received(
+                        pioneer_observability::work::Boundary::StdThread,
+                        pioneer_observability::work::WorkKind::ClientCommand,
+                        pioneer_observability::work::ExecutorRole::ClientController,
+                    );
+                    let _scope = carrier.enter();
+                    let mut active_work = pioneer_observability::live::WorkGuard::start(
+                        pioneer_observability::work::current(),
+                        false,
+                    );
                     let Some(core) = weak.upgrade() else {
                         return;
                     };
@@ -523,9 +555,16 @@ impl ClientCore {
                         let params =
                             configuration_params(&work.workspace, config_json, oauth_redirect);
                         let result = sender.mcp_install(params);
+                        let outcome = if result.is_ok() {
+                            pioneer_observability::work::Outcome::Completed
+                        } else {
+                            pioneer_observability::work::Outcome::Failed
+                        };
                         if let Some(core) = weak.upgrade() {
                             core.complete_mcp_configuration(work, result);
                         }
+                        processing.processed();
+                        active_work.finish(outcome);
                         continue;
                     }
                     let result = match &work.intent {
@@ -608,13 +647,21 @@ impl ClientCore {
                             unreachable!("configuration uses typed validation completion")
                         }
                     };
+                    let outcome = if result.is_ok() {
+                        pioneer_observability::work::Outcome::Completed
+                    } else {
+                        pioneer_observability::work::Outcome::Failed
+                    };
                     if let Some(core) = weak.upgrade() {
                         core.complete_mcp_action(work, result);
                     }
+                    processing.processed();
+                    active_work.finish(outcome);
                 }
             })
             .expect("MCP action controller could not start");
         let mut owner = self.mcp_controller.lock().expect("MCP controller poisoned");
+        owner.observer = Some(queue_observer);
         owner.sender = Some(sender);
         owner.task = Some(task);
     }
@@ -656,6 +703,12 @@ mod tests {
         core.mcp_intent("workspace", intent()).unwrap();
         let work = queue.try_recv().unwrap();
         let late = Work {
+            work_context: pioneer_observability::work::WorkCarrier::child(
+                pioneer_observability::work::Boundary::StdThread,
+                pioneer_observability::work::WorkKind::ClientCommand,
+                pioneer_observability::work::Trigger::Event,
+                pioneer_observability::work::ExecutorRole::ClientController,
+            ),
             workspace: work.workspace.clone(),
             target: work.target.clone(),
             operation: work.operation,

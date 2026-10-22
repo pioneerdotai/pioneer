@@ -3484,7 +3484,7 @@ impl MessageProcessor {
         hub: std::sync::Weak<ExecutionEventHub>,
         mut durable_receiver: pioneer_runtime_events::DurableEventReceiver,
         mut snapshot_receiver: pioneer_runtime_events::SnapshotEventReceiver,
-        mut live_receiver: tokio::sync::broadcast::Receiver<AgentProgressEvent>,
+        mut live_receiver: pioneer_runtime_events::ProgressEventReceiver,
     ) {
         let processor = self.clone();
         tokio::spawn(async move {
@@ -3506,7 +3506,7 @@ impl MessageProcessor {
                                         .await
                                     {
                                         if AssertUnwindSafe(
-                                            listener_processor.handle_snapshot_agent_event(event),
+                                            snapshot_receiver.pending_work().scope(listener_processor.handle_snapshot_agent_event(event)),
                                         )
                                         .catch_unwind()
                                         .await
@@ -3537,7 +3537,7 @@ impl MessageProcessor {
                                         .await
                                     {
                                         if AssertUnwindSafe(
-                                            listener_processor.handle_progress_agent_event(event),
+                                            live_receiver.pending_work().scope(listener_processor.handle_progress_agent_event(event)),
                                         )
                                         .catch_unwind()
                                         .await
@@ -3586,7 +3586,7 @@ impl MessageProcessor {
                                         .await
                                     {
                                         match AssertUnwindSafe(
-                                            commit_processor.commit_durable_agent_event_with_cli_blocked_guard(event, durable_receiver.cli_blocked_guard().cloned(), durable_receiver.turn_transition().cloned()),
+                                            durable_receiver.pending_work().scope_result(commit_processor.commit_durable_agent_event_with_cli_blocked_guard(event, durable_receiver.cli_blocked_guard().cloned(), durable_receiver.turn_transition().cloned())),
                                         )
                                         .catch_unwind()
                                         .await
@@ -3766,15 +3766,21 @@ impl MessageProcessor {
             let key = instance.key();
             let mut events = receivers.events;
             let runtime_kind = receivers.runtime_kind;
-            while let Some(mut event) = events.recv().await {
+            while let Some(item) = events.recv().await {
+                let (mut event, work) = item.received(
+                    pioneer_observability::work::Boundary::EventLane,
+                    pioneer_observability::work::WorkKind::Event,
+                    pioneer_observability::work::ExecutorRole::Event,
+                );
+                work.scope(async {
                 if !processor.cli_runtime_instance_is_current(&instance).await {
                     processor.audit_stale_cli_runtime_process_activity(&instance, "event");
-                    continue;
+                    return;
                 }
                 if runtime_kind == "opencode" {
                     if let Err(error) = session.enrich_runtime_event(&mut event) {
                         warn!(error = %error, "rejected invalid OpenCode native MCP lifecycle event");
-                        continue;
+                        return;
                     }
                 }
                 if cli_runtime_event_requires_native_journal(&event) {
@@ -3788,6 +3794,8 @@ impl MessageProcessor {
                         .await;
                 }
                 processor.handle_cli_runtime_event(&instance, event).await;
+
+                }).await;
             }
             debug!(
                 workspace_id = key.workspace_id.as_str(),
@@ -3824,43 +3832,51 @@ impl MessageProcessor {
         tokio::spawn(async move {
             let notification_key = notification_instance.key();
             let mut notifications = receivers.notifications;
-            while let Some(notification) = notifications.recv().await {
-                if !notification_processor
-                    .cli_runtime_instance_is_current(&notification_instance)
-                    .await
-                {
-                    notification_processor.audit_stale_cli_runtime_process_activity(
-                        &notification_instance,
-                        "notification",
-                    );
-                    continue;
-                }
-                let mut event = map_codex_notification_event(&notification, options);
-                if let Err(error) = notification_session.enrich_runtime_event(&mut event) {
-                    warn!(
-                        workspace_id = notification_key.workspace_id.as_str(),
-                        runtime_id = notification_key.runtime_id.as_str(),
-                        thread_id = notification_key.thread_id.as_str(),
-                        method = notification.method.as_str(),
-                        error = %format!("{error:#}"),
-                        "rejected invalid Codex native MCP lifecycle event"
-                    );
-                    continue;
-                }
-                if cli_runtime_event_requires_native_journal(&event) {
-                    notification_processor
-                        .persist_codex_native_transport_event(
+            while let Some(item) = notifications.recv().await {
+                let (notification, work) = item.received(
+                    pioneer_observability::work::Boundary::EventLane,
+                    pioneer_observability::work::WorkKind::Event,
+                    pioneer_observability::work::ExecutorRole::Event,
+                );
+                work.scope(async {
+                    if !notification_processor
+                        .cli_runtime_instance_is_current(&notification_instance)
+                        .await
+                    {
+                        notification_processor.audit_stale_cli_runtime_process_activity(
                             &notification_instance,
                             "notification",
-                            notification.method.as_str(),
-                            notification.params.as_ref(),
-                            debug_native_events,
-                        )
+                        );
+                        return;
+                    }
+                    let mut event = map_codex_notification_event(&notification, options);
+                    if let Err(error) = notification_session.enrich_runtime_event(&mut event) {
+                        warn!(
+                            workspace_id = notification_key.workspace_id.as_str(),
+                            runtime_id = notification_key.runtime_id.as_str(),
+                            thread_id = notification_key.thread_id.as_str(),
+                            method = notification.method.as_str(),
+                            error = %format!("{error:#}"),
+                            "rejected invalid Codex native MCP lifecycle event"
+                        );
+                        return;
+                    }
+                    if cli_runtime_event_requires_native_journal(&event) {
+                        notification_processor
+                            .persist_codex_native_transport_event(
+                                &notification_instance,
+                                "notification",
+                                notification.method.as_str(),
+                                notification.params.as_ref(),
+                                debug_native_events,
+                            )
+                            .await;
+                    }
+                    notification_processor
+                        .handle_cli_runtime_timeline_event(&notification_instance, event)
                         .await;
-                }
-                notification_processor
-                    .handle_cli_runtime_timeline_event(&notification_instance, event)
-                    .await;
+                })
+                .await;
             }
             debug!(
                 workspace_id = notification_key.workspace_id.as_str(),

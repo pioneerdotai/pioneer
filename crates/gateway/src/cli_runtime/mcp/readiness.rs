@@ -436,7 +436,7 @@ impl OpenCodeMcpFingerprintFlights {
                 })
         };
         let slot = local_mcp_probe_slots().clone().acquire_owned().await.ok()?;
-        tokio::task::spawn_blocking(move || {
+        pioneer_observability::work::spawn_blocking(move || {
             let _slot = slot;
             cell.get_or_init(probe).clone()
         })

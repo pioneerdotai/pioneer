@@ -822,7 +822,7 @@ async fn verified_file(
     let path = path.to_owned();
     let expected_size = request.expected_size_bytes;
     let expected_sha = request.expected_sha256.clone();
-    tokio::task::spawn_blocking(move || {
+    pioneer_observability::work::spawn_blocking(move || {
         verify_file_sync(path.as_path(), expected_size, &expected_sha)
     })
     .await

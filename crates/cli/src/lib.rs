@@ -1,3 +1,5 @@
+include!(concat!(env!("OUT_DIR"), "/pioneer-build-section.rs"));
+mod diagnostics;
 mod installer;
 mod secrets;
 mod service;
@@ -19,6 +21,23 @@ pub fn main_entry() {
     if let Some(exit_code) = dispatch_hidden_cli_mcp_stdio(env::args_os().skip(1)) {
         if exit_code != 0 {
             std::process::exit(exit_code);
+        }
+        return;
+    }
+
+    std::hint::black_box(&PIONEER_BUILD_SECTION);
+    let _ = pioneer_observability::identity::configure_build(include_str!(concat!(
+        env!("OUT_DIR"),
+        "/pioneer-build.json"
+    )));
+
+    // Operator diagnostics can contain private local artifact/tool failures.
+    // Keep this local command outside ordinary CLI Sentry/tracing initialization;
+    // the selected application authorizes observations through its own consent.
+    if env::args_os().nth(1).as_deref() == Some(OsStr::new("diagnostics")) {
+        if let Err(error) = diagnostics::run(env::args().skip(2)) {
+            eprintln!("{error:#}");
+            std::process::exit(1);
         }
         return;
     }
@@ -56,7 +75,8 @@ pub fn main_entry() {
 }
 
 fn requests_json_output(args: impl Iterator<Item = OsString>) -> bool {
-    args.into_iter().any(|arg| arg == OsStr::new("--json"))
+    args.into_iter()
+        .any(|arg| arg == OsStr::new("--json") || arg == OsStr::new("diagnostics"))
 }
 
 fn dispatch_hidden_cli_mcp_stdio(args: impl Iterator<Item = OsString>) -> Option<i32> {
@@ -157,6 +177,7 @@ fn run_with_args(mut args: impl Iterator<Item = String>) -> Result<()> {
             ))),
             None => Err(usage_error("missing device command; expected `create`")),
         },
+        Some("diagnostics") => diagnostics::run(args),
         Some("task-invariants") => task_invariants::run(args),
         Some("secrets") => secrets::run(args),
         Some("status") => {

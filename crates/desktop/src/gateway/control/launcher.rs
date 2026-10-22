@@ -697,7 +697,10 @@ fn try_start_with_command(mut command: Command) -> Result<StartAttempt> {
     let command_label = render_command(&command);
     let command_started_at = SystemTime::now();
 
-    let output = match command.output() {
+    let output = match pioneer_observability::resources::captured_output(
+        &mut command,
+        pioneer_observability::resources::ChildRole::DesktopHelper,
+    ) {
         Ok(output) => output,
         Err(error) if error.kind() == ErrorKind::NotFound => {
             return Ok(StartAttempt::ProgramNotFound);
@@ -886,7 +889,10 @@ fn try_create_pending_device_session_with_command(
 ) -> Result<DeviceCreateAttempt> {
     let command_label = render_command(&command);
 
-    let output = match command.output() {
+    let output = match pioneer_observability::resources::captured_output(
+        &mut command,
+        pioneer_observability::resources::ChildRole::DesktopHelper,
+    ) {
         Ok(output) => output,
         Err(error) if error.kind() == ErrorKind::NotFound => {
             return Ok(DeviceCreateAttempt::ProgramNotFound);

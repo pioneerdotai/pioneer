@@ -146,8 +146,13 @@ impl ClientCore {
             .enable_all()
             .build()
             .map_err(|_| InvitationRequestError::Runtime)?;
-        let result = runtime
+        let _runtime_observer = pioneer_observability::runtime::register(
+            runtime.handle(),
+            pioneer_observability::runtime::RuntimeRole::ClientHttp,
+        );
+        let result = _runtime_observer
             .block_on(
+                &runtime,
                 crate::transport::ws::auth_exchange::AuthExchangeClient::new(timeout)
                     .preview_invitation(presentation),
             )
@@ -184,20 +189,27 @@ impl ClientCore {
             .enable_all()
             .build()
             .map_err(|_| InvitationRequestError::Runtime)?;
+        let _runtime_observer = pioneer_observability::runtime::register(
+            runtime.handle(),
+            pioneer_observability::runtime::RuntimeRole::ClientHttp,
+        );
         let client = crate::transport::ws::auth_exchange::AuthExchangeClient::new(timeout);
-        let accepted = runtime
-            .block_on(client.accept_invitation(presentation, params))
+        let accepted = _runtime_observer
+            .block_on(&runtime, client.accept_invitation(presentation, params))
             .map_err(InvitationRequestError::Exchange)?;
         let cleanup_grant = accepted.grant.clone();
         let commit =
             match InvitationSessionCommit::new(presentation, accepted, expected_installation_id) {
                 Ok(commit) => commit,
                 Err(_) => {
-                    let _ = runtime.block_on(client.cleanup_session_once(
-                        presentation.gateway_base_url(),
-                        cleanup_grant.access_token.expose_secret(),
-                        cleanup_grant.session.id,
-                    ));
+                    let _ = _runtime_observer.block_on(
+                        &runtime,
+                        client.cleanup_session_once(
+                            presentation.gateway_base_url(),
+                            cleanup_grant.access_token.expose_secret(),
+                            cleanup_grant.session.id,
+                        ),
+                    );
                     return Err(InvitationRequestError::InvalidGrant);
                 }
             };
@@ -206,13 +218,13 @@ impl ClientCore {
             || epoch != self.authorization_connection_generation()
             || gateway != self.gateway_operation_epoch()
         {
-            cleanup_untracked(&runtime, &client, commit);
+            cleanup_untracked(&runtime, &_runtime_observer, &client, commit);
             return Err(InvitationRequestError::Unavailable);
         }
         match self.retain_invitation_commit(commit, fence) {
             Ok(id) => Ok((id, state)),
             Err(commit) => {
-                cleanup_untracked(&runtime, &client, commit);
+                cleanup_untracked(&runtime, &_runtime_observer, &client, commit);
                 Err(InvitationRequestError::Unavailable)
             }
         }
@@ -226,10 +238,15 @@ impl ClientCore {
             .enable_all()
             .build()
             .map_err(|_| InvitationRequestError::Runtime)?;
+        let _runtime_observer = pioneer_observability::runtime::register(
+            runtime.handle(),
+            pioneer_observability::runtime::RuntimeRole::ClientHttp,
+        );
         let cleanup = self
             .invitation_commit_take_failed_storage_cleanup(id)
             .map_err(|_| InvitationRequestError::Unavailable)?;
-        runtime.block_on(
+        _runtime_observer.block_on(
+            &runtime,
             crate::transport::ws::auth_exchange::AuthExchangeClient::new(timeout)
                 .cleanup_invitation_session_best_effort(cleanup),
         );
@@ -238,6 +255,7 @@ impl ClientCore {
 }
 fn cleanup_untracked(
     runtime: &tokio::runtime::Runtime,
+    runtime_observer: &pioneer_observability::runtime::RuntimeRegistration,
     client: &crate::transport::ws::auth_exchange::AuthExchangeClient,
     mut commit: InvitationSessionCommit,
 ) {
@@ -246,6 +264,9 @@ fn cleanup_untracked(
     };
     drop(refresh);
     if let Ok(cleanup) = commit.secure_storage_failed() {
-        runtime.block_on(client.cleanup_invitation_session_best_effort(cleanup));
+        runtime_observer.block_on(
+            runtime,
+            client.cleanup_invitation_session_best_effort(cleanup),
+        );
     }
 }

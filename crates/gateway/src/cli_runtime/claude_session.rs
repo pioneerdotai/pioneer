@@ -2080,7 +2080,7 @@ enum ClaudeMcpToolLifecycle {
 impl ClaudeStreamClient {
     fn new(
         stdin: ChildStdin,
-        event_tx: mpsc::Sender<RuntimeEvent>,
+        event_tx: mpsc::Sender<pioneer_observability::work::WorkItem<RuntimeEvent>>,
         provider_session_verifier: ClaudeProviderSessionVerifier,
         mcp: Option<ClaudeMcpEventContext>,
         native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget,
@@ -2102,7 +2102,7 @@ impl ClaudeStreamClient {
 
     fn new_for_local_probe(
         stdin: ChildStdin,
-        event_tx: mpsc::Sender<RuntimeEvent>,
+        event_tx: mpsc::Sender<pioneer_observability::work::WorkItem<RuntimeEvent>>,
         expected_provider_session_id: uuid::Uuid,
     ) -> Self {
         Self {
@@ -2122,7 +2122,7 @@ impl ClaudeStreamClient {
     #[cfg(test)]
     fn new_for_test_with_mcp(
         stdin: ChildStdin,
-        event_tx: mpsc::Sender<RuntimeEvent>,
+        event_tx: mpsc::Sender<pioneer_observability::work::WorkItem<RuntimeEvent>>,
         expected_provider_session_id: uuid::Uuid,
         mcp: Option<ClaudeMcpEventContext>,
     ) -> Self {
@@ -2405,7 +2405,7 @@ impl ClaudeStreamClient {
                     Self::decode_complete_stdout_frame(frame)
                 }
                 pioneer_cli_agent_runtime::SpooledNativeFrame::Oversized { file, .. } => {
-                    match tokio::task::spawn_blocking(move || {
+                    match pioneer_observability::work::spawn_blocking(move || {
                         Self::decode_spooled_stdout_frame(file)
                     })
                     .await
@@ -4590,7 +4590,7 @@ pub(crate) mod tests {
     ) -> (
         Arc<ClaudeStreamClient>,
         tokio::process::Child,
-        mpsc::Receiver<RuntimeEvent>,
+        mpsc::Receiver<pioneer_observability::work::WorkItem<RuntimeEvent>>,
     ) {
         let script = r#"
 while IFS= read -r line; do
@@ -5157,7 +5157,7 @@ done
             .expect("session mismatch event timeout")
             .expect("session mismatch event");
         assert!(matches!(
-            mismatch,
+            mismatch.value,
             RuntimeEvent::Error(RuntimeErrorEvent { code: Some(code), .. })
                 if code == "claude_session_identity_invalid"
         ));
@@ -5197,7 +5197,7 @@ done
                 .await
                 .expect("EOF reconciliation event timeout")
                 .expect("EOF reconciliation event");
-            match event {
+            match event.value {
                 RuntimeEvent::ItemCompleted(item) if item.native_item_id == "call-eof" => {
                     eof_terminal_count += 1;
                     assert_eq!(item.metadata.unwrap()["status"], json!("failed"));

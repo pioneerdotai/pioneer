@@ -248,6 +248,11 @@ async fn ensure_browser(cancel: &CancellationToken) -> Result<PathBuf> {
     let mut child = owned_process(installer)
         .spawn()
         .context("browser missing; install the pioneer/browser skill's agent-browser CLI")?;
+    let mut observation = pioneer_observability::resources::ChildRegistration::register(
+        child.id(),
+        pioneer_observability::resources::ChildRole::Browser,
+        None,
+    );
     let status = tokio::select! {
         _ = cancel.cancelled() => None,
         _ = tokio::time::sleep(Duration::from_secs(100)) => None,
@@ -255,11 +260,13 @@ async fn ensure_browser(cancel: &CancellationToken) -> Result<PathBuf> {
     };
     let Some(status) = status else {
         let _ = Box::into_pin(child.kill()).await;
-        tokio::time::timeout(Duration::from_secs(5), child.wait())
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
             .await
-            .context("browser installer cleanup deadline exceeded")??;
+            .context("browser installer cleanup deadline exceeded")?;
+        observe_browser_wait(&mut observation, status)?;
         bail!("preview cancelled or browser installation deadline exceeded");
     };
+    observation.exited(status.success());
     if !status.success() {
         bail!(
             "agent-browser install failed; repair pioneer/browser browser dependencies on this Gateway"
@@ -400,6 +407,11 @@ async fn capture_owned(
     let mut child = owned_process(command)
         .spawn()
         .context("could not start skill-installed browser on execution Gateway")?;
+    let mut observation = pioneer_observability::resources::ChildRegistration::register(
+        child.id(),
+        pioneer_observability::resources::ChildRole::Browser,
+        None,
+    );
     let stderr = child
         .stderr()
         .take()
@@ -560,11 +572,20 @@ async fn capture_owned(
     Box::into_pin(child.kill())
         .await
         .context("preview process cleanup failed")?;
-    tokio::time::timeout(Duration::from_secs(5), child.wait())
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
         .await
-        .context("preview process cleanup deadline exceeded")??;
+        .context("preview process cleanup deadline exceeded")?;
+    observe_browser_wait(&mut observation, status)?;
     profile.close().context("preview profile cleanup failed")?;
     result
+}
+
+// The process outcome is already known here, before preview/profile errors.
+fn observe_browser_wait(
+    observation: &mut pioneer_observability::resources::ChildRegistration,
+    waited: std::io::Result<std::process::ExitStatus>,
+) -> std::io::Result<std::process::ExitStatus> {
+    waited.inspect(|status| observation.exited(status.success()))
 }
 
 #[cfg(test)]
@@ -734,5 +755,78 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod exit_observation_tests {
+    use super::*;
+    #[test]
+    fn cleanup_wait_records_exit_before_preview_or_profile_error() {
+        let old = pioneer_observability::telemetry_enabled();
+        pioneer_observability::set_telemetry_enabled(true);
+        for (index, success) in [true, false].into_iter().enumerate() {
+            #[cfg(unix)]
+            let status = {
+                use std::os::unix::process::ExitStatusExt;
+                std::process::ExitStatus::from_raw(if success { 0 } else { 7 << 8 })
+            };
+            #[cfg(windows)]
+            let status = {
+                use std::os::windows::process::ExitStatusExt;
+                std::process::ExitStatus::from_raw(if success { 0 } else { 7 })
+            };
+            let id = 742000 + index as u64;
+            let mut observation = pioneer_observability::resources::ChildRegistration::register(
+                Some(std::process::id()),
+                pioneer_observability::resources::ChildRole::Browser,
+                Some(id),
+            );
+            let observed = observe_browser_wait(&mut observation, Ok(status)).unwrap();
+            assert_eq!(observed, status);
+            let _later_preview_or_profile_result: Result<()> =
+                Err(anyhow!("fixture preview/profile cleanup failed"));
+            drop(observation);
+            let snapshot = pioneer_observability::resources::resource_snapshot().unwrap();
+            let child = snapshot
+                .children
+                .iter()
+                .find(|c| c.owner_generation == Some(id))
+                .unwrap();
+            assert_eq!(
+                child.outcome,
+                if success {
+                    "exited_success"
+                } else {
+                    "exited_failure"
+                }
+            );
+            assert!(
+                child.exited_monotonic_ms.is_some() && child.ownership_ended_monotonic_ms.is_some()
+            );
+            assert_eq!(child.final_usage, "incomplete_no_wait_rusage");
+            let token = child.work.unwrap().token;
+            let live = pioneer_observability::live::snapshot().unwrap();
+            assert!(!live.active.iter().any(|w| w.context.token == token));
+            assert_eq!(live.journal.iter().filter(|r| matches!(&r.payload, pioneer_observability::live::JournalPayload::Work(w) if w.context.token == token && matches!(w.state, pioneer_observability::live::WorkState::Terminal(_)))).count(), 1);
+        }
+        let mut unknown = pioneer_observability::resources::ChildRegistration::register(
+            Some(std::process::id()),
+            pioneer_observability::resources::ChildRole::Browser,
+            Some(742002),
+        );
+        assert!(
+            observe_browser_wait(&mut unknown, Err(std::io::Error::other("wait failed"))).is_err()
+        );
+        drop(unknown);
+        let snapshot = pioneer_observability::resources::resource_snapshot().unwrap();
+        let child = snapshot
+            .children
+            .iter()
+            .find(|c| c.owner_generation == Some(742002))
+            .unwrap();
+        assert_eq!(child.outcome, "owner_dropped_exit_unknown");
+        assert!(child.exited_monotonic_ms.is_none());
+        pioneer_observability::set_telemetry_enabled(old);
     }
 }

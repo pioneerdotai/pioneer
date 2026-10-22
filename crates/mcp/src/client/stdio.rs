@@ -77,6 +77,7 @@ pub(crate) type BoundedStdioTransport =
 pub(crate) struct ManagedChildStdout {
     child: Option<Box<dyn ChildWrapper>>,
     stdout: ChildStdout,
+    observation: Option<pioneer_observability::resources::ChildRegistration>,
 }
 
 impl AsyncRead for ManagedChildStdout {
@@ -92,12 +93,19 @@ impl AsyncRead for ManagedChildStdout {
 impl Drop for ManagedChildStdout {
     fn drop(&mut self) {
         if let Some(child) = self.child.take() {
-            tokio::spawn(async move {
-                let mut child = child;
-                if let Err(error) = Box::into_pin(child.kill()).await {
-                    tracing::warn!(%error, "failed to terminate MCP stdio child process");
-                }
-            });
+            let observation = self.observation.take();
+            tokio::spawn(pioneer_observability::work::inherit(
+                pioneer_observability::work::Boundary::Child,
+                pioneer_observability::work::WorkKind::Child,
+                pioneer_observability::work::ExecutorRole::Child,
+                async move {
+                    let _observation = observation;
+                    let mut child = child;
+                    if let Err(error) = Box::into_pin(child.kill()).await {
+                        tracing::warn!(%error, "failed to terminate MCP stdio child process");
+                    }
+                },
+            ));
         }
     }
 }
@@ -129,6 +137,11 @@ pub(crate) fn build_stdio_transport(
     command.wrap(JobObject);
 
     let mut child = command.spawn()?;
+    let observation = pioneer_observability::resources::ChildRegistration::register(
+        child.id(),
+        pioneer_observability::resources::ChildRole::Mcp,
+        None,
+    );
     let stdin = child
         .inner_mut()
         .stdin()
@@ -148,6 +161,7 @@ pub(crate) fn build_stdio_transport(
         ManagedChildStdout {
             child: Some(child),
             stdout,
+            observation: Some(observation),
         },
         MCP_MAX_STDIO_FRAME_BYTES,
     );
