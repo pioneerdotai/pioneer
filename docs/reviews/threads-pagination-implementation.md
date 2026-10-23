@@ -140,3 +140,10 @@ Revision scan использует существующий CRUD keyset reader: 
 В финальном проходе перечитан весь diff от проверенного HEAD, включая тесты и описания tools; поля Rust wire/schema не меняются, поэтому schemas и generators не затронуты. Предыдущие history/anchor/title/preview/result ownership/grants/native/CLI/retention/replay реализации остаются в исходном implementation commit, без правок этого follow-up. В частности, не возвращены малые 2048/4096 token или 28/32 KiB defaults и ceilings 128 identities/256 profiles, не изменены зависимости/vendor/Search/episodic/Tasks/Subagents.
 
 Фактически выполнены чтение/поиск (pwd/cat/sed/rg/head/tail/ls), Git status/branch/rev-parse/worktree/diff, статическое редактирование apply_patch и Python (только тексты отчётов). `cargo fmt --all` и финальный `cargo fmt --all -- --check` завершились с exit code 0; `git diff --check` — без whitespace errors. Python проверка whitespace обоих отчётов — без ошибок. Stage/commit и staged/final whitespace checks записываются в handoff после выполнения. Тесты, компиляция, сборки, cargo check/build/clippy/test/nextest/run, приложение/Gateway/CLI agents, project generators и Git hooks не запускались. Merge/push/deploy не выполнялись. Выполнение новых регрессий, SQL/runtime, фактическая компиляция и native/CLI transport остаются непроверенными до отдельного разрешения.
+
+
+## Publication and integration with main
+
+Before publication, origin/main was fetched at `3e760431768250fa3e722a5dc4106081f5ac0d5e`. Its tool-name correction conflicted with the removed legacy profile filter in agent_runtime_adapter. The resolution keeps every admitted profile reachable and preserves main's canonical catalog tool name. The shared page-retention guard now uses `AgentModelToolName::IdentityModelsList.as_str()` so native/CLI delivery follows that canonical name too. No launch grants or ACL checks were widened. The merge also includes main's existing push fixture fix.
+
+The initial implementation retained the tool spelling that existed on its original base; integration follows the later correction already accepted on main. REVIEW_REPORT.md remains an untracked local handoff file.

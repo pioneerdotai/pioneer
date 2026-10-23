@@ -249,7 +249,7 @@ const INTERNAL_TOOL_RECORDS: &[AuthorizationCatalogRecord] = &[
     ),
     record(
         AuthorizationCatalogSurface::InternalTool,
-        "threads_identity_odels_list",
+        "threads_identity_models_list",
         "child_observe",
         "execution_agent_options",
         "not_found",

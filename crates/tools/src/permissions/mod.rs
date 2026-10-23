@@ -576,7 +576,7 @@ fn extract_computer_use_permission_intent(invocation: &ToolInvocation) -> Option
 fn extract_agent_action_permission_intent(invocation: &ToolInvocation) -> Option<PermissionIntent> {
     let (operation, mutation) = match invocation.tool_name.as_str() {
         "threads_start_options" => ("read agent start options", false),
-        "threads_identity_odels_list" => ("read identity model options", false),
+        "threads_identity_models_list" => ("read identity model options", false),
         "thread_message_send" => ("send message to thread", true),
         "thread_create" => ("create thread", true),
         "threads_turn_start" => ("start agent", true),
@@ -2417,7 +2417,7 @@ mod tests {
             ("read_skill", PermissionActionKind::Internal),
             ("threads_start_options", PermissionActionKind::Internal),
             (
-                "threads_identity_odels_list",
+                "threads_identity_models_list",
                 PermissionActionKind::Internal,
             ),
             ("thread_message_send", PermissionActionKind::AgentAction),

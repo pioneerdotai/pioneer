@@ -3308,7 +3308,7 @@ impl ToolHandler for AgentActionToolHandler {
                                 "providerId": profile.provider_id, "modelId": profile.model_id, "allowedReasoning": profile.allowed_reasoning,
                             })).collect::<Vec<_>>();
                         return Ok(Box::new(FunctionToolOutput::with_payload(
-                            "Choose an available executor/model and compatible reasoning; detailed metadata is available through threads_identity_odels_list",
+                            "Choose an available executor/model and compatible reasoning; detailed metadata is available through threads_identity_models_list",
                             false, serde_json::json!({"status":"denied", "outcome":"agent_execution_selection_not_allowed", "availableModels":available}),
                         )) as Box<dyn ToolOutput>);
                     }

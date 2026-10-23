@@ -157,8 +157,7 @@ pub fn is_thread_paged_tool(name: &str) -> bool {
             | "threads_children_list"
             | "threads_tools_result_read"
             | "threads_start_options"
-            | "threads_identity_odels_list"
-    )
+    ) || name == pioneer_protocol::AgentModelToolName::IdentityModelsList.as_str()
 }
 
 /// Count actual JSON escaping and both the projection and delivery envelopes.

@@ -23,7 +23,7 @@ use std::collections::BTreeSet;
 pub enum AgentModelToolName {
     #[serde(rename = "threads_start_options", alias = "agent_start_options")]
     AgentStartOptions,
-    #[serde(rename = "threads_identity_odels_list")]
+    #[serde(rename = "threads_identity_models_list")]
     IdentityModelsList,
     SendMessage,
     CreateThread,
@@ -41,7 +41,7 @@ impl AgentModelToolName {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AgentStartOptions => "threads_start_options",
-            Self::IdentityModelsList => "threads_identity_odels_list",
+            Self::IdentityModelsList => "threads_identity_models_list",
             Self::SendMessage => "thread_message_send",
             Self::CreateThread => "thread_create",
             Self::StartAgent => "threads_turn_start",
@@ -583,7 +583,7 @@ pub fn agent_turn_start_catalog_entry() -> AgentModelToolCatalogEntry {
     AgentModelToolCatalogEntry {
         name: AgentModelToolName::StartAgent,
         capability: AgentToolCapability::ChildStart,
-        description: "Start an Agent-turn in a permitted thread. Omit launch to inherit the current identity, executor, model and reasoning. For explicit models use threads_identity_odels_list. Set launch.useDefaultReasoning=true to use the selected model's native default without inheriting effort; do not combine it with launch.reasoning. Use task_create for task delegation and attached subagents.".to_owned(),
+        description: "Start an Agent-turn in a permitted thread. Omit launch to inherit the current identity, executor, model and reasoning. For explicit models use threads_identity_models_list. Set launch.useDefaultReasoning=true to use the selected model's native default without inheriting effort; do not combine it with launch.reasoning. Use task_create for task delegation and attached subagents.".to_owned(),
         parameters: schema::<AgentStartToolInput>(),
     }
 }
@@ -823,6 +823,26 @@ mod tests {
         );
         assert!(!names.contains(&"agent_start_options"));
         assert!(!names.contains(&"agent_start"));
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| **name == "threads_identity_models_list")
+                .count(),
+            1
+        );
+        assert_eq!(
+            serde_json::to_value(AgentModelToolName::IdentityModelsList).unwrap(),
+            json!("threads_identity_models_list")
+        );
+        assert_eq!(
+            serde_json::from_value::<AgentModelToolName>(json!("threads_identity_models_list"))
+                .unwrap(),
+            AgentModelToolName::IdentityModelsList
+        );
+        assert!(
+            serde_json::from_value::<AgentModelToolName>(json!("threads_identity_odels_list"))
+                .is_err()
+        );
     }
 
     #[test]
