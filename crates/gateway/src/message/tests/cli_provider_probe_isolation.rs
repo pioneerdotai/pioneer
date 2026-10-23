@@ -97,6 +97,14 @@ fn cli_probe_failure_reaches_execution_and_never_repeats_an_accepted_turn() {
                         TurnStatus::Blocked,
                         "execution error must remain a failure"
                     );
+                    // Blocked is persisted before terminal session cleanup.
+                    timeout(Duration::from_secs(5), async {
+                        while harness.cli_session.closes.load(Ordering::SeqCst) == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("failed execution should close its CLI session");
                 } else {
                     timeout(Duration::from_secs(2), async {
                         loop {
@@ -116,6 +124,8 @@ fn cli_probe_failure_reaches_execution_and_never_repeats_an_accepted_turn() {
                     .unwrap();
                 }
                 let starts = harness.cli_session.factory_starts.load(Ordering::SeqCst);
+                let closes = harness.cli_session.closes.load(Ordering::SeqCst);
+                assert_eq!(closes, usize::from(fail_operation), "{kind:?} cleanup");
                 harness
                     .processor
                     .mark_cli_runtime_probe_failed_for_tests(
@@ -129,7 +139,11 @@ fn cli_probe_failure_reaches_execution_and_never_repeats_an_accepted_turn() {
                     harness.cli_session.factory_starts.load(Ordering::SeqCst),
                     starts
                 );
-                assert_eq!(harness.cli_session.closes.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    harness.cli_session.closes.load(Ordering::SeqCst),
+                    closes,
+                    "probe failure must not close a session: {kind:?}"
+                );
                 let snapshot = harness
                     .processor
                     .cli_runtime_probe_snapshot(&harness.workspace_id, &harness.runtime_id)

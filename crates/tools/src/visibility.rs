@@ -363,6 +363,7 @@ mod tests {
             spec("threads_history_read"),
             spec("threads_children_list"),
             spec("threads_start_options"),
+            spec("threads_identity_odels_list"),
             spec("threads_turn_start"),
             spec("thread_create"),
             spec("thread_message_send"),
@@ -401,13 +402,14 @@ mod tests {
             "threads_history_read",
             "threads_children_list",
             "threads_start_options",
+            "threads_identity_odels_list",
             "threads_turn_start",
             "thread_create",
             "thread_message_send",
         ] {
             assert!(!snapshot.contains_name(name).await);
         }
-        assert_eq!(snapshot.all_specs().len(), 19);
+        assert_eq!(snapshot.all_specs().len(), 20);
         // Domain expansion must make the registered readers callable while
         // keeping unrelated domains closed.
         snapshot
@@ -422,6 +424,7 @@ mod tests {
             "threads_list",
             "threads_history_read",
             "threads_children_list",
+            "threads_identity_odels_list",
         ] {
             assert!(snapshot.contains_name(name).await);
         }

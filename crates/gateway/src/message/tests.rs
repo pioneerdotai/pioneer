@@ -44,6 +44,9 @@ mod task_capsule;
 #[path = "tests/task_launch_continuity.rs"]
 mod task_launch_continuity;
 
+#[path = "tests/thread_launch_choices.rs"]
+mod thread_launch_choices;
+
 #[path = "tests/reconciliation_workers.rs"]
 mod reconciliation_workers;
 
@@ -477,6 +480,54 @@ async fn ensure_test_superuser_execution_turn(
             turn_id,
         )
         .await;
+    }
+    if processor
+        .crud_store
+        .get_turn_runtime_snapshot(turn_id)
+        .await
+        .unwrap()
+        .is_none()
+    {
+        let thread = processor
+            .crud_store
+            .get_thread_model(thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let history = processor
+            .load_prepared_conversation_history_for_workspace(workspace_id, thread_id, turn_id)
+            .await
+            .expect("test runtime snapshot should retain the accepted history");
+        let now = pioneer_crud::utc_now();
+        processor
+            .crud_store
+            .upsert_turn_runtime_snapshot_with_source_epochs(
+                pioneer_crud::NewTurnRuntimeSnapshot {
+                    turn_id: turn_id.into(),
+                    thread_id: thread_id.into(),
+                    workspace_id: workspace_id.into(),
+                    mode_json: serde_json::to_string(&ThreadMode::Agent).unwrap(),
+                    model: thread.model,
+                    provider_name: thread.model_provider,
+                    reasoning_effort: thread.reasoning_effort,
+                    agent_skill_versions_json: None,
+                    hook_runtime_context_json: serde_json::to_string(
+                        &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+                    )
+                    .unwrap(),
+                    workspace_skill_policies_json: "[]".into(),
+                    input_json: "[]".into(),
+                    capabilities_json: "[]".into(),
+                    resolved_artifacts_json: "[]".into(),
+                    runtime_environment_json: "{}".into(),
+                    history_json: serde_json::to_string(&history.descriptor).unwrap(),
+                    created_at: now,
+                    updated_at: now,
+                },
+                &history.source_epochs,
+            )
+            .await
+            .unwrap();
     }
 }
 
@@ -2464,6 +2515,14 @@ async fn capability_persistence_order_impl() {
             .await
             .expect("committed MCP capability event should arrive")
             .expect("committed lane should stay open");
+        // Thread actions/model options require explicit selection; this turn
+        // admits only the readers alongside the default HTML and task tools.
+        let expected_mcp_bindings = 2
+            + crate::turn_mcp::native_tools::NativeToolFamily::Tasks
+                .definitions()
+                .len()
+            + super::thread_read_tools::thread_read_tool_specs().len()
+            + super::thread_tool_results::thread_result_tool_specs().len();
         assert!(matches!(
             committed_capabilities,
             AgentDurableEvent::TurnCapabilitiesResolved {
@@ -2475,7 +2534,7 @@ async fn capability_persistence_order_impl() {
             } if committed_turn_id == turn_id
                 && accepted.is_empty()
                 && rejected.is_empty()
-                && mcp_bindings.len() == 2 + crate::turn_mcp::native_tools::NativeToolFamily::Tasks.definitions().len() + crate::turn_mcp::native_tools::NativeToolFamily::Threads.definitions().len()
+                && mcp_bindings.len() == expected_mcp_bindings
                 && mcp_bindings.iter().all(|binding| crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(&binding.server_installation_id).is_some())
                 && mcp_bindings.iter().any(|binding| binding.raw_tool_name == "task_wait")
         ));
@@ -8591,45 +8650,36 @@ async fn exact_cli_task_launch_for_test(
 ) -> anyhow::Result<pioneer_protocol::AgentLaunchSelection> {
     sync_test_cli_runtime_identities(processor).await?;
 
-    let (_, default_launch) = super::agent_action_tools::resolve_workspace_task_launch(
+    let runtime = processor
+        .load_cli_runtime_instances()?
+        .into_iter()
+        .find(|runtime| runtime.id == runtime_id && runtime.enabled)
+        .context("test CLI runtime missing")?;
+    let runtime_kind = match runtime.kind {
+        pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex => {
+            pioneer_protocol::CLIAgentRuntimeKind::Codex
+        }
+        pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude => {
+            pioneer_protocol::CLIAgentRuntimeKind::Claude
+        }
+        pioneer_config::GatewayCliAgentRuntimeKindConfig::OpenCode => {
+            pioneer_protocol::CLIAgentRuntimeKind::OpenCode
+        }
+    };
+    let (_, resolved) = super::agent_action_tools::resolve_workspace_task_launch(
         processor,
         workspace_id,
         default_provider,
         default_model,
         None,
-        None,
+        Some(&pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime {
+            runtime_id: runtime_id.to_owned(),
+            runtime_kind,
+        }),
         "test-cli-task-launch-catalog",
     )
     .await?;
-    let (default_identity, default_profile) =
-        default_launch.context("test workspace Pioneer launch projection is missing")?;
-    let (identities, profiles) = super::agent_action_tools::current_workspace_launch_catalog(
-        processor,
-        workspace_id,
-        &default_identity,
-        &default_profile,
-        default_provider,
-        default_model,
-    )
-    .await?;
-    let profile = profiles
-        .into_iter()
-        .find(|profile| {
-            matches!(
-                &profile.backend,
-                pioneer_protocol::AgentExecutionProfileBackend::CliRuntime {
-                    runtime_instance_id,
-                } if runtime_instance_id == runtime_id
-            )
-        })
-        .with_context(|| format!("test CLI runtime `{runtime_id}` has no exact launch profile"))?;
-    let identity = identities
-        .into_iter()
-        .find(|identity| {
-            identity.source_kind == pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance
-                && profile.compatible_agent_identity_ids.contains(&identity.id)
-        })
-        .with_context(|| format!("test CLI runtime `{runtime_id}` has no exact Agent identity"))?;
+    let (identity, profile) = resolved.context("test CLI launch projection missing")?;
     Ok(pioneer_protocol::AgentLaunchSelection {
         agent: pioneer_protocol::AgentIdentitySelection::Exact {
             agent_identity_id: identity.id,
@@ -8800,8 +8850,7 @@ async fn create_task_for_test(
                     params.workspace_id.as_str(),
                     identity,
                     profile,
-                    task_model_provider.as_str(),
-                    task_model.as_str(),
+                    &admitted,
                     true,
                     child_skill_ids,
                     admitted.granted_mcp_server_capability_ids().to_vec(),

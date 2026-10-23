@@ -44,8 +44,8 @@ pub use context::{
 pub use domain::{
     ARTIFACT_DOMAIN_TOOL_NAMES, BUILTIN_TOOL_DOMAIN_MAP, BuiltinToolDomain,
     COMPUTER_USE_DOMAIN_TOOL_NAMES, MEMORY_DOMAIN_TOOL_NAMES, REQUEST_TOOLS_DOMAIN_VALUES,
-    TASK_DOMAIN_TOOL_NAMES, builtin_tool_domain_map, builtin_tool_domain_names,
-    registered_domain_tool_names,
+    TASK_DOMAIN_TOOL_NAMES, THREADS_DOMAIN_TOOL_NAMES, builtin_tool_domain_map,
+    builtin_tool_domain_names, registered_domain_tool_names,
 };
 pub use error::ToolError;
 pub use events::{

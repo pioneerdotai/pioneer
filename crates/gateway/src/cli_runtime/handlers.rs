@@ -622,6 +622,29 @@ impl MessageProcessor {
         .await;
     }
 
+    /// Cache-only view shared with identity model discovery. This never probes
+    /// or starts a CLI process; the Gateway readiness owner supplies the data.
+    pub(crate) async fn cli_launch_models_catalog(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> anyhow::Result<Vec<pioneer_protocol::RuntimeModelInfo>> {
+        let snapshot = self
+            .cli_runtime_probe_snapshot(workspace_id, runtime_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("CLI model catalog is unavailable"))?;
+        if !cli_runtime_ready_for_model_discovery(&snapshot.summary) {
+            anyhow::bail!("CLI model catalog is unavailable");
+        }
+        let models = snapshot
+            .models
+            .ok_or_else(|| anyhow::anyhow!("CLI model catalog is unavailable"))?;
+        if models.result.models.is_empty() {
+            anyhow::bail!("CLI model catalog is unavailable");
+        }
+        Ok(models.result.models)
+    }
+
     pub(super) async fn cli_runtime_list_models(
         &self,
         request_context: &RequestContext,

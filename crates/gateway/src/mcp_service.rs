@@ -3060,6 +3060,8 @@ impl TurnMcpValidatedExecution for McpService {
             );
             let native_tasks = native_family == Some(crate::turn_mcp::native_tools::NativeToolFamily::Tasks);
             let native_shared = native_tasks || native_family == Some(crate::turn_mcp::native_tools::NativeToolFamily::Threads);
+            let native_stable_call = native_shared
+                && native_family.is_some_and(|family| !family.is_thread_reader(&validated.binding.raw_tool_name));
             let bundles = if native_shared {
                 self.materialize_cli_task_tools(&validated).await?
             } else {
@@ -3139,7 +3141,7 @@ impl TurnMcpValidatedExecution for McpService {
             let mut call = tools
                 .router
                 .build_tool_call(pioneer_tools::RawToolCall {
-                    call_id: if native_tasks {
+                    call_id: if native_stable_call {
                         crate::turn_mcp::native_tools::cli_task_call_id(
                             &validated.invocation.turn_id,
                             &validated.binding.raw_tool_name,
@@ -3153,7 +3155,7 @@ impl TurnMcpValidatedExecution for McpService {
                     arguments,
                 })
                 .map_err(map_shared_tool_error)?;
-            if native_tasks && call.idempotency_key.is_none() {
+            if native_stable_call && call.idempotency_key.is_none() {
                 call.idempotency_key = Some(format!("{}:{}", call.tool_name, call.call_id));
             }
             let started = std::time::Instant::now();
@@ -3238,19 +3240,17 @@ impl McpService {
         let bundles = match crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(
             &validated.binding.server_installation_id,
         ) {
-            Some(crate::turn_mcp::native_tools::NativeToolFamily::Threads) => {
+            Some(family) if family.is_thread_reader(&validated.binding.raw_tool_name) => {
                 crate::turn_mcp::native_tools::materialize_thread_tools(processor, context)
             }
-            Some(crate::turn_mcp::native_tools::NativeToolFamily::Tasks) => {
-                crate::turn_mcp::native_tools::materialize_task_tools(processor, context)
-                    .await
-                    .map_err(|error| {
-                        TurnMcpInvocationError::new(
-                            TurnMcpInvocationErrorCode::PermissionDenied,
-                            error,
-                        )
-                    })?
-            }
+            Some(
+                crate::turn_mcp::native_tools::NativeToolFamily::Tasks
+                | crate::turn_mcp::native_tools::NativeToolFamily::Threads,
+            ) => crate::turn_mcp::native_tools::materialize_task_tools(processor, context)
+                .await
+                .map_err(|error| {
+                    TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::PermissionDenied, error)
+                })?,
             _ => {
                 return Err(TurnMcpInvocationError::new(
                     TurnMcpInvocationErrorCode::ToolUnbound,

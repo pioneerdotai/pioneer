@@ -1351,6 +1351,41 @@ impl ExecutionAuthorizationContext {
         self.grant_manifest.allows_action(action)
     }
 
+    pub(crate) fn child_launch_executor_allowed(&self, executor: &str, cli: bool) -> bool {
+        let Ok((kind, role)) = self.registered_role_identity() else {
+            return false;
+        };
+        let policy = AuthorizationService::new();
+        if cli {
+            self.grants_action(ResourceAction::CliRuntimeUse)
+                && policy.cli_runtime_allowed(kind, role.as_ref(), executor)
+        } else {
+            self.grants_action(ResourceAction::ProviderUse)
+                && policy.provider_allowed(kind, role.as_ref(), executor)
+        }
+    }
+
+    /// A new child may select another model within its admitted actions and
+    /// registered role. The parent's exact execution grant remains immutable.
+    pub(crate) fn child_launch_model_allowed(
+        &self,
+        provider: &str,
+        model: &str,
+        cli: bool,
+    ) -> bool {
+        let Ok((kind, role)) = self.registered_role_identity() else {
+            return false;
+        };
+        let policy = AuthorizationService::new();
+        if cli {
+            self.grants_action(ResourceAction::CliRuntimeUse)
+                && policy.cli_model_allowed(kind, role.as_ref(), provider, model)
+        } else {
+            self.grants_action(ResourceAction::ProviderUse)
+                && policy.provider_model_allowed(kind, role.as_ref(), provider, model)
+        }
+    }
+
     pub(crate) const fn human_interaction_budget(&self) -> HumanInteractionBudget {
         self.human_interaction_budget
     }
@@ -3583,6 +3618,10 @@ impl RuntimeDraftMaterialization {
 }
 
 impl ExecutionAuthorizationAdmission {
+    pub(crate) fn permission_profile_cap(&self) -> &TurnPermissionProfileCap {
+        &self.permission_profile_cap
+    }
+
     pub(crate) async fn project_root_action(
         &self,
         store: &CrudStore,

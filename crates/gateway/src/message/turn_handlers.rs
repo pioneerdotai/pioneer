@@ -2402,8 +2402,7 @@ impl MessageProcessor {
                             thread.workspace_id.as_str(),
                             identity,
                             profile,
-                            task_model_provider.as_str(),
-                            outcome.materialization.thread.model.as_str(),
+                            &task_execution_context,
                             true,
                             child_skill_ids,
                             task_execution_context
@@ -2935,6 +2934,7 @@ impl MessageProcessor {
                     security_params.agent_launch.as_ref(),
                     security_params.execution_backend.as_ref(),
                     None,
+                    effective_reasoning_effort.as_deref(),
                 )
                 .await
                 .map_err(|error| {
@@ -3910,27 +3910,40 @@ impl MessageProcessor {
         if mode == pioneer_protocol::ThreadMode::Message {
             return Ok(definitions);
         }
-        for spec in NativeToolFamily::Threads.definitions() {
-            let allowed = match authority {
-                TurnExecutionAuthority::Fresh(admission) => {
-                    admission
-                        .project_root_action(
-                            self.crud_store.as_ref(),
-                            crate::authorization::ResourceAction::ThreadRead,
-                        )
-                        .await?
-                }
-                TurnExecutionAuthority::Durable { context, .. } => {
-                    context.grants_action(crate::authorization::ResourceAction::ThreadRead)
-                }
-            };
-            if allowed {
-                definitions.push((NativeToolFamily::Threads, spec));
-            }
-        }
         let binding = self.agent_action_binding(&params.turn_id).await;
-        for spec in NativeToolFamily::Tasks.definitions() {
-            let action = NativeToolFamily::Tasks.action(&spec.spec.name)?;
+        let permission_cap = match authority {
+            TurnExecutionAuthority::Fresh(admission) => admission.permission_profile_cap(),
+            TurnExecutionAuthority::Durable { context, .. } => context.permission_profile_cap(),
+        };
+        let permission = pioneer_protocol::task_permission_cap_snapshot(permission_cap);
+
+        for (family, spec) in [NativeToolFamily::Tasks, NativeToolFamily::Threads]
+            .into_iter()
+            .flat_map(|family| {
+                family
+                    .definitions()
+                    .into_iter()
+                    .map(move |spec| (family, spec))
+            })
+        {
+            let thread_reader = family.is_thread_reader(&spec.spec.name);
+            // Thread actions and model options require explicit tool selection.
+            // Readers use their separate ThreadRead grant. CLI catalogs freeze
+            // at admission; request_tools cannot extend them afterwards.
+            if family == NativeToolFamily::Threads
+                && !thread_reader
+                && (!permission
+                    .effective_policy
+                    .allowed_tools
+                    .contains(&spec.spec.name)
+                    || permission
+                        .effective_policy
+                        .denied_tools
+                        .contains(&spec.spec.name))
+            {
+                continue;
+            }
+            let action = family.action(&spec.spec.name)?;
             let allowed = match authority {
                 TurnExecutionAuthority::Fresh(admission) => {
                     admission
@@ -3943,10 +3956,23 @@ impl MessageProcessor {
                 continue;
             }
             if let Some(binding) = binding.as_ref() {
-                let visible = if spec.spec.name == "threads_start_options" {
+                let visible = if thread_reader {
+                    true
+                } else if matches!(
+                    spec.spec.name.as_str(),
+                    "threads_start_options" | "threads_identity_odels_list" | "threads_turn_start"
+                ) {
                     binding
                         .capabilities
                         .contains(&pioneer_protocol::AgentToolCapability::ChildStart)
+                } else if spec.spec.name == "thread_create" {
+                    binding
+                        .capabilities
+                        .contains(&pioneer_protocol::AgentToolCapability::ThreadCreate)
+                } else if spec.spec.name == "thread_message_send" {
+                    binding
+                        .capabilities
+                        .contains(&pioneer_protocol::AgentToolCapability::MessageCreate)
                 } else {
                     crate::task_tools::agent_bound_task_tool_visible(
                         &spec.spec.name,
@@ -3957,7 +3983,7 @@ impl MessageProcessor {
                     continue;
                 }
             }
-            definitions.push((NativeToolFamily::Tasks, spec));
+            definitions.push((family, spec));
         }
         Ok(definitions)
     }
@@ -3976,8 +4002,12 @@ impl MessageProcessor {
         // before freezing it. Registration does not widen Agent capabilities.
         if let Some(projection) = plan.mcp_projection.as_mut()
             && projection.tools.iter().any(|tool| {
-                NativeToolFamily::from_server_id(&tool.server_installation_id)
-                    == Some(NativeToolFamily::Tasks)
+                NativeToolFamily::from_server_id(&tool.server_installation_id).is_some_and(
+                    |family| {
+                        matches!(family, NativeToolFamily::Tasks | NativeToolFamily::Threads)
+                            && !family.is_thread_reader(&tool.raw_tool_name)
+                    },
+                )
             })
         {
             let permitted = crate::turn_mcp::native_tools::materialize_task_tools(
@@ -3991,9 +4021,12 @@ impl MessageProcessor {
             .collect::<std::collections::HashSet<_>>();
             let previous_hash = projection.manifest_hash.clone();
             projection.tools.retain(|tool| {
-                NativeToolFamily::from_server_id(&tool.server_installation_id)
-                    != Some(NativeToolFamily::Tasks)
-                    || permitted.contains(&tool.raw_tool_name)
+                !NativeToolFamily::from_server_id(&tool.server_installation_id).is_some_and(
+                    |family| {
+                        matches!(family, NativeToolFamily::Tasks | NativeToolFamily::Threads)
+                            && !family.is_thread_reader(&tool.raw_tool_name)
+                    },
+                ) || permitted.contains(&tool.raw_tool_name)
             });
             let (max_tools, max_total_schema_bytes) = self.mcp_service.projection_limit_values();
             let mut limits = crate::turn_mcp::McpProjectionLimits {
@@ -6088,6 +6121,7 @@ impl MessageProcessor {
                         security_params.agent_launch.as_ref(),
                         security_params.execution_backend.as_ref(),
                         None,
+                        effective_cli_runtime_effort.as_deref(),
                     )
                     .await
                     {
@@ -12157,7 +12191,7 @@ fn normalized_reasoning_effort_for_comparison(value: &str) -> String {
     reasoning_effort_comparison_key(value)
 }
 
-fn provider_model_from_runtime_model_for_reasoning_lookup(
+pub(super) fn provider_model_from_runtime_model_for_reasoning_lookup(
     provider_key: &str,
     model: RuntimeModelInfo,
 ) -> ProviderModelInfo {
