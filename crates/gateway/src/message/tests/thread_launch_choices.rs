@@ -403,7 +403,7 @@ async fn identity_models_catalog_exposes_model_reasoning_without_secrets_and_rej
     let identity = binding.adapter.lock().await.persistence_facts().identity.id;
     let result = call(
         &tools,
-        "threads_identity_odels_list",
+        "threads_identity_models_list",
         "models",
         json!({"identityId":identity}),
     )

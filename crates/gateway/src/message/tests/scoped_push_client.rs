@@ -632,7 +632,7 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
                     launch:pioneer_protocol::AgentToolLaunchSelection {
                         identity:pioneer_protocol::AgentToolIdentityChoice::InheritParent,
                         profile:pioneer_protocol::AgentToolProfileChoice::InheritParent,
-                        reasoning:None,permission_profile:None,skill_ids:vec![],mcp_server_ids:vec![],
+                        reasoning:None,use_default_reasoning:false,permission_profile:None,skill_ids:vec![],mcp_server_ids:vec![],
                     },
                 }).unwrap(),
             ).await;

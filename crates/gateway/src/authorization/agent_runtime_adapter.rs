@@ -228,7 +228,7 @@ impl BoundAgentActionAdapter {
         self.root.options_generation_fingerprint = start_options.generation_fingerprint.clone();
         self.start_options = start_options;
         let mut safe = self.start_options.clone().safe_tool_projection();
-        // Detailed models belong to threads_identity_odels_list. Keep only
+        // Detailed models belong to threads_identity_models_list. Keep only
         // legacy default-profile options here; the immutable internal catalog
         // still validates every explicit model selection.
         safe.profiles.retain(|profile| {

@@ -153,7 +153,7 @@ fn select_profile(
                     .ok_or(ExecutionMaterializationError::MissingProfile)?;
                 if compatible.next().is_some() {
                     return Err(ExecutionMaterializationError::InvalidLaunchSelection(
-                        "identity requires an explicit model; inspect threads_identity_odels_list",
+                        "identity requires an explicit model; inspect threads_identity_models_list",
                     ));
                 }
                 profile.clone()

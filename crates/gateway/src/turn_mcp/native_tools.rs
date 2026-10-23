@@ -110,7 +110,7 @@ impl NativeToolFamily {
         match self {
             Self::Html => Ok(ResourceAction::McpUse),
             Self::Threads
-                if self.is_thread_reader(name) || name == "threads_identity_odels_list" =>
+                if self.is_thread_reader(name) || name == "threads_identity_models_list" =>
             {
                 Ok(ResourceAction::ThreadRead)
             }
