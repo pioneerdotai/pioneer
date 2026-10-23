@@ -13,6 +13,7 @@ use pioneer_client::threads::tree::{self as client_thread_tree, SidebarTreeNodeK
 use pioneer_client::workspaces::{ThreadAgentsDocSummary, ThreadFolder};
 use std::any::Any;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 const TREE_ROW_HEIGHT_PX: f32 = 32.0;
@@ -26,8 +27,23 @@ const SIDEBAR_MENU_ITEM_OPACITY: f32 = 0.8;
 #[derive(Clone)]
 struct SidebarThreadRow {
     thread_id: String,
-    title: String,
+    // Resolve the localized fallback while rendering, so locale changes do not
+    // require a new directory publication.
+    title: Option<String>,
     unread_count: u64,
+}
+
+/// One workspace's immutable presentation data. Replaced on publication/owner
+/// changes; render callbacks share handles instead of copying whole maps.
+#[derive(Default)]
+pub(super) struct SidebarPreparation {
+    input: Option<Arc<pioneer_client::workspaces::directory::ThreadTreePublication>>,
+    workspace_id: Option<String>,
+    can_manage_workspace: bool,
+    agents_scope: Option<ThreadAgentsDocEditorScope>,
+    rows: Arc<HashMap<String, SidebarThreadRow>>,
+    folders: Arc<HashMap<String, ThreadFolder>>,
+    summaries: Arc<HashMap<ThreadAgentsDocSummaryKey, ThreadAgentsDocSummary>>,
 }
 
 // Stock Spinner animation invalidates only this retained view. Virtualized
@@ -70,8 +86,64 @@ actions!(
 actions!(sidebar_thread_menu, [SidebarThreadRename]);
 
 impl ThreadSidebarView {
-    pub(super) fn rebuild_sidebar_tree_state(&mut self, cx: &mut Context<Self>) {
-        cx.notify();
+    pub(super) fn refresh_sidebar_tree_state(
+        &mut self,
+        force_structure: bool,
+        selection_changed: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let workspace_changed =
+            self.prepared_sidebar.workspace_id.as_deref() != self.active_workspace_id();
+        let input_changed = workspace_changed
+            || match (&self.prepared_sidebar.input, &self.input) {
+                (Some(before), Some(after)) => !Arc::ptr_eq(before, after),
+                (None, None) => false,
+                _ => true,
+            };
+        let can_manage_workspace = self
+            .principal_presentation_capabilities()
+            .can_manage_workspace;
+        let structure_changed = force_structure
+            || workspace_changed
+            || self.prepared_sidebar.can_manage_workspace != can_manage_workspace
+            || self.prepared_sidebar.agents_scope != self.active_agents_doc_editor_scope
+            || (input_changed
+                && sidebar_tree_source_changed(
+                    self.prepared_sidebar.input.as_deref(),
+                    self.input.as_deref(),
+                    can_manage_workspace,
+                ));
+        if input_changed {
+            self.prepare_sidebar_rows();
+            self.refresh_task_activity_indicators(cx);
+        }
+        self.prepared_sidebar.input = self.input.clone();
+        self.prepared_sidebar.workspace_id = self.active_workspace_id().map(str::to_owned);
+        self.prepared_sidebar.can_manage_workspace = can_manage_workspace;
+        self.prepared_sidebar.agents_scope = self.active_agents_doc_editor_scope.clone();
+        if structure_changed {
+            let model = self.build_sidebar_tree_model();
+            self.visible_node_count = model.visible_node_ids.len();
+            let mut structure = Vec::new();
+            tree_structure(&model.items, 0, &mut structure);
+            if force_structure || structure != self.tree_structure {
+                self.tree_structure = structure;
+                self.thread_tree_state.update(cx, |state, cx| {
+                    // set_items clears selection/context targeting. Metadata-only
+                    // publications must keep the retained tree untouched.
+                    state.set_items(model.items, cx);
+                });
+                self.sync_sidebar_tree_selection(cx);
+            } else if selection_changed {
+                self.sync_sidebar_tree_selection(cx);
+            }
+        } else if selection_changed {
+            self.sync_sidebar_tree_selection(cx);
+        }
+        input_changed || structure_changed
+    }
+
+    fn refresh_task_activity_indicators(&mut self, cx: &mut Context<Self>) {
         let mut active_nodes = std::collections::HashSet::new();
         if let Some(input) = &self.input {
             active_nodes.extend(
@@ -89,14 +161,16 @@ impl ThreadSidebarView {
                     .map(|id| client_thread_tree::sidebar_folder_node_id(id)),
             );
         }
-        self.task_activity_indicators
-            .retain(|id, _| active_nodes.contains(id));
+        let indicators = Rc::make_mut(&mut self.task_activity_indicators);
+        indicators.retain(|id, _| active_nodes.contains(id));
         for id in active_nodes {
-            self.task_activity_indicators
+            indicators
                 .entry(id)
                 .or_insert_with(|| cx.new(|_| TaskActivityIndicator));
         }
-        let model = self.build_sidebar_tree_model();
+    }
+
+    fn sync_sidebar_tree_selection(&mut self, cx: &mut Context<Self>) {
         let selected_ix = if matches!(
             self.main_content_view(),
             MainContentView::Threads | MainContentView::AgentsDoc
@@ -110,30 +184,31 @@ impl ThreadSidebarView {
                     .map(thread_node_key)
                     .or_else(|| self.selected_thread_tree_node_id().map(str::to_owned))
             };
-            selected_node_id.and_then(|node_id| {
-                model
-                    .visible_node_ids
-                    .iter()
-                    .position(|candidate| candidate == &node_id)
-            })
+            selected_node_id
+                .and_then(|node_id| self.thread_tree_state.read(cx).index_of(&node_id.into()))
         } else {
             None
         };
-
-        let mut structure = Vec::new();
-        tree_structure(&model.items, 0, &mut structure);
-        let structure_changed = structure != self.tree_structure;
-        self.tree_structure = structure;
         self.thread_tree_state.update(cx, |state, cx| {
-            // Stock set_items clears selection/context targeting, so metadata-only
-            // publications must keep the retained tree untouched.
-            if structure_changed {
-                state.set_items(model.items, cx);
-            }
-            if structure_changed || state.selected_index() != selected_ix {
+            if state.selected_index() != selected_ix {
                 state.set_selected_index(selected_ix, cx);
             }
         });
+    }
+
+    pub(super) fn update_visible_node_count(&mut self) {
+        let mut collapsed_depth = None;
+        self.visible_node_count = self
+            .tree_structure
+            .iter()
+            .filter(|(_, depth, expanded, _)| {
+                if collapsed_depth.is_some_and(|hidden_depth| *depth > hidden_depth) {
+                    return false;
+                }
+                collapsed_depth = (!expanded).then_some(*depth);
+                true
+            })
+            .count();
     }
 
     pub(crate) fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -144,32 +219,11 @@ impl ThreadSidebarView {
         let scoped_thread_id = self.thread_scope_capabilities_thread_id.clone();
         let scoped_thread_capabilities = self.thread_scope_capabilities;
         let active_workspace_id = self.active_workspace_id().map(str::to_owned);
-        let rows_by_thread_id = self.sidebar_rows_by_thread_id();
+        let rows_by_thread_id = self.prepared_sidebar.rows.clone();
         let task_activity_indicators = self.task_activity_indicators.clone();
         let publication = self.input.clone();
-        let folders_by_id: Arc<HashMap<String, ThreadFolder>> = Arc::new(
-            active_workspace_id
-                .as_deref()
-                .map(|workspace_id| {
-                    self.thread_folders_for_workspace(workspace_id)
-                        .into_iter()
-                        .map(|folder| (folder.id.clone(), folder.clone()))
-                        .collect()
-                })
-                .unwrap_or_default(),
-        );
-        let agents_doc_summaries: HashMap<ThreadAgentsDocSummaryKey, ThreadAgentsDocSummary> =
-            active_workspace_id
-                .as_deref()
-                .map(|workspace_id| {
-                    agents_doc_scope::thread_agents_doc_summaries_for_workspace(
-                        &self.agents_doc_summaries(),
-                        workspace_id,
-                    )
-                    .map(|(key, summary)| (key.clone(), summary.clone()))
-                    .collect()
-                })
-                .unwrap_or_default();
+        let folders_by_id = self.prepared_sidebar.folders.clone();
+        let agents_doc_summaries = self.prepared_sidebar.summaries.clone();
         let root_agents_doc_summary = agents_doc_summaries.get(&ThreadAgentsDocSummaryKey::Root);
         let root_agents_doc_active =
             agents_doc_scope::agents_doc_has_active_explicit_badge(root_agents_doc_summary);
@@ -177,8 +231,7 @@ impl ThreadSidebarView {
             agents_doc_scope::agents_doc_edit_action(root_agents_doc_summary);
         let root_area_agents_doc_active = root_agents_doc_active;
         let root_area_agents_doc_edit_menu_label = root_agents_doc_edit_menu_label;
-        let root_context_area_top_px =
-            self.build_sidebar_tree_model().visible_node_ids.len() as f32 * TREE_ROW_HEIGHT_PX;
+        let root_context_area_top_px = self.visible_node_count as f32 * TREE_ROW_HEIGHT_PX;
         let tree_state = self.thread_tree_state().clone();
         let is_new_thread_active = self.main_content_view() == MainContentView::Threads
             && match (
@@ -290,16 +343,19 @@ impl ThreadSidebarView {
                         .cloned()
                         .unwrap_or_else(|| SidebarThreadRow {
                             thread_id: thread_id.to_owned(),
-                            title: thread_id.to_owned(),
+                            title: Some(thread_id.to_owned()),
                             unread_count: 0,
                         });
+                    let title = row
+                        .title
+                        .unwrap_or_else(|| t!("sidebar.thread.untitled").to_string());
                     let can_manage_thread = can_manage_all_threads
                         || (scoped_thread_id.as_deref() == Some(row.thread_id.as_str())
                             && scoped_thread_capabilities.can_manage_thread);
                     let thread_id_for_click = row.thread_id.clone();
                     let thread_id_for_context_menu_rename = row.thread_id.clone();
                     let thread_payload = SidebarTreeDragPayload {
-                        label: row.title.clone(),
+                        label: title.clone(),
                         item: SidebarTreeDragItem::Thread {
                             thread_id: row.thread_id.clone(),
                         },
@@ -392,7 +448,7 @@ impl ThreadSidebarView {
                                                         .font_normal()
                                                         .opacity(SIDEBAR_MENU_ITEM_OPACITY)
                                                         .when(selected, |this| this.opacity(1.0))
-                                                        .child(row.title),
+                                                        .child(title),
                                                 )
                                                 .when(
                                                     should_render_thread_unread_badge(
@@ -860,41 +916,40 @@ impl ThreadSidebarView {
             .into_any_element()
     }
 
-    fn sidebar_rows_by_thread_id(&self) -> HashMap<String, SidebarThreadRow> {
-        let Some(workspace_id) = self.active_workspace_id() else {
-            return HashMap::new();
+    fn prepare_sidebar_rows(&mut self) {
+        let Some(input) = &self.input else {
+            self.prepared_sidebar.rows = Arc::default();
+            self.prepared_sidebar.folders = Arc::default();
+            self.prepared_sidebar.summaries = Arc::default();
+            return;
         };
-
-        self.sorted_thread_ids_for_workspace(workspace_id)
-            .into_iter()
-            .map(|thread_id| {
-                let title = self
-                    .input
-                    .as_ref()
-                    .and_then(|publication| publication.snapshot().threads_by_id.get(&thread_id))
-                    .and_then(thread_display_title)
-                    .unwrap_or_else(|| t!("sidebar.thread.untitled").to_string());
-
-                let unread_count = self
-                    .input
-                    .as_ref()
-                    .and_then(|p| {
-                        p.snapshot()
-                            .unread
-                            .iter()
-                            .find(|entry| entry.thread_id == thread_id)
-                    })
-                    .map_or(0, |entry| entry.unread_count);
-                (
-                    thread_id.clone(),
-                    SidebarThreadRow {
-                        thread_id,
-                        title,
-                        unread_count,
-                    },
-                )
-            })
-            .collect()
+        let snapshot = input.snapshot();
+        let unread_by_thread_id = snapshot
+            .unread
+            .iter()
+            .map(|entry| (entry.thread_id.as_str(), entry.unread_count))
+            .collect::<HashMap<_, _>>();
+        self.prepared_sidebar.rows = Arc::new(
+            snapshot
+                .threads_by_id
+                .iter()
+                .map(|(id, thread)| {
+                    (
+                        id.clone(),
+                        SidebarThreadRow {
+                            thread_id: id.clone(),
+                            title: thread_display_title(thread),
+                            unread_count: unread_by_thread_id
+                                .get(id.as_str())
+                                .copied()
+                                .unwrap_or(0),
+                        },
+                    )
+                })
+                .collect(),
+        );
+        self.prepared_sidebar.folders = Arc::new(snapshot.folders_by_id.clone());
+        self.prepared_sidebar.summaries = Arc::new(self.agents_doc_summaries());
     }
 
     fn build_sidebar_tree_model(&self) -> SidebarTreeModel {
@@ -904,17 +959,25 @@ impl ThreadSidebarView {
                 visible_node_ids: Vec::new(),
             };
         };
-
         let can_manage_workspace = self
             .principal_presentation_capabilities()
             .can_manage_workspace;
-        let summaries = self.agents_doc_summaries();
+        let summaries = &self.prepared_sidebar.summaries;
         let client_model = client_thread_tree::sidebar_tree_model_from_workspace_data(
             client_thread_tree::SidebarTreeSourceData {
                 workspace_id,
                 folders: self.thread_folders_for_workspace(workspace_id),
                 placements: self.thread_placements_for_workspace(workspace_id),
-                sorted_thread_ids: self.sorted_thread_ids_for_workspace(workspace_id),
+                // The authoritative projection already groups threads in their
+                // display order. Order between different folders is irrelevant.
+                sorted_thread_ids: self
+                    .input
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|input| input.snapshot().thread_ids_by_folder_id.values())
+                    .flatten()
+                    .cloned()
+                    .collect(),
                 agents_doc_summaries: if can_manage_workspace {
                     summaries.values().collect()
                 } else {
@@ -940,6 +1003,34 @@ impl ThreadSidebarView {
             visible_node_ids: client_model.visible_node_ids,
         }
     }
+}
+
+fn sidebar_tree_source_changed(
+    before: Option<&pioneer_client::workspaces::directory::ThreadTreePublication>,
+    after: Option<&pioneer_client::workspaces::directory::ThreadTreePublication>,
+    can_manage_workspace: bool,
+) -> bool {
+    let (Some(before), Some(after)) = (before, after) else {
+        return before.is_some() != after.is_some();
+    };
+    let before = before.snapshot();
+    let after = after.snapshot();
+    before.workspace_id != after.workspace_id
+        || before.thread_ids_by_folder_id != after.thread_ids_by_folder_id
+        || before.folders_by_id.len() != after.folders_by_id.len()
+        || before.folders_by_id.iter().any(|(id, folder)| {
+            after.folders_by_id.get(id).is_none_or(|next| {
+                folder.name != next.name || folder.parent_folder_id != next.parent_folder_id
+            })
+        })
+        || before.placements_by_thread_id != after.placements_by_thread_id
+        || (can_manage_workspace
+            && (before.agents_doc_summaries_by_folder_key.len()
+                != after.agents_doc_summaries_by_folder_key.len()
+                || before
+                    .agents_doc_summaries_by_folder_key
+                    .keys()
+                    .any(|key| !after.agents_doc_summaries_by_folder_key.contains_key(key))))
 }
 
 fn should_render_thread_unread_badge(unread_count: u64, selected: bool) -> bool {
@@ -1095,5 +1186,106 @@ fn tree_structure(items: &[TreeItem], depth: usize, output: &mut Vec<(String, us
             item.is_disabled(),
         ));
         tree_structure(&item.children, depth + 1, output);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ThreadSidebarView, thread_node_key};
+    use gpui_kit::{AppContext, TestAppContext};
+    use std::sync::Arc;
+
+    #[gpui_kit::test]
+    fn prepared_rows_follow_unread_metadata_and_owner_without_resetting_selection(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let core = Arc::new(pioneer_client::core::ClientCore::new());
+        let thread = |id: &str, name: &str| {
+            serde_json::from_value(serde_json::json!({
+                "id":id,"workspace_id":"w","name":name,"preview":"","mode":"Chat",
+                "model":"m","model_provider":"p","created_at":1,"updated_at":1,
+                "status":"Idle","turns":[]
+            }))
+            .unwrap()
+        };
+        core.upsert_thread(thread("a", "Alpha"));
+        core.upsert_thread(thread("b", "Beta"));
+        core.open_workspace_thread("w".into(), Some("a".into()), None);
+        let config = crate::context_tests::config(core.clone(), Default::default());
+        let sidebar = cx.new(|cx| ThreadSidebarView::new(config, cx));
+        let tree = sidebar.read_with(cx, |sidebar, _| sidebar.thread_tree_state.clone());
+        let selected = tree.read_with(cx, |tree, _| tree.selected_item().unwrap().id.clone());
+        let rows = sidebar.read_with(cx, |sidebar, _| sidebar.prepared_sidebar.rows.clone());
+        for _ in 0..3 {
+            sidebar.update(cx, |sidebar, cx| sidebar.sync(cx));
+            assert!(sidebar.read_with(cx, |sidebar, _| Arc::ptr_eq(
+                &rows,
+                &sidebar.prepared_sidebar.rows
+            )));
+        }
+        let cursor = serde_json::from_value(serde_json::json!({
+            "sort_key":"1","through_turn_id":"turn"
+        }))
+        .unwrap();
+        for (id, unread) in [("a", 9), ("b", 4)] {
+            core.apply_directory_read("w", id, &cursor, unread);
+        }
+        sidebar.update(cx, |sidebar, cx| sidebar.sync(cx));
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(sidebar.prepared_sidebar.rows["a"].unread_count, 9);
+            assert_eq!(sidebar.prepared_sidebar.rows["b"].unread_count, 4);
+            assert_eq!(sidebar.visible_node_count, 3);
+        });
+        core.apply_directory_read("w", "a", &cursor, 0);
+        core.upsert_thread(thread("a", "Renamed"));
+        sidebar.update(cx, |sidebar, cx| sidebar.sync(cx));
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(sidebar.prepared_sidebar.rows["a"].unread_count, 0);
+            assert_eq!(sidebar.prepared_sidebar.rows["b"].unread_count, 4);
+            assert_eq!(
+                sidebar.prepared_sidebar.rows["a"].title.as_deref(),
+                Some("Renamed")
+            );
+        });
+        assert_eq!(
+            tree.read_with(cx, |tree, _| tree.selected_item().unwrap().id.clone()),
+            selected
+        );
+        drop(rows);
+        let old_rows = sidebar.read_with(cx, |sidebar, _| {
+            Arc::downgrade(&sidebar.prepared_sidebar.rows)
+        });
+        // Replace the gateway owner while reusing the workspace identifier.
+        core.begin_authorization_epoch(Some(("replacement".into(), 1)));
+        core.upsert_thread(thread("c", "New owner"));
+        core.open_workspace_thread("w".into(), Some("c".into()), None);
+        sidebar.update(cx, |sidebar, cx| sidebar.sync(cx));
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(sidebar.prepared_sidebar.rows.len(), 1);
+            assert_eq!(
+                sidebar.prepared_sidebar.rows["c"].title.as_deref(),
+                Some("New owner")
+            );
+            assert_eq!(sidebar.visible_node_count, 2);
+        });
+        assert!(old_rows.upgrade().is_none());
+        assert!(tree.read_with(cx, |tree, _| {
+            tree.index_of(&thread_node_key("a").into()).is_none()
+        }));
+        // Clearing only the active thread keeps the workspace tree visible.
+        core.navigate(
+            pioneer_client::navigation::NavigationIntent::SelectWorkspace { workspace_id: None },
+            None,
+        );
+        sidebar.update(cx, |sidebar, cx| sidebar.sync(cx));
+        assert!(tree.read_with(cx, |tree, _| tree.entry(0).is_none()));
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.close(cx);
+            assert!(sidebar.prepared_sidebar.rows.is_empty());
+            assert!(sidebar.prepared_sidebar.folders.is_empty());
+            assert!(sidebar.prepared_sidebar.summaries.is_empty());
+            assert_eq!(sidebar.visible_node_count, 0);
+        });
     }
 }
