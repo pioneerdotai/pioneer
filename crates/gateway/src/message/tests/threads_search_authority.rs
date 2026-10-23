@@ -273,7 +273,7 @@ async fn admit(
         turn_id: turn_id.into(),
     };
     let prepared = crate::message::agent_action_tools::prepare_root_agent_execution_admission(
-        processor, &context, &thread, &envelope, None, None, None, None,
+        processor, &context, &thread, &envelope, None, None, None, None, None,
     )
     .await
     .unwrap();

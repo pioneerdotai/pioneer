@@ -284,7 +284,7 @@ async fn invoke_threads_facade(
         )
         .await
         .unwrap();
-    assert!(listed["error"].is_null(), "{listed}");
+    assert!(JsonValue::is_null(&listed["error"]), "{listed}");
     let turn = coordinator
         .reserve_turn(
             &context.bound_grant.grant_ref(),
@@ -305,7 +305,7 @@ async fn invoke_threads_facade(
         .unwrap();
     context.activation_generation = Some(turn.activation_generation);
     let response = facade.handle_message(&context, json!({"jsonrpc":"2.0","id":call_id,"method":"tools/call","params":{"name":name,"arguments":arguments}})).await.unwrap();
-    if !response["error"].is_null() {
+    if !JsonValue::is_null(&response["error"]) {
         anyhow::bail!("{response}");
     }
     let result = &response["result"];
