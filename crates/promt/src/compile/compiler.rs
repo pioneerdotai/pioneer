@@ -705,6 +705,7 @@ pub fn compile_prompt(input: PromptCompileInput) -> anyhow::Result<CompiledPromp
 mod tests {
     use super::{DEFAULT_DYNAMIC_PROMPT_SECTIONS_MAX_COUNT, compile_prompt};
     use crate::bundle::{PromptCompileInput, PromptLimits};
+    use crate::content;
     use crate::diagnostics::PromptDiagnosticCode;
     use crate::profile::PromptProfile;
     use crate::section::{
