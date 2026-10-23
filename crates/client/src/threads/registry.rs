@@ -519,6 +519,54 @@ impl ThreadRegistry {
         true
     }
 
+    /// Scoped compact metadata is part of the caller's atomic workspace batch.
+    /// Never require/create a detailed store for a sidebar-only identity.
+    pub(crate) fn apply_push_summaries(
+        &mut self,
+        threads: &[pioneer_protocol::ThreadMetadataPatch],
+    ) -> Vec<ClientPublicationDraft> {
+        let mut drafts = Vec::new();
+        for patch in threads {
+            let summary = &patch.thread;
+            if self
+                .stores
+                .get(&summary.id)
+                .and_then(|store| store.coordinator.thread())
+                .is_some_and(|previous| previous.updated_at > summary.updated_at)
+            {
+                continue;
+            }
+            if self
+                .directory
+                .threads
+                .get(&summary.id)
+                .is_some_and(|previous| previous.updated_at > summary.updated_at)
+            {
+                continue;
+            }
+            self.directory.upsert_thread_summary(summary.clone());
+            let Some(store) = self.stores.get_mut(&summary.id) else {
+                continue;
+            };
+            if store.coordinator.workspace_id != summary.workspace_id {
+                continue;
+            }
+            let mut thread = summary.clone();
+            let Some(previous) = store.coordinator.thread() else {
+                continue; // A compact summary cannot complete Thread/get bootstrap.
+            };
+            if patch.preview_truncated
+                && previous.preview.len() > thread.preview.len()
+                && previous.preview.starts_with(&thread.preview)
+            {
+                thread.preview = previous.preview.clone();
+            }
+            store.set_snapshot(thread);
+            drafts.extend(self.publish(&summary.id));
+        }
+        drafts
+    }
+
     fn publish(&mut self, id: &str) -> Vec<ClientPublicationDraft> {
         let Some(store) = self.stores.get_mut(id) else {
             return Vec::new();

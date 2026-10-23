@@ -473,6 +473,8 @@ impl ClientCore {
         auth.session.refresh_generation = metadata.refresh_generation;
         auth.session.refresh_expires_at_unix = metadata.refresh_expires_at_unix;
         self.apply_current_auth(&mut owner, &auth);
+        drop(owner); // Never acquire domain owners under the identity lock.
+        self.renew_workspace_push();
         Ok(())
     }
 

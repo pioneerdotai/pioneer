@@ -1049,6 +1049,18 @@ impl MessageProcessor {
                 }
                 return;
             }
+            let sidebar_visible = outcome.materialization.thread.sidebar_visibility
+                == pioneer_protocol::ThreadSidebarVisibility::Visible;
+            if sidebar_visible {
+                self.dirty_push(
+                    &outcome.completed_notification.workspace_id,
+                    Some(&outcome.completed_notification.thread_id),
+                    None,
+                    None,
+                    false,
+                    None,
+                );
+            }
             log_message_turn_outcome(
                 &params,
                 input_metrics,
@@ -1105,8 +1117,13 @@ impl MessageProcessor {
                 outcome.completed_notification.turn.id.as_str(),
             )
             .await;
-            self.notify_thread_tree_changed(outcome.completed_notification.workspace_id.clone())
+            if sidebar_visible {
+                self.notify_thread_unread_legacy(
+                    &outcome.completed_notification.workspace_id,
+                    &outcome.completed_notification.thread_id,
+                )
                 .await;
+            }
         })
     }
 }

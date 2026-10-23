@@ -580,6 +580,7 @@
       "type": "string",
       "enum": [
         "cancel",
+        "finish",
         "resume",
         "detach",
         "pause",

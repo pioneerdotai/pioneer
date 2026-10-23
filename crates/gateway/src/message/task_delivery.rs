@@ -1002,6 +1002,8 @@ impl MessageProcessor {
                     .await?
             }
         };
+        let sidebar_visible = turn_outcome.materialization.thread.sidebar_visibility
+            == pioneer_protocol::ThreadSidebarVisibility::Visible;
         let profile_selected_audit = match self.turn_profile_selected_audit_event(&turn_outcome) {
             Ok(event) => event,
             Err(error) => {
@@ -1100,6 +1102,16 @@ impl MessageProcessor {
                         .await;
                     return Err(error);
                 }
+                if sidebar_visible {
+                    self.dirty_push(
+                        &delivery.workspace_id,
+                        Some(thread_id),
+                        None,
+                        None,
+                        false,
+                        None,
+                    );
+                }
                 self.send_notification_to_authorized_thread_connections(
                     thread_id,
                     events::TURN_STARTED,
@@ -1128,7 +1140,7 @@ impl MessageProcessor {
                     &item_completed,
                 )
                 .await;
-                self.notify_semantic_timeline_item_changed(
+                self.notify_semantic_timeline_item_changed_after_indicator_commit(
                     item_completed.workspace_id.as_str(),
                     item_completed.thread_id.as_str(),
                     item_completed.turn_id.as_str(),
@@ -1172,6 +1184,16 @@ impl MessageProcessor {
                         .await;
                     return Err(error);
                 }
+                if sidebar_visible {
+                    self.dirty_push(
+                        &delivery.workspace_id,
+                        Some(thread_id),
+                        None,
+                        None,
+                        false,
+                        None,
+                    );
+                }
                 self.send_notification_to_authorized_thread_connections(
                     thread_id,
                     events::TURN_STARTED,
@@ -1193,8 +1215,10 @@ impl MessageProcessor {
                 .await;
             }
         }
-        self.notify_thread_tree_changed(delivery.workspace_id.clone())
-            .await;
+        if sidebar_visible {
+            self.notify_thread_unread_legacy(&delivery.workspace_id, thread_id)
+                .await;
+        }
         Ok(turn_id)
     }
 
@@ -1244,6 +1268,27 @@ impl MessageProcessor {
         item: TurnItem,
         agent_action: Option<pioneer_crud::AgentCommitInput>,
     ) -> Result<()> {
+        // The destination was loaded above. Reuse its materialized visibility;
+        // only an unloaded target needs a single row in this operation's scope.
+        let sidebar_visible = match self
+            .thread_manager
+            .loaded_thread_sidebar_visibility(workspace_id, thread_id)
+            .await
+        {
+            Some(visibility) => visibility == pioneer_protocol::ThreadSidebarVisibility::Visible,
+            None => {
+                let thread = self
+                    .crud_store
+                    .get_thread_by_id(thread_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("delivery target thread not found"))?;
+                anyhow::ensure!(
+                    thread.workspace_id == workspace_id,
+                    "delivery workspace changed"
+                );
+                thread.sidebar_visibility == "visible"
+            }
+        };
         let started = pioneer_protocol::ItemStartedNotification {
             workspace_id: workspace_id.to_owned(),
             thread_id: thread_id.to_owned(),
@@ -1260,6 +1305,9 @@ impl MessageProcessor {
         self.crud_store
             .materialize_task_delivery_item(started.clone(), completed.clone(), now, agent_action)
             .await?;
+        if sidebar_visible {
+            self.dirty_push(workspace_id, Some(thread_id), None, None, false, None);
+        }
         self.send_notification_to_thread_subscribers(thread_id, events::ITEM_STARTED, &started)
             .await;
         self.notify_semantic_timeline_item_changed(
@@ -1276,7 +1324,7 @@ impl MessageProcessor {
         self.kick_native_turn_event_deliveries();
         self.send_notification_to_thread_subscribers(thread_id, events::ITEM_COMPLETED, &completed)
             .await;
-        self.notify_semantic_timeline_item_changed(
+        self.notify_semantic_timeline_item_changed_after_indicator_commit(
             completed.workspace_id.as_str(),
             completed.thread_id.as_str(),
             completed.turn_id.as_str(),
@@ -1284,6 +1332,10 @@ impl MessageProcessor {
             Some("completed"),
         )
         .await;
+        if sidebar_visible {
+            self.notify_thread_unread_legacy(workspace_id, thread_id)
+                .await;
+        }
         Ok(())
     }
 

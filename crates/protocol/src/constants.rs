@@ -34,6 +34,7 @@ pub mod methods {
     pub const WORKSPACE_UPDATE: &str = "workspace/update";
     pub const THREAD_START: &str = "thread/start";
     pub const THREAD_TREE: &str = "thread/tree";
+    pub const WORKSPACE_PUSH: &str = "workspace/push";
     pub const THREAD_UPDATE: &str = "thread/update";
     pub const THREAD_MOVE: &str = "thread/move";
     pub const THREAD_PARTICIPANTS_LIST: &str = "thread/participants/list";
@@ -203,6 +204,7 @@ pub mod methods {
         WORKSPACE_UPDATE,
         THREAD_START,
         THREAD_TREE,
+        WORKSPACE_PUSH,
         THREAD_UPDATE,
         THREAD_MOVE,
         THREAD_PARTICIPANTS_LIST,
@@ -363,6 +365,7 @@ pub mod events {
     pub const THREAD_PARTICIPANTS_CHANGED: &str = "thread/participants/changed";
     pub const THREAD_CLOSED: &str = "thread/closed";
     pub const THREAD_TREE_CHANGED: &str = "thread/tree/changed";
+    pub const WORKSPACE_PUSH_CHANGED: &str = "workspace/push";
     pub const THREAD_AGENTS_DOC_CHANGED: &str = "thread/agents_doc/changed";
     pub const THREAD_TIMELINE_BLOCKS_CHANGED: &str = "thread/timeline/blocks/changed";
     pub const THREAD_READ_CURSOR_CHANGED: &str = "thread/read/changed";

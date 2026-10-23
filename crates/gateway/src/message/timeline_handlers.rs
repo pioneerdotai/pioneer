@@ -158,6 +158,24 @@ impl MessageProcessor {
             return;
         }
 
+        // One persisted row for this operation, before any peer keys/ready ack.
+        // Hidden reads remain valid; sidebar membership is separate from ThreadRead.
+        let sidebar_visible = match self.crud_store.get_thread_by_id(thread_id).await {
+            Ok(Some(thread)) if thread.workspace_id == authorization.workspace_id() => {
+                thread.sidebar_visibility == "visible"
+            }
+            _ => {
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::Unavailable.response(request_id),
+                )
+                .await;
+                return;
+            }
+        };
+        let push_mutation = sidebar_visible
+            .then(|| self.begin_push_mutation(connection_id, authorization.workspace_id(), true))
+            .flatten();
         let response_payload = match self
             .crud_store
             .mark_thread_read(pioneer_crud::MarkThreadReadRequest {
@@ -200,6 +218,23 @@ impl MessageProcessor {
                 return;
             }
         };
+        if sidebar_visible {
+            self.dirty_push_peers(
+                request_context,
+                &response_payload.workspace_id,
+                Some(&response_payload.thread_id),
+                None,
+            );
+        }
+        if let Some(mutation) = push_mutation {
+            mutation.finish(
+                Some((
+                    response_payload.thread_id.clone(),
+                    response_payload.unread_count,
+                )),
+                None,
+            );
+        }
         log_thread_read_outcome(
             thread_id,
             through_turn_id,

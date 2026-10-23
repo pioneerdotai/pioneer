@@ -26,33 +26,52 @@ impl MessageProcessor {
         item: &TurnItem,
         db_status: Option<&str>,
     ) {
+        self.notify_semantic_timeline_item_changed_with_indicators(
+            workspace_id,
+            thread_id,
+            turn_id,
+            item,
+            db_status,
+            true,
+        )
+        .await;
+    }
+
+    pub(super) async fn notify_semantic_timeline_item_changed_after_indicator_commit(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        item: &TurnItem,
+        db_status: Option<&str>,
+    ) {
+        self.notify_semantic_timeline_item_changed_with_indicators(
+            workspace_id,
+            thread_id,
+            turn_id,
+            item,
+            db_status,
+            false,
+        )
+        .await;
+    }
+
+    async fn notify_semantic_timeline_item_changed_with_indicators(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        item: &TurnItem,
+        db_status: Option<&str>,
+        publish_indicators: bool,
+    ) {
         let classification = classify_turn_item_with_db_status(item, db_status);
-        if classification.placement == ProjectionPlacement::TopLevelAssistantMessage
+        if publish_indicators
+            && classification.placement == ProjectionPlacement::TopLevelAssistantMessage
             && db_status == Some("completed")
         {
-            // Hidden execution replies never enter sidebar unread. Their root
-            // activity is invalidated by durable RunStarting/Started/terminal
-            // events (tasks.rs); visible root delivery invalidates independently
-            // (task_delivery.rs). Keep the fallback on missing/error lineage.
-            let hidden_execution = self
-                .thread_manager
-                .is_loaded_hidden_task_thread(thread_id)
-                .await
-                && self
-                    .crud_store
-                    .get_task_thread_lineage(thread_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some_and(|lineage| {
-                        lineage.child_thread_id == thread_id
-                            && lineage.root_thread_id != thread_id
-                            && lineage.origin_kind.as_deref() == Some("task_run")
-                    });
-            if !hidden_execution {
-                self.notify_thread_tree_changed(workspace_id.to_owned())
-                    .await;
-            }
+            self.notify_thread_unread_changed(workspace_id, thread_id)
+                .await;
         }
         let item_id = item.item_id();
         let detached_task_run = self.is_detached_task_run_turn(thread_id, turn_id).await;

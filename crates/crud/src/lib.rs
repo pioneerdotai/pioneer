@@ -215,9 +215,9 @@ pub use repositories::task_actor_contract::{
 };
 pub use repositories::task_completion_inbox::{
     TaskCompletionInboxAccess, TaskCompletionInboxRow, count_unread_task_completion_inbox,
-    find_task_completion_inbox_entry, list_task_completion_inbox,
-    mark_all_task_completion_inbox_read, mark_task_completion_inbox_read,
-    mark_viewed_task_completion_inbox_read,
+    find_task_completion_inbox_entry, find_unread_task_completion_inbox_entries,
+    list_task_completion_inbox, mark_all_task_completion_inbox_read,
+    mark_task_completion_inbox_read, mark_viewed_task_completion_inbox_read,
 };
 pub use repositories::thread::{
     ThreadManagementChange, advance_thread_read_cursor, find_thread_read_cursor,
@@ -23019,6 +23019,22 @@ impl CrudStore {
         limit: u64,
     ) -> Result<Vec<pioneer_entity::turn_work_item_projection::Model>> {
         list_turn_work_items_page(&self.connection, turn_id, visibility, anchor, limit).await
+    }
+
+    /// One addressed packet: canonical total and <=100 exact memberships share
+    /// one reader snapshot. Scheduling is inherited from this scoped store.
+    /// The snapshot is released before the caller transforms/serializes/fans out.
+    pub async fn task_completion_inbox_patch(
+        &self,
+        access: &TaskCompletionInboxAccess<'_>,
+        run_ids: &[String],
+    ) -> Result<(Vec<TaskCompletionInboxRow>, u64)> {
+        anyhow::ensure!(run_ids.len() <= 100, "inbox addressed batch exceeds limit");
+        let snapshot = self.connection.begin_read().await?;
+        let total = count_unread_task_completion_inbox(&snapshot, access).await?;
+        let entries = find_unread_task_completion_inbox_entries(&snapshot, access, run_ids).await?;
+        snapshot.commit().await?;
+        Ok((entries, total))
     }
 
     pub async fn get_thread_sandbox_mode(&self, thread_id: &str) -> Result<Option<SandboxMode>> {
@@ -46905,8 +46921,22 @@ mod tests {
         .unwrap();
         assert_eq!(
             counter.load(Ordering::Relaxed),
-            1,
-            "one reader SELECT for the whole batch"
+            2,
+            "thin discovery and one bounded scope SELECT"
+        );
+        let filtered = list_running_task_scopes(
+            &store.connection,
+            "ws_task",
+            &["missing-thread".into()],
+            &principal,
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(filtered.scopes.is_empty());
+        assert_eq!(
+            filtered.after_task_id, page.after_task_id,
+            "discovery must progress even when every scope is filtered"
         );
         assert_eq!(page.scopes.len(), 1);
         assert_eq!(

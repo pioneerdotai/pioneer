@@ -4096,6 +4096,18 @@ impl AgentActionToolHandler {
                 )));
             }
         };
+        let sidebar_visible = outcome.materialization.thread.sidebar_visibility
+            == pioneer_protocol::ThreadSidebarVisibility::Visible;
+        if sidebar_visible {
+            processor.dirty_push(
+                &outcome.started_notification.workspace_id,
+                Some(&outcome.started_notification.thread_id),
+                None,
+                None,
+                false,
+                None,
+            );
+        }
         plan.projection.queued = graph_result.queued;
         processor
             .register_execution_lease(turn_id.as_str())
@@ -4130,9 +4142,14 @@ impl AgentActionToolHandler {
                 outcome.started_notification_connection_ids.clone(),
             )
             .await;
-        processor
-            .notify_thread_tree_changed(self.context.workspace_id.clone())
-            .await;
+        if sidebar_visible {
+            processor
+                .notify_thread_unread_legacy(
+                    &self.context.workspace_id,
+                    &outcome.started_notification.thread_id,
+                )
+                .await;
+        }
         let safe = BoundAgentActionAdapter::safe_result(&plan.projection);
         let payload = serde_json::to_value(&safe).map_err(|error| {
             ToolError::internal(format!("failed to encode agent result: {error}"))
@@ -4544,6 +4561,18 @@ impl AgentActionToolHandler {
             .map_err(|error| {
                 ToolError::execution_failed(format!("failed to commit agent message: {error:#}"))
             })?;
+        let sidebar_visible = outcome.materialization.thread.sidebar_visibility
+            == pioneer_protocol::ThreadSidebarVisibility::Visible;
+        if sidebar_visible {
+            processor.dirty_push(
+                &outcome.completed_notification.workspace_id,
+                Some(&thread_id),
+                None,
+                None,
+                false,
+                None,
+            );
+        }
         if let Err(_error) = processor
             .thread_manager
             .commit_completed_message_turn(&outcome)
@@ -4578,9 +4607,14 @@ impl AgentActionToolHandler {
                 outcome.completed_notification.turn.id.as_str(),
             )
             .await;
-        processor
-            .notify_thread_tree_changed(outcome.completed_notification.workspace_id)
-            .await;
+        if sidebar_visible {
+            processor
+                .notify_thread_unread_legacy(
+                    &outcome.completed_notification.workspace_id,
+                    &thread_id,
+                )
+                .await;
+        }
         Self::mark_outbox_delivered(processor.as_ref(), plan.projection.outbox_id.as_str()).await;
 
         let payload = serde_json::to_value(&safe).map_err(|error| {

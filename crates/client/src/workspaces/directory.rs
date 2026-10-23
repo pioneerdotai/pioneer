@@ -278,6 +278,7 @@ struct DirectoryRequestBaseline {
     placements: HashMap<String, ThreadPlacement>,
     agents_docs: HashMap<(String, Option<String>), ThreadAgentsDocSummary>,
     read_revisions: HashMap<String, u64>,
+    push_revision: Option<(String, u64)>,
     // Accepted writes can return to their baseline value (or disappear from
     // both maps). Track that fact only for the lifetime of this request.
     touched_threads: std::collections::HashSet<String>,
@@ -319,6 +320,7 @@ fn merge_directory_rows<K, V>(
 
 #[derive(Default)]
 pub struct ThreadDirectoryStore {
+    pub(crate) push_revisions: HashMap<String, (String, u64)>,
     pub(super) initial_restore: Option<InitialDirectoryRestore>,
     pub(crate) dirty_workspaces: std::collections::BTreeSet<String>,
     pub(crate) threads: HashMap<String, Thread>,
@@ -401,6 +403,71 @@ impl ThreadDirectoryStore {
         self.running_task_thread_ids.remove(id);
     }
 
+    pub(crate) fn push_demand(&self, workspace: &str) -> Option<Vec<String>> {
+        if self.suspended_workspaces.contains(workspace)
+            || !self.subscriptions.contains_key(workspace)
+            || !self
+                .loads
+                .get(workspace)
+                .is_some_and(|load| load.state == ThreadTreeLoadState::Ready)
+        {
+            return None;
+        }
+        Some(
+            self.threads
+                .values()
+                .filter(|t| t.workspace_id == workspace)
+                .map(|t| t.id.clone())
+                .collect(),
+        )
+    }
+    pub(crate) fn push_epoch_is_current(&self, workspace: &str, epoch: &str) -> bool {
+        !self.suspended_workspaces.contains(workspace)
+            && self.subscriptions.contains_key(workspace)
+            && self
+                .push_revisions
+                .get(workspace)
+                .is_some_and(|(current, _)| current == epoch)
+    }
+    pub(crate) fn apply_push_indicators(
+        &mut self,
+        packet: &pioneer_protocol::WorkspacePushNotification,
+    ) -> bool {
+        if self
+            .push_revisions
+            .get(&packet.workspace_id)
+            .is_none_or(|(epoch, _)| epoch != &packet.epoch)
+            || packet.indicators.iter().any(|patch| {
+                !self
+                    .threads
+                    .get(&patch.thread_id)
+                    .is_some_and(|thread| thread.workspace_id == packet.workspace_id)
+            })
+        {
+            return false;
+        }
+        for patch in &packet.indicators {
+            if let Some(count) = patch.unread_count {
+                self.unread.insert(patch.thread_id.clone(), count);
+                *self
+                    .read_revisions
+                    .entry(patch.thread_id.clone())
+                    .or_default() += 1;
+            }
+            if let Some(running) = patch.has_running_tasks {
+                if running {
+                    self.running_task_thread_ids.insert(patch.thread_id.clone());
+                } else {
+                    self.running_task_thread_ids.remove(&patch.thread_id);
+                }
+            }
+        }
+        self.push_revisions.insert(
+            packet.workspace_id.clone(),
+            (packet.epoch.clone(), packet.revision),
+        );
+        true
+    }
     pub(crate) fn read_position_is_confirmed(&self, thread: &str, sort_key: &str) -> bool {
         self.cursors
             .get(thread)
@@ -493,6 +560,7 @@ impl ThreadDirectoryStore {
         self.request_baselines.insert(
             workspace.to_owned(),
             DirectoryRequestBaseline {
+                push_revision: self.push_revisions.get(workspace).cloned(),
                 threads: self
                     .threads
                     .iter()
@@ -663,10 +731,15 @@ impl ThreadDirectoryStore {
             {
                 continue; // Never resurrect a locally deleted/moved thread.
             }
-            if incoming_running.contains(&id) {
+            let push_unchanged =
+                self.push_revisions.get(workspace) == before.push_revision.as_ref();
+            if push_unchanged && incoming_running.contains(&id) {
                 self.running_task_thread_ids.insert(id.clone());
-            } else {
+            } else if push_unchanged {
                 self.running_task_thread_ids.remove(&id);
+            }
+            if !push_unchanged {
+                continue;
             }
             if self.read_revisions.get(&id) == before.read_revisions.get(&id) {
                 if let Some(count) = incoming_unread.get(&id) {
@@ -722,6 +795,7 @@ impl ClientCore {
                 self.queue_directory_refresh(workspace);
             }
         }
+        self.queue_workspace_push(workspace);
     }
     pub(crate) fn resume_workspace_directory_demand(&self) {
         if self.is_stopped() || self.authorization_snapshot(None, None).is_none() {
@@ -787,6 +861,7 @@ impl ClientCore {
             if resumed && self.authorization_snapshot(None, None).is_some() {
                 self.queue_directory_refresh(workspace);
             }
+            self.queue_workspace_push(workspace);
             return;
         }
         self.cancel_workspace_requests(workspace);
@@ -813,7 +888,10 @@ impl ClientCore {
         {
             registry.directory.cancel_initial_restore();
         }
+        registry.directory.push_revisions.remove(workspace);
         let Some(previous) = registry.directory.snapshot(workspace) else {
+            drop(registry);
+            self.queue_workspace_push(workspace);
             return;
         };
         let mut next = previous.as_ref().clone();
@@ -825,6 +903,8 @@ impl ClientCore {
             }
         });
         if next == *previous {
+            drop(registry);
+            self.queue_workspace_push(workspace);
             return;
         }
         next.revision += 1;
@@ -840,6 +920,8 @@ impl ClientCore {
             .publications
             .insert(workspace.clone(), publication.clone());
         self.publish_workspace_tree(publication);
+        drop(registry);
+        self.queue_workspace_push(workspace);
     }
     pub fn workspace_tree(&self, workspace: &str) -> Option<Arc<ThreadTreePublication>> {
         self.thread_registry
@@ -957,6 +1039,7 @@ impl ClientCore {
             self.queue_directory_refresh(workspace);
             anyhow::bail!("Directory read changed during loading; reconciling counts");
         }
+        self.queue_workspace_push(workspace);
         Ok(publication)
     }
     pub(crate) fn publish_workspace_tree(&self, publication: Arc<ThreadTreePublication>) {
@@ -1012,6 +1095,12 @@ impl ClientCore {
         {
             return;
         }
+        // Negotiated publisher owns counts; legacy reads still confirm the cursor.
+        let unread = if registry.directory.push_revisions.contains_key(workspace) {
+            registry.directory.unread.get(thread).copied().unwrap_or(0)
+        } else {
+            unread
+        };
         let read_changed = registry.directory.cursors.get(thread) != Some(cursor)
             || registry.directory.unread.get(thread).copied().unwrap_or(0) != unread;
         if read_changed {
