@@ -33,11 +33,12 @@ GitHub CLI/API access or the connected GitHub tool. Private artifact access may
 require signing in with an account allowed to read repository Actions. Do not ask
 for tokens to be pasted into chat or send the bundle to a public symbol server.
 
-The independent `.github/workflows/build-debug-symbols.yml` workflow is named
-**Build Debug Symbols**. The unified **Release** workflow queues it alongside
-publication. Publication can finish before symbols do; a published installer does
-not prove the symbol job succeeded. Jobs consume original release inputs instead
-of compiling another application binary.
+The **Release** workflow (`.github/workflows/release.yml`) prepares symbols in its
+`prepare-debug-symbols`, `build-dsymutil` and `symbols-*` jobs after publication.
+Symbol artifacts belong to that same Release run. A published installer does not
+prove the symbol jobs succeeded; the workflow can still be running or fail after
+publication. Jobs consume original release inputs instead of compiling another
+application binary.
 
 Identify the exact Release **run ID and commit** (or Release Gateway / Release App
 for older releases), target
@@ -51,7 +52,7 @@ Example read-only discovery, after setting the known commit:
 ```bash
 diag_repo='pioneerdotai/pioneer'
 diag_release_sha='EXACT_PRODUCING_COMMIT'
-gh run list --repo "$diag_repo" --workflow build-debug-symbols.yml \
+gh run list --repo "$diag_repo" --workflow release.yml \
   --commit "$diag_release_sha" --limit 20 \
   --json databaseId,headSha,status,conclusion,url
 ```
@@ -59,13 +60,16 @@ gh run list --repo "$diag_repo" --workflow build-debug-symbols.yml \
 If the workflow is not present on the installed release's revision or artifacts
 are absent/expired, report that. This can occur with a version predating the new
 diagnostics/release pipeline. The skill does not itself upgrade the installation.
+Older releases may have symbols in a separate **Build Debug Symbols** run;
+inspect that release revision's workflow and verify the original producer ID.
 
 ## Download only the matching platform/variant
 
-Choose a candidate symbol run and inspect its artifacts before downloading:
+Choose the exact producing Release run and inspect its artifacts before downloading
+(use the separate symbol run ID only for older releases that used one):
 
 ```bash
-diag_symbols_run='EXACT_SYMBOL_WORKFLOW_RUN_ID'
+diag_symbols_run='EXACT_PRODUCING_RELEASE_RUN_ID'
 gh api --paginate "repos/$diag_repo/actions/runs/$diag_symbols_run/artifacts" \
   --jq '.artifacts[] | {id, name, size_in_bytes, expired}'
 ```
@@ -198,11 +202,12 @@ Check the actual repository/run rather than promising permanent availability.
 Do not rebuild Gateway/Desktop or compile LLVM locally just because symbols are
 missing. First inspect the exact producer and symbol run logs, artifact expiry,
 `collection-result.json` and native verifier output. If another symbol generation
-is actually needed and authorized, dispatch **Build Debug Symbols** for the same
-release ref/commit with its exact `source_run_id`. The workflow validates that
-association and requires the original inputs. This is an external CI action,
-not an automatic side effect of reading a profile; obtain authorization unless
-the user already requested it. It does not restart the application.
+is actually needed and authorized, inspect the failed jobs in that exact Release
+run and rerun only the required symbol jobs and any failed symbol-tool prerequisite,
+using its retained inputs. Do not rerun the entire release, recreate its tag or
+dispatch a removed symbol workflow. This is an external CI action, not an automatic
+side effect of reading a profile; obtain authorization unless the user already
+requested it. It does not restart the application.
 
 The macOS runner builds a standalone `dsymutil` from pinned LLVM revision
 `5e8490a1cf89bd94194246d0569c232a923d0161` with the committed one-line
@@ -211,7 +216,8 @@ from an address map, preserving valid debug ranges for these builds. The runner
 records tool/patch hashes and checks output DWARF and UUID. This is not a runtime
 library dependency, a system Xcode replacement, or a file users build at startup.
 The release job still compiles debug information and retains/uploads exact inputs;
-heavy linking/tool compilation runs separately. Do not promise zero release cost.
+heavy linking/tool compilation runs in separate jobs after publication. Do not
+promise zero release cost.
 
 If original inputs have expired, explicitly report the limit. Never relabel a
 fresh build's dSYM as the old release's symbols, silently accept verifier errors,
