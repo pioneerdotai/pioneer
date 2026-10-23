@@ -160,8 +160,6 @@ def main():
         digest = hashlib.sha256(data).hexdigest()
         packaged = value.setdefault('packaged_binary_sha256s', [])
         if digest not in packaged:
-            if len(packaged) >= 16:
-                raise ValueError('packaged executable checksum inventory overflow')
             packaged.append(digest)
         # Keep the last packaged artifact fields for existing manifest readers.
         value['packaged_binary_sha256'] = digest

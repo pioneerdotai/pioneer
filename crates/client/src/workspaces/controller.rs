@@ -21,6 +21,7 @@ pub(crate) struct ThreadDraftRetry {
     pub plan: crate::threads::start::ThreadStartRetryPlan,
 }
 enum WorkspaceRequest {
+    ReconcilePush(String),
     ReconcileDraft,
     RetryDraft(ThreadDraftRetry),
     Bootstrap {
@@ -38,6 +39,7 @@ enum WorkspaceRequest {
 }
 #[derive(Default)]
 pub(crate) struct WorkspaceController {
+    pub(super) push: super::push::PushController,
     queue: Option<pioneer_observability::queues::QueueObserver>,
     sender: Option<mpsc::SyncSender<()>>,
     // At most one refresh per retained workspace; hints during a request leave
@@ -53,12 +55,13 @@ impl WorkspaceController {
     pub(crate) fn stop(&mut self) {
         self.sender.take();
         self.refresh.clear();
+        self.push = Default::default();
         self.bootstrap = None;
         self.commands.clear();
         self.draft_retry = None;
         self.reconcile_draft = false;
     }
-    fn wake(&self) {
+    pub(super) fn wake(&self) {
         let queue = self
             .queue
             .as_ref()
@@ -103,13 +106,16 @@ impl WorkspaceController {
             .is_some_and(|retry| retry.plan.next_attempt_at <= now)
         {
             self.draft_retry.take().map(WorkspaceRequest::RetryDraft)
+        } else if let Some((workspace, connection)) = self.refresh.pop_first() {
+            Some(WorkspaceRequest::Refresh {
+                workspace,
+                connection,
+            })
         } else {
-            self.refresh
+            self.push
+                .pending
                 .pop_first()
-                .map(|(workspace, connection)| WorkspaceRequest::Refresh {
-                    workspace,
-                    connection,
-                })
+                .map(WorkspaceRequest::ReconcilePush)
         }
     }
 }
@@ -284,6 +290,7 @@ impl ClientCore {
     fn execute_workspace_request(&self, request: WorkspaceRequest) {
         let core = self;
         match request {
+            WorkspaceRequest::ReconcilePush(workspace) => core.reconcile_workspace_push(&workspace),
             WorkspaceRequest::ReconcileDraft => {
                 if let Some(workspace) = core.navigation_snapshot().workspace_id() {
                     core.restore_selected_workspace_thread(workspace);
@@ -350,6 +357,16 @@ impl ClientCore {
     ) -> bool {
         use pioneer_protocol::GatewayNotification;
         match notification {
+            GatewayNotification::Unknown(change)
+                if change.method == pioneer_protocol::constants::events::WORKSPACE_PUSH_CHANGED =>
+            {
+                self.recover_malformed_workspace_push();
+                true
+            }
+            GatewayNotification::WorkspacePush(change) => {
+                self.observe_workspace_push(change);
+                true
+            }
             GatewayNotification::WorkspaceChanged(_) => {
                 self.observe_workspace_catalog(notification);
                 true
@@ -607,6 +624,16 @@ impl ClientCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn paused_combined_scope_resumes_after_renewal_or_page_deferred_action() {
+        super::super::push::tests::paused_combined_scope_resumes_after_renewal_or_page_deferred_action(
+            |core| {
+                assert!(run_workspace_cycle(&Arc::downgrade(core), |core, request| {
+                    core.execute_workspace_request(request);
+                }));
+            },
+        );
+    }
     #[test]
     fn actual_workspace_quantum_is_live_during_handlers_and_terminal_before_idle() {
         use pioneer_observability::{

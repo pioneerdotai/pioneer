@@ -34,7 +34,7 @@ def restore(inputs, names, target, commit, catalog):
                 entry = binaries[member.name]
                 row = records[member.name]
                 if (member.name in seen or not member.isfile() or member.size != row["bytes"]
-                        or member.size > 2 * 1024**3 or row["sha256"] != entry["sha256"]):
+                        or row["sha256"] != entry["sha256"]):
                     raise ValueError("Invalid release executable member")
                 binary = output / entry["filename"]
                 digest = hashlib.sha256()

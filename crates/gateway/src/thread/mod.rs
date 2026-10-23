@@ -697,6 +697,22 @@ impl ThreadManager {
         })
     }
 
+    /// Inspect sidebar membership without cloning loaded timeline/preview.
+    /// Completion and item delivery reuse their already materialized thread;
+    /// an unloaded target needs a persisted point lookup at the operation owner.
+    pub(crate) async fn loaded_thread_sidebar_visibility(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+    ) -> Option<ThreadSidebarVisibility> {
+        let state = self.state.read().await;
+        state
+            .threads
+            .get(thread_id)
+            .filter(|entry| entry.thread.workspace_id == workspace_id)
+            .map(|entry| entry.thread.sidebar_visibility)
+    }
+
     /// Inspect loaded execution metadata without cloning its timeline/preview.
     /// An unknown thread stays eligible for conservative tree invalidation.
     pub(crate) async fn is_loaded_hidden_task_thread(&self, thread_id: &str) -> bool {

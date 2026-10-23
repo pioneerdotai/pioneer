@@ -33,7 +33,7 @@ impl GatewayEventRoute {
             InvitationChanged(_) | MemberChanged(_) | WorkspaceMembersChanged(_) => {
                 Self::Administration
             }
-            WorkspaceChanged(_) | ThreadTreeChanged(_) => Self::Workspace,
+            WorkspaceChanged(_) | ThreadTreeChanged(_) | WorkspacePush(_) => Self::Workspace,
             GatewayRemoteAccessStatusChanged(_)
             | GatewayThreadEpisodicVectorRefillStatusChanged(_)
             | GatewayVoiceInputStatusChanged(_) => Self::Settings,

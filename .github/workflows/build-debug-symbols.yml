@@ -1,4 +1,5 @@
 name: Build Debug Symbols
+run-name: Debug symbols (release run ${{ inputs.source_run_id }})
 
 # Publication does not wait for this independent workflow. Never rebuild a
 # release executable here: consume the original producer's link inputs.
@@ -16,6 +17,7 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  SENTRY_DISABLE_UPDATE_CHECK: "true"
 
 jobs:
   inputs:
@@ -37,15 +39,14 @@ jobs:
             if (!/^[0-9]+$/.test(id)) throw new Error('Invalid source run ID');
             const {data: run} = await github.rest.actions.getWorkflowRun({
               owner: context.repo.owner, repo: context.repo.repo, run_id: Number(id)});
-            const {data: commit} = await github.rest.repos.getCommit({
-              owner: context.repo.owner, repo: context.repo.repo, ref: context.ref});
-            const producers = {'Release': '.github/workflows/release.yml',
-                               'Release App': '.github/workflows/release-app.yml',
-                               'Release Gateway': '.github/workflows/release-gateway.yml'};
-            if (run.head_repository.id !== context.payload.repository.id || run.head_sha !== commit.sha ||
+            const producers = {'.github/workflows/release.yml': ['desktop', 'gateway'],
+                               '.github/workflows/release-app.yml': ['desktop'],
+                               '.github/workflows/release-gateway.yml': ['gateway']};
+            const products = producers[run.path.split('@')[0]];
+            if (run.head_repository.id !== context.payload.repository.id || !/^[0-9a-f]{40}$/.test(run.head_sha) ||
                 !['push', 'workflow_dispatch'].includes(run.event) ||
-                producers[run.name] !== run.path.split('@')[0]) {
-              throw new Error('Select the same ref/SHA as the trusted release producer');
+                !products) {
+              throw new Error('Select a trusted release producer from this repository');
             }
             core.setOutput('source_sha', run.head_sha);
             core.setOutput('source_run_id', String(run.id));
@@ -63,8 +64,6 @@ jobs:
             for (const artifact of artifacts) {
               const match = /^symbol-inputs-(desktop|gateway)-(.+?)(?:-(default|computer-use))?$/.exec(artifact.name);
               if (!match || artifact.expired || !platforms[match[2]]) continue;
-              const products = run.name === 'Release' ? ['desktop', 'gateway']
-                : [run.name === 'Release App' ? 'desktop' : 'gateway'];
               if (!products.includes(match[1])) throw new Error('Unexpected input producer');
               include.push({artifact_id: artifact.id, name: artifact.name,
                             target: match[2], os: platforms[match[2]]});
@@ -72,8 +71,6 @@ jobs:
             core.setOutput('matrix', JSON.stringify({include}));
             core.setOutput('count', include.length);
             core.setOutput('has_macos', include.some(row => row.os.startsWith('macos')));
-            const products = run.name === 'Release' ? ['desktop', 'gateway']
-              : [run.name === 'Release App' ? 'desktop' : 'gateway'];
             const expected = Object.keys(platforms).flatMap(target => products.flatMap(product => product === 'desktop'
               ? [`symbol-inputs-desktop-${target}`]
               : ['default', 'computer-use'].map(feature => `symbol-inputs-gateway-${target}-${feature}`)));
@@ -81,7 +78,12 @@ jobs:
             if (expected.some(name => !names.has(name))) throw new Error('Missing release symbol inputs');
 
   macos-tool:
+    name: build-dsymutil
     needs: inputs
+    permissions:
+      contents: read
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     if: needs.inputs.outputs.has_macos == 'true'
     runs-on: macos-latest
     steps:
@@ -100,18 +102,24 @@ jobs:
           name: debug-symbols-macos-tool
           path: ${{ runner.temp }}/pioneer-dsymutil/
           retention-days: 7
+          overwrite: true
           if-no-files-found: error
 
   symbols:
     name: symbols-${{ matrix.name }}
     needs: [inputs, macos-tool]
+    permissions:
+      contents: read
+      actions: read
     if: >-
-      always() && needs.inputs.result == 'success' && needs.inputs.outputs.count != '0'
+      always() && !cancelled() && needs.inputs.result == 'success' && needs.inputs.outputs.count != '0'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.inputs.outputs.matrix) }}
     env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      SENTRY_DISABLE_UPDATE_CHECK: "true"
       SYMBOL_SOURCE_SHA: ${{ needs.inputs.outputs.source_sha }}
       SYMBOL_SOURCE_RUN_ID: ${{ needs.inputs.outputs.source_run_id }}
       SYMBOL_TARGET: ${{ matrix.target }}
@@ -146,6 +154,47 @@ jobs:
           fi
           python scripts/packaging/run-symbol-job.py python scripts/packaging/symbol-inputs.py process symbol-inputs symbol-work symbols
           if [[ -f symbol-tool/tool.json ]]; then cp symbol-tool/tool.json symbols/dsymutil-tool.json; fi
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: install-pinned-sentry-cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global --no-audit --no-fund @sentry/cli@3.8.2
+          sentry_cli="$(node -e 'process.stdout.write(require(process.argv[1]).SentryCli.getPath())' "$(npm root -g)/@sentry/cli")"
+          export SENTRY_CLI_EXECUTABLE="$sentry_cli"
+          echo "SENTRY_CLI_EXECUTABLE=$sentry_cli" >> "$GITHUB_ENV"
+          # Exercise the same native invocation as source bundling, including Windows.
+          python -c 'import os, subprocess; subprocess.run([os.environ["SENTRY_CLI_EXECUTABLE"], "--version"], check=True)'
+      # Prepare source context offline, even before Sentry credentials exist.
+      # Use the exact producer checkout; keep bundles in the private artifact.
+      - name: bundle-sources-for-sentry
+        shell: bash
+        run: |
+          python scripts/packaging/run-symbol-job.py python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          manifests = sorted(Path('symbols').glob('*/manifest.json'))
+          if not manifests:
+              raise SystemExit('No verified symbol manifests found')
+          for manifest in manifests:
+              metadata = json.loads(manifest.read_text())
+              files = [manifest.parent / item['filename'] for item in metadata['files']]
+              native = [path for path in files if path.suffix.lower() in ('.debug', '.pdb')
+                        or '.dSYM/Contents/Resources/DWARF/' in path.as_posix()]
+              if not metadata['symbols_validated'] or len(native) != 1:
+                  raise SystemExit(f'Expected one verified native symbol file: {manifest}')
+              output = Path('symbols/sentry-sources') / manifest.parent.name
+              output.mkdir(parents=True, exist_ok=True)
+              subprocess.run([os.environ['SENTRY_CLI_EXECUTABLE'], 'debug-files', 'bundle-sources',
+                              str(native[0]), '--output', str(output)], check=True)
+              if not list(output.glob('*.src.zip')):
+                  raise SystemExit(f'No source context found for {native[0]}')
+          PY
       - name: upload-private-debug-symbols
         if: always()
         uses: actions/upload-artifact@v6
@@ -154,4 +203,21 @@ jobs:
           path: symbols/
           compression-level: 1
           retention-days: 90
+          overwrite: true
           if-no-files-found: error
+      # Configure each account separately: SENTRY_AUTH_TOKEN_GATEWAY / _DESKTOP
+      # secrets, SENTRY_ORG_GATEWAY / _DESKTOP and SENTRY_PROJECT_GATEWAY / _DESKTOP
+      # variables. Never fall back to the other product's account.
+      - name: upload-to-sentry-if-configured
+        shell: bash
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets[startsWith(matrix.name, 'symbol-inputs-desktop-') && 'SENTRY_AUTH_TOKEN_DESKTOP' || 'SENTRY_AUTH_TOKEN_GATEWAY'] }}
+          SENTRY_ORG: ${{ vars[startsWith(matrix.name, 'symbol-inputs-desktop-') && 'SENTRY_ORG_DESKTOP' || 'SENTRY_ORG_GATEWAY'] }}
+          SENTRY_PROJECT: ${{ vars[startsWith(matrix.name, 'symbol-inputs-desktop-') && 'SENTRY_PROJECT_DESKTOP' || 'SENTRY_PROJECT_GATEWAY'] }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SENTRY_AUTH_TOKEN:-}" || -z "${SENTRY_ORG:-}" || -z "${SENTRY_PROJECT:-}" ]]; then
+            echo "Sentry upload is not configured; private symbols and source bundles were retained."
+            exit 0
+          fi
+          python -c 'import os, subprocess; subprocess.run([os.environ["SENTRY_CLI_EXECUTABLE"], "debug-files", "upload", "symbols"], check=True)'

@@ -2593,3 +2593,136 @@ async fn legacy_grant_uses_epoch_and_retains_the_ambiguous_second_without_receip
     );
     assert_eq!(unread(&store, B).await, 3);
 }
+
+#[tokio::test]
+async fn addressed_patch_uses_unread_membership_and_exact_completion_order() {
+    let (_dir, store, _writer) = fixture(false).await;
+    task(
+        &store,
+        "patch-task",
+        Some("T0000000000000000000P"),
+        None,
+        "system",
+        "none",
+        "detached",
+    )
+    .await;
+    for (number, id) in ["earlier", "later", "read", "historical"]
+        .into_iter()
+        .enumerate()
+    {
+        run(&store, id, "patch-task", "succeeded", number as i64 + 1).await;
+    }
+    let db = store.database_connection();
+    db.execute_unprepared(
+        "UPDATE task_run SET completed_at='2026-10-16 10:00:00.100 +00:00' WHERE id='earlier'",
+    )
+    .await
+    .unwrap();
+    db.execute_unprepared(
+        "UPDATE task_run SET completed_at='2026-10-16 10:00:00.200 +00:00' WHERE id='later'",
+    )
+    .await
+    .unwrap();
+    db.execute_unprepared(
+        "UPDATE task_run SET completed_at='2020-01-01 00:00:00 +00:00' WHERE id='historical'",
+    )
+    .await
+    .unwrap();
+    read(&store, A, "read").await;
+    let ids = ["earlier", "later", "read", "historical", "missing"].map(str::to_owned);
+    let (entries, total) = store
+        .task_completion_inbox_patch(&access(A), &ids)
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(
+        entries
+            .iter()
+            .map(|r| r.run_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["later", "earlier"]
+    );
+    assert_ne!(entries[0].completed_key, entries[1].completed_key);
+    assert_eq!(entries[0].completed_at, entries[1].completed_at);
+    // Broad history is deliberately retained, but must never become an upsert.
+    assert!(
+        find_task_completion_inbox_entry(&db, &access(A), "historical")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        find_task_completion_inbox_entry(&db, &access(A), "read")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    db.execute_unprepared(
+        "DELETE FROM workspace_membership WHERE principal_id='P0000000000000000000A'",
+    )
+    .await
+    .unwrap();
+    let (entries, total) = store
+        .task_completion_inbox_patch(&access(A), &ids)
+        .await
+        .unwrap();
+    assert!(entries.is_empty());
+    assert_eq!(total, 0);
+}
+
+#[tokio::test]
+async fn activity_discovery_pages_survive_filtered_scopes_and_duplicate_active_runs() {
+    let (_dir, store, _writer) = fixture(false).await;
+    let db = store.with_maintenance_access().database_connection();
+    db.execute_unprepared(
+        "WITH RECURSIVE ids(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM ids WHERE n<513)
+         INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,executor_kind,status,title,goal,priority,delivery_policy_json,lifecycle_policy_json,revision,created_at,updated_at)
+         SELECT printf('active-%04d',n),'W0000000000000000000I','workspace','W0000000000000000000I','T0000000000000000000P','system','running','Task','Goal',0,'{}','{}',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM ids",
+    ).await.unwrap();
+    for (suffix, status) in [("-starting", "starting"), ("-running", "running")] {
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,created_at,updated_at)
+             SELECT id || ?1,id,id || ?1,1,?3,?2,'system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM task",
+            [suffix.into(), status.into(), (if status == "starting" { 1_i64 } else { 2_i64 }).into()],
+        )).await.unwrap();
+    }
+    let principal = pioneer_protocol::PrincipalId::new(A).unwrap();
+    let first = pioneer_crud::list_running_task_scopes(
+        &db,
+        access(A).workspace_id,
+        &["T0000000000000000000P".into()],
+        &principal,
+        "",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        first.scopes.len(),
+        512,
+        "all four scope batches must survive LIMIT"
+    );
+    assert_eq!(first.after_task_id.as_deref(), Some("active-0512"));
+    let filtered = pioneer_crud::list_running_task_scopes(
+        &db,
+        access(A).workspace_id,
+        &["missing".into()],
+        &principal,
+        "",
+    )
+    .await
+    .unwrap();
+    assert!(filtered.scopes.is_empty());
+    assert_eq!(filtered.after_task_id, first.after_task_id);
+    let second = pioneer_crud::list_running_task_scopes(
+        &db,
+        access(A).workspace_id,
+        &["T0000000000000000000P".into()],
+        &principal,
+        filtered.after_task_id.as_deref().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.scopes.len(), 1);
+    assert_eq!(second.scopes[0].0.task_id, "active-0513");
+}

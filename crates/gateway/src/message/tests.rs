@@ -1,6 +1,12 @@
 #[path = "tests/threads_search_authority.rs"]
 mod threads_search_authority;
 
+#[path = "tests/scoped_push.rs"]
+mod scoped_push;
+
+#[path = "tests/scoped_push_client.rs"]
+mod scoped_push_client;
+
 #[path = "tests/cli_provider_probe_isolation.rs"]
 mod cli_provider_probe_isolation;
 

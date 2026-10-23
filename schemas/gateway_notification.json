@@ -215,6 +215,22 @@
       "properties": {
         "kind": {
           "type": "string",
+          "const": "workspace_push"
+        },
+        "params": {
+          "$ref": "#/$defs/WorkspacePushNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "params"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
           "const": "thread_agents_doc_changed"
         },
         "params": {
@@ -5825,7 +5841,7 @@
     "ProviderRequestId": {
       "type": "string",
       "maxLength": 128,
-      "pattern": "^(gen-|req-|cmpl-|chatcmpl-)[A-Za-z0-9_-]+$"
+      "pattern": "^(gen-|req-|req_|cmpl-|chatcmpl-)[A-Za-z0-9_-]+$"
     },
     "ProviderTransportKind": {
       "type": "string",
@@ -7707,6 +7723,70 @@
         "workspaceId"
       ]
     },
+    "TaskCompletionInboxEntry": {
+      "description": "One saved terminal run in the current user's workspace inbox. Contains no\nexecution-thread identity, raw failure, HTML, or full result payload.",
+      "type": "object",
+      "properties": {
+        "completedAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "completedKey": {
+          "description": "Exact server keyset ordering key. Empty only for legacy servers.",
+          "type": "string"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "readAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/TaskRunStatus"
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "threadTitle": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "workspaceId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "taskId",
+        "runId",
+        "title",
+        "threadId",
+        "threadTitle",
+        "status",
+        "completedAt"
+      ]
+    },
     "TaskComposerWork": {
       "type": "object",
       "properties": {
@@ -8320,6 +8400,70 @@
         "task"
       ]
     },
+    "TaskFinishRequest": {
+      "description": "A user-directed final soft stop; this is not evidence that the goal succeeded.",
+      "type": "object",
+      "properties": {
+        "firstRunNumber": {
+          "description": "Earliest admitted run whose real outcome contributes to the final state.",
+          "type": "integer",
+          "format": "int64"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requestedAt": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "requestedAt",
+        "firstRunNumber"
+      ]
+    },
+    "TaskInboxPatch": {
+      "type": "object",
+      "properties": {
+        "nextCursor": {
+          "description": "Authoritative keyset frontier when snapshot or replace is true.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "removes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "replace": {
+          "description": "Authoritative inbox replacement, also used by a read-all mutation ack.",
+          "type": "boolean",
+          "default": false
+        },
+        "unreadCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "upserts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TaskCompletionInboxEntry"
+          }
+        }
+      },
+      "required": [
+        "upserts",
+        "removes",
+        "unreadCount"
+      ]
+    },
     "TaskLifecyclePolicy": {
       "type": "object",
       "properties": {
@@ -8369,6 +8513,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/TaskValue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "finishRequest": {
+          "description": "Server-owned durable decision to stop future runs.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskFinishRequest"
             },
             {
               "type": "null"
@@ -9876,6 +10031,48 @@
       "required": [
         "workspaceId",
         "threadId"
+      ]
+    },
+    "ThreadIndicatorPatch": {
+      "type": "object",
+      "properties": {
+        "hasRunningTasks": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "unreadCount": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "threadId"
+      ]
+    },
+    "ThreadMetadataPatch": {
+      "type": "object",
+      "properties": {
+        "previewTruncated": {
+          "description": "True only when directory projection actually shortened the preview.\nA real shorter/empty edit is authoritative when this is false.",
+          "type": "boolean"
+        },
+        "thread": {
+          "description": "Canonical thin directory metadata; never a full timeline/history snapshot.",
+          "$ref": "#/$defs/Thread"
+        }
+      },
+      "required": [
+        "thread",
+        "previewTruncated"
       ]
     },
     "ThreadMode": {
@@ -14567,6 +14764,59 @@
       "required": [
         "revision",
         "workspace_id"
+      ]
+    },
+    "WorkspacePushNotification": {
+      "type": "object",
+      "properties": {
+        "epoch": {
+          "type": "string"
+        },
+        "inbox": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskInboxPatch"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "indicators": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ThreadIndicatorPatch"
+          }
+        },
+        "resyncRequired": {
+          "type": "boolean"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "snapshot": {
+          "type": "boolean"
+        },
+        "threadSummaries": {
+          "description": "Compact metadata and indicators share one revision and atomic reduction.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ThreadMetadataPatch"
+          }
+        },
+        "workspaceId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "epoch",
+        "revision",
+        "snapshot",
+        "resyncRequired",
+        "indicators"
       ]
     }
   }
