@@ -97,7 +97,8 @@ pub use output_policy::{
     ToolOutputPolicySnapshot, ToolOutputProjectionKind, ToolOutputSummary, ToolRecoveryView,
     ToolResultEnvelope, ToolResultView, ToolStoragePayload, builtin_output_policy,
     computer_use_output_policy, download_output_policy, dynamic_unknown_output_policy,
-    mcp_output_policy, model_only_metadata_policy, shell_output_policy, web_fetch_output_policy,
+    is_thread_paged_tool, mcp_output_policy, model_only_metadata_policy, shell_output_policy,
+    thread_read_page_bytes, thread_read_page_fits, web_fetch_output_policy,
     web_search_output_policy,
 };
 pub use output_projection::{ToolProjectionInput, bounded_summary_for_chars, project_tool_result};

@@ -138,10 +138,53 @@ impl ToolResultEnvelope {
         ModelInputItem::tool_result(
             call_id.to_owned(),
             tool_name.to_owned(),
-            self.llm_text(),
+            if is_thread_paged_tool(tool_name) {
+                serde_json::to_string(&payload).expect("tool page is serializable")
+            } else {
+                self.llm_text()
+            },
             Some(payload),
         )
     }
+}
+
+/// These producers paginate before projection. Keep the list scoped to their contracts.
+pub fn is_thread_paged_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "threads_list"
+            | "threads_history_read"
+            | "threads_children_list"
+            | "threads_tools_result_read"
+            | "threads_start_options"
+            | "threads_identity_odels_list"
+    )
+}
+
+/// Count actual JSON escaping and both the projection and delivery envelopes.
+/// This is Pioneer's projection limit, not a transport limit.
+pub fn thread_read_page_fits(value: &JsonValue) -> bool {
+    thread_read_page_bytes(value) <= pioneer_protocol::TOOL_RESPONSE_MAX_BYTES
+}
+
+pub fn thread_read_page_bytes(value: &JsonValue) -> usize {
+    let view = ToolResultView::Json {
+        value: value.clone(),
+        truncated: false,
+    };
+    let view_bytes = view.serialized_size_bytes();
+    let envelope = ToolResultEnvelope {
+        llm_view: view,
+        display: ToolDisplayPayload::Hidden,
+        storage: ToolStoragePayload::None,
+        recovery: None,
+        outcome: ToolOutcome::ok(),
+        success: true,
+        output_policy: ToolOutputPolicySnapshot::for_tool_name("threads_history_read"),
+    };
+    view_bytes.max(
+        serde_json::to_vec(&envelope.llm_payload()).map_or(usize::MAX, |encoded| encoded.len()),
+    )
 }
 
 impl ToolResultView {

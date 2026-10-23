@@ -14,6 +14,20 @@ use pioneer_compaction::runner::RunnerState;
 use pioneer_compaction::{Checkpoint, ModelBudget, OperationSnapshot, SourceRef};
 
 impl CrudStore {
+    /// Canonical ownership and disclosure metadata, independent of full result
+    /// payload size. Every canonical tool item is visible in timeline projection;
+    /// non-tool/hidden system records are excluded in the repository query.
+    pub async fn tool_result_access_source(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        item: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        repositories::compaction::tool_result_access_source(self, workspace, thread, turn, item)
+            .await
+    }
+
     /// One restart-safe, payload-free page of legacy history preparation.
     /// Dropping the caller cancels work; a later caller resumes its durable cursor.
     pub async fn compaction_prepare_history_quantum(

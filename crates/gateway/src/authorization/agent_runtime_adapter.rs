@@ -228,24 +228,6 @@ impl BoundAgentActionAdapter {
         self.root.options_generation_fingerprint = start_options.generation_fingerprint.clone();
         self.start_options = start_options;
         let mut safe = self.start_options.clone().safe_tool_projection();
-        // Detailed models belong to threads_identity_odels_list. Keep only
-        // legacy default-profile options here; the immutable internal catalog
-        // still validates every explicit model selection.
-        safe.profiles.retain(|profile| {
-            self.start_options.profiles.iter().any(|full| {
-                full.id == profile.id
-                    && full.backend == self.root.profile.backend
-                    && full.provider_id == self.root.profile.provider_id
-                    && full.model_id == self.root.profile.model_id
-            }) || profile.compatible_identity_ids.iter().any(|id| {
-                self.start_options
-                    .profiles
-                    .iter()
-                    .filter(|full| full.compatible_agent_identity_ids.contains(id))
-                    .count()
-                    == 1
-            })
-        });
         let capabilities = task_agent_capabilities(&self.envelope);
         populate_binding_options(
             &self.root,

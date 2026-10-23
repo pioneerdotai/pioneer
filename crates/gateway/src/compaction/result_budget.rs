@@ -24,8 +24,14 @@ pub(super) async fn shrink_results(
         .filter_map(|(i, m)| {
             // Typed media keeps its original indexing and accounting. Reduce text
             // only when a trusted, exact durable locator can be recovered below.
-            (m.role == Role::Tool && m.content_parts.is_empty() && m.provenance.is_some())
-                .then_some(i)
+            (m.role == Role::Tool
+                && m.content_parts.is_empty()
+                && m.provenance.is_some()
+                && !m
+                    .name
+                    .as_deref()
+                    .is_some_and(pioneer_tools::is_thread_paged_tool))
+            .then_some(i)
         })
         .collect();
     if candidates.is_empty() {

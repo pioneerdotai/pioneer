@@ -191,35 +191,43 @@ impl AgentActionRuntimeBinding {
             anyhow::bail!("launch catalog authority differs from its AgentExecution");
         }
         let mut same_capsule_targets = Vec::new();
-        for lineage in processor
-            .crud_store
-            .list_task_thread_lineage_by_root_thread_bounded(
-                execution.home_root_thread_id.as_str(),
-                pioneer_protocol::ChildAgentLaunchGrantSet::MAX_IDENTITIES as u64,
-            )
-            .await?
-        {
-            if lineage.root_thread_id != execution.home_root_thread_id {
-                continue;
-            }
-            let Some(thread) = processor
+        let mut lineage_after = None;
+        loop {
+            let page = processor
                 .crud_store
-                .get_thread_model(lineage.child_thread_id.as_str())
-                .await?
-            else {
-                continue;
-            };
-            if thread.workspace_id != execution.workspace_id {
-                continue;
+                .list_task_thread_lineage_by_root_thread_page(
+                    execution.home_root_thread_id.as_str(),
+                    lineage_after.as_deref(),
+                )
+                .await?;
+            let done = page.len() < 200;
+            lineage_after = page.last().map(|edge| edge.child_thread_id.clone());
+            for lineage in page {
+                if lineage.root_thread_id != execution.home_root_thread_id {
+                    continue;
+                }
+                let Some(thread) = processor
+                    .crud_store
+                    .get_thread_model(lineage.child_thread_id.as_str())
+                    .await?
+                else {
+                    continue;
+                };
+                if thread.workspace_id != execution.workspace_id {
+                    continue;
+                }
+                let label = thread
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("Internal collaboration thread")
+                    .to_owned();
+                same_capsule_targets.push((thread.id, label));
             }
-            let label = thread
-                .name
-                .as_deref()
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .unwrap_or("Internal collaboration thread")
-                .to_owned();
-            same_capsule_targets.push((thread.id, label));
+            if done {
+                break;
+            }
         }
         let allowed_skill_ids = authority
             .granted_skill_ids()
@@ -714,112 +722,129 @@ pub(crate) async fn current_workspace_launch_catalog(
     let database = processor.crud_store.database_connection();
     let cli_runtimes = processor.load_cli_runtime_instances()?;
     let cli_identity_catalog = cli_identity_catalog(processor, cli_runtimes.as_slice())?;
-    let identities = pioneer_crud::list_active_agent_identities(&database, workspace_id).await?;
     let mut projected_identities = Vec::new();
     let mut projected_profiles = Vec::new();
 
-    for identity in identities {
-        let source_kind = match identity.source_kind.as_str() {
-            pioneer_crud::SOURCE_NATIVE_AGENT => {
-                let Some(config) =
-                    pioneer_crud::load_native_agent_config(&database, identity.source_id.as_str())
-                        .await?
-                else {
-                    continue;
-                };
-                if !config.enabled
-                    || config.workspace_id != workspace_id
-                    || config.config_revision != identity.source_revision
-                {
-                    continue;
-                }
-                pioneer_protocol::AgentIdentitySourceKind::NativeAgent
-            }
-            pioneer_crud::SOURCE_CLI_RUNTIME_INSTANCE => {
-                let Some(runtime) = cli_identity_catalog
-                    .iter()
-                    .find(|runtime| runtime.id == identity.source_id && runtime.enabled)
-                else {
-                    continue;
-                };
-                if pioneer_crud::cli_runtime_identity_fingerprint(runtime)
-                    != identity.source_fingerprint
-                {
-                    continue;
-                }
-                pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance
-            }
-            // Persisted ephemeral identities are execution-local history and
-            // are never reusable catalog entries.
-            pioneer_crud::SOURCE_EPHEMERAL => continue,
-            _ => continue,
-        };
-        let Some(snapshot) = pioneer_crud::load_current_agent_presentation_snapshot(
+    let mut identity_after = None;
+    loop {
+        let identities = pioneer_crud::list_active_agent_identities_page(
             &database,
-            identity.id.as_str(),
-            identity.source_revision,
-            identity.source_fingerprint.as_str(),
-        )
-        .await?
-        else {
-            continue;
-        };
-        let projection = pioneer_protocol::AgentIdentityProjection::new(
-            pioneer_protocol::AgentIdentityId::new(identity.id.clone()).map_err(|error| {
-                anyhow::anyhow!("workspace agent identity has invalid id: {error:?}")
-            })?,
-            source_kind,
-            snapshot.display_name,
-            snapshot.nickname,
-            snapshot.avatar_revision,
-            snapshot.role_label,
-            u64::try_from(identity.source_revision)
-                .map_err(|_| anyhow::anyhow!("workspace identity revision is invalid"))?,
-            identity.source_fingerprint,
-        )
-        .map_err(|error| anyhow::anyhow!("workspace identity projection is invalid: {error:?}"))?;
-        let executors = identity_models_catalog(
-            processor,
             workspace_id,
-            &projection,
-            &identity.source_id,
-            authority,
+            identity_after.as_deref(),
         )
         .await?;
-        for executor in executors {
-            for model in executor.models {
-                let mut profile = workspace_launch_profile(
-                    &projection,
-                    identity.source_id.as_str(),
-                    cli_runtimes.as_slice(),
-                    &executor.provider_id,
-                    &model.id,
-                    &[],
-                    parent_profile.allowed_permission_profiles.as_slice(),
-                    parent_profile.catalog_generation.max(1),
-                    parent_profile.policy_generation.max(1),
-                )?;
-                apply_launch_model_metadata(&mut profile, &model);
-                profile.provider_display_name = executor.display_name.clone();
-                if projection.id == parent_identity.id
-                    && profile.backend == parent_profile.backend
-                    && profile.provider_id == parent_profile.provider_id
-                    && profile.model_id == parent_profile.model_id
-                {
-                    // Keep the admitted profile's stable identity, while its
-                    // child choices use model metadata rather than its pinned effort.
-                    profile.id = parent_profile.id.clone();
-                    profile.fingerprint = parent_profile.fingerprint.clone();
-                    for reasoning in &parent_profile.allowed_reasoning {
-                        if !profile.allowed_reasoning.contains(reasoning) {
-                            profile.allowed_reasoning.push(reasoning.clone());
+        let done = identities.len() < 200;
+        identity_after = identities.last().map(|identity| identity.id.clone());
+        for identity in identities {
+            let source_kind = match identity.source_kind.as_str() {
+                pioneer_crud::SOURCE_NATIVE_AGENT => {
+                    let Some(config) = pioneer_crud::load_native_agent_config(
+                        &database,
+                        identity.source_id.as_str(),
+                    )
+                    .await?
+                    else {
+                        continue;
+                    };
+                    if !config.enabled
+                        || config.workspace_id != workspace_id
+                        || config.config_revision != identity.source_revision
+                    {
+                        continue;
+                    }
+                    pioneer_protocol::AgentIdentitySourceKind::NativeAgent
+                }
+                pioneer_crud::SOURCE_CLI_RUNTIME_INSTANCE => {
+                    let Some(runtime) = cli_identity_catalog
+                        .iter()
+                        .find(|runtime| runtime.id == identity.source_id && runtime.enabled)
+                    else {
+                        continue;
+                    };
+                    if pioneer_crud::cli_runtime_identity_fingerprint(runtime)
+                        != identity.source_fingerprint
+                    {
+                        continue;
+                    }
+                    pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance
+                }
+                // Persisted ephemeral identities are execution-local history and
+                // are never reusable catalog entries.
+                pioneer_crud::SOURCE_EPHEMERAL => continue,
+                _ => continue,
+            };
+            let Some(snapshot) = pioneer_crud::load_current_agent_presentation_snapshot(
+                &database,
+                identity.id.as_str(),
+                identity.source_revision,
+                identity.source_fingerprint.as_str(),
+            )
+            .await?
+            else {
+                continue;
+            };
+            let projection = pioneer_protocol::AgentIdentityProjection::new(
+                pioneer_protocol::AgentIdentityId::new(identity.id.clone()).map_err(|error| {
+                    anyhow::anyhow!("workspace agent identity has invalid id: {error:?}")
+                })?,
+                source_kind,
+                snapshot.display_name,
+                snapshot.nickname,
+                snapshot.avatar_revision,
+                snapshot.role_label,
+                u64::try_from(identity.source_revision)
+                    .map_err(|_| anyhow::anyhow!("workspace identity revision is invalid"))?,
+                identity.source_fingerprint,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!("workspace identity projection is invalid: {error:?}")
+            })?;
+            let executors = identity_models_catalog(
+                processor,
+                workspace_id,
+                &projection,
+                &identity.source_id,
+                authority,
+            )
+            .await?;
+            for executor in executors {
+                for model in executor.models {
+                    let mut profile = workspace_launch_profile(
+                        &projection,
+                        identity.source_id.as_str(),
+                        cli_runtimes.as_slice(),
+                        &executor.provider_id,
+                        &model.id,
+                        &[],
+                        parent_profile.allowed_permission_profiles.as_slice(),
+                        parent_profile.catalog_generation.max(1),
+                        parent_profile.policy_generation.max(1),
+                    )?;
+                    apply_launch_model_metadata(&mut profile, &model);
+                    profile.provider_display_name = executor.display_name.clone();
+                    if projection.id == parent_identity.id
+                        && profile.backend == parent_profile.backend
+                        && profile.provider_id == parent_profile.provider_id
+                        && profile.model_id == parent_profile.model_id
+                    {
+                        // Keep the admitted profile's stable identity, while its
+                        // child choices use model metadata rather than its pinned effort.
+                        profile.id = parent_profile.id.clone();
+                        profile.fingerprint = parent_profile.fingerprint.clone();
+                        for reasoning in &parent_profile.allowed_reasoning {
+                            if !profile.allowed_reasoning.contains(reasoning) {
+                                profile.allowed_reasoning.push(reasoning.clone());
+                            }
                         }
                     }
+                    projected_profiles.push(profile);
                 }
-                projected_profiles.push(profile);
             }
+            projected_identities.push(projection);
         }
-        projected_identities.push(projection);
+        if done {
+            break;
+        }
     }
 
     if parent_identity.source_kind == pioneer_protocol::AgentIdentitySourceKind::Ephemeral {
@@ -834,23 +859,6 @@ pub(crate) async fn current_workspace_launch_catalog(
     }
     projected_identities.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
     projected_profiles.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-    if projected_identities.len() > pioneer_protocol::ChildAgentLaunchGrantSet::MAX_IDENTITIES {
-        let mut bounded = projected_identities
-            .iter()
-            .filter(|identity| identity.id == parent_identity.id)
-            .cloned()
-            .collect::<Vec<_>>();
-        let remaining = pioneer_protocol::ChildAgentLaunchGrantSet::MAX_IDENTITIES
-            .saturating_sub(bounded.len());
-        bounded.extend(
-            projected_identities
-                .into_iter()
-                .filter(|identity| identity.id != parent_identity.id)
-                .take(remaining),
-        );
-        bounded.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        projected_identities = bounded;
-    }
     let visible_ids = projected_identities
         .iter()
         .map(|identity| identity.id.clone())
@@ -862,23 +870,6 @@ pub(crate) async fn current_workspace_launch_catalog(
                 .iter()
                 .all(|identity_id| visible_ids.contains(identity_id))
     });
-    if projected_profiles.len() > pioneer_protocol::ChildAgentLaunchGrantSet::MAX_PROFILES {
-        let mut bounded = projected_profiles
-            .iter()
-            .filter(|profile| profile.id == parent_profile.id)
-            .cloned()
-            .collect::<Vec<_>>();
-        let remaining =
-            pioneer_protocol::ChildAgentLaunchGrantSet::MAX_PROFILES.saturating_sub(bounded.len());
-        bounded.extend(
-            projected_profiles
-                .into_iter()
-                .filter(|profile| profile.id != parent_profile.id)
-                .take(remaining),
-        );
-        bounded.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        projected_profiles = bounded;
-    }
     Ok((projected_identities, projected_profiles))
 }
 
@@ -3081,6 +3072,44 @@ async fn dispatch_agent_action_outbox_row(
     Ok(AgentActionOutboxDispatch::Delivered)
 }
 
+impl AgentActionToolHandler {
+    async fn launch_catalog_page(
+        &self,
+        processor: &MessageProcessor,
+        payload: serde_json::Value,
+        limit: u32,
+        cursor: Option<&str>,
+        identity: Option<&str>,
+    ) -> Result<serde_json::Value, ToolError> {
+        processor
+            .revalidate_tool_execution_authorization(
+                &self.context.workspace_id,
+                &self.context.thread_id,
+                &self.context.turn_id,
+                None,
+                crate::authorization::ResourceAction::ThreadRead,
+            )
+            .await
+            .map_err(|_| ToolError::execution_failed("agent_action_not_allowed"))?;
+        let codec = processor
+            .thread_read_cursor_codec()
+            .map_err(|_| ToolError::internal("catalog cursor unavailable"))?;
+        let scope = serde_json::json!([
+            "launch-catalog-v1",
+            self.context.workspace_id,
+            self.context.thread_id,
+            self.context.turn_id,
+            self.tool,
+            identity,
+            limit
+        ])
+        .to_string();
+        super::thread_launch_pages::catalog_page(payload, limit, cursor, &codec, &scope).map_err(
+            |_| ToolError::invalid_arguments("agent_catalog_cursor_invalid_or_stale_restart"),
+        )
+    }
+}
+
 #[async_trait]
 impl ToolHandler for AgentActionToolHandler {
     async fn handle(
@@ -3205,10 +3234,15 @@ impl ToolHandler for AgentActionToolHandler {
                 }
                 let payload =
                     serde_json::to_value(pioneer_protocol::AgentIdentityModelsToolResult {
-                        identity,
+                        identity_id: input.identity_id.clone(),
+                        identity: Some(identity),
                         executors,
+                        next_cursor: None,
+                        eof: true,
+                        fragments: Vec::new(),
                     })
                     .map_err(|_| ToolError::internal("agent_runtime_integrity_lost"))?;
+                let payload = self.launch_catalog_page(&processor, payload, input.limit, input.cursor.as_deref(), Some(input.identity_id.as_str())).await?;
                 return Ok(Box::new(FunctionToolOutput::with_payload(
                     "Identity model options",
                     true,
@@ -3216,7 +3250,7 @@ impl ToolHandler for AgentActionToolHandler {
                 )) as Box<dyn ToolOutput>);
             }
             if self.tool == AgentModelToolName::AgentStartOptions {
-                let _: AgentStartOptionsToolInput = match invocation.payload {
+                let input: AgentStartOptionsToolInput = match invocation.payload {
                     ToolPayload::Function { arguments } => serde_json::from_value(arguments),
                     ToolPayload::Custom { input } => serde_json::from_str(input.as_str()),
                     _ => {
@@ -3227,6 +3261,7 @@ impl ToolHandler for AgentActionToolHandler {
                 let payload = serde_json::to_value(&options).map_err(|error| {
                     ToolError::internal(format!("failed to encode options: {error}"))
                 })?;
+                let payload = self.launch_catalog_page(&processor, payload, input.limit, input.cursor.as_deref(), None).await?;
                 return Ok(Box::new(FunctionToolOutput::with_payload(
                     "server-projected agent options",
                     true,
@@ -4780,8 +4815,11 @@ pub(crate) fn sanitize_agent_tool_error(error: ToolError) -> ToolError {
     match error {
         // This exact public code is assigned at decoding boundaries. Unknown
         // InvalidArguments also include semantic failures after decoding.
-        ToolError::InvalidArguments(message) if message == "agent_invalid_arguments" => {
-            ToolError::invalid_arguments("agent_invalid_arguments")
+        ToolError::InvalidArguments(message)
+            if message == "agent_invalid_arguments"
+                || message == "agent_catalog_cursor_invalid_or_stale_restart" =>
+        {
+            ToolError::invalid_arguments(message)
         }
         ToolError::InvalidArguments(message) => ToolError::invalid_arguments(
             stable_outcome(message.as_str())
@@ -4914,6 +4952,14 @@ mod tests {
             direct_decode.to_string(),
             "invalid arguments: agent_invalid_arguments"
         );
+        let restart = sanitize_agent_tool_error(ToolError::invalid_arguments(
+            "agent_catalog_cursor_invalid_or_stale_restart",
+        ));
+        assert!(
+            restart
+                .to_string()
+                .contains("agent_catalog_cursor_invalid_or_stale_restart")
+        );
         let denied = sanitize_agent_tool_error(adapter_tool_error(AgentToolAdapterError::Action(
             crate::authorization::AgentActionServiceError::NotAuthorized("hidden policy detail"),
         )));
@@ -4993,6 +5039,71 @@ mod tests {
             intersect_child_launch_ceiling(&ceiling, &[identity("A12345678901234567890", 2)], &[]);
         assert_eq!(identities, vec![identity("A12345678901234567890", 2)]);
         assert!(profiles.is_empty());
+    }
+
+    #[test]
+    fn large_saved_launch_ceiling_keeps_every_admitted_choice_and_excludes_new_catalog_entries() {
+        let granted_identities = (0..140)
+            .map(|n| identity(&format!("A{n:020}"), 1))
+            .collect::<Vec<_>>();
+        let granted_profiles = (0..300)
+            .map(|n| profile(&format!("P{n:020}"), &granted_identities[n % 140]))
+            .collect::<Vec<_>>();
+        let ceiling = pioneer_protocol::ChildAgentLaunchGrantSet::new(
+            granted_identities.clone(),
+            granted_profiles.clone(),
+        )
+        .unwrap();
+        let restored: pioneer_protocol::ChildAgentLaunchGrantSet =
+            serde_json::from_str(&serde_json::to_string(&ceiling).unwrap()).unwrap();
+        restored.validate().unwrap();
+        let mut current_identities = granted_identities.clone();
+        let extra = identity("Z12345678901234567890", 1);
+        let mut current_profiles = granted_profiles.clone();
+        current_profiles.push(profile("Z12345678901234567891", &extra));
+        current_identities.push(extra);
+        let (identities, profiles) =
+            intersect_child_launch_ceiling(&restored, &current_identities, &current_profiles);
+        assert_eq!(identities, granted_identities);
+        assert_eq!(profiles, granted_profiles);
+        let options = pioneer_protocol::AgentStartOptionsProjection {
+            agents: identities,
+            profiles,
+            inherit_parent_agent_available: false,
+            derived_ephemeral_available: false,
+            inherit_parent_profile_available: false,
+            allowed_skill_ids: Vec::new(),
+            allowed_mcp_server_ids: Vec::new(),
+            max_permission_profile: restored.max_permission_profile.clone(),
+            generation_fingerprint: "saved".into(),
+        };
+        let mut selection = pioneer_protocol::AgentLaunchSelection {
+            agent: pioneer_protocol::AgentIdentitySelection::Exact {
+                agent_identity_id: granted_identities[299 % 140].id.clone(),
+            },
+            execution: pioneer_protocol::AgentExecutionSelection {
+                profile: pioneer_protocol::AgentExecutionProfileSelection::Exact {
+                    profile_id: granted_profiles[299].id.clone(),
+                },
+                reasoning: None,
+                permission_profile: None,
+                skill_ids: Vec::new(),
+                mcp_server_ids: Vec::new(),
+                selected_capabilities: Vec::new(),
+            },
+        };
+        assert!(
+            crate::authorization::resolve_agent_launch_selection(&selection, &options, None, None)
+                .is_ok()
+        );
+        selection.execution.profile = pioneer_protocol::AgentExecutionProfileSelection::Exact {
+            profile_id: pioneer_protocol::AgentExecutionProfileId::new("Z12345678901234567891")
+                .unwrap(),
+        };
+        assert!(
+            crate::authorization::resolve_agent_launch_selection(&selection, &options, None, None)
+                .is_err()
+        );
     }
 
     #[test]
