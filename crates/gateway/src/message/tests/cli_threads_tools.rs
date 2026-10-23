@@ -187,38 +187,23 @@ async fn start_threads_cli_fixture(
         .get_turn_inputs(&turn_id)
         .await
         .unwrap();
+    assert!(
+        matches!(
+            processor
+                .agent_manager
+                .observe_turn(thread_id, &turn_id)
+                .await,
+            Err(pioneer_agent::AgentControlError::ThreadNotFound)
+        ),
+        "a fresh CLI target must not need a native actor before its first start"
+    );
     // This fixture has no background outbox worker. Deliver the committed
     // start through the normal dispatcher before observing CLI activation.
-    let database = processor
-        .crud_store
-        .with_maintenance_access()
-        .database_connection();
-    let claimed = pioneer_crud::claim_agent_action_outbox(&database, 64)
-        .await
-        .unwrap();
-    let dispatch_errors = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let (batch, admission_events) = crate::public_error::test_support::capture_events_async(
-        crate::message::agent_action_tools::process_claimed_agent_action_outbox(
-            &database,
-            claimed,
-            |row| {
-                let processor = processor.clone();
-                let dispatch_errors = dispatch_errors.clone();
-                async move {
-                    let result =
-                        crate::message::agent_action_tools::dispatch_agent_action_outbox_row(
-                            &processor, &row,
-                        )
-                        .await;
-                    if let Err(error) = &result {
-                        dispatch_errors.lock().await.push(format!("{error:#}"));
-                    }
-                    result
-                }
-            },
-        ),
+        crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64),
     )
     .await;
+    let batch = batch.unwrap();
     assert!(batch.errors.is_empty(), "{:?}", batch.errors);
     let delivered_outbox = pioneer_crud::load_agent_action_outbox(
         &processor.crud_store.database_connection(),
@@ -228,12 +213,9 @@ async fn start_threads_cli_fixture(
     .unwrap()
     .unwrap();
     assert_eq!(
-        batch.delivered,
-        1,
-        "seed Agent start must reach the {kind:?} CLI dispatcher; outbox status={}, last_error={:?}; errors={:?}; {admission_events:?}",
-        delivered_outbox.status,
-        delivered_outbox.last_error,
-        dispatch_errors.lock().await
+        batch.delivered, 1,
+        "seed Agent start must reach the {kind:?} CLI dispatcher; outbox status={}, last_error={:?}; {admission_events:?}",
+        delivered_outbox.status, delivered_outbox.last_error
     );
     wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
     wait_for_task_cli_activation(&processor, &turn_id).await;

@@ -2833,7 +2833,7 @@ pub(super) enum AgentActionOutboxDispatch {
     AwaitingRuntime,
 }
 
-pub(super) async fn dispatch_agent_action_outbox_row(
+async fn dispatch_agent_action_outbox_row(
     processor: &Arc<MessageProcessor>,
     row: &pioneer_entity::agent_action_outbox::Model,
 ) -> anyhow::Result<AgentActionOutboxDispatch> {
@@ -2938,14 +2938,16 @@ pub(super) async fn dispatch_agent_action_outbox_row(
         // the outbox without starting the same provider/CLI turn again.
         return Ok(AgentActionOutboxDispatch::Delivered);
     }
-    if processor
+    match processor
         .agent_manager
         .observe_turn(dispatch.thread_id.as_str(), dispatch.turn_id.as_str())
         .await
-        .map_err(|error| anyhow::anyhow!("native control-plane observation failed: {error}"))?
-        .is_some()
     {
-        return Ok(AgentActionOutboxDispatch::Delivered);
+        Ok(Some(_)) => return Ok(AgentActionOutboxDispatch::Delivered),
+        // A new target has no native actor yet, and a CLI target may never
+        // have one. Absence is not a delivered start or a control-plane fault.
+        Ok(None) | Err(pioneer_agent::AgentControlError::ThreadNotFound) => {}
+        Err(error) => anyhow::bail!("native control-plane observation failed: {error}"),
     }
     if processor
         .thread_manager
