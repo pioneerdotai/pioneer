@@ -67,6 +67,9 @@ pub struct CaptureManifest {
     pub files: Vec<ArtifactFile>,
     pub local_reference: String,
     pub correlation_scope: String,
+    /// Local SQL command CPU coverage; independent from native profile status/window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_cpu: Option<serde_json::Value>,
 }
 fn is_profile_file(mode: CaptureMode, file: &ArtifactFile) -> bool {
     file.bytes > 0
@@ -475,6 +478,7 @@ pub(super) fn capture(
     let path = storage::capture_dir(root, &capture_id)?;
     let _capture_lease = storage::CaptureLease::new(&path);
     let mut attempt = None;
+    let mut sql_cpu = SqlCpuCapture::default();
     let outcome = capture_inner(
         &path,
         &capture_id,
@@ -485,12 +489,17 @@ pub(super) fn capture(
         stop,
         cancel,
         &mut attempt,
+        &mut sql_cpu,
     );
+    // Seal even on native spawn/wait/inventory failure; deadline is owned by
+    // Session and never extended by native-tool finalization.
+    sql_cpu.seal();
+    let sql_cpu = sql_cpu.snapshot;
     if !crate::telemetry_sample_allowed(Some(epoch)) || stop.load(Ordering::Acquire) {
         storage::remove_owned(&path);
         bail!("capture_shutdown_or_consent_revoked");
     }
-    let manifest = match outcome {
+    let mut manifest = match outcome {
         Ok(manifest) => manifest,
         Err(error) => {
             // capture_inner has already dropped/reaped its owned native tool.
@@ -521,6 +530,65 @@ pub(super) fn capture(
             manifest
         }
     };
+    if let Some(snapshot) = sql_cpu {
+        // This thread owns diagnostic storage and no database capacity. Keep
+        // provenance alongside the bounded table without exporting SQL text.
+        let sidecar = serde_json::json!({
+            "schema_version": 1,
+            "kind": "pioneer.gateway.sql_cpu",
+            "run": target.run,
+            "consent_generation": epoch,
+            "native_profile_status": manifest.status,
+            "native_profile_interval": {
+                "started_monotonic_ms": manifest.started_monotonic_ms,
+                "ended_monotonic_ms": manifest.ended_monotonic_ms,
+                "clock_scope": manifest.clock_scope,
+            },
+            "sql_cpu": snapshot,
+        });
+        if !crate::telemetry_sample_allowed(Some(epoch)) || stop.load(Ordering::Acquire) {
+            storage::remove_owned(&path);
+            bail!("capture_shutdown_or_consent_revoked");
+        }
+        let stored = (|| -> Result<Vec<ArtifactFile>> {
+            storage::write_new_json(&path.join("sql-cpu.json"), &sidecar)?;
+            storage::inventory(&path)
+        })();
+        match stored {
+            Ok(files) => {
+                manifest.files = files;
+                manifest.sql_cpu = Some(serde_json::json!({
+                    "filename": "sql-cpu.json",
+                    "status": "recorded",
+                    "coverage": sidecar["sql_cpu"]["coverage"],
+                    "measured_unknown": sidecar["sql_cpu"]["measured_unknown"],
+                    "group_overflow": sidecar["sql_cpu"]["group_overflow"],
+                    "started_monotonic_ms": sidecar["sql_cpu"]["started_monotonic_ms"],
+                    "ended_monotonic_ms": sidecar["sql_cpu"]["ended_monotonic_ms"],
+                    "scope": "SQLx command CPU in observed query scopes; independent window; inspect unknown, overflow, clock errors and incomplete before drawing conclusions",
+                }));
+            }
+            Err(_) => {
+                // A sidecar must never bypass the existing byte/file quota or
+                // turn a failed native profile into a successful capture.
+                let _ = fs::remove_file(path.join("sql-cpu.json"));
+                manifest.sql_cpu = Some(
+                    serde_json::json!({"status":"unavailable", "reason":"sql_cpu_storage_or_inventory_failed"}),
+                );
+                manifest
+                    .incomplete_reasons
+                    .push("sql_cpu_sidecar_unavailable".into());
+                if manifest.status == "completed" {
+                    manifest.status = "partial".into();
+                }
+            }
+        }
+    }
+    if manifest.sql_cpu.is_none() && sql_cpu_eligible(&target.service, &config, pid) {
+        manifest.sql_cpu = Some(
+            serde_json::json!({"status":"unavailable", "reason":"native_prerequisite_failed_or_session_unavailable"}),
+        );
+    }
     storage::write_new_json(&path.join("manifest.json"), &manifest)?;
     if !crate::telemetry_sample_allowed(Some(epoch)) {
         storage::remove_owned(&path);
@@ -528,6 +596,24 @@ pub(super) fn capture(
     }
     record_reference(&manifest);
     Ok(manifest)
+}
+#[derive(Default)]
+struct SqlCpuCapture {
+    session: Option<crate::query_cpu::Session>,
+    snapshot: Option<crate::query_cpu::Snapshot>,
+}
+impl SqlCpuCapture {
+    fn seal(&mut self) {
+        if let Some(session) = self.session.take() {
+            self.snapshot = Some(session.finish());
+        }
+    }
+}
+fn sql_cpu_eligible(service: &str, config: &CaptureRequest, pid: u32) -> bool {
+    service == "gateway"
+        && config.mode == CaptureMode::Cpu
+        && config.child_generation.is_none()
+        && pid == std::process::id()
 }
 fn capture_inner(
     path: &Path,
@@ -539,6 +625,7 @@ fn capture_inner(
     stop: &AtomicBool,
     cancel: &AtomicBool,
     attempt: &mut Option<AttemptProvenance>,
+    sql_cpu: &mut SqlCpuCapture,
 ) -> Result<CaptureManifest> {
     let epoch = target.consent_generation;
     let plan = plan(&config, pid, path, &target.stack_logging)?;
@@ -557,6 +644,9 @@ fn capture_inner(
     let stderr = fs::File::create(path.join("tool-stderr.txt"))?;
     let started_unix_ms = unix_ms();
     let started_monotonic_ms = monotonic_ms();
+    if sql_cpu_eligible(&target.service, &config, pid) {
+        sql_cpu.session = crate::query_cpu::Session::start(config.seconds, epoch);
+    }
     let mut child = OwnedTool(
         Command::new(&plan.program)
             .args(&plan.args)
@@ -597,7 +687,15 @@ fn capture_inner(
     };
     let timeout = Duration::from_secs(config.seconds + finish_allowance);
     loop {
-        if let Some(exit) = child.try_wait()? {
+        let exited = match child.try_wait() {
+            Ok(exited) => exited,
+            Err(error) => {
+                sql_cpu.seal();
+                return Err(error.into());
+            }
+        };
+        if let Some(exit) = exited {
+            sql_cpu.seal();
             registration.exited(exit.success());
             if !exit.success() {
                 status = "failed";
@@ -608,22 +706,26 @@ fn capture_inner(
         if cancel.load(Ordering::Acquire) {
             reasons.push("operator_cancelled".into());
             status = "partial";
+            sql_cpu.seal();
             stop_tool(&mut child, plan.graceful_stop, &mut registration);
             break;
         }
         if !crate::telemetry_sample_allowed(Some(epoch)) || stop.load(Ordering::Acquire) {
+            sql_cpu.seal();
             stop_tool(&mut child, plan.graceful_stop, &mut registration);
             bail!("consent_revoked_or_shutdown");
         }
         if let Err(error) = verify_identity(pid, start_identity) {
             reasons.push(error.to_string());
             status = "partial";
+            sql_cpu.seal();
             stop_tool(&mut child, plan.graceful_stop, &mut registration);
             break;
         }
         if storage::size(path, storage::CAPTURE_BYTES - 1024 * 1024).is_err() {
             reasons.push("output_overflow".into());
             status = "partial";
+            sql_cpu.seal();
             stop_tool(&mut child, plan.graceful_stop, &mut registration);
             trim_overflow(path)?;
             break;
@@ -632,6 +734,7 @@ fn capture_inner(
         if config.mode == CaptureMode::Cpu
             && started.elapsed() >= Duration::from_secs(config.seconds)
         {
+            sql_cpu.seal();
             if !stop_tool(&mut child, true, &mut registration) {
                 status = "partial";
                 reasons.push("profiler_forced_termination_after_grace".into());
@@ -641,11 +744,13 @@ fn capture_inner(
         if started.elapsed() >= timeout {
             reasons.push("tool_timeout".into());
             status = "partial";
+            sql_cpu.seal();
             stop_tool(&mut child, plan.graceful_stop, &mut registration);
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    sql_cpu.seal();
     let ended_unix_ms = unix_ms();
     let ended_monotonic_ms = monotonic_ms();
     if let Some(attempt) = attempt {
@@ -678,7 +783,7 @@ fn capture_inner(
         reasons.push("profile_artifact_missing".into());
     }
     let symbol_status = symbol_status(module.as_ref());
-    Ok(CaptureManifest{schema_version:1,capture_id:capture_id.into(),run:target.run.clone(),consent_generation:epoch,target_pid:pid,target_start_identity:start_identity.into(),target_child_generation:config.child_generation,target_build_scope:if config.child_generation.is_none(){"target_executable"}else{"parent_build_only; child module identity separately reported"}.into(),mode:config.mode,tool:plan.program.file_name().unwrap_or_default().to_string_lossy().into_owned(),tool_version,configuration:plan.args,actual_format:plan.format.into(),started_unix_ms,ended_unix_ms,started_monotonic_ms,ended_monotonic_ms,clock_scope:"native tool spawn through observed exit/stop, target process monotonic_ms and unix_ms; tool artifact contains actual sample times; module hashing/version preparation excluded".into(),module_coverage:if module.is_some(){"main executable only; native tool artifact contains loaded-module evidence where available"}else{"main module ID unavailable; native artifact loaded-module evidence tool-defined"}.into(),module,symbol_status:symbol_status.into(),coverage:if cfg!(target_os="macos")&&matches!(config.mode,CaptureMode::Cpu|CaptureMode::Allocations){"template-controlled sampling; all target threads; frequency and lost samples unknown until tool analysis"}else{"tool-defined; see actual format; no CPU-to-async-operation attribution"}.into(),lost_samples:None,status:status.into(),incomplete_reasons:reasons,files,local_reference:format!("captures/pioneer-capture-{capture_id}/manifest.json"),correlation_scope:"service.instance.id + build + process/start + capture interval; not async work CPU attribution".into()})
+    Ok(CaptureManifest{schema_version:1,capture_id:capture_id.into(),run:target.run.clone(),consent_generation:epoch,target_pid:pid,target_start_identity:start_identity.into(),target_child_generation:config.child_generation,target_build_scope:if config.child_generation.is_none(){"target_executable"}else{"parent_build_only; child module identity separately reported"}.into(),mode:config.mode,tool:plan.program.file_name().unwrap_or_default().to_string_lossy().into_owned(),tool_version,configuration:plan.args,actual_format:plan.format.into(),started_unix_ms,ended_unix_ms,started_monotonic_ms,ended_monotonic_ms,clock_scope:"native tool spawn through observed exit/stop, target process monotonic_ms and unix_ms; tool artifact contains actual sample times; module hashing/version preparation excluded".into(),module_coverage:if module.is_some(){"main executable only; native tool artifact contains loaded-module evidence where available"}else{"main module ID unavailable; native artifact loaded-module evidence tool-defined"}.into(),module,symbol_status:symbol_status.into(),coverage:if cfg!(target_os="macos")&&matches!(config.mode,CaptureMode::Cpu|CaptureMode::Allocations){"template-controlled sampling; all target threads; frequency and lost samples unknown until tool analysis"}else{"tool-defined; see actual format; no CPU-to-async-operation attribution"}.into(),lost_samples:None,status:status.into(),incomplete_reasons:reasons,files,local_reference:format!("captures/pioneer-capture-{capture_id}/manifest.json"),correlation_scope:"service.instance.id + build + process/start + capture interval; SQL sidecar has its own observed query window, not arbitrary async stack attribution".into(),sql_cpu:None})
 }
 fn child_module(
     pid: u32,
@@ -892,6 +997,18 @@ mod tests {
         );
         assert!(!m.profile_data_present());
         m.files.push(ArtifactFile {
+            filename: "sql-cpu.json".into(),
+            bytes: 128,
+            sha256: "fixture".into(),
+        });
+        m.sql_cpu = Some(serde_json::json!({"filename":"sql-cpu.json", "status":"recorded"}));
+        m.status = "partial".into();
+        assert!(
+            !m.profile_data_present(),
+            "SQL sidecar is not a native profile"
+        );
+        m.status = "failed".into();
+        m.files.push(ArtifactFile {
             filename: "perf.data".into(),
             bytes: 32,
             sha256: "fixture".into(),
@@ -1030,6 +1147,7 @@ fn failed_manifest(
         status: "failed".into(),
         incomplete_reasons: vec![reason],
         files,
+        sql_cpu: None,
         local_reference: format!("captures/pioneer-capture-{id}/manifest.json"),
         correlation_scope:
             "attempt linked by run/build/PID-start; no successful sampling or symbolication claimed"

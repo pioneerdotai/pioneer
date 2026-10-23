@@ -46,7 +46,7 @@ pub(crate) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
         let outcome = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return,
-            outcome = crate::database::attribution::scope_database_workload_result(pioneer_observability::DatabaseWorkload::FrozenStorageMaintenance,batch(&store, &mut progress, &mut lifetime, &mut admission, BATCH_STEPS, BATCH_TIME)) => outcome,
+            outcome = crate::database::attribution::scope_database_workload_result(pioneer_observability::DatabaseWorkload::FrozenStorageMaintenance, pioneer_observability::DatabaseOperationSite::FrozenStorageBatch,batch(&store, &mut progress, &mut lifetime, &mut admission, BATCH_STEPS, BATCH_TIME)) => outcome,
         };
         let pause = match outcome {
             Ok(more) => pause_after_batch(more, &admission, Instant::now()),

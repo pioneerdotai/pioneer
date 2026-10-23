@@ -406,6 +406,7 @@ async fn run_periodic_maintenance(
 ) -> Result<ZstdPeriodicMaintenanceOutcome> {
     let result = crate::database::attribution::scope_database_workload_result(
         pioneer_observability::DatabaseWorkload::ZstdMaintenance,
+        pioneer_observability::DatabaseOperationSite::ZstdMaintenance,
         run_periodic_maintenance_inner(
             crud_store,
             cache,

@@ -2378,6 +2378,7 @@ impl MessageProcessor {
             let cycle = AssertUnwindSafe(async {
                 if let Err(error) = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseOperationSite::ExecutionOwnerHeartbeat,
                     retry_transient_storage_access(|| {
                         store.heartbeat_turn_executions_owned_by(
                             owner.as_ref(),
@@ -2425,6 +2426,7 @@ impl MessageProcessor {
                 let now = now_timestamp_secs();
                 match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::ProjectionRecovery,
+                    pioneer_observability::DatabaseOperationSite::ProjectionReplay,
                     retry_transient_storage_access(|| {
                         this.crud_store.replay_due_turn_event_projections(now, 64)
                     }),
@@ -2453,6 +2455,7 @@ impl MessageProcessor {
 
                 let result = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::FinalizationRecovery,
+                    pioneer_observability::DatabaseOperationSite::PreparedFinalizationReconcile,
                     retry_transient_storage_access(|| {
                         this.reconcile_prepared_native_turn_finalizations(now, 64)
                     }),
@@ -2487,6 +2490,7 @@ impl MessageProcessor {
 
                 if let Err(error) = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::EventDelivery,
+                    pioneer_observability::DatabaseOperationSite::NativeEventDelivery,
                     retry_transient_storage_access(|| {
                         this.process_due_native_turn_event_deliveries(now, 64)
                     }),
@@ -2521,6 +2525,7 @@ impl MessageProcessor {
                 let now = now_timestamp_secs();
                 match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::TaskReconcile,
+                    pioneer_observability::DatabaseOperationSite::TaskChildReconcile,
                     this.reconcile_terminal_task_child_turns_with_retry(64),
                 )
                 .await
@@ -2535,6 +2540,7 @@ impl MessageProcessor {
 
                 let result = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::TaskReconcile,
+                    pioneer_observability::DatabaseOperationSite::TaskOccurrenceReconcile,
                     this.reconcile_terminal_task_run_occurrence_turns(64),
                 )
                 .await;
@@ -2566,6 +2572,7 @@ impl MessageProcessor {
 
                 if let Err(error) = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::TaskReconcile,
+                    pioneer_observability::DatabaseOperationSite::TaskDelivery,
                     this.process_due_task_deliveries(now, 64),
                 )
                 .await
@@ -2850,6 +2857,7 @@ impl MessageProcessor {
                 if now >= next_skill_upload_cleanup {
                     crate::database::attribution::scope_database_workload(
                         pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        pioneer_observability::DatabaseOperationSite::StaleSkillUploadCleanup,
                         maintenance.cleanup_stale_skill_uploads(now),
                     )
                     .await;
@@ -2861,6 +2869,7 @@ impl MessageProcessor {
                 // authoritative liveness check before any destructive claim.
                 crate::database::attribution::scope_database_workload(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseOperationSite::CliCommandHeartbeat,
                     this.heartbeat_due_cli_runtime_command_items(now),
                 )
                 .await;
@@ -2869,6 +2878,7 @@ impl MessageProcessor {
                     crate::authorization::AgentWorkResourcePolicy::default();
                 match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseOperationSite::QueuedExecutionPromotion,
                     retry_transient_storage_access(|| {
                         this.crud_store.promote_queued_agent_executions(
                             pioneer_crud::utc_now(),
@@ -2888,6 +2898,7 @@ impl MessageProcessor {
                             if let Err(error) =
                                 crate::database::attribution::scope_database_workload_result(
                                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                                    pioneer_observability::DatabaseOperationSite::AgentOutboxWake,
                                     pioneer_crud::wake_agent_action_outbox_for_execution(
                                         &database,
                                         execution.execution_id.as_str(),
@@ -2909,7 +2920,7 @@ impl MessageProcessor {
                             .collect::<std::collections::BTreeSet<_>>();
                         for root_execution_id in roots {
                             crate::database::attribution::scope_database_workload(
-                                pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                                pioneer_observability::DatabaseWorkload::ExecutionSupervision, pioneer_observability::DatabaseOperationSite::AgentGraphNotification,
                                 this.notify_agent_work_graph_state_changed(
                                     root_execution_id.as_str(),
                                 ),
@@ -2934,6 +2945,7 @@ impl MessageProcessor {
                         now.saturating_add(AGENT_ACTION_LEDGER_COMPACTION_INTERVAL_SECONDS);
                     match crate::database::attribution::scope_database_workload_result(
                         pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        pioneer_observability::DatabaseOperationSite::TerminalExecutionCompaction,
                         retry_transient_storage_access(|| {
                             let database = maintenance.crud_store.database_connection();
                             async move {
@@ -2980,6 +2992,7 @@ impl MessageProcessor {
                         now.saturating_add(NATIVE_TERMINAL_EFFECT_RECOVERY_INTERVAL_SECONDS);
                     match crate::database::attribution::scope_database_workload_result(
                         pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        pioneer_observability::DatabaseOperationSite::NativeTerminalEffectRequeue,
                         retry_transient_storage_access(|| {
                             maintenance
                                 .crud_store
@@ -3022,6 +3035,7 @@ impl MessageProcessor {
                         now.saturating_add(NATIVE_TERMINAL_EFFECT_PURGE_INTERVAL_SECONDS);
                     match crate::database::attribution::scope_database_workload_result(
                         pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        pioneer_observability::DatabaseOperationSite::NativeTerminalEffectPurge,
                         retry_transient_storage_access(|| {
                             maintenance
                                 .crud_store
@@ -3061,6 +3075,7 @@ impl MessageProcessor {
 
                 match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseOperationSite::AgentActionOutbox,
                     // One input quantum. Report errors/back off only after all
                     // independent known-committed rows have had their dispatch.
                     agent_action_tools::process_due_agent_action_outbox(&this, 64),
@@ -3104,6 +3119,7 @@ impl MessageProcessor {
 
                 match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseOperationSite::ExecutionTimeoutPoll,
                     retry_transient_storage_access(|| {
                         this.poll_timeouts_respecting_human_wait(now, 64)
                     }),
@@ -3114,6 +3130,7 @@ impl MessageProcessor {
                         for candidate in candidates {
                             crate::database::attribution::scope_database_workload(
                                 pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                                pioneer_observability::DatabaseOperationSite::ExecutionTimeoutApply,
                                 this.handle_timeout_candidate(candidate, now),
                             )
                             .await;
@@ -3133,6 +3150,7 @@ impl MessageProcessor {
 
                 if let Err(error) = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::RecoveryTerminalizationAudit,
+                    pioneer_observability::DatabaseOperationSite::RecoveryTerminalizationAudit,
                     retry_transient_storage_access(|| {
                         this.crud_store
                             .enqueue_missing_recovery_terminalizations(64, now)
@@ -3152,6 +3170,7 @@ impl MessageProcessor {
 
                 if let Err(error) = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::RecoveryTerminalizationApply,
+                    pioneer_observability::DatabaseOperationSite::RecoveryTerminalizationApply,
                     retry_transient_storage_access(|| {
                         this.process_due_recovery_terminalizations(now, 64)
                     }),
@@ -3170,6 +3189,7 @@ impl MessageProcessor {
 
                 match crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseOperationSite::RecoveryJobs,
                     retry_transient_storage_access(|| {
                         this.recovery_coordinator.run_ready_jobs(now, 64)
                     }),
@@ -3180,6 +3200,7 @@ impl MessageProcessor {
                         for event in events {
                             crate::database::attribution::scope_database_workload(
                                 pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                                pioneer_observability::DatabaseOperationSite::RecoveryEventApply,
                                 this.handle_recovery_event(event, now),
                             )
                             .await;
@@ -3199,6 +3220,7 @@ impl MessageProcessor {
 
                 crate::database::attribution::scope_database_workload(
                     pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseOperationSite::StaleCliTurnFailure,
                     this.fail_stale_cli_runtime_turns(
                         now_timestamp_millis(),
                         &mut cli_runtime_stale_turn_scan,
@@ -3614,6 +3636,7 @@ impl MessageProcessor {
                 if config.enabled && (!first_pass || config.startup_scan) {
                     crate::database::attribution::scope_database_workload(
                         pioneer_observability::DatabaseWorkload::HookRecovery,
+                        pioneer_observability::DatabaseOperationSite::HookRecovery,
                         this.run_hook_recovery_pass(config.clone()),
                     )
                     .await;
@@ -3700,6 +3723,7 @@ impl MessageProcessor {
                 };
                 let result = crate::database::attribution::scope_database_workload_result(
                     pioneer_observability::DatabaseWorkload::TaskEventFanout,
+                    pioneer_observability::DatabaseOperationSite::TaskEventFanout,
                     this.for_background_reconciliation()
                         .task_event_fanout_quantum(),
                 )

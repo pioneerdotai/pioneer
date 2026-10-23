@@ -1439,6 +1439,7 @@ fn reviewer_background_batch_preserves_ownership_progress_and_no_new_immediate_r
             // lifecycle worker; no infinite worker or timer is started.
             let error = crate::database::attribution::scope_database_workload_result(
                 pioneer_observability::DatabaseWorkload::TaskReconcile,
+                pioneer_observability::DatabaseOperationSite::TaskChildReconcile,
                 background.reconcile_terminal_task_child_turns_with_retry(64),
             )
             .await

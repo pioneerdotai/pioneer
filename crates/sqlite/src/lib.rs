@@ -6,7 +6,9 @@ use std::pin::Pin;
 use std::time::Duration;
 
 mod database;
+mod query_scope;
 mod reader;
+pub use query_scope::DiagnosticStream;
 mod writer;
 
 pub use database::{SqliteDatabase, SqliteReadTransaction};

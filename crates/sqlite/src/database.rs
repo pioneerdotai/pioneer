@@ -1,4 +1,6 @@
+use crate::query_scope::{DiagnosticStream, ScopedFuture, observe_control, open_stream};
 use async_trait::async_trait;
+use pioneer_observability::query_cpu::{self, QueryScope};
 use sea_orm::{
     AccessMode, ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, DbErr,
     ExecResult, IsolationLevel, QueryResult, Statement, StreamTrait, TransactionError,
@@ -81,15 +83,16 @@ impl SqliteReadPool {
             let _startup_execute = pioneer_observability::turn_startup::current_stage(
                 pioneer_observability::turn_startup::Stage::DbExecute,
             );
-            let row = self
-                .connection
-                .query_one_raw(Statement::from_string(
+            let row = observe_control(
+                self.connection.query_one_raw(Statement::from_string(
                     DbBackend::Sqlite,
                     "PRAGMA query_only".to_owned(),
-                ))
-                .instrument(reader_pool_span(class))
-                .await?
-                .ok_or_else(|| DbErr::Custom("PRAGMA query_only returned no row".to_owned()))?;
+                )),
+                "bootstrap",
+            )
+            .instrument(reader_pool_span(class))
+            .await?
+            .ok_or_else(|| DbErr::Custom("PRAGMA query_only returned no row".to_owned()))?;
             Ok(row.try_get::<i64>("", "query_only")? != 0)
         }
         .await;
@@ -108,8 +111,7 @@ impl SqliteReadPool {
             let _startup_execute = pioneer_observability::turn_startup::current_stage(
                 pioneer_observability::turn_startup::Stage::DbExecute,
             );
-            self.connection
-                .ping()
+            observe_control(self.connection.ping(), "ping")
                 .instrument(reader_pool_span(class))
                 .await
         }
@@ -147,8 +149,7 @@ impl SqliteReadPool {
             let _startup_execute = pioneer_observability::turn_startup::current_stage(
                 pioneer_observability::turn_startup::Stage::DbExecute,
             );
-            self.connection
-                .query_one_raw(statement)
+            query_cpu::observe(self.connection.query_one_raw(statement))
                 .instrument(reader_pool_span(class))
                 .await
         }
@@ -173,8 +174,7 @@ impl SqliteReadPool {
             let _startup_execute = pioneer_observability::turn_startup::current_stage(
                 pioneer_observability::turn_startup::Stage::DbExecute,
             );
-            self.connection
-                .query_all_raw(statement)
+            query_cpu::observe(self.connection.query_all_raw(statement))
                 .instrument(reader_pool_span(class))
                 .await
         }
@@ -196,9 +196,7 @@ impl SqliteReadPool {
         let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
         let result = async {
             let permit = self.acquire(class).await?;
-            let stream = self
-                .connection
-                .stream_raw(statement)
+            let stream = open_stream(self.connection.stream_raw(statement))
                 .instrument(reader_pool_span(class))
                 .await?;
             Ok((stream, permit))
@@ -217,11 +215,13 @@ impl SqliteReadPool {
         let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
         let result = async {
             let permit = self.acquire(class).await?;
-            let transaction = self
-                .connection
-                .begin_with_config(None, Some(AccessMode::ReadOnly))
-                .instrument(reader_pool_span(class))
-                .await?;
+            let transaction = observe_control(
+                self.connection
+                    .begin_with_config(None, Some(AccessMode::ReadOnly)),
+                "begin",
+            )
+            .instrument(reader_pool_span(class))
+            .await?;
             Ok((transaction, permit))
         }
         .await;
@@ -274,12 +274,14 @@ impl SqliteReadTransaction {
     }
 
     pub async fn commit(mut self) -> Result<(), DbErr> {
-        let result = self
-            .inner
-            .take()
-            .expect("SQLite read transaction was already completed")
-            .commit()
-            .await;
+        let result = observe_control(
+            self.inner
+                .take()
+                .expect("SQLite read transaction was already completed")
+                .commit(),
+            "commit",
+        )
+        .await;
         self._maintenance_permit.take();
         if let Some(operation) = self.operation.as_mut() {
             operation.finish(if result.is_ok() {
@@ -293,12 +295,14 @@ impl SqliteReadTransaction {
     }
 
     pub async fn rollback(mut self) -> Result<(), DbErr> {
-        let result = self
-            .inner
-            .take()
-            .expect("SQLite read transaction was already completed")
-            .rollback()
-            .await;
+        let result = observe_control(
+            self.inner
+                .take()
+                .expect("SQLite read transaction was already completed")
+                .rollback(),
+            "rollback",
+        )
+        .await;
         self._maintenance_permit.take();
         if let Some(operation) = self.operation.as_mut() {
             operation.finish(if result.is_ok() {
@@ -309,6 +313,17 @@ impl SqliteReadTransaction {
         }
         self.operation.take();
         result
+    }
+}
+
+// Drop-triggered rollback is its own control command, never a successful SQL query.
+impl Drop for SqliteReadTransaction {
+    fn drop(&mut self) {
+        if self.inner.is_some() {
+            let scope = QueryScope::control("rollback_drop");
+            let _entered = scope.enter();
+            drop(self.inner.take());
+        }
     }
 }
 
@@ -339,12 +354,12 @@ impl ConnectionTrait for SqliteReadTransaction {
 
     async fn query_one_raw(&self, statement: Statement) -> Result<Option<QueryResult>, DbErr> {
         SqliteReadPool::ensure_read_statement(&statement)?;
-        self.inner().query_one_raw(statement).await
+        query_cpu::observe(self.inner().query_one_raw(statement)).await
     }
 
     async fn query_all_raw(&self, statement: Statement) -> Result<Vec<QueryResult>, DbErr> {
         SqliteReadPool::ensure_read_statement(&statement)?;
-        self.inner().query_all_raw(statement).await
+        query_cpu::observe(self.inner().query_all_raw(statement)).await
     }
 
     fn support_returning(&self) -> bool {
@@ -357,7 +372,7 @@ impl ConnectionTrait for SqliteReadTransaction {
 }
 
 impl StreamTrait for SqliteReadTransaction {
-    type Stream<'a> = TransactionStream<'a>;
+    type Stream<'a> = DiagnosticStream<TransactionStream<'a>>;
 
     fn get_database_backend(&self) -> DbBackend {
         StreamTrait::get_database_backend(self.inner())
@@ -369,7 +384,15 @@ impl StreamTrait for SqliteReadTransaction {
     ) -> Pin<Box<dyn Future<Output = Result<Self::Stream<'a>, DbErr>> + 'a + Send>> {
         Box::pin(async move {
             SqliteReadPool::ensure_read_statement(&statement)?;
-            self.inner().stream_raw(statement).await
+            let scope = QueryScope::new();
+            let result = ScopedFuture::new(self.inner().stream_raw(statement), &scope).await;
+            match result {
+                Ok(stream) => Ok(DiagnosticStream::new(stream, scope)),
+                Err(error) => {
+                    scope.finish(false);
+                    Err(error)
+                }
+            }
         })
     }
 }

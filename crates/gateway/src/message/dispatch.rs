@@ -4462,7 +4462,7 @@ impl MessageProcessor {
                     match serde_json::from_value::<ThreadTreeParams>(params_value) {
                         Ok(params) => {
                             crate::database::attribution::scope_database_workload(
-                                pioneer_observability::DatabaseWorkload::ThreadTreeLoad,
+                                pioneer_observability::DatabaseWorkload::ThreadTreeLoad, pioneer_observability::DatabaseOperationSite::ThreadTreeLoad,
                                 self.thread_tree(
                                     &context,
                                     admission.workspace().expect(
@@ -4838,7 +4838,7 @@ impl MessageProcessor {
                                 .expect("central admission supplies thread proof");
                             debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
                             crate::database::attribution::scope_database_workload(
-                                pioneer_observability::DatabaseWorkload::TimelinePage,
+                                pioneer_observability::DatabaseWorkload::TimelinePage, pioneer_observability::DatabaseOperationSite::TimelinePage,
                                 self.thread_timeline_page(&context, proof, request.id, params),
                             )
                                 .await;

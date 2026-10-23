@@ -1200,6 +1200,7 @@ impl MessageProcessor {
         let handle = tokio::spawn(async move {
             crate::database::attribution::scope_database_workload_result(
                 pioneer_observability::DatabaseWorkload::SkillsWatch,
+                pioneer_observability::DatabaseOperationSite::SkillsWatch,
                 run(this, worker_stop).map(Ok::<_, anyhow::Error>),
             )
             .await

@@ -99,6 +99,93 @@ impl DatabaseWorkload {
     }
 }
 
+/// Fixed initiating boundaries, independent of domain identifiers and SQL text.
+/// This records instrumented operations, not an arbitrary async call stack.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum DatabaseOperationSite {
+    Unknown,
+    EpisodicMaintenanceRound,
+    ZstdMaintenance,
+    ThreadTreeLoad,
+    TimelinePage,
+    TurnEventCommit,
+    AgentProgress,
+    ExecutionOwnerHeartbeat,
+    ProjectionReplay,
+    PreparedFinalizationReconcile,
+    NativeEventDelivery,
+    TaskChildReconcile,
+    TaskOccurrenceReconcile,
+    TaskDelivery,
+    StaleSkillUploadCleanup,
+    CliCommandHeartbeat,
+    QueuedExecutionPromotion,
+    AgentOutboxWake,
+    AgentGraphNotification,
+    TerminalExecutionCompaction,
+    NativeTerminalEffectRequeue,
+    NativeTerminalEffectPurge,
+    AgentActionOutbox,
+    ExecutionTimeoutPoll,
+    ExecutionTimeoutApply,
+    RecoveryTerminalizationAudit,
+    RecoveryTerminalizationApply,
+    RecoveryJobs,
+    RecoveryEventApply,
+    StaleCliTurnFailure,
+    HookRecovery,
+    TaskEventFanout,
+    SkillsWatch,
+    HtmlPreviewQuantum,
+    FrozenStorageBatch,
+    NativeEventCleanupQuantum,
+    ProjectionReceiptCleanupQuantum,
+}
+
+impl DatabaseOperationSite {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::EpisodicMaintenanceRound => "episodic_maintenance_round",
+            Self::ZstdMaintenance => "zstd_maintenance",
+            Self::ThreadTreeLoad => "thread_tree_load",
+            Self::TimelinePage => "timeline_page",
+            Self::TurnEventCommit => "turn_event_commit",
+            Self::AgentProgress => "agent_progress",
+            Self::ExecutionOwnerHeartbeat => "execution_owner_heartbeat",
+            Self::ProjectionReplay => "projection_replay",
+            Self::PreparedFinalizationReconcile => "prepared_finalization_reconcile",
+            Self::NativeEventDelivery => "native_event_delivery",
+            Self::TaskChildReconcile => "task_child_reconcile",
+            Self::TaskOccurrenceReconcile => "task_occurrence_reconcile",
+            Self::TaskDelivery => "task_delivery",
+            Self::StaleSkillUploadCleanup => "stale_skill_upload_cleanup",
+            Self::CliCommandHeartbeat => "cli_command_heartbeat",
+            Self::QueuedExecutionPromotion => "queued_execution_promotion",
+            Self::AgentOutboxWake => "agent_outbox_wake",
+            Self::AgentGraphNotification => "agent_graph_notification",
+            Self::TerminalExecutionCompaction => "terminal_execution_compaction",
+            Self::NativeTerminalEffectRequeue => "native_terminal_effect_requeue",
+            Self::NativeTerminalEffectPurge => "native_terminal_effect_purge",
+            Self::AgentActionOutbox => "agent_action_outbox",
+            Self::ExecutionTimeoutPoll => "execution_timeout_poll",
+            Self::ExecutionTimeoutApply => "execution_timeout_apply",
+            Self::RecoveryTerminalizationAudit => "recovery_terminalization_audit",
+            Self::RecoveryTerminalizationApply => "recovery_terminalization_apply",
+            Self::RecoveryJobs => "recovery_jobs",
+            Self::RecoveryEventApply => "recovery_event_apply",
+            Self::StaleCliTurnFailure => "stale_cli_turn_failure",
+            Self::HookRecovery => "hook_recovery",
+            Self::TaskEventFanout => "task_event_fanout",
+            Self::SkillsWatch => "skills_watch",
+            Self::HtmlPreviewQuantum => "html_preview_quantum",
+            Self::FrozenStorageBatch => "frozen_storage_batch",
+            Self::NativeEventCleanupQuantum => "native_event_cleanup_quantum",
+            Self::ProjectionReceiptCleanupQuantum => "projection_receipt_cleanup_quantum",
+        }
+    }
+}
+
 const _: () = assert!(
     DatabaseWorkload::CARDINALITY
         * DATABASE_WORKLOAD_OUTCOME_CARDINALITY
@@ -181,6 +268,7 @@ impl DatabaseWorkloadQueryStats {
 #[derive(Debug)]
 struct DatabaseWorkloadState {
     workload: DatabaseWorkload,
+    site: DatabaseOperationSite,
     query_stats: Mutex<DatabaseWorkloadQueryStats>,
 }
 
@@ -204,6 +292,10 @@ impl DatabaseWorkloadContext {
         self.state.workload
     }
 
+    pub fn site(&self) -> DatabaseOperationSite {
+        self.state.site
+    }
+
     pub fn record_query(&self, fingerprint: u64, kind: DatabaseQueryKind, elapsed: Duration) {
         self.state.lock().record(fingerprint, kind, elapsed);
     }
@@ -222,11 +314,16 @@ pub struct DatabaseWorkloadTrace {
 
 impl DatabaseWorkloadTrace {
     pub fn start(workload: DatabaseWorkload) -> Self {
+        Self::start_at(workload, DatabaseOperationSite::Unknown)
+    }
+
+    pub fn start_at(workload: DatabaseWorkload, site: DatabaseOperationSite) -> Self {
         let (telemetry_enabled, consent_generation) = super::telemetry_consent_snapshot();
         Self {
             context: DatabaseWorkloadContext {
                 state: Arc::new(DatabaseWorkloadState {
                     workload,
+                    site,
                     query_stats: Mutex::new(DatabaseWorkloadQueryStats::default()),
                 }),
             },

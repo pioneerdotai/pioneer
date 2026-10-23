@@ -3495,6 +3495,7 @@ impl MessageProcessor {
         let result = match message_fresh_task(
             crate::database::attribution::scope_database_workload_result(
                 pioneer_observability::DatabaseWorkload::TurnEventCommit,
+                pioneer_observability::DatabaseOperationSite::TurnEventCommit,
                 async move {
                     if let Some(guard) = cli_blocked_guard {
                         let pioneer_crud::CanonicalTurnEventPayload::TurnBlocked(notification) =
@@ -5160,6 +5161,7 @@ impl MessageProcessor {
     pub(super) async fn handle_progress_agent_event(&self, event: AgentProgressEvent) {
         crate::database::attribution::scope_database_workload(
             pioneer_observability::DatabaseWorkload::AgentProgress,
+            pioneer_observability::DatabaseOperationSite::AgentProgress,
             pioneer_observability::turn_startup::scope_stage(
                 Some(match &event {
                     AgentProgressEvent::ItemDelta { notification } => notification.turn_id.clone(),

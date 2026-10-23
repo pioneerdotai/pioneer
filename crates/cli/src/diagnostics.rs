@@ -113,6 +113,15 @@ pub(crate) fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
         }
     };
     println!("{}", serde_json::to_string_pretty(&result)?);
+    if let Some(sql_cpu) = result.get("sql_cpu") {
+        eprintln!(
+            "local SQL CPU: {}; coverage and independent capture window are in the manifest and sql-cpu.json",
+            sql_cpu
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+        );
+    }
     ensure!(
         result.get("status").and_then(|v| v.as_str()) != Some("failed"),
         "capture_failed; inspect the emitted manifest reasons"

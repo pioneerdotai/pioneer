@@ -3367,7 +3367,7 @@ impl ThreadEpisodicIndexExecutor {
                     let result = tokio::select! { biased;
                         _ = stopping.cancelled() => return,
                         result = crate::database::attribution::scope_database_workload_result(
-                            pioneer_observability::DatabaseWorkload::EpisodicMaintenance,
+                            pioneer_observability::DatabaseWorkload::EpisodicMaintenance, pioneer_observability::DatabaseOperationSite::EpisodicMaintenanceRound,
                             executor.run_once(executor.now_unix()),
                         ) => result
                     };
