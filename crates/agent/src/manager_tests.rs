@@ -10758,6 +10758,113 @@ async fn memory_identity_flow_preflight_provider_owned_active_recall_contributes
     );
 }
 
+// Covers the native runtime snapshot and real preflight orchestrator boundary.
+// Gateway regressions separately exercise the server ACL and shared retrieval.
+struct RecordingWorkspaceRecallProvider {
+    allowed: bool,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl pioneer_memory::hooks::AgentEpisodicRecallProvider for RecordingWorkspaceRecallProvider {
+    async fn recall_capabilities(
+        &self,
+        _context: MemoryTurnContext,
+    ) -> pioneer_memory::hooks::MemoryEpisodicRecallCapabilities {
+        pioneer_memory::hooks::MemoryEpisodicRecallCapabilities {
+            current_thread_search: true,
+            related_thread_search: self.allowed,
+            workspace_thread_search: self.allowed,
+            ..Default::default()
+        }
+    }
+
+    async fn recall_workspace_threads(
+        &self,
+        request: pioneer_memory::hooks::MemoryWorkspaceThreadRecallRequest,
+    ) -> Result<pioneer_memory::hooks::MemoryEpisodicRecallResponse, String> {
+        assert_eq!(request.turn_id, "turn_workspace_preflight");
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(pioneer_memory::hooks::MemoryEpisodicRecallResponse::default())
+    }
+}
+
+#[tokio::test]
+async fn production_preflight_uses_installed_episodic_capabilities_before_executing_provider_plan()
+{
+    for allowed in [true, false] {
+        let provider = Arc::new(CaptureAgentProvider::with_preflight_response(json!({
+            "tools":{"visibleTools":[]},
+            "memory":{"activeRecall":{
+                "durable":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":[],"targets":[]},
+                "episodic":{"status":"run","reasonCode":"provider_run","confidence":0.9,
+                    "queries":[{"mode":"workspace_thread","query":"provider configuration","targets":[]}]}
+            }}
+        }).to_string()));
+        let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+        let mut config = test_tool_loop_config();
+        config.memory.active_recall.mode = super::MemoryActiveRecallMode::Hybrid;
+        let manager = AgentManager::new(registry, config);
+        manager
+            .set_memory_provider(Some(Arc::new(
+                RecordingMemoryProvider::with_recall_sequence(
+                    vec![Ok(MemoryRecallSnapshot::empty())],
+                    Ok(MemoryToolMaterialization {
+                        bundles: vec![fake_standard_memory_tool_bundle()],
+                        diagnostics: Vec::new(),
+                    }),
+                ),
+            )))
+            .await;
+        let episodic = Arc::new(RecordingWorkspaceRecallProvider {
+            allowed,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        manager
+            .set_memory_episodic_recall_provider(Some(episodic.clone()))
+            .await;
+        install_configured_memory_hooks_for_test(&manager).await;
+        let observed = start_simple_turn(
+            &manager,
+            "thr_workspace_preflight",
+            "ws_workspace_preflight",
+            "turn_workspace_preflight",
+            ThreadMode::Agent,
+            "capture",
+            "Where did we discuss provider configuration in other conversations?",
+        )
+        .await;
+        assert_turn_completed(&observed);
+        let requests = provider.snapshot_all_requests();
+        let preflight = requests
+            .iter()
+            .find(|r| is_turn_preflight_request(r))
+            .expect("real preflight call");
+        let input: serde_json::Value = serde_json::from_str(
+            preflight.messages[0]
+                .content
+                .split_once("Structured input JSON:\n")
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        // The response above always asks for workspace retrieval. Advertising
+        // and execution must still depend on the installed provider's authority.
+        assert_eq!(
+            input["memory"]["activeRecall"]["decisionRequest"]["availableEpisodicModes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mode| mode == "workspace_thread"),
+            allowed
+        );
+        assert_eq!(
+            episodic.calls.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(allowed)
+        );
+    }
+}
+
 #[tokio::test]
 async fn preflight_memory_active_recall_disabled_suppresses_provider_plan() {
     let preflight_response = json!({

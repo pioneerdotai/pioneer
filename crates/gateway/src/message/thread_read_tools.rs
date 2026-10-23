@@ -38,7 +38,7 @@ pub(crate) fn thread_read_tool_specs() -> Vec<ConfiguredToolSpec> {
         (
             "threads_search",
             "Search accessible indexed conversations in the current workspace. Automatically combines lexical and compatible semantic retrieval. Returns bounded thread cards and exact sources usable with threads_history_read. limit counts fragments (1..20). Continue with the same query, limit and nextCursor within five minutes; pages use a fixed selection and recheck current access/content. eof ends this selection only; limitations describes incomplete coverage, capped selection, approximate semantic retrieval and lexical fallback. Start a new search to refresh.",
-            json!({"query":{"type":"string","minLength":1,"maxLength":4096},"limit":{"type":"integer","minimum":1,"maximum":20},"cursor":cursor}),
+            json!({"query":{"type":"string","minLength":1,"maxLength":4096,"description":"Nonempty after trimming; at most 4096 UTF-8 bytes (checked by the server). maxLength separately bounds Unicode characters, not bytes."},"limit":{"type":"integer","minimum":1,"maximum":20},"cursor":cursor}),
             vec!["query", "limit"],
         ),
         (

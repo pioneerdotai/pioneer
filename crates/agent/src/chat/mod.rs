@@ -51,10 +51,8 @@ use pioneer_hooks::{
     TurnPrePromptContextHookInput,
 };
 use pioneer_memory::hooks::{
-    MemoryEpisodicRecallCapabilities, MemoryTurnContext, MemoryTurnPolicy,
-    active_recall_thread_episodic_summary,
-    build_active_recall_local_preflight_plan_with_thread_summary,
-    deterministic_recall_context_summary, memory_turn_policy_from_hook_policy_set,
+    MemoryTurnContext, MemoryTurnPolicy, deterministic_recall_context_summary,
+    memory_turn_policy_from_hook_policy_set,
 };
 use pioneer_promt::{
     CompiledInstructionDeliveryPlan, CompiledPromptBundle, ExecutionContinuationRuntimeFactsInput,
@@ -2096,6 +2094,7 @@ async fn run_agent_turn_preflight_stage(
     thread_id: &str,
     turn_id: &str,
     hook_runtime_context: &AgentTurnHookRuntimeContext,
+    episodic_provider: Option<&Arc<dyn pioneer_memory::hooks::AgentEpisodicRecallProvider>>,
     input_text: &str,
 ) -> TurnPreflightOrchestratorResult {
     let memory_config = tool_loop_config.memory.active_recall.normalized();
@@ -2133,35 +2132,16 @@ async fn run_agent_turn_preflight_stage(
             .then(|| hook_runtime_context.actor_id.clone())
             .flatten(),
     };
-    let episodic_capabilities = MemoryEpisodicRecallCapabilities {
-        current_thread_search: !memory_context
-            .effective_conversation_thread_id()
-            .trim()
-            .is_empty(),
-        related_thread_search: false,
-        workspace_thread_search: false,
-        full_input_query: false,
-        current_task_context: hook_runtime_context
-            .task_id
-            .as_ref()
-            .is_some_and(|task_id| !task_id.trim().is_empty()),
-        completed_task_summary: false,
-    };
-    let thread_episodic_summary = active_recall_thread_episodic_summary(
-        &hook_prompt_context_set,
-        &memory_context,
-        &episodic_capabilities,
-    );
-    let active_recall = build_active_recall_local_preflight_plan_with_thread_summary(
+    let active_recall = pioneer_memory::hooks::prepare_active_recall_preflight(
         &memory_context,
         &prompt_context_input,
         &memory_policy,
         &memory_config,
-        &deterministic_summary,
-        episodic_capabilities,
-        thread_episodic_summary,
+        &hook_prompt_context_set,
+        episodic_provider,
         true,
-    );
+    )
+    .await;
     let input_text_char_count = input_text.chars().count();
     let input_text_preview = active_recall.decision_context.input_text_preview.clone();
     let turn = TurnPreflightTurnInput {
@@ -2683,6 +2663,9 @@ pub(super) async fn execute_chat_turn_flow(
     turn_finalization_provider: Option<Arc<dyn TurnFinalizationProvider>>,
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     hook_runtime: Option<Arc<HookRuntime>>,
+    memory_episodic_recall_provider: Option<
+        Arc<dyn pioneer_memory::hooks::AgentEpisodicRecallProvider>,
+    >,
     tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
     permission_approval_broker: Arc<dyn PermissionApprovalBroker>,
     turn_control: TurnExecutionControl,
@@ -2775,6 +2758,7 @@ pub(super) async fn execute_chat_turn_flow(
                 turn_finalization_provider,
                 task_tool_provider,
                 hook_runtime,
+                memory_episodic_recall_provider,
                 tool_bundle_artifacts,
                 permission_approval_broker,
                 turn_control.clone(),
@@ -3471,6 +3455,9 @@ async fn execute_agent_provider_response(
     turn_finalization_provider: Option<Arc<dyn TurnFinalizationProvider>>,
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     hook_runtime: Option<Arc<HookRuntime>>,
+    memory_episodic_recall_provider: Option<
+        Arc<dyn pioneer_memory::hooks::AgentEpisodicRecallProvider>,
+    >,
     tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
     permission_approval_broker: Arc<dyn PermissionApprovalBroker>,
     turn_control: TurnExecutionControl,
@@ -3875,6 +3862,7 @@ async fn execute_agent_provider_response(
             thread_id,
             turn_id,
             &hook_runtime_context,
+            memory_episodic_recall_provider.as_ref(),
             user_input_text.as_str(),
         )
         .await;
@@ -4222,6 +4210,7 @@ async fn execute_agent_provider_response(
         thread_id,
         turn_id,
         &hook_runtime_context,
+        memory_episodic_recall_provider.as_ref(),
         user_input_text.as_str(),
     )
     .await;

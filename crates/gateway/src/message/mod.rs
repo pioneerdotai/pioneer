@@ -2084,7 +2084,9 @@ impl MessageProcessor {
             Ok(builder) => {
                 let runtime = builder.build();
                 *self.hook_runtime.write().await = Some(runtime.clone());
-                self.agent_manager.set_hook_runtime(Some(runtime)).await;
+                self.agent_manager
+                    .set_memory_hook_runtime(runtime, episodic_provider)
+                    .await;
             }
             Err(error) => {
                 error!(error = %error, "failed to install memory hook package");

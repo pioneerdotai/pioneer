@@ -1251,35 +1251,64 @@ async fn prior_current_thread_prompt_is_reused_and_workspace_context_uses_only_r
 }
 
 #[tokio::test]
-async fn a_completed_empty_current_thread_search_is_reused_without_a_global_cache() {
-    let mut receipt = HookDiagnostic::new(
-        HookDiagnosticCode::new("thread_context.search_empty").unwrap(),
-        HookDiagnosticMessage::new(crate::episodic_search::episodic_query_fingerprint(
-            "ws",
-            "thr",
-            "turn",
-            "provider configuration",
-        ))
-        .unwrap(),
-        HookDiagnosticSeverity::Info,
+async fn aggregator_truncation_does_not_exclude_sources_that_were_not_shown() {
+    let unseen_id = "thread:old-turn/unseen/projection";
+    let prior = HookPromptContextSet::aggregate_contributions(
+        [PromptContextContribution {
+            contribution_id: HookContributionId::new(MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID)
+                .unwrap(),
+            domain: HookDomain::new("thread_context").unwrap(),
+            priority: 480,
+            content: HookPromptContent::new(format!(
+                "{}\nunseen provider decision",
+                "shown ".repeat(30)
+            ))
+            .unwrap(),
+            max_chars: None,
+            source_refs: vec![HookSourceRef {
+                kind: HookSourceKind::from("thread"),
+                id: HookSourceId::new(unseen_id).unwrap(),
+                label: None,
+            }],
+            diagnostics: Vec::new(),
+            truncated: false,
+        }],
+        HookPromptContextLimits {
+            max_entries: 1,
+            max_total_chars: 100,
+        },
     );
-    receipt.safe_for_user = true;
-    let prior = HookPromptContextSet {
-        diagnostics: vec![receipt],
-        ..Default::default()
-    };
-    let episodic = Arc::new(FakeEpisodicRecallProvider::with_capabilities(
-        MemoryEpisodicRecallCapabilities {
+    assert!(prior.entries().next().unwrap().truncated);
+    assert!(
+        !prior
+            .entries()
+            .next()
+            .unwrap()
+            .content
+            .as_str()
+            .contains("unseen")
+    );
+    assert_eq!(prior.entries().next().unwrap().source_refs.len(), 1);
+    let mut episodic =
+        FakeEpisodicRecallProvider::with_capabilities(MemoryEpisodicRecallCapabilities {
             current_thread_search: true,
             ..Default::default()
-        },
-    ));
+        });
+    episodic.current_thread.items = vec![episodic_item(
+        unseen_id,
+        MemoryEpisodicRecallSourceKind::CurrentThread,
+        "unseen provider decision",
+    )];
+    let episodic = Arc::new(episodic);
     let hook = ActiveMemoryRecallHook {
         memory_provider: Arc::new(TestRecallMemoryProvider::with_recall(
             MemoryRecallSnapshot::empty(),
         )),
         episodic_provider: Some(episodic.clone()),
-        config: MemoryActiveRecallConfig::default(),
+        config: MemoryActiveRecallConfig {
+            max_prompt_chars: 600,
+            ..Default::default()
+        },
     };
     let plan = parse_active_memory_decision_json(r#"{"durable":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":[],"targets":[]},"episodic":{"status":"run","reasonCode":"provider_run","confidence":0.9,"queries":[{"mode":"current_thread","query":"provider configuration","targets":[]}]}}"#).unwrap();
     let mut request = test_active_prompt_context_hook_request(
@@ -1296,6 +1325,18 @@ async fn a_completed_empty_current_thread_search_is_reused_without_a_global_cach
         .with_active_memory_recall_preflight_plan(serde_json::to_value(plan).unwrap()),
     );
     let response = hook.execute(request).await.unwrap();
-    assert!(episodic.calls().is_empty());
-    assert!(prompt_context_contributions(&response).is_empty());
+    assert_eq!(episodic.calls(), vec!["current_thread"]);
+    let contributions = prompt_context_contributions(&response);
+    assert!(
+        contributions
+            .iter()
+            .any(|c| c.content.as_str().contains("unseen provider decision"))
+    );
+    assert!(
+        100 + contributions
+            .iter()
+            .map(|c| c.content.as_str().chars().count())
+            .sum::<usize>()
+            <= 600
+    );
 }

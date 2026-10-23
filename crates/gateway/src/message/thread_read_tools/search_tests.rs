@@ -23,6 +23,9 @@ struct RecordingBackend {
     calls: AtomicUsize,
     semantic_calls: AtomicUsize,
     fail_semantic: AtomicBool,
+    complete: AtomicBool,
+    unavailable: AtomicBool,
+    queries: std::sync::Mutex<Vec<String>>,
 }
 #[async_trait]
 impl ThreadEpisodicMemvidBackend for RecordingBackend {
@@ -43,10 +46,18 @@ impl ThreadEpisodicMemvidBackend for RecordingBackend {
     }
     async fn source_candidates(
         &self,
-        _: ThreadEpisodicMemvidSearchRequest,
+        request: ThreadEpisodicMemvidSearchRequest,
         embedding: Option<EpisodicQueryEmbedding>,
+        _capacity: Arc<tokio::sync::OwnedSemaphorePermit>,
     ) -> EpisodicChannelCandidates {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.queries.lock().unwrap().push(request.query);
+        if self.unavailable.load(Ordering::SeqCst) {
+            return EpisodicChannelCandidates {
+                unavailable: true,
+                ..Default::default()
+            };
+        }
         if embedding.is_some() {
             self.semantic_calls.fetch_add(1, Ordering::SeqCst);
             if self.fail_semantic.load(Ordering::SeqCst) {
@@ -58,7 +69,7 @@ impl ThreadEpisodicMemvidBackend for RecordingBackend {
         }
         EpisodicChannelCandidates {
             partitions: vec![self.hits.lock().unwrap().clone()],
-            coverage_limited: true,
+            coverage_limited: !self.complete.load(Ordering::SeqCst),
             unavailable: false,
         }
     }
@@ -118,14 +129,13 @@ async fn canonical_source_for(
                 workspace_id: WORKSPACE_RED_ID.into(),
                 thread_id: thread_id.into(),
                 turn_id: turn_id.clone(),
-                timestamp: 1_700_000_000,
                 item: TurnItem::UserMessage {
                     id: item_id.clone(),
                     text: text.into(),
                     attachments: Vec::new(),
                 },
             },
-            None,
+            1_700_000_000,
         )
         .await
         .unwrap();
@@ -552,6 +562,38 @@ async fn hybrid_embeds_query_once_and_pages_do_not_reembed_with_lexical_fallback
         2,
         "failed embedding does not call vector retrieval"
     );
+    // Approximation alone is successful; a failed configured channel is not.
+    provider.fail.store(false, Ordering::SeqCst);
+    backend.complete.store(true, Ordering::SeqCst);
+    backend.hits.lock().unwrap().clear();
+    let processor = Arc::new(processor);
+    let runtime = installed_recall_runtime(&processor).await;
+    for degraded in [false, true] {
+        backend.fail_semantic.store(degraded, Ordering::SeqCst);
+        let request = recall_phase(&context, "provider configuration");
+        let prior = aggregate_recall_phase(runtime.run_phase(request.clone()).await.unwrap());
+        assert_eq!(
+            prior
+                .diagnostics
+                .iter()
+                .any(|d| d.code.as_str() == "thread_context.search_empty"),
+            !degraded
+        );
+        let before = backend.calls.load(Ordering::SeqCst);
+        runtime
+            .run_phase(post_recall_phase(
+                request,
+                prior,
+                "provider configuration",
+                episodic_plan("current_thread", "provider configuration"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst) - before,
+            if degraded { 2 } else { 0 }
+        );
+    }
 }
 
 #[tokio::test]
@@ -621,7 +663,7 @@ async fn canonical_validation_suppresses_deleted_excluded_hidden_stale_and_missi
             &excluded.source_id,
         ),
         (
-            "UPDATE thread_episodic_items SET visibility='hidden' WHERE id=?",
+            "UPDATE thread_episodic_items SET visibility='internal_hidden' WHERE id=?",
             &hidden.source_id,
         ),
         (
@@ -782,4 +824,287 @@ async fn causal_projections_are_one_result_but_independent_equal_text_remains_se
     assert_eq!(output.sources[0].reference.source_id, original.source_id);
     assert_eq!(output.sources[1].reference.source_id, independent.source_id);
     assert!((output.sources[0].score - 1.0 / 61.0).abs() < 0.00001);
+}
+
+async fn installed_recall_runtime(
+    processor: &Arc<MessageProcessor>,
+) -> Arc<pioneer_hooks::HookRuntime> {
+    let mut config = processor.memory_loop_config();
+    config.active_recall = pioneer_memory::hooks::MemoryActiveRecallConfig::default();
+    processor.apply_memory_loop_config(config);
+    processor.bind_memory_bridge().await;
+    processor.hook_runtime.read().await.clone().unwrap()
+}
+
+// These requests traverse the installed production hook packages and runtime
+// redaction, then aggregate and hand the result to the post-preflight phase.
+fn recall_phase(context: &TurnToolContext, query: &str) -> pioneer_hooks::HookPhaseRequest {
+    use pioneer_hooks::*;
+    let mut request = crate::thread_episodic_hooks::tests::test_phase_request(
+        pioneer_memory::hooks::MemoryTurnPolicy::normal_default_allow(),
+    );
+    request.context.workspace_id = Some(HookWorkspaceId::new(&context.workspace_id).unwrap());
+    request.context.thread_id = Some(HookThreadId::new(&context.thread_id).unwrap());
+    request.context.turn_id = Some(HookTurnId::new(&context.turn_id).unwrap());
+    request.input = HookInput::turn_pre_prompt_context(TurnPrePromptContextHookInput::from_parts(
+        query,
+        Some("test-model"),
+        Some("test-provider"),
+    ));
+    request
+}
+
+fn aggregate_recall_phase(
+    response: pioneer_hooks::HookPhaseResponse,
+) -> pioneer_hooks::HookPromptContextSet {
+    use pioneer_hooks::*;
+    let mut context = HookPromptContextSet::aggregate_contributions(
+        response.contributions.into_iter().filter_map(|c| match c {
+            HookContribution::PromptContext(c) => Some(c),
+            _ => None,
+        }),
+        HookPromptContextLimits::default(),
+    );
+    context.diagnostics.extend(response.diagnostics);
+    context
+}
+
+fn episodic_plan(mode: &str, query: &str) -> Value {
+    json!({"durable":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":[],"targets":[]},
+        "episodic":{"status":"run","reasonCode":"provider_run","confidence":0.9,
+        "queries":[{"mode":mode,"query":query,"targets":[]}]}})
+}
+
+fn post_recall_phase(
+    mut request: pioneer_hooks::HookPhaseRequest,
+    prior: pioneer_hooks::HookPromptContextSet,
+    query: &str,
+    plan: Value,
+) -> pioneer_hooks::HookPhaseRequest {
+    use pioneer_hooks::*;
+    request.phase = HookPhase::TurnPostPreflightPromptContext;
+    request.input = HookInput::turn_post_preflight_prompt_context(
+        TurnPostPreflightPromptContextHookInput::from_parts(
+            query,
+            Some("test-model"),
+            Some("test-provider"),
+        )
+        .with_active_memory_recall_preflight_plan(plan),
+    );
+    request.prompt_context_set = prior;
+    request
+}
+
+#[tokio::test]
+async fn runtime_reuses_only_successfully_completed_empty_search_across_phases() {
+    for (complete, unavailable, expected_calls) in
+        [(true, false, 1), (false, false, 2), (true, true, 2)]
+    {
+        let (_harness, processor, backend, context) = search_fixture().await;
+        backend.complete.store(complete, Ordering::SeqCst);
+        backend.unavailable.store(unavailable, Ordering::SeqCst);
+        let runtime = installed_recall_runtime(&processor).await;
+        let request = recall_phase(&context, "provider configuration");
+        let prior = aggregate_recall_phase(runtime.run_phase(request.clone()).await.unwrap());
+        let receipt = prior
+            .diagnostics
+            .iter()
+            .find(|d| d.code.as_str() == "thread_context.search_empty");
+        assert_eq!(receipt.is_some(), complete && !unavailable);
+        if let Some(receipt) = receipt {
+            assert_eq!(
+                receipt.message.as_str(),
+                pioneer_memory::episodic_search::episodic_query_fingerprint(
+                    WORKSPACE_RED_ID,
+                    &context.thread_id,
+                    &context.turn_id,
+                    "provider configuration",
+                )
+            );
+        }
+        if !complete || unavailable {
+            // Ordinary diagnostics remain redacted by the actual runtime.
+            assert!(
+                prior
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code.as_str() == "thread_context.search_incomplete"
+                        && !d.message.as_str().contains("coverage"))
+            );
+        }
+        runtime
+            .run_phase(post_recall_phase(
+                request,
+                prior,
+                "provider configuration",
+                episodic_plan("current_thread", "provider configuration"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(backend.calls.load(Ordering::SeqCst), expected_calls);
+    }
+}
+
+#[tokio::test]
+async fn current_hook_searches_long_input_while_tool_enforces_documented_utf8_limit() {
+    let (_harness, processor, backend, context) = search_fixture().await;
+    let boundary = "я".repeat(2048);
+    page(&processor, &context, &boundary, None).await.unwrap();
+    for query in ["я".repeat(2049), "я".repeat(3000)] {
+        assert!(query.chars().count() <= 4096);
+        assert!(page(&processor, &context, &query, None).await.is_err());
+    }
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    let long = format!("provider configuration\n{}", "лог с кодом\n".repeat(800));
+    assert!(long.len() > 4096);
+    let runtime = installed_recall_runtime(&processor).await;
+    runtime
+        .run_phase(recall_phase(&context, &long))
+        .await
+        .unwrap();
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(backend.queries.lock().unwrap().last(), Some(&long));
+}
+
+#[tokio::test]
+async fn production_preflight_capabilities_reach_planning_and_runtime_recall_without_expanding_grants()
+ {
+    use pioneer_hooks::*;
+    use pioneer_memory::hooks::*;
+    let (_harness, processor, backend, context) = search_fixture().await;
+    *backend.hits.lock().unwrap() = vec![
+        canonical_source(
+            &processor,
+            THREAD_RED_WORKSPACE_ID,
+            "workspace provider configuration decision",
+        )
+        .await,
+    ];
+    let runtime = installed_recall_runtime(&processor).await;
+    let provider: Arc<dyn AgentEpisodicRecallProvider> = Arc::new(
+        crate::thread_episodic_hooks::ThreadEpisodicMemoryRecallProvider::new(
+            Arc::downgrade(&processor),
+            processor.thread_episodic_recall_service.clone(),
+        ),
+    );
+    let memory_context = MemoryTurnContext {
+        workspace_id: context.workspace_id.clone(),
+        thread_id: context.thread_id.clone(),
+        conversation_thread_id: None,
+        turn_id: context.turn_id.clone(),
+        mode: pioneer_protocol::ThreadMode::Agent,
+        input_text: "where did we discuss provider configuration?".into(),
+        task_id: None,
+        agent_id: None,
+        principal_id: Some(MEMBER_B_ID.into()),
+    };
+    let input = TurnPrePromptContextHookInput::from_parts(
+        &memory_context.input_text,
+        Some("model"),
+        Some("provider"),
+    );
+    // This is the preparation function called by run_agent_turn_preflight_stage,
+    // rather than a capabilities literal or an injected workspace-only plan.
+    let prepared = prepare_active_recall_preflight(
+        &memory_context,
+        &input,
+        &MemoryTurnPolicy::normal_default_allow(),
+        &MemoryActiveRecallConfig::default(),
+        &HookPromptContextSet::default(),
+        Some(&provider),
+        true,
+    )
+    .await;
+    assert!(
+        prepared
+            .decision_request
+            .available_episodic_modes
+            .iter()
+            .any(|m| m == "workspace_thread")
+    );
+    assert!(
+        prepared
+            .decision_request
+            .available_episodic_modes
+            .iter()
+            .any(|m| m == "related_thread")
+    );
+    // Recording planner response chooses a mode actually present in its request.
+    let mode = prepared
+        .decision_request
+        .available_episodic_modes
+        .iter()
+        .find(|m| *m == "workspace_thread")
+        .unwrap();
+    let plan = active_recall_preflight_provider_success(
+        parse_active_memory_decision_json(
+            &episodic_plan(mode, "provider configuration").to_string(),
+        )
+        .unwrap(),
+        None,
+        None,
+    );
+    let phase = post_recall_phase(
+        recall_phase(&context, &memory_context.input_text),
+        HookPromptContextSet::default(),
+        &memory_context.input_text,
+        serde_json::to_value(&plan).unwrap(),
+    );
+    let response = runtime.run_phase(phase.clone()).await.unwrap();
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        response
+            .contributions
+            .iter()
+            .any(|c| matches!(c, HookContribution::PromptContext(c)
+        if c.content.as_str().contains("workspace provider configuration decision")))
+    );
+    let mut envelope = serde_json::to_value(
+        processor
+            .load_turn_execution_authorization_context(&context.turn_id)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    envelope["grant_manifest"]["actions"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|a| a != "thread_observe_workspace");
+    processor
+        .crud_store
+        .set_turn_execution_authorization_context(&context.turn_id, &envelope.to_string())
+        .await
+        .unwrap();
+    let restricted = prepare_active_recall_preflight(
+        &memory_context,
+        &input,
+        &MemoryTurnPolicy::normal_default_allow(),
+        &MemoryActiveRecallConfig::default(),
+        &HookPromptContextSet::default(),
+        Some(&provider),
+        true,
+    )
+    .await;
+    assert!(
+        !restricted
+            .decision_request
+            .available_episodic_modes
+            .iter()
+            .any(|m| m == "workspace_thread" || m == "related_thread")
+    );
+    runtime.run_phase(phase).await.unwrap(); // stale allowed plan is reauthorized
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    let mut missing = memory_context;
+    missing.turn_id = "missing-execution".into();
+    let absent = prepare_active_recall_preflight(
+        &missing,
+        &input,
+        &MemoryTurnPolicy::normal_default_allow(),
+        &MemoryActiveRecallConfig::default(),
+        &HookPromptContextSet::default(),
+        Some(&provider),
+        true,
+    )
+    .await;
+    assert!(!absent.decision_request.episodic_capabilities.any());
 }

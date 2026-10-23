@@ -2537,6 +2537,8 @@ pub(crate) struct NativeTurnRuntimeSnapshot {
     pub(crate) task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     pub(crate) task_cleanup_runtime_contract: Option<String>,
     pub(crate) hook_runtime: Option<Arc<HookRuntime>>,
+    pub(crate) memory_episodic_recall_provider:
+        Option<Arc<dyn pioneer_memory::hooks::AgentEpisodicRecallProvider>>,
     pub(crate) tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
     pub(crate) post_turn_hook_dispatch_policy: AgentPostTurnHookDispatchPolicy,
     pub(crate) interrupted_hook_snapshot: Option<
@@ -2724,6 +2726,7 @@ impl NativeRuntimeDependencies {
                 .as_ref()
                 .map(|provider| provider.terminal_cleanup_runtime_contract().to_owned()),
             hook_runtime: state.hook_runtime.clone(),
+            memory_episodic_recall_provider: state.memory_episodic_recall_provider.clone(),
             tool_bundle_artifacts: state
                 .hook_runtime
                 .as_ref()
@@ -3071,6 +3074,21 @@ impl AgentManager {
         self.runtime_dependencies
             .update_hook_builder_input(move |state| {
                 state.memory_episodic_recall_provider = provider
+            })
+            .await;
+    }
+
+    /// Install matching recall capabilities and hook handlers as one runtime
+    /// generation, so an admitted turn cannot snapshot different providers.
+    pub async fn set_memory_hook_runtime(
+        &self,
+        runtime: Arc<HookRuntime>,
+        episodic_provider: Arc<dyn AgentEpisodicRecallProvider>,
+    ) {
+        self.runtime_dependencies
+            .update(move |state| {
+                state.hook_runtime = Some(runtime);
+                state.memory_episodic_recall_provider = Some(episodic_provider);
             })
             .await;
     }

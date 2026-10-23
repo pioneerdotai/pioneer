@@ -96,7 +96,7 @@ pub use recall::{
     MemoryActiveRecallProviderFallbackContext, active_recall_preflight_provider_fallback,
     active_recall_preflight_provider_success, build_active_recall_local_preflight_plan,
     build_active_recall_local_preflight_plan_with_thread_summary,
-    deterministic_recall_context_summary,
+    deterministic_recall_context_summary, prepare_active_recall_preflight,
 };
 use state::*;
 use synthesis::*;

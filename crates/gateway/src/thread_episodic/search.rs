@@ -34,6 +34,7 @@ pub(crate) struct SourceSearchOutput {
 /// below consumes only the independent lexical/semantic candidate contracts.
 struct MemvidCandidateAdapter<'a> {
     service: &'a ThreadEpisodicRecallService,
+    capacity: Arc<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl MemvidCandidateAdapter<'_> {
@@ -118,6 +119,7 @@ impl MemvidCandidateAdapter<'_> {
                     exact_source: None,
                 },
                 embedding,
+                self.capacity.clone(),
             )
             .await;
         output.coverage_limited |= coverage_limited;
@@ -157,12 +159,11 @@ impl ThreadEpisodicRecallService {
     ) -> Result<SourceSearchOutput>
     where
         F: FnMut(String) -> Fut,
-        Fut: Future<Output = bool>,
+        Fut: Future<Output = Result<bool>>,
     {
-        ensure!(
-            !query.trim().is_empty() && query.len() <= 4096,
-            "query must contain 1..4096 bytes"
-        );
+        // The external tool enforces its byte limit before entering retrieval.
+        // Internal recall retains the full user input and query-specific embedding.
+        ensure!(!query.trim().is_empty(), "query must not be empty");
         let permit = Arc::new(
             self.search_capacity
                 .clone()
@@ -228,7 +229,10 @@ impl ThreadEpisodicRecallService {
         } else {
             None
         };
-        let adapter = MemvidCandidateAdapter { service: self };
+        let adapter = MemvidCandidateAdapter {
+            service: self,
+            capacity: permit,
+        };
         self.search_sources_from_channels(
             query,
             &scope,
@@ -253,7 +257,7 @@ impl ThreadEpisodicRecallService {
     ) -> Result<SourceSearchOutput>
     where
         F: FnMut(String) -> Fut,
-        Fut: Future<Output = bool>,
+        Fut: Future<Output = Result<bool>>,
     {
         let work = EpisodicSearchWork {
             max_partitions: SEARCH_SEGMENTS,
@@ -302,16 +306,19 @@ impl ThreadEpisodicRecallService {
                     let cache_key =
                         serde_json::to_string(&(&candidate.source_id, &candidate.source_version))?;
                     if !validated.contains_key(&cache_key) {
-                        let source = if readable(candidate.thread_id.clone()).await {
-                            match self.validate_search_source(&candidate).await {
+                        let source = match readable(candidate.thread_id.clone()).await {
+                            Ok(true) => match self.validate_search_source(&candidate).await {
                                 Ok(source) => source,
                                 Err(_) => {
                                     limitations.coverage_limited = true;
                                     None
                                 }
+                            },
+                            Ok(false) => None,
+                            Err(_) => {
+                                limitations.coverage_limited = true;
+                                None
                             }
-                        } else {
-                            None
                         };
                         validated.insert(cache_key.clone(), source);
                     }

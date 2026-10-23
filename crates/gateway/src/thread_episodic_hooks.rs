@@ -195,9 +195,12 @@ impl ThreadEpisodicMemoryRecallProvider {
                         message: "episodic semantic retrieval is approximate".to_owned(),
                     });
                 }
-                if result.limitations.coverage_limited || result.limitations.semantic_degraded {
+                if result.limitations.selection_limited
+                    || result.limitations.coverage_limited
+                    || result.limitations.semantic_degraded
+                {
                     output.diagnostics.push(ThreadEpisodicRecallDiagnostic {
-                        code: ThreadEpisodicRecallDiagnosticCode::Completed,
+                        code: ThreadEpisodicRecallDiagnosticCode::SearchIncomplete,
                         message: "episodic search has limited coverage or semantic degradation"
                             .to_owned(),
                     });
@@ -283,24 +286,27 @@ impl AgentEpisodicRecallProvider for ThreadEpisodicMemoryRecallProvider {
         &self,
         context: pioneer_memory::hooks::MemoryTurnContext,
     ) -> MemoryEpisodicRecallCapabilities {
-        let allowed = if let Some(processor) = self.processor.upgrade() {
+        let workspace_scope = if let Some(processor) = self.processor.upgrade() {
             match processor
                 .episodic_execution_context(&context.workspace_id, &context.turn_id)
                 .await
             {
-                Ok(context) => processor.episodic_execution_readable(&context).await,
-                Err(_) => false,
+                Ok(context) => processor.episodic_execution_scope(&context).await,
+                Err(_) => None,
             }
         } else {
-            false
+            None
         };
+        let allowed = workspace_scope.is_some() && self.service.recall_enabled();
+        let workspace_allowed = allowed && workspace_scope == Some(true);
         MemoryEpisodicRecallCapabilities {
             current_thread_search: allowed,
-            related_thread_search: allowed,
-            workspace_thread_search: allowed,
-            full_input_query: self
-                .service
-                .full_input_query_enabled_for_workspace(&context.workspace_id),
+            related_thread_search: workspace_allowed,
+            workspace_thread_search: workspace_allowed,
+            full_input_query: allowed
+                && self
+                    .service
+                    .full_input_query_enabled_for_workspace(&context.workspace_id),
             current_task_context: false,
             completed_task_summary: false,
         }
@@ -669,18 +675,15 @@ impl HookHandler for ThreadContextRecallHook {
             .await;
         if recall_output.hits.is_empty()
             && !recall_output.fallback_used
-            && !recall_output.diagnostics.iter().any(|d| {
-                matches!(
-                    d.code,
-                    ThreadEpisodicRecallDiagnosticCode::SkippedByPolicy
-                        | ThreadEpisodicRecallDiagnosticCode::PromptBudgetExceeded
-                )
-            })
+            && recall_output
+                .diagnostics
+                .iter()
+                .all(|d| d.code == ThreadEpisodicRecallDiagnosticCode::Completed)
         {
             // Phase diagnostics survive even when no prompt entry is emitted.
             // Their metadata is redacted by HookRuntime, so the receipt uses a
             // bounded opaque query identity in the diagnostic message.
-            response.diagnostics.push(thread_context_info_diagnostic(
+            let mut receipt = thread_context_info_diagnostic(
                 "thread_context.search_empty",
                 pioneer_memory::episodic_search::episodic_query_fingerprint(
                     workspace_id,
@@ -688,7 +691,10 @@ impl HookHandler for ThreadContextRecallHook {
                     turn_id,
                     &input.input_text,
                 ),
-            ));
+            );
+            // Only this bounded opaque identity is safe across runtime redaction.
+            receipt.safe_for_user = true;
+            response.diagnostics.push(receipt);
         }
         let mut recall_diagnostics = hook_diagnostics_from_recall(&recall_output.diagnostics);
         let mut reuse = thread_context_info_diagnostic(
@@ -872,6 +878,7 @@ fn hook_diagnostics_from_recall(
                     HookDiagnosticSeverity::Warning
                 }
                 ThreadEpisodicRecallDiagnosticCode::Completed
+                | ThreadEpisodicRecallDiagnosticCode::SearchIncomplete
                 | ThreadEpisodicRecallDiagnosticCode::SkippedByPolicy
                 | ThreadEpisodicRecallDiagnosticCode::PromptBudgetExceeded
                 | ThreadEpisodicRecallDiagnosticCode::SuppressedByBoundary
@@ -889,6 +896,7 @@ fn hook_diagnostics_from_recall(
 fn recall_diagnostic_code(code: &ThreadEpisodicRecallDiagnosticCode) -> &'static str {
     match code {
         ThreadEpisodicRecallDiagnosticCode::Completed => "thread_context.completed",
+        ThreadEpisodicRecallDiagnosticCode::SearchIncomplete => "thread_context.search_incomplete",
         ThreadEpisodicRecallDiagnosticCode::SkippedByPolicy => "thread_context.skipped_by_policy",
         ThreadEpisodicRecallDiagnosticCode::BackendUnavailable => {
             "thread_context.backend_unavailable"
@@ -942,7 +950,7 @@ fn thread_context_hook_error(code: &'static str, message: impl Into<String>) -> 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use pioneer_hooks::{
         HookContext, HookInput, HookPhaseRequest, HookPolicyKey, HookPolicySet, HookRuntimeBuilder,
@@ -954,10 +962,9 @@ mod tests {
         MemoryTurnPolicy,
     };
     use pioneer_protocol::{
-        ArtifactBindingDirection, ArtifactBindingKind, ArtifactKind, ArtifactRole, Thread,
+        ArtifactBindingDirection, ArtifactBindingKind, ArtifactKind, ArtifactRole,
         ThreadEpisodicItemId, ThreadEpisodicScoreBreakdown, ThreadEpisodicSourceActorRole,
-        ThreadEpisodicSourceContext, ThreadEpisodicSourceProvenance, ThreadMode, ThreadOriginKind,
-        ThreadSidebarVisibility, ThreadStatus,
+        ThreadEpisodicSourceContext, ThreadEpisodicSourceProvenance,
     };
     use std::collections::BTreeMap;
     use tokio::sync::Mutex;
@@ -1231,7 +1238,7 @@ mod tests {
         }
     }
 
-    fn test_phase_request(policy: MemoryTurnPolicy) -> HookPhaseRequest {
+    pub(crate) fn test_phase_request(policy: MemoryTurnPolicy) -> HookPhaseRequest {
         HookPhaseRequest::new(
             HookPhase::TurnPrePromptContext,
             HookContext {

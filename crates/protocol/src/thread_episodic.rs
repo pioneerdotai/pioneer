@@ -232,6 +232,8 @@ pub struct ThreadEpisodicRecallInput {
 #[serde(rename_all = "snake_case")]
 pub enum ThreadEpisodicRecallDiagnosticCode {
     Completed,
+    // Candidate coverage or a configured retrieval channel was incomplete.
+    SearchIncomplete,
     SkippedByPolicy,
     BackendUnavailable,
     InvalidInput,

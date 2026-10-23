@@ -106,8 +106,11 @@ impl MessageProcessor {
         })
     }
 
-    pub(crate) async fn episodic_execution_readable(&self, context: &TurnToolContext) -> bool {
-        self.thread_read_authority(context).await.is_ok()
+    pub(crate) async fn episodic_execution_scope(&self, context: &TurnToolContext) -> Option<bool> {
+        self.thread_read_authority(context)
+            .await
+            .ok()
+            .map(|authority| authority.observe_workspace)
     }
 
     pub(crate) async fn search_thread_sources(
@@ -125,29 +128,32 @@ impl MessageProcessor {
             .thread_episodic_recall_service
             .search_sources(query, scope, |thread| {
                 let authority = &authority;
-                async move {
-                    self.thread_source_readable(authority, &thread)
-                        .await
-                        .unwrap_or(false)
-                }
+                async move { self.thread_source_readable(authority, &thread).await }
             })
             .await?;
         let authority = self.thread_read_authority(context).await?;
         let mut verified = Vec::new();
         for source in output.sources {
-            if self
+            match self
                 .thread_source_readable(&authority, &source.reference.thread_id)
                 .await
-                .unwrap_or(false)
             {
-                if let Ok(Some(mut current)) = self
-                    .thread_episodic_recall_service
-                    .validate_search_source(&source.reference)
-                    .await
-                {
+                Ok(true) => {}
+                _ => {
+                    output.limitations.coverage_limited = true;
+                    continue;
+                }
+            }
+            match self
+                .thread_episodic_recall_service
+                .validate_search_source(&source.reference)
+                .await
+            {
+                Ok(Some(mut current)) => {
                     current.score = source.score;
                     verified.push(current);
                 }
+                _ => output.limitations.coverage_limited = true,
             }
         }
         output.sources = verified;

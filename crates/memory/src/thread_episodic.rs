@@ -632,10 +632,13 @@ pub trait ThreadEpisodicMemvidBackend: Send + Sync {
     ) -> Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError>;
 
     /// Direct channel retrieval, without ask interpretation or prompt cutoffs.
+    /// Keep a capacity clone inside every started blocking operation until it
+    /// actually finishes, even if the async caller stops waiting.
     async fn source_candidates(
         &self,
         _request: ThreadEpisodicMemvidSearchRequest,
         _embedding: Option<crate::episodic_search::EpisodicQueryEmbedding>,
+        _capacity: Arc<tokio::sync::OwnedSemaphorePermit>,
     ) -> crate::episodic_search::EpisodicChannelCandidates {
         crate::episodic_search::EpisodicChannelCandidates {
             unavailable: true,
@@ -801,6 +804,25 @@ impl MemvidThreadEpisodicBackend {
         self
     }
 
+    // The admission slot belongs to every started blocking retrieval as well as
+    // its async owner. Cancellation can stop waiting but cannot stop Memvid.
+    async fn run_search_blocking<T, F>(
+        &self,
+        path: &Path,
+        capacity: Arc<tokio::sync::OwnedSemaphorePermit>,
+        operation: F,
+    ) -> Result<T, tokio::task::JoinError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        self.run_blocking(path, move || {
+            let _capacity = capacity;
+            operation()
+        })
+        .await
+    }
+
     async fn run_blocking<T, F>(
         &self,
         path: &Path,
@@ -951,6 +973,7 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
         &self,
         request: ThreadEpisodicMemvidSearchRequest,
         embedding: Option<crate::episodic_search::EpisodicQueryEmbedding>,
+        capacity: Arc<tokio::sync::OwnedSemaphorePermit>,
     ) -> crate::episodic_search::EpisodicChannelCandidates {
         let mut output = crate::episodic_search::EpisodicChannelCandidates::default();
         if request.profile.validate().is_err() {
@@ -971,7 +994,7 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
             let embedding = embedding.clone();
             let limit = request.profile.max_candidates as usize;
             let result = self
-                .run_blocking(&path.clone(), move || {
+                .run_search_blocking(&path.clone(), capacity.clone(), move || {
                     source_candidates_blocking(
                         path,
                         &query,
@@ -1981,6 +2004,44 @@ mod tests {
     use crate::thread_episodic_embedding::ThreadEpisodicEmbeddingProvider;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn cancelled_search_retains_admission_until_blocking_retrieval_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(MemvidThreadEpisodicBackend::new());
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::new(capacity.clone().try_acquire_owned().unwrap());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_backend = backend.clone();
+        let first_path = root.path().join("first.mv2");
+        let waiter = tokio::spawn(async move {
+            worker_backend
+                .run_search_blocking(&first_path, permit, move || {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        // A different capsule has no shared file lock to protect this capacity.
+        // Cancelling only the async waiter must not admit another search there.
+        assert!(capacity.clone().try_acquire_owned().is_err());
+        release_tx.send(()).unwrap();
+        let permit = tokio::time::timeout(Duration::from_secs(2), capacity.acquire_owned())
+            .await
+            .unwrap()
+            .unwrap();
+        backend
+            .run_search_blocking(&root.path().join("other.mv2"), Arc::new(permit), || ())
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn independent_backends_share_capsule_lock_after_async_cancellation() {
@@ -2996,7 +3057,14 @@ mod tests {
             }],
             exact_source: None,
         };
-        let lexical = backend.source_candidates(request.clone(), None).await;
+        let capacity = Arc::new(
+            Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .unwrap(),
+        );
+        let lexical = backend
+            .source_candidates(request.clone(), None, capacity.clone())
+            .await;
         assert!(!lexical.unavailable);
         assert_eq!(lexical.partitions[0][0].source_id, "source");
         let embedding = EpisodicQueryEmbedding {
@@ -3004,7 +3072,7 @@ mod tests {
             vector: vec![1.0, 0.0, 0.0],
         };
         let semantic = backend
-            .source_candidates(request.clone(), Some(embedding.clone()))
+            .source_candidates(request.clone(), Some(embedding.clone()), capacity.clone())
             .await;
         assert!(!semantic.unavailable);
         assert_eq!(semantic.partitions[0][0].turn_id, "turn");
@@ -3012,7 +3080,7 @@ mod tests {
         incompatible.identity.model = "other-model".into();
         assert!(
             backend
-                .source_candidates(request.clone(), Some(incompatible))
+                .source_candidates(request.clone(), Some(incompatible), capacity.clone())
                 .await
                 .unavailable
         );
@@ -3022,7 +3090,7 @@ mod tests {
         };
         assert!(
             backend
-                .source_candidates(request, Some(malformed))
+                .source_candidates(request, Some(malformed), capacity)
                 .await
                 .unavailable
         );

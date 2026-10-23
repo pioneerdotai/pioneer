@@ -163,6 +163,34 @@ pub struct MemoryActiveRecallProviderFallbackContext {
     config: MemoryActiveRecallConfig,
 }
 
+/// Prepare the production preflight with the same provider used by execution.
+/// Capabilities are resolved from its server-side execution authority; execution
+/// resolves them again and reauthorizes sources if permissions change meanwhile.
+pub async fn prepare_active_recall_preflight(
+    context: &MemoryTurnContext,
+    input: &TurnPrePromptContextHookInput,
+    policy: &MemoryTurnPolicy,
+    config: &MemoryActiveRecallConfig,
+    prompt_context: &pioneer_hooks::HookPromptContextSet,
+    episodic_provider: Option<&Arc<dyn AgentEpisodicRecallProvider>>,
+    planner_available: bool,
+) -> MemoryActiveRecallLocalPlan {
+    let capabilities = resolve_episodic_recall_capabilities(episodic_provider, context).await;
+    let deterministic = deterministic_recall_context_summary(prompt_context);
+    let thread_episodic =
+        active_recall_thread_episodic_summary(prompt_context, context, &capabilities);
+    build_active_recall_local_preflight_plan_with_thread_summary(
+        context,
+        input,
+        policy,
+        config,
+        &deterministic,
+        capabilities,
+        thread_episodic,
+        planner_available,
+    )
+}
+
 pub fn build_active_recall_local_preflight_plan(
     context: &MemoryTurnContext,
     input: &TurnPrePromptContextHookInput,

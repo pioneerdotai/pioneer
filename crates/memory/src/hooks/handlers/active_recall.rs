@@ -212,7 +212,11 @@ impl HookHandler for ActiveMemoryRecallHook {
         let existing_sources = request
             .prompt_context_set
             .entries()
-            .filter(|entry| entry.contribution_id.as_str() == MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID)
+            .filter(|entry| {
+                // Truncation preserves refs to sources the model may never have seen.
+                entry.contribution_id.as_str() == MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID
+                    && !entry.truncated
+            })
             .flat_map(|entry| entry.source_refs.iter())
             .map(|source| {
                 crate::episodic_search::episodic_source_identity(source.id.as_str()).to_owned()

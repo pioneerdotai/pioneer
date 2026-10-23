@@ -19,6 +19,7 @@
       "type": "string",
       "enum": [
         "completed",
+        "search_incomplete",
         "skipped_by_policy",
         "backend_unavailable",
         "invalid_input",

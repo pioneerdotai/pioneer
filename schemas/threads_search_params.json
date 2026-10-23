@@ -3,7 +3,7 @@
   "title": "ThreadsSearchParams",
   "type": "object",
   "properties": {
-    "query": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "query": { "description": "Nonempty after trimming; at most 4096 UTF-8 bytes (checked by the server). maxLength separately bounds Unicode characters, not bytes.", "type": "string", "minLength": 1, "maxLength": 4096 },
     "limit": { "type": "integer", "format": "uint32", "minimum": 1, "maximum": 20 },
     "cursor": { "type": ["string", "null"], "default": null }
   },

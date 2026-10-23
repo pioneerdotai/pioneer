@@ -54,6 +54,7 @@ pub enum ThreadHistoryDirection {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ThreadsSearchParams {
+    /// Nonempty after trimming; at most 4096 UTF-8 bytes (checked by the server). maxLength separately bounds Unicode characters, not bytes.
     #[schemars(length(min = 1, max = 4096))]
     pub query: String,
     #[schemars(range(min = 1, max = 20))]
