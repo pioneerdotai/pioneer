@@ -411,7 +411,7 @@ mod tests {
         ] {
             assert!(!snapshot.contains_name(name).await);
         }
-        assert_eq!(snapshot.all_specs().len(), 20);
+        assert_eq!(snapshot.all_specs().len(), 21);
         // Domain expansion must make the registered readers callable while
         // keeping unrelated domains closed.
         snapshot

@@ -174,6 +174,12 @@ async fn start_threads_cli_fixture(
     .unwrap();
     let payload: JsonValue = serde_json::from_str(&outbox.payload_json).unwrap();
     let turn_id = payload["dispatch"]["turn_id"].as_str().unwrap().to_owned();
+    // This fixture has no background outbox worker. Deliver the committed
+    // start through the normal dispatcher before observing CLI activation.
+    let batch = crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+        .await
+        .unwrap();
+    assert!(batch.errors.is_empty(), "{:?}", batch.errors);
     wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
     wait_for_task_cli_activation(&processor, &turn_id).await;
     (harness, processor, turn_id)

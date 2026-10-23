@@ -2720,7 +2720,7 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
 
         let first_receipt_bytes = first_receipt_snapshot.unwrap();
         let first_receipt = pioneer_skills::read_external_runtime_receipt(&receipt_path).unwrap();
-        assert_eq!(first_receipt.entries.len(), 3);
+        assert_eq!(first_receipt.entries.len(), 4);
         assert_eq!(first_receipt.entries[0].skill_id, lifecycle_id);
         assert_eq!(first_receipt.entries[0].owner.as_deref(), Some("tests"));
         assert_eq!(first_receipt.entries[0].slug, "lifecycle");
