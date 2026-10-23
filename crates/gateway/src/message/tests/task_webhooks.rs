@@ -3,6 +3,8 @@
 use super::*;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
+use pioneer_protocol::TaskGetParams;
+use std::collections::BTreeSet;
 use tower::ServiceExt as _;
 
 #[tokio::test]

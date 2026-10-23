@@ -873,6 +873,7 @@ async fn run_gateway_until_shutdown_inner(
     services_prepare_stage.succeed();
     let listener_bind_stage =
         startup.stage(pioneer_observability::GatewayStartupStage::ListenerBind);
+    let post_remote_access_config = config.gateway.remote_access.clone();
     let handle = spawn_server(
         config,
         auth,
@@ -903,7 +904,6 @@ async fn run_gateway_until_shutdown_inner(
     let post_message_processor = message_processor.clone();
     let post_crud_store = message_processor.crud_store.clone();
     let post_self_improvement_supervisor = self_improvement_supervisor.clone();
-    let post_remote_access_config = config.gateway.remote_access.clone();
     let post_thread_episodic_storage_root = thread_episodic_storage_root.clone();
     let post_workspace_vector_search_configs =
         thread_episodic_workspace_vector_search_configs.clone();

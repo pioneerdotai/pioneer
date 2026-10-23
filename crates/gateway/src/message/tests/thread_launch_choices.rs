@@ -704,7 +704,7 @@ async fn webhook_task_tools_create_get_and_replay_require_current_task_read() {
         )
         .await
         .unwrap();
-        assert!(created["runId"].is_null());
+        assert!(serde_json::Value::is_null(&created["runId"]));
         assert_eq!(created["waitable"], false);
         assert_eq!(
             created["attachment"],
