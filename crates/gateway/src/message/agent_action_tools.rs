@@ -2833,7 +2833,7 @@ pub(super) enum AgentActionOutboxDispatch {
     AwaitingRuntime,
 }
 
-async fn dispatch_agent_action_outbox_row(
+pub(super) async fn dispatch_agent_action_outbox_row(
     processor: &Arc<MessageProcessor>,
     row: &pioneer_entity::agent_action_outbox::Model,
 ) -> anyhow::Result<AgentActionOutboxDispatch> {
