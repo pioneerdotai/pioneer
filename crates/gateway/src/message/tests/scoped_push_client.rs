@@ -776,11 +776,13 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
             assert!(tree_requests.load(Ordering::SeqCst) > baseline_requests);
             assert!(prefix_requests.load(Ordering::SeqCst) > baseline_prefix);
             assert!(push_requests.load(Ordering::SeqCst) > baseline_push);
+            // Retire the adapter before client shutdown drops its socket. A
+            // disconnect during the scenario must still fail the adapter task.
+            cancel.cancel();
+            socket_owner.join_next().await.unwrap().unwrap();
             core.0.shutdown();
             drop(inbox_subscription);
             drop(subscription);
-            cancel.cancel();
-            socket_owner.join_next().await.unwrap().unwrap();
             sessions.unregister_connection(source).await;
             return;
         }
@@ -911,10 +913,10 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
         await_unread(&core.0, &workspace, 0).await;
         assert_eq!(tree_requests.load(Ordering::SeqCst), baseline_requests);
 
-        core.0.shutdown();
-        drop(subscription);
         cancel.cancel();
         socket_owner.join_next().await.unwrap().unwrap();
+        core.0.shutdown();
+        drop(subscription);
         sessions.unregister_connection(source).await;
         assert_eq!(tree_requests.load(Ordering::SeqCst), baseline_requests);
     }).await.unwrap_or_else(|_| panic!("bounded committed-push integration at {}", stage.get()));
