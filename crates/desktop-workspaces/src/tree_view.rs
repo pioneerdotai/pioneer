@@ -1273,7 +1273,11 @@ mod tests {
         assert!(tree.read_with(cx, |tree, _| {
             tree.index_of(&thread_node_key("a").into()).is_none()
         }));
-        core.activate_thread(None, None);
+        // Clearing only the active thread keeps the workspace tree visible.
+        core.navigate(
+            pioneer_client::navigation::NavigationIntent::SelectWorkspace { workspace_id: None },
+            None,
+        );
         sidebar.update(cx, |sidebar, cx| sidebar.sync(cx));
         assert!(tree.read_with(cx, |tree, _| tree.entry(0).is_none()));
         sidebar.update(cx, |sidebar, cx| {
