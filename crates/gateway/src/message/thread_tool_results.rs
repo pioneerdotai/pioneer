@@ -14,15 +14,29 @@ use std::sync::Arc;
 
 pub(super) const RESULT_READ_TOOL: &str = "threads_tools_result_read";
 
-// The public cursor keeps its existing object shape; version contains a sealed
-// copy of BOTH version and offset, scoped to this execution and exact source.
-fn result_delivery_encoding(response: &ThreadToolResultReadResponse) -> Result<String> {
-    let mut response = response.clone();
-    if let Some(next) = &mut response.next {
-        let length = (serde_json::to_vec(next)?.len() + 29).div_ceil(3) * 4;
-        next.version = "x".repeat(length);
-    }
-    Ok(serde_json::to_string(&response)?)
+#[derive(Clone, Copy)]
+struct ResultCursorProtection<'a> {
+    codec: &'a super::thread_read_cursor::ThreadReadCursorCodec,
+    scope: &'a str,
+}
+
+// Size the exact public representation, including the real random ciphertext
+// and the handler's Value serialization order. Return that same sealed cursor;
+// encrypting it again after checking would change its token count.
+fn result_delivery_encoding(
+    mut response: ThreadToolResultReadResponse,
+    protection: Option<ResultCursorProtection<'_>>,
+) -> Result<(ThreadToolResultReadResponse, String)> {
+    let encoded = if let Some(protection) = protection {
+        if let Some(next) = &mut response.next {
+            next.version = protection.codec.encode(next, protection.scope)?;
+        }
+        serde_json::to_string(&serde_json::to_value(&response)?)?
+    } else {
+        // Internal/direct consumers retain their raw source cursor contract.
+        serde_json::to_string(&response)?
+    };
+    Ok((response, encoded))
 }
 fn result_projection_excess(encoded: &str) -> Result<usize> {
     Ok(
@@ -36,6 +50,14 @@ impl MessageProcessor {
     pub(super) async fn read_thread_tool_result(
         &self,
         params: ThreadToolResultReadParams,
+    ) -> Result<ThreadToolResultReadResponse> {
+        self.read_thread_tool_result_with_cursor(params, None).await
+    }
+
+    async fn read_thread_tool_result_with_cursor(
+        &self,
+        params: ThreadToolResultReadParams,
+        protection: Option<ResultCursorProtection<'_>>,
     ) -> Result<ThreadToolResultReadResponse> {
         let source = self
             .crud_store
@@ -54,7 +76,7 @@ impl MessageProcessor {
             "tool result source is unavailable"
         );
         if params.output_log {
-            return self.read_thread_tool_output_log(params).await;
+            return self.read_thread_tool_output_log(params, protection).await;
         }
         let offset = params.cursor.as_ref().map_or(0, |c| c.offset);
         let item_reference = self
@@ -97,7 +119,7 @@ impl MessageProcessor {
             )
             .await?;
         let Some(fragment) = fragment else {
-            return self.read_saved_tool_item_fallback(params).await;
+            return self.read_saved_tool_item_fallback(params, protection).await;
         };
         // Source reads remain bounded quanta. Fill at most one public page,
         // instead of exposing the internal 16K-character read as a hidden cap.
@@ -118,7 +140,7 @@ impl MessageProcessor {
                 }),
                 eof: false,
             };
-            let encoded = result_delivery_encoding(&probe)?;
+            let (_, encoded) = result_delivery_encoding(probe, protection)?;
             if encoded.len() >= max_bytes
                 || result_projection_excess(&encoded)? > 0
                 || (max_tokens != u64::MAX
@@ -168,7 +190,7 @@ impl MessageProcessor {
                 }),
                 eof,
             };
-            let encoded = result_delivery_encoding(&result)?;
+            let (result, encoded) = result_delivery_encoding(result, protection)?;
             let token_excess = if max_tokens == u64::MAX {
                 0
             } else {
@@ -445,6 +467,7 @@ impl MessageProcessor {
     async fn read_saved_tool_item_fallback(
         &self,
         params: ThreadToolResultReadParams,
+        protection: Option<ResultCursorProtection<'_>>,
     ) -> Result<ThreadToolResultReadResponse> {
         let item = self
             .crud_store
@@ -495,7 +518,7 @@ impl MessageProcessor {
                     offset: end,
                 }),
             };
-            let encoded = result_delivery_encoding(&response)?;
+            let (response, encoded) = result_delivery_encoding(response, protection)?;
             let token_excess = if max_tokens == u64::MAX {
                 0
             } else {
@@ -516,6 +539,7 @@ impl MessageProcessor {
     async fn read_thread_tool_output_log(
         &self,
         params: ThreadToolResultReadParams,
+        protection: Option<ResultCursorProtection<'_>>,
     ) -> Result<ThreadToolResultReadResponse> {
         let ordinal = params
             .cursor
@@ -589,7 +613,7 @@ impl MessageProcessor {
                 eof: next.is_none(),
                 next,
             };
-            let encoded = result_delivery_encoding(&response)?;
+            let (response, encoded) = result_delivery_encoding(response, protection)?;
             let token_excess = if max_tokens == u64::MAX {
                 0
             } else {
@@ -711,13 +735,19 @@ impl ToolHandler for ResultReadHandler {
             return Err(denied());
         }
         let source_thread_id = params.thread_id.clone();
-        let mut result = self
+        let result = self
             .processor
-            .read_thread_tool_result(params.clone())
+            .read_thread_tool_result_with_cursor(
+                params.clone(),
+                Some(ResultCursorProtection {
+                    codec: &codec,
+                    scope: &scope,
+                }),
+            )
             .await
             .map_err(|_| {
                 ToolError::invalid_arguments(
-                    "result unavailable, cursor stale, or page budget too small",
+                    "result unavailable, cursor stale, or requested page budget cannot fit framing and source text",
                 )
             })?;
         let current = self
@@ -752,11 +782,6 @@ impl ToolHandler for ResultReadHandler {
                 "result cursor is stale; restart reading",
             ));
         }
-        if let Some(next) = &mut result.next {
-            next.version = codec
-                .encode(next, &scope)
-                .map_err(|_| ToolError::invalid_arguments("result cursor unavailable"))?;
-        }
         let payload = serde_json::to_value(result)
             .map_err(|_| ToolError::invalid_arguments("result encoding failed"))?;
         if !pioneer_tools::thread_read_page_fits(&payload) {
@@ -766,6 +791,14 @@ impl ToolHandler for ResultReadHandler {
         }
         let text = serde_json::to_string(&payload)
             .map_err(|_| ToolError::invalid_arguments("result encoding failed"))?;
+        if params
+            .max_tokens
+            .is_some_and(|budget| pioneer_compaction::text_tokens(&text) > budget)
+        {
+            return Err(ToolError::invalid_arguments(
+                "result page cannot fit the requested max_tokens budget",
+            ));
+        }
         Ok(Box::new(FunctionToolOutput::with_payload(
             text, true, payload,
         )))
@@ -780,7 +813,7 @@ pub(crate) fn thread_result_tool_specs() -> Vec<ConfiguredToolSpec> {
                 "workspace_id":{"type":"string"},"thread_id":{"type":"string"},"turn_id":{"type":"string"},"item_id":{"type":"string"},
                 "output_log":{"type":"boolean","default":false},
                 "cursor":{"type":"object","properties":{"version":{"type":"string"},"offset":{"type":"integer","minimum":0}},"required":["version","offset"]},
-                "max_tokens":{"type":"integer","minimum":1},"max_bytes":{"type":"integer","minimum":1,"description":"Optional caller page budget; the complete page always fits Pioneer’s 2 MiB response projection."}},
+                "max_tokens":{"type":"integer","minimum":1,"description":"Optional token budget for the complete returned JSON, including the protected cursor; omitted means no token ceiling."},"max_bytes":{"type":"integer","minimum":1,"description":"Optional caller page budget; the complete page always fits Pioneer’s 2 MiB response projection."}},
                 "required":["workspace_id","thread_id","turn_id","item_id"],"additionalProperties":false}),
         PayloadKind::Function,
     );

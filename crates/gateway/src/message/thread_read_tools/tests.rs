@@ -223,7 +223,7 @@ async fn recursive_pages_cover_large_intermediate_subtree_without_siblings_or_cy
     let mut cursor = None;
     let mut found = std::collections::BTreeMap::new();
     let mut ended = false;
-    for _ in 0..100 {
+    for page_index in 0..100 {
         let page = processor
             .thread_children_page(
                 &a,
@@ -243,6 +243,16 @@ async fn recursive_pages_cover_large_intermediate_subtree_without_siblings_or_cy
                 found.insert(id, row["depth"].as_u64().unwrap()).is_none(),
                 "duplicate descendant"
             );
+        }
+        if page_index == 0 {
+            assert_eq!(page["eof"], false);
+            // Neither a sibling's metadata/activity nor an inaccessible thread
+            // elsewhere in this workspace belongs to this subtree's revision.
+            processor.crud_store.database_connection().execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "UPDATE thread SET name='unrelated edit',preview='new preview',updated_at='2030-01-01 00:00:00+00:00' WHERE id IN ('sibling',?)",
+                [THREAD_RED_PRIVATE_B_ID.into()],
+            )).await.unwrap();
         }
         if page["eof"] == true {
             ended = true;
@@ -298,6 +308,104 @@ async fn recursive_pages_cover_large_intermediate_subtree_without_siblings_or_cy
     assert!(
         error.to_string().contains("stale"),
         "reparenting an unvisited descendant must not silently skip it"
+    );
+}
+
+#[tokio::test]
+async fn children_cursor_pins_pending_metadata_and_detects_deleted_unvisited_child() {
+    let (harness, processor) = fixture().await;
+    add_thread(&processor, "fragment-root", None, false).await;
+    add_thread(&processor, "fragment-child", Some("fragment-root"), false).await;
+    add_thread(&processor, "fragment-tail", Some("fragment-root"), false).await;
+    add_thread(&processor, "outside-child", Some("fragment-tail"), false).await;
+    let title = "🌍\"\n".repeat(450_000);
+    harness
+        .database
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE thread SET name=? WHERE id='fragment-child'",
+            [title.into()],
+        ))
+        .await
+        .unwrap();
+    let a = authority(MEMBER_A_ID, THREAD_RED_WORKSPACE_ID, true);
+    let codec = processor.thread_read_cursor_codec().unwrap();
+    let params = ThreadsChildrenListParams {
+        thread_id: "fragment-root".into(),
+        recursive: false,
+        limit: 1,
+        cursor: None,
+    };
+    let first = processor
+        .thread_children_page(&a, params.clone(), &codec)
+        .await
+        .unwrap();
+    let fragment = &first["threads"][0]["fragment"];
+    assert_eq!(fragment["offset"], 0);
+    assert_eq!(fragment["eof"], false);
+    assert!(pioneer_tools::thread_read_page_fits(&first));
+    let cursor = first["nextCursor"].as_str().unwrap().to_owned();
+    // A grandchild is outside a direct-children traversal, even though it would
+    // be relevant to recursive=true. The pending fragment must still continue.
+    harness.database.execute_unprepared(
+        "UPDATE thread SET name='outside direct traversal',preview='activity',updated_at='2030-01-01 00:00:00+00:00' WHERE id='outside-child'",
+    ).await.unwrap();
+    let continuation = ThreadsChildrenListParams {
+        cursor: Some(cursor),
+        ..params.clone()
+    };
+    let second = processor
+        .thread_children_page(&a, continuation.clone(), &codec)
+        .await
+        .unwrap();
+    assert_eq!(
+        second["threads"][0]["fragment"]["offset"],
+        fragment["nextOffset"]
+    );
+    assert_eq!(
+        second["threads"][0]["fragment"]["version"],
+        fragment["version"]
+    );
+    assert!(pioneer_tools::thread_read_page_fits(&second));
+    harness
+        .database
+        .execute_unprepared(
+            "UPDATE thread SET name='changed pending title' WHERE id='fragment-child'",
+        )
+        .await
+        .unwrap();
+    assert!(
+        processor
+            .thread_children_page(&a, continuation, &codec)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("stale")
+    );
+
+    // After restarting with the new metadata, deletion beyond the first page
+    // must invalidate that walk rather than silently report an earlier EOF.
+    let restarted = processor
+        .thread_children_page(&a, params.clone(), &codec)
+        .await
+        .unwrap();
+    assert_eq!(restarted["threads"][0]["title"], "changed pending title");
+    harness
+        .database
+        .execute_unprepared("DELETE FROM thread WHERE id='fragment-tail'")
+        .await
+        .unwrap();
+    let continuation = ThreadsChildrenListParams {
+        cursor: Some(restarted["nextCursor"].as_str().unwrap().to_owned()),
+        ..params
+    };
+    assert!(
+        processor
+            .thread_children_page(&a, continuation, &codec)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("stale")
     );
 }
 
@@ -623,6 +731,251 @@ async fn legacy_tool_result_and_retained_log_are_readable_but_deleted_turn_is_no
     );
     params.output_log = false;
     assert!(processor.read_thread_tool_result(params).await.is_err());
+}
+
+#[tokio::test]
+async fn public_result_reader_honors_token_budget_with_real_cursors_for_all_sources() {
+    use pioneer_protocol::{
+        ThreadToolResultReadParams, ThreadToolResultReadResponse, ToolCallStatus,
+        ToolDisplayPayload, ToolOutputPolicySnapshot, ToolStoragePayload, TurnItem,
+        TurnItemExecutionClass,
+    };
+
+    async fn call(
+        handler: &Arc<dyn ToolHandler>,
+        params: &ThreadToolResultReadParams,
+    ) -> Result<Box<dyn ToolOutput>, ToolError> {
+        handler
+            .handle(
+                ToolInvocation {
+                    call_id: "budget-read".into(),
+                    tool_name: "threads_tools_result_read".into(),
+                    source: pioneer_tools::ToolCallSource::Model,
+                    payload: ToolPayload::Function {
+                        arguments: serde_json::to_value(params).unwrap(),
+                    },
+                    workdir: Default::default(),
+                    environment: Default::default(),
+                    attempt_id: 0,
+                    idempotency_key: None,
+                    recovery: Default::default(),
+                    permission_metadata: Default::default(),
+                    execution_security_snapshot: None,
+                    apply_patch_preflight: None,
+                    cancellation: tokio_util::sync::CancellationToken::new(),
+                },
+                pioneer_tools::ToolEventBus::new(8).start_trace(
+                    "budget-turn",
+                    "budget-read",
+                    "threads_tools_result_read",
+                ),
+            )
+            .await
+    }
+
+    let (harness, processor) = fixture().await;
+    harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,initiated_by_actor_kind,initiated_by_actor_id,created_at,updated_at) VALUES ('budget-turn',?,'in_progress','conversation','user','principal',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        [THREAD_RED_PRIVATE_A_ID.into(), MEMBER_A_ID.into()],
+    )).await.unwrap();
+    // Reach the public reader through a live member execution within the
+    // member role's supervised ceiling, as in the anchored-handler fixture.
+    let profile = pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+        pioneer_protocol::TurnPermissionMode::Supervised,
+        pioneer_protocol::TurnPermissionProfileSource::Composer,
+    );
+    let mut authorization = crate::authorization::ExecutionAuthorizationContext::for_test(
+        &member(MEMBER_A_ID),
+        WORKSPACE_RED_ID,
+        THREAD_RED_PRIVATE_A_ID,
+        &profile,
+        None,
+    );
+    authorization.bind_test_provider_authority(
+        "openai",
+        "test-model",
+        processor
+            .provider_registry
+            .authority_fingerprint_for_workspace(WORKSPACE_RED_ID, "openai")
+            .unwrap()
+            .as_str(),
+    );
+    assert!(
+        processor
+            .crud_store
+            .set_turn_execution_authorization_context(
+                "budget-turn",
+                &authorization.to_persisted_json().unwrap(),
+            )
+            .await
+            .unwrap()
+    );
+    let text = (0..180)
+        .map(|n| format!("{n:04}:🌍e\u{301}漢字 \"\\\n"))
+        .collect::<String>();
+    for id in ["canonical-budget", "saved-item-budget"] {
+        let item = TurnItem::DynamicToolCall {
+            id: id.into(),
+            tool_name: "exec_command".into(),
+            arguments: json!({"exact":42}),
+            status: ToolCallStatus::Completed,
+            execution_class: TurnItemExecutionClass::Standard,
+            recovery_policy: None,
+            output_policy: ToolOutputPolicySnapshot::for_external_runtime_tool_name("exec_command"),
+            display: ToolDisplayPayload::Shell {
+                stdout: Some(text.clone()),
+                stderr: None,
+                aggregated_output: None,
+                exit_code: Some(0),
+                duration_ms: None,
+                timed_out: None,
+                truncated: false,
+            },
+            storage: ToolStoragePayload::None,
+            recovery: None,
+            success: Some(true),
+            outcome: None,
+            observation: None,
+        };
+        processor
+            .crud_store
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: WORKSPACE_RED_ID.into(),
+                    thread_id: THREAD_RED_PRIVATE_A_ID.into(),
+                    turn_id: "budget-turn".into(),
+                    item,
+                },
+                1_800_000_000,
+            )
+            .await
+            .unwrap();
+    }
+    let canonical = json!({"output":text,"sentinel":"complete🌍"}).to_string();
+    harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+        "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('budget-source','budget-turn','canonical-budget',1,'tool_result_v2',?,'{}',CURRENT_TIMESTAMP)",
+        [canonical.clone().into()],
+    )).await.unwrap();
+    let mut log = String::new();
+    for (index, delta) in [text.clone(), "last 🌍 chunk\n".repeat(90)]
+        .into_iter()
+        .enumerate()
+    {
+        processor
+            .crud_store
+            .record_tool_output(
+                &format!("budget-log-{index}"),
+                &pioneer_protocol::ItemDeltaNotification {
+                    workspace_id: WORKSPACE_RED_ID.into(),
+                    thread_id: THREAD_RED_PRIVATE_A_ID.into(),
+                    turn_id: "budget-turn".into(),
+                    item_id: "saved-item-budget".into(),
+                    delta: delta.clone(),
+                    stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
+                    payload: None,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            )
+            .await
+            .unwrap();
+        log.push_str(&json!({"stream":"stdout","text":delta,"metadata":null}).to_string());
+    }
+    let processor = Arc::new(processor);
+    let bundle = processor.thread_result_tools(TurnToolContext {
+        workspace_id: WORKSPACE_RED_ID.into(),
+        thread_id: THREAD_RED_PRIVATE_A_ID.into(),
+        turn_id: "budget-turn".into(),
+    });
+    let handler = &bundle
+        .handlers
+        .iter()
+        .find(|(name, _)| name == "threads_tools_result_read")
+        .unwrap()
+        .1;
+    for (item_id, output_log, expected) in [
+        ("canonical-budget", false, Some(canonical)),
+        ("saved-item-budget", false, None),
+        ("saved-item-budget", true, Some(log)),
+    ] {
+        let mut params = ThreadToolResultReadParams {
+            workspace_id: WORKSPACE_RED_ID.into(),
+            thread_id: THREAD_RED_PRIVATE_A_ID.into(),
+            turn_id: "budget-turn".into(),
+            item_id: item_id.into(),
+            output_log,
+            cursor: None,
+            max_tokens: Some(1),
+            max_bytes: None,
+        };
+        let error = call(handler, &params)
+            .await
+            .err()
+            .expect("framing cannot fit one token");
+        assert!(error.to_string().contains("budget"));
+        params.max_tokens = Some(500);
+        // The legacy saved view has typed metadata as well as stdout. Compare
+        // every byte with its complete public, unbudgeted representation too.
+        let expected = if let Some(expected) = expected {
+            expected
+        } else {
+            let unbudgeted = ThreadToolResultReadParams {
+                max_tokens: None,
+                ..params.clone()
+            };
+            let whole: ThreadToolResultReadResponse =
+                serde_json::from_str(&call(handler, &unbudgeted).await.unwrap().raw_text())
+                    .unwrap();
+            assert!(whole.eof && whole.next.is_none());
+            let saved: Value = serde_json::from_str(&whole.text).unwrap();
+            assert_eq!(saved["kind"], "saved_item");
+            assert_eq!(saved["fullResultSaved"], false);
+            assert_eq!(saved["item"]["id"], item_id);
+            assert_eq!(saved["item"]["display"]["stdout"], text);
+            whole.text
+        };
+        let mut restored = String::new();
+        let mut pages = 0;
+        let mut rollovers = 0;
+        loop {
+            let output = call(handler, &params).await.unwrap();
+            let wire = output.raw_text();
+            assert!(output.success());
+            assert!(
+                pioneer_compaction::text_tokens(&wire) <= 500,
+                "{item_id}, log={output_log}"
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(&wire).unwrap(),
+                output.raw_json()
+            );
+            assert!(pioneer_tools::thread_read_page_fits(&output.raw_json()));
+            let page: ThreadToolResultReadResponse = serde_json::from_str(&wire).unwrap();
+            let start = params.cursor.as_ref().map_or(0, |cursor| cursor.offset);
+            let end = start + page.text.chars().count() as u64;
+            restored.push_str(&page.text);
+            pages += 1;
+            assert!(pages < 200, "reader must make progress");
+            if page.eof {
+                assert!(page.next.is_none());
+                break;
+            }
+            let next = page.next.expect("nonterminal page needs a public cursor");
+            assert!(serde_json::to_vec(&next).unwrap().len() <= 16384);
+            if output_log && next.offset == 0 {
+                rollovers += 1;
+            } else {
+                assert!(!page.text.is_empty());
+                assert_eq!(next.offset, end, "offsets count Unicode scalars, not bytes");
+            }
+            params.cursor = Some(next);
+        }
+        assert!(pages > 1, "fixture must exercise protected continuation");
+        assert_eq!(restored, expected, "{item_id}, log={output_log}");
+        if output_log {
+            assert_eq!(rollovers, 1, "continue through both retained log chunks");
+        }
+    }
 }
 
 #[tokio::test]

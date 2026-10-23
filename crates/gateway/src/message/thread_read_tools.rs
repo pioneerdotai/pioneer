@@ -49,7 +49,7 @@ pub(crate) fn thread_read_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         (
             "threads_children_list",
-            "Optionally list direct children (recursive=false) or every descendant of this specific conversation (recursive=true). Does not read child history. Follow nextCursor until eof even if a page is empty. Metadata/lineage changes invalidate cursors; restart listing. Oversized metadata uses UTF-8 JSON fragments: concatenate text by byte offsets before decoding. Open selected children with threads_history_read; this list is not a prerequisite for reading history.",
+            "Optionally list direct children (recursive=false) or every descendant of this specific conversation (recursive=true). Does not read child history. Follow nextCursor until eof even if a page is empty. Changes to traversed parent edges or returned child metadata invalidate cursors; restart listing. Unrelated conversations and activity do not invalidate this traversal. Oversized metadata uses UTF-8 JSON fragments: concatenate text by byte offsets before decoding. Open selected children with threads_history_read; this list is not a prerequisite for reading history.",
             json!({"threadId":{"type":"string"},"recursive":{"type":"boolean"},"limit":limit,"cursor":cursor}),
             vec!["threadId", "recursive", "limit"],
         ),
@@ -289,7 +289,7 @@ impl MessageProcessor {
     }
 
     // Hash bounded, released reads instead of putting a catalog/tree snapshot
-    // into the cursor. Any workspace metadata/lineage edit invalidates a walk;
+    // into the cursor. Any workspace metadata/lineage edit invalidates a list;
     // ACLs are separately checked against the current principal on every page.
     async fn thread_listing_revision(&self, workspace: &str) -> Result<String> {
         let mut digest = Sha256::new();
@@ -322,6 +322,74 @@ impl MessageProcessor {
             after = rows.last().cloned();
             if done {
                 break;
+            }
+        }
+        Ok(hex::encode(digest.finalize()))
+    }
+
+    // Children depend on actual parent edges within the requested traversal and
+    // the fields they return, not unrelated workspace activity. Recomputing the
+    // subtree also detects reparenting/deletion ahead of the current position.
+    // Each read releases DB capacity before hashing; only the DFS ancestor path
+    // is retained, never a complete tree or an accumulated result list.
+    async fn thread_children_revision(
+        &self,
+        workspace: &str,
+        root: &str,
+        recursive: bool,
+    ) -> Result<String> {
+        let mut digest = Sha256::new();
+        let root_workspace = self
+            .crud_store
+            .get_thread_by_id(root)
+            .await?
+            .map(|row| row.workspace_id);
+        digest.update(serde_json::to_vec(&json!([
+            "children-tree-v1",
+            workspace,
+            root,
+            recursive,
+            root_workspace
+        ]))?);
+        let mut path = vec![root.to_owned()];
+        let mut after = None;
+        loop {
+            let rows = self
+                .crud_store
+                .list_thread_child_lineage_page(path.last().unwrap(), after.as_deref(), 1)
+                .await?;
+            let Some(edge) = rows.first() else {
+                if path.len() == 1 {
+                    break;
+                }
+                after = path.pop();
+                continue;
+            };
+            digest.update(serde_json::to_vec(&json!([
+                edge.parent_thread_id,
+                edge.child_thread_id
+            ]))?);
+            if path.contains(&edge.child_thread_id) {
+                after = Some(edge.child_thread_id.clone());
+                continue;
+            }
+            let row = self
+                .crud_store
+                .get_thread_by_id(&edge.child_thread_id)
+                .await?;
+            digest.update(serde_json::to_vec(&row.map(|row| {
+                json!([
+                    row.workspace_id,
+                    row.name,
+                    row.status,
+                    row.sidebar_visibility
+                ])
+            }))?);
+            if recursive {
+                path.push(edge.child_thread_id.clone());
+                after = None;
+            } else {
+                after = Some(edge.child_thread_id.clone());
             }
         }
         Ok(hex::encode(digest.finalize()))
@@ -498,13 +566,13 @@ impl MessageProcessor {
             "source unavailable or access denied"
         );
         let scope = authority.scope(
-            "children",
+            "children-tree-v1",
             &params.thread_id,
             params.recursive,
             params.limit,
         );
         let revision = self
-            .thread_listing_revision(&authority.workspace_id)
+            .thread_children_revision(&authority.workspace_id, &params.thread_id, params.recursive)
             .await?;
         let mut state = params
             .cursor
@@ -646,8 +714,12 @@ impl MessageProcessor {
             Some(codec.encode(&state, &scope)?)
         };
         ensure!(
-            self.thread_listing_revision(&authority.workspace_id)
-                .await?
+            self.thread_children_revision(
+                &authority.workspace_id,
+                &params.thread_id,
+                params.recursive,
+            )
+            .await?
                 == revision,
             "cursor is stale; restart reading"
         );
