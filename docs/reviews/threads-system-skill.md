@@ -7,7 +7,7 @@
 - Worktree: `/Users/alexander/Code/pioneer/pioneer/.worktrees/threads-system-skill`.
 - Рабочая база после подключения зависимостей: `51205596d9fc23c490089db4f3b14cb305b0e763`.
 - Итоговый commit реализации: `e70f8cf77d49b3065175334697bba51f27fe0d66`.
-- Этот отчёт добавляется отдельным следующим коммитом передачи. Его идентификатор — HEAD указанной ветки после передачи; код зафиксирован предыдущим commit реализации. Это позволяет указать точный проверенный commit кода без самоссылки отчёта на собственный Git hash.
+- Первоначальная передача отчёта: `d2cc63627cce7a7eb6ba396669c596dbbdbff945`. Исправления двух последующих замечаний внешнего ревью описаны ниже; их commit также содержит обновление этого отчёта.
 
 При начале работы основной checkout был чистым. Указанные ветка и worktree отсутствовали; они созданы от фактического main. Основной checkout и соседние worktree не редактировались. Исходные dependency branches сохранены. Merge в main, push и deploy не выполнялись. При создании worktree, merge и commit использован `-c core.hooksPath=/dev/null`; commit hooks не запускались.
 
@@ -57,7 +57,7 @@ Skill описывает все десять фактических имён и�
 
 | Сценарий | Native | Codex / Claude / OpenCode |
 | --- | --- | --- |
-| Разрешены readers/search | Скрытые инструменты; загрузка точного `skill:<id>` из Internal Skill References через `read_skill`, затем `request_tools` с `domains:["threads"]` | Разрешённые canonical tools входят в frozen projection; implicit export skill и отдельный Threads block/context |
+| Разрешены readers/search | При активном и читаемом Threads skill с доставленной точной ссылкой: отдельный block, загрузка `skill:<id>` из Internal Skill References через `read_skill`, затем `request_tools` с `domains:["threads"]` | Разрешённые canonical tools входят в frozen projection; implicit export skill и отдельный Threads block/context |
 | Разрешены create/send/start/model options | Имеющиеся Agent capabilities, user/execution grants и opaque options; runtime permission checks сохраняются | Имеющиеся explicit tool selection, user/execution action grants и Agent capabilities; финальная материализация и текущий MCP lease; opaque routes проверяет общий handler |
 | Только `threads_start_options` | Сам по себе не включает Threads block | Сам по себе не выбирает implicit Threads skill, не включает Threads block или Tasks/Subagents policy |
 | Explicit deny или ограниченный allow-list | Не является основанием включать новый block по запрещённому capability; execution permission evaluator остаётся обязательным | Threads фильтруется до frozen binding; skill не возвращает исключённые операции |
@@ -79,7 +79,7 @@ Skill описывает все десять фактических имён и�
 | `gateway/src/message/tests.rs`, `tests/cli_task_tools.rs`, `tests/thread_launch_choices.rs` | Общий bundled fixture включает Threads; ожидаемые отдельные skill attachments и persisted binding events; coexistence с пользовательским skill `threads`; переиспользование test-only native setup/activation helpers |
 | `promt/src/compile/compiler.rs` | Независимая матрица Tasks/Threads × native/CLI, delivery/trust/manifest sections, сохранение block при повторной компиляции; прежние sections Tasks/Subagents включаются только своим флагом |
 | `promt/src/cli_runtime_context.rs` | Раздельные capabilities для трёх CLI; пустой/options-only каталог не активирует policy; Threads-only не включает Task protocol и не требует native loading |
-| `agent/src/chat/mod.rs` | Allowed hidden capabilities включают guidance до `request_tools`; deny/restricted allow-list и отсутствие пути открытия не активируют его; options-only не активирует Threads |
+| `agent/src/chat/skills.rs` (ранее `chat/mod.rs`) | Allowed hidden capabilities включают guidance до `request_tools` при активном skill, read index entry и доставленной ссылке; workspace/global disable и prompt budget исключают policy; deny/restricted allow-list, отсутствие пути открытия и options-only не активируют Threads |
 | `promt/src/section.rs`, `promt/tests/compile_snapshots.rs` | Reserved manifest id защищён от dynamic collision; все прежние compile fixtures явно оставляют Threads flag выключенным |
 
 Новая facade suite использует существующие recording CLI fixtures. Нативные setup-вызовы только готовят разрешённый child execution; проверяемые CLI mutations проходят facade → invoker → lease → shared runtime/handler → ledger/outbox. Тесты не подменены сравнением схем или прямым вызовом mutation handler. Существующее бизнес-покрытие поиска, пагинации истории и model discovery не переписывалось.
@@ -115,3 +115,39 @@ Skill описывает все десять фактических имён и�
 - Search остаётся зависимым от существующего индекса и серверной retrieval policy; incomplete/approximate/index_unavailable не трактуются как отсутствие совпадений.
 - Фактические provider процессы и реальная работа native/shadow homes здесь не проверялись запуском: написанное покрытие использует recording fixtures и остаётся ненапущенным.
 - Установленные skills в пользовательских CLI-каталогах вручную не менялись. Выполнена только подготовка репозиторного bundled package и штатного подключения.
+
+## Повторная передача: два замечания P2
+
+Исправления выполнены в прежней ветке и worktree от проверенного HEAD `d2cc63627cce7a7eb6ba396669c596dbbdbff945`; при начале исправлений рабочее дерево было чистым. Рабочая база первоначальной реализации `51205596d9fc23c490089db4f3b14cb305b0e763` и зависимости не менялись. Diff этой итерации — изменения после `d2cc6362`, только два исправления, связанное покрытие и этот отчёт.
+
+### Защита Threads alias при legacy receipt conversion
+
+В `crates/gateway/src/cli_runtime/skills.rs`, в существующем вызове `prepare_external_runtime_receipt_v2`, к protected destinations добавлен `pioneer-system-threads` для текущего native skills root. Защита Tasks/Subagents сохранена. Converter и механизм миграции не менялись.
+
+Статически прослежена цепочка: неизвестная/неоднозначная legacy v1 запись для защищённого destination вызывает отказ внутри converter; `?` возвращает ошибку раньше сохранения конвертированного receipt и установки в destination. Проверка не зависит от существования каталога. Это действует и при установке явно выбранного пользовательского skill перед автоматическим Threads plan.
+
+Существующий тест `orchestration_exports_refuse_foreign_destinations_receipts_and_local_edits` сохранён без ослабления assertions и без дубликатов. Перечитаны Threads-сценарии `legacy-foreign-receipt`, `legacy-stale-foreign-receipt`, `legacy-sibling-foreign-receipt`: ожидается отказ установления владения, неизменность байтов receipt и сохранение файлов либо отсутствующего destination. Тест не запускался.
+
+### Native Threads policy требует доступного skill и доставленной ссылки
+
+В `crates/agent/src/chat/mod.rs` predicate дополнительно использует существующий `TurnSkillResolution`: активный `system:pioneer/threads`, его точную запись `skill:<id>` в runtime read_skill index и полную строку `pioneer/threads` с той же ссылкой в итоговом skill prompt. Флаг вычисляется после возможного fallback промпта без Agent overlay. Прежние проверки callable `read_skill`, discoverability, denied/restricted tools и разрешённых Threads capabilities сохранены.
+
+Workspace `enabled:false` исключает Threads из active resolution; глобальное `skills.enabled:false` оставляет обычные package skills неактивными. Ничего не включается принудительно. Если prompt budget удаляет Internal Skill References, наличие active skill и runtime entry само по себе больше не включает policy.
+
+Проверена цепочка `resolve_turn_skills_with_explicit_refs` → runtime read_skill index → `materialize_skill_tooling` → итоговый skills prompt → native prompt compiler → instruction delivery. Компилятор переносит SkillsRuntimePrompt без дополнительного обрезания, native delivery сохраняет полный текст. Первоначальная и все повторные компиляции используют тот же согласованный флаг и неизменяемый после его вычисления skills prompt. Guidance для разрешённых скрытых Threads tools до первого `request_tools` сохраняется при доступном skill и ссылке.
+
+Существующий `native_threads_guidance_uses_allowed_hidden_capabilities_before_domain_discovery` перенесён в test module `crates/agent/src/chat/skills.rs` и расширен на границе настоящего resolution/prompt pipeline. Он загружает bundled Threads package через общий catalog loader, строит runtime index и materialization `read_skill`, проверяет секцию Threads и точную ссылку в доставляемых инструкциях. Добавлены workspace disable, global disable, исключение ссылки бюджетом при активном skill и отсутствие runtime read entry. Другой inline Agent skill сохраняет реальный read_skill path во всех этих сценариях. Прежние deny/restricted/discovery/options-only проверки сохранены. Tasks/Subagents sections при Threads-only guidance отсутствуют. Тест не запускался.
+
+### Самоаудит и фактически выполненные проверки этой итерации
+
+- После первого исправления перечитаны converter, порядок записи receipt/установки и существующая ownership-матрица. После второго — resolver/policy, runtime index mapping, read_skill handler, формирование и budget skill prompt, fallback, compiler/delivery и callers повторной компиляции.
+- Перечитан полный diff исправлений относительно `d2cc6362`. Skills/references и policy blocks Tasks/Subagents, их условия включения, Threads business logic, авторизация и grants не менялись. Изменения production ограничены защитой дополнительного destination и условием Threads policy.
+- `cargo fmt --package pioneer-agent --package pioneer-gateway` — выполнено форматирование изменений.
+- `cargo fmt --package pioneer-agent --package pioneer-gateway -- --check` — итоговая проверка успешна. Один промежуточный вызов после расширения test closure обнаружил только форматирование; оно исправлено перед итоговой проверкой.
+- `git diff --check` и `git diff --cached --check` — успешно для итоговых исправлений.
+- `git diff d2cc6362 -- resources/skills/pioneer/tasks resources/skills/pioneer/subagents crates/promt/src/content.rs crates/promt/src/compile/compiler.rs crates/skills/src/resolver.rs crates/skills/src/policy.rs crates/tools/src/handlers/skill.rs` — пустой diff.
+- Read-only `git status`, `git rev-parse`, `git worktree list`, просмотр diff и чтение/поиск затронутых контрактов. Commit выполнен с `-c core.hooksPath=/dev/null`; hooks не запускались. Основной checkout и соседние worktree не редактировались; merge в main, push и deploy не выполнялись.
+
+Оба замечания устранены по результатам статического самоаудита. Это повторная передача на внешнее ревью, а не внешняя приёмка или разрешение запускать проверки.
+
+**Тесты, cargo check, компиляция, сборки, приложение, Gateway, CLI-агенты и генераторы не запускались. Компиляция и прохождение тестов не подтверждены.** Python использовался только для редактирования текста.

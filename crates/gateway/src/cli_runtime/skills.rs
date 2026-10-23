@@ -739,7 +739,7 @@ pub(crate) async fn install_one_cli_runtime_skill(
         let (receipt, converted) = prepare_external_runtime_receipt_v2(
             &plan.receipt_path,
             receipt_conversion_candidates,
-            // An explicit user plan can precede the automatic plans. Neither
+            // An explicit user plan can precede the automatic plans. No
             // reserved receipt may be discarded by that earlier conversion.
             &[
                 (
@@ -749,6 +749,10 @@ pub(crate) async fn install_one_cli_runtime_skill(
                 (
                     plan.native_skills_root.as_path(),
                     CLI_SUBAGENTS_SKILL_EXPORT_NAME,
+                ),
+                (
+                    plan.native_skills_root.as_path(),
+                    CLI_THREADS_SKILL_EXPORT_NAME,
                 ),
             ],
         )?;

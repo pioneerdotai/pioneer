@@ -438,6 +438,236 @@ mod tests {
     }
 
     #[test]
+    fn native_threads_guidance_uses_allowed_hidden_capabilities_before_domain_discovery() {
+        use pioneer_promt::PromptSectionId;
+        use pioneer_protocol::SkillId;
+        use pioneer_skills::BundledSkillCatalogEntry;
+
+        let root = temp_case("native-threads-guidance");
+        let bundled_root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../resources/skills/pioneer");
+        let threads_id = SkillId::new("ThR7m2K9vQ4cX8pL6nB3s").unwrap();
+        let catalog = load_catalog(&SkillCatalogLoadParams {
+            installations: Vec::new(),
+            bundled: vec![BundledSkillCatalogEntry {
+                skill_id: threads_id.clone(),
+                owner: Some("pioneer".to_owned()),
+                slug: "threads".to_owned(),
+                source_root: bundled_root.clone(),
+                install_path: bundled_root.join("threads"),
+            }],
+            max_file_bytes: 1024 * 1024,
+        })
+        .expect("load bundled Threads skill");
+        let config = test_skills_config(&root);
+        // Keep another skill/read_skill available even when package skills are
+        // disabled globally or Threads is excluded by workspace policy.
+        let overlay = [agent_entry()];
+        let resolve = |config: &SkillsLoopConfig, policies: &HashMap<_, _>| {
+            resolve_turn_skills_with_explicit_refs(
+                &[],
+                &[],
+                &catalog,
+                &overlay,
+                config,
+                policies,
+                &crate::AgentMcpAvailability::default(),
+            )
+            .expect("resolve native skills")
+        };
+        let active = resolve(&config, &HashMap::new());
+        let index = pioneer_tools::build_preflight_tool_index([
+            &pioneer_tools::threads_search::threads_search_tool_spec(),
+        ]);
+        let mut permission = pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+            pioneer_protocol::TurnPermissionMode::FullAccess,
+            pioneer_protocol::TurnPermissionProfileSource::Composer,
+        );
+        let visible = vec!["read_skill".to_owned(), "request_tools".to_owned()];
+        let reference = format!("- pioneer/threads: `skill:{threads_id}`");
+        let assert_delivery =
+            |resolution: &super::TurnSkillResolution, config: &SkillsLoopConfig, expected: bool| {
+                assert!(
+                    resolution
+                        .runtime_plan
+                        .read_skill_index
+                        .contains_key(&format!("skill:{}", overlay[0].skill_id))
+                );
+                let materialized = super::super::skill_tools::materialize_skill_tooling(
+                    &resolution.runtime_plan,
+                    config,
+                );
+                assert!(materialized.bundles.iter().any(|bundle| {
+                    bundle
+                        .specs
+                        .iter()
+                        .any(|spec| spec.spec.name == "read_skill")
+                }));
+                let include_threads = super::super::native_threads_policy_available(
+                    &index,
+                    &permission,
+                    &visible,
+                    resolution,
+                    Some(&resolution.prompt),
+                );
+                let plan = super::super::compile_agent_instruction_delivery_plan_with_prompt_root(
+                    &root,
+                    Some(resolution.prompt.clone()),
+                    None,
+                    &[],
+                    &permission,
+                    false,
+                    include_threads,
+                    true,
+                    false,
+                    Some("thread_test"),
+                    "thread_test",
+                    "turn_test",
+                )
+                .expect("compile native Threads delivery");
+                assert_eq!(
+                    plan.bundle
+                        .sections
+                        .iter()
+                        .any(|section| section.id == PromptSectionId::ThreadsPolicy),
+                    expected,
+                );
+                assert!(!plan.bundle.sections.iter().any(|section| matches!(
+                    section.id,
+                    PromptSectionId::TaskOrchestrationPolicy
+                        | PromptSectionId::SubagentsPolicy
+                        | PromptSectionId::TasksPolicy
+                )));
+                assert!(
+                    plan.provider_instructions
+                        .text
+                        .contains("agent/stable-procedure")
+                );
+                if expected {
+                    assert!(
+                        plan.provider_instructions
+                            .text
+                            .contains("[Internal Skill References]")
+                    );
+                    assert!(
+                        plan.provider_instructions
+                            .text
+                            .lines()
+                            .any(|line| line == reference)
+                    );
+                }
+            };
+        assert!(
+            active
+                .runtime_plan
+                .read_skill_index
+                .contains_key(&format!("skill:{threads_id}"))
+        );
+        assert_delivery(&active, &config, true);
+        let disabled = resolve(
+            &config,
+            &HashMap::from([(
+                SkillPolicyKey::new(threads_id.clone()),
+                crate::WorkspaceSkillPolicy {
+                    enabled: Some(false),
+                    allow_implicit_invocation: None,
+                },
+            )]),
+        );
+        assert!(disabled.result.active.is_empty());
+        assert!(
+            !disabled
+                .runtime_plan
+                .read_skill_index
+                .contains_key(&format!("skill:{threads_id}"))
+        );
+        assert!(!disabled.prompt.contains(&reference));
+        assert_delivery(&disabled, &config, false);
+        let mut disabled_config = config.clone();
+        disabled_config.enabled = false;
+        let globally_disabled = resolve(&disabled_config, &HashMap::new());
+        assert!(globally_disabled.result.active.is_empty());
+        assert_delivery(&globally_disabled, &disabled_config, false);
+        let mut small_budget = config.clone();
+        small_budget.prompt_max_chars = 1;
+        let budgeted = resolve(&small_budget, &HashMap::new());
+        assert_eq!(budgeted.result.active.len(), 1);
+        assert!(
+            budgeted
+                .runtime_plan
+                .read_skill_index
+                .contains_key(&format!("skill:{threads_id}"))
+        );
+        assert!(!budgeted.prompt.contains(&reference));
+        assert_delivery(&budgeted, &small_budget, false);
+        let mut missing_read_entry = active.clone();
+        missing_read_entry
+            .runtime_plan
+            .read_skill_index
+            .remove(&format!("skill:{threads_id}"));
+        assert_delivery(&missing_read_entry, &config, false);
+        permission
+            .effective_policy
+            .denied_tools
+            .push("threads_search".to_owned());
+        assert!(!super::super::native_threads_policy_available(
+            &index,
+            &permission,
+            &visible,
+            &active,
+            Some(active.prompt.as_str()),
+        ));
+        permission.effective_policy.denied_tools.clear();
+        permission.effective_policy.allowed_tools_restricted = true;
+        permission.effective_policy.allowed_tools = visible.clone();
+        assert!(!super::super::native_threads_policy_available(
+            &index,
+            &permission,
+            &visible,
+            &active,
+            Some(active.prompt.as_str()),
+        ));
+        permission
+            .effective_policy
+            .allowed_tools
+            .push("threads_search".to_owned());
+        assert!(super::super::native_threads_policy_available(
+            &index,
+            &permission,
+            &visible,
+            &active,
+            Some(active.prompt.as_str()),
+        ));
+        assert!(!super::super::native_threads_policy_available(
+            &index,
+            &permission,
+            &["read_skill".to_owned()],
+            &active,
+            Some(active.prompt.as_str()),
+        ));
+        let options = pioneer_protocol::agent_start_options_catalog_entry();
+        let options = pioneer_tools::ConfiguredToolSpec::new(
+            pioneer_tools::ToolSpec::new(
+                options.name.as_str(),
+                options.description,
+                options.parameters,
+                pioneer_tools::PayloadKind::Function,
+            ),
+            pioneer_tools::ExecutionClass::Shared,
+            pioneer_tools::dynamic_unknown_output_policy(),
+        );
+        let options_only = pioneer_tools::build_preflight_tool_index([&options]);
+        assert!(!super::super::native_threads_policy_available(
+            &options_only,
+            &permission,
+            &visible,
+            &active,
+            Some(active.prompt.as_str()),
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn skill_activates_when_dependency_exists_only_in_metadata() {
         let root = temp_case("metadata-pass");
         let skill_dir = root.join("tests").join("agent-browser");
