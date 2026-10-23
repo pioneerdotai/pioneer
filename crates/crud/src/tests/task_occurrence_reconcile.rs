@@ -910,6 +910,32 @@ async fn migration_objects_and_marker_rollback_on_trigger_installation_failure()
     );
 }
 
+// This migration fixture predates webhook payloads. Insert only historical
+// columns and avoid RETURNING the current entity's newer columns.
+async fn legacy_seed_source_run(store: &CrudStore, task: &Task, n: u64, status: TaskRunStatus) {
+    let id = format!("r{n:020}");
+    runs::Entity::insert(runs::ActiveModel {
+        id: Set(id.clone()),
+        task_id: Set(task.id.clone()),
+        run_group_id: Set(id),
+        attempt_number: Set(1),
+        run_number: Set((n + 1).try_into().unwrap()),
+        status: Set(crate::convention::task_run_status_to_db(status).to_owned()),
+        executor_kind: Set(
+            crate::convention::task_executor_kind_to_db(task.executor_kind).to_owned(),
+        ),
+        completed_at: Set(status
+            .is_terminal()
+            .then(|| crate::util::unix_to_datetime(AT + 1))),
+        created_at: Set(crate::util::unix_to_datetime(AT)),
+        updated_at: Set(crate::util::unix_to_datetime(AT)),
+        ..Default::default()
+    })
+    .exec_without_returning(&store.connection)
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn seed_interruption_keeps_fixed_bound_and_accepts_terminal_history() {
     let store = test_store_with_workspace_migrator::<TrackerMigrator>("ws_task").await;
@@ -919,9 +945,9 @@ async fn seed_interruption_keeps_fixed_bound_and_accepts_terminal_history() {
     tx.commit().await.unwrap();
     let task = task(&store, TaskExecutorKind::System).await;
     for n in 0..40 {
-        source_run(&store, &task, n, TaskRunStatus::Queued).await;
+        legacy_seed_source_run(&store, &task, n, TaskRunStatus::Queued).await;
     }
-    source_run(&store, &task, 50, TaskRunStatus::Succeeded).await;
+    legacy_seed_source_run(&store, &task, 50, TaskRunStatus::Succeeded).await;
     let tx = maintenance.connection.begin().await.unwrap();
     TrackerMigrator::up(&*tx, None).await.unwrap();
     tx.commit().await.unwrap();
@@ -972,7 +998,7 @@ async fn seed_interruption_keeps_fixed_bound_and_accepts_terminal_history() {
             .unwrap(),
         16
     );
-    source_run(&store, &task, 100, TaskRunStatus::Queued).await; // own INSERT, outside fixed seed bound
+    legacy_seed_source_run(&store, &task, 100, TaskRunStatus::Queued).await; // own INSERT, outside fixed seed bound
     assert!(
         pending_row(&store, &format!("r{:020}", 100))
             .await

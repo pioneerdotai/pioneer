@@ -38,6 +38,9 @@ async fn webhook_http_admits_distinct_durable_runs_and_create_get_recover_the_sa
         .unwrap()
         .prompt
         .output_instructions = Some("Return a concise summary.".to_owned());
+    params.agent_spec.as_mut().unwrap().prompt.instructions = vec![
+        "Interpret the immutable HTTP request body supplied for this run using currently available tools; fail clearly if a required capability is unavailable.".to_owned(),
+    ];
     let created = create_task_for_test(&processor, params).await.unwrap();
     assert!(created.run.is_none());
     assert_eq!(created.trigger.id.len(), 21);
