@@ -1820,7 +1820,10 @@ mod tests {
             .expect("create returning stream");
         let interactive_task = tokio::spawn(async move {
             interactive
-                .execute_unprepared("INSERT INTO probe (id) VALUES (2)")
+                .execute_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "INSERT INTO probe (id) VALUES (2)",
+                ))
                 .await
         });
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1845,7 +1848,10 @@ mod tests {
         // writer can observe data. Neither operation proves query success.
         let transaction = maintenance.begin().await.expect("begin transaction");
         transaction
-            .execute_unprepared("INSERT INTO probe (id) VALUES (3)")
+            .execute_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "INSERT INTO probe (id) VALUES (3)",
+            ))
             .await
             .expect("transaction write");
         let mut transaction_stream = StreamTrait::stream_raw(
