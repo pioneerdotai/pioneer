@@ -681,8 +681,10 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
                 saw_inbox |= packet.inbox.as_ref().is_some_and(|patch| patch.upserts.iter().any(|entry| entry.run_id == run_id));
             }
             loop {
+                // The batch count map omits zeroes; a missing root entry is
+                // an authoritative zero, just as in the sidebar publisher.
                 let expected_unread = store.unread_counts_for_threads(&authenticated_test_superuser().principal_id,
-                    &[THREAD.to_owned()]).await.unwrap()[THREAD];
+                    &[THREAD.to_owned()]).await.unwrap().get(THREAD).copied().unwrap_or(0);
                 let tree = core.0.workspace_tree(&workspace).unwrap();
                 let inbox = core.0.task_inbox(&workspace).unwrap();
                 if inbox.items().iter().any(|entry| entry.notification().run_id == run_id)
