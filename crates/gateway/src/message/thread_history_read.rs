@@ -436,6 +436,7 @@ impl MessageProcessor {
                     let value = serde_json::to_value(&item)?;
                     let name = value["toolName"].as_str().unwrap_or_default();
                     let observer = super::thread_read_tools::THREAD_READ_TOOL_NAMES.contains(&name)
+                        || name == super::thread_search_tools::SEARCH_TOOL
                         || name == super::thread_tool_results::RESULT_READ_TOOL;
                     let target = value["arguments"]["threadId"]
                         .as_str()
@@ -519,6 +520,7 @@ fn project_tool_record(
     // retain them even when no full provider result was ever saved.
     let read_tool = value["toolName"].as_str().is_some_and(|name| {
         super::thread_read_tools::THREAD_READ_TOOL_NAMES.contains(&name)
+            || name == super::thread_search_tools::SEARCH_TOOL
             || name == super::thread_tool_results::RESULT_READ_TOOL
     });
     for key in ["display", "storage"].into_iter().filter(|_| !read_tool) {

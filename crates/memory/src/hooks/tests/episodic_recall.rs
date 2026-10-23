@@ -157,6 +157,9 @@ fn episodic_item(
                 .to_owned(),
             ),
             turn_id: Some("turn_prev".to_owned()),
+            item_id: None,
+            index_item_id: None,
+            source_kind: None,
             task_id: matches!(
                 source,
                 MemoryEpisodicRecallSourceKind::CurrentTask

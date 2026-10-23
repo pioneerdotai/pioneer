@@ -63,14 +63,20 @@ pub(crate) fn thread_read_tool_specs() -> Vec<ConfiguredToolSpec> {
 
 pub(super) struct ThreadReadAuthority {
     principal: AuthenticatedSessionPrincipal,
-    workspace_id: String,
+    pub(super) workspace_id: String,
     root_thread_id: String,
     current_thread_id: String,
     observe_children: bool,
     observe_workspace: bool,
 }
 impl ThreadReadAuthority {
-    fn scope(&self, operation: &str, resource: &str, recursive: bool, limit: u32) -> String {
+    pub(super) fn scope(
+        &self,
+        operation: &str,
+        resource: &str,
+        recursive: bool,
+        limit: u32,
+    ) -> String {
         // JSON encoding avoids delimiter ambiguity in imported legacy IDs.
         json!([
             "thread-read-v1",
@@ -261,7 +267,7 @@ impl MessageProcessor {
         })
     }
 
-    fn thread_read_cursor_codec(&self) -> Result<ThreadReadCursorCodec> {
+    pub(super) fn thread_read_cursor_codec(&self) -> Result<ThreadReadCursorCodec> {
         let secret = self
             .gateway_secrets
             .load_or_create_auth_credential_hmac_key(64)?;
@@ -707,7 +713,7 @@ fn safe_read_error(error: &anyhow::Error) -> ToolError {
 
 #[cfg(test)]
 #[path = "thread_read_tools/tests.rs"]
-mod tests;
+pub(in crate::message) mod tests;
 
 fn thread_metadata_page_fits(threads: &[Value]) -> Result<bool> {
     let encoded = serde_json::to_string(threads)?;

@@ -11855,6 +11855,24 @@ impl CrudStore {
         .collect()
     }
 
+    pub async fn list_thread_episodic_capsules_for_workspace_after(
+        &self,
+        workspace_id: &str,
+        after: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<ThreadEpisodicCapsuleRecord>> {
+        thread_episodic_repository::list_capsules_for_workspace_after(
+            &self.connection,
+            workspace_id,
+            after,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(crate::thread_episodic::thread_episodic_capsule_record_from_model)
+        .collect()
+    }
+
     pub async fn list_recallable_thread_episodic_items_for_thread(
         &self,
         workspace_id: &str,

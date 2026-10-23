@@ -1,3 +1,8 @@
+mod thread_search;
+pub use thread_search::{
+    ThreadsSearchFragment, ThreadsSearchPageFragment, ThreadsSearchParams, ThreadsSearchResponse,
+    ThreadsSearchSource, ThreadsSearchThread,
+};
 mod thread_read;
 pub use thread_read::{
     ThreadHistoryAnchor, ThreadHistoryDirection, ThreadsChildrenListParams,

@@ -1560,6 +1560,8 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         ),
         schema_doc!("turn_message_edited_event.json", TurnMessageEditedEvent),
         schema_doc!("turn_message_deleted_event.json", TurnMessageDeletedEvent),
+        schema_doc!("threads_search_params.json", crate::ThreadsSearchParams),
+        schema_doc!("threads_search_response.json", crate::ThreadsSearchResponse),
         schema_doc!("thread_read_params.json", ThreadReadParams),
         schema_doc!("thread_read_position.json", ThreadReadPosition),
         schema_doc!("thread_read_cursor.json", ThreadReadCursor),

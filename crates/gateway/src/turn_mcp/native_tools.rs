@@ -57,6 +57,7 @@ impl NativeToolFamily {
             Self::Html => HTML.get_or_init(pioneer_tools::html::html_tool_specs),
             Self::Threads => THREADS.get_or_init(|| {
                 let mut specs = crate::message::thread_read_tools::thread_read_tool_specs();
+                specs.extend(crate::message::thread_search_tools::thread_search_tool_specs());
                 specs.extend(crate::message::thread_tool_results::thread_result_tool_specs());
                 let capabilities = [
                     pioneer_protocol::AgentToolCapability::ChildStart,
@@ -133,7 +134,8 @@ impl NativeToolFamily {
     pub(crate) fn is_thread_reader(self, name: &str) -> bool {
         self == Self::Threads
             && (crate::message::thread_read_tools::THREAD_READ_TOOL_NAMES.contains(&name)
-                || name == "threads_tools_result_read")
+                || name == "threads_tools_result_read"
+                || name == "threads_search")
     }
 
     pub(crate) fn timeout_ms(self, name: &str) -> u64 {
@@ -294,6 +296,7 @@ pub(crate) fn materialize_thread_tools(
 ) -> Vec<pioneer_tools::ToolExtensionBundle> {
     vec![
         processor.thread_read_tools(context.clone()),
+        processor.thread_search_tools(context.clone()),
         processor.thread_result_tools(context),
     ]
 }
@@ -303,6 +306,22 @@ mod tests {
     use super::*;
     use crate::turn_mcp::{McpSelectionReason, ResolvedMcpTurnProjection};
     use serde_json::json;
+
+    #[test]
+    fn search_is_a_thread_reader_with_a_bounded_page_and_unbounded_query_schema() {
+        let spec = NativeToolFamily::Threads
+            .definitions()
+            .into_iter()
+            .find(|spec| spec.spec.name == "threads_search")
+            .unwrap();
+        assert_eq!(
+            NativeToolFamily::Threads.action("threads_search").unwrap(),
+            ResourceAction::ThreadRead
+        );
+        let properties = &spec.spec.parameters["properties"];
+        assert_eq!(properties["limit"]["maximum"], 100);
+        assert!(properties["query"].get("maxLength").is_none());
+    }
 
     #[test]
     fn every_provider_preserves_native_catalog_with_full_external_allowance() {

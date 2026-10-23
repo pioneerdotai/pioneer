@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadsSearchResponse",
+  "type": "object",
+  "properties": {
+    "coverageIncomplete": {
+      "type": "boolean"
+    },
+    "eof": {
+      "type": "boolean"
+    },
+    "nextCursor": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "pageFragment": {
+      "description": "Fragment of one oversized serialized conversation card. Concatenate text\nuntil complete, following nextCursor, then continue the global result page.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ThreadsSearchPageFragment"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "threads": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ThreadsSearchThread"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "threads",
+    "eof",
+    "coverageIncomplete",
+    "warnings"
+  ],
+  "$defs": {
+    "ThreadsSearchFragment": {
+      "type": "object",
+      "properties": {
+        "score": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "source": {
+          "$ref": "#/$defs/ThreadsSearchSource"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "source"
+      ]
+    },
+    "ThreadsSearchPageFragment": {
+      "description": "Exact serialized-card continuation, bound to a currently readable source.",
+      "type": "object",
+      "properties": {
+        "complete": {
+          "type": "boolean"
+        },
+        "source": {
+          "$ref": "#/$defs/ThreadsSearchSource"
+        },
+        "text": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "source",
+        "version",
+        "complete"
+      ]
+    },
+    "ThreadsSearchSource": {
+      "description": "Canonical application source; itemId is absent for sources without a saved item.",
+      "type": "object",
+      "properties": {
+        "indexItemId": {
+          "type": "string"
+        },
+        "itemId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sourceKind": {
+          "type": "string"
+        },
+        "sourceVersion": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "workspaceId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "threadId",
+        "turnId",
+        "sourceKind",
+        "indexItemId",
+        "sourceVersion"
+      ]
+    },
+    "ThreadsSearchThread": {
+      "type": "object",
+      "properties": {
+        "fragments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ThreadsSearchFragment"
+          }
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "threadId",
+        "fragments"
+      ]
+    }
+  }
+}

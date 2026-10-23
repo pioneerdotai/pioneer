@@ -48,6 +48,7 @@ mod thread_handlers;
 mod thread_history_read;
 mod thread_read_cursor;
 pub(crate) mod thread_read_tools;
+pub(crate) mod thread_search_tools;
 pub(crate) mod thread_tool_results;
 mod timeline_cursor;
 mod timeline_handlers;
@@ -153,10 +154,7 @@ use crate::thread_episodic::{
     ThreadEpisodicIndexExecutor, ThreadEpisodicIngestor, ThreadEpisodicRecallService,
     ThreadEpisodicRuntimeConfig,
 };
-use crate::thread_episodic_hooks::{
-    ThreadContextRecallHookConfig, ThreadEpisodicMemoryRecallProvider,
-    thread_context_recall_hook_package,
-};
+use crate::thread_episodic_hooks::ThreadEpisodicMemoryRecallProvider;
 use anyhow::Context as AnyhowContext;
 use futures_util::FutureExt;
 use pioneer_agent::MemoryLoopConfig;
@@ -951,6 +949,7 @@ impl AgentMarkdownBufferStats {
 
 #[derive(Clone)]
 struct MemoryBridgeProviders {
+    episodic_provider: Arc<ThreadEpisodicMemoryRecallProvider>,
     memory_provider: Arc<crate::memory_tools::GatewayMemoryProvider>,
     memory_policy_provider: Arc<crate::memory_policy::GatewayMemoryTurnPolicyProvider>,
 }
@@ -2035,6 +2034,9 @@ impl MessageProcessor {
             .await;
 
         let bridge = MemoryBridgeProviders {
+            episodic_provider: Arc::new(ThreadEpisodicMemoryRecallProvider::new(Arc::downgrade(
+                self,
+            ))),
             memory_provider,
             memory_policy_provider,
         };
@@ -2050,30 +2052,10 @@ impl MessageProcessor {
                 Some(bridge.memory_provider.clone()),
                 Some(bridge.memory_provider.clone()),
                 Some(bridge.memory_policy_provider),
-                Some(Arc::new(ThreadEpisodicMemoryRecallProvider::new(
-                    self.thread_episodic_recall_service.clone(),
-                    self.crud_store.clone(),
-                ))),
+                Some(bridge.episodic_provider),
                 self.agent_manager.memory_tool_bundle_artifact_store(),
                 self.memory_loop_config(),
             ))
-            .and_then(|builder| {
-                let thread_config = self
-                    .thread_episodic_runtime_config
-                    .read()
-                    .map(|config| config.clone())
-                    .unwrap_or_default();
-                builder.install(thread_context_recall_hook_package(
-                    self.thread_episodic_recall_service.clone(),
-                    Some(self.crud_store.clone()),
-                    self.memory_loop_config(),
-                    ThreadContextRecallHookConfig {
-                        enabled: thread_config.enabled && thread_config.recall_enabled,
-                        max_prompt_chars: thread_config.hook_max_prompt_chars,
-                        max_candidates: thread_config.hook_max_candidates,
-                    },
-                ))
-            })
             .and_then(|builder| {
                 builder.install(agents_doc_prompt_hook_package(self.crud_store.clone()))
             }) {

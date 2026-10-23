@@ -706,6 +706,7 @@ pub fn memvid_search_request(
     snippet_chars: usize,
 ) -> SearchRequest {
     SearchRequest {
+        query_embedding: None,
         query: query.into(),
         top_k,
         snippet_chars,

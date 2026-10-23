@@ -2412,6 +2412,7 @@ mod tests {
             ("threads_tools_result_read", PermissionActionKind::Internal),
             ("threads_list", PermissionActionKind::Internal),
             ("threads_history_read", PermissionActionKind::Internal),
+            ("threads_search", PermissionActionKind::Internal),
             ("threads_children_list", PermissionActionKind::Internal),
             ("computer_use", PermissionActionKind::ComputerUse),
             ("read_skill", PermissionActionKind::Internal),

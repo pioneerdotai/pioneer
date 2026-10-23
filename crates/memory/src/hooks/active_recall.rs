@@ -793,7 +793,7 @@ async fn execute_episodic_active_recall_mode(
                 timeout,
                 provider.recall_current_thread(MemoryCurrentThreadRecallRequest {
                     workspace_id: context.workspace_id.clone(),
-                    thread_id: context.effective_conversation_thread_id().to_owned(),
+                    thread_id: context.thread_id.clone(),
                     turn_id: context.turn_id.clone(),
                     principal_id: context.principal_id.clone(),
                     query: query.to_owned(),
@@ -3019,6 +3019,17 @@ fn episodic_prompt_line(item: &MemoryEpisodicRecallItem, max_chars: usize) -> Op
         MemoryEpisodicRecallSourceKind::CompletedTask => "completed task",
     };
     let boundary = item.provenance.boundary.as_str().replace('_', " ");
+    if let (Some(thread), Some(turn), Some(item_id)) = (
+        item.provenance.thread_id.as_deref(),
+        item.provenance.turn_id.as_deref(),
+        item.provenance.item_id.as_deref(),
+    ) {
+        let reference = serde_json::json!({"workspaceId":item.provenance.workspace_id,"threadId":thread,
+            "anchor":{"turnId":turn,"itemId":item_id},"sourceKind":item.provenance.source_kind});
+        return Some(format!(
+            "- [{source}, {boundary}, source={reference}]: {content}"
+        ));
+    }
     let id = item.id.trim();
     if id.starts_with("thread:")
         && matches!(

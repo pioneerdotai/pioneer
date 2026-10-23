@@ -119,8 +119,8 @@ impl MessageProcessor {
 
     // Saved observation results carry ACL-protected metadata of OTHER sources.
     // Replaying their byte cursor must not bypass those sources' current ACLs.
-    // The three producers already bound the response to 32KiB; only their known
-    // public envelopes are decoded here, never arbitrary user text/receipts.
+    // Reader responses are bounded to 32KiB; search pages to 2MiB. Only their
+    // known public envelopes are decoded, never arbitrary user text/receipts.
     pub(super) async fn saved_thread_read_result_disclosable(
         &self,
         authority: &super::thread_read_tools::ThreadReadAuthority,
@@ -180,10 +180,10 @@ impl MessageProcessor {
             target = nested;
         }
         let params = &target;
-        let Some(name) = value["toolName"]
-            .as_str()
-            .filter(|name| super::thread_read_tools::THREAD_READ_TOOL_NAMES.contains(name))
-        else {
+        let Some(name) = value["toolName"].as_str().filter(|name| {
+            super::thread_read_tools::THREAD_READ_TOOL_NAMES.contains(name)
+                || *name == super::thread_search_tools::SEARCH_TOOL
+        }) else {
             return Ok(true);
         };
         if params.output_log {
@@ -200,16 +200,28 @@ impl MessageProcessor {
         source.max_tokens = Some(4096);
         let mut encoded = String::new();
         let mut complete = false;
-        for _ in 0..32 {
+        let search_result = name == super::thread_search_tools::SEARCH_TOOL;
+        let mut page_count = 0;
+        loop {
+            if !search_result && page_count == 32 {
+                break;
+            }
+            page_count += 1;
             let page = self.read_thread_tool_result(source.clone()).await?;
             encoded.push_str(&page.text);
-            if encoded.len() > 256 * 1024 {
+            if !search_result && encoded.len() > 256 * 1024 {
                 return Ok(false);
             }
             if page.eof {
                 complete = true;
                 break;
             }
+            ensure!(
+                page.next.is_some()
+                    && page.next.as_ref().map(|c| (&c.version, c.offset))
+                        != source.cursor.as_ref().map(|c| (&c.version, c.offset)),
+                "saved result continuation did not advance"
+            );
             source.cursor = page.next;
         }
         if !complete {
@@ -219,6 +231,9 @@ impl MessageProcessor {
         let Some(response) = saved_read_response(root, name) else {
             return Ok(false);
         };
+        if search_result {
+            return self.search_response_readable(authority, &response).await;
+        }
         let mut references = Vec::new();
         if let Some(thread) = response["threadId"].as_str() {
             references.push(thread.to_owned());
@@ -485,7 +500,7 @@ impl ToolHandler for ResultReadHandler {
         let source_thread_id = params.thread_id.clone();
         let result = self
             .processor
-            .read_thread_tool_result(params)
+            .read_thread_tool_result(params.clone())
             .await
             .map_err(|_| {
                 ToolError::invalid_arguments(
@@ -502,6 +517,11 @@ impl ToolHandler for ResultReadHandler {
             .thread_source_readable(&current, &source_thread_id)
             .await
             .map_err(|_| denied())?
+            || !self
+                .processor
+                .saved_thread_read_result_disclosable(&current, &params, &item)
+                .await
+                .map_err(|_| denied())?
         {
             return Err(denied());
         }
