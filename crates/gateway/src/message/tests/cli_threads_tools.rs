@@ -195,9 +195,17 @@ async fn start_threads_cli_fixture(
     .await;
     let batch = batch.unwrap();
     assert!(batch.errors.is_empty(), "{:?}", batch.errors);
+    let delivered_outbox = pioneer_crud::load_agent_action_outbox(
+        &processor.crud_store.database_connection(),
+        crate::authorization::action_id_for_call("seed-cli-start").as_str(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(
         batch.delivered, 1,
-        "seed Agent start must reach the CLI dispatcher: {admission_events:?}"
+        "seed Agent start must reach the {kind:?} CLI dispatcher; outbox status={}, last_error={:?}; {admission_events:?}",
+        delivered_outbox.status, delivered_outbox.last_error
     );
     wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
     wait_for_task_cli_activation(&processor, &turn_id).await;
