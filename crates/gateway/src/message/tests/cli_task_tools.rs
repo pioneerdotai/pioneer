@@ -23,6 +23,18 @@ async fn start_task_cli_fixture_with_task_config(
     Arc<MessageProcessor>,
     String,
 ) {
+    start_task_cli_fixture_with_models(kind, task_config, &[]).await
+}
+
+async fn start_task_cli_fixture_with_models(
+    kind: CLIAgentRuntimeKind,
+    task_config: pioneer_tasks::TaskRuntimeConfig,
+    models: &[&str],
+) -> (
+    CliRuntimeSkillPreflightHarness,
+    Arc<MessageProcessor>,
+    String,
+) {
     let mut harness = setup_cli_runtime_skill_preflight_harness(kind, false).await;
     harness.processor.task_runtime = Arc::new(pioneer_tasks::TaskRuntime::new_with_config(
         harness.crud_store.clone(),
@@ -33,6 +45,16 @@ async fn start_task_cli_fixture_with_task_config(
     let turn_id = format!("cli_tasks_turn_{kind:?}").to_lowercase();
     seed_cli_runtime_skill_preflight_thread(&harness, &thread_id).await;
     let processor = Arc::new(harness.processor.clone());
+    for model in models {
+        processor
+            .mark_cli_reasoning_model_ready_for_tests(
+                &harness.workspace_id,
+                &harness.runtime_id,
+                model,
+            )
+            .await
+            .unwrap();
+    }
     processor.bind_agent_tool_bridges().await;
     let request = cli_runtime_turn_start_request_with_capabilities(
         &generate_test_request_id("cli-tasks", &format!("{kind:?}")),
@@ -49,6 +71,128 @@ async fn start_task_cli_fixture_with_task_config(
     wait_for_task_cli_activation(&processor, &turn_id).await;
 
     (harness, processor, turn_id)
+}
+
+#[test]
+fn cli_explicit_model_and_reasoning_reach_native_launch_and_survive_mcp_replay() {
+    run_standard_stack_message_test("CLI explicit launch selection", async {
+        let (harness, processor, parent) = start_task_cli_fixture_with_models(
+            CLIAgentRuntimeKind::Codex,
+            pioneer_tasks::TaskRuntimeConfig::default(),
+            &["catalog-cli-choice"],
+        )
+        .await;
+        let options = invoke_task(
+            &processor,
+            &parent,
+            "launch-options",
+            "threads_start_options",
+            json!({}),
+        )
+        .await
+        .unwrap();
+        assert!(!options.is_error, "{options:?}");
+        // The MCP envelope adds transport metadata beside the domain fields.
+        let identities: Vec<pioneer_protocol::AgentToolIdentityOption> =
+            serde_json::from_value(options.structured_content.unwrap()["identities"].clone())
+                .unwrap();
+        let identity = identities
+            .iter()
+            .find(|identity| {
+                identity.source_kind
+                    == pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance
+            })
+            .unwrap();
+        let provider = format!("cli_runtime:{}", harness.runtime_id);
+        let arguments = json!({
+            "title":"Explicit CLI model", "goal":"Use the selected CLI model and effort",
+            "launch":{"identity":{"kind":"exact","id":identity.id},
+                "profile":{"kind":"model","providerId":provider,"modelId":"catalog-cli-choice"},
+                "reasoning":{"effort":"high"}}
+        });
+        harness
+            .cli_session
+            .set_next_native_turn_id("explicit-cli-child")
+            .await;
+        let created = invoke_task(
+            &processor,
+            &parent,
+            "explicit-cli",
+            "task_create",
+            arguments.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!created.is_error, "{created:?}");
+        let created = created.structured_content.unwrap();
+        let child =
+            wait_for_task_cli_child(&processor, created["runId"].as_str().unwrap(), None).await;
+        let starts = wait_for_cli_runtime_turn_starts(&harness.cli_session, 2).await;
+        let start = &starts[1];
+        assert_eq!(start.native_thread_id, child.native_thread_id);
+        assert_eq!(start.model.as_deref(), Some("catalog-cli-choice"));
+        assert_eq!(start.effort.as_deref(), Some("high"));
+        assert_eq!(child.runtime_id, harness.runtime_id);
+        let snapshot = processor
+            .crud_store
+            .get_turn_runtime_snapshot(&child.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.provider_name, provider);
+        assert_eq!(snapshot.model, "catalog-cli-choice");
+        assert_eq!(snapshot.reasoning_effort.as_deref(), Some("high"));
+        let actor = processor
+            .crud_store
+            .get_task_actor_contract(created["taskId"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            actor.resolved_identity_id.as_deref(),
+            Some(identity.id.as_str())
+        );
+        assert_eq!(
+            actor
+                .launch
+                .as_ref()
+                .unwrap()
+                .execution
+                .reasoning
+                .as_ref()
+                .unwrap()
+                .effort,
+            "high"
+        );
+        let replay = invoke_task(
+            &processor,
+            &parent,
+            "explicit-cli",
+            "task_create",
+            arguments,
+        )
+        .await
+        .unwrap();
+        assert!(!replay.is_error, "{replay:?}");
+        assert_eq!(
+            replay.structured_content.unwrap()["taskId"],
+            created["taskId"]
+        );
+        assert_eq!(
+            harness.cli_session.turn_starts.lock().await.len(),
+            2,
+            "replay must not launch a second child with current defaults"
+        );
+        assert_eq!(
+            processor
+                .crud_store
+                .get_task_actor_contract(created["taskId"].as_str().unwrap())
+                .await
+                .unwrap()
+                .unwrap(),
+            actor
+        );
+    });
 }
 
 async fn wait_for_task_cli_activation(processor: &MessageProcessor, turn_id: &str) {
@@ -1943,17 +2087,28 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
                 .list_turn_mcp_bindings(&turn_id)
                 .await
                 .unwrap();
-            for family in [
-                crate::turn_mcp::native_tools::NativeToolFamily::Tasks,
-                crate::turn_mcp::native_tools::NativeToolFamily::Threads,
+            for definition in crate::turn_mcp::native_tools::NativeToolFamily::Tasks
+                .definitions()
+                .into_iter()
+                .chain(crate::message::thread_read_tools::thread_read_tool_specs())
+                .chain(crate::message::thread_tool_results::thread_result_tool_specs())
+            {
+                assert!(
+                    bindings
+                        .iter()
+                        .any(|binding| binding.raw_tool_name == definition.spec.name)
+                );
+            }
+            for name in [
+                "threads_identity_odels_list",
+                "thread_message_send",
+                "thread_create",
+                "threads_turn_start",
             ] {
-                for definition in family.definitions() {
-                    assert!(
-                        bindings
-                            .iter()
-                            .any(|binding| binding.raw_tool_name == definition.spec.name)
-                    );
-                }
+                assert!(
+                    !bindings.iter().any(|binding| binding.raw_tool_name == name),
+                    "unselected thread action must stay outside the fixed CLI catalog: {name}"
+                );
             }
             // The fixed CLI binding must reach the shared observation handlers,
             // rather than only publishing a schema with no native dispatcher.

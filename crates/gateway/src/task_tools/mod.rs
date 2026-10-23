@@ -825,6 +825,7 @@ impl TaskToolAuthorizationScope {
         &self,
         processor: &MessageProcessor,
         params: &TaskCreateParams,
+        profile: Option<&pioneer_protocol::AgentExecutionProfileProjection>,
     ) -> Result<Option<pioneer_tasks::TaskExecutionAdmissionSeed>, ToolError> {
         let principal = &self.principal;
         let workspace_id = &self.workspace_id;
@@ -847,6 +848,14 @@ impl TaskToolAuthorizationScope {
             None,
         )
         .map_err(|_| task_tool_authorization_error())?;
+        if let Some(profile) = profile {
+            request.provider = profile.provider_id.clone();
+            request.model = profile.model_id.clone();
+            request.execution_backend =
+                crate::message::agent_action_tools::execution_backend_for_profile(
+                    processor, profile,
+                )?;
+        }
         if !matches!(
             request.execution_backend,
             Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime { .. })
@@ -1726,11 +1735,11 @@ impl TaskToolHandler {
                 identity: AgentToolIdentityChoice::InheritParent,
                 profile: AgentToolProfileChoice::InheritParent,
                 reasoning: None,
+                use_default_reasoning: false,
                 permission_profile: None,
                 skill_ids: Vec::new(),
                 mcp_server_ids: Vec::new(),
             });
-        let server_launch = requested_launch.clone().into_server_selection();
         let template_fingerprint = {
             let canonical = serde_json::to_vec(&input).map_err(|error| {
                 ToolError::internal(format!("failed to fingerprint task_create: {error}"))
@@ -1745,6 +1754,22 @@ impl TaskToolHandler {
         {
             return Ok(function_output(output));
         }
+        let inherit_current_model = matches!(
+            requested_launch.profile,
+            AgentToolProfileChoice::InheritParent
+        );
+        let requested_launch = crate::message::agent_action_tools::resolve_tool_launch(
+            self.processor.as_ref(),
+            &pioneer_agent::TurnToolContext {
+                workspace_id: self.context.workspace_id.clone(),
+                thread_id: self.context.thread_id.clone(),
+                turn_id: self.context.turn_id.clone(),
+            },
+            requested_launch,
+            &invocation.call_id,
+        )
+        .await?;
+        let server_launch = requested_launch.clone().into_server_selection();
         let mut params = self.create_params(input, authorization).await?;
         let agent_binding = self
             .processor
@@ -1827,6 +1852,27 @@ impl TaskToolHandler {
                 .resolve_task_launch(&server_launch)
                 .map_err(crate::message::agent_action_tools::adapter_tool_error)?
         };
+        crate::message::agent_action_tools::validate_new_launch_model(
+            self.processor.as_ref(),
+            &pioneer_agent::TurnToolContext {
+                workspace_id: self.context.workspace_id.clone(),
+                thread_id: self.context.thread_id.clone(),
+                turn_id: self.context.turn_id.clone(),
+            },
+            &profile,
+            server_launch.execution.reasoning.as_ref(),
+            &self
+                .processor
+                .load_turn_execution_authorization_context(&self.context.turn_id)
+                .await
+                .map_err(|_| task_tool_authorization_error())?,
+            inherit_current_model,
+        )
+        .await?;
+        if let Some(spec) = &mut params.agent_spec {
+            spec.model = Some(profile.model_id.clone());
+            spec.model_provider = Some(profile.provider_id.clone());
+        }
         create_context.resolved_launch_identity = Some(identity);
         create_context.resolved_launch_profile = Some(profile);
         let target_option_id = requested_target_option_id
@@ -1941,7 +1987,11 @@ impl TaskToolHandler {
         params.launch = Some(persisted_launch.clone());
         create_context.launch_selection = Some(persisted_launch);
         let execution_admission = authorization
-            .authorize_execution_intent(self.processor.as_ref(), &params)
+            .authorize_execution_intent(
+                self.processor.as_ref(),
+                &params,
+                create_context.resolved_launch_profile.as_ref(),
+            )
             .await?;
         let agent_action_projection = plan.projection;
         create_context.agent_action_commit = Some(plan.input);
@@ -3325,6 +3375,8 @@ struct TaskCreateToolInput {
     /// Optional child identity/profile and additional Skill/MCP selection from
     /// threads_start_options. Immediate tasks in the current capsule inherit the
     /// current Turn's selected capabilities. Empty lists keep that inheritance.
+    /// Set useDefaultReasoning=true to use the model's native default instead
+    /// of inheriting effort; this cannot be combined with reasoning.
     launch: Option<AgentToolLaunchSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Omit for an immediate attached subagent. Use this object directly; do not wrap it in spec, schedule, or triggerInput. For daily scheduled work choose the cron trigger kind and fill its leaf fields.
@@ -5908,6 +5960,7 @@ mod tests {
             identity: AgentToolIdentityChoice::InheritParent,
             profile: AgentToolProfileChoice::InheritParent,
             reasoning: None,
+            use_default_reasoning: false,
             permission_profile: None,
             skill_ids: Vec::new(),
             mcp_server_ids: Vec::new(),
@@ -5938,6 +5991,7 @@ mod tests {
             identity: AgentToolIdentityChoice::InheritParent,
             profile: AgentToolProfileChoice::InheritParent,
             reasoning: None,
+            use_default_reasoning: false,
             permission_profile: None,
             skill_ids: Vec::new(),
             mcp_server_ids: Vec::new(),

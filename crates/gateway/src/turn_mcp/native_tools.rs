@@ -58,6 +58,34 @@ impl NativeToolFamily {
             Self::Threads => THREADS.get_or_init(|| {
                 let mut specs = crate::message::thread_read_tools::thread_read_tool_specs();
                 specs.extend(crate::message::thread_tool_results::thread_result_tool_specs());
+                let capabilities = [
+                    pioneer_protocol::AgentToolCapability::ChildStart,
+                    pioneer_protocol::AgentToolCapability::ThreadCreate,
+                    pioneer_protocol::AgentToolCapability::MessageCreate,
+                ]
+                .into_iter()
+                .collect();
+                // Share the protocol definitions without embedding execution
+                // facts in the fixed catalog.
+                let entry = pioneer_protocol::agent_identity_models_catalog_entry();
+                let mut entries = vec![entry];
+                entries.extend(pioneer_protocol::project_agent_model_tool_catalog(
+                    &capabilities,
+                    None,
+                ));
+                entries.push(pioneer_protocol::agent_turn_start_catalog_entry());
+                specs.extend(entries.into_iter().map(|entry| {
+                    ConfiguredToolSpec::new(
+                        ToolSpec::new(
+                            entry.name.as_str(),
+                            entry.description,
+                            entry.parameters,
+                            PayloadKind::Function,
+                        ),
+                        ExecutionClass::Shared,
+                        dynamic_unknown_output_policy(),
+                    )
+                }));
                 specs
             }),
             Self::Tasks => TASKS.get_or_init(|| {
@@ -82,7 +110,19 @@ impl NativeToolFamily {
     pub(crate) fn action(self, name: &str) -> Result<ResourceAction, pioneer_tools::ToolError> {
         match self {
             Self::Html => Ok(ResourceAction::McpUse),
-            Self::Threads => Ok(ResourceAction::ThreadRead),
+            Self::Threads
+                if self.is_thread_reader(name) || name == "threads_identity_odels_list" =>
+            {
+                Ok(ResourceAction::ThreadRead)
+            }
+            Self::Threads => match name {
+                "thread_message_send" => Ok(ResourceAction::MessageCreate),
+                "thread_create" => Ok(ResourceAction::ThreadCreateWorkspace),
+                "threads_turn_start" => Ok(ResourceAction::AgentTurnStart),
+                _ => Err(pioneer_tools::ToolError::NotFound(
+                    "unknown threads tool".to_owned(),
+                )),
+            },
             // Reading the already capability-filtered launch catalog is not a
             // child-start mutation. ChildStart belongs to the Agent action
             // envelope, not the Turn execution's resource-action grant.
@@ -91,6 +131,12 @@ impl NativeToolFamily {
             }
             Self::Tasks => crate::task_tools::task_tool_resource_action(name),
         }
+    }
+
+    pub(crate) fn is_thread_reader(self, name: &str) -> bool {
+        self == Self::Threads
+            && (crate::message::thread_read_tools::THREAD_READ_TOOL_NAMES.contains(&name)
+                || name == "threads_tools_result_read")
     }
 
     pub(crate) fn timeout_ms(self, name: &str) -> u64 {
@@ -228,12 +274,12 @@ pub(crate) async fn materialize_task_tools(
     let mut actions =
         crate::message::agent_action_tools::materialize(processor.clone(), context.clone()).await?;
     for bundle in &mut actions.bundles {
-        bundle
-            .specs
-            .retain(|spec| spec.spec.name == "threads_start_options");
+        bundle.specs.retain(|spec| {
+            pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&spec.spec.name.as_str())
+        });
         bundle
             .handlers
-            .retain(|(name, _)| name == "threads_start_options");
+            .retain(|(name, _)| pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&name.as_str()));
     }
     if let Some(search) =
         super::threads_search::materialize(processor.clone(), context.clone()).await

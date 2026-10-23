@@ -828,7 +828,14 @@ pub(crate) fn migrate_child_launch_grant_v1_to_v2(
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentExecutionProfileSelection {
     InheritParent,
-    Exact { profile_id: AgentExecutionProfileId },
+    Exact {
+        profile_id: AgentExecutionProfileId,
+    },
+    Model {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_id: Option<String>,
+        model_id: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]

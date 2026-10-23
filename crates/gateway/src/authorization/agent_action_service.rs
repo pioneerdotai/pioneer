@@ -227,6 +227,7 @@ impl CanonicalAgentActionService {
                             pioneer_protocol::AgentExecutionProfileSelection::InheritParent => {
                                 Some(&root.profile.id)
                             }
+                            pioneer_protocol::AgentExecutionProfileSelection::Model { .. } => None,
                         }
                     });
                     let routed_disclosure_class =

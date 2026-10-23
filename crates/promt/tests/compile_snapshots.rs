@@ -367,7 +367,7 @@ Some tool domains and their tools are hidden until requested. If you need a hidd
 A tool listed in more than one domain becomes visible when any of those domains is opened.
 
 Domains:
-- threads: threads_search, threads_tools_result_read, threads_list, threads_history_read, threads_children_list, threads_start_options, thread_message_send, thread_create, threads_turn_start.
+- threads: threads_search, threads_tools_result_read, threads_list, threads_history_read, threads_children_list, threads_start_options, threads_identity_odels_list, thread_message_send, thread_create, threads_turn_start.
 - memory: memory_search, memory_list, memory_get, memory_remember, memory_forget.
 - task: threads_start_options, task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_finish, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
 - artifact: artifact_prepare, artifact_register, artifact_read.
@@ -418,7 +418,7 @@ Some tool domains and their tools are hidden until requested. If you need a hidd
 A tool listed in more than one domain becomes visible when any of those domains is opened.
 
 Domains:
-- threads: threads_search, threads_tools_result_read, threads_list, threads_history_read, threads_children_list, threads_start_options, thread_message_send, thread_create, threads_turn_start.
+- threads: threads_search, threads_tools_result_read, threads_list, threads_history_read, threads_children_list, threads_start_options, threads_identity_odels_list, thread_message_send, thread_create, threads_turn_start.
 - memory: memory_search, memory_list, memory_get, memory_remember, memory_forget.
 - task: threads_start_options, task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_finish, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
 - artifact: artifact_prepare, artifact_register, artifact_read.

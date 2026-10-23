@@ -224,6 +224,15 @@ impl TaskDerivedChildLaunchGrant {
             crate::AgentExecutionProfileSelection::Exact { profile_id } => {
                 profile_id == &profile.id
             }
+            crate::AgentExecutionProfileSelection::Model {
+                provider_id,
+                model_id,
+            } => {
+                model_id == &profile.model_id
+                    && provider_id
+                        .as_ref()
+                        .is_none_or(|id| id == &profile.provider_id)
+            }
         };
         let permission_selection_allowed =
             launch

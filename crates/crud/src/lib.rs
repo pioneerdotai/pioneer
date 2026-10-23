@@ -3570,8 +3570,15 @@ fn completed_message_turn_events(
             sandbox_mode: write.sandbox_mode,
             turn: write.started_turn.clone(),
             input: write.input.to_vec(),
+            // An agent-authored Message does not select or run a model. Preserve
+            // the destination's configuration, including an intentional None,
+            // so single-thread and list snapshots restore the same selection.
+            reasoning_effort: if matches!(&write.actor, PersistedActorRef::AgentExecution(_)) {
+                write.thread.reasoning_effort.clone()
+            } else {
+                None
+            },
             actor: Some(write.actor),
-            reasoning_effort: None,
             work_owner: Default::default(),
         }),
         TurnEventPayload::TurnCompleted(write.completed),
@@ -23548,13 +23555,23 @@ impl CrudStore {
         )
         .await?;
         let mut threads = Vec::with_capacity(models.len());
+        let mut creator_executions = HashMap::new();
         for model in models {
+            if model.created_by_actor_kind.as_deref() == Some("agent_execution") {
+                creator_executions.insert(
+                    model.id.clone(),
+                    model
+                        .created_by_actor_id
+                        .clone()
+                        .context("agent-created thread has no creator execution")?,
+                );
+            }
             let Some(thread) = thread_from_db_model(model)? else {
                 continue;
             };
             threads.push(thread);
         }
-        self.attach_latest_thread_turn_snapshots(&mut threads)
+        self.attach_latest_thread_turn_snapshots(&mut threads, &creator_executions)
             .await?;
         Ok(threads)
     }
@@ -23579,20 +23596,34 @@ impl CrudStore {
         let models =
             thread::list_threads_by_workspace(&self.connection, workspace_id, limit).await?;
         let mut threads = Vec::with_capacity(models.len());
+        let mut creator_executions = HashMap::new();
 
         for model in models {
+            if model.created_by_actor_kind.as_deref() == Some("agent_execution") {
+                creator_executions.insert(
+                    model.id.clone(),
+                    model
+                        .created_by_actor_id
+                        .clone()
+                        .context("agent-created thread has no creator execution")?,
+                );
+            }
             let Some(thread) = thread_from_db_model(model)? else {
                 continue;
             };
             threads.push(thread);
         }
 
-        self.attach_latest_thread_turn_snapshots(&mut threads)
+        self.attach_latest_thread_turn_snapshots(&mut threads, &creator_executions)
             .await?;
         Ok(threads)
     }
 
-    async fn attach_latest_thread_turn_snapshots(&self, threads: &mut [Thread]) -> Result<()> {
+    async fn attach_latest_thread_turn_snapshots(
+        &self,
+        threads: &mut [Thread],
+        creator_executions: &HashMap<String, String>,
+    ) -> Result<()> {
         for batch in threads.chunks_mut(turn::THREAD_TURN_SNAPSHOT_BATCH_SIZE) {
             let thread_ids = batch
                 .iter()
@@ -23617,11 +23648,30 @@ impl CrudStore {
                 .into_iter()
                 .map(|model| (model.thread_id.clone(), model))
                 .collect::<HashMap<_, _>>();
+            let empty_creator_ids = batch
+                .iter()
+                .filter(|thread| !latest.contains_key(&thread.id))
+                .filter_map(|thread| creator_executions.get(&thread.id).map(String::as_str))
+                .collect::<Vec<_>>();
+            let creator_reasoning = repositories::agent_domain::agent_thread_creator_reasoning(
+                &self.connection,
+                &empty_creator_ids,
+            )
+            .await?;
 
             // All DB capacity has been released. Attach in original list order
             // using the same snapshot conversion as the single-thread caller.
             for thread in batch {
                 let Some(model) = latest.remove(thread.id.as_str()) else {
+                    if let Some((workspace, reasoning)) = creator_executions
+                        .get(&thread.id)
+                        .and_then(|id| creator_reasoning.get(id))
+                    {
+                        if workspace != &thread.workspace_id {
+                            bail!("thread creator execution workspace differs");
+                        }
+                        thread.reasoning_effort = reasoning.clone();
+                    }
                     continue;
                 };
                 let reasoning_effort = if model.turn_kind == turn_kind_to_db(TurnKind::Conversation)
@@ -23643,6 +23693,11 @@ impl CrudStore {
         let Some(turn_model) =
             turn::find_latest_turn_for_thread(&self.connection, thread.id.as_str()).await?
         else {
+            thread.reasoning_effort = repositories::agent_domain::empty_agent_thread_reasoning(
+                &self.connection,
+                &thread.id,
+            )
+            .await?;
             return Ok(());
         };
 
@@ -34879,7 +34934,7 @@ mod tests {
         ColumnTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, PaginatorTrait,
         QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set, Statement, TransactionTrait,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -59380,7 +59435,7 @@ mod tests {
             let mut selected = selected.clone();
             async move {
                 store
-                    .attach_latest_thread_turn_snapshots(&mut selected)
+                    .attach_latest_thread_turn_snapshots(&mut selected, &HashMap::new())
                     .await
             }
         });
@@ -59437,7 +59492,7 @@ mod tests {
         reads.events.lock().unwrap().clear();
         tokio::time::timeout(
             Duration::from_secs(5),
-            critical.attach_latest_thread_turn_snapshots(&mut selected),
+            critical.attach_latest_thread_turn_snapshots(&mut selected, &HashMap::new()),
         )
         .await
         .expect("cancelled batch must not leak reader capacity")

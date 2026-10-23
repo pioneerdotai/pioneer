@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentIdentityModelsToolInput",
+  "description": "Model discovery is scoped to an identity already admitted to this execution.",
+  "type": "object",
+  "properties": {
+    "identityId": {
+      "$ref": "#/$defs/AgentIdentityId"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "identityId"
+  ],
+  "$defs": {
+    "AgentIdentityId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

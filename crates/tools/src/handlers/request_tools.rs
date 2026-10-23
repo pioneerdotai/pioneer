@@ -410,6 +410,7 @@ mod tests {
         let catalog = [
             "request_tools",
             "threads_start_options",
+            "threads_identity_odels_list",
             "threads_turn_start",
             "thread_create",
             "thread_message_send",
@@ -437,7 +438,10 @@ mod tests {
         assert!(!task_only.added.values().flatten().any(|name| {
             matches!(
                 name.as_str(),
-                "thread_create" | "thread_message_send" | "threads_turn_start"
+                "thread_create"
+                    | "thread_message_send"
+                    | "threads_turn_start"
+                    | "threads_identity_odels_list"
             )
         }));
         assert!(!snapshot.contains_name("threads_start_options").await);
@@ -448,7 +452,9 @@ mod tests {
             }))
             .await
             .expect("both domains resolve");
-        assert_eq!(both.added["threads"].len(), 4);
+        assert_eq!(both.added["threads"].len(), 5);
+        assert!(both.added["threads"].contains(&"threads_identity_odels_list".to_owned()));
+        assert!(!snapshot.contains_name("threads_identity_odels_list").await);
         assert!(!both.added.contains_key("task"));
         assert_eq!(
             both.already_visible["task"],
