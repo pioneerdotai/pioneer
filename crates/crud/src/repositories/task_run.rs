@@ -387,7 +387,7 @@ pub async fn has_dispatch_capacity<C: ConnectionTrait>(
         )
         .count(db)
         .await?;
-    Ok(occupied.saturating_add(earlier_ready) < u64::from(max_parallel_runs.max(1)))
+    Ok(occupied.saturating_add(earlier_ready) < u64::from(std::cmp::max(max_parallel_runs, 1)))
 }
 
 pub async fn claim_run_for_dispatch<C: ConnectionTrait>(
