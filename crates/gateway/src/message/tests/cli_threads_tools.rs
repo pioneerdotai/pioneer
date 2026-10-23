@@ -174,14 +174,51 @@ async fn start_threads_cli_fixture(
     .unwrap();
     let payload: JsonValue = serde_json::from_str(&outbox.payload_json).unwrap();
     let turn_id = payload["dispatch"]["turn_id"].as_str().unwrap().to_owned();
+    let thread_id = payload["dispatch"]["thread_id"].as_str().unwrap();
+    let admitted_turn = processor
+        .crud_store
+        .get_turn(thread_id, &turn_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    let admitted_input = processor
+        .crud_store
+        .get_turn_inputs(&turn_id)
+        .await
+        .unwrap();
     // This fixture has no background outbox worker. Deliver the committed
     // start through the normal dispatcher before observing CLI activation.
     let batch = crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
         .await
         .unwrap();
     assert!(batch.errors.is_empty(), "{:?}", batch.errors);
+    assert_eq!(
+        batch.delivered, 1,
+        "seed Agent start must reach the CLI dispatcher"
+    );
     wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
     wait_for_task_cli_activation(&processor, &turn_id).await;
+    let activated_turn = processor
+        .crud_store
+        .get_turn(thread_id, &turn_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    assert_eq!(activated_turn.author, admitted_turn.author);
+    assert_eq!(
+        activated_turn.permission_profile,
+        admitted_turn.permission_profile
+    );
+    assert_eq!(
+        processor
+            .crud_store
+            .get_turn_inputs(&turn_id)
+            .await
+            .unwrap(),
+        admitted_input
+    );
     (harness, processor, turn_id)
 }
 

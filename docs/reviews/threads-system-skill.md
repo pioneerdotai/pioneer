@@ -171,3 +171,13 @@ Workspace `enabled:false` исключает Threads из active resolution; г�
 Фактически выполнены `cargo fmt --package pioneer-agent -- --check`, `git diff --check` и `git diff --cached --check` — успешно; форматирование использовалось только в check-only режиме. Дополнительно выполнены read-only Git-проверки HEAD, ветки, рабочего дерева, просмотр полного diff и поиск/чтение всех callers. Commit выполняется с `-c core.hooksPath=/dev/null`, без запуска hooks. Основной checkout и соседние worktree не редактировались; merge в main, push и deploy не выполнялись.
 
 **Тесты, cargo check, компиляция, сборки, приложение, Gateway, CLI-агенты и генераторы не запускались. Компиляция и прохождение тестов не подтверждены.** Результат передаётся на повторное внешнее ревью; самоаудит не заменяет внешнюю приёмку и не разрешает запуск тестов.
+
+## CI follow-up: preserve committed Agent turns during CLI activation
+
+At `a3af75b5`, [CI run 39925044636](https://github.com/pioneerdotai/pioneer/actions/runs/39925044636) built successfully. Its only failing test was the CLI Threads facade integration, which timed out waiting for the recording runtime to start.
+
+The durable Agent dispatcher rehydrated an already committed turn, rolled it back in memory, and sent it through fresh CLI preparation. The shared preparation path therefore treated that turn as prior history and attempted materialization again. The dispatcher now passes the committed outcome into `DurableAgent`, and CLI preparation uses the existing path for admitted outcomes. The Task conditions, permissions, grants, outbox/replay protocol, and skill policies remain unchanged.
+
+The existing facade integration now checks that the seed outbox is delivered and that CLI activation preserves the admitted author, permission profile, and input. The DurableAgent completion fixture initializes the new optional outcome field without changing its assertions. All constructors and the single caller of the updated preparation helper were reviewed statically.
+
+Local validation was limited to `cargo fmt --package pioneer-gateway -- --check`, `git diff --check`, and `git diff --cached --check`. No local tests, cargo check, compilation, builds, application, Gateway, CLI agents, or generators were run. The new CI result is not yet confirmed.

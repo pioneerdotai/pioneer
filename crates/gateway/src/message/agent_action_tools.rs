@@ -3045,18 +3045,13 @@ async fn dispatch_agent_action_outbox_row(
                     anyhow::anyhow!("committed StartAgent CLI Turn has no security snapshot")
                 })?
                 .snapshot;
-            // Main CLI execution receives the new command, never a Pioneer
-            // history projection or a summary prepared for native continuation.
-            // The outbox owns activation. Clear only the in-memory rehydrated
-            // draft before the shared CLI admission path recreates the same
-            // deterministic, already-durable Turn idempotently.
-            processor
-                .thread_manager
-                .rollback_turn_start(outcome.rollback_context)
-                .await;
+            // The action already committed this Turn. Keep its immutable
+            // admission outcome through CLI preparation, just as for other
+            // admitted children, without rolling it back or materializing it again.
             let prepared = processor
                 .prepare_committed_agent_cli_runtime_turn(
                     dispatch.params,
+                    outcome,
                     runtime_id,
                     runtime_kind,
                     permission_profile,

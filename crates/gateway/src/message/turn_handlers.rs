@@ -825,6 +825,7 @@ pub(super) enum TurnStartSuccessResponse {
         continuation_thread_id: String,
         context_thread_id: String,
         agent_author: pioneer_protocol::TurnAuthorSnapshot,
+        admitted_outcome: Option<Box<crate::thread::TurnStartOutcome>>,
         completion: std::sync::Arc<
             std::sync::Mutex<
                 Option<
@@ -3693,6 +3694,7 @@ impl MessageProcessor {
     pub(super) async fn prepare_committed_agent_cli_runtime_turn(
         &self,
         params: TurnStartParams,
+        admitted_outcome: crate::thread::TurnStartOutcome,
         runtime_id: String,
         runtime_kind: CLIAgentRuntimeKind,
         permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
@@ -3725,6 +3727,7 @@ impl MessageProcessor {
             continuation_thread_id,
             context_thread_id,
             agent_author,
+            admitted_outcome: Some(Box::new(admitted_outcome)),
             completion: std::sync::Arc::new(std::sync::Mutex::new(Some(sender))),
         };
         self.turn_start_cli_runtime(
@@ -4630,6 +4633,9 @@ impl MessageProcessor {
             let already_materialized = matches!(
                 &success_response,
                 TurnStartSuccessResponse::Task {
+                    admitted_outcome: Some(_),
+                    ..
+                } | TurnStartSuccessResponse::DurableAgent {
                     admitted_outcome: Some(_),
                     ..
                 }
@@ -5949,7 +5955,8 @@ impl MessageProcessor {
                 }
             };
             let admitted_outcome = match &mut success_response {
-                TurnStartSuccessResponse::Task { admitted_outcome, .. } => admitted_outcome.take(),
+                TurnStartSuccessResponse::Task { admitted_outcome, .. }
+                | TurnStartSuccessResponse::DurableAgent { admitted_outcome, .. } => admitted_outcome.take(),
                 _ => None,
             };
             let outcome_result = if let Some(outcome) = admitted_outcome {
