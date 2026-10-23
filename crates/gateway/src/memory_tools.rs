@@ -147,6 +147,10 @@ struct MemoryExecutionBoundary {
 }
 
 impl GatewayMemoryProvider {
+    pub(crate) fn processor_weak(&self) -> Weak<MessageProcessor> {
+        self.processor.clone()
+    }
+
     pub(crate) fn new(processor: Weak<MessageProcessor>) -> Self {
         Self { processor }
     }

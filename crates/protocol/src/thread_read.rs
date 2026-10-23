@@ -50,3 +50,62 @@ pub enum ThreadHistoryDirection {
     Older,
     Newer,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadsSearchParams {
+    #[schemars(length(min = 1, max = 4096))]
+    pub query: String,
+    #[schemars(range(min = 1, max = 20))]
+    pub limit: u32,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadsSearchLimitations {
+    pub selection_limited: bool,
+    pub coverage_limited: bool,
+    pub semantic_approximate: bool,
+    pub semantic_degraded: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadsSearchResponse {
+    pub threads: Vec<ThreadSearchCard>,
+    pub next_cursor: Option<String>,
+    pub eof: bool,
+    pub limitations: ThreadsSearchLimitations,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadSearchCard {
+    pub thread_id: String,
+    pub title: Option<String>,
+    pub fragments: Vec<ThreadSearchFragment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadSearchFragment {
+    pub snippet: String,
+    pub source: ThreadSearchSource,
+    pub provenance: ThreadSearchProvenance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadSearchSource {
+    pub thread_id: String,
+    pub anchor: ThreadHistoryAnchor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadSearchProvenance {
+    pub actor_role: crate::ThreadEpisodicSourceActorRole,
+    pub source_context: crate::ThreadEpisodicSourceContext,
+}

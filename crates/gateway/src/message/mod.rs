@@ -48,6 +48,7 @@ mod thread_handlers;
 mod thread_history_read;
 mod thread_read_cursor;
 pub(crate) mod thread_read_tools;
+mod thread_search;
 pub(crate) mod thread_tool_results;
 mod timeline_cursor;
 mod timeline_handlers;
@@ -721,6 +722,7 @@ pub struct MessageProcessor {
     thread_episodic_embedding_provider_resolver:
         Arc<ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver>,
     thread_episodic_recall_service: Arc<ThreadEpisodicRecallService>,
+    thread_search_sessions: Arc<std::sync::Mutex<thread_search::ThreadSearchSessions>>,
     voice_input_supervisor: Option<Arc<VoiceInputSupervisor>>,
     self_improvement_supervisor: Option<Arc<crate::self_improvement::supervisor::SelfImprovementSupervisor>>,
     gateway_settings_update_lock: Arc<Mutex<()>>,
@@ -1382,6 +1384,7 @@ impl MessageProcessor {
             thread_episodic_index_executor,
             thread_episodic_embedding_provider_resolver,
             thread_episodic_recall_service,
+            thread_search_sessions: Arc::new(std::sync::Mutex::new(Default::default())),
             voice_input_supervisor: None,
             self_improvement_supervisor: None,
             gateway_settings_update_lock: Arc::new(Mutex::new(())),
@@ -2043,6 +2046,10 @@ impl MessageProcessor {
     }
 
     async fn install_memory_hook_runtime(&self, bridge: MemoryBridgeProviders) {
+        let episodic_provider = Arc::new(ThreadEpisodicMemoryRecallProvider::new(
+            bridge.memory_provider.processor_weak(),
+            self.thread_episodic_recall_service.clone(),
+        ));
         match GatewayHookRuntimeBuilder::new(self.crud_store.clone())
             .with_crud_run_store()
             .install(pioneer_memory::hooks::package(
@@ -2050,10 +2057,7 @@ impl MessageProcessor {
                 Some(bridge.memory_provider.clone()),
                 Some(bridge.memory_provider.clone()),
                 Some(bridge.memory_policy_provider),
-                Some(Arc::new(ThreadEpisodicMemoryRecallProvider::new(
-                    self.thread_episodic_recall_service.clone(),
-                    self.crud_store.clone(),
-                ))),
+                Some(episodic_provider.clone()),
                 self.agent_manager.memory_tool_bundle_artifact_store(),
                 self.memory_loop_config(),
             ))
@@ -2064,8 +2068,8 @@ impl MessageProcessor {
                     .map(|config| config.clone())
                     .unwrap_or_default();
                 builder.install(thread_context_recall_hook_package(
-                    self.thread_episodic_recall_service.clone(),
-                    Some(self.crud_store.clone()),
+                    episodic_provider.clone(),
+                    None,
                     self.memory_loop_config(),
                     ThreadContextRecallHookConfig {
                         enabled: thread_config.enabled && thread_config.recall_enabled,
@@ -5028,6 +5032,7 @@ impl MessageProcessor {
             thread_episodic_index_executor,
             thread_episodic_embedding_provider_resolver,
             thread_episodic_recall_service,
+            thread_search_sessions: Arc::new(std::sync::Mutex::new(Default::default())),
             voice_input_supervisor: None,
             self_improvement_supervisor: None,
             gateway_settings_update_lock: Arc::new(Mutex::new(())),

@@ -1101,3 +1101,201 @@ async fn prompt_contract_separates_durable_thread_and_task_context() {
     assert!(thread_content.contains("broad recall requires explicit intent."));
     assert!(!thread_content.contains("Relevant memory context for this turn:"));
 }
+
+#[tokio::test]
+async fn identical_current_thread_queries_share_one_execution_and_prompt_contributions_share_budget()
+ {
+    let durable = TestRecallMemoryProvider::with_recall(MemoryRecallSnapshot::empty());
+    let mut episodic =
+        FakeEpisodicRecallProvider::with_capabilities(MemoryEpisodicRecallCapabilities {
+            current_thread_search: true,
+            ..Default::default()
+        });
+    episodic.current_thread.items = vec![episodic_item(
+        "thread:old-turn/item/projection",
+        MemoryEpisodicRecallSourceKind::CurrentThread,
+        "earlier provider configuration",
+    )];
+    let episodic = Arc::new(episodic);
+    let execution = execute_active_recall_plan(
+        &durable,
+        ActiveRecallExecutionInput {
+            context: test_memory_turn_context(),
+            plan: ActiveRecallPlan::run(
+                ActiveMemoryDecisionReasonCode::ProviderRun,
+                0.9,
+                vec![
+                    ActiveRecallMode::ThreadEpisodic,
+                    ActiveRecallMode::CurrentThread,
+                ],
+                Vec::new(),
+                Vec::new(),
+            ),
+            deterministic: DeterministicRecallContextSummary::default(),
+            config: MemoryActiveRecallConfig::default(),
+            episodic_provider: Some(episodic.clone()),
+            episodic_capabilities: MemoryEpisodicRecallCapabilities {
+                current_thread_search: true,
+                ..Default::default()
+            },
+        },
+    )
+    .await;
+    assert_eq!(episodic.calls(), vec!["current_thread"]);
+    assert_eq!(execution.episodic_items.len(), 1);
+    let config = MemoryActiveRecallConfig {
+        max_prompt_chars: 200,
+        ..Default::default()
+    };
+    let contributions = memory_episodic_recall_prompt_context_contributions(
+        vec![
+            episodic_item(
+                "thread:a/a/a",
+                MemoryEpisodicRecallSourceKind::CurrentThread,
+                &"current ".repeat(12),
+            ),
+            episodic_item(
+                "thread:b/b/b",
+                MemoryEpisodicRecallSourceKind::WorkspaceThread,
+                &"workspace ".repeat(12),
+            ),
+        ],
+        false,
+        &config,
+    );
+    assert!(
+        contributions
+            .iter()
+            .map(|c| c.content.as_str().chars().count())
+            .sum::<usize>()
+            <= 200
+    );
+}
+
+#[tokio::test]
+async fn prior_current_thread_prompt_is_reused_and_workspace_context_uses_only_remaining_budget() {
+    let mut diagnostic = HookDiagnostic::new(
+        HookDiagnosticCode::new("thread_context.search_query").unwrap(),
+        HookDiagnosticMessage::new("completed").unwrap(),
+        HookDiagnosticSeverity::Info,
+    );
+    diagnostic.metadata.insert(
+        metadata_key("queryFingerprint"),
+        HookValue::Text(crate::episodic_search::episodic_query_fingerprint(
+            "ws",
+            "thr",
+            "turn",
+            "provider configuration",
+        )),
+    );
+    let existing = pioneer_hooks::HookPromptContextEntry {
+        contribution_id: HookContributionId::new(MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID).unwrap(),
+        domain: HookDomain::new("thread_context").unwrap(),
+        priority: 480,
+        content: HookPromptContent::new("existing thread context ".repeat(20)).unwrap(),
+        max_chars: Some(1000),
+        source_refs: Vec::new(),
+        diagnostics: vec![diagnostic],
+        truncated: false,
+    };
+    let prior_chars = existing.content.as_str().chars().count();
+    let prior = HookPromptContextSet {
+        entries: vec![existing],
+        ..Default::default()
+    };
+    let durable = Arc::new(TestRecallMemoryProvider::with_recall(
+        MemoryRecallSnapshot::empty(),
+    ));
+    let mut episodic =
+        FakeEpisodicRecallProvider::with_capabilities(MemoryEpisodicRecallCapabilities {
+            current_thread_search: true,
+            workspace_thread_search: true,
+            ..Default::default()
+        });
+    episodic.workspace_threads.items = vec![episodic_item(
+        "thread:workspace/item/projection",
+        MemoryEpisodicRecallSourceKind::WorkspaceThread,
+        "workspace provider decision",
+    )];
+    let episodic = Arc::new(episodic);
+    let hook = ActiveMemoryRecallHook {
+        memory_provider: durable,
+        episodic_provider: Some(episodic.clone()),
+        config: MemoryActiveRecallConfig {
+            max_prompt_chars: 600,
+            ..Default::default()
+        },
+    };
+    let plan = parse_active_memory_decision_json(r#"{"durable":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":[],"targets":[]},"episodic":{"status":"run","reasonCode":"provider_run","confidence":0.9,"queries":[{"mode":"current_thread","query":"provider configuration","targets":[]},{"mode":"workspace_thread","query":"provider configuration","targets":[]}]}}"#).unwrap();
+    let mut request = test_active_prompt_context_hook_request(
+        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+        prior,
+        "provider configuration",
+    );
+    request.input = HookInput::turn_post_preflight_prompt_context(
+        TurnPostPreflightPromptContextHookInput::from_parts(
+            "provider configuration",
+            Some("test-model"),
+            Some("test-provider"),
+        )
+        .with_active_memory_recall_preflight_plan(serde_json::to_value(plan).unwrap()),
+    );
+    let response = hook.execute(request).await.unwrap();
+    assert_eq!(episodic.calls(), vec!["workspace_threads"]);
+    let added = prompt_context_contributions(&response)
+        .iter()
+        .map(|c| c.content.as_str().chars().count())
+        .sum::<usize>();
+    assert!(added > 0);
+    assert!(prior_chars + added <= 600);
+}
+
+#[tokio::test]
+async fn a_completed_empty_current_thread_search_is_reused_without_a_global_cache() {
+    let mut receipt = HookDiagnostic::new(
+        HookDiagnosticCode::new("thread_context.search_empty").unwrap(),
+        HookDiagnosticMessage::new(crate::episodic_search::episodic_query_fingerprint(
+            "ws",
+            "thr",
+            "turn",
+            "provider configuration",
+        ))
+        .unwrap(),
+        HookDiagnosticSeverity::Info,
+    );
+    receipt.safe_for_user = true;
+    let prior = HookPromptContextSet {
+        diagnostics: vec![receipt],
+        ..Default::default()
+    };
+    let episodic = Arc::new(FakeEpisodicRecallProvider::with_capabilities(
+        MemoryEpisodicRecallCapabilities {
+            current_thread_search: true,
+            ..Default::default()
+        },
+    ));
+    let hook = ActiveMemoryRecallHook {
+        memory_provider: Arc::new(TestRecallMemoryProvider::with_recall(
+            MemoryRecallSnapshot::empty(),
+        )),
+        episodic_provider: Some(episodic.clone()),
+        config: MemoryActiveRecallConfig::default(),
+    };
+    let plan = parse_active_memory_decision_json(r#"{"durable":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":[],"targets":[]},"episodic":{"status":"run","reasonCode":"provider_run","confidence":0.9,"queries":[{"mode":"current_thread","query":"provider configuration","targets":[]}]}}"#).unwrap();
+    let mut request = test_active_prompt_context_hook_request(
+        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+        prior,
+        "provider configuration",
+    );
+    request.input = HookInput::turn_post_preflight_prompt_context(
+        TurnPostPreflightPromptContextHookInput::from_parts(
+            "provider configuration",
+            Some("test-model"),
+            Some("test-provider"),
+        )
+        .with_active_memory_recall_preflight_plan(serde_json::to_value(plan).unwrap()),
+    );
+    let response = hook.execute(request).await.unwrap();
+    assert!(episodic.calls().is_empty());
+    assert!(prompt_context_contributions(&response).is_empty());
+}

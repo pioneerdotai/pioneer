@@ -1,7 +1,9 @@
 mod thread_read;
 pub use thread_read::{
-    ThreadHistoryAnchor, ThreadHistoryDirection, ThreadsChildrenListParams,
-    ThreadsHistoryReadParams, ThreadsListParams,
+    ThreadHistoryAnchor, ThreadHistoryDirection, ThreadSearchCard, ThreadSearchFragment,
+    ThreadSearchProvenance, ThreadSearchSource, ThreadsChildrenListParams,
+    ThreadsHistoryReadParams, ThreadsListParams, ThreadsSearchLimitations, ThreadsSearchParams,
+    ThreadsSearchResponse,
 };
 mod thread_tool_result;
 pub use thread_tool_result::{

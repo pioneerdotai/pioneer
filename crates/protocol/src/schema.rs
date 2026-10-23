@@ -322,6 +322,8 @@ macro_rules! schema_doc {
 
 pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
     vec![
+        schema_doc!("threads_search_params.json", crate::ThreadsSearchParams),
+        schema_doc!("threads_search_response.json", crate::ThreadsSearchResponse),
         schema_doc!("access_change_kind.json", AccessChangeKind),
         schema_doc!(
             "access_changed_notification.json",

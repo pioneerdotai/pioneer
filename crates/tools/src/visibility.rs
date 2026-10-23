@@ -359,6 +359,7 @@ mod tests {
             spec("task_create"),
             spec("artifact_prepare"),
             spec("computer_use"),
+            spec("threads_search"),
             spec("threads_list"),
             spec("threads_history_read"),
             spec("threads_children_list"),
@@ -398,6 +399,7 @@ mod tests {
         assert!(!snapshot.contains_name("artifact_prepare").await);
         assert!(!snapshot.contains_name("computer_use").await);
         for name in [
+            "threads_search",
             "threads_list",
             "threads_history_read",
             "threads_children_list",
@@ -409,7 +411,7 @@ mod tests {
         ] {
             assert!(!snapshot.contains_name(name).await);
         }
-        assert_eq!(snapshot.all_specs().len(), 20);
+        assert_eq!(snapshot.all_specs().len(), 21);
         // Domain expansion must make the registered readers callable while
         // keeping unrelated domains closed.
         snapshot
@@ -421,6 +423,7 @@ mod tests {
             )
             .await;
         for name in [
+            "threads_search",
             "threads_list",
             "threads_history_read",
             "threads_children_list",

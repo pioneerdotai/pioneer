@@ -1,7 +1,4 @@
-use crate::thread_episodic::{
-    ThreadEpisodicRecallService, WorkspaceEpisodicRecallIntentSource, WorkspaceEpisodicRecallMode,
-    WorkspaceEpisodicRecallRequest, WorkspaceEpisodicRecallService,
-};
+use crate::thread_episodic::ThreadEpisodicRecallService;
 use async_trait::async_trait;
 use pioneer_crud::{
     ConversationArtifactRef, ConversationArtifactRefLimits, ConversationTurnArtifactRefs, CrudStore,
@@ -23,10 +20,10 @@ use pioneer_memory::hooks::{
     MemoryWorkspaceThreadRecallRequest, memory_turn_policy_from_hook_policy_set,
 };
 use pioneer_protocol::{
-    PrincipalId, ThreadEpisodicHit, ThreadEpisodicRecallDiagnostic,
-    ThreadEpisodicRecallDiagnosticCode, ThreadEpisodicRecallInput, ThreadEpisodicRecallOutput,
-    ThreadEpisodicRecallPolicyContext, ThreadEpisodicSourceActorRole, ThreadEpisodicThreadId,
-    ThreadEpisodicTurnId, ThreadEpisodicWorkspaceId, ThreadVisibility,
+    ThreadEpisodicHit, ThreadEpisodicRecallDiagnostic, ThreadEpisodicRecallDiagnosticCode,
+    ThreadEpisodicRecallInput, ThreadEpisodicRecallOutput, ThreadEpisodicRecallPolicyContext,
+    ThreadEpisodicSourceActorRole, ThreadEpisodicThreadId, ThreadEpisodicTurnId,
+    ThreadEpisodicWorkspaceId,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -65,6 +62,7 @@ pub(crate) trait ThreadContextRecallProvider: Send + Sync {
     ) -> ThreadEpisodicRecallOutput;
 }
 
+#[cfg(test)]
 #[async_trait]
 impl ThreadContextRecallProvider for ThreadEpisodicRecallService {
     async fn search_current_thread(
@@ -76,89 +74,207 @@ impl ThreadContextRecallProvider for ThreadEpisodicRecallService {
 }
 
 pub(crate) struct ThreadEpisodicMemoryRecallProvider {
+    processor: std::sync::Weak<crate::message::MessageProcessor>,
     service: Arc<ThreadEpisodicRecallService>,
-    workspace_service: Option<Arc<WorkspaceEpisodicRecallService>>,
-    crud_store: Arc<CrudStore>,
 }
 
 impl ThreadEpisodicMemoryRecallProvider {
-    #[allow(dead_code)]
     pub(crate) fn new(
+        processor: std::sync::Weak<crate::message::MessageProcessor>,
         service: Arc<ThreadEpisodicRecallService>,
-        crud_store: Arc<CrudStore>,
     ) -> Self {
-        Self {
-            service,
-            workspace_service: None,
-            crud_store,
-        }
+        Self { processor, service }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn with_workspace_service(
-        service: Arc<ThreadEpisodicRecallService>,
-        workspace_service: Arc<WorkspaceEpisodicRecallService>,
-        crud_store: Arc<CrudStore>,
-    ) -> Self {
-        Self {
-            service,
-            workspace_service: Some(workspace_service),
-            crud_store,
-        }
-    }
-
-    async fn accessible_thread_ids_for_member(
+    async fn search(
         &self,
-        workspace_id: &str,
-        principal_id: Option<&str>,
-    ) -> Option<BTreeSet<String>> {
-        self.member_thread_ids(workspace_id, principal_id, false)
-            .await
-    }
-
-    async fn workspace_visible_thread_ids_for_member(
-        &self,
-        workspace_id: &str,
-        principal_id: Option<&str>,
-    ) -> Option<BTreeSet<String>> {
-        self.member_thread_ids(workspace_id, principal_id, true)
-            .await
-    }
-
-    async fn member_thread_ids(
-        &self,
-        workspace_id: &str,
-        principal_id: Option<&str>,
-        workspace_visible_only: bool,
-    ) -> Option<BTreeSet<String>> {
-        let principal_id = principal_id?;
-        let Ok(principal_id) = PrincipalId::new(principal_id) else {
-            return Some(BTreeSet::new());
+        input: ThreadEpisodicRecallInput,
+        scope: MemoryEpisodicRecallSourceKind,
+    ) -> ThreadEpisodicRecallOutput {
+        let started = std::time::Instant::now();
+        let mut output = ThreadEpisodicRecallOutput {
+            hits: Vec::new(),
+            diagnostics: Vec::new(),
+            fallback_used: false,
         };
-        match self
-            .crud_store
-            .list_accessible_threads_for_principal(&principal_id, workspace_id, u64::MAX)
+        if !self.service.recall_enabled() || !input.policy_context.context_recall_allowed {
+            output.diagnostics.push(ThreadEpisodicRecallDiagnostic {
+                code: ThreadEpisodicRecallDiagnosticCode::SkippedByPolicy,
+                message: "episodic recall skipped by policy".to_owned(),
+            });
+            return self
+                .service
+                .record_source_recall(&input, output, started, 0)
+                .await;
+        }
+        let mut verified_candidates = 0;
+        let result = async {
+            let processor = self.processor.upgrade().ok_or(())?;
+            let context = processor
+                .episodic_execution_context(&input.workspace_id.0, &input.turn_id.0)
+                .await
+                .map_err(|_| ())?;
+            let result = processor
+                .search_thread_sources(
+                    &context,
+                    &input.query_text,
+                    if scope == MemoryEpisodicRecallSourceKind::CurrentThread {
+                        Some(input.thread_id.0.as_str())
+                    } else {
+                        None
+                    },
+                )
+                .await
+                .map_err(|_| ())?;
+            Ok::<_, ()>((processor, result))
+        }
+        .await;
+        match result {
+            Ok((processor, result)) => {
+                let in_scope = |source: &crate::thread_episodic::search::SearchSource| {
+                    scope != MemoryEpisodicRecallSourceKind::RelatedThread
+                        || source.reference.thread_id != input.thread_id.0
+                };
+                verified_candidates = result
+                    .sources
+                    .iter()
+                    .filter(|source| in_scope(source))
+                    .count();
+                let (prompt_cap, top_k, hit_cap) = self.service.source_recall_budgets(&input);
+                let mut remaining = prompt_cap;
+                for mut source in result.sources.into_iter().filter(in_scope).take(top_k) {
+                    source.text = source.text.chars().take(hit_cap).collect();
+                    let chars = source.text.chars().count();
+                    if chars > remaining {
+                        output.diagnostics.push(ThreadEpisodicRecallDiagnostic {
+                            code: ThreadEpisodicRecallDiagnosticCode::PromptBudgetExceeded,
+                            message: "episodic prompt budget reached".to_owned(),
+                        });
+                        break;
+                    }
+                    remaining -= chars;
+                    output.hits.push(ThreadEpisodicHit {
+                        provenance: source.provenance,
+                        text: source.text,
+                        score: source.score,
+                        created_at: source.created_at,
+                        adaptive_diagnostics: None,
+                        score_breakdown: pioneer_protocol::ThreadEpisodicScoreBreakdown {
+                            final_score: source.score,
+                            memvid_score: None,
+                            semantic_score: None,
+                            lexical_score: None,
+                            temporal_score: None,
+                            exact_source_boost: None,
+                            recency_boost: None,
+                            source_role_boost: None,
+                        },
+                    });
+                }
+                // Artifact references also consume the same prompt budget.
+                output.hits = enrich_thread_hits_with_artifact_refs(
+                    processor.crud_store_for_episodic(),
+                    output.hits,
+                )
+                .await;
+                let mut used = 0;
+                let before = output.hits.len();
+                output.hits.retain(|hit| {
+                    used += hit.text.chars().count();
+                    used <= prompt_cap
+                });
+                if output.hits.len() < before {
+                    output.diagnostics.push(ThreadEpisodicRecallDiagnostic {
+                        code: ThreadEpisodicRecallDiagnosticCode::PromptBudgetExceeded,
+                        message: "episodic artifact references reached prompt budget".to_owned(),
+                    });
+                }
+                if result.limitations.semantic_approximate {
+                    output.diagnostics.push(ThreadEpisodicRecallDiagnostic {
+                        code: ThreadEpisodicRecallDiagnosticCode::Completed,
+                        message: "episodic semantic retrieval is approximate".to_owned(),
+                    });
+                }
+                if result.limitations.coverage_limited || result.limitations.semantic_degraded {
+                    output.diagnostics.push(ThreadEpisodicRecallDiagnostic {
+                        code: ThreadEpisodicRecallDiagnosticCode::Completed,
+                        message: "episodic search has limited coverage or semantic degradation"
+                            .to_owned(),
+                    });
+                }
+            }
+            Err(()) => {
+                output.fallback_used = true;
+                output.diagnostics.push(ThreadEpisodicRecallDiagnostic {
+                    code: ThreadEpisodicRecallDiagnosticCode::BackendUnavailable,
+                    message: "episodic search unavailable or not authorized".to_owned(),
+                });
+            }
+        }
+        self.service
+            .record_source_recall(&input, output, started, verified_candidates)
             .await
-        {
-            Ok(threads) => Some(
-                threads
-                    .into_iter()
-                    .filter(|thread| {
-                        member_thread_matches_recall_boundary(thread, workspace_visible_only)
-                    })
-                    .map(|thread| thread.id)
-                    .collect(),
-            ),
-            Err(_) => Some(BTreeSet::new()),
+    }
+
+    async fn memory_search(
+        &self,
+        workspace_id: String,
+        current_thread_id: String,
+        turn_id: String,
+        query: String,
+        top_k: u32,
+        max_chars: usize,
+        scope: MemoryEpisodicRecallSourceKind,
+    ) -> MemoryEpisodicRecallResponse {
+        let output = self
+            .search(
+                ThreadEpisodicRecallInput {
+                    workspace_id: ThreadEpisodicWorkspaceId(workspace_id),
+                    thread_id: ThreadEpisodicThreadId(current_thread_id.clone()),
+                    turn_id: ThreadEpisodicTurnId(turn_id),
+                    query_text: query,
+                    recent_context_summary: None,
+                    policy_context: ThreadEpisodicRecallPolicyContext {
+                        context_recall_allowed: true,
+                        include_sensitive_context: false,
+                    },
+                    max_prompt_chars: Some(max_chars.min(12000) as u32),
+                    max_candidates: Some(top_k),
+                },
+                scope,
+            )
+            .await;
+        MemoryEpisodicRecallResponse {
+            items: output
+                .hits
+                .into_iter()
+                .map(|hit| {
+                    let source = if hit.provenance.thread_id.0 == current_thread_id {
+                        MemoryEpisodicRecallSourceKind::CurrentThread
+                    } else {
+                        scope
+                    };
+                    thread_hit_to_memory_episodic_item(hit, source)
+                })
+                .collect(),
+            truncated: output
+                .diagnostics
+                .iter()
+                .any(|d| d.code == ThreadEpisodicRecallDiagnosticCode::PromptBudgetExceeded),
+            diagnostics: output.diagnostics.into_iter().map(|d| d.message).collect(),
         }
     }
 }
 
-fn member_thread_matches_recall_boundary(
-    thread: &pioneer_protocol::Thread,
-    workspace_visible_only: bool,
-) -> bool {
-    !workspace_visible_only || thread.visibility == Some(ThreadVisibility::Workspace)
+#[async_trait]
+impl ThreadContextRecallProvider for ThreadEpisodicMemoryRecallProvider {
+    async fn search_current_thread(
+        &self,
+        input: ThreadEpisodicRecallInput,
+    ) -> ThreadEpisodicRecallOutput {
+        self.search(input, MemoryEpisodicRecallSourceKind::CurrentThread)
+            .await
+    }
 }
 
 #[async_trait]
@@ -167,185 +283,75 @@ impl AgentEpisodicRecallProvider for ThreadEpisodicMemoryRecallProvider {
         &self,
         context: pioneer_memory::hooks::MemoryTurnContext,
     ) -> MemoryEpisodicRecallCapabilities {
+        let allowed = if let Some(processor) = self.processor.upgrade() {
+            match processor
+                .episodic_execution_context(&context.workspace_id, &context.turn_id)
+                .await
+            {
+                Ok(context) => processor.episodic_execution_readable(&context).await,
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
         MemoryEpisodicRecallCapabilities {
-            current_thread_search: true,
-            related_thread_search: self.workspace_service.is_some(),
-            workspace_thread_search: self.workspace_service.is_some(),
+            current_thread_search: allowed,
+            related_thread_search: allowed,
+            workspace_thread_search: allowed,
             full_input_query: self
                 .service
-                .full_input_query_enabled_for_workspace(context.workspace_id.as_str()),
+                .full_input_query_enabled_for_workspace(&context.workspace_id),
             current_task_context: false,
             completed_task_summary: false,
         }
     }
-
     async fn recall_current_thread(
         &self,
         request: MemoryCurrentThreadRecallRequest,
     ) -> Result<MemoryEpisodicRecallResponse, String> {
-        if self
-            .accessible_thread_ids_for_member(
-                request.workspace_id.as_str(),
-                request.principal_id.as_deref(),
+        Ok(self
+            .memory_search(
+                request.workspace_id,
+                request.thread_id,
+                request.turn_id,
+                request.query,
+                request.top_k,
+                request.max_chars,
+                MemoryEpisodicRecallSourceKind::CurrentThread,
             )
-            .await
-            .is_some_and(|thread_ids| !thread_ids.contains(request.thread_id.as_str()))
-        {
-            return Ok(MemoryEpisodicRecallResponse {
-                diagnostics: vec!["memory.episodic_recall.current_thread_inaccessible".to_owned()],
-                ..MemoryEpisodicRecallResponse::default()
-            });
-        }
-        let output = self
-            .service
-            .search_current_thread(
-                ThreadEpisodicRecallInput {
-                    workspace_id: ThreadEpisodicWorkspaceId(request.workspace_id),
-                    thread_id: ThreadEpisodicThreadId(request.thread_id),
-                    turn_id: ThreadEpisodicTurnId(request.turn_id),
-                    query_text: request.query,
-                    recent_context_summary: None,
-                    policy_context: ThreadEpisodicRecallPolicyContext {
-                        context_recall_allowed: true,
-                        include_sensitive_context: false,
-                    },
-                    max_prompt_chars: Some(request.max_chars.min(u32::MAX as usize) as u32),
-                    max_candidates: Some(request.top_k),
-                },
-                None,
-            )
-            .await;
-        let truncated = output.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == ThreadEpisodicRecallDiagnosticCode::PromptBudgetExceeded
-        });
-        let hits = enrich_thread_hits_with_artifact_refs(&self.crud_store, output.hits).await;
-        Ok(MemoryEpisodicRecallResponse {
-            items: hits
-                .into_iter()
-                .map(|hit| {
-                    thread_hit_to_memory_episodic_item(
-                        hit,
-                        MemoryEpisodicRecallSourceKind::CurrentThread,
-                    )
-                })
-                .collect(),
-            diagnostics: output
-                .diagnostics
-                .into_iter()
-                .map(|diagnostic| diagnostic.message)
-                .collect(),
-            truncated,
-        })
+            .await)
     }
-
     async fn recall_related_threads(
         &self,
         request: MemoryRelatedThreadRecallRequest,
     ) -> Result<MemoryEpisodicRecallResponse, String> {
-        let Some(service) = self.workspace_service.as_ref() else {
-            return Ok(MemoryEpisodicRecallResponse {
-                diagnostics: vec!["memory.episodic_recall.related_threads_unavailable".to_owned()],
-                ..MemoryEpisodicRecallResponse::default()
-            });
-        };
-        let accessible_thread_ids = self
-            .workspace_visible_thread_ids_for_member(
-                request.workspace_id.as_str(),
-                request.principal_id.as_deref(),
+        Ok(self
+            .memory_search(
+                request.workspace_id,
+                request.current_thread_id,
+                request.turn_id,
+                request.query,
+                request.top_k,
+                request.max_chars,
+                MemoryEpisodicRecallSourceKind::RelatedThread,
             )
-            .await;
-        let output = service
-            .search_related_threads(WorkspaceEpisodicRecallRequest {
-                workspace_id: request.workspace_id,
-                current_thread_id: request.current_thread_id,
-                turn_id: "related_thread_recall".to_owned(),
-                query_text: request.query,
-                mode: WorkspaceEpisodicRecallMode::RelatedThreads,
-                intent_source: Some(WorkspaceEpisodicRecallIntentSource::Planner),
-                task_affinity_json: None,
-                project_affinity_json: None,
-                max_threads: request.top_k.max(1).min(8),
-                max_segments_per_thread: 4,
-                max_candidates_per_thread: request.top_k.max(1).min(16),
-                max_total_candidates: request.top_k.max(1).min(32),
-                max_prompt_chars: request.max_chars.min(u32::MAX as usize) as u32,
-                policy_context: ThreadEpisodicRecallPolicyContext {
-                    context_recall_allowed: true,
-                    include_sensitive_context: false,
-                },
-                accessible_thread_ids,
-            })
-            .await;
-        let hits = enrich_thread_hits_with_artifact_refs(&self.crud_store, output.hits).await;
-        Ok(MemoryEpisodicRecallResponse {
-            items: hits
-                .into_iter()
-                .map(|hit| {
-                    thread_hit_to_memory_episodic_item(
-                        hit,
-                        MemoryEpisodicRecallSourceKind::RelatedThread,
-                    )
-                })
-                .collect(),
-            diagnostics: output.diagnostics,
-            truncated: output.fallback_used,
-        })
+            .await)
     }
-
     async fn recall_workspace_threads(
         &self,
         request: MemoryWorkspaceThreadRecallRequest,
     ) -> Result<MemoryEpisodicRecallResponse, String> {
-        let Some(service) = self.workspace_service.as_ref() else {
-            return Ok(MemoryEpisodicRecallResponse {
-                diagnostics: vec![
-                    "memory.episodic_recall.workspace_threads_unavailable".to_owned(),
-                ],
-                ..MemoryEpisodicRecallResponse::default()
-            });
-        };
-        let accessible_thread_ids = self
-            .workspace_visible_thread_ids_for_member(
-                request.workspace_id.as_str(),
-                request.principal_id.as_deref(),
+        Ok(self
+            .memory_search(
+                request.workspace_id,
+                request.current_thread_id,
+                request.turn_id,
+                request.query,
+                request.top_k,
+                request.max_chars,
+                MemoryEpisodicRecallSourceKind::WorkspaceThread,
             )
-            .await;
-        let output = service
-            .search_workspace_threads(WorkspaceEpisodicRecallRequest {
-                workspace_id: request.workspace_id,
-                current_thread_id: request.current_thread_id,
-                turn_id: "workspace_thread_recall".to_owned(),
-                query_text: request.query,
-                mode: WorkspaceEpisodicRecallMode::WorkspaceThreads,
-                intent_source: Some(WorkspaceEpisodicRecallIntentSource::Planner),
-                task_affinity_json: None,
-                project_affinity_json: None,
-                max_threads: request.top_k.max(1).min(8),
-                max_segments_per_thread: 4,
-                max_candidates_per_thread: request.top_k.max(1).min(16),
-                max_total_candidates: request.top_k.max(1).min(32),
-                max_prompt_chars: request.max_chars.min(u32::MAX as usize) as u32,
-                policy_context: ThreadEpisodicRecallPolicyContext {
-                    context_recall_allowed: true,
-                    include_sensitive_context: false,
-                },
-                accessible_thread_ids,
-            })
-            .await;
-        let hits = enrich_thread_hits_with_artifact_refs(&self.crud_store, output.hits).await;
-        Ok(MemoryEpisodicRecallResponse {
-            items: hits
-                .into_iter()
-                .map(|hit| {
-                    thread_hit_to_memory_episodic_item(
-                        hit,
-                        MemoryEpisodicRecallSourceKind::WorkspaceThread,
-                    )
-                })
-                .collect(),
-            diagnostics: output.diagnostics,
-            truncated: output.fallback_used,
-        })
+            .await)
     }
 }
 
@@ -661,7 +667,46 @@ impl HookHandler for ThreadContextRecallHook {
                 max_candidates: Some(self.config.max_candidates),
             })
             .await;
-        let recall_diagnostics = hook_diagnostics_from_recall(&recall_output.diagnostics);
+        if recall_output.hits.is_empty()
+            && !recall_output.fallback_used
+            && !recall_output.diagnostics.iter().any(|d| {
+                matches!(
+                    d.code,
+                    ThreadEpisodicRecallDiagnosticCode::SkippedByPolicy
+                        | ThreadEpisodicRecallDiagnosticCode::PromptBudgetExceeded
+                )
+            })
+        {
+            // Phase diagnostics survive even when no prompt entry is emitted.
+            // Their metadata is redacted by HookRuntime, so the receipt uses a
+            // bounded opaque query identity in the diagnostic message.
+            response.diagnostics.push(thread_context_info_diagnostic(
+                "thread_context.search_empty",
+                pioneer_memory::episodic_search::episodic_query_fingerprint(
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    &input.input_text,
+                ),
+            ));
+        }
+        let mut recall_diagnostics = hook_diagnostics_from_recall(&recall_output.diagnostics);
+        let mut reuse = thread_context_info_diagnostic(
+            "thread_context.search_query",
+            "current-thread search completed",
+        );
+        reuse.metadata.insert(
+            pioneer_hooks::HookMetadataKey::new("queryFingerprint").expect("static key"),
+            pioneer_hooks::HookValue::Text(
+                pioneer_memory::episodic_search::episodic_query_fingerprint(
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    &input.input_text,
+                ),
+            ),
+        );
+        recall_diagnostics.push(reuse);
         response.diagnostics.extend(recall_diagnostics.clone());
 
         let recall_output = if let Some(artifact_store) = self.artifact_store.as_ref() {
@@ -944,37 +989,6 @@ mod tests {
             self.inputs.lock().await.push(input);
             self.output.lock().await.clone()
         }
-    }
-
-    #[test]
-    fn cross_thread_member_recall_excludes_private_sources() {
-        let thread = |id: &str, visibility| Thread {
-            id: id.to_owned(),
-            workspace_id: "ws_1".to_owned(),
-            name: None,
-            preview: String::new(),
-            preview_author: None,
-            mode: ThreadMode::Chat,
-            model: "test".to_owned(),
-            model_provider: "test".to_owned(),
-            reasoning_effort: None,
-            created_at: 1,
-            updated_at: 1,
-            status: ThreadStatus::Idle,
-            origin_kind: ThreadOriginKind::User,
-            sidebar_visibility: ThreadSidebarVisibility::Visible,
-            agent_nickname: None,
-            agent_role: None,
-            visibility: Some(visibility),
-            turns: Vec::new(),
-        };
-        let private = thread("private", ThreadVisibility::Private);
-        let workspace = thread("workspace", ThreadVisibility::Workspace);
-
-        assert!(member_thread_matches_recall_boundary(&private, false));
-        assert!(member_thread_matches_recall_boundary(&workspace, false));
-        assert!(!member_thread_matches_recall_boundary(&private, true));
-        assert!(member_thread_matches_recall_boundary(&workspace, true));
     }
 
     #[tokio::test]

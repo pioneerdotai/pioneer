@@ -648,3 +648,6 @@ async fn saved_observation_result_cannot_replay_a_now_inaccessible_thread() {
 
 #[path = "anchor_tests.rs"]
 mod anchor_tests;
+
+#[path = "search_tests.rs"]
+mod search_tests;

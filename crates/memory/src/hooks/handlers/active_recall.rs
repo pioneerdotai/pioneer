@@ -143,11 +143,13 @@ impl HookHandler for ActiveMemoryRecallHook {
             return Ok(response);
         }
 
+        let mut execution_plan = decision.clone();
+        reuse_contributed_thread_search(&mut execution_plan, &context, &request.prompt_context_set);
         let mut execution = execute_active_recall_plan(
             self.memory_provider.as_ref(),
             ActiveRecallExecutionInput {
                 context: context.clone(),
-                plan: decision.clone(),
+                plan: execution_plan,
                 deterministic: deterministic.clone(),
                 config: config.clone(),
                 episodic_provider: self.episodic_provider.clone(),
@@ -206,7 +208,23 @@ impl HookHandler for ActiveMemoryRecallHook {
                 &active_dedup,
             ));
 
-        let episodic_items = execution.episodic_items.clone();
+        let mut episodic_items = execution.episodic_items.clone();
+        let existing_sources = request
+            .prompt_context_set
+            .entries()
+            .filter(|entry| entry.contribution_id.as_str() == MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID)
+            .flat_map(|entry| entry.source_refs.iter())
+            .map(|source| {
+                crate::episodic_search::episodic_source_identity(source.id.as_str()).to_owned()
+            })
+            .collect::<BTreeSet<_>>();
+        episodic_items.retain(|item| {
+            !existing_sources.contains(crate::episodic_search::episodic_source_identity(&item.id))
+        });
+        let mut episodic_config = config.clone();
+        episodic_config.max_prompt_chars = config
+            .max_prompt_chars
+            .saturating_sub(thread_episodic.prompt_context_chars);
 
         let mut contributed = false;
         let mut active_synthesis = None;
@@ -242,7 +260,7 @@ impl HookHandler for ActiveMemoryRecallHook {
         let episodic_contributions = memory_episodic_recall_prompt_context_contributions(
             episodic_items,
             execution.truncated,
-            &config,
+            &episodic_config,
         );
         if !episodic_contributions.is_empty() {
             contributed = true;
@@ -292,4 +310,45 @@ fn validate_active_recall_preflight_plan_shape(
         return Err("non-run episodic plan must not include queries");
     }
     Ok(())
+}
+
+fn reuse_contributed_thread_search(
+    plan: &mut ActiveRecallPlan,
+    context: &MemoryTurnContext,
+    set: &pioneer_hooks::HookPromptContextSet,
+) {
+    let matches = |query: &str| {
+        let fingerprint = crate::episodic_search::episodic_query_fingerprint(
+            &context.workspace_id,
+            context.effective_conversation_thread_id(),
+            &context.turn_id,
+            query,
+        );
+        set.diagnostics.iter().any(|d| {
+            d.code.as_str() == "thread_context.search_empty" && d.message.as_str() == fingerprint
+        }) || set.entries().any(|entry| {
+            entry.contribution_id.as_str() == MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID
+                && !entry.truncated
+                && entry.diagnostics.iter().any(|d| {
+                    d.code.as_str() == "thread_context.search_query"
+                        && d.metadata.get(&metadata_key("queryFingerprint"))
+                            == Some(&HookValue::Text(fingerprint.clone()))
+                })
+        })
+    };
+    if matches(&context.input_text) {
+        plan.durable.modes.retain(|mode| {
+            !matches!(
+                mode,
+                ActiveRecallMode::CurrentThread | ActiveRecallMode::ThreadEpisodic
+            )
+        });
+    }
+    plan.episodic.queries.retain(|query| {
+        !matches!(
+            query.mode,
+            ActiveRecallMode::CurrentThread | ActiveRecallMode::ThreadEpisodic
+        ) || !query.targets.is_empty()
+            || !matches(query.query.as_deref().unwrap_or(&context.input_text))
+    });
 }

@@ -632,6 +632,7 @@ pub(super) async fn execute_active_recall_plan(
     }
 
     let mut mode_results = Vec::new();
+    let mut episodic_results = BTreeMap::<String, ActiveRecallModeResult>::new();
     for request in requests {
         if let Some(skip_reason) = active_recall_mode_skip_reason(&request, &input.context) {
             mode_results.push(ActiveRecallModeResult::skipped(request.mode, skip_reason));
@@ -643,8 +644,20 @@ pub(super) async fn execute_active_recall_plan(
                 .query
                 .as_deref()
                 .unwrap_or(input.context.input_text.as_str());
-            mode_results.push(
-                execute_episodic_active_recall_mode(
+            let key = format!(
+                "{:?}",
+                (
+                    source,
+                    query,
+                    &request.targets,
+                    request.budget.top_k,
+                    request.budget.max_chars
+                )
+            );
+            let mut result = if let Some(result) = episodic_results.get(&key) {
+                result.clone()
+            } else {
+                let result = execute_episodic_active_recall_mode(
                     input.episodic_provider.as_deref(),
                     &input.episodic_capabilities,
                     &input.context,
@@ -653,8 +666,12 @@ pub(super) async fn execute_active_recall_plan(
                     source,
                     input.config.timeout_ms,
                 )
-                .await,
-            );
+                .await;
+                episodic_results.insert(key, result.clone());
+                result
+            };
+            result.mode = mode;
+            mode_results.push(result);
             continue;
         }
 
@@ -810,6 +827,7 @@ async fn execute_episodic_active_recall_mode(
                 provider.recall_related_threads(MemoryRelatedThreadRecallRequest {
                     workspace_id: context.workspace_id.clone(),
                     current_thread_id: context.effective_conversation_thread_id().to_owned(),
+                    turn_id: context.turn_id.clone(),
                     principal_id: context.principal_id.clone(),
                     query: query.to_owned(),
                     targets,
@@ -825,6 +843,7 @@ async fn execute_episodic_active_recall_mode(
                 provider.recall_workspace_threads(MemoryWorkspaceThreadRecallRequest {
                     workspace_id: context.workspace_id.clone(),
                     current_thread_id: context.effective_conversation_thread_id().to_owned(),
+                    turn_id: context.turn_id.clone(),
                     principal_id: context.principal_id.clone(),
                     query: query.to_owned(),
                     targets,
@@ -1401,7 +1420,10 @@ fn merge_active_recall_mode_results(
                 break;
             }
             let item_id = item.id.trim();
-            if item_id.is_empty() || !seen_episodic_ids.insert(item_id.to_owned()) {
+            if item_id.is_empty()
+                || !seen_episodic_ids
+                    .insert(crate::episodic_search::episodic_source_identity(item_id).to_owned())
+            {
                 duplicate_count += 1;
                 continue;
             }
@@ -2901,6 +2923,9 @@ pub(super) fn memory_episodic_recall_prompt_context_contributions(
     snapshot_truncated: bool,
     config: &MemoryActiveRecallConfig,
 ) -> Vec<PromptContextContribution> {
+    if config.max_prompt_chars == 0 {
+        return Vec::new();
+    }
     let mut current_thread_items = Vec::new();
     let mut related_thread_items = Vec::new();
     let mut workspace_thread_items = Vec::new();
@@ -2915,43 +2940,50 @@ pub(super) fn memory_episodic_recall_prompt_context_contributions(
             | MemoryEpisodicRecallSourceKind::CompletedTask => task_items.push(item),
         }
     }
-    [
-        episodic_prompt_context_contribution(
+    let mut contributions = Vec::new();
+    let mut remaining = config.max_prompt_chars;
+    for (id, domain, priority, items) in [
+        (
             MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID,
             "current_thread_context",
             480,
             current_thread_items,
-            snapshot_truncated,
-            config.max_prompt_chars,
         ),
-        episodic_prompt_context_contribution(
+        (
             MEMORY_RELATED_THREAD_CONTEXT_CONTRIBUTION_ID,
             "related_thread_context",
             475,
             related_thread_items,
-            snapshot_truncated,
-            config.max_prompt_chars,
         ),
-        episodic_prompt_context_contribution(
+        (
             MEMORY_WORKSPACE_THREAD_CONTEXT_CONTRIBUTION_ID,
             "workspace_thread_context",
             470,
             workspace_thread_items,
-            snapshot_truncated,
-            config.max_prompt_chars,
         ),
-        episodic_prompt_context_contribution(
+        (
             MEMORY_TASK_CONTEXT_CONTRIBUTION_ID,
             "task_context",
             470,
             task_items,
-            snapshot_truncated,
-            config.max_prompt_chars,
         ),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+    ] {
+        if remaining == 0 {
+            break;
+        }
+        if let Some(contribution) = episodic_prompt_context_contribution(
+            id,
+            domain,
+            priority,
+            items,
+            snapshot_truncated,
+            remaining,
+        ) {
+            remaining = remaining.saturating_sub(contribution.content.as_str().chars().count());
+            contributions.push(contribution);
+        }
+    }
+    contributions
 }
 
 fn episodic_prompt_context_contribution(

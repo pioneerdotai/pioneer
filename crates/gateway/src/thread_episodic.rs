@@ -1,3 +1,4 @@
+pub(crate) mod search;
 use crate::database::startup::thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget;
 use crate::thread_episodic_embedding::{
     LocalEmbeddingProvider, RemoteEmbeddingProvider, local_embedding_model_files,
@@ -1054,6 +1055,21 @@ impl StoreThreadEpisodicIndexPayloadProvider {
         &self,
         index_item: &ThreadEpisodicItemRecord,
     ) -> std::result::Result<(String, String), ThreadEpisodicIndexResolutionError> {
+        let (source, payload, _) = self.resolve_item_source(index_item).await?;
+        Ok((source.text.trim().to_owned(), payload))
+    }
+
+    async fn resolve_item_source(
+        &self,
+        index_item: &ThreadEpisodicItemRecord,
+    ) -> std::result::Result<
+        (
+            ThreadEpisodicIndexableSource,
+            String,
+            ThreadEpisodicSourceRuntimeKind,
+        ),
+        ThreadEpisodicIndexResolutionError,
+    > {
         let canonical = self
             .crud_store
             .get_thread_episodic_canonical_item(
@@ -1085,9 +1101,11 @@ impl StoreThreadEpisodicIndexPayloadProvider {
             item: canonical.item,
         };
         match select_committed_item_source(&committed) {
-            ThreadEpisodicSourceSelection::Indexable(source) => {
-                Ok((source.text.trim().to_owned(), canonical.source_payload))
-            }
+            ThreadEpisodicSourceSelection::Indexable(source) => Ok((
+                source,
+                canonical.source_payload,
+                store_source_runtime_kind(committed.item_type),
+            )),
             ThreadEpisodicSourceSelection::Rejected { reason } => {
                 Err(ThreadEpisodicIndexResolutionError::source_changed(format!(
                     "canonical thread item is no longer indexable: {}",
@@ -1707,6 +1725,7 @@ pub(crate) struct ThreadEpisodicRecallService {
     backend: Arc<dyn ThreadEpisodicMemvidBackend>,
     embedding_provider_resolver: Option<Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>>,
     config: StdRwLock<ThreadEpisodicRecallServiceConfig>,
+    search_capacity: Arc<tokio::sync::Semaphore>,
     workspace_vector_search_configs:
         StdRwLock<BTreeMap<String, GatewayThreadEpisodicVectorSearchConfig>>,
 }
@@ -1730,6 +1749,7 @@ impl ThreadEpisodicRecallService {
             backend,
             embedding_provider_resolver,
             config: StdRwLock::new(ThreadEpisodicRecallServiceConfig::default()),
+            search_capacity: Arc::new(tokio::sync::Semaphore::new(4)),
             workspace_vector_search_configs: StdRwLock::new(BTreeMap::new()),
         }
     }
@@ -1755,6 +1775,7 @@ impl ThreadEpisodicRecallService {
             backend,
             embedding_provider_resolver,
             config: StdRwLock::new(config),
+            search_capacity: Arc::new(tokio::sync::Semaphore::new(4)),
             workspace_vector_search_configs: StdRwLock::new(BTreeMap::new()),
         }
     }
@@ -1810,6 +1831,65 @@ impl ThreadEpisodicRecallService {
         ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
             &vector_search,
         )
+    }
+
+    pub(crate) async fn record_source_recall(
+        &self,
+        input: &ThreadEpisodicRecallInput,
+        output: ThreadEpisodicRecallOutput,
+        started: Instant,
+        verified_candidates: usize,
+    ) -> ThreadEpisodicRecallOutput {
+        let event = NewThreadEpisodicRecallEventRecord {
+            id: None,
+            workspace_id: input.workspace_id.0.clone(),
+            thread_id: input.thread_id.0.clone(),
+            turn_id: input.turn_id.0.clone(),
+            query_hash: Some(stable_text_hash(input.query_text.trim())),
+            search_profile_json: None,
+            search_mode: None,
+            adaptive_strategy: None,
+            cutoff_json: None,
+            // Count only verified Pioneer sources, never inaccessible index rows.
+            candidate_count: verified_candidates.min(search::SEARCH_RESULTS) as i64,
+            returned_count: output.hits.len() as i64,
+            latency_ms: elapsed_ms(started),
+            fallback_used: output.fallback_used,
+            error: output
+                .fallback_used
+                .then(|| "episodic search unavailable".to_owned()),
+        };
+        if self
+            .crud_store
+            .insert_thread_episodic_recall_event(event, chrono::Utc::now().timestamp())
+            .await
+            .is_err()
+        {
+            tracing::warn!("failed to persist episodic recall event");
+        }
+        output
+    }
+
+    pub(crate) fn source_recall_budgets(
+        &self,
+        input: &ThreadEpisodicRecallInput,
+    ) -> (usize, usize, usize) {
+        let config = self.config.read().map(|c| c.clone()).unwrap_or_default();
+        (
+            input
+                .max_prompt_chars
+                .unwrap_or(config.default_prompt_chars)
+                .min(config.max_prompt_chars) as usize,
+            input
+                .max_candidates
+                .unwrap_or(config.default_max_candidates)
+                .min(config.max_candidate_work) as usize,
+            config.max_hit_chars.min(1200),
+        )
+    }
+
+    pub(crate) fn recall_enabled(&self) -> bool {
+        self.config.read().map(|c| c.enabled).unwrap_or(false)
     }
 
     pub(crate) async fn search_current_thread(
@@ -2542,7 +2622,7 @@ impl ThreadEpisodicRecallService {
             ));
         }
 
-        let mut text = self.hydrate_hit_text(&item, hit.text.as_str()).await?;
+        let mut text = self.reconstruct_item_text(&item).await?;
         if looks_secret_like(text.as_str()) {
             return Err(format!(
                 "suppressed thread episodic hit `{}`: secret-like text",
@@ -2581,11 +2661,23 @@ impl ThreadEpisodicRecallService {
         &self,
         item: &ThreadEpisodicItemRecord,
     ) -> std::result::Result<String, String> {
-        let provider = StoreThreadEpisodicIndexPayloadProvider::new(self.crud_store.clone(), "");
-        let (source_text, _source_payload) = provider
-            .resolve_item_source_text(item)
+        // Retrieval inherits its request scope; indexing's constructor selects
+        // Maintenance and must not classify an interactive canonical read.
+        let provider = StoreThreadEpisodicIndexPayloadProvider {
+            crud_store: self.crud_store.clone(),
+            storage_uri_root: String::new(),
+        };
+        let (source, _source_payload, runtime_kind) = provider
+            .resolve_item_source(item)
             .await
             .map_err(|error| error.message)?;
+        if source.source_context != item.source_context
+            || store_source_actor_role(source.source_actor_role) != item.source_actor_role
+            || runtime_kind != item.source_runtime_kind
+        {
+            return Err("canonical source provenance changed".to_owned());
+        }
+        let source_text = source.text.trim().to_owned();
         if source_text_hash(source_text.as_str()) != item.source_text_hash {
             return Err(format!(
                 "suppressed thread episodic hit `{}`: source text hash changed",
@@ -2594,25 +2686,6 @@ impl ThreadEpisodicRecallService {
         }
         Ok(source_text)
     }
-
-    async fn hydrate_hit_text(
-        &self,
-        item: &ThreadEpisodicItemRecord,
-        fallback_text: &str,
-    ) -> std::result::Result<String, String> {
-        match self.reconstruct_item_text(item).await {
-            Ok(source_text) => Ok(source_text),
-            Err(message) if can_fallback_to_memvid_hit_text(message.as_str()) => {
-                Ok(fallback_text.trim().to_owned())
-            }
-            Err(message) => Err(message),
-        }
-    }
-}
-
-fn can_fallback_to_memvid_hit_text(message: &str) -> bool {
-    message.contains("turn item events are not available")
-        || message.contains("canonical thread item is missing")
 }
 
 #[derive(Debug, Clone, Default)]
@@ -5557,7 +5630,7 @@ fn thread_episodic_source_context_is_recallable(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::bootstrap::bootstrap;
     use crate::workspace::WorkspaceManager;
@@ -6169,7 +6242,7 @@ mod tests {
         }
     }
 
-    async fn seed_active_thread_episodic_item(
+    pub(crate) async fn seed_active_thread_episodic_item(
         crud_store: &CrudStore,
         workspace_id: &str,
         thread_id: &str,
@@ -6177,6 +6250,26 @@ mod tests {
         item_id: &str,
         source_text: &str,
     ) -> ThreadEpisodicItemRecord {
+        if crud_store
+            .get_thread_episodic_canonical_item(workspace_id, thread_id, turn_id, item_id)
+            .await
+            .expect("canonical fixture lookup")
+            .is_none()
+        {
+            materialize_thread_with_item(
+                crud_store,
+                workspace_id,
+                thread_id,
+                turn_id,
+                TurnItem::UserMessage {
+                    id: item_id.to_owned(),
+                    text: source_text.to_owned(),
+                    attachments: Vec::new(),
+                },
+                1_700_000_000,
+            )
+            .await;
+        }
         seed_thread_episodic_item_with_state(
             crud_store,
             workspace_id,
@@ -10008,7 +10101,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thread_episodic_recall_service_hydrates_memvid_text_with_provenance() {
+    async fn thread_episodic_recall_service_rejects_indexed_text_without_canonical_source() {
         let (crud_store, workspace_id) = setup_thread_episodic_store().await;
         let thread_id = "thread_recall_memvid";
         let item = seed_active_thread_episodic_item(
@@ -10020,6 +10113,16 @@ mod tests {
             "canonical text",
         )
         .await;
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+        crud_store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "DELETE FROM turn_item WHERE turn_id=? AND item_id=?",
+                [item.turn_id.clone().into(), item.item_id.clone().into()],
+            ))
+            .await
+            .unwrap();
         let backend = Arc::new(FakeThreadEpisodicMemvidBackend::with_search(vec![Ok(
             search_output_with_hits(vec![ranked_hit_for_item(&item, "memvid text", 0.8)]),
         )]));
@@ -10032,13 +10135,10 @@ mod tests {
             )
             .await;
 
-        assert_eq!(output.hits.len(), 1);
-        assert_eq!(output.hits[0].text, "memvid text");
-        assert_eq!(
-            output.hits[0].provenance.source_id,
-            format!("thread:turn_memvid/item_memvid/{}", item.id)
+        assert!(
+            output.hits.is_empty(),
+            "indexed text cannot replace missing canonical source"
         );
-        assert_eq!(output.hits[0].provenance.thread_id.0, thread_id);
     }
 
     #[tokio::test]
@@ -10381,7 +10481,7 @@ mod tests {
             thread_id,
             "turn_secret",
             "item_secret",
-            "token source text",
+            "OPENAI_API_KEY=sk-test-secret-value",
         )
         .await;
         let backend = Arc::new(FakeThreadEpisodicMemvidBackend::with_search(vec![Ok(
@@ -14801,7 +14901,7 @@ mod tests {
         (crud_store, workspace_id)
     }
 
-    async fn mark_thread_episodic_workspace_refill_complete_for_test(
+    pub(crate) async fn mark_thread_episodic_workspace_refill_complete_for_test(
         crud_store: &CrudStore,
         workspace_id: &str,
     ) {
@@ -14813,7 +14913,7 @@ mod tests {
         .await;
     }
 
-    async fn mark_thread_episodic_workspace_vector_refill_complete_for_test(
+    pub(crate) async fn mark_thread_episodic_workspace_vector_refill_complete_for_test(
         crud_store: &CrudStore,
         workspace_id: &str,
         config: &pioneer_config::GatewayThreadEpisodicVectorSearchConfig,
@@ -17429,6 +17529,65 @@ mod tests {
             thread_id: &str,
             fixture: &EvalItemFixture,
         ) -> ThreadEpisodicItemRecord {
+            let canonical = match (fixture.source_context, fixture.source_actor_role) {
+                (
+                    ThreadEpisodicSourceContext::UserVisibleThreadItem,
+                    StoreThreadEpisodicSourceActorRole::User,
+                ) => Some(TurnItem::UserMessage {
+                    id: fixture.item_id.clone(),
+                    text: fixture.text.clone(),
+                    attachments: Vec::new(),
+                }),
+                (
+                    ThreadEpisodicSourceContext::UserVisibleThreadItem,
+                    StoreThreadEpisodicSourceActorRole::Assistant,
+                ) => Some(TurnItem::AgentMessage {
+                    id: fixture.item_id.clone(),
+                    text: fixture.text.clone(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                }),
+                (ThreadEpisodicSourceContext::UserVisibleTaskSummary, _) => Some(TurnItem::Task {
+                    item: TaskTurnItem {
+                        id: fixture.item_id.clone(),
+                        task_id: "eval_task".to_owned(),
+                        created_by_turn_id: None,
+                        run_id: None,
+                        parent_task_id: None,
+                        root_task_id: None,
+                        title: String::new(),
+                        status: TaskStatus::Completed,
+                        attachment: pioneer_protocol::TaskAttachmentMode::Attached,
+                        trigger_kind: TaskTriggerKind::Immediate,
+                        executor_kind: TaskExecutorKind::Agent,
+                        child_thread_id: None,
+                        child_turn_id: None,
+                        agent_role: None,
+                        depth: 0,
+                        max_depth: 3,
+                        next_fire_at: None,
+                        progress_preview: None,
+                        result_preview: Some(fixture.text.clone()),
+                        error_preview: None,
+                        started_at: None,
+                        created_at: 1,
+                        updated_at: 2,
+                    },
+                }),
+                _ => None,
+            };
+            if let Some(item) = canonical {
+                materialize_thread_with_item(
+                    crud_store,
+                    workspace_id,
+                    thread_id,
+                    &fixture.turn_id,
+                    item,
+                    1_700_000_000,
+                )
+                .await;
+            }
             let capsule = crud_store
                 .resolve_thread_episodic_workspace_active_write_segment(
                     ThreadEpisodicWorkspaceActiveWriteSegmentRequest {
@@ -17720,20 +17879,18 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn eval_thread_compaction_summary_is_recallable_and_sourced() {
+        async fn eval_compaction_projection_without_canonical_source_is_suppressed() {
             let result = run_eval_fixture(
                 EvalFixture::new("compaction_summary", "what did the compressed thread say?")
                     .items(vec![EvalItemFixture::compaction_summary(
                         "turn_summary",
                         "item_summary",
-                        "Thread summary: migrations for thread episodic memory must live in the new migration file, not the old workspace migration.",
+                        "Thread summary: earlier decision",
                     )])
-                    .expect_contains(vec!["Thread summary:", "new migration file"])
-                    .expect_top_item("item_summary"),
+                    .expect_absent(vec!["Thread summary: earlier decision"]),
             )
             .await;
-
-            assert!(result.direct_thread_prompt.contains("Thread summary:"));
+            assert!(result.recall.hits.is_empty());
         }
 
         #[tokio::test]

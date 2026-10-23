@@ -4463,6 +4463,10 @@ impl ToolOutputPolicySnapshot {
             "exec_command" | "write_stdin" => shell_output_policy_snapshot(),
             "web_fetch" => web_fetch_output_policy_snapshot(),
             "web_search" => web_search_output_policy_snapshot(),
+            "threads_search" => ToolOutputPolicySnapshot {
+                llm: LlmOutputPolicy::Structured { max_bytes: 32768 },
+                ..download_output_policy_snapshot()
+            },
             "download_url" | "download" => download_output_policy_snapshot(),
             "computer_use" => computer_use_output_policy_snapshot(),
             "html_preview" | "html_render" => html_output_policy_snapshot(),

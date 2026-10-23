@@ -4,6 +4,7 @@ mod config;
 mod context;
 mod convert;
 mod debug;
+pub mod episodic_search;
 mod extractor_ontology;
 pub mod hooks;
 mod lifecycle;

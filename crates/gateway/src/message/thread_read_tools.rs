@@ -22,7 +22,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, sync::Arc};
 
-pub(crate) const THREAD_READ_TOOL_NAMES: [&str; 3] = [
+pub(crate) const THREAD_READ_TOOL_NAMES: [&str; 4] = [
+    "threads_search",
     "threads_list",
     "threads_history_read",
     "threads_children_list",
@@ -34,6 +35,12 @@ pub(crate) fn thread_read_tool_specs() -> Vec<ConfiguredToolSpec> {
     let limit = json!({"type":"integer","minimum":1,"maximum":100});
     let cursor = json!({"type":["string","null"],"description":"Opaque nextCursor from the same operation, resource and parameters; omit/null for first page."});
     let definitions = [
+        (
+            "threads_search",
+            "Search accessible indexed conversations in the current workspace. Automatically combines lexical and compatible semantic retrieval. Returns bounded thread cards and exact sources usable with threads_history_read. limit counts fragments (1..20). Continue with the same query, limit and nextCursor within five minutes; pages use a fixed selection and recheck current access/content. eof ends this selection only; limitations describes incomplete coverage, capped selection, approximate semantic retrieval and lexical fallback. Start a new search to refresh.",
+            json!({"query":{"type":"string","minLength":1,"maxLength":4096},"limit":{"type":"integer","minimum":1,"maximum":20},"cursor":cursor}),
+            vec!["query", "limit"],
+        ),
         (
             "threads_list",
             "List accessible saved conversations in the current workspace, including hidden internal children and archived conversations. Bounded pages ordered by immutable thread ID. Follow nextCursor until eof; an empty nonterminal page is possible. No search. Read a selected conversation with threads_history_read.",
@@ -62,15 +69,21 @@ pub(crate) fn thread_read_tool_specs() -> Vec<ConfiguredToolSpec> {
 }
 
 pub(super) struct ThreadReadAuthority {
-    principal: AuthenticatedSessionPrincipal,
-    workspace_id: String,
-    root_thread_id: String,
-    current_thread_id: String,
-    observe_children: bool,
-    observe_workspace: bool,
+    pub(super) principal: AuthenticatedSessionPrincipal,
+    pub(super) workspace_id: String,
+    pub(super) root_thread_id: String,
+    pub(super) current_thread_id: String,
+    pub(super) observe_children: bool,
+    pub(super) observe_workspace: bool,
 }
 impl ThreadReadAuthority {
-    fn scope(&self, operation: &str, resource: &str, recursive: bool, limit: u32) -> String {
+    pub(super) fn scope(
+        &self,
+        operation: &str,
+        resource: &str,
+        recursive: bool,
+        limit: u32,
+    ) -> String {
         // JSON encoding avoids delimiter ambiguity in imported legacy IDs.
         json!([
             "thread-read-v1",
@@ -135,36 +148,22 @@ impl MessageProcessor {
         let envelope = self
             .load_turn_execution_authorization_context(&context.turn_id)
             .await?;
-        let mut agent_observe = false;
+        // Recall may run before tool materialization creates a runtime binding.
+        // The persisted execution envelope is authoritative in both phases.
+        let mut agent_observe = envelope.grants_action(ResourceAction::ThreadObserveWorkspace);
         let mut observe_children = false;
-        if let Some(binding) = self.agent_action_binding(&context.turn_id).await {
-            let facts = binding.adapter.lock().await.persistence_facts();
-            let grants = &facts.agent_authorization_allowed_actions;
+        if let Some((role, grants)) = self.thread_read_agent_ceiling(context).await? {
             let policy = RoleDefinitionRegistry::new();
+            let permits = |action: ResourceAction| {
+                grants.iter().any(|name| name == action.safe_name())
+                    && policy.agent_policy_allows(&role, action)
+            };
             ensure!(
-                grants
-                    .iter()
-                    .any(|name| name == ResourceAction::ThreadRead.safe_name())
-                    && policy.agent_policy_allows(
-                        &facts.agent_authorization_role_key,
-                        ResourceAction::ThreadRead
-                    ),
+                permits(ResourceAction::ThreadRead),
                 "source unavailable or access denied"
             );
-            observe_children = grants
-                .iter()
-                .any(|name| name == ResourceAction::ChildObserve.safe_name())
-                && policy.agent_policy_allows(
-                    &facts.agent_authorization_role_key,
-                    ResourceAction::ChildObserve,
-                );
-            agent_observe = grants
-                .iter()
-                .any(|name| name == ResourceAction::ThreadObserveWorkspace.safe_name())
-                && policy.agent_policy_allows(
-                    &facts.agent_authorization_role_key,
-                    ResourceAction::ThreadObserveWorkspace,
-                );
+            observe_children = permits(ResourceAction::ChildObserve);
+            agent_observe &= permits(ResourceAction::ThreadObserveWorkspace);
         }
         let mut authority = ThreadReadAuthority {
             principal,
@@ -214,6 +213,56 @@ impl MessageProcessor {
             }
         }
         Ok(authority)
+    }
+
+    // Resolve the same immutable Agent ceiling used by tool materialization.
+    // Hooks can precede the in-memory binding; loading a persisted grant never
+    // creates an execution, expands grants or admits another Agent.
+    async fn thread_read_agent_ceiling(
+        &self,
+        context: &TurnToolContext,
+    ) -> Result<Option<(String, Vec<String>)>> {
+        if let Some(binding) = self.agent_action_binding(&context.turn_id).await {
+            let facts = binding.adapter.lock().await.persistence_facts();
+            return Ok(Some((
+                facts.agent_authorization_role_key,
+                facts.agent_authorization_allowed_actions,
+            )));
+        }
+        let db = self.crud_store.database_connection();
+        let execution = if let Some(response) =
+            pioneer_crud::load_agent_turn_response(&db, &context.turn_id).await?
+        {
+            Some(response.execution_id)
+        } else {
+            self.crud_store
+                .get_turn(&context.thread_id, &context.turn_id)
+                .await?
+                .and_then(|(_, turn)| turn.author)
+                .and_then(|author| match author.actor {
+                    pioneer_protocol::PersistedActorRef::AgentExecution(id) => Some(id.to_string()),
+                    _ => None,
+                })
+        };
+        let Some(execution) = execution else {
+            return Ok(None);
+        };
+        let grant = pioneer_crud::load_agent_execution_grant(&db, &execution)
+            .await?
+            .ok_or_else(|| anyhow!("source unavailable or access denied"))?;
+        let grant: Value = serde_json::from_str(&grant.grant_json)?;
+        let role = grant
+            .get("role_key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("source unavailable or access denied"))?
+            .to_owned();
+        let actions = serde_json::from_value(
+            grant
+                .get("allowed_actions")
+                .cloned()
+                .ok_or_else(|| anyhow!("source unavailable or access denied"))?,
+        )?;
+        Ok(Some((role, actions)))
     }
 
     pub(super) async fn thread_source_readable(
@@ -540,6 +589,17 @@ impl ThreadReadHandler {
             .map_err(|_| anyhow!("source unavailable or access denied"))?;
         let codec = self.processor.thread_read_cursor_codec()?;
         let mut result = match name {
+            "threads_search" => {
+                self.processor
+                    .thread_search_page(
+                        &self.context,
+                        &authority,
+                        serde_json::from_value(arguments)
+                            .map_err(|_| anyhow!("invalid search parameters"))?,
+                        &codec,
+                    )
+                    .await
+            }
             "threads_list" => {
                 self.processor
                     .thread_list_page(
@@ -690,8 +750,15 @@ impl ThreadReadHandler {
 // an agent tool; only the bounded public error vocabulary crosses this boundary.
 fn safe_read_error(error: &anyhow::Error) -> ToolError {
     let message = error.to_string();
-    let safe = if message.contains("cursor is stale") || message.contains("source changed; restart")
-    {
+    let safe = if message.starts_with("search session expired") {
+        "search session expired or evicted; restart search without cursor"
+    } else if message.starts_with("search limit must") {
+        "search limit must be between 1 and 20"
+    } else if message.starts_with("query must") {
+        "query must contain 1..4096 bytes"
+    } else if message.contains("search is busy") {
+        "thread search is busy; retry later"
+    } else if message.contains("cursor is stale") || message.contains("source changed; restart") {
         "cursor is stale; restart reading from the first page"
     } else if message.contains("cursor") {
         "invalid cursor or cursor scope/parameters mismatch"

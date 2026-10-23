@@ -631,6 +631,18 @@ pub trait ThreadEpisodicMemvidBackend: Send + Sync {
         request: ThreadEpisodicMemvidSearchRequest,
     ) -> Result<ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidError>;
 
+    /// Direct channel retrieval, without ask interpretation or prompt cutoffs.
+    async fn source_candidates(
+        &self,
+        _request: ThreadEpisodicMemvidSearchRequest,
+        _embedding: Option<crate::episodic_search::EpisodicQueryEmbedding>,
+    ) -> crate::episodic_search::EpisodicChannelCandidates {
+        crate::episodic_search::EpisodicChannelCandidates {
+            unavailable: true,
+            ..Default::default()
+        }
+    }
+
     async fn ask_retrieval(
         &self,
         _request: ThreadEpisodicMemvidSearchRequest,
@@ -935,6 +947,52 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
         ))
     }
 
+    async fn source_candidates(
+        &self,
+        request: ThreadEpisodicMemvidSearchRequest,
+        embedding: Option<crate::episodic_search::EpisodicQueryEmbedding>,
+    ) -> crate::episodic_search::EpisodicChannelCandidates {
+        let mut output = crate::episodic_search::EpisodicChannelCandidates::default();
+        if request.profile.validate().is_err() {
+            output.unavailable = true;
+            return output;
+        }
+        for segment in request
+            .segments
+            .iter()
+            .take(request.profile.max_segments as usize)
+        {
+            let Ok(path) = path_from_storage_uri(&segment.storage_uri) else {
+                output.unavailable = true;
+                continue;
+            };
+            let query = request.query.clone();
+            let scope = request.scope.clone();
+            let embedding = embedding.clone();
+            let limit = request.profile.max_candidates as usize;
+            let result = self
+                .run_blocking(&path.clone(), move || {
+                    source_candidates_blocking(
+                        path,
+                        &query,
+                        scope.as_deref(),
+                        limit,
+                        embedding.as_ref(),
+                    )
+                })
+                .await;
+            match result {
+                Ok(Ok((hits, limited))) => {
+                    output.partitions.push(hits);
+                    output.coverage_limited |= limited;
+                }
+                _ => output.unavailable = true,
+            }
+        }
+        output.coverage_limited |= request.segments.len() > request.profile.max_segments as usize;
+        output
+    }
+
     async fn ask_retrieval(
         &self,
         request: ThreadEpisodicMemvidSearchRequest,
@@ -1171,6 +1229,87 @@ fn ask_segment_blocking(
             )
         })
         .collect())
+}
+
+fn source_candidates_blocking(
+    path: PathBuf,
+    query: &str,
+    scope: Option<&str>,
+    limit: usize,
+    embedding: Option<&crate::episodic_search::EpisodicQueryEmbedding>,
+) -> Result<(Vec<crate::episodic_search::EpisodicSourceCandidate>, bool), ThreadEpisodicMemvidError>
+{
+    let mut memvid = Memvid::open_read_only(&path).map_err(classify_memvid_error)?;
+    let (metadata, limited) = if let Some(embedding) = embedding {
+        embedding
+            .identity
+            .validate_embedding(embedding.vector.len())
+            .map_err(|_| ThreadEpisodicMemvidError::non_retryable("query embedding mismatch"))?;
+        let hits = memvid
+            .search_vec(&embedding.vector, limit)
+            .map_err(classify_memvid_error)?;
+        let limited = hits.len() == limit;
+        let mut metadata = Vec::new();
+        for hit in hits {
+            let frame = memvid
+                .frame_by_id(hit.frame_id)
+                .map_err(classify_memvid_error)?;
+            if frame.status != FrameStatus::Active {
+                continue;
+            }
+            let tags = frame.extra_metadata;
+            let identity = &embedding.identity;
+            if tags.get("pioneer.thread_episodic.embedding.provider_id")
+                != Some(&identity.provider_id)
+                || tags.get("pioneer.thread_episodic.embedding.model") != Some(&identity.model)
+                || tags.get("pioneer.thread_episodic.embedding.dimension")
+                    != Some(&identity.dimension.to_string())
+                || tags.get("pioneer.thread_episodic.embedding.normalized")
+                    != Some(&identity.normalized.to_string())
+            {
+                return Err(ThreadEpisodicMemvidError::non_retryable(
+                    "incompatible vector projection",
+                ));
+            }
+            metadata.push(tags);
+        }
+        (metadata, limited)
+    } else {
+        let mut profile =
+            ThreadEpisodicSearchProfile::for_kind(ThreadEpisodicSearchProfileKind::DefaultContext);
+        profile.mode = ThreadEpisodicSearchMode::Lexical;
+        profile.max_candidates = limit as u32;
+        let response = memvid
+            .search(memvid_thread_episodic_search_request(
+                &profile, query, scope,
+            ))
+            .map_err(classify_memvid_error)?;
+        let limited = response.hits.len() == limit;
+        let metadata = response
+            .hits
+            .into_iter()
+            .filter_map(|mut hit| {
+                hydrate_search_hit_metadata(&memvid, &mut hit);
+                hit.metadata.map(|m| m.extra_metadata)
+            })
+            .collect::<Vec<_>>();
+        (metadata, limited)
+    };
+    let candidates = metadata
+        .into_iter()
+        .filter_map(|m| {
+            let field = |key: &str| m.get(&format!("pioneer.thread_episodic.{key}")).cloned();
+            Some(crate::episodic_search::EpisodicSourceCandidate {
+                source_id: field("index_item_id")?,
+                workspace_id: field("workspace_id")?,
+                thread_id: field("thread_id")?,
+                turn_id: field("turn_id")?,
+                item_id: field("item_id")?,
+                source_version: field("source_text_hash")?,
+            })
+        })
+        .collect();
+    Ok((candidates, limited))
 }
 
 fn search_segment_blocking(
@@ -2804,6 +2943,88 @@ mod tests {
                 .get("pioneer.thread_episodic.embedding.normalized")
                 .map(String::as_str),
             Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_channels_use_real_memvid_and_reject_incompatible_vectors_without_ask() {
+        use crate::episodic_search::EpisodicQueryEmbedding;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("direct.mv2");
+        let identity = ThreadEpisodicEmbeddingIdentity::new("test", "vectors", 3, true);
+        let backend = MemvidThreadEpisodicBackend::default();
+        backend
+            .index_item(ThreadEpisodicMemvidIndexRequest {
+                storage_uri: thread_episodic_storage_uri_from_path(&path),
+                capsule_id: "segment".into(),
+                capsule_ref: "capsule".into(),
+                workspace_capsule: true,
+                index_item_id: "source".into(),
+                frame_uri: "mv2://workspace/thread/source".into(),
+                text: "provider configuration architecture".into(),
+                metadata: thread_episodic_memvid_metadata(
+                    "workspace",
+                    "thread",
+                    "turn",
+                    "item",
+                    "user",
+                    "user_turn",
+                    "user_visible_thread_item",
+                    "text-hash",
+                    "version",
+                ),
+                embedding: Some(
+                    ThreadEpisodicMemvidIndexEmbedding::new(identity.clone(), vec![1.0, 0.0, 0.0])
+                        .unwrap(),
+                ),
+            })
+            .await
+            .unwrap();
+        let request = ThreadEpisodicMemvidSearchRequest {
+            workspace_id: "workspace".into(),
+            thread_id: "thread".into(),
+            query: "configuration".into(),
+            scope: None,
+            profile: ThreadEpisodicSearchProfile::for_kind(
+                ThreadEpisodicSearchProfileKind::DefaultContext,
+            ),
+            segments: vec![ThreadEpisodicMemvidSearchSegment {
+                capsule_id: "segment".into(),
+                capsule_ref: "capsule".into(),
+                storage_uri: thread_episodic_storage_uri_from_path(&path),
+                segment_index: 1,
+            }],
+            exact_source: None,
+        };
+        let lexical = backend.source_candidates(request.clone(), None).await;
+        assert!(!lexical.unavailable);
+        assert_eq!(lexical.partitions[0][0].source_id, "source");
+        let embedding = EpisodicQueryEmbedding {
+            identity: identity.clone(),
+            vector: vec![1.0, 0.0, 0.0],
+        };
+        let semantic = backend
+            .source_candidates(request.clone(), Some(embedding.clone()))
+            .await;
+        assert!(!semantic.unavailable);
+        assert_eq!(semantic.partitions[0][0].turn_id, "turn");
+        let mut incompatible = embedding.clone();
+        incompatible.identity.model = "other-model".into();
+        assert!(
+            backend
+                .source_candidates(request.clone(), Some(incompatible))
+                .await
+                .unavailable
+        );
+        let malformed = EpisodicQueryEmbedding {
+            identity,
+            vector: vec![1.0],
+        };
+        assert!(
+            backend
+                .source_candidates(request, Some(malformed))
+                .await
+                .unavailable
         );
     }
 

@@ -2112,6 +2112,20 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
             }
             // The fixed CLI binding must reach the shared observation handlers,
             // rather than only publishing a schema with no native dispatcher.
+            let searched = invoke_task(
+                &processor,
+                &turn_id,
+                "read-search",
+                "threads_search",
+                json!({"query":"provider configuration", "limit":2}),
+            )
+            .await
+            .unwrap();
+            assert!(!searched.is_error, "{kind:?}: {searched:?}");
+            let search = searched.structured_content.as_ref().unwrap();
+            assert!(search["threads"].is_array());
+            assert!(search["eof"].is_boolean());
+            assert!(search["limitations"]["coverageLimited"].is_boolean());
             let listed = invoke_task(
                 &processor,
                 &turn_id,
