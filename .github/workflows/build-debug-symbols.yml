@@ -39,12 +39,13 @@ jobs:
               owner: context.repo.owner, repo: context.repo.repo, run_id: Number(id)});
             const {data: commit} = await github.rest.repos.getCommit({
               owner: context.repo.owner, repo: context.repo.repo, ref: context.ref});
-            const producers = {'Release': '.github/workflows/release.yml',
-                               'Release App': '.github/workflows/release-app.yml',
-                               'Release Gateway': '.github/workflows/release-gateway.yml'};
+            const producers = {'.github/workflows/release.yml': ['desktop', 'gateway'],
+                               '.github/workflows/release-app.yml': ['desktop'],
+                               '.github/workflows/release-gateway.yml': ['gateway']};
+            const products = producers[run.path.split('@')[0]];
             if (run.head_repository.id !== context.payload.repository.id || run.head_sha !== commit.sha ||
                 !['push', 'workflow_dispatch'].includes(run.event) ||
-                producers[run.name] !== run.path.split('@')[0]) {
+                !products) {
               throw new Error('Select the same ref/SHA as the trusted release producer');
             }
             core.setOutput('source_sha', run.head_sha);
@@ -63,8 +64,6 @@ jobs:
             for (const artifact of artifacts) {
               const match = /^symbol-inputs-(desktop|gateway)-(.+?)(?:-(default|computer-use))?$/.exec(artifact.name);
               if (!match || artifact.expired || !platforms[match[2]]) continue;
-              const products = run.name === 'Release' ? ['desktop', 'gateway']
-                : [run.name === 'Release App' ? 'desktop' : 'gateway'];
               if (!products.includes(match[1])) throw new Error('Unexpected input producer');
               include.push({artifact_id: artifact.id, name: artifact.name,
                             target: match[2], os: platforms[match[2]]});
@@ -72,8 +71,6 @@ jobs:
             core.setOutput('matrix', JSON.stringify({include}));
             core.setOutput('count', include.length);
             core.setOutput('has_macos', include.some(row => row.os.startsWith('macos')));
-            const products = run.name === 'Release' ? ['desktop', 'gateway']
-              : [run.name === 'Release App' ? 'desktop' : 'gateway'];
             const expected = Object.keys(platforms).flatMap(target => products.flatMap(product => product === 'desktop'
               ? [`symbol-inputs-desktop-${target}`]
               : ['default', 'computer-use'].map(feature => `symbol-inputs-gateway-${target}-${feature}`)));

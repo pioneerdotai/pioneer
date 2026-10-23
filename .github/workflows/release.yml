@@ -323,7 +323,7 @@ jobs:
           name: compiled-desktop-${{ matrix.target }}
           path: desktop-symbol-inputs/
           compression-level: 0
-          retention-days: 1
+          retention-days: 7
           if-no-files-found: error
 
   package-desktop:
