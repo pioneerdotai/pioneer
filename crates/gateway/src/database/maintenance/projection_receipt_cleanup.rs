@@ -32,7 +32,7 @@ pub(super) async fn run(crud_store: Arc<CrudStore>, cancellation: CancellationTo
             biased;
             _ = cancellation.cancelled() => return,
             result = crate::database::attribution::scope_database_workload_result(
-                pioneer_observability::DatabaseWorkload::ProjectionReceiptCleanup,
+                pioneer_observability::DatabaseWorkload::ProjectionReceiptCleanup, pioneer_observability::DatabaseOperationSite::ProjectionReceiptCleanupQuantum,
                 async {
                     match store.cleanup_projection_receipts_quantum(after_turn_id.as_deref()).await {
                         Ok(outcome) if outcome.failed => Err(QuantumError::StreamFailed(outcome)),

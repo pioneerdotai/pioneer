@@ -34,6 +34,7 @@ mod patch_telemetry;
 mod performance;
 #[cfg(feature = "qualification-diagnostics")]
 mod qualification_diagnostics;
+pub mod query_cpu;
 pub mod queues;
 pub mod resources;
 pub mod runtime;
@@ -44,8 +45,8 @@ pub mod turn_startup;
 pub mod work;
 
 pub use database_workload::{
-    DatabaseQueryKind, DatabaseWorkload, DatabaseWorkloadContext, DatabaseWorkloadOutcome,
-    DatabaseWorkloadTrace,
+    DatabaseOperationSite, DatabaseQueryKind, DatabaseWorkload, DatabaseWorkloadContext,
+    DatabaseWorkloadOutcome, DatabaseWorkloadTrace,
 };
 pub use desktop_gateway::{DesktopGatewayLifecycleOperation, DesktopGatewayLifecycleTrace};
 pub use metrics::{
@@ -223,7 +224,8 @@ where
 {
     let filter = Targets::new()
         .with_default(LevelFilter::INFO)
-        .with_target("rmcp::service", LevelFilter::WARN);
+        .with_target("rmcp::service", LevelFilter::WARN)
+        .with_target(query_cpu::TARGET, LevelFilter::OFF);
     // The OTLP crate deliberately keeps the concrete reqwest failure at DEBUG
     // and returns a redacted `network error` to the SDK. Send only that target
     // through the Sentry mapper so the first outage event has a useful DNS,
@@ -244,6 +246,9 @@ where
         database_metrics_target_enabled(metadata.target(), telemetry_enabled())
     });
     let subscriber = tracing_subscriber::registry()
+        .with(query_cpu::QueryCpuLayer.with_filter(filter_fn(|metadata| {
+            metadata.is_span() && query_cpu::target_enabled(metadata.target())
+        })))
         .with(metrics::DatabasePoolAcquireMetricsLayer.with_filter(database_metrics_filter))
         .with(format_layer);
 
@@ -372,6 +377,7 @@ fn set_telemetry_gate(enabled: bool) {
     let next = (generation << 1) | u64::from(enabled);
     TELEMETRY_CONSENT.store(next, Ordering::Release);
     if !enabled {
+        query_cpu::close_on_opt_out();
         turn_startup::discard_on_opt_out();
         resources::discard(generation);
         live::discard(generation);
