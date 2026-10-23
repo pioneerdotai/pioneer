@@ -65,9 +65,9 @@ the backend retained every event.
    user instructions for macOS allocation history only when attach cannot answer
    the question; read the restart reference before planning it.
 5. Read [references/symbols.md](references/symbols.md) to download the matching private
-   symbol artifact from the producing `Release` run, validate it against the capture
-   and executable, and resolve addresses. Prefer existing artifacts; local LLVM
-   builds and release rebuilds are not a normal diagnostic step.
+   `Build Debug Symbols` artifact for the exact producing release, validate it
+   against the capture and executable, and resolve addresses. Prefer existing
+   artifacts; local LLVM builds and release rebuilds are not a normal diagnostic step.
 6. Follow the evidence to the initiating work and concrete functions. Give a
    short verdict, evidence paths/time window, missing coverage and a scoped next
    action. A single failed native capture is not proof that ordinary telemetry

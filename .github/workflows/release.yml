@@ -823,191 +823,21 @@ jobs:
             gh release edit "${GITHUB_REF_NAME}" --draft=false --prerelease=false --latest
           fi
 
-  # Symbols are prepared after publication, from this run's exact link inputs.
-  symbol-inputs:
-    name: prepare-debug-symbols
-    needs: publish-release
-    permissions:
-      contents: read
-      actions: read
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  # Dispatch once the exact inputs exist; publication does not wait for symbols.
+  queue-debug-symbols:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    name: queue-independent-debug-symbols
+    needs: [build-gateway, package-desktop]
     runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.select.outputs.matrix }}
-      count: ${{ steps.select.outputs.count }}
-      has_macos: ${{ steps.select.outputs.has_macos }}
+    permissions:
+      actions: write
     steps:
       - uses: actions/github-script@v8
-        id: select
         with:
           script: |
-            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts,
-              {owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId, per_page: 100});
-            const platforms = {
-              'x86_64-unknown-linux-gnu': 'ubuntu-latest',
-              'aarch64-unknown-linux-gnu': 'ubuntu-24.04-arm',
-              'x86_64-apple-darwin': 'macos-latest',
-              'aarch64-apple-darwin': 'macos-latest',
-              'x86_64-pc-windows-msvc': 'windows-latest',
-              'aarch64-pc-windows-msvc': 'windows-11-arm',
-            };
-            const include = [];
-            for (const artifact of artifacts) {
-              const match = /^symbol-inputs-(desktop|gateway)-(.+?)(?:-(default|computer-use))?$/.exec(artifact.name);
-              if (!match || artifact.expired || !platforms[match[2]]) continue;
-              include.push({artifact_id: artifact.id, name: artifact.name,
-                            target: match[2], os: platforms[match[2]]});
-            }
-            core.setOutput('matrix', JSON.stringify({include}));
-            core.setOutput('count', include.length);
-            core.setOutput('has_macos', include.some(row => row.os.startsWith('macos')));
-            const expected = Object.keys(platforms).flatMap(target => ['desktop', 'gateway'].flatMap(product => product === 'desktop'
-              ? [`symbol-inputs-desktop-${target}`]
-              : ['default', 'computer-use'].map(feature => `symbol-inputs-gateway-${target}-${feature}`)));
-            const names = new Set(include.map(row => row.name));
-            if (expected.some(name => !names.has(name))) throw new Error('Missing release symbol inputs');
-
-  symbol-tool:
-    name: build-dsymutil
-    needs: symbol-inputs
-    permissions:
-      contents: read
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-    if: needs.symbol-inputs.outputs.has_macos == 'true'
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.sha }}
-      - uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}/pioneer-dsymutil
-          key: dsymutil-${{ runner.os }}-${{ runner.arch }}-5e8490a1-${{ hashFiles('scripts/packaging/dsymutil-undefined-symbols.patch') }}
-      - name: build-pinned-dsymutil
-        shell: bash
-        run: python3 scripts/packaging/run-symbol-job.py bash scripts/packaging/build-dsymutil.sh "$RUNNER_TEMP/pioneer-dsymutil"
-      - uses: actions/upload-artifact@v6
-        with:
-          name: debug-symbols-macos-tool
-          path: ${{ runner.temp }}/pioneer-dsymutil/
-          retention-days: 7
-          overwrite: true
-          if-no-files-found: error
-
-  debug-symbols:
-    name: symbols-${{ matrix.name }}
-    needs: [symbol-inputs, symbol-tool]
-    permissions:
-      contents: read
-      actions: read
-    if: >-
-      always() && !cancelled() && needs.symbol-inputs.result == 'success' && needs.symbol-inputs.outputs.count != '0'
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.symbol-inputs.outputs.matrix) }}
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-      SENTRY_DISABLE_UPDATE_CHECK: "true"
-      SYMBOL_SOURCE_SHA: ${{ github.sha }}
-      SYMBOL_SOURCE_RUN_ID: ${{ github.run_id }}
-      SYMBOL_TARGET: ${{ matrix.target }}
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.sha }}
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.x'
-      - name: download-exact-release-inputs
-        uses: actions/download-artifact@v7
-        with:
-          artifact-ids: ${{ matrix.artifact_id }}
-          run-id: ${{ github.run_id }}
-          github-token: ${{ github.token }}
-          path: symbol-inputs
-          merge-multiple: true
-      - name: download-pinned-dsymutil
-        if: runner.os == 'macOS'
-        uses: actions/download-artifact@v7
-        with:
-          name: debug-symbols-macos-tool
-          path: symbol-tool
-      - name: generate-and-verify-debug-symbols
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "$RUNNER_OS" == "macOS" ]]; then
-            chmod +x symbol-tool/dsymutil
-            export DSYMUTIL="$PWD/symbol-tool/dsymutil"
-          fi
-          python scripts/packaging/run-symbol-job.py python scripts/packaging/symbol-inputs.py process symbol-inputs symbol-work symbols
-          if [[ -f symbol-tool/tool.json ]]; then cp symbol-tool/tool.json symbols/dsymutil-tool.json; fi
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '24'
-      - name: install-pinned-sentry-cli
-        shell: bash
-        run: |
-          set -euo pipefail
-          npm install --global --no-audit --no-fund @sentry/cli@3.8.2
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            npm prefix -g >> "$GITHUB_PATH"
-          else
-            echo "$(npm prefix -g)/bin" >> "$GITHUB_PATH"
-          fi
-      # Prepare source context offline, even before Sentry credentials exist.
-      # Use the exact producer checkout; keep bundles in the private artifact.
-      - name: bundle-sources-for-sentry
-        shell: bash
-        run: |
-          python scripts/packaging/run-symbol-job.py python - <<'PY'
-          import json
-          from pathlib import Path
-          import subprocess
-
-          manifests = sorted(Path('symbols').glob('*/manifest.json'))
-          if not manifests:
-              raise SystemExit('No verified symbol manifests found')
-          for manifest in manifests:
-              metadata = json.loads(manifest.read_text())
-              files = [manifest.parent / item['filename'] for item in metadata['files']]
-              native = [path for path in files if path.suffix.lower() in ('.debug', '.pdb')
-                        or '.dSYM/Contents/Resources/DWARF/' in path.as_posix()]
-              if not metadata['symbols_validated'] or len(native) != 1:
-                  raise SystemExit(f'Expected one verified native symbol file: {manifest}')
-              output = Path('symbols/sentry-sources') / manifest.parent.name
-              output.mkdir(parents=True, exist_ok=True)
-              subprocess.run(['sentry-cli', 'debug-files', 'bundle-sources',
-                              str(native[0]), '--output', str(output)], check=True)
-              if not list(output.glob('*.src.zip')):
-                  raise SystemExit(f'No source context found for {native[0]}')
-          PY
-      - name: upload-private-debug-symbols
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: debug-${{ matrix.name }}
-          path: symbols/
-          compression-level: 1
-          retention-days: 90
-          overwrite: true
-          if-no-files-found: error
-      # Configure each account separately: SENTRY_AUTH_TOKEN_GATEWAY / _DESKTOP
-      # secrets, SENTRY_ORG_GATEWAY / _DESKTOP and SENTRY_PROJECT_GATEWAY / _DESKTOP
-      # variables. Never fall back to the other product's account.
-      - name: upload-to-sentry-if-configured
-        shell: bash
-        env:
-          SENTRY_AUTH_TOKEN: ${{ secrets[startsWith(matrix.name, 'symbol-inputs-desktop-') && 'SENTRY_AUTH_TOKEN_DESKTOP' || 'SENTRY_AUTH_TOKEN_GATEWAY'] }}
-          SENTRY_ORG: ${{ vars[startsWith(matrix.name, 'symbol-inputs-desktop-') && 'SENTRY_ORG_DESKTOP' || 'SENTRY_ORG_GATEWAY'] }}
-          SENTRY_PROJECT: ${{ vars[startsWith(matrix.name, 'symbol-inputs-desktop-') && 'SENTRY_PROJECT_DESKTOP' || 'SENTRY_PROJECT_GATEWAY'] }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${SENTRY_AUTH_TOKEN:-}" || -z "${SENTRY_ORG:-}" || -z "${SENTRY_PROJECT:-}" ]]; then
-            echo "Sentry upload is not configured; private symbols and source bundles were retained."
-            exit 0
-          fi
-          sentry-cli debug-files upload symbols
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner, repo: context.repo.repo,
+              workflow_id: 'build-debug-symbols.yml',
+              ref: context.ref.replace(/^refs\/(heads|tags)\//, ''),
+              inputs: {source_run_id: String(context.runId)},
+            });
