@@ -136,7 +136,9 @@ Native/CLI preflight может формироваться до разрешен
 
 Внутренние attached tasks применялись по [pioneer-system-subagents SKILL.md](/Users/alexander/.codex/skills/pioneer-system-subagents/SKILL.md); предоставленный [pioneer-system-tasks SKILL.md](/Users/alexander/.codex/skills/pioneer-system-tasks/SKILL.md) прочитан. Они не изменялись. Результаты Memvid (`mpg6WFOd6zTwJHvdqrpSi`) и memory adapter (`k1NX5lUKPa84o3e5c4qDv`) перечитаны и приняты внутренним reviewer после доработок; это не внешнее ревью. Последние финальные тексты исполнителей регистрации (`Nc6760CkvdRgkEyRIJEyV`) и gateway regressions (`tozjvRs1Koyjt7X8og0h6`) прочитаны через их thread history, а изменённые исходники проверены непосредственно родителем. Task Service не сформировал для этих последних текстов review candidates. Задача регистрации отменена как более не нужная после прямого аудита; её последний результат не объявляется принятым кандидатом.
 
-Инфраструктурный блокер закрытия последней подзадачи: `task_wait` продолжает возвращать gateway run `wWfiHnxIjPXP0N472tG3i` как running без candidate, хотя финальный текст уже получен; повторные `task_cancel`/`task_get` отклонены с `MCP turn is not active / session_binding_unavailable`. Закрытие через Task Service не подтверждено. Это не результат тестирования и не блокер подготовки локального кода. Обход через БД Task Service или запуск CLI-агента не выполнялся.
+Инфраструктурный блокер закрытия последней подзадачи устранён после восстановления runtime binding. Ранее `task_wait` возвращал gateway run `wWfiHnxIjPXP0N472tG3i` как running без candidate, а `task_cancel`/`task_get` отклонялись с `MCP turn is not active / session_binding_unavailable`. После восстановления выполнены `task_get`, `task_wait` и разрешённый `task_cancel(scope=task_only)`: дополнительная работа исполнителя больше не нужна, его финальные исходники уже проверены напрямую и включены в commit кода. Отмена подтверждена Task Service (receipt `R164feca0d377e023ff46`); отсутствующий последний candidate не объявляется принятым.
+
+Итоговая сверка `task_list(parentTaskId=fEfVJFNzxAECTEu8oLi7a)` и `task_wait` всех четырёх run IDs подтвердила: Memvid и adapter — completed/succeeded; registration и gateway regressions — cancelled; `terminalCount=4`, `pendingCount=0`, `reviewRequiredCount=0`, `timedOut=false`. Терминальные ошибки отменённых задач имеют class=cancelled с вложенным code=conflict; это состояние управления задачами, а не ошибка сборки или теста. Все созданные attached-подзадачи разрешены. Обход через БД Task Service или запуск CLI-агента не выполнялся.
 
 ## Команды
 
@@ -161,6 +163,7 @@ git diff --cached --check
 git -c core.hooksPath=/dev/null commit -m "feat(threads): search indexed conversations and share workspace recall"
 git add docs/reviews/threads-search-recall.md
 git -c core.hooksPath=/dev/null commit -m "docs: prepare threads search and recall for external review"
+git -c core.hooksPath=/dev/null commit -m "docs: reconcile terminal search implementation tasks"
 git diff 6c1e6b2c49359c76e49624c0545bbafc4a3d310a HEAD --check
 git diff --check
 
