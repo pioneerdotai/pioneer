@@ -1191,8 +1191,9 @@ fn tree_structure(items: &[TreeItem], depth: usize, output: &mut Vec<(String, us
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use gpui_kit::TestAppContext;
+    use super::{ThreadSidebarView, thread_node_key};
+    use gpui_kit::{AppContext, TestAppContext};
+    use std::sync::Arc;
 
     #[gpui_kit::test]
     fn prepared_rows_follow_unread_metadata_and_owner_without_resetting_selection(
