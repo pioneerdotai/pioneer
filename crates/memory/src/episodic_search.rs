@@ -103,7 +103,7 @@ pub fn episodic_query_fingerprint(
 ) -> String {
     use sha2::{Digest, Sha256};
     let bytes = serde_json::to_vec(&(workspace, thread, turn, query)).expect("string tuple");
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 pub fn episodic_source_identity(id: &str) -> &str {

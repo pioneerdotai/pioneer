@@ -335,8 +335,9 @@ fn reuse_contributed_thread_search(
                 && !entry.truncated
                 && entry.diagnostics.iter().any(|d| {
                     d.code.as_str() == "thread_context.search_query"
-                        && d.metadata.get(&metadata_key("queryFingerprint"))
-                            == Some(&HookValue::Text(fingerprint.clone()))
+                        && d.metadata.get(
+                            &HookMetadataKey::new("queryFingerprint").expect("static metadata key"),
+                        ) == Some(&HookValue::Text(fingerprint.clone()))
                 })
         })
     };
