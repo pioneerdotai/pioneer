@@ -151,3 +151,23 @@ Workspace `enabled:false` исключает Threads из active resolution; г�
 Оба замечания устранены по результатам статического самоаудита. Это повторная передача на внешнее ревью, а не внешняя приёмка или разрешение запускать проверки.
 
 **Тесты, cargo check, компиляция, сборки, приложение, Gateway, CLI-агенты и генераторы не запускались. Компиляция и прохождение тестов не подтверждены.** Python использовался только для редактирования текста.
+
+## Повторная передача: аргумент Threads policy в пяти тестовых вызовах
+
+Исходный HEAD этой итерации — `5ce99ba71b1e6d6699b4db445d89cf5d23f3c7f2`; ветка и worktree прежние, рабочее дерево при начале исправления было чистым. Внешнее ревью обнаружило пять пропущенных обновлений callers после добавления обязательного `include_threads_policy` в `compile_agent_instruction_delivery_plan_with_prompt_root`: тестовые вызовы передавали 11 аргументов вместо 12. Этот дефект не был замечен предыдущим статическим самоаудитом и блокировал компиляцию unit-test target.
+
+В `crates/agent/src/chat/mod.rs` добавлен ровно один `false` для Threads policy в каждом из существующих тестов:
+
+- `native_delivery_plan_uses_runtime_home_root_not_workspace_root`;
+- `agents_md_runtime_section_is_compiled_by_native_delivery_plan`;
+- `current_permissions_section_is_compiled_for_restricted_native_delivery_plan`;
+- `request_tools_catalog_is_compiled_for_tool_enabled_native_delivery_plan`;
+- `request_tools_catalog_is_omitted_from_no_tool_native_delivery_plan`.
+
+Порядок флагов сверен с сигнатурой: Task policy, Threads policy, request_tools catalog, continuation hint. В первом, втором и пятом тестах это `false, false, false, false`; в третьем и четвёртом — `false, false, true, false`. Прежний `true` сохранён именно для request_tools catalog. Остальные аргументы и все assertions сохранены; новых тестов или wrappers нет.
+
+Статически перечитаны все 12 вызовов helper: шесть production callers, пять исправленных тестов и тест в `chat/skills.rs`. Каждый теперь передаёт 12 аргументов с правильным порядком флагов. Перечитан весь diff относительно `5ce99ba7`: только пять добавленных строк в test module и этот раздел отчёта. Production code, сигнатура helper, Tasks/Subagents, skills/policy blocks, grants и бизнес-логика не изменены. Оба предыдущих P2 исправления сохранены без изменений.
+
+Фактически выполнены `cargo fmt --package pioneer-agent -- --check`, `git diff --check` и `git diff --cached --check` — успешно; форматирование использовалось только в check-only режиме. Дополнительно выполнены read-only Git-проверки HEAD, ветки, рабочего дерева, просмотр полного diff и поиск/чтение всех callers. Commit выполняется с `-c core.hooksPath=/dev/null`, без запуска hooks. Основной checkout и соседние worktree не редактировались; merge в main, push и deploy не выполнялись.
+
+**Тесты, cargo check, компиляция, сборки, приложение, Gateway, CLI-агенты и генераторы не запускались. Компиляция и прохождение тестов не подтверждены.** Результат передаётся на повторное внешнее ревью; самоаудит не заменяет внешнюю приёмку и не разрешает запуск тестов.
