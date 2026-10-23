@@ -736,7 +736,17 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
             store.upsert_thread_model(&visible, pioneer_protocol::PersistedActorRef::Principal(
                 authenticated_test_superuser().principal_id.clone(),
             )).await.unwrap();
-            processor.ensure_thread_loaded(UNSEEN, &workspace).await.unwrap();
+            // Opening the persisted thread subscribes only the source session.
+            // A system load alone cannot admit its subsequent Message RPC.
+            let open_id = generate_test_request_id("pushclient", "unseen-open");
+            processor.process_request_for_connection(source, &json!({
+                "jsonrpc":"2.0","id":open_id,"method":"thread/start",
+                "params":{"thread_id":UNSEEN,"workspace_id":workspace}
+            }).to_string()).await;
+            let opened = recv_response_by_id(&mut source_rx, &open_id).await;
+            let opened: pioneer_protocol::ThreadStartResponse = serde_json::from_value(opened.result).unwrap();
+            assert_eq!(opened.thread.id, UNSEEN);
+            let _ = recv_notification_by_method(&mut source_rx, events::THREAD_STARTED).await;
             assert!(!core.0.workspace_tree(&workspace).unwrap().snapshot().threads_by_id.contains_key(UNSEEN));
             send_epic6_test_message(&processor, source, &mut source_rx, UNSEEN, UNSEEN_TURN,
                 "visible membership recovery control").await;
