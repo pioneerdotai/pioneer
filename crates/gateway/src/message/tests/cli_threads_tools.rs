@@ -189,13 +189,15 @@ async fn start_threads_cli_fixture(
         .unwrap();
     // This fixture has no background outbox worker. Deliver the committed
     // start through the normal dispatcher before observing CLI activation.
-    let batch = crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
-        .await
-        .unwrap();
+    let (batch, admission_events) = crate::public_error::test_support::capture_events_async(
+        crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64),
+    )
+    .await;
+    let batch = batch.unwrap();
     assert!(batch.errors.is_empty(), "{:?}", batch.errors);
     assert_eq!(
         batch.delivered, 1,
-        "seed Agent start must reach the CLI dispatcher"
+        "seed Agent start must reach the CLI dispatcher: {admission_events:?}"
     );
     wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
     wait_for_task_cli_activation(&processor, &turn_id).await;
