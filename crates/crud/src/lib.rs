@@ -31,6 +31,7 @@ pub use repositories::task_occurrence_reconcile::{
 };
 mod task_finish;
 mod task_terminal;
+mod task_webhook;
 pub use repositories::task_run_occurrence_reconcile::{
     OCCURRENCE_RECONCILE_BUDGET, OCCURRENCE_RECONCILE_INITIAL_BACKOFF_SECS,
     OCCURRENCE_RECONCILE_MAX_ATTEMPT_COUNT, OCCURRENCE_RECONCILE_MAX_BACKOFF_SECS,
@@ -40,12 +41,15 @@ pub use repositories::task_run_occurrence_reconcile::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use task_delivery_lifecycle::TaskDeliveryCommitTestKind;
-pub use task_delivery_lifecycle::{TaskDeliveryTransition, TaskDeliveryTransitionOutcome};
+pub use task_delivery_lifecycle::{
+    TaskCancellationRunsChanged, TaskDeliveryTransition, TaskDeliveryTransitionOutcome,
+};
 pub use task_run_occurrence::{TaskRunOccurrenceRepairPhase, TaskRunOccurrenceRepairReason};
 pub use task_terminal::{
     PreparedTaskTerminalTransition, TaskTerminalCommitOutcome, TaskTerminalCommitStatus,
     TaskTerminalConflict,
 };
+pub use task_webhook::TaskWebhookAdmissionSnapshot;
 mod task_projector;
 mod thread_episodic;
 pub mod thread_episodic_source;
@@ -17805,6 +17809,9 @@ impl CrudStore {
         let Some(candidate) = task_run::find_run_by_id(&self.connection, &run_id).await? else {
             return Ok(None);
         };
+        // The optional body can be large. Decode on the reader path, then
+        // compare its immutable serialized representation during the claim.
+        let trigger_input = optional_typed_json_from_db(candidate.trigger_input_json.clone())?;
         let prepared = self
             .prepare_task_events_for_write(vec![TaskEventPayload::RunStarting {
                 task_id: candidate.task_id.clone(),
@@ -17829,13 +17836,43 @@ impl CrudStore {
             if task_repository::finish_requested(&transaction, &current.task_id).await? {
                 return Ok(None);
             }
+            let Some(task) =
+                task_repository::find_task_by_id(&transaction, &current.task_id).await?
+            else {
+                return Ok(None);
+            };
+            if task_status_from_db(&task.status).is_none_or(|status| status.is_terminal()) {
+                return Ok(None);
+            }
+            let max_parallel_runs = optional_typed_json_from_db::<
+                pioneer_protocol::TaskConcurrencyPolicy,
+            >(task.concurrency_policy_json)?
+            .map(|policy| policy.max_parallel_runs)
+            .unwrap_or(1);
+            if !task_run::has_dispatch_capacity(
+                &transaction,
+                &current,
+                max_parallel_runs,
+                unix_to_datetime(claimed_at),
+            )
+            .await?
+            {
+                return Ok(None);
+            }
             let claimed = task_run::claim_run_for_dispatch(
                 &transaction,
                 run_id.as_str(),
                 unix_to_datetime(claimed_at),
             )
             .await?
-            .map(task_run_from_db_model)
+            .map(|mut model| {
+                anyhow::ensure!(
+                    model.trigger_input_json == candidate.trigger_input_json,
+                    "queued run input changed during claim"
+                );
+                model.trigger_input_json = None;
+                task_run_from_db_model(model)
+            })
             .transpose()?;
             let Some(run) = claimed else { return Ok(None) };
             if let Some(occurrence) = retry_occurrence {
@@ -17859,11 +17896,14 @@ impl CrudStore {
         }
         .await;
         match result {
-            Ok(run) => {
+            Ok(mut run) => {
                 transaction
                     .commit()
                     .await
                     .context("failed to commit Task dispatch claim transaction")?;
+                if let Some((run, _)) = run.as_mut() {
+                    run.trigger_input = trigger_input;
+                }
                 Ok(run)
             }
             Err(error) => {
@@ -33712,6 +33752,7 @@ fn task_trigger_from_db_model(model: pioneer_entity::task_trigger::Model) -> Res
     );
 
     Ok(TaskTrigger {
+        webhook_secret_ref: model.webhook_secret_ref,
         id: model.id,
         task_id: model.task_id,
         status,
@@ -33730,6 +33771,7 @@ fn task_run_from_db_model(model: pioneer_entity::task_run::Model) -> Result<Task
         .with_context(|| format!("unknown task run executor kind `{}`", model.executor_kind))?;
 
     Ok(TaskRun {
+        trigger_input: optional_typed_json_from_db(model.trigger_input_json)?,
         id: model.id,
         task_id: model.task_id,
         trigger_id: model.trigger_id,
@@ -34782,6 +34824,7 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 #[cfg(test)]
 mod tests {
     mod saved_history_read;
+    mod task_webhook;
     mod thread_read_pages;
     mod unread_start;
     use crate::{
@@ -35014,7 +35057,8 @@ mod tests {
 
     // Some rollback guards exercise today's projector on a deliberately older
     // migration prefix. Add only its unrelated inbox runtime dependencies, not
-    // migration records or historical grants. Pure upgrade fixtures must not
+    // migration records or historical grants. Webhook input columns are also
+    // required by today's task entities. Pure upgrade fixtures must not
     // call this helper: they retain the exact historical schema under test.
     async fn add_inbox_runtime_fields_to_legacy_projector_fixture(store: &CrudStore) {
         use migration::{ColumnDef, SchemaManager, Table};
@@ -35035,6 +35079,22 @@ mod tests {
                 )
                 .await
                 .unwrap();
+        }
+        for (table, column) in [
+            ("task_trigger", "webhook_secret_ref"),
+            ("task_run", "trigger_input_json"),
+        ] {
+            if !schema.has_column(table, column).await.unwrap() {
+                schema
+                    .alter_table(
+                        Table::alter()
+                            .table(Alias::new(table))
+                            .add_column(ColumnDef::new(Alias::new(column)).text().null())
+                            .to_owned(),
+                    )
+                    .await
+                    .unwrap();
+            }
         }
         schema
             .alter_table(
@@ -46713,6 +46773,7 @@ mod tests {
 
     fn sample_task_trigger(timestamp: i64) -> TaskTrigger {
         TaskTrigger {
+            webhook_secret_ref: None,
             id: "trg_00000000000000001".to_owned(),
             task_id: "task_0000000000000001".to_owned(),
             status: TaskTriggerStatus::Active,
@@ -46730,6 +46791,7 @@ mod tests {
 
     fn sample_task_run(timestamp: i64) -> TaskRun {
         TaskRun {
+            trigger_input: None,
             id: "run_00000000000000001".to_owned(),
             task_id: "task_0000000000000001".to_owned(),
             trigger_id: Some("trg_00000000000000001".to_owned()),

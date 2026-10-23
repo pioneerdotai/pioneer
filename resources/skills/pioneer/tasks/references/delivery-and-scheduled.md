@@ -39,7 +39,7 @@ Post the report in this conversation.
 Every morning, check this and tell me here.
 ```
 
-`origin_thread` targets the visible thread where the work originated. It is the default for scheduled tasks created from a thread.
+`origin_thread` targets the visible thread where the work originated. It is the default for scheduled tasks and inbound webhook tasks created from a thread. A webhook trigger waits without an active agent between requests; each completed request run uses the ordinary delivery policy.
 
 ```json
 {

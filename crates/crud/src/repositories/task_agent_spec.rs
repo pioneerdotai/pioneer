@@ -89,6 +89,21 @@ pub async fn find_terminal_agent_spec<C: ConnectionTrait>(
         .context("failed to query terminal task agent spec")
 }
 
+/// The default used by task updates/execution is the latest base spec by
+/// creation time. Run snapshots are deliberately excluded from admission.
+pub async fn find_latest_base_agent_spec<C: ConnectionTrait>(
+    db: &C,
+    task_id: &str,
+) -> Result<Option<task_agent_spec::Model>> {
+    task_agent_spec::Entity::find()
+        .filter(task_agent_spec::Column::TaskId.eq(task_id.to_owned()))
+        .filter(task_agent_spec::Column::RunId.is_null())
+        .order_by_desc(task_agent_spec::Column::CreatedAt)
+        .one(db)
+        .await
+        .context("failed to query base task agent spec")
+}
+
 pub async fn find_agent_spec_by_run<C: ConnectionTrait>(
     db: &C,
     run_id: &str,

@@ -398,6 +398,8 @@ struct GatewayCliRuntimeInstanceSettingsOverride {
 #[serde(deny_unknown_fields)]
 struct GatewayRemoteAccessSettingsOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    public_base_url: Option<pioneer_protocol::GatewayBaseUrl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     server: Option<String>,
@@ -462,6 +464,13 @@ impl GatewayRemoteAccessSettingsOverride {
             changes.clear_key = true;
         }
 
+        if changes.key.is_some()
+            || changes.clear_key
+            || changes.server_changed
+            || changes.enabled == Some(false)
+        {
+            self.public_base_url = None;
+        }
         Ok(changes)
     }
 }
@@ -633,6 +642,18 @@ impl GatewaySettings {
             .filter(|id| before.get(*id) != after.get(*id))
             .cloned()
             .collect()
+    }
+
+    /// Runtime discovery, never a caller-supplied remote access setting.
+    pub(crate) fn set_remote_access_public_base_url(
+        &mut self,
+        public_base_url: Option<pioneer_protocol::GatewayBaseUrl>,
+    ) -> bool {
+        if self.remote_access.public_base_url == public_base_url {
+            return false;
+        }
+        self.remote_access.public_base_url = public_base_url;
+        true
     }
 
     pub fn remote_access_secret_ref(&self) -> Option<&str> {
@@ -4267,6 +4288,54 @@ backend = "keystore"
         let workspace_configs = settings.workspace_thread_episodic_vector_search_configs();
         assert_eq!(workspace_configs.len(), 1);
         assert!(workspace_configs.contains_key("workspace_a"));
+    }
+
+    #[test]
+    fn discovered_relay_base_url_survives_settings_reload_and_is_cleared_on_reconfiguration() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("gateway-settings.toml");
+        let mut settings =
+            load_or_create_gateway_settings(&path, 1, "gateway-settings.toml").unwrap();
+        let base =
+            pioneer_protocol::GatewayBaseUrl::parse_presentation("https://relay.example/pioneer")
+                .unwrap();
+        assert!(settings.set_remote_access_public_base_url(Some(base.clone())));
+        assert!(!settings.set_remote_access_public_base_url(Some(base.clone())));
+        save_gateway_settings(&path, &settings).unwrap();
+        let persisted = fs::read_to_string(&path).unwrap();
+        assert!(persisted.contains("public_base_url = \"https://relay.example/pioneer/\""));
+        let settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml").unwrap();
+        assert_eq!(settings.remote_access.public_base_url.as_ref(), Some(&base));
+        for update in [
+            pioneer_protocol::GatewayRemoteAccessSettingsUpdate {
+                key: Some("replacement-key".into()),
+                ..Default::default()
+            },
+            pioneer_protocol::GatewayRemoteAccessSettingsUpdate {
+                clear_key: Some(true),
+                ..Default::default()
+            },
+            pioneer_protocol::GatewayRemoteAccessSettingsUpdate {
+                enabled: Some(false),
+                ..Default::default()
+            },
+            pioneer_protocol::GatewayRemoteAccessSettingsUpdate {
+                server: Some("another-relay:2333".into()),
+                ..Default::default()
+            },
+        ] {
+            let mut reconfigured = settings.clone();
+            reconfigured
+                .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                    remote_access: Some(update),
+                    ..Default::default()
+                })
+                .unwrap();
+            save_gateway_settings(&path, &reconfigured).unwrap();
+            let reloaded =
+                load_or_create_gateway_settings(&path, 1, "gateway-settings.toml").unwrap();
+            assert!(reloaded.remote_access.public_base_url.is_none());
+        }
     }
 
     #[test]

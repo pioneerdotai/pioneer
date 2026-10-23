@@ -65,6 +65,7 @@ mod turn_security;
 mod usage_journal;
 mod view_grants;
 mod voice;
+mod webhook_address;
 mod workspace;
 
 use anyhow::{Context, Result};
@@ -860,7 +861,6 @@ async fn run_gateway_until_shutdown_inner(
     message_processor
         .cleanup_stale_skill_uploads(now_timestamp_secs())
         .await;
-    let remote_access_config = config.gateway.remote_access.clone();
     let startup_thread_episodic_vector_search_config =
         config.gateway.thread_episodic.vector_search.clone();
     let startup_thread_episodic_indexing_enabled =
@@ -903,10 +903,7 @@ async fn run_gateway_until_shutdown_inner(
     let post_message_processor = message_processor.clone();
     let post_crud_store = message_processor.crud_store.clone();
     let post_self_improvement_supervisor = self_improvement_supervisor.clone();
-    let post_remote_access_supervisor = remote_access_supervisor.clone();
-    let post_remote_access_config = remote_access_config.clone();
-    let post_gateway_settings = gateway_settings.clone();
-    let post_gateway_secrets = gateway_secrets.clone();
+    let post_remote_access_config = config.gateway.remote_access.clone();
     let post_thread_episodic_storage_root = thread_episodic_storage_root.clone();
     let post_workspace_vector_search_configs =
         thread_episodic_workspace_vector_search_configs.clone();
@@ -1040,26 +1037,13 @@ async fn run_gateway_until_shutdown_inner(
                         _ = post_message_processor.start_skills_watcher() => {}
                     }
 
-                    match remote_access_desired_state(
-                        &post_remote_access_config,
-                        &post_gateway_settings,
-                        post_gateway_secrets.as_ref(),
-                    ) {
-                        Ok(desired) => {
-                            let result = tokio::select! {
-                                _ = cancellation.cancelled() => return,
-                                result = post_remote_access_supervisor.apply(desired) => result,
-                            };
-                            if let Err(error) = result {
-                                warn!(error = %format!("{error:#}"), "failed to apply initial remote access settings");
-                                post_readiness
-                                    .set_degraded(ReadinessDegradation::RemoteAccess, true);
-                            }
-                        }
-                        Err(error) => {
-                            warn!(error = %format!("{error:#}"), "failed to resolve initial remote access state");
-                            post_readiness.set_degraded(ReadinessDegradation::RemoteAccess, true);
-                        }
+                    let result = tokio::select! {
+                        _ = cancellation.cancelled() => return,
+                        result = post_message_processor.apply_initial_remote_access(&post_remote_access_config) => result,
+                    };
+                    if let Err(error) = result {
+                        warn!(error = %format!("{error:#}"), "failed to apply initial remote access settings");
+                        post_readiness.set_degraded(ReadinessDegradation::RemoteAccess, true);
                     }
 
                     tokio::select! {

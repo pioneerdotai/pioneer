@@ -1150,6 +1150,7 @@ mod tests {
             &pioneer_protocol::GatewayNotification::GatewayRemoteAccessStatusChanged(
                 pioneer_protocol::GatewayRemoteAccessStatusChangedNotification {
                     status: pioneer_protocol::GatewayRemoteAccessStatusSnapshot {
+                        public_base_url: None,
                         state: pioneer_protocol::GatewayRemoteAccessState::Connected,
                         error_kind: None,
                         message: None,
