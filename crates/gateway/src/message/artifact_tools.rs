@@ -135,8 +135,14 @@ impl TurnToolProvider for GatewayArtifactToolProvider {
             .collect::<Vec<_>>();
         bundles.extend(agent_actions.bundles);
         bundles.push(processor.html_tools(context_for_results.clone()));
-        bundles.push(processor.thread_read_tools(context_for_results.clone()));
-        bundles.push(processor.thread_result_tools(context_for_results.clone()));
+        if processor
+            .thread_read_authority(&context_for_results)
+            .await
+            .is_ok()
+        {
+            bundles.push(processor.thread_read_tools(context_for_results.clone()));
+            bundles.push(processor.thread_result_tools(context_for_results.clone()));
+        }
         if let Some(search) =
             crate::turn_mcp::threads_search::materialize(processor.clone(), context_for_results)
                 .await

@@ -6,6 +6,8 @@ mod cli_provider_probe_isolation;
 
 #[path = "tests/cli_task_tools.rs"]
 mod cli_task_tools;
+#[path = "tests/cli_threads_tools.rs"]
+mod cli_threads_tools;
 
 #[path = "tests/cli_runtime_active_bindings.rs"]
 mod cli_runtime_active_bindings;
@@ -2177,7 +2179,7 @@ async fn setup_cli_runtime_skill_preflight_harness(
     for entry in
         crate::system_skills::bundled_system_skill_catalog_entries(&harness.system_root).unwrap()
     {
-        if matches!(entry.slug.as_str(), "tasks" | "subagents") {
+        if matches!(entry.slug.as_str(), "tasks" | "subagents" | "threads") {
             let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../resources/skills/pioneer")
                 .join(&entry.slug);
@@ -2551,7 +2553,7 @@ async fn capability_persistence_order_impl() {
                 turn_id: committed_turn_id,
                 bindings,
                 ..
-            } if committed_turn_id == turn_id && bindings.len() == 4
+            } if committed_turn_id == turn_id && bindings.len() == 5
         ));
         if matches!(
             runtime_kind,
@@ -2564,7 +2566,11 @@ async fn capability_persistence_order_impl() {
                     item["type"] == "skill"
                         && !matches!(
                             item["name"].as_str(),
-                            Some("pioneer-system-tasks" | "pioneer-system-subagents")
+                            Some(
+                                "pioneer-system-tasks"
+                                    | "pioneer-system-subagents"
+                                    | "pioneer-system-threads"
+                            )
                         )
                 })
                 .cloned()
@@ -2814,7 +2820,10 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
                 .expect("must read zero-skill CLI runtime turn bindings")
                 .iter()
                 .all(|binding| binding.source_kind == "system"
-                    && matches!(binding.skill_slug.as_str(), "tasks" | "subagents"))
+                    && matches!(
+                        binding.skill_slug.as_str(),
+                        "tasks" | "subagents" | "threads"
+                    ))
         );
         assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt_after_update);
         assert_eq!(
@@ -26266,8 +26275,8 @@ fn composer_cli_skill_pack_matches_individual_members_and_preserves_presentation
                     .list_turn_skill_bindings(&lineage.child_turn_id)
                     .await
                     .unwrap();
-                assert_eq!(bindings.len(), skill_ids.len() + 2);
-                for slug in ["tasks", "subagents"] {
+                assert_eq!(bindings.len(), skill_ids.len() + 3);
+                for slug in ["tasks", "subagents", "threads"] {
                     assert!(bindings.iter().any(|binding| {
                         binding.source_kind == "system"
                             && binding.skill_owner.as_deref() == Some("pioneer")
@@ -33896,7 +33905,11 @@ async fn cli_task_bootstrap_honors_empty_parent_context_policy_impl() {
         .collect::<Vec<_>>();
     assert_eq!(
         skill_names,
-        vec!["pioneer-system-tasks", "pioneer-system-subagents"]
+        vec![
+            "pioneer-system-tasks",
+            "pioneer-system-subagents",
+            "pioneer-system-threads"
+        ]
     );
     let adapter_messages = adapter_input
         .iter()

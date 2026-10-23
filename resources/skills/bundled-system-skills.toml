@@ -29,3 +29,9 @@ skill_id = "6V8zjRNsuABtUUbHV6Gzo"
 owner = "pioneer"
 slug = "runtime-diagnostics"
 resource_path = "pioneer/runtime-diagnostics"
+
+[[skills]]
+skill_id = "ThR7m2K9vQ4cX8pL6nB3s"
+owner = "pioneer"
+slug = "threads"
+resource_path = "pioneer/threads"

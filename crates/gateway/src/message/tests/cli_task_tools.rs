@@ -195,7 +195,7 @@ fn cli_explicit_model_and_reasoning_reach_native_launch_and_survive_mcp_replay()
     });
 }
 
-async fn wait_for_task_cli_activation(processor: &MessageProcessor, turn_id: &str) {
+pub(super) async fn wait_for_task_cli_activation(processor: &MessageProcessor, turn_id: &str) {
     timeout(Duration::from_secs(10), async {
         loop {
             if processor
@@ -1816,7 +1816,7 @@ fn cli_automatic_orchestration_skills_coexist_with_selected_user_names() {
             CLIAgentRuntimeKind::Claude,
             CLIAgentRuntimeKind::OpenCode,
         ] {
-            for user_name in ["tasks", "subagents"] {
+            for user_name in ["tasks", "subagents", "threads"] {
                 let harness = setup_cli_runtime_skill_preflight_harness(kind, false).await;
                 *harness.cli_session.projected_mcp_store.lock().await =
                     Some(harness.crud_store.clone());
@@ -1879,9 +1879,9 @@ fn cli_automatic_orchestration_skills_coexist_with_selected_user_names() {
                         label: Some(format!("tests/{user_name}")),
                     }]
                 );
-                assert_eq!(bindings.len(), 3);
+                assert_eq!(bindings.len(), 4);
                 assert!(bindings.iter().any(|binding| binding.skill_id == user_id && binding.source_kind == "user"));
-                for slug in ["tasks", "subagents"] {
+                for slug in ["tasks", "subagents", "threads"] {
                     assert!(
                         bindings
                             .iter()
@@ -1930,6 +1930,7 @@ fn cli_automatic_orchestration_skills_coexist_with_selected_user_names() {
                 for name in [
                     "pioneer-system-tasks",
                     "pioneer-system-subagents",
+                    "pioneer-system-threads",
                     user_name,
                 ] {
                     assert!(instructions.contains(name), "{kind:?}: {name}");
@@ -2178,10 +2179,10 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
                 .unwrap();
             assert_eq!(
                 skills.len(),
-                2,
+                3,
                 "orchestration skills are automatic even without user attachments"
             );
-            for slug in ["tasks", "subagents"] {
+            for slug in ["tasks", "subagents", "threads"] {
                 assert!(
                     skills
                         .iter()

@@ -52,6 +52,7 @@ pub struct CliRuntimeSelectedServerInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliRuntimeSelectedCapabilitiesInput {
     pub native_task_tools: Vec<String>,
+    pub native_threads_tools: Vec<String>,
     pub total_tool_count: usize,
     pub explicit_servers: Vec<CliRuntimeSelectedServerInput>,
     pub explicit_tool_names: Vec<String>,
@@ -72,6 +73,15 @@ pub fn compile_cli_runtime_delivery_plan(
             .selected_capabilities
             .as_ref()
             .is_some_and(|capabilities| !capabilities.native_task_tools.is_empty()),
+        include_threads_policy: input
+            .selected_capabilities
+            .as_ref()
+            .is_some_and(|capabilities| {
+                capabilities
+                    .native_threads_tools
+                    .iter()
+                    .any(|name| name != "threads_start_options")
+            }),
         continue_generation_hint: false,
         runtime_sections: cli_runtime_context_sections(&input),
         dynamic_sections: Vec::new(),
@@ -313,6 +323,20 @@ fn render_selected_capabilities(
         );
         lines.push("Names in the tasks/subagents skills refer to these operations. Codex and Claude qualify them as mcp__pioneer__<name>; OpenCode qualifies them as pioneer_<name>. Use only the operations actually present, and obey their current schemas and permissions.".to_owned());
     }
+    if input
+        .native_threads_tools
+        .iter()
+        .any(|name| name != "threads_start_options")
+    {
+        lines.push("Authorized Pioneer Threads operations (use the matching callable in the runtime MCP catalog):".to_owned());
+        lines.extend(
+            input
+                .native_threads_tools
+                .iter()
+                .map(|name| format!("- {}", safe_context_label(name))),
+        );
+        lines.push("Canonical names in pioneer-system-threads map to the current catalog: Codex/Claude use mcp__pioneer__<name>; OpenCode uses pioneer_<name>. Only listed operations are available; use their current schemas. Threads do not activate the Task wait/review protocol.".to_owned());
+    }
     if !servers.is_empty() {
         lines.push(String::new());
         lines.push("Attached MCP servers:".to_owned());
@@ -474,6 +498,7 @@ mod tests {
             skill_names: vec!["mail-helper".to_owned()],
         });
         input.selected_capabilities = Some(CliRuntimeSelectedCapabilitiesInput {
+            native_threads_tools: Vec::new(),
             native_task_tools: Vec::new(),
             total_tool_count: 1,
             explicit_servers: vec![CliRuntimeSelectedServerInput {
@@ -561,6 +586,7 @@ mod tests {
                 ],
             });
             input.selected_capabilities = Some(CliRuntimeSelectedCapabilitiesInput {
+                native_threads_tools: Vec::new(),
                 native_task_tools: vec!["task_get".to_owned(), "task_wait".to_owned()],
                 total_tool_count: 2,
                 explicit_servers: Vec::new(),
@@ -592,6 +618,86 @@ mod tests {
                     .text
                     .contains("call `read_skill`")
             );
+        }
+    }
+
+    #[test]
+    fn cli_threads_capabilities_do_not_enable_task_protocol_or_require_native_discovery() {
+        let root = temp_workspace("threads_capabilities");
+        for (runtime, kind) in [
+            ("codex", CLIAgentRuntimeKind::Codex),
+            ("claude", CLIAgentRuntimeKind::Claude),
+            ("opencode", CLIAgentRuntimeKind::OpenCode),
+        ] {
+            for names in [
+                vec![],
+                vec!["threads_start_options"],
+                vec!["threads_history_read", "threads_start_options"],
+            ] {
+                let available = names.contains(&"threads_history_read");
+                let mut input = base_input();
+                input.runtime_id = runtime.to_owned();
+                input.selected_skills = Some(CliRuntimeSelectedSkillsInput {
+                    runtime_kind: kind,
+                    skill_names: if available {
+                        vec!["pioneer-system-threads".to_owned()]
+                    } else {
+                        vec![]
+                    },
+                });
+                input.selected_capabilities = Some(CliRuntimeSelectedCapabilitiesInput {
+                    native_task_tools: Vec::new(),
+                    native_threads_tools: names.iter().map(|s| (*s).to_owned()).collect(),
+                    total_tool_count: names.len(),
+                    explicit_servers: Vec::new(),
+                    explicit_tool_names: Vec::new(),
+                    implicit_policy_tool_count: names.len(),
+                });
+                let plan = compile_cli_runtime_delivery_plan(&root, input).unwrap();
+                assert_eq!(
+                    plan.provider_instructions
+                        .section_ids
+                        .iter()
+                        .any(|id| id == "threads_policy"),
+                    available
+                );
+                assert!(
+                    !plan
+                        .provider_instructions
+                        .section_ids
+                        .iter()
+                        .any(|id| matches!(id.as_str(), "tasks_policy" | "subagents_policy"))
+                );
+                assert!(
+                    !plan
+                        .provider_instructions
+                        .text
+                        .contains("Authorized Pioneer task operations")
+                );
+                assert!(
+                    !plan
+                        .provider_instructions
+                        .text
+                        .contains("call `read_skill`")
+                );
+                if available {
+                    assert!(
+                        plan.provider_instructions
+                            .text
+                            .contains("pioneer-system-threads")
+                    );
+                    assert!(
+                        plan.provider_instructions
+                            .text
+                            .contains("fixed current-turn MCP catalog")
+                    );
+                    assert!(
+                        plan.provider_instructions
+                            .text
+                            .contains("Authorized Pioneer Threads operations")
+                    );
+                }
+            }
         }
     }
 
@@ -642,6 +748,7 @@ mod tests {
         let root = temp_workspace("sanitized_mcp");
         let mut input = base_input();
         input.selected_capabilities = Some(CliRuntimeSelectedCapabilitiesInput {
+            native_threads_tools: Vec::new(),
             native_task_tools: Vec::new(),
             total_tool_count: 1,
             explicit_servers: vec![CliRuntimeSelectedServerInput {

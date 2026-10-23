@@ -415,6 +415,24 @@ pub(crate) fn cli_runtime_mcp_capabilities_input(
             .filter(|tool| crate::turn_mcp::native_tools::is_task_operation(tool))
             .map(|tool| tool.canonical_callable_name.clone())
             .collect(),
+        native_threads_tools: if projection
+            .tools
+            .iter()
+            .any(crate::turn_mcp::native_tools::is_thread_operation)
+        {
+            projection
+                .tools
+                .iter()
+                .filter(|tool| {
+                    crate::turn_mcp::native_tools::is_thread_operation(tool)
+                        || (crate::turn_mcp::native_tools::exact_definition(tool).is_some()
+                            && tool.raw_tool_name == "threads_start_options")
+                })
+                .map(|tool| tool.canonical_callable_name.clone())
+                .collect()
+        } else {
+            Vec::new()
+        },
         total_tool_count: projection.tools.len(),
         explicit_servers: explicit_servers
             .into_iter()

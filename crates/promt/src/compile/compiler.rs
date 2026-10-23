@@ -103,6 +103,21 @@ fn build_tasks_policy_section(cli: bool) -> PromptSection {
     }
 }
 
+fn build_threads_policy_section(cli: bool) -> PromptSection {
+    PromptSection {
+        id: PromptSectionId::ThreadsPolicy,
+        stability: PromptStability::Dynamic,
+        title: content::SECTION_TITLE_THREADS_POLICY.to_owned(),
+        content: if cli {
+            content::CLI_THREADS_POLICY_PROMPT
+        } else {
+            content::THREADS_POLICY_PROMPT
+        }
+        .to_owned(),
+        sources: Vec::new(),
+    }
+}
+
 fn format_file_block(file: &BudgetedBootstrapFile, include_evolution_note: bool) -> String {
     let mut block = content::IDENTITY_FILE_BLOCK_TEMPLATE
         .replace(content::IDENTITY_FILE_BLOCK_NAME_TOKEN, file.name.as_str())
@@ -632,6 +647,12 @@ pub fn compile_prompt(input: PromptCompileInput) -> anyhow::Result<CompiledPromp
         ));
     }
 
+    if input.include_threads_policy {
+        sections.push(build_threads_policy_section(
+            profile == PromptProfile::CliRuntime,
+        ));
+    }
+
     sections.extend(build_runtime_dynamic_sections(&input, &mut diagnostics));
 
     if profile == PromptProfile::AssistantNone {
@@ -761,6 +782,7 @@ mod tests {
             retry_instruction: Some("retry with corrected arguments".to_owned()),
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: true,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -787,6 +809,7 @@ mod tests {
             retry_instruction: Some("retry".to_owned()),
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: true,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -814,6 +837,7 @@ mod tests {
             retry_instruction: Some("retry".to_owned()),
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: true,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -884,6 +908,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: false,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections,
             dynamic_sections: Vec::new(),
@@ -928,6 +953,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: true,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -987,6 +1013,125 @@ mod tests {
     }
 
     #[test]
+    fn threads_policy_has_independent_delivery_and_survives_recompilation() {
+        let root = temp_workspace("threads_policy");
+        for profile in [PromptProfile::AssistantFull, PromptProfile::CliRuntime] {
+            for tasks in [false, true] {
+                for threads in [false, true] {
+                    let input = PromptCompileInput {
+                        workspace_root: root.clone(),
+                        profile,
+                        skills_prompt: None,
+                        retry_instruction: None,
+                        include_tool_recovery_policy: false,
+                        include_task_orchestration_policy: tasks,
+                        include_threads_policy: threads,
+                        continue_generation_hint: false,
+                        runtime_sections: Vec::new(),
+                        dynamic_sections: Vec::new(),
+                        dynamic_context: None,
+                        extra_system: None,
+                        limits: PromptLimits::default(),
+                    };
+                    let first = compile_prompt(input.clone()).unwrap();
+                    let mut retry = input;
+                    retry.retry_instruction = Some("Continue from the saved source.".to_owned());
+                    let repeated = compile_prompt(retry).unwrap();
+                    for bundle in [first, repeated] {
+                        let section = bundle
+                            .sections
+                            .iter()
+                            .find(|section| section.id == PromptSectionId::ThreadsPolicy);
+                        assert_eq!(section.is_some(), threads);
+                        assert_eq!(
+                            bundle
+                                .sections
+                                .iter()
+                                .any(|s| s.id == PromptSectionId::TasksPolicy),
+                            tasks
+                        );
+                        assert_eq!(
+                            bundle
+                                .sections
+                                .iter()
+                                .any(|s| s.id == PromptSectionId::SubagentsPolicy),
+                            tasks
+                        );
+                        if let Some(section) = section {
+                            assert_eq!(section.stability, PromptStability::Dynamic);
+                            assert_eq!(
+                                section.content,
+                                if profile == PromptProfile::CliRuntime {
+                                    content::CLI_THREADS_POLICY_PROMPT
+                                } else {
+                                    content::THREADS_POLICY_PROMPT
+                                }
+                            );
+                        }
+                        if tasks {
+                            assert_eq!(
+                                bundle
+                                    .sections
+                                    .iter()
+                                    .find(|s| s.id == PromptSectionId::TasksPolicy)
+                                    .unwrap()
+                                    .content,
+                                if profile == PromptProfile::CliRuntime {
+                                    content::CLI_TASKS_POLICY_PROMPT
+                                } else {
+                                    content::TASKS_POLICY_PROMPT
+                                }
+                            );
+                            assert_eq!(
+                                bundle
+                                    .sections
+                                    .iter()
+                                    .find(|s| s.id == PromptSectionId::SubagentsPolicy)
+                                    .unwrap()
+                                    .content,
+                                if profile == PromptProfile::CliRuntime {
+                                    content::CLI_SUBAGENTS_POLICY_PROMPT
+                                } else {
+                                    content::SUBAGENTS_POLICY_PROMPT
+                                }
+                            );
+                        }
+                        let plan = crate::compile_instruction_delivery_plan(bundle).unwrap();
+                        let delivered = plan
+                            .sections
+                            .iter()
+                            .find(|s| s.section_id == "threads_policy");
+                        assert_eq!(delivered.is_some(), threads);
+                        if let Some(delivered) = delivered {
+                            assert_eq!(delivered.trust, crate::InstructionTrust::Pioneer);
+                            assert_eq!(
+                                delivered.channel,
+                                crate::InstructionDeliveryChannel::ProviderInstructions
+                            );
+                            assert!(!plan.turn_context.text.contains("## Threads"));
+                            assert!(plan.provider_instructions.text.contains(
+                                if profile == PromptProfile::CliRuntime {
+                                    "pioneer-system-threads"
+                                } else {
+                                    "call `read_skill` with that exact reference"
+                                }
+                            ));
+                            if profile == PromptProfile::CliRuntime {
+                                assert!(
+                                    !plan
+                                        .provider_instructions
+                                        .text
+                                        .contains("call `read_skill`")
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn tool_usage_policy_renders_apply_patch_guidance() {
         let root = temp_workspace("tool_usage_policy");
         std::fs::write(root.join("SOUL.md"), "Voice: direct and concise").expect("write SOUL");
@@ -999,6 +1144,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -1065,6 +1211,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections: vec![memory_recall_runtime_section(
                 "Available memory tools: memory_search",
@@ -1106,6 +1253,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections: vec![agents_md_runtime_section(
                 "Follow project-specific instructions.",
@@ -1154,6 +1302,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections: vec![agents_md_runtime_section("   ", Some(20_000))],
             dynamic_sections: Vec::new(),
@@ -1182,6 +1331,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections: vec![agents_md_runtime_section(content.as_str(), Some(25_000))],
             dynamic_sections: Vec::new(),
@@ -1223,6 +1373,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections: vec![
                 runtime_dynamic,
@@ -1287,6 +1438,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: vec![dynamic_section(
@@ -1331,6 +1483,7 @@ mod tests {
             retry_instruction: Some("retry".to_owned()),
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: true,
             runtime_sections: vec![memory_recall_runtime_section("memory recall content")],
             dynamic_sections: vec![
@@ -1384,6 +1537,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -1400,6 +1554,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: vec![dynamic_section(
@@ -1435,6 +1590,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: vec![section],
@@ -1464,6 +1620,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: vec![dynamic_section("test.phase10.empty", Some("Empty"), "   ")],
@@ -1490,6 +1647,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: vec![dynamic_section(
@@ -1534,6 +1692,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -1578,6 +1737,7 @@ mod tests {
                 retry_instruction: None,
                 include_tool_recovery_policy: true,
                 include_task_orchestration_policy: false,
+                include_threads_policy: false,
                 continue_generation_hint: false,
                 runtime_sections: Vec::new(),
                 dynamic_sections: Vec::new(),
@@ -1625,6 +1785,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -1641,6 +1802,7 @@ mod tests {
             retry_instruction: Some("retry with corrected args".to_owned()),
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: true,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -1672,6 +1834,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -1730,6 +1893,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -1765,6 +1929,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -1802,6 +1967,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -1829,6 +1995,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -1870,6 +2037,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -1909,6 +2077,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),

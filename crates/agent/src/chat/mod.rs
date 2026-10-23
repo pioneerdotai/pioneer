@@ -2249,6 +2249,33 @@ fn preflight_active_recall_prompt_context_input(
     )
 }
 
+fn native_threads_policy_available(
+    index: &PreflightToolIndex,
+    permission: &TurnPermissionProfileSnapshot,
+    visible: &[String],
+) -> bool {
+    let policy = &permission.effective_policy;
+    let name_allowed = |name: &str| {
+        !policy.denied_tools.iter().any(|denied| denied == name)
+            && (!(policy.allowed_tools_restricted || !policy.allowed_tools.is_empty())
+                || policy.allowed_tools.iter().any(|allowed| allowed == name))
+    };
+    let can_load = visible.iter().any(|name| name == "read_skill") && name_allowed("read_skill");
+    let can_discover =
+        visible.iter().any(|name| name == "request_tools") && name_allowed("request_tools");
+    can_load
+        && index.candidate_tools.iter().any(|tool| {
+            tool.name != "threads_start_options"
+                && pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&tool.name.as_str())
+                && name_allowed(&tool.name)
+                && (!matches!(
+                    tool.name.as_str(),
+                    "thread_create" | "thread_message_send" | "threads_turn_start"
+                ) || policy.agent_action != pioneer_protocol::PermissionBehavior::Deny)
+                && (can_discover || visible.contains(&tool.name))
+        })
+}
+
 fn compile_agent_instruction_delivery_plan_with_prompt_root(
     prompt_root: &std::path::Path,
     skills_prompt: Option<String>,
@@ -2256,6 +2283,7 @@ fn compile_agent_instruction_delivery_plan_with_prompt_root(
     runtime_sections: &[PromptRuntimeSectionInput],
     permission_profile: &TurnPermissionProfileSnapshot,
     include_task_orchestration_policy: bool,
+    include_threads_policy: bool,
     include_request_tools_catalog: bool,
     continue_generation_hint: bool,
     initiating_thread_id: Option<&str>,
@@ -2286,6 +2314,7 @@ fn compile_agent_instruction_delivery_plan_with_prompt_root(
         retry_instruction,
         include_tool_recovery_policy: true,
         include_task_orchestration_policy,
+        include_threads_policy,
         continue_generation_hint,
         runtime_sections,
         dynamic_sections: Vec::new(),
@@ -3934,6 +3963,7 @@ async fn execute_agent_provider_response(
             &permission_profile,
             include_task_orchestration_policy,
             false,
+            false,
             continue_generation_hint,
             turn_tool_materialization.initiating_thread_id.as_deref(),
             thread_id,
@@ -4232,6 +4262,14 @@ async fn execute_agent_provider_response(
         initial_visibility.diagnostics.as_slice(),
     );
 
+    // Hidden registered capabilities must be discoverable before request_tools.
+    // Use the admitted catalog, not just the currently visible domain tools.
+    let include_threads_policy = native_threads_policy_available(
+        &router.preflight_tool_index(),
+        &permission_profile,
+        &initial_visibility.visible_tools,
+    );
+
     let read_skill_is_visible = initial_visibility
         .visible_tools
         .iter()
@@ -4363,6 +4401,7 @@ async fn execute_agent_provider_response(
         prompt_runtime_sections.as_slice(),
         &permission_profile,
         include_task_orchestration_policy,
+        include_threads_policy,
         true,
         continue_generation_hint,
         turn_tool_materialization.initiating_thread_id.as_deref(),
@@ -4740,6 +4779,7 @@ async fn execute_agent_provider_response(
                         prompt_runtime_sections.as_slice(),
                         &permission_profile,
                         include_task_orchestration_policy,
+                        include_threads_policy,
                         round_plan.tools_enabled,
                         continue_generation_hint,
                         turn_tool_materialization.initiating_thread_id.as_deref(),
@@ -4834,6 +4874,7 @@ async fn execute_agent_provider_response(
                     no_tool_runtime_sections.as_slice(),
                     &permission_profile,
                     include_task_orchestration_policy,
+                    include_threads_policy,
                     false,
                     continue_generation_hint,
                     turn_tool_materialization.initiating_thread_id.as_deref(),
@@ -5188,6 +5229,7 @@ async fn execute_agent_provider_response(
                             prompt_runtime_sections.as_slice(),
                             &permission_profile,
                             include_task_orchestration_policy,
+                            include_threads_policy,
                             false,
                             continue_generation_hint,
                             turn_tool_materialization.initiating_thread_id.as_deref(),
@@ -6551,6 +6593,7 @@ async fn execute_agent_provider_response(
                     prompt_runtime_sections.as_slice(),
                     &permission_profile,
                     include_task_orchestration_policy,
+                    include_threads_policy,
                     next_round_tools_enabled,
                     continue_generation_hint,
                     turn_tool_materialization.initiating_thread_id.as_deref(),
@@ -8308,6 +8351,71 @@ mod tests {
             .cloned()
             .chain(extra.iter().map(|name| (*name).to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn native_threads_guidance_uses_allowed_hidden_capabilities_before_domain_discovery() {
+        let index = pioneer_tools::build_preflight_tool_index([
+            &pioneer_tools::threads_search::threads_search_tool_spec(),
+        ]);
+        let mut permission = pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+            pioneer_protocol::TurnPermissionMode::FullAccess,
+            pioneer_protocol::TurnPermissionProfileSource::Composer,
+        );
+        let visible = vec!["read_skill".to_owned(), "request_tools".to_owned()];
+        assert!(super::native_threads_policy_available(
+            &index,
+            &permission,
+            &visible
+        ));
+        permission
+            .effective_policy
+            .denied_tools
+            .push("threads_search".to_owned());
+        assert!(!super::native_threads_policy_available(
+            &index,
+            &permission,
+            &visible
+        ));
+        permission.effective_policy.denied_tools.clear();
+        permission.effective_policy.allowed_tools_restricted = true;
+        permission.effective_policy.allowed_tools = visible.clone();
+        assert!(!super::native_threads_policy_available(
+            &index,
+            &permission,
+            &visible
+        ));
+        permission
+            .effective_policy
+            .allowed_tools
+            .push("threads_search".to_owned());
+        assert!(super::native_threads_policy_available(
+            &index,
+            &permission,
+            &visible
+        ));
+        assert!(!super::native_threads_policy_available(
+            &index,
+            &permission,
+            &["read_skill".to_owned()]
+        ));
+        let options = pioneer_protocol::agent_start_options_catalog_entry();
+        let options = pioneer_tools::ConfiguredToolSpec::new(
+            pioneer_tools::ToolSpec::new(
+                options.name.as_str(),
+                options.description,
+                options.parameters,
+                pioneer_tools::PayloadKind::Function,
+            ),
+            pioneer_tools::ExecutionClass::Shared,
+            pioneer_tools::dynamic_unknown_output_policy(),
+        );
+        let options_only = pioneer_tools::build_preflight_tool_index([&options]);
+        assert!(!super::native_threads_policy_available(
+            &options_only,
+            &permission,
+            &visible
+        ));
     }
 
     fn assert_no_discovery_tools(visible_tools: &[String]) {

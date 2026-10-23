@@ -285,6 +285,7 @@ mod tests {
         SkillResolvedReason, SkillRuntimeBudget, SkillSourceKind, SkillTrustLevel,
         build_skill_prompt, build_skill_runtime_plan, load_catalog,
     };
+    use std::{fs, path::Path};
 
     #[test]
     fn materializes_bundled_browser_subagents_tasks_and_memory_skills() {
@@ -550,6 +551,76 @@ mod tests {
             Some(expected_tasks_asset_root.as_str())
         );
 
+        let threads = catalog
+            .skills
+            .iter()
+            .find(|skill| skill.identity.slug == "threads")
+            .expect("bundled threads skill");
+        assert_eq!(threads.identity.skill_id.as_str(), "ThR7m2K9vQ4cX8pL6nB3s");
+        assert_eq!(threads.identity.source_kind, SkillSourceKind::System);
+        assert_eq!(threads.identity.owner.as_deref(), Some("pioneer"));
+        assert_eq!(
+            threads.policy_hints.implicit_invocation,
+            SkillImplicitInvocationPolicy::Required
+        );
+        assert!(threads.policy_hints.catalog_hidden);
+        assert!(!threads.runtime.disable_model_invocation);
+        let threads_active = vec![ResolvedSkill {
+            skill_id: threads.identity.skill_id.clone(),
+            slug: "pioneer/threads".to_owned(),
+            reason: SkillResolvedReason::Implicit,
+            definition: threads.clone(),
+        }];
+        let threads_prompt = build_skill_prompt(
+            &threads_active,
+            SkillPromptBudget {
+                max_chars: 4_000,
+                compact_mode_threshold: 6,
+                include_read_skill_hint: true,
+            },
+        );
+        assert!(
+            threads_prompt
+                .text
+                .contains("- pioneer/threads: `skill:ThR7m2K9vQ4cX8pL6nB3s`")
+        );
+        assert!(!threads_prompt.text.contains("Use when:"));
+        let threads_plan = build_skill_runtime_plan(
+            &threads_active,
+            SkillRuntimeBudget {
+                enable_dynamic_tools: false,
+                max_dynamic_tools_per_skill: 16,
+                allow_shell_tools: false,
+                allow_http_tools: false,
+                allow_function_proxy_tools: false,
+                allow_untrusted_install: false,
+                min_trust_for_shell_tools: SkillTrustLevel::Verified,
+                min_trust_for_http_tools: SkillTrustLevel::Community,
+                min_trust_for_function_proxy_tools: SkillTrustLevel::Community,
+            },
+        );
+        let asset_root = root.join("ThR7m2K9vQ4cX8pL6nB3s/threads");
+        assert_eq!(
+            threads_plan
+                .read_skill_index
+                .get("skill:ThR7m2K9vQ4cX8pL6nB3s")
+                .unwrap()
+                .source
+                .package_asset_root(),
+            Some(asset_root.to_str().unwrap())
+        );
+        for reference in ["tool-schemas.md", "workflows.md", "troubleshooting.md"] {
+            assert_eq!(
+                fs::read(asset_root.join("references").join(reference)).unwrap(),
+                fs::read(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../resources/skills/pioneer/threads/references")
+                        .join(reference)
+                )
+                .unwrap()
+            );
+        }
+
         let memory = catalog
             .skills
             .iter()
@@ -586,7 +657,7 @@ mod tests {
             if skill.policy_hints.implicit_invocation == SkillImplicitInvocationPolicy::Required
                 && !matches!(
                     skill.identity.slug.as_str(),
-                    "tasks" | "subagents" | "memory"
+                    "tasks" | "subagents" | "threads" | "memory"
                 )
             {
                 let unsupported = [ResolvedSkill {
@@ -701,6 +772,12 @@ mod tests {
                 "pioneer/subagents",
             ),
             ("AzBYfaNgS6u1tiPaSlwnm", "pioneer", "tasks", "pioneer/tasks"),
+            (
+                "ThR7m2K9vQ4cX8pL6nB3s",
+                "pioneer",
+                "threads",
+                "pioneer/threads",
+            ),
         ];
         let actual = BUNDLED_SYSTEM_SKILLS
             .iter()

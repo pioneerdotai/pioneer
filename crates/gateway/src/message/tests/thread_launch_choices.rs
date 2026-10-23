@@ -153,7 +153,7 @@ async fn fixture() -> (
     (processor, context, tools)
 }
 
-async fn call(
+pub(super) async fn call(
     tools: &pioneer_agent::TurnToolMaterialization,
     name: &str,
     id: &str,

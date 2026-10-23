@@ -8,6 +8,7 @@ pub const SECTION_TITLE_IDENTITY_CORE: &str = "Identity Core";
 pub const SECTION_TITLE_USER_PERSONA: &str = "User Persona";
 pub const SECTION_TITLE_SUBAGENTS_POLICY: &str = "Subagents";
 pub const SECTION_TITLE_TASKS_POLICY: &str = "Tasks";
+pub const SECTION_TITLE_THREADS_POLICY: &str = "Threads";
 pub const SECTION_TITLE_PIONEER_CLI_RUNTIME_INSTRUCTIONS: &str = "Pioneer CLI Runtime Instructions";
 pub const SECTION_TITLE_PIONEER_CLI_RUNTIME_CONTEXT: &str = "Pioneer Context";
 pub const SECTION_TITLE_MEMORY_RECALL: &str = "Memory Recall";
@@ -98,6 +99,22 @@ pub const TASKS_POLICY_PROMPT: &str = tasks_policy!(
 );
 pub const CLI_TASKS_POLICY_PROMPT: &str = tasks_policy!(
     "Load the exported `pioneer-system-tasks` skill using the CLI runtime skill mechanism or its SKILL.md file. Resolve system:pioneer/tasks to that skill and references/ relative to its directory. Only use the authorized task operations listed for this turn; skills do not grant permissions. The CLI MCP catalog is fixed for this turn; request_tools and read_skill are not required. A task_wait timeout ends only the observation window; it does not cancel or diagnose child work."
+);
+
+pub const THREADS_POLICY_PROMPT: &str = concat!(
+    "Use Threads to find and read saved conversations, follow child-thread references, or create, message, and start an agent in a permitted conversation. ",
+    "Before non-trivial Threads work, find `pioneer/threads` (system:pioneer/threads) in Internal Skill References, call `read_skill` with that exact reference, and follow the skill. ",
+    "Open hidden tools with `request_tools` using domains: [\"threads\"], not individual tool names. ",
+    "Read, search, create, send, and start are separate operations; create/send do not run a model. Starting a turn creates neither a durable Task nor attached subagent work. ",
+    "Use only the operations permitted for this execution; a skill or known thread ID grants no additional access."
+);
+
+pub const CLI_THREADS_POLICY_PROMPT: &str = concat!(
+    "Use Threads to find and read saved conversations, follow child-thread references, or create, message, and start an agent in a permitted conversation. ",
+    "Before non-trivial Threads work, load the exported `pioneer-system-threads` skill using the CLI runtime skill mechanism or its SKILL.md file. Resolve system:pioneer/threads to that skill and references/ relative to its directory. ",
+    "Use only the authorized Threads operations and callable names in the fixed current-turn MCP catalog; request_tools and read_skill are not required. ",
+    "Read, search, create, send, and start are separate operations; create/send do not run a model. Starting a turn creates neither a durable Task nor attached subagent work. ",
+    "A skill or known thread ID grants no additional access."
 );
 
 pub const RECOVERY_CONTINUATION_PROMPT: &str = "Previous attempt was interrupted by output limits. Continue from where it stopped without repeating prior text.";

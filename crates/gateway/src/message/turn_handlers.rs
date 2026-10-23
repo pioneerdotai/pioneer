@@ -3963,6 +3963,28 @@ impl MessageProcessor {
             {
                 continue;
             }
+            // Preserve task selection; apply the execution's explicit tool policy
+            // to Threads, including search in its existing transport family.
+            if pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&spec.spec.name.as_str())
+                && spec.spec.name != "threads_start_options"
+                && ((matches!(
+                    spec.spec.name.as_str(),
+                    "thread_create" | "thread_message_send" | "threads_turn_start"
+                ) && permission.effective_policy.agent_action
+                    == pioneer_protocol::PermissionBehavior::Deny)
+                    || permission
+                        .effective_policy
+                        .denied_tools
+                        .contains(&spec.spec.name)
+                    || ((permission.effective_policy.allowed_tools_restricted
+                        || !permission.effective_policy.allowed_tools.is_empty())
+                        && !permission
+                            .effective_policy
+                            .allowed_tools
+                            .contains(&spec.spec.name)))
+            {
+                continue;
+            }
             let action = family.action(&spec.spec.name)?;
             let allowed = match authority {
                 TurnExecutionAuthority::Fresh(admission) => {
@@ -3976,7 +3998,7 @@ impl MessageProcessor {
                 continue;
             }
             if let Some(binding) = binding.as_ref() {
-                let visible = if spec.spec.name == "threads_search" {
+                let visible = if thread_reader || spec.spec.name == "threads_search" {
                     let facts = binding.adapter.lock().await.persistence_facts();
                     facts
                         .agent_authorization_allowed_actions
@@ -3988,8 +4010,6 @@ impl MessageProcessor {
                             &facts.agent_authorization_role_key,
                             crate::authorization::ResourceAction::ThreadRead,
                         )
-                } else if thread_reader {
-                    true
                 } else if matches!(
                     spec.spec.name.as_str(),
                     "threads_start_options" | "threads_identity_odels_list" | "threads_turn_start"
@@ -4035,29 +4055,42 @@ impl MessageProcessor {
         if let Some(projection) = plan.mcp_projection.as_mut()
             && projection.tools.iter().any(|tool| {
                 NativeToolFamily::from_server_id(&tool.server_installation_id).is_some_and(
+                    |family| matches!(family, NativeToolFamily::Tasks | NativeToolFamily::Threads),
+                )
+            })
+        {
+            let mut permitted = std::collections::HashSet::new();
+            if projection.tools.iter().any(|tool| {
+                NativeToolFamily::from_server_id(&tool.server_installation_id).is_some_and(
                     |family| {
                         matches!(family, NativeToolFamily::Tasks | NativeToolFamily::Threads)
                             && !family.is_thread_reader(&tool.raw_tool_name)
                     },
                 )
-            })
-        {
-            let permitted = crate::turn_mcp::native_tools::materialize_task_tools(
-                Arc::new(self.clone()),
-                context,
-            )
-            .await
-            .map_err(anyhow::Error::msg)?
-            .into_iter()
-            .flat_map(|bundle| bundle.specs.into_iter().map(|spec| spec.spec.name))
-            .collect::<std::collections::HashSet<_>>();
+            }) {
+                permitted.extend(
+                    crate::turn_mcp::native_tools::materialize_task_tools(
+                        Arc::new(self.clone()),
+                        context.clone(),
+                    )
+                    .await
+                    .map_err(anyhow::Error::msg)?
+                    .into_iter()
+                    .flat_map(|bundle| bundle.specs.into_iter().map(|spec| spec.spec.name)),
+                );
+            }
+            if self.thread_read_authority(&context).await.is_ok() {
+                for bundle in crate::turn_mcp::native_tools::materialize_thread_tools(
+                    Arc::new(self.clone()),
+                    context,
+                ) {
+                    permitted.extend(bundle.specs.into_iter().map(|spec| spec.spec.name));
+                }
+            }
             let previous_hash = projection.manifest_hash.clone();
             projection.tools.retain(|tool| {
                 !NativeToolFamily::from_server_id(&tool.server_installation_id).is_some_and(
-                    |family| {
-                        matches!(family, NativeToolFamily::Tasks | NativeToolFamily::Threads)
-                            && !family.is_thread_reader(&tool.raw_tool_name)
-                    },
+                    |family| matches!(family, NativeToolFamily::Tasks | NativeToolFamily::Threads),
                 ) || permitted.contains(&tool.raw_tool_name)
             });
             let (max_tools, max_total_schema_bytes) = self.mcp_service.projection_limit_values();
@@ -4117,6 +4150,7 @@ impl MessageProcessor {
             plan.skill_install_plans
                 .retain(|plan| !omitted.contains(&plan.skill_id));
         }
+        plan.reconcile_implicit_threads_skill();
         Ok(())
     }
 
@@ -4265,8 +4299,18 @@ impl MessageProcessor {
                         .iter()
                         .any(crate::turn_mcp::native_tools::is_task_operation)
                 });
+            let include_threads = combined_preflight_input
+                .mcp_projection
+                .as_ref()
+                .is_some_and(|projection| {
+                    projection
+                        .tools
+                        .iter()
+                        .any(crate::turn_mcp::native_tools::is_thread_operation)
+                });
             let (skill_install_plans, resolved_skill_bindings) = if attachments.is_empty()
                 && !include_task_orchestration
+                && !include_threads
             {
                 (Vec::new(), Vec::new())
             } else {
@@ -4278,6 +4322,7 @@ impl MessageProcessor {
                         attachments,
                         &projected_mcp_availability,
                         include_task_orchestration,
+                        include_threads,
                     ),
                 )
                 .await
@@ -6729,8 +6774,9 @@ impl MessageProcessor {
             }
             if combined_preflight.mcp_projection.as_ref().is_some_and(|projection| {
                 projection.tools.iter().any(|tool| {
-                    crate::turn_mcp::native_tools::is_task_operation(tool)
-                        && tool.raw_tool_name == "task_create"
+                    (crate::turn_mcp::native_tools::is_task_operation(tool)
+                        && tool.raw_tool_name == "task_create")
+                        || crate::turn_mcp::native_tools::is_thread_operation(tool)
                 })
             }) {
                 if let Err(error) = self.persist_cli_task_runtime_snapshot(
@@ -8812,7 +8858,21 @@ impl MessageProcessor {
                 ) == Some(crate::turn_mcp::native_tools::NativeToolFamily::Tasks)
                     && tool.raw_tool_name != "threads_start_options"
             });
-        let renew_mcp = task_continuation || task_projection || opencode;
+        let threads_projection = self
+            .crud_store
+            .list_turn_mcp_bindings(&prepared_binding.turn_id)
+            .await?
+            .iter()
+            .any(|tool| {
+                crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(
+                    &tool.server_installation_id,
+                )
+                .is_some()
+                    && pioneer_tools::THREADS_DOMAIN_TOOL_NAMES
+                        .contains(&tool.raw_tool_name.as_str())
+                    && tool.raw_tool_name != "threads_start_options"
+            });
+        let renew_mcp = task_continuation || task_projection || threads_projection || opencode;
         if renew_mcp && !opencode {
             if let Some(handle) = manager.existing_session(&restored.session_key).await {
                 // End only the old native attempt's lease. Codex/Claude can

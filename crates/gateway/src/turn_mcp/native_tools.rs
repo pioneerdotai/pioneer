@@ -179,6 +179,14 @@ pub(crate) fn is_task_operation(tool: &ResolvedMcpTurnTool) -> bool {
         )
 }
 
+/// Domain membership is independent of the persisted transport family.
+/// The shared options lookup alone does not activate Threads instructions.
+pub(crate) fn is_thread_operation(tool: &ResolvedMcpTurnTool) -> bool {
+    exact_definition(tool).is_some()
+        && tool.raw_tool_name != "threads_start_options"
+        && pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&tool.raw_tool_name.as_str())
+}
+
 pub(crate) fn projection_allowance(
     tools: &[ResolvedMcpTurnTool],
     mut limits: McpProjectionLimits,
@@ -369,6 +377,47 @@ mod tests {
                 ResourceAction::ThreadRead
             );
             assert!(!is_task_operation(search));
+            assert!(is_thread_operation(search));
+            assert_eq!(
+                projection
+                    .tools
+                    .iter()
+                    .filter(|tool| tool.raw_tool_name == "threads_start_options")
+                    .count(),
+                1
+            );
+            for name in pioneer_tools::THREADS_DOMAIN_TOOL_NAMES {
+                assert_eq!(
+                    projection
+                        .tools
+                        .iter()
+                        .filter(|tool| tool.raw_tool_name == *name)
+                        .count(),
+                    1,
+                    "{name}"
+                );
+            }
+            let capabilities =
+                crate::cli_runtime::context::cli_runtime_mcp_capabilities_input(Some(&projection))
+                    .unwrap();
+            assert!(
+                capabilities
+                    .native_threads_tools
+                    .iter()
+                    .any(|name| name == "threads_search")
+            );
+            assert!(
+                capabilities
+                    .native_threads_tools
+                    .iter()
+                    .any(|name| name == "threads_start_options")
+            );
+            assert!(
+                !capabilities
+                    .native_task_tools
+                    .iter()
+                    .any(|name| pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&name.as_str()))
+            );
 
             let budget =
                 crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits::transport_bounded(
