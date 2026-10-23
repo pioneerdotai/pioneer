@@ -27,7 +27,7 @@
       "type": "string",
       "enum": [
         "threads_start_options",
-        "threads_identity_odels_list",
+        "threads_identity_models_list",
         "send_message",
         "create_thread",
         "threads_turn_start",

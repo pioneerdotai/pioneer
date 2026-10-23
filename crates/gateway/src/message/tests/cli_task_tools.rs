@@ -2100,7 +2100,7 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
                 );
             }
             for name in [
-                "threads_identity_odels_list",
+                "threads_identity_models_list",
                 "thread_message_send",
                 "thread_create",
                 "threads_turn_start",

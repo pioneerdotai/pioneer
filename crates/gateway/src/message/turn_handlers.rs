@@ -3960,7 +3960,7 @@ impl MessageProcessor {
                     true
                 } else if matches!(
                     spec.spec.name.as_str(),
-                    "threads_start_options" | "threads_identity_odels_list" | "threads_turn_start"
+                    "threads_start_options" | "threads_identity_models_list" | "threads_turn_start"
                 ) {
                     binding
                         .capabilities
