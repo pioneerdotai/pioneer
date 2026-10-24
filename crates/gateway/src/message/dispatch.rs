@@ -252,6 +252,9 @@ fn vector_provider_key_name(
         Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter) => {
             Some("openrouter")
         }
+        Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::VercelAiGateway) => {
+            Some("vercel-ai-gateway")
+        }
         Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local) | None => None,
     }
 }

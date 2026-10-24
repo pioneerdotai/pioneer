@@ -352,11 +352,12 @@ pub(crate) struct ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
     runtime_home: PathBuf,
     config: StdRwLock<GatewayThreadEpisodicVectorSearchConfig>,
     workspace_configs: StdRwLock<BTreeMap<String, GatewayThreadEpisodicVectorSearchConfig>>,
-    openrouter_model_cache: StdRwLock<BTreeMap<String, CachedOpenRouterEmbeddingModel>>,
+    aggregator_model_cache: StdRwLock<BTreeMap<String, CachedAggregatorEmbeddingModel>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CachedOpenRouterEmbeddingModel {
+struct CachedAggregatorEmbeddingModel {
+    authority: Option<String>,
     config: GatewayThreadEpisodicVectorSearchConfig,
     dimension: usize,
     max_input_tokens: usize,
@@ -490,7 +491,7 @@ impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
             runtime_home,
             config: StdRwLock::new(config),
             workspace_configs: StdRwLock::new(BTreeMap::new()),
-            openrouter_model_cache: StdRwLock::new(BTreeMap::new()),
+            aggregator_model_cache: StdRwLock::new(BTreeMap::new()),
         }
     }
 
@@ -498,7 +499,7 @@ impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
         if let Ok(mut current) = self.config.write() {
             *current = config;
         }
-        if let Ok(mut cache) = self.openrouter_model_cache.write() {
+        if let Ok(mut cache) = self.aggregator_model_cache.write() {
             cache.clear();
         }
     }
@@ -510,7 +511,7 @@ impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
         if let Ok(mut current) = self.workspace_configs.write() {
             *current = configs;
         }
-        if let Ok(mut cache) = self.openrouter_model_cache.write() {
+        if let Ok(mut cache) = self.aggregator_model_cache.write() {
             cache.clear();
         }
     }
@@ -570,31 +571,36 @@ impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
                 .map_err(embedding_resolution_error)?;
                 Ok(Arc::new(provider))
             }
-            Some(GatewayThreadEpisodicVectorProviderConfig::OpenRouter) => {
+            Some(
+                kind @ (GatewayThreadEpisodicVectorProviderConfig::OpenRouter
+                | GatewayThreadEpisodicVectorProviderConfig::VercelAiGateway),
+            ) => {
+                let provider_id = crate::settings::vector_provider_identity_name(kind);
                 let model = config.model.as_deref().unwrap_or("").trim();
                 if model.is_empty() {
                     return Err(embedding_resolution_error(
-                        ThreadEpisodicEmbeddingError::missing_model("openrouter", ""),
+                        ThreadEpisodicEmbeddingError::missing_model(provider_id, ""),
                     ));
                 }
                 let api_provider = self
                     .provider_registry
-                    .get_or_create_for_workspace(workspace_id, "openrouter")
-                    .map_err(|error| {
+                    .get_or_create_for_workspace(workspace_id, provider_id)
+                    .map_err(|_error| {
                         embedding_resolution_error(
                             ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
-                                "openrouter",
+                                provider_id,
                                 model,
-                                format!("failed to resolve OpenRouter provider: {error:#}"),
+                                "failed to resolve embedding provider",
                             ),
                         )
                     })?;
+                let authority = api_provider.authority_fingerprint().map(str::to_owned);
                 let cached = self
-                    .openrouter_model_cache
+                    .aggregator_model_cache
                     .read()
                     .ok()
                     .and_then(|cache| cache.get(workspace_id).cloned())
-                    .filter(|cached| cached.config == *config);
+                    .filter(|cached| cached.config == *config && cached.authority == authority);
                 let (explicit_dimension, explicit_max_input_tokens) = cached
                     .as_ref()
                     .map(|cached| (Some(cached.dimension), Some(cached.max_input_tokens)))
@@ -606,12 +612,9 @@ impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
                             .find(|candidate| candidate.id == model)
                             .and_then(|candidate| candidate.limits.max_input_tokens)
                             .and_then(|limit| usize::try_from(limit).ok()),
-                        Err(error) => {
+                        Err(_error) => {
                             tracing::warn!(
-                                workspace_id,
-                                model,
-                                error = %format!("{error:#}"),
-                                "failed to resolve OpenRouter embedding input limit; using conservative fallback"
+                                "failed to resolve embedding input limit; using conservative fallback"
                             );
                             None
                         }
@@ -619,7 +622,8 @@ impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
                 } else {
                     None
                 };
-                let provider = RemoteEmbeddingProvider::openrouter_with_max_input_tokens(
+                let provider = RemoteEmbeddingProvider::aggregator_with_max_input_tokens(
+                    provider_id,
                     model,
                     explicit_dimension,
                     explicit_max_input_tokens.or(catalog_max_input_tokens),
@@ -629,10 +633,11 @@ impl ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver {
                 )
                 .map_err(embedding_resolution_error)?;
                 if cached.is_none() {
-                    if let Ok(mut cache) = self.openrouter_model_cache.write() {
+                    if let Ok(mut cache) = self.aggregator_model_cache.write() {
                         cache.insert(
                             workspace_id.to_owned(),
-                            CachedOpenRouterEmbeddingModel {
+                            CachedAggregatorEmbeddingModel {
+                                authority,
                                 config: config.clone(),
                                 dimension: provider.dimension(),
                                 max_input_tokens: provider.max_input_tokens(),
@@ -5595,13 +5600,15 @@ mod tests {
     use tokio::sync::Mutex;
 
     struct CatalogEmbeddingProvider {
+        name: &'static str,
         list_calls: AtomicUsize,
         embed_calls: AtomicUsize,
     }
 
     impl CatalogEmbeddingProvider {
-        fn new() -> Self {
+        fn new(name: &'static str) -> Self {
             Self {
+                name,
                 list_calls: AtomicUsize::new(0),
                 embed_calls: AtomicUsize::new(0),
             }
@@ -5611,7 +5618,7 @@ mod tests {
     #[async_trait]
     impl pioneer_provider::Provider for CatalogEmbeddingProvider {
         fn name(&self) -> &str {
-            "openrouter"
+            self.name
         }
 
         fn capabilities(&self) -> pioneer_provider::ProviderCapabilities {
@@ -10689,41 +10696,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn config_backed_openrouter_resolver_caches_model_metadata_between_jobs() {
-        let provider = Arc::new(CatalogEmbeddingProvider::new());
-        let registry = Arc::new(ProviderRegistry::with_provider(
-            "openrouter",
-            provider.clone(),
-        ));
-        let runtime_home = tempfile::tempdir().expect("runtime home");
-        let resolver = ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver::new(
-            registry,
-            runtime_home.path().to_path_buf(),
-            GatewayThreadEpisodicVectorSearchConfig {
-                enabled: true,
-                provider: Some(GatewayThreadEpisodicVectorProviderConfig::OpenRouter),
-                model: Some("vendor/custom-embed".to_owned()),
-                local_model: None,
-                embedding_normalized: true,
-                use_search_instructions: false,
-            },
-        );
+    async fn config_backed_aggregator_resolver_caches_model_metadata_between_jobs() {
+        for (id, kind) in [
+            (
+                "openrouter",
+                GatewayThreadEpisodicVectorProviderConfig::OpenRouter,
+            ),
+            (
+                "vercel-ai-gateway",
+                GatewayThreadEpisodicVectorProviderConfig::VercelAiGateway,
+            ),
+        ] {
+            let provider = Arc::new(CatalogEmbeddingProvider::new(id));
+            let registry = Arc::new(ProviderRegistry::with_provider(id, provider.clone()));
+            let runtime_home = tempfile::tempdir().expect("runtime home");
+            let resolver = ConfigBackedThreadEpisodicIndexEmbeddingProviderResolver::new(
+                registry,
+                runtime_home.path().to_path_buf(),
+                GatewayThreadEpisodicVectorSearchConfig {
+                    enabled: true,
+                    provider: Some(kind),
+                    model: Some("vendor/custom-embed".to_owned()),
+                    local_model: None,
+                    embedding_normalized: true,
+                    use_search_instructions: false,
+                },
+            );
 
-        let first = resolver
-            .resolve_active_embedding_provider("workspace_cache")
-            .await
-            .expect("first provider resolution should succeed")
-            .expect("provider should be configured");
-        let second = resolver
-            .resolve_active_embedding_provider("workspace_cache")
-            .await
-            .expect("second provider resolution should succeed")
-            .expect("provider should remain configured");
+            let first = resolver
+                .resolve_active_embedding_provider("workspace_cache")
+                .await
+                .expect("first provider resolution should succeed")
+                .expect("provider should be configured");
+            let second = resolver
+                .resolve_active_embedding_provider("workspace_cache")
+                .await
+                .expect("second provider resolution should succeed")
+                .expect("provider should remain configured");
 
-        assert_eq!(first.dimension(), 4);
-        assert_eq!(second.dimension(), 4);
-        assert_eq!(provider.list_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(provider.embed_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(first.provider_id(), id);
+            assert_eq!(first.model(), "vendor/custom-embed");
+            assert_eq!(first.dimension(), 4);
+            assert_eq!(second.dimension(), 4);
+            assert_eq!(provider.list_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.embed_calls.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[tokio::test]

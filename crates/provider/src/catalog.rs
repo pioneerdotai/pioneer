@@ -147,7 +147,7 @@ impl ModelCatalog {
         origins: &str,
         tool_capabilities: Option<ToolCapabilities>,
     ) -> anyhow::Result<Self> {
-        let catalog = Self {
+        let mut catalog = Self {
             models: serde_json::from_str(models)?,
             origins: serde_json::from_str(origins)?,
             snapshot_id: {
@@ -156,6 +156,45 @@ impl ModelCatalog {
             },
             tool_capabilities,
         };
+        // Old Vercel cache records describe a different wire contract. Isolate
+        // only those records; last-good evidence for every other source survives.
+        if let Some(models) = catalog.models.get_mut("vercel-ai-gateway") {
+            let stale: Vec<String> = models
+                .iter()
+                .filter(|(_, m)| {
+                    m.api != "openai-responses" || m.base_url != "https://ai-gateway.vercel.sh/v1"
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in stale {
+                models.remove(&id);
+                if let Some(origins) = catalog.origins.get_mut("vercel-ai-gateway") {
+                    origins.remove(&id);
+                }
+                if let Some(capabilities) = catalog
+                    .tool_capabilities
+                    .as_mut()
+                    .and_then(|c| c.get_mut("vercel-ai-gateway"))
+                {
+                    capabilities.remove(&id);
+                }
+            }
+        }
+        if let Some(capabilities) = catalog
+            .tool_capabilities
+            .as_mut()
+            .and_then(|c| c.get_mut("vercel-ai-gateway"))
+        {
+            // A tool-only legacy supplement carries no Responses route proof.
+            // Preserve explicit denials; positives require a current model.
+            capabilities.retain(|id, supported| {
+                !*supported
+                    || catalog
+                        .models
+                        .get("vercel-ai-gateway")
+                        .is_some_and(|models| models.contains_key(id))
+            });
+        }
         anyhow::ensure!(!catalog.models.is_empty(), "empty model catalog");
         for (provider, models) in &catalog.models {
             for (id, model) in models {
@@ -328,6 +367,26 @@ impl ModelCatalog {
 /// overrides only present keys; omitted off cannot erase known mandatory.
 fn enrich_reasoning(provider: &str, model: &mut ProviderModelInfo, entry: Option<&CatalogModel>) {
     use pioneer_protocol::ReasoningCapabilitySource as Source;
+    if provider == "vercel-ai-gateway"
+        && model
+            .capabilities
+            .reasoning
+            .as_ref()
+            .is_some_and(|reasoning| {
+                matches!(reasoning.source.as_ref(), Some(Source::ProviderMetadata))
+            })
+    {
+        // Vercel discovery already applied the real Responses mapper to its
+        // authority-native model. A missing/stale public entry cannot erase or
+        // widen that validated enum after the discovery scope has ended.
+        return;
+    }
+    // Discovery-only/private models have no public record. Preserve the same
+    // authority-scoped source facts used by runtime request validation.
+    let scoped = (provider == "vercel-ai-gateway")
+        .then(|| crate::generation::native_model(provider, &model.id))
+        .flatten();
+    let entry = scoped.as_ref().or(entry);
     let fallback = crate::reasoning_registry::reasoning_capabilities_for_model(provider, &model.id);
     let documented_off = fallback
         .as_ref()
@@ -429,7 +488,9 @@ fn enrich_reasoning(provider: &str, model: &mut ProviderModelInfo, entry: Option
             // mandatory thinking. Only the original catalog off fact can do so;
             // a separately published native mandatory fact wins below.
             if let Some(off) = catalog_off {
-                reasoning.mandatory = Some(off.is_null());
+                if provider != "vercel-ai-gateway" || off.is_string() {
+                    reasoning.mandatory = Some(off.is_null());
+                }
             }
         }
         if entry
@@ -541,6 +602,17 @@ pub(crate) fn merge_tool_support(discovery: Option<bool>, catalog: Option<bool>)
     }
 }
 
+/// Local catalog bootstrap has not supplied a validated snapshot yet.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelCatalogUnavailable;
+
+impl std::fmt::Display for ModelCatalogUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Model catalog is not loaded yet. Retry after the catalog has loaded.")
+    }
+}
+impl std::error::Error for ModelCatalogUnavailable {}
+
 #[derive(Default)]
 struct CatalogStore(RwLock<Option<Arc<ModelCatalog>>>);
 impl CatalogStore {
@@ -549,11 +621,7 @@ impl CatalogStore {
             .read()
             .expect("model catalog lock")
             .clone()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Model catalog is not loaded yet. Retry after the catalog has loaded."
-                )
-            })
+            .ok_or_else(|| ModelCatalogUnavailable.into())
     }
     fn publish(&self, catalog: ModelCatalog) {
         *self.0.write().expect("model catalog lock") = Some(Arc::new(catalog));

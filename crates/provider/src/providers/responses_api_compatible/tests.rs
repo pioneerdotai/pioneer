@@ -30,13 +30,17 @@ fn snapshot(output: Vec<Value>) -> Value {
     json!({"id":"resp_synthetic","status":"completed","model":"gpt-6.1-sol","output":output,"usage":{"input_tokens":100,"output_tokens":20,"input_tokens_details":{"cached_tokens":80},"output_tokens_details":{"reasoning_tokens":12},"total_tokens":120}})
 }
 fn reducer() -> Reducer {
+    reducer_for("openai")
+}
+fn reducer_for(provider: &str) -> Reducer {
     Reducer::new(
-        "openai",
+        provider,
         "gpt-6.1-sol",
         "authority",
         Some(false),
         Some("req-synthetic"),
     )
+    .with_provisional_messages(provider == "vercel-ai-gateway")
 }
 fn event(reducer: &mut Reducer, value: Value) -> Vec<StreamChunk> {
     reducer.event(None, &value).unwrap()
@@ -114,46 +118,139 @@ fn early_commentary_is_visible_before_terminal_and_done_snapshots_do_not_duplica
 }
 #[test]
 fn absent_late_unknown_and_conflicting_phase_are_explicit() {
-    for phase in [Value::Null, json!("final_answer"), json!("commentary")] {
-        let mut r = reducer();
-        let mut added = message("m", Value::Null, "");
-        added.as_object_mut().unwrap().remove("phase");
-        assert!(
+    for provider in ["openai", "vercel-ai-gateway"] {
+        for initial_null in [false, true] {
+            for phase in [Value::Null, json!("final_answer"), json!("commentary")] {
+                let mut r = reducer_for(provider);
+                let mut consumer = ProviderMessageCollector::default();
+                let mut added = message("m", Value::Null, "");
+                if !initial_null {
+                    added.as_object_mut().unwrap().remove("phase");
+                }
+                let start = event(
+                    &mut r,
+                    json!({"type":"response.output_item.added","output_index":0,"item":added}),
+                );
+                let early = event(
+                    &mut r,
+                    json!({"type":"response.output_text.delta","output_index":0,"item_id":"m","content_index":0,"delta":"held"}),
+                );
+                if provider == "openai" {
+                    assert!(start.is_empty());
+                    assert!(early.is_empty());
+                } else {
+                    assert_eq!(
+                        start[0].message.as_ref().unwrap().boundary,
+                        crate::ProviderMessageBoundary::StartProvisional
+                    );
+                    assert_eq!(
+                        early.iter().map(|c| c.delta.as_str()).collect::<String>(),
+                        "held"
+                    );
+                    assert!(!r.is_terminal());
+                }
+                for chunk in start.iter().chain(&early) {
+                    consumer.push(chunk).unwrap();
+                }
+                assert_eq!(consumer.text(), "", "unknown phase is not accepted final");
+                let chunks = r
+                    .snapshot(&snapshot(vec![message("m", phase.clone(), "held")]))
+                    .unwrap();
+                assert_eq!(
+                    chunks.iter().map(|c| c.delta.as_str()).collect::<String>(),
+                    if provider == "openai" { "held" } else { "" }
+                );
+                for chunk in &chunks {
+                    consumer.push(chunk).unwrap();
+                }
+                consumer.finish().unwrap();
+                let response = r.response().unwrap();
+                assert_eq!(response.messages.as_slice(), consumer.messages());
+                assert_eq!(response.messages[0].text, "held");
+                assert_eq!(
+                    response.messages[0].phase,
+                    match phase.as_str() {
+                        Some("commentary") => Some(pioneer_protocol::AgentMessagePhase::Commentary),
+                        Some("final_answer") =>
+                            Some(pioneer_protocol::AgentMessagePhase::FinalAnswer),
+                        _ => None,
+                    }
+                );
+                assert_eq!(
+                    response.text,
+                    if phase == "commentary" { "" } else { "held" }
+                );
+                assert_eq!(response.text, consumer.text());
+            }
+        }
+        for changed in [Value::Null, json!("final_answer"), json!("unknown")] {
+            let mut r = reducer_for(provider);
             event(
                 &mut r,
-                json!({"type":"response.output_item.added","output_index":0,"item":added})
-            )
-            .is_empty()
-        );
-        assert!(event(&mut r,json!({"type":"response.output_text.delta","output_index":0,"item_id":"m","content_index":0,"delta":"held"})).is_empty());
-        let chunks = r
-            .snapshot(&snapshot(vec![message("m", phase.clone(), "held")]))
-            .unwrap();
-        assert_eq!(
-            chunks.iter().map(|c| c.delta.as_str()).collect::<String>(),
-            "held"
-        );
-        assert_eq!(
-            r.response().unwrap().messages[0].phase,
-            match phase.as_str() {
-                Some("commentary") => Some(pioneer_protocol::AgentMessagePhase::Commentary),
-                Some("final_answer") => Some(pioneer_protocol::AgentMessagePhase::FinalAnswer),
-                _ => None,
-            }
-        );
-    }
-    for changed in [Value::Null, json!("final_answer"), json!("unknown")] {
-        let mut r = reducer();
-        event(
-            &mut r,
-            json!({"type":"response.output_item.added","output_index":0,"item":message("m",json!("commentary"),"")}),
-        );
-        assert!(
-            r.snapshot(&snapshot(vec![message("m", changed, "changed")]))
-                .is_err()
-        );
+                json!({"type":"response.output_item.added","output_index":0,"item":message("m",json!("commentary"),"")}),
+            );
+            assert!(
+                r.snapshot(&snapshot(vec![message("m", changed, "changed")]))
+                    .is_err()
+            );
+        }
     }
 }
+
+#[test]
+fn wire_completed_provisional_item_does_not_block_the_next_live_message() {
+    for provider in ["openai", "vercel-ai-gateway"] {
+        let mut r = reducer_for(provider);
+        let mut consumer = ProviderMessageCollector::default();
+        for (index, id, text) in [(0, "one", "first"), (1, "two", "second")] {
+            let added = event(
+                &mut r,
+                json!({"type":"response.output_item.added","output_index":index,"item":message(id,Value::Null,"")}),
+            );
+            let delta = event(
+                &mut r,
+                json!({"type":"response.output_text.delta","output_index":index,"item_id":id,"content_index":0,"delta":text}),
+            );
+            assert_eq!(
+                delta
+                    .iter()
+                    .map(|chunk| chunk.delta.as_str())
+                    .collect::<String>(),
+                if provider == "openai" { "" } else { text }
+            );
+            assert!(!r.is_terminal());
+            let done = event(
+                &mut r,
+                json!({"type":"response.output_item.done","output_index":index,"item":message(id,Value::Null,text)}),
+            );
+            for chunk in added.iter().chain(&delta).chain(&done) {
+                consumer.push(chunk).unwrap();
+            }
+        }
+        assert!(consumer.text().is_empty());
+        let terminal = r
+            .snapshot(&snapshot(vec![
+                message("one", json!("commentary"), "first"),
+                message("two", Value::Null, "second"),
+            ]))
+            .unwrap();
+        for chunk in &terminal {
+            consumer.push(chunk).unwrap();
+        }
+        consumer.finish().unwrap();
+        assert_eq!(consumer.text(), "second");
+        assert_eq!(
+            consumer
+                .messages()
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert_eq!(r.response().unwrap().text, "second");
+    }
+}
+
 #[test]
 fn successful_terminal_is_the_only_executable_call_authority() {
     let mut r = reducer();
@@ -470,6 +567,77 @@ async fn generic_root_auth_profiles_and_openai_facade_dispatch_real_http() {
             response.usage.unwrap().request_id.as_deref(),
             Some("req-synthetic")
         );
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn provisional_delivery_is_explicit_and_independent_of_provider_name() {
+    for (name, provisional) in [
+        ("neutral-responses", true),
+        ("neutral-responses", false),
+        ("openai", false),
+    ] {
+        let events = [
+            json!({"type":"response.output_item.added","output_index":0,"item":message("m",Value::Null,"")}),
+            json!({"type":"response.output_text.delta","output_index":0,"item_id":"m","content_index":0,"delta":"visible"}),
+            json!({"type":"response.completed","response":snapshot(vec![message("m",Value::Null,"visible")])}),
+        ];
+        let body = events
+            .iter()
+            .map(|e| format!("data: {e}\n\n"))
+            .collect::<String>();
+        let (root, server) =
+            super::super::usage_tests::fixture_with_headers(body, String::new(), "200 OK").await;
+        let provider =
+            ResponsesApiCompatibleProvider::new(name, root, "fixture", AuthStyle::Bearer);
+        // Leave defaults untouched in the control rows, including OpenAI.
+        let provider = if provisional {
+            provider.with_provisional_messages(true)
+        } else {
+            provider
+        };
+        // Neutral providers have no verified model generation contract; leave
+        // generation controls omitted so this fixture exercises delivery only.
+        let mut req = request();
+        req.max_tokens = None;
+        let chunks = crate::attachments::runtime::with_async_authority_scope(
+            "delivery-fixture".into(),
+            async {
+                let stream = provider.stream_chat_with_diagnostics(req).await.unwrap();
+                assert_eq!(
+                    stream.message_delivery,
+                    if provisional {
+                        crate::ProviderMessageDelivery::Provisional
+                    } else {
+                        crate::ProviderMessageDelivery::Incremental
+                    }
+                );
+                stream.stream.collect::<Vec<_>>().await
+            },
+        )
+        .await;
+        let chunks = chunks.into_iter().collect::<Result<Vec<_>>>().unwrap();
+        let mut collector = ProviderMessageCollector::default();
+        let mut unresolved = false;
+        let mut provisional_text = String::new();
+        for chunk in &chunks {
+            if let Some(event) = &chunk.message {
+                match event.boundary {
+                    crate::ProviderMessageBoundary::StartProvisional => unresolved = true,
+                    crate::ProviderMessageBoundary::Resolve => unresolved = false,
+                    _ => {}
+                }
+            }
+            if unresolved {
+                provisional_text.push_str(&chunk.delta);
+            }
+            collector.push(chunk).unwrap();
+        }
+        collector.finish().unwrap();
+        assert_eq!(provisional_text, if provisional { "visible" } else { "" });
+        assert_eq!(collector.text(), "visible");
+        assert_eq!(collector.messages().len(), 1);
         server.await.unwrap();
     }
 }
@@ -963,34 +1131,55 @@ fn interleaved_items_keep_native_order_with_local_message_ordinals_and_json_pari
 }
 
 #[tokio::test]
-async fn calls_followed_by_failed_or_incomplete_never_leave_decoder_as_executable() {
-    for status in ["failed", "incomplete"] {
-        let mut terminal = snapshot(vec![call(json!("call_real"), "{")]);
-        terminal["status"] = json!(status);
-        terminal["incomplete_details"] = json!({"reason":"max_output_tokens"});
-        terminal["error"] = json!({"code":"invalid_request_error","message":"SECRET"});
-        let wire = format!(
-            "data: {}\n\ndata: {}\n\ndata: {}\n\n",
-            json!({"type":"response.output_item.added","output_index":0,"item":call(json!("call_real"),"")}),
-            json!({"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_synthetic","arguments":"{"}),
-            json!({"type":format!("response.{status}"),"response":terminal})
-        );
-        let bytes = futures_util::stream::iter(vec![Ok(bytes::Bytes::from(wire))]).boxed();
-        let chunks = ResponsesApiCompatibleProvider::decode(bytes, reducer())
-            .collect::<Vec<_>>()
-            .await;
-        assert!(chunks.iter().all(|c| {
-            c.as_ref().map_or(true, |c| {
-                c.tool_calls.is_empty() && c.provider_replay_state.is_none()
-            })
-        }));
-        if status == "incomplete" {
-            assert_eq!(
-                chunks.last().unwrap().as_ref().unwrap().termination,
-                Some(ProviderTermination::Length)
+async fn calls_followed_by_failed_incomplete_or_eof_never_leave_decoder_as_executable() {
+    for provider in ["openai", "vercel-ai-gateway"] {
+        for status in ["failed", "incomplete", "eof"] {
+            let text = message("m", Value::Null, "partial");
+            let mut terminal = snapshot(vec![text.clone(), call(json!("call_real"), "{")]);
+            terminal["status"] = json!(status);
+            terminal["incomplete_details"] = json!({"reason":"max_output_tokens"});
+            terminal["error"] = json!({"code":"invalid_request_error","message":"SECRET"});
+            let mut wire = format!(
+                "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\n",
+                json!({"type":"response.output_item.added","output_index":0,"item":message("m", Value::Null, "")}),
+                json!({"type":"response.output_text.delta","output_index":0,"item_id":"m","content_index":0,"delta":"partial"}),
+                json!({"type":"response.output_item.added","output_index":1,"item":call(json!("call_real"),"")}),
+                json!({"type":"response.function_call_arguments.done","output_index":1,"item_id":"fc_synthetic","arguments":"{"})
             );
-        } else {
-            assert!(chunks.last().unwrap().is_err());
+            if status != "eof" {
+                wire.push_str(&format!(
+                    "data: {}\n\n",
+                    json!({"type":format!("response.{status}"),"response":terminal})
+                ));
+            }
+            let bytes = futures_util::stream::iter(vec![Ok(bytes::Bytes::from(wire))]).boxed();
+            let chunks = ResponsesApiCompatibleProvider::decode(bytes, reducer_for(provider))
+                .collect::<Vec<_>>()
+                .await;
+            assert!(
+                chunks
+                    .iter()
+                    .all(|c| c.as_ref().map_or(true, |c| c.tool_calls.is_empty()
+                        && c.provider_replay_state.is_none()))
+            );
+            if provider == "vercel-ai-gateway" {
+                assert_eq!(
+                    chunks
+                        .iter()
+                        .filter_map(|c| c.as_ref().ok())
+                        .map(|c| c.delta.as_str())
+                        .collect::<String>(),
+                    "partial"
+                );
+            }
+            if status == "incomplete" {
+                assert_eq!(
+                    chunks.last().unwrap().as_ref().unwrap().termination,
+                    Some(ProviderTermination::Length)
+                );
+            } else {
+                assert!(chunks.last().unwrap().is_err());
+            }
         }
     }
 }
@@ -2100,4 +2289,192 @@ async fn responses_gemini_named_consumer_does_not_inherit_native_live_endpoint_g
         })
         .await;
     }
+}
+
+#[tokio::test]
+async fn vercel_authority_models_drive_controls_and_media_on_the_responses_wire() {
+    use crate::attachments::regression::{image, part};
+    use crate::{InputContentType as Kind, ReasoningConfig as Config, ReasoningEffort as Effort};
+    // Independent, hand-authored contracts. Names intentionally resemble
+    // vendors without authorizing any family-based control inference.
+    for (raw, selection, expected, forbidden) in [
+        (
+            json!({"id":"private/gpt-6-astra","type":"language","tags":["tool-use","reasoning"],"modalities":{"input":["text","image","pdf"],"output":["text"]},"reasoning_options":[{"type":"effort","values":["low","high"]}],"temperature":false,"max_tokens":800}),
+            Config::Effort(Effort::High),
+            "high",
+            Effort::Max,
+        ),
+        (
+            json!({"id":"private/claude","type":"language","tags":["tool-use","reasoning"],"modalities":{"input":["text","image","pdf"],"output":["text"]},"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["medium"]}],"temperature":true,"max_tokens":800}),
+            Config::Disabled,
+            "none",
+            Effort::High,
+        ),
+        (
+            json!({"id":"private/gemini","type":"language","tags":["tool-use","reasoning"],"modalities":{"input":["text","image","pdf"],"output":["text"]},"reasoning_options":[{"type":"effort","values":["low"]}],"temperature":true,"max_tokens":800}),
+            Config::Effort(Effort::Low),
+            "low",
+            Effort::None,
+        ),
+    ] {
+        let model = crate::catalog::generator::vercel_model(&raw).unwrap();
+        let id = model.id.clone();
+        let models = std::collections::BTreeMap::from([(id.clone(), model)]);
+        let provider = ResponsesApiCompatibleProvider::new(
+            "vercel-ai-gateway",
+            "https://private.invalid/v1",
+            "fixture",
+            AuthStyle::Bearer,
+        )
+        .with_input_capabilities(crate::ProviderInputCapabilities {
+            text: true,
+            image: crate::InputTypeSupport::data_url_inline_only(),
+            file: crate::InputTypeSupport {
+                native: true,
+                file_upload: false,
+                data_url_inline: true,
+                text_fallback: false,
+            },
+            ..crate::ProviderInputCapabilities::disabled_for_all_file_types()
+        });
+        crate::attachments::runtime::with_async_authority_scope(
+            "fixture-authority".into(),
+            crate::generation::with_native_models("vercel-ai-gateway", false, models, async {
+                let mut req = request();
+                req.model = id;
+                req.reasoning = Some(selection);
+                req.messages[0].content_parts.push(part(
+                    Kind::Image,
+                    "image/png",
+                    &image(image::ImageFormat::Png, 1, 1),
+                ));
+                req.messages[0].content_parts.push(part(
+                    Kind::File,
+                    "application/pdf",
+                    &crate::attachments::regression::pdf(1),
+                ));
+                let budget = provider.prepare_input_budget(req.clone()).await.unwrap();
+                assert_eq!(budget.media.len(), 2);
+                assert!(budget.media.iter().all(|media| media.input_tokens > 0));
+                let prepared = provider
+                    .prepare(req.clone(), &provider.capabilities())
+                    .await
+                    .unwrap();
+                let body = provider.render(&prepared, true).unwrap();
+                assert_eq!(body["reasoning"]["effort"], expected);
+                assert_eq!(body["model"], req.model);
+                assert_eq!(body["max_output_tokens"], 100);
+                assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
+                assert!(
+                    body["input"][0]["content"][1]["image_url"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("data:image/png;base64,")
+                );
+                assert_eq!(body["input"][0]["content"][2]["type"], "input_file");
+                assert!(
+                    body["input"][0]["content"][2]["file_data"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("data:application/pdf;base64,")
+                );
+                assert!(body["input"][0]["content"][2].get("file_id").is_none());
+                req.reasoning = Some(Config::Effort(forbidden));
+                assert!(
+                    provider
+                        .prepare(req.clone(), &provider.capabilities())
+                        .await
+                        .is_err()
+                );
+                req.reasoning = None;
+                req.max_tokens = Some(801);
+                assert!(
+                    provider
+                        .prepare(req.clone(), &provider.capabilities())
+                        .await
+                        .is_err()
+                );
+                req.max_tokens = None;
+                let prepared = provider
+                    .prepare(req.clone(), &provider.capabilities())
+                    .await
+                    .unwrap();
+                let body = provider.render(&prepared, false).unwrap();
+                assert!(body.get("reasoning").is_none());
+                assert!(body.get("max_output_tokens").is_none());
+                assert!(body.get("temperature").is_none());
+                if raw["temperature"] == true {
+                    for temperature in [f32::NAN, -0.1, 2.1] {
+                        req.temperature = Some(temperature);
+                        assert!(
+                            provider
+                                .prepare(req.clone(), &provider.capabilities())
+                                .await
+                                .is_err()
+                        );
+                    }
+                    req.temperature = None;
+                }
+                req.messages[0]
+                    .content_parts
+                    .push(part(Kind::Audio, "audio/wav", b"not accessed"));
+                assert!(
+                    provider
+                        .prepare(req, &provider.capabilities())
+                        .await
+                        .is_err()
+                );
+            }),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn vercel_unknown_controls_leave_defaults_and_fallback_limits_are_not_native_caps() {
+    let model = crate::catalog::generator::vercel_model(&json!({"id":"private/claude-gpt-gemini","type":"language","tags":["tool-use","reasoning"],"modalities":{"input":["text"],"output":["text"]}})).unwrap();
+    let provider = ResponsesApiCompatibleProvider::new(
+        "vercel-ai-gateway",
+        "https://private.invalid/v1",
+        "fixture",
+        AuthStyle::Bearer,
+    );
+    crate::attachments::runtime::with_async_authority_scope(
+        "fixture-authority".into(),
+        crate::generation::with_native_models(
+            "vercel-ai-gateway",
+            false,
+            std::collections::BTreeMap::from([(model.id.clone(), model.clone())]),
+            async {
+                let mut req = request();
+                req.model = model.id;
+                req.max_tokens = Some(5000);
+                // 4096 in normalized storage is a conservative fallback, not evidence
+                // of a Vercel output ceiling. Explicit unknown controls still fail.
+                let prepared = provider
+                    .prepare(req.clone(), &provider.capabilities())
+                    .await
+                    .unwrap();
+                let body = provider.render(&prepared, false).unwrap();
+                assert_eq!(body["max_output_tokens"], 5000);
+                assert!(body.get("reasoning").is_none());
+                req.reasoning = Some(crate::ReasoningConfig::Effort(crate::ReasoningEffort::High));
+                assert!(
+                    provider
+                        .prepare(req.clone(), &provider.capabilities())
+                        .await
+                        .is_err()
+                );
+                req.reasoning = None;
+                req.temperature = Some(0.5);
+                assert!(
+                    provider
+                        .prepare(req, &provider.capabilities())
+                        .await
+                        .is_err()
+                );
+            },
+        ),
+    )
+    .await;
 }

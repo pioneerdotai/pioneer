@@ -20,11 +20,14 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::timeout;
 
-/// Request-local UI ownership. Only End creates a completed-copy relation.
+/// Request-local UI ownership. Only resolved commentary End creates a
+/// completed-copy relation. Text previews use the existing lossy progress lane:
+/// they are never canonical items, ACKs, history, or semantic phase evidence.
 #[derive(Default)]
 struct CommentaryUi {
-    ids: Vec<(pioneer_provider::ProviderMessageId, String)>,
+    ids: Vec<(pioneer_provider::ProviderMessageId, String, bool)>,
     copies: Vec<ProviderRoundUiCopy>,
+    previews: bool,
 }
 impl CommentaryUi {
     async fn push(
@@ -39,28 +42,37 @@ impl CommentaryUi {
         let Some(meta) = &chunk.message else {
             return Ok(());
         };
-        if meta.phase != Some(pioneer_protocol::AgentMessagePhase::Commentary) {
+        if meta.boundary == ProviderMessageBoundary::StartProvisional {
+            self.previews = true;
+        }
+        let commentary = meta.phase == Some(pioneer_protocol::AgentMessagePhase::Commentary);
+        if matches!(
+            meta.boundary,
+            ProviderMessageBoundary::Start | ProviderMessageBoundary::StartProvisional
+        ) {
+            self.ids
+                .push((meta.id, super::generate_id(super::TURN_ITEM_ID_LEN), false));
+        }
+        if !commentary && !self.previews {
             return Ok(());
         }
-        let item = match meta.boundary {
-            ProviderMessageBoundary::Start => {
-                let id = super::generate_id(super::TURN_ITEM_ID_LEN);
-                self.ids.push((meta.id, id.clone()));
-                TurnItem::AgentMessage {
-                    id,
-                    text: String::new(),
-                    phase: pioneer_protocol::AgentMessagePhase::Commentary,
-                    markdown: None,
-                    markdown_version: None,
-                }
-            }
-            ProviderMessageBoundary::Delta => {
-                let id = &self
-                    .ids
-                    .iter()
-                    .find(|(id, _)| *id == meta.id)
-                    .expect("validated message start")
-                    .1;
+        let index = self
+            .ids
+            .iter()
+            .position(|(id, _, _)| *id == meta.id)
+            .expect("validated message start");
+        let id = self.ids[index].1.clone();
+        let text = &collector
+            .messages()
+            .iter()
+            .find(|message| message.id == meta.id)
+            .expect("validated message")
+            .text;
+        if !commentary {
+            if meta.boundary == ProviderMessageBoundary::Delta && !chunk.delta.is_empty() {
+                // Use real append deltas on a separate progress key from the
+                // eventual canonical commentary. Generic progress already has
+                // bounded UTF-8 coalescing/fanout; no prefix is hidden in payload.
                 super::emit_progress_event(
                     events,
                     AgentProgressEvent::ItemDelta {
@@ -68,43 +80,29 @@ impl CommentaryUi {
                             workspace_id: workspace.into(),
                             thread_id: thread.into(),
                             turn_id: turn.into(),
-                            item_id: id.clone(),
+                            item_id: id,
                             delta: chunk.delta.clone(),
-                            stream: Some(pioneer_protocol::ItemDeltaStream::AgentMessage),
-                            payload: None,
+                            stream: Some(pioneer_protocol::ItemDeltaStream::Generic),
+                            payload: Some(
+                                serde_json::json!({"runtimeDeltaKind":"provider_message_preview"}),
+                            ),
                             markdown: None,
                             markdown_version: None,
                         },
                     },
                 )
                 .await?;
+            }
+            return Ok(());
+        }
+        let was_started = self.ids[index].2;
+        if !was_started {
+            // An unresolved empty item is never made into empty commentary.
+            if text.is_empty() && (self.previews || meta.boundary != ProviderMessageBoundary::Start)
+            {
                 return Ok(());
             }
-            ProviderMessageBoundary::End => {
-                let id = self
-                    .ids
-                    .iter()
-                    .find(|(id, _)| *id == meta.id)
-                    .expect("validated message start")
-                    .1
-                    .clone();
-                let text = collector
-                    .messages()
-                    .iter()
-                    .find(|m| m.id == meta.id)
-                    .expect("validated message")
-                    .text
-                    .clone();
-                TurnItem::AgentMessage {
-                    id,
-                    text,
-                    phase: pioneer_protocol::AgentMessagePhase::Commentary,
-                    markdown: None,
-                    markdown_version: None,
-                }
-            }
-        };
-        if meta.boundary == ProviderMessageBoundary::Start {
+            self.ids[index].2 = true;
             super::emit_durable_event(
                 events,
                 AgentDurableEvent::ItemStarted {
@@ -112,12 +110,45 @@ impl CommentaryUi {
                         workspace_id: workspace.into(),
                         thread_id: thread.into(),
                         turn_id: turn.into(),
-                        item,
+                        item: TurnItem::AgentMessage {
+                            id: id.clone(),
+                            text: text.clone(),
+                            phase: pioneer_protocol::AgentMessagePhase::Commentary,
+                            markdown: None,
+                            markdown_version: None,
+                        },
                     },
                 },
             )
             .await?;
-        } else {
+        }
+        if meta.boundary == ProviderMessageBoundary::Delta && was_started {
+            super::emit_progress_event(
+                events,
+                AgentProgressEvent::ItemDelta {
+                    notification: ItemDeltaNotification {
+                        workspace_id: workspace.into(),
+                        thread_id: thread.into(),
+                        turn_id: turn.into(),
+                        item_id: id.clone(),
+                        delta: chunk.delta.clone(),
+                        stream: Some(pioneer_protocol::ItemDeltaStream::AgentMessage),
+                        payload: None,
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+            )
+            .await?;
+        }
+        if meta.boundary == ProviderMessageBoundary::End {
+            let item = TurnItem::AgentMessage {
+                id,
+                text: text.clone(),
+                phase: pioneer_protocol::AgentMessagePhase::Commentary,
+                markdown: None,
+                markdown_version: None,
+            };
             let copy = ProviderRoundUiCopy::from_item(&item).expect("commentary item");
             super::emit_durable_event(
                 events,
@@ -407,6 +438,7 @@ async fn request_agent_round_observed(
         let pioneer_provider::ProviderStream {
             mut stream,
             diagnostics,
+            message_delivery,
         } = {
             let _startup_part = pioneer_observability::turn_startup::stage(
                 turn_id,
@@ -431,7 +463,10 @@ async fn request_agent_round_observed(
 
         let mut full_text = String::new();
         let mut message_collector = ProviderMessageCollector::default();
-        let mut commentary_ui = CommentaryUi::default();
+        let mut commentary_ui = CommentaryUi {
+            previews: message_delivery == pioneer_provider::ProviderMessageDelivery::Provisional,
+            ..Default::default()
+        };
         let mut full_reasoning = String::new();
         let mut tool_calls = Vec::new();
         let mut provider_replay_state = None;
@@ -750,6 +785,7 @@ async fn stream_provider_response_observed(
     let pioneer_provider::ProviderStream {
         mut stream,
         diagnostics,
+        message_delivery,
     } = {
         let _startup_part = pioneer_observability::turn_startup::stage(
             turn_id,
@@ -774,7 +810,10 @@ async fn stream_provider_response_observed(
 
     let mut full_text = String::new();
     let mut message_collector = ProviderMessageCollector::default();
-    let mut commentary_ui = CommentaryUi::default();
+    let mut commentary_ui = CommentaryUi {
+        previews: message_delivery == pioneer_provider::ProviderMessageDelivery::Provisional,
+        ..Default::default()
+    };
     let mut reasoning_parts = String::new();
     let mut message_started = false;
     let mut completed_reasoning_len = None;
@@ -896,6 +935,9 @@ async fn stream_provider_response_observed(
             }
 
             if !delta.is_empty() {
+                full_text.push_str(delta.as_str());
+            }
+            if !commentary_ui.previews && !delta.is_empty() {
                 if !message_started {
                     message_started = true;
                     let reasoning_text = reasoning_parts.clone();
@@ -942,7 +984,6 @@ async fn stream_provider_response_observed(
                     .await?;
                 }
 
-                full_text.push_str(delta.as_str());
                 super::emit_progress_event(
                     event_tx,
                     AgentProgressEvent::ItemDelta {
@@ -1025,6 +1066,28 @@ async fn stream_provider_response_observed(
             thinking_item_id,
             &reasoning_parts,
             event_tx,
+        )
+        .await?;
+    }
+    if !message_started && !full_text.trim().is_empty() {
+        // Replace runtime previews only after successful request termination.
+        // The canonical final still follows history ACK and finalization gates.
+        super::emit_durable_event(
+            event_tx,
+            AgentDurableEvent::ItemStarted {
+                notification: ItemStartedNotification {
+                    workspace_id: workspace_id.into(),
+                    thread_id: thread_id.into(),
+                    turn_id: turn_id.into(),
+                    item: TurnItem::AgentMessage {
+                        id: message_item_id.into(),
+                        text: String::new(),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+            },
         )
         .await?;
     }
@@ -1314,6 +1377,23 @@ fn response_stream_target<'a>(
     } else {
         FailureTarget::new(thinking_item_id, TurnItemType::Reasoning)
     }
+}
+
+pub(super) fn model_preparation_error(
+    item_id: &str,
+    provider: &dyn Provider,
+    model: &str,
+    error: &anyhow::Error,
+) -> ChatTurnError {
+    adapter_error_for_target(
+        FailureTarget::new(item_id, TurnItemType::Reasoning),
+        provider,
+        model,
+        ProviderTransportKind::NonStream,
+        ProviderFailureStage::Connect,
+        "model capability discovery failed",
+        error,
+    )
 }
 
 fn adapter_error_for_target(
@@ -4257,6 +4337,323 @@ mod phased_message_tests {
             reasoning: None,
             compiled_prompt: None,
         }
+    }
+    struct ProvisionalProvider {
+        release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        phase: Option<AgentMessagePhase>,
+        eof: bool,
+        delivery: pioneer_provider::ProviderMessageDelivery,
+        provisional_start: bool,
+    }
+    #[async_trait]
+    impl Provider for ProvisionalProvider {
+        fn name(&self) -> &str {
+            "provisional-fixture"
+        }
+        fn capabilities(&self) -> pioneer_provider::ProviderCapabilities {
+            pioneer_provider::ProviderCapabilities {
+                streaming: true,
+                ..Default::default()
+            }
+        }
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            anyhow::bail!("no fallback")
+        }
+        async fn stream_chat_with_diagnostics(
+            &self,
+            request: ChatRequest,
+        ) -> anyhow::Result<pioneer_provider::ProviderStream> {
+            let mut stream =
+                pioneer_provider::ProviderStream::new(self.stream_chat(request).await?);
+            stream.message_delivery = self.delivery;
+            Ok(stream)
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            let mut early = message(
+                0,
+                if self.provisional_start {
+                    None
+                } else {
+                    self.phase
+                },
+                "working",
+            );
+            if self.provisional_start {
+                early[0].message.as_mut().unwrap().boundary = Boundary::StartProvisional;
+            }
+            let provisional_start = self.provisional_start;
+            early.truncate(2);
+            let release = self.release.lock().unwrap().take().unwrap();
+            let phase = self.phase;
+            let eof = self.eof;
+            let rest = futures_util::stream::once(async move {
+                release.await.unwrap();
+                if eof {
+                    return futures_util::stream::iter(vec![Err(pioneer_provider::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into())]);
+                }
+                let mut resolve = StreamChunk::delta("");
+                resolve.message = Some(ProviderMessageMetadata { id: ProviderMessageId(0), phase, boundary: Boundary::Resolve });
+                let mut end = resolve.clone();
+                end.message.as_mut().unwrap().boundary = Boundary::End;
+                let mut chunks = if provisional_start { vec![resolve, end] } else { vec![end] };
+                if phase == Some(AgentMessagePhase::Commentary) {
+                    chunks.extend(message(1, Some(AgentMessagePhase::FinalAnswer), "answer"));
+                }
+                chunks.push(StreamChunk::final_chunk_with(ProviderTermination::Complete));
+                futures_util::stream::iter(chunks.into_iter().map(Ok).collect::<Vec<_>>())
+            }).flatten();
+            Ok(futures_util::stream::iter(early.into_iter().map(Ok))
+                .chain(rest)
+                .boxed())
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn provisional_text_reaches_agent_and_chat_before_terminal_without_final_or_history_pollution()
+     {
+        for agent in [false, true] {
+            use pioneer_provider::ProviderMessageDelivery::{Incremental, Provisional};
+            for (phase, eof, delivery, provisional_start) in [
+                (None, false, Incremental, true),
+                (
+                    Some(AgentMessagePhase::FinalAnswer),
+                    false,
+                    Incremental,
+                    true,
+                ),
+                (
+                    Some(AgentMessagePhase::Commentary),
+                    false,
+                    Incremental,
+                    true,
+                ),
+                (None, true, Incremental, true),
+                (None, false, Provisional, true),
+                (
+                    Some(AgentMessagePhase::FinalAnswer),
+                    false,
+                    Provisional,
+                    false,
+                ),
+                (None, true, Provisional, false),
+            ] {
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                let provider: Arc<dyn Provider> = Arc::new(ProvisionalProvider {
+                    release: std::sync::Mutex::new(Some(release_rx)),
+                    phase,
+                    eof,
+                    delivery,
+                    provisional_start,
+                });
+                let hub = AgentEventHub::new();
+                let mut durable = hub.take_durable_receiver().await.unwrap();
+                let mut live = hub.subscribe_live();
+                let expected = if phase == Some(AgentMessagePhase::Commentary) {
+                    "answer"
+                } else {
+                    "working"
+                };
+                let mut policy = ProviderTimeoutPolicy::default();
+                policy.first_chunk_timeout = std::time::Duration::from_secs(5);
+                policy.inter_chunk_idle_timeout = std::time::Duration::from_secs(60);
+                let producer = async {
+                    if agent {
+                        let round = request_agent_round(
+                            &provider,
+                            request(),
+                            "ws",
+                            "thread",
+                            "turn",
+                            "thinking",
+                            false,
+                            policy,
+                            &hub,
+                        )
+                        .await?;
+                        assert_eq!(round.messages[0].phase, phase);
+                        assert_eq!(round.messages[0].text, "working");
+                        assert_eq!(
+                            round.ui_copies.len(),
+                            usize::from(phase == Some(AgentMessagePhase::Commentary))
+                        );
+                        Ok(round.text)
+                    } else {
+                        stream_provider_response(
+                            &provider,
+                            request(),
+                            "ws",
+                            "thread",
+                            "turn",
+                            "thinking",
+                            "final",
+                            policy,
+                            &hub,
+                        )
+                        .await
+                        .map(|r| r.0)
+                    }
+                };
+                let consume = async {
+                    let mut release = Some(release_tx);
+                    let mut saved = false;
+                    let mut finals = 0;
+                    let mut commentary = 0;
+                    let mut preview_id = None;
+                    loop {
+                        tokio::select! {
+                            progress = live.recv(), if release.is_some() => {
+                                let AgentProgressEvent::ItemDelta { notification } = progress.unwrap() else { continue; };
+                                if notification.payload.as_ref().and_then(|p|p["runtimeDeltaKind"].as_str()) == Some("provider_message_preview") {
+                                    assert_eq!(notification.delta, "working");
+                                    assert_eq!(notification.stream, Some(pioneer_protocol::ItemDeltaStream::Generic));
+                                    assert!(notification.payload.as_ref().unwrap().get("text").is_none());
+                                    assert_eq!(finals, 0);
+                                    preview_id = Some(notification.item_id);
+                                    // Real text, rather than heartbeat bytes, changes the existing
+                                    // first-content gate to the accepted inter-content deadline.
+                                    tokio::time::advance(std::time::Duration::from_secs(10)).await;
+                                    release.take().unwrap().send(()).unwrap();
+                                }
+                            }
+                            event = durable.recv() => {
+                                let event = event.unwrap();
+                                let done = matches!(&event,AgentDurableEvent::ItemCompleted{notification} if matches!(&notification.item,TurnItem::SystemEvent{code,..} if code.as_deref()==Some("provider_usage"))) && release.is_none();
+                                match &event {
+                                    AgentDurableEvent::ItemStarted { notification } if matches!(&notification.item,TurnItem::AgentMessage{phase:AgentMessagePhase::FinalAnswer,..}) => {
+                                        assert!(release.is_none(), "preview must not start a canonical result");
+                                    }
+                                    AgentDurableEvent::ItemCompleted { notification } if matches!(&notification.item,TurnItem::AgentMessage{phase:AgentMessagePhase::Commentary,..}) => {
+                                        let TurnItem::AgentMessage { id, text, .. } = &notification.item else { unreachable!() };
+                                        assert_eq!(Some(id), preview_id.as_ref());
+                                        assert_eq!(text, "working");
+                                        commentary += 1;
+                                    }
+                                    AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } => {
+                                        assert!(release.is_none(), "preview is not accepted history");
+                                        let envelope: pioneer_provider::CanonicalProviderRoundEnvelope = serde_json::from_value(payload.clone()).unwrap();
+                                        assert_eq!(envelope.termination, if eof { ProviderTermination::ProviderError } else { ProviderTermination::Complete });
+                                        assert!(envelope.calls.is_empty());
+                                        assert!(envelope.message.provider_replay_state.is_none());
+                                        if phase == Some(AgentMessagePhase::Commentary) { assert!(envelope.message.content.contains("[Assistant commentary]\nworking")); }
+                                        saved = true;
+                                    }
+                                    AgentDurableEvent::TurnFinalizationPrepared { notification, .. } => {
+                                        assert!(!eof);
+                                        assert!(saved, "history ACK precedes finalization");
+                                        let TurnItem::AgentMessage { text, .. } = &notification.item else { panic!("final") };
+                                        assert_eq!(text, expected);
+                                        finals += 1;
+                                    }
+                                    _ => {}
+                                }
+                                durable.acknowledge_last(Ok(()));
+                                if done { break; }
+                            }
+                        }
+                    }
+                    assert!(
+                        preview_id.is_some(),
+                        "text was consumed before terminal release"
+                    );
+                    assert_eq!(
+                        commentary,
+                        usize::from(phase == Some(AgentMessagePhase::Commentary))
+                    );
+                    assert_eq!(finals, usize::from(!agent && !eof));
+                };
+                let (result, ()) =
+                    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+                        tokio::join!(producer, consume)
+                    })
+                    .await
+                    .expect("live text must release the terminal gate");
+                if eof {
+                    assert!(result.is_err());
+                } else {
+                    assert_eq!(result.unwrap(), expected);
+                }
+            }
+        }
+    }
+    #[tokio::test]
+    async fn default_delivery_keeps_incremental_chat_result_before_terminal() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let provider: Arc<dyn Provider> = Arc::new(ProvisionalProvider {
+            release: std::sync::Mutex::new(Some(release_rx)),
+            phase: Some(AgentMessagePhase::FinalAnswer),
+            eof: false,
+            delivery: Default::default(),
+            provisional_start: false,
+        });
+        let hub = AgentEventHub::new();
+        let mut durable = hub.take_durable_receiver().await.unwrap();
+        let mut live = hub.subscribe_live();
+        let consume = async {
+            let mut release = Some(release_tx);
+            let mut started = 0;
+            let mut saved = false;
+            loop {
+                tokio::select! {
+                    progress = live.recv(), if release.is_some() => {
+                        let AgentProgressEvent::ItemDelta { notification } = progress.unwrap() else { continue; };
+                        assert_ne!(notification.payload.as_ref().and_then(|p| p["runtimeDeltaKind"].as_str()), Some("provider_message_preview"));
+                        if notification.stream == Some(pioneer_protocol::ItemDeltaStream::AgentMessage) {
+                            assert_eq!(notification.item_id, "final");
+                            assert_eq!(notification.delta, "working");
+                            // The producer has received the durable start ACK before this delta.
+                            assert_eq!(started, 1);
+                            release.take().unwrap().send(()).unwrap();
+                        }
+                    }
+                    event = durable.recv() => {
+                        let event = event.unwrap();
+                        let done = matches!(&event, AgentDurableEvent::ItemCompleted { notification } if matches!(&notification.item, TurnItem::SystemEvent { code, .. } if code.as_deref() == Some("provider_usage")));
+                        match &event {
+                            AgentDurableEvent::ItemStarted { notification } if matches!(&notification.item, TurnItem::AgentMessage { phase: AgentMessagePhase::FinalAnswer, .. }) => {
+                                assert!(release.is_some());
+                                started += 1;
+                            }
+                            AgentDurableEvent::TurnProviderHistoryAppended { .. } => {
+                                assert!(release.is_none());
+                                saved = true;
+                            }
+                            AgentDurableEvent::TurnFinalizationPrepared { notification, .. } => {
+                                assert!(saved);
+                                let TurnItem::AgentMessage { text, .. } = &notification.item else { panic!("final") };
+                                assert_eq!(text, "working");
+                            }
+                            _ => {}
+                        }
+                        durable.acknowledge_last(Ok(()));
+                        if done { break; }
+                    }
+                }
+            }
+            assert_eq!(started, 1);
+            assert!(release.is_none());
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                stream_provider_response(
+                    &provider,
+                    request(),
+                    "ws",
+                    "thread",
+                    "turn",
+                    "thinking",
+                    "final",
+                    ProviderTimeoutPolicy::default(),
+                    &hub
+                ),
+                consume
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap().0, "working");
     }
     #[tokio::test]
     async fn commentary_precedes_terminal_and_multiple_results_share_one_gated_final() {

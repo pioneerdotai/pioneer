@@ -201,6 +201,10 @@ description = "GPT und andere OpenAI-Modelle"
 title = "OpenRouter"
 description = "Router für viele Modellanbieter"
 
+[providers.catalog.vercel-ai-gateway]
+title = "Vercel AI Gateway"
+description = "Zugriff auf Modelle über Vercel AI Gateway"
+
 [providers.catalog.telnyx]
 title = "Telnyx"
 description = "Telnyx-Inferenzendpunkt"

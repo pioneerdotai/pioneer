@@ -997,9 +997,24 @@ async fn request_turn_preflight_provider_json(
     max_output_chars: usize,
     _attempt: u32,
 ) -> anyhow::Result<String> {
-    let model_catalog = pioneer_provider::catalog::model_catalog()
-        .map_err(TurnPreflightProviderRequestFailure::model_catalog_error)?;
-    let model_limits = model_catalog.limits(provider.name(), &request.model);
+    let model_limits = provider
+        .model_limits(&request.model)
+        .await
+        .map_err(|error| {
+            if error.is::<pioneer_provider::catalog::ModelCatalogUnavailable>() {
+                TurnPreflightProviderRequestFailure::model_catalog_error(error)
+            } else {
+                if let Some(observation) = observation {
+                    observation.observe_error(&error);
+                }
+                TurnPreflightProviderRequestFailure::provider_error(
+                    provider,
+                    "model_capability_discovery",
+                    ProviderFailureStage::Connect,
+                    error,
+                )
+            }
+        })?;
     let evaluated = crate::compaction::request::NativeRequestProjection::full(
         request,
         vec![],
@@ -2305,6 +2320,7 @@ mod tests {
         name: String,
         streaming: bool,
         phased: bool,
+        model_failure: Option<bool>,
         responses: Mutex<VecDeque<FakePreflightResponse>>,
         requests: Mutex<Vec<ChatRequest>>,
     }
@@ -2320,6 +2336,7 @@ mod tests {
                 name: name.into(),
                 streaming,
                 phased: false,
+                model_failure: None,
                 responses: Mutex::new(responses.into_iter().collect()),
                 requests: Mutex::new(Vec::new()),
             }
@@ -2420,6 +2437,26 @@ mod tests {
             self.name.as_str()
         }
 
+        async fn model_limits(
+            &self,
+            model: &str,
+        ) -> anyhow::Result<pioneer_provider::catalog::CatalogLimits> {
+            match self.model_failure {
+                Some(true) => Err(anyhow::Error::new(
+                    pioneer_provider::catalog::ModelCatalogUnavailable,
+                )
+                .context("sensitive catalog context")),
+                Some(false) => Err(anyhow::Error::new(FakeClassifiedFailure {
+                    text: "sensitive discovery response".into(),
+                    classification: pioneer_provider::ProviderFailureClassification::new(
+                        pioneer_protocol::ProviderFailureClass::RateLimit,
+                    ),
+                })
+                .context("sensitive discovery context")),
+                None => Ok(pioneer_provider::catalog::model_catalog()?.limits(self.name(), model)),
+            }
+        }
+
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {
                 streaming: self.streaming,
@@ -2487,6 +2524,44 @@ mod tests {
                     pioneer_provider::ProviderTermination::Complete,
                 )),
             ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn model_discovery_failure_classification_is_independent_of_provider_name() {
+        for local_catalog in [false, true] {
+            let mut provider = FakePreflightProvider::new("connection-facts-provider", false, []);
+            provider.model_failure = Some(local_catalog);
+            let error = request_turn_preflight_provider_json(
+                &provider,
+                turn_preflight_chat_request("private/model", "prompt".into()),
+                None,
+                1024,
+                1,
+            )
+            .await
+            .unwrap_err();
+            let failure = error
+                .downcast_ref::<TurnPreflightProviderRequestFailure>()
+                .unwrap();
+            assert_eq!(
+                failure.description.stage,
+                if local_catalog {
+                    "model_catalog"
+                } else {
+                    "model_capability_discovery"
+                }
+            );
+            assert_eq!(
+                failure.description.failure_class,
+                if local_catalog {
+                    None
+                } else {
+                    Some(pioneer_protocol::ProviderFailureClass::RateLimit)
+                }
+            );
+            assert!(!format!("{error:#}").contains("sensitive"));
+            assert!(provider.requests().is_empty());
         }
     }
 

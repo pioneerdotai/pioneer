@@ -1379,6 +1379,7 @@ impl OpenRouterProvider {
         crate::ProviderStream {
             stream: Box::pin(chunk_stream),
             diagnostics,
+            message_delivery: crate::ProviderMessageDelivery::default(),
         }
     }
 }

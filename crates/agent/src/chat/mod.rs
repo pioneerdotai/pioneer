@@ -3454,6 +3454,22 @@ fn workdir_from_execution_security_snapshot(
         })
 }
 
+// Resolve connection-owned model facts before fixing the agent's tool inventory.
+async fn preload_agent_model(
+    context_session: Option<&crate::compaction::controller::NativeContextSession>,
+    provider: &dyn Provider,
+    model: &str,
+    thinking_item_id: &str,
+) -> Result<(), ChatTurnError> {
+    await_context_request(context_session, async {
+        provider.prepare_model(model).await.map_err(|error| {
+            provider::model_preparation_error(thinking_item_id, provider, model, &error)
+        })
+    })
+    .await?;
+    Ok(())
+}
+
 async fn execute_agent_provider_response(
     context_session: Option<&crate::compaction::controller::NativeContextSession>,
     provider_registry: Arc<ProviderRegistry>,
@@ -3498,6 +3514,13 @@ async fn execute_agent_provider_response(
     let filesystem_prompt_snapshot = execution_security_snapshot.clone();
 
     let tool_loop_config = tool_loop_config.normalized();
+    preload_agent_model(
+        context_session,
+        provider.as_ref(),
+        &model,
+        &initial_thinking_item_id,
+    )
+    .await?;
     let provider_tool_calling =
         provider.model_tool_calling(model.as_str()) && !disable_tool_calling;
     let native_file_tool_capability = if provider_tool_calling {
@@ -7053,6 +7076,146 @@ mod tests {
         PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId, PromptRuntimeSectionInput,
         PromptSectionId,
     };
+
+    // Owns the context-gate lifecycle contract shared by model-fact preload
+    // and provider rounds. No network or catalog fixture is required.
+    #[tokio::test(start_paused = true)]
+    async fn context_gate_drops_model_preparation_on_cancel_or_deadline() {
+        use crate::compaction::controller::{
+            NativeContext, NativeContextController, NativeContextSession, NativePreparedRequest,
+            NativeUsageMeasurement,
+        };
+        use pioneer_provider::{ChatRequest, ChatResponse, Provider, StreamChunk};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        struct DropSignal(Arc<AtomicBool>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        struct ModelPreparationFixture {
+            entered: tokio::sync::Notify,
+            dropped: Arc<AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for ModelPreparationFixture {
+            fn name(&self) -> &str {
+                "connection-facts-provider"
+            }
+            async fn prepare_model(&self, _: &str) -> anyhow::Result<()> {
+                let _drop = DropSignal(self.dropped.clone());
+                self.entered.notify_one();
+                std::future::pending().await
+            }
+            async fn chat(&self, _: ChatRequest) -> anyhow::Result<ChatResponse> {
+                panic!("generation must not begin")
+            }
+            async fn stream_chat(
+                &self,
+                _: ChatRequest,
+            ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+            {
+                panic!("stream generation must not begin")
+            }
+        }
+        struct NoPreparation;
+        #[async_trait::async_trait]
+        impl NativeContextController for NoPreparation {
+            async fn stop(&self, _: &NativeContext) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn prepare(
+                &self,
+                _: &NativeContext,
+                _: ChatRequest,
+                _: Option<NativeUsageMeasurement>,
+                _: bool,
+            ) -> anyhow::Result<NativePreparedRequest> {
+                panic!("context preparation must not begin")
+            }
+        }
+
+        for cancellation in [true, false] {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let provider = Arc::new(ModelPreparationFixture {
+                entered: tokio::sync::Notify::new(),
+                dropped: dropped.clone(),
+            });
+            let token = tokio_util::sync::CancellationToken::new();
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let session = NativeContextSession::new(
+                NativeContext {
+                    overflow_recovery: true,
+                    recovery_deadline_ms: Some(now_ms + 60_000),
+                    workspace_id: "workspace".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    conversation_thread_id: None,
+                    provider_instance: "instance".into(),
+                    provider: provider.clone(),
+                    events: Arc::new(pioneer_runtime_events::ExecutionEventHub::new()),
+                    cancellation: token.clone(),
+                },
+                Arc::new(NoPreparation),
+            );
+            let deadline = session.provider_deadline().unwrap();
+            let continued = AtomicBool::new(false);
+            let work = async {
+                super::preload_agent_model(
+                    Some(&session),
+                    provider.as_ref(),
+                    "private/model",
+                    "thinking",
+                )
+                .await?;
+                continued.store(true, Ordering::SeqCst);
+                session
+                    .prepare(
+                        ChatRequest {
+                            model: "private/model".into(),
+                            messages: vec![],
+                            temperature: None,
+                            max_tokens: None,
+                            tools: None,
+                            tool_choice: None,
+                            parallel_tool_calls: None,
+                            reasoning: None,
+                            compiled_prompt: None,
+                        },
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                Ok::<(), super::ChatTurnError>(())
+            };
+            tokio::pin!(work);
+            tokio::select! { biased;
+                result = &mut work => panic!("preload unexpectedly finished: {result:?}"),
+                _ = provider.entered.notified() => {}
+            }
+            assert!(!dropped.load(Ordering::SeqCst));
+            if cancellation {
+                token.cancel();
+            } else {
+                tokio::time::advance(deadline - tokio::time::Instant::now()).await;
+            }
+            let std::task::Poll::Ready(result) = futures_util::poll!(work.as_mut()) else {
+                panic!("context gate left model discovery pending");
+            };
+            let error = result.unwrap_err();
+            assert!(matches!(error, super::ChatTurnError::Blocked(ref message)
+                if message.contains(if cancellation { "cancelled" } else { "deadline exceeded" })));
+            assert!(dropped.load(Ordering::SeqCst));
+            assert!(!continued.load(Ordering::SeqCst));
+        }
+    }
 
     #[test]
     fn provider_tool_definition_uses_only_the_selected_input_form() {

@@ -122,6 +122,15 @@ impl Provider for JournalProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         self.inner.capabilities()
     }
+    async fn prepare_model(&self, model: &str) -> Result<()> {
+        self.inner.prepare_model(model).await
+    }
+    async fn model_limits(&self, model: &str) -> Result<pioneer_provider::catalog::CatalogLimits> {
+        self.inner.model_limits(model).await
+    }
+    fn model_catalog_entry(&self, model: &str) -> Option<pioneer_provider::catalog::CatalogModel> {
+        self.inner.model_catalog_entry(model)
+    }
     fn model_tool_calling(&self, model: &str) -> bool {
         self.inner.model_tool_calling(model)
     }
@@ -185,6 +194,7 @@ impl Provider for JournalProvider {
             }
         };
         let diagnostics = response.diagnostics;
+        let message_delivery = response.message_delivery;
         let stream = Box::pin(futures_util::stream::unfold(
             (response.stream, call, usage, None::<bool>),
             |(mut stream, call, mut usage, mut terminal)| async move {
@@ -244,6 +254,7 @@ impl Provider for JournalProvider {
         Ok(pioneer_provider::ProviderStream {
             stream,
             diagnostics,
+            message_delivery,
         })
     }
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {

@@ -1790,6 +1790,9 @@ impl SettingsScreenView {
         let provider = match settings.provider {
             Some(GatewayThreadEpisodicVectorProvider::OpenAi) => Some("openai".to_owned()),
             Some(GatewayThreadEpisodicVectorProvider::OpenRouter) => Some("openrouter".to_owned()),
+            Some(GatewayThreadEpisodicVectorProvider::VercelAiGateway) => {
+                Some("vercel-ai-gateway".to_owned())
+            }
             Some(GatewayThreadEpisodicVectorProvider::Local) => Some("local".to_owned()),
             None => None,
         };

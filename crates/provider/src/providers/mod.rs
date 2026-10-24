@@ -16,6 +16,8 @@ pub(crate) mod openai;
 pub(crate) mod openrouter;
 pub(crate) mod retired;
 pub(crate) mod telnyx;
+pub(crate) mod vercel_ai_gateway;
+pub use vercel_ai_gateway::VercelAiGatewayProvider;
 
 pub use anthropic::AnthropicProvider;
 pub use azure_openai::AzureOpenAiProvider;
