@@ -3972,8 +3972,8 @@ async fn start_threads_cli_fixture(
         },
         completion: Arc::new(std::sync::Mutex::new(Some(sender))),
     };
-    processor
-        .turn_start_cli_runtime(
+    let (_, diagnostics) =
+        crate::public_error::test_support::capture_events_async(processor.turn_start_cli_runtime(
             harness.connection_id,
             serde_json::from_value(request["id"].clone()).unwrap(),
             pioneer_protocol::PersistedActorRef::Principal(
@@ -3987,12 +3987,14 @@ async fn start_threads_cli_fixture(
                 revalidation: Arc::new(revalidation),
             },
             response,
-        )
+        ))
         .await;
     let prepared = receiver
         .await
         .expect("Threads fixture preparation should return a result")
-        .expect("Threads fixture durable CLI preparation should succeed");
+        .unwrap_or_else(|error| {
+            panic!("Threads fixture durable CLI preparation failed: {error:#}; diagnostics: {diagnostics:#?}")
+        });
     processor
         .activate_prepared_committed_agent_cli_runtime_turn(prepared)
         .await
