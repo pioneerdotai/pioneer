@@ -24,6 +24,10 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub config_hash: Option<String>,
     pub managed: i64,
+    /// Execution intents are retained for lifecycle; only publication may opt
+    /// into the root conversation preparation policy.
+    #[sea_orm(column_type = "Text")]
+    pub purpose: String,
     #[sea_orm(
         belongs_to,
         from = "turn_id",

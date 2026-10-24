@@ -1,3 +1,6 @@
+#[path = "tests/root_conversation_compaction.rs"]
+mod root_conversation_compaction;
+
 #[path = "tests/scoped_push.rs"]
 mod scoped_push;
 
@@ -73654,6 +73657,7 @@ async fn completed_command_history_fits_real_background_preflight_after_projecti
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         None,
+        None,
         &mut diagnostic,
     )
     .await
@@ -73762,6 +73766,7 @@ async fn genuinely_large_command_history_compacts_through_real_background_prefli
         0,
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
         None,
         None,
         &mut diagnostic,
@@ -79269,6 +79274,25 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
         "idempotency must not bypass workspace/thread/turn validation"
     );
 
+    harness
+        .crud_store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: TurnItem::AgentMessage {
+                    id: "native-intent-published-answer".into(),
+                    text: "Ready answer".into(),
+                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            phase_13_now_secs(),
+        )
+        .await
+        .unwrap();
     let mut completed = harness
         .crud_store
         .get_turn(thread, turn)
@@ -79646,8 +79670,8 @@ async fn history_intents_are_per_execution_turn_for_followups_nested_and_cli() {
     );
     assert_eq!(
         row.try_get::<i64>("", "cli").unwrap(),
-        1,
-        "CLI completion must keep using its existing trigger registration"
+        0,
+        "CLI completion without a published answer must not register hypothetical continuation work"
     );
 }
 
@@ -79879,6 +79903,7 @@ async fn production_background_preflight_ignores_technical_noise_but_budgets_rea
                 fixed_input_tokens,
                 None,
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
                 None,
                 None,
                 &mut diagnostic,
@@ -80435,6 +80460,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         None,
+        None,
         &mut baseline,
     )
     .await
@@ -80544,6 +80570,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         None,
+        None,
         &mut fitting,
     )
     .await
@@ -80574,6 +80601,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
         fixed,
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
         None,
         None,
         &mut overflowing,
@@ -81207,6 +81235,27 @@ async fn check_completed_history(
             native_owner_context = Some(native_context);
         }
     }
+    // Optional preparation now follows a published human answer, rather than
+    // execution completion alone. Keep the existing lifecycle/recovery proof.
+    harness
+        .crud_store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: TurnItem::AgentMessage {
+                    id: format!("{turn}-published-answer"),
+                    text: "Ready answer".into(),
+                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            phase_13_now_secs(),
+        )
+        .await
+        .unwrap();
     let mut completed = harness
         .crud_store
         .get_turn(thread, turn)
@@ -81619,6 +81668,27 @@ async fn compaction_history_waits_for_changed_settings_without_spending_provider
         &"completed work ".repeat(80_000),
     )
     .await;
+    // Optional preparation now follows a published human answer, rather than
+    // execution completion alone. Keep the existing lifecycle/recovery proof.
+    harness
+        .crud_store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: TurnItem::AgentMessage {
+                    id: format!("{turn}-published-answer"),
+                    text: "Ready answer".into(),
+                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            phase_13_now_secs(),
+        )
+        .await
+        .unwrap();
     let mut completed = harness
         .crud_store
         .get_turn(thread, turn)
@@ -81912,6 +81982,7 @@ async fn background_completed_history_projects_reasoning_before_fit_and_compacti
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         None,
+        None,
         &mut fitting,
     )
     .await
@@ -81941,6 +82012,7 @@ async fn background_completed_history_projects_reasoning_before_fit_and_compacti
         fixed,
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
         None,
         None,
         &mut compacted,
@@ -82240,6 +82312,7 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
             None,
+            None,
             &mut diagnostic,
         )
         .await
@@ -82298,6 +82371,7 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
         compaction_fixed,
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
         None,
         None,
         &mut diagnostic,

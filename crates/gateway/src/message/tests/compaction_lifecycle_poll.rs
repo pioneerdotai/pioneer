@@ -30,9 +30,27 @@ async fn fixture() -> (
         )))
         .await;
     let db = store.with_maintenance_access().database_connection();
-    db.execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Sqlite,
-        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('poll-thread',?,'','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", [workspace.clone().into()])).await.unwrap();
-    db.execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('poll-turn','poll-thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    let history = Phase13CompactionHarness {
+        processor: processor.clone(),
+        crud_store: store.clone(),
+        workspace_id: workspace.clone(),
+    };
+    super::root_conversation_compaction::human_input(
+        &history,
+        "poll-thread",
+        "poll-turn",
+        phase_13_now_secs(),
+        "actual root question",
+    )
+    .await;
+    super::root_conversation_compaction::answer(
+        &history,
+        "poll-thread",
+        "poll-turn",
+        phase_13_now_secs(),
+        "actual root answer",
+    )
+    .await;
     db.execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Sqlite,
         "INSERT INTO compaction_context(owner,workspace_id,thread_id,format_version) VALUES('poll-owner',?,'poll-thread',1)", [workspace.into()])).await.unwrap();
     for id in
@@ -67,7 +85,15 @@ async fn lifecycle_claim_and_deferral_failure_keeps_batch_progress_history_poll_
         .unwrap()
         .unwrap();
     // An independent history check must still be owned after lifecycle failure.
-    db.execute_unprepared("INSERT INTO compaction_history_check(turn_id,state,descriptor,managed) VALUES('poll-turn','pending','{}',1)").await.unwrap();
+    assert!(
+        store
+            .compaction_pending_history_checks()
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.turn_id == "poll-turn"),
+        "actual answer must enqueue root work"
+    );
     let started = std::time::Instant::now();
     let write_start = observer.writes.lock().unwrap().len();
     let result = tokio::time::timeout(

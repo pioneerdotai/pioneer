@@ -66,6 +66,10 @@ view_grants_global = 4096
 view_grants_per_session = 16
 view_grant_streams = 4
 
+[gateway.context_compaction]
+# Prepare active main conversations in the background for eight hours after user activity.
+hot_conversation_window_secs = 28800
+
 [gateway.resilience.command_execution]
 lease_secs = 600
 idle_secs = 1800
