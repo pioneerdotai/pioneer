@@ -896,6 +896,8 @@ impl ProviderCatalogView {
             ("ovhcloud", false) => "logos/providers/ovhcloud-light.svg",
             ("openai", true) => "logos/providers/openai-dark.svg",
             ("openai", false) => "logos/providers/openai-light.svg",
+            ("vercel-ai-gateway", true) => "logos/providers/vercel-dark.svg",
+            ("vercel-ai-gateway", false) => "logos/providers/vercel-light.svg",
             ("xai", true) => "logos/providers/xai-dark.svg",
             ("xai", false) => "logos/providers/xai-light.svg",
             ("yi", true) => "logos/providers/yi-dark.svg",

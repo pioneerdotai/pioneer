@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 const OPENAI_PROVIDER_ID: &str = "openai";
 const OPENROUTER_PROVIDER_ID: &str = "openrouter";
+const VERCEL_PROVIDER_ID: &str = "vercel-ai-gateway";
 const LOCAL_PROVIDER_ID: &str = "local";
 const LOCAL_EMBEDDING_MODELS_RELATIVE_DIR: &[&str] = &["models", "embedding", "text"];
 const LOCAL_EMBEDDING_DOWNLOAD_TIMEOUT_SECS: u64 = 15 * 60;
@@ -1168,7 +1169,13 @@ pub(crate) fn embedding_provider_readiness_from_settings(
     }
 
     if settings.embedding_dimension.is_none()
-        && settings.provider != Some(GatewayThreadEpisodicVectorProvider::OpenRouter)
+        && !matches!(
+            settings.provider,
+            Some(
+                GatewayThreadEpisodicVectorProvider::OpenRouter
+                    | GatewayThreadEpisodicVectorProvider::VercelAiGateway
+            )
+        )
     {
         return EmbeddingProviderReadinessDiagnostic::new(
             EmbeddingProviderReadinessState::MissingConfiguration,
@@ -1233,6 +1240,7 @@ fn vector_provider_id(provider: Option<GatewayThreadEpisodicVectorProvider>) -> 
     match provider {
         Some(GatewayThreadEpisodicVectorProvider::OpenAi) => OPENAI_PROVIDER_ID,
         Some(GatewayThreadEpisodicVectorProvider::OpenRouter) => OPENROUTER_PROVIDER_ID,
+        Some(GatewayThreadEpisodicVectorProvider::VercelAiGateway) => VERCEL_PROVIDER_ID,
         Some(GatewayThreadEpisodicVectorProvider::Local) => LOCAL_PROVIDER_ID,
         None => "none",
     }
@@ -1603,29 +1611,53 @@ impl RemoteEmbeddingProvider {
         use_search_instructions: bool,
         provider: Arc<dyn Provider>,
     ) -> Result<Self, ThreadEpisodicEmbeddingError> {
-        Self::ensure_provider_supports_embeddings(
+        Self::aggregator_with_max_input_tokens(
             OPENROUTER_PROVIDER_ID,
-            model,
-            provider.as_ref(),
-        )?;
-        let model_info = match openrouter_embedding_model_info_with_input_limit(
             model,
             explicit_dimension,
             explicit_max_input_tokens,
-        ) {
-            Ok(model_info) => model_info,
-            Err(_) if explicit_dimension.is_none() => {
-                let dimension = Self::probe_embedding_dimension(
-                    OPENROUTER_PROVIDER_ID,
-                    model,
-                    provider.as_ref(),
-                )?;
+            normalized,
+            use_search_instructions,
+            provider,
+        )
+    }
+
+    pub(crate) fn aggregator_with_max_input_tokens(
+        provider_id: &'static str,
+        model: &str,
+        explicit_dimension: Option<usize>,
+        explicit_max_input_tokens: Option<usize>,
+        normalized: bool,
+        use_search_instructions: bool,
+        provider: Arc<dyn Provider>,
+    ) -> Result<Self, ThreadEpisodicEmbeddingError> {
+        Self::ensure_provider_supports_embeddings(provider_id, model, provider.as_ref())?;
+        let known = if provider_id == OPENROUTER_PROVIDER_ID {
+            match openrouter_embedding_model_info_with_input_limit(
+                model,
+                explicit_dimension,
+                explicit_max_input_tokens,
+            ) {
+                Ok(info) => Some(info),
+                Err(error) if explicit_dimension.is_some() => return Err(error),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let model_info = match known {
+            Some(model_info) => model_info,
+            None => {
+                let dimension = match explicit_dimension.filter(|dimension| *dimension > 0) {
+                    Some(dimension) => dimension,
+                    None => Self::probe_embedding_dimension(provider_id, model, provider.as_ref())?,
+                };
                 OpenRouterEmbeddingModelInfo {
                     model: model.to_owned(),
                     dimension,
                     max_batch_size:
                         pioneer_provider::providers::embedding::EmbeddingBatchLimits::for_model(
-                            OPENROUTER_PROVIDER_ID,
+                            provider_id,
                             model,
                             Some(dimension),
                             None,
@@ -1633,7 +1665,7 @@ impl RemoteEmbeddingProvider {
                         )
                         .map_err(|error| {
                             ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
-                                OPENROUTER_PROVIDER_ID,
+                                provider_id,
                                 model,
                                 error.to_string(),
                             )
@@ -1645,11 +1677,10 @@ impl RemoteEmbeddingProvider {
                     custom: true,
                 }
             }
-            Err(error) => return Err(error),
         };
 
         Ok(Self {
-            provider_id: OPENROUTER_PROVIDER_ID,
+            provider_id,
             model: model_info.model,
             dimension: model_info.dimension,
             max_batch_size: model_info.max_batch_size,
@@ -2764,6 +2795,31 @@ mod tests {
         assert_eq!(provider.provider_id(), OPENROUTER_PROVIDER_ID);
         assert_eq!(provider.dimension(), 4096);
         assert_eq!(provider.embed_text("hello").unwrap().len(), 4096);
+    }
+
+    #[test]
+    fn vercel_remote_embeddings_probe_dimension_without_direct_vendor_assumptions() {
+        let provider = RemoteEmbeddingProvider::aggregator_with_max_input_tokens(
+            "vercel-ai-gateway",
+            "openai/text-embedding-3-small",
+            None,
+            Some(4096),
+            true,
+            false,
+            Arc::new(FakeRemoteProvider::with_responses(
+                "vercel-ai-gateway",
+                vec![
+                    Ok(embedding_response(vec![vec![0.1; 3]])),
+                    Ok(embedding_response(vec![vec![0.2; 3]])),
+                ],
+            )),
+        )
+        .expect("Vercel remote embeddings");
+        assert_eq!(provider.provider_id(), "vercel-ai-gateway");
+        assert_eq!(provider.model(), "openai/text-embedding-3-small");
+        assert_eq!(provider.dimension(), 3);
+        assert_eq!(provider.max_input_tokens(), 4096);
+        assert_eq!(provider.embed_text("hello").unwrap(), vec![0.2; 3]);
     }
 
     #[test]

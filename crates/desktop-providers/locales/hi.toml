@@ -201,6 +201,10 @@ description = "GPT और अन्य OpenAI मॉडल"
 title = "OpenRouter"
 description = "कई मॉडल प्रदाताओं के लिए राउटर"
 
+[providers.catalog.vercel-ai-gateway]
+title = "Vercel AI Gateway"
+description = "Vercel AI Gateway के ज़रिए मॉडल का उपयोग करें"
+
 [providers.catalog.telnyx]
 title = "Telnyx"
 description = "Telnyx अनुमान एंडपॉइंट"

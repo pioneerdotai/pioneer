@@ -4374,6 +4374,161 @@ async fn start_simple_turn_with_terminal_effects(
     recv_and_execute_terminal_effects(manager, &mut durable_events, turn_id).await
 }
 
+// Preparation must precede the real agent inventory, not just dispatch.
+#[tokio::test]
+async fn connection_owned_model_preparation_precedes_agent_tool_inventory() {
+    use crate::compaction::controller::NativeContextController;
+    #[derive(Default)]
+    struct AdmissionBoundary {
+        inner: RecordingContextBoundary,
+        admitted: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl crate::compaction::controller::NativeContextController for AdmissionBoundary {
+        async fn stop(
+            &self,
+            context: &crate::compaction::controller::NativeContext,
+        ) -> anyhow::Result<()> {
+            self.inner.stop(context).await
+        }
+        async fn prepare(
+            &self,
+            context: &crate::compaction::controller::NativeContext,
+            request: ChatRequest,
+            measurement: Option<crate::compaction::controller::NativeUsageMeasurement>,
+            recovery: bool,
+        ) -> anyhow::Result<crate::compaction::controller::NativePreparedRequest> {
+            let prepared = context.provider.prepare_input_budget(request).await?;
+            self.admitted.store(true, Ordering::SeqCst);
+            self.inner
+                .prepare(context, prepared.request, measurement, recovery)
+                .await
+        }
+    }
+    struct PreparedModel {
+        inner: CaptureAgentProvider,
+        prepared: std::sync::atomic::AtomicBool,
+        preflight_observed_prepared: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl Provider for PreparedModel {
+        fn name(&self) -> &str {
+            "connection-facts-provider"
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.inner.capabilities()
+        }
+        async fn prepare_model(&self, _: &str) -> anyhow::Result<()> {
+            self.prepared.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn model_catalog_entry(
+            &self,
+            model: &str,
+        ) -> Option<pioneer_provider::catalog::CatalogModel> {
+            Some(pioneer_provider::catalog::CatalogModel {
+                id: model.into(),
+                name: "connection model".into(),
+                provider: self.name().into(),
+                api: "fixture-api".into(),
+                base_url: String::new(),
+                context_window: 32000,
+                max_tokens: 4321,
+                reasoning: false,
+                input: vec!["text".into()],
+                cost: serde_json::json!({}),
+                metadata: Default::default(),
+            })
+        }
+        fn model_tool_calling(&self, _: &str) -> bool {
+            self.prepared.load(Ordering::SeqCst)
+        }
+        fn native_file_tool_capability(
+            &self,
+            model: &str,
+        ) -> pioneer_provider::NativeFileToolCapability {
+            self.inner.native_file_tool_capability(model)
+        }
+        async fn prepare_input_budget(
+            &self,
+            request: ChatRequest,
+        ) -> anyhow::Result<pioneer_provider::attachments::PreparedInputBudget> {
+            assert!(
+                self.prepared.load(Ordering::SeqCst),
+                "model facts must be ready before input admission"
+            );
+            self.inner.prepare_input_budget(request).await
+        }
+        async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+            if is_turn_preflight_request(&request) {
+                assert!(
+                    self.prepared.load(Ordering::SeqCst),
+                    "preflight follows model preparation and inventory selection"
+                );
+                self.preflight_observed_prepared
+                    .store(true, Ordering::SeqCst);
+            } else {
+                assert!(
+                    self.prepared.load(Ordering::SeqCst),
+                    "main dispatch requires prepared model facts"
+                );
+            }
+            self.inner.chat(request).await
+        }
+        async fn stream_chat(
+            &self,
+            request: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            self.inner.stream_chat(request).await
+        }
+    }
+    let provider = Arc::new(PreparedModel {
+        inner: CaptureAgentProvider::default(),
+        prepared: std::sync::atomic::AtomicBool::new(false),
+        preflight_observed_prepared: std::sync::atomic::AtomicBool::new(false),
+    });
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "connection-facts-provider",
+        provider.clone(),
+    ));
+    let wrapped = registry.get_or_create("connection-facts-provider").unwrap();
+    assert!(wrapped.capabilities().tool_calling);
+    assert!(!wrapped.model_tool_calling("test-model"));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let admission = Arc::new(AdmissionBoundary::default());
+    manager
+        .set_context_controller(Some(admission.clone()))
+        .await;
+    assert!(!provider.prepared.load(Ordering::SeqCst));
+    let observed = start_simple_turn(
+        &manager,
+        "prepared_model_inventory_thread",
+        "workspace",
+        "prepared_model_inventory_turn",
+        ThreadMode::Agent,
+        "connection-facts-provider",
+        "hello",
+    )
+    .await;
+    assert_turn_completed(&observed);
+    assert!(admission.admitted.load(Ordering::SeqCst));
+    assert!(provider.preflight_observed_prepared.load(Ordering::SeqCst));
+    let requests = provider.inner.snapshot_all_requests();
+    assert!(is_turn_preflight_request(
+        requests.first().expect("preflight request")
+    ));
+    let main_request = requests
+        .iter()
+        .find(|request| request.compiled_prompt.is_some())
+        .expect("main provider request");
+    let tools = main_request
+        .tools
+        .as_ref()
+        .expect("prepared model must receive the real tool inventory");
+    assert!(tools.iter().any(|tool| tool.name == "read_file"));
+}
+
 #[tokio::test]
 async fn preflight_agent_loop_runs_before_first_main_prompt_compile() {
     let provider = Arc::new(CaptureAgentProvider::default());

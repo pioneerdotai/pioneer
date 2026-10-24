@@ -62,8 +62,9 @@ pub use types::{
     InputContentType, InputTypeSupport, MessageAttachment, MessageContentPart, MessageProvenance,
     MessageSourceAlias, MessageSourceIdentity, MessageSourceRef, ModelInputItem,
     ProviderCallIdentity, ProviderCapabilities, ProviderFailureClassification,
-    ProviderHttpErrorBodyTooLarge, ProviderInputCapabilities, ProviderReplayState,
-    ProviderResponseLimits, ProviderResponseTooLarge, ProviderStream, ProviderStreamDiagnostics,
-    ProviderTermination, ProviderTimeoutPolicy, ProviderToolCall, ProviderUsageProfile,
-    ReasoningConfig, ReasoningEffort, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+    ProviderHttpErrorBodyTooLarge, ProviderInputCapabilities, ProviderMessageDelivery,
+    ProviderReplayState, ProviderResponseLimits, ProviderResponseTooLarge, ProviderStream,
+    ProviderStreamDiagnostics, ProviderTermination, ProviderTimeoutPolicy, ProviderToolCall,
+    ProviderUsageProfile, ReasoningConfig, ReasoningEffort, Role, StreamChunk, TokenUsage,
+    ToolChoice, ToolDefinition,
 };

@@ -17,6 +17,12 @@ pub struct ProviderMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderMessageBoundary {
     Start,
+    /// A live message whose semantic phase is not yet known. Its real text is
+    /// observable progress, but is excluded from the accepted result prefix.
+    StartProvisional,
+    /// Resolve a provisional message exactly once, before End. None here is
+    /// definitive absence, unlike the unknown phase at StartProvisional.
+    Resolve,
     Delta,
     End,
 }
@@ -55,6 +61,7 @@ fn matches_result(messages: &[ProviderMessage], text: &str) -> bool {
 pub struct ProviderMessageCollector {
     messages: Vec<ProviderMessage>,
     ended: Vec<bool>,
+    provisional: Vec<bool>,
     result: String,
     result_cursor: usize,
     result_offsets: Vec<usize>,
@@ -74,7 +81,7 @@ impl ProviderMessageCollector {
             ensure!(!self.legacy_seen, "mixed legacy and typed provider text");
             let index = self.messages.iter().position(|m| m.id == meta.id);
             match meta.boundary {
-                ProviderMessageBoundary::Start => {
+                ProviderMessageBoundary::Start | ProviderMessageBoundary::StartProvisional => {
                     ensure!(
                         chunk.delta.is_empty() && index.is_none(),
                         "invalid provider message start"
@@ -83,14 +90,30 @@ impl ProviderMessageCollector {
                         self.messages.len() < Self::MAX_MESSAGES,
                         "provider message count limit"
                     );
+                    let provisional = meta.boundary == ProviderMessageBoundary::StartProvisional;
+                    ensure!(
+                        !provisional || meta.phase.is_none(),
+                        "provisional message has a phase"
+                    );
                     self.messages.push(ProviderMessage {
                         id: meta.id,
                         phase: meta.phase.clone(),
                         text: String::new(),
                     });
                     self.ended.push(false);
+                    self.provisional.push(provisional);
                     self.result_offsets.push(0);
                     self.result_started.push(false);
+                }
+                ProviderMessageBoundary::Resolve => {
+                    let index =
+                        index.ok_or_else(|| anyhow::anyhow!("provider message before start"))?;
+                    ensure!(
+                        self.provisional[index] && !self.ended[index] && chunk.delta.is_empty(),
+                        "invalid provider message resolution"
+                    );
+                    self.messages[index].phase = meta.phase;
+                    self.provisional[index] = false;
                 }
                 boundary => {
                     let index =
@@ -101,6 +124,7 @@ impl ProviderMessageCollector {
                     );
                     if boundary == ProviderMessageBoundary::End {
                         ensure!(chunk.delta.is_empty(), "provider message end carries text");
+                        ensure!(!self.provisional[index], "unresolved provider message end");
                         self.ended[index] = true;
                     } else {
                         self.messages[index].text.push_str(&chunk.delta);
@@ -119,6 +143,9 @@ impl ProviderMessageCollector {
         while self.result_cursor < self.messages.len() {
             let index = self.result_cursor;
             let message = &self.messages[index];
+            if self.provisional[index] {
+                break;
+            }
             if message.phase == Some(AgentMessagePhase::Commentary) {
                 self.result_cursor += 1;
                 continue;
@@ -143,6 +170,10 @@ impl ProviderMessageCollector {
     }
     pub fn finish(&self) -> Result<()> {
         ensure!(self.ended.iter().all(|v| *v), "unfinished provider message");
+        ensure!(
+            !self.provisional.iter().any(|v| *v),
+            "unresolved provider message"
+        );
         ensure!(
             self.messages.is_empty() || matches_result(&self.messages, &self.result),
             "provider result projection conflict"
@@ -174,7 +205,7 @@ impl ProviderMessageCollector {
                 self.result.len()
             })
             .saturating_add(self.messages.len().saturating_mul(
-                std::mem::size_of::<ProviderMessage>() + 2 + std::mem::size_of::<usize>(),
+                std::mem::size_of::<ProviderMessage>() + 3 + std::mem::size_of::<usize>(),
             ))
     }
     pub fn validate_response(response: &ChatResponse) -> Result<()> {
@@ -293,6 +324,38 @@ mod tests {
             ))
             .is_err()
         );
+    }
+    #[test]
+    fn provisional_phase_is_resolved_once_before_projection_and_end() {
+        use ProviderMessageBoundary::*;
+        for phase in [
+            None,
+            Some(AgentMessagePhase::FinalAnswer),
+            Some(AgentMessagePhase::Commentary),
+        ] {
+            let mut c = ProviderMessageCollector::default();
+            c.push(&part(0, None, StartProvisional, "")).unwrap();
+            c.push(&part(0, None, Delta, "real progress")).unwrap();
+            assert_eq!(c.messages()[0].text, "real progress");
+            assert!(c.text().is_empty());
+            assert!(c.finish().is_err());
+            assert!(c.push(&part(0, None, End, "")).is_err());
+            c.push(&part(0, phase, Resolve, "")).unwrap();
+            assert_eq!(
+                c.text(),
+                if phase == Some(AgentMessagePhase::Commentary) {
+                    ""
+                } else {
+                    "real progress"
+                }
+            );
+            assert!(c.push(&part(0, phase, Resolve, "")).is_err());
+            c.push(&part(0, phase, Delta, " more")).unwrap();
+            c.push(&part(0, phase, End, "")).unwrap();
+            c.finish().unwrap();
+            assert_eq!(c.messages()[0].text, "real progress more");
+            assert!(c.push(&part(0, None, Resolve, "")).is_err());
+        }
     }
     #[test]
     fn missing_end_phase_change_and_legacy_mix_are_errors() {

@@ -10063,6 +10063,63 @@ fn web_fetch_item(item_id: &str) -> TurnItem {
     }
 }
 
+#[tokio::test]
+async fn provider_preview_deltas_do_not_pollute_canonical_markdown_or_retain_a_draft_buffer() {
+    let harness = setup_progress_delta_harness(
+        "provider_preview",
+        TurnItem::Reasoning {
+            id: "thinking_preview".into(),
+            summary: vec![],
+            content: vec![],
+        },
+        false,
+    )
+    .await;
+    let mut preview = progress_delta_notification(&harness, "working", ItemDeltaStream::Generic);
+    preview.item_id = "provider_preview".into();
+    preview.payload = Some(json!({"runtimeDeltaKind":"provider_message_preview"}));
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut preview)
+        .await;
+    assert!(preview.markdown.is_none());
+    assert!(preview.markdown_version.is_none());
+    let mut resolved = ItemStartedNotification {
+        workspace_id: harness.workspace_id.clone(),
+        thread_id: harness.thread_id.clone(),
+        turn_id: harness.turn_id.clone(),
+        item: TurnItem::AgentMessage {
+            id: "provider_preview".into(),
+            text: "working".into(),
+            phase: pioneer_protocol::AgentMessagePhase::Commentary,
+            markdown: None,
+            markdown_version: None,
+        },
+    };
+    harness
+        .processor
+        .enrich_item_started_markdown(&mut resolved)
+        .await;
+    preview.delta = "stale preview".into();
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut preview)
+        .await;
+    assert!(preview.markdown.is_none());
+    let mut delta = progress_delta_notification(&harness, " more", ItemDeltaStream::AgentMessage);
+    delta.item_id = "provider_preview".into();
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut delta)
+        .await;
+    assert_eq!(
+        delta.markdown,
+        Some(pioneer_protocol::MarkdownDocument::from_plain_text(
+            "working more"
+        ))
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn assistant_progress_delta_is_live_only_and_completed_item_is_durable() {
     let mut harness = setup_progress_delta_harness(
@@ -26852,6 +26909,8 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
                     runtime_id: Some(runtime_id.to_owned()),
                     session_generation: Some(session_generation),
                     provider_call_id: format!("provider-call-{runtime_id}"),
+                    native_call: None,
+                    admission_deadline: None,
                     canonical_callable_name: projected_tool.canonical_callable_name,
                     arguments: json!({"message": format!("{runtime_id} MCP authorization")}),
                     origin: crate::turn_mcp::invoker::TurnMcpInvocationOrigin::CliFacade,
@@ -85376,6 +85435,91 @@ async fn opencode_v2_summary_totals_and_native_categories_reach_completion_and_j
             retained.cache_write_input_tokens
         );
     }
+}
+
+#[tokio::test]
+async fn neutral_provider_preparation_and_delivery_survive_registry_and_journal() {
+    use pioneer_provider::{ProviderMessageDelivery, ProviderStream};
+    struct ConnectionFactsProvider(std::sync::atomic::AtomicBool);
+    #[async_trait::async_trait]
+    impl Provider for ConnectionFactsProvider {
+        fn name(&self) -> &str {
+            "connection-facts-provider"
+        }
+        fn capabilities(&self) -> pioneer_provider::ProviderCapabilities {
+            pioneer_provider::ProviderCapabilities {
+                streaming: true,
+                tool_calling: self.0.load(std::sync::atomic::Ordering::SeqCst),
+                ..Default::default()
+            }
+        }
+        async fn prepare_model(&self, _: &str) -> anyhow::Result<()> {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn chat(
+            &self,
+            _: pioneer_provider::ChatRequest,
+        ) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            panic!("the stream path must be preserved")
+        }
+        async fn stream_chat(
+            &self,
+            _: pioneer_provider::ChatRequest,
+        ) -> anyhow::Result<
+            futures_util::stream::BoxStream<'static, anyhow::Result<pioneer_provider::StreamChunk>>,
+        > {
+            panic!("diagnostic stream must not fall back to stream_chat")
+        }
+        async fn stream_chat_with_diagnostics(
+            &self,
+            _: pioneer_provider::ChatRequest,
+        ) -> anyhow::Result<ProviderStream> {
+            assert!(self.0.load(std::sync::atomic::Ordering::SeqCst));
+            let mut response = ProviderStream::new(Box::pin(futures_util::stream::iter(vec![
+                Ok(pioneer_provider::StreamChunk::delta("prepared connection")),
+                Ok(pioneer_provider::StreamChunk::final_chunk_with(
+                    pioneer_provider::ProviderTermination::Complete,
+                )),
+            ])));
+            response.message_delivery = ProviderMessageDelivery::Provisional;
+            Ok(response)
+        }
+    }
+    let (_, store, workspace_id) = setup_workspace_manager().await;
+    let inner = Arc::new(ConnectionFactsProvider(std::sync::atomic::AtomicBool::new(
+        false,
+    )));
+    let registry =
+        pioneer_provider::ProviderRegistry::with_provider("connection-facts-provider", inner);
+    let authority = registry.get_or_create("connection-facts-provider").unwrap();
+    let provider =
+        crate::usage_journal::observe(authority, store.as_ref(), &workspace_id, "summary", "owner");
+    assert!(!provider.capabilities().tool_calling);
+    provider.prepare_model("private/model").await.unwrap();
+    assert!(provider.capabilities().tool_calling);
+    let response = provider
+        .stream_chat_with_diagnostics(pioneer_provider::ChatRequest {
+            model: "private/model".into(),
+            messages: vec![pioneer_provider::ChatMessage::user("hello")],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        response.message_delivery,
+        ProviderMessageDelivery::Provisional
+    );
+    let chunks = response.stream.collect::<Vec<_>>().await;
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].as_ref().unwrap().delta, "prepared connection");
+    assert!(chunks[1].as_ref().unwrap().is_final);
 }
 
 #[tokio::test]

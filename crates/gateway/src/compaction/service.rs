@@ -31,8 +31,7 @@ pub(super) async fn make_summarizer(
         let provider = providers.get_or_create_for_workspace(workspace, &selection.instance)?;
         let provider =
             crate::usage_journal::observe(provider, store, workspace, "summary", workspace);
-        let limits =
-            pioneer_provider::catalog::model_catalog()?.limits(provider.name(), &selection.model);
+        let limits = provider.model_limits(&selection.model).await?;
         return Ok(Arc::new(NativeSummarizer::new(
             provider,
             selection,

@@ -905,3 +905,44 @@ cancellation and minimum-OS qualification. No tests, compiler/build/check/typech
 linter/resolver, CI/workflow, packaging/install/dev scripts, SDK/daemon, GUI or OS
 probes ran. **This is a reviewable source candidate, not external acceptance or
 passing compilation/runtime/platform evidence.**
+
+
+## 2026-10-24 — requested merge of current main after source acceptance
+
+The user accepted R01–R08, authorized publication (accepted implementation commit
+`abbdf80a654e48c9c414d82fc1a5de0dc19bdea2`), then requested resolution of the PR's
+main conflicts and another push. Entry branch was `feature/cua-gateway-migration`,
+HEAD `abbdf80a654e48c9c414d82fc1a5de0dc19bdea2`, with clean worktree/index.
+After `git fetch origin`, main was
+`c0f9f151ef43a3b57a6bec279a347bca9a8526e2` (previous common ancestor
+`fa0ec29bfd19f9ada8f66be9665d77f5e51e0095`). GitHub reported CONFLICTING/DIRTY.
+A normal `git merge --no-commit --no-ff origin/main` exposed one content conflict
+in `crates/gateway/src/cli_runtime/mcp/facade.rs`.
+
+Resolution preserves both the CUA task-local typed delivery guard and main's
+adapter-selected `CliMcpCallContract`. Main's native identity parsing, ledger
+identity, admission deadline and real callers remain; CUA final-frame receipt
+commit/revocation and no-replay behavior remain. The existing oversized-response
+regression now supplies a valid independent Claude native tool-use ID while
+retaining the escaped RPC ID, duplicate/revocation/action/fresh-observation
+assertions. Otherwise main's auto-merged changes are retained.
+
+Applied test-audit only to this test-fixture batch after the production conflict
+resolution: the exclusively test-module edit preserved the full production prefix
+and all other tracked file hashes. No assertion was removed, no new harness or
+production seam was added. Static tree comparison also confirmed all 114
+feature-only paths match entry HEAD and all 89 main-only paths match fetched main;
+the eleven overlapping paths were inspected for the existing migration changes
+and main's provider/native correlation additions. Server/CU features, six-target
+release/compatibility packages, update/recovery and provenance owners were not
+changed by conflict resolution. Cargo.lock equals entry HEAD; CUA pin remains
+`688c5fd62a9f13dddc309970c948df494e7de33f`.
+
+Actual checks: `cargo fmt --all --check`, `git diff --check`,
+`git diff --cached --check`, Git lockfile equality, and Python standard-library
+source/hash comparison. An initial bytes-to-Path mistake in the comparison script
+failed before any write and was corrected. No local tests/builds/compiler/linter,
+resolver, project scripts or runtime/platform probes ran. Existing monitor
+`1EuSrEXDwGwWI6UvduAfp` was paused before merging (no run active), and will resume
+on the same fifteen-minute schedule after the authorized merge commit/push.
+Fresh GitHub CI and platform/runtime qualification remain pending.

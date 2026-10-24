@@ -8223,6 +8223,17 @@ impl MessageProcessor {
         &self,
         notification: &mut pioneer_protocol::ItemDeltaNotification,
     ) {
+        if notification
+            .payload
+            .as_ref()
+            .and_then(|value| value["runtimeDeltaKind"].as_str())
+            == Some("provider_message_preview")
+        {
+            // Runtime drafts never enter canonical markdown buffers. A late
+            // preview must not append to a resolved commentary's buffer, and
+            // a final-only preview has no ItemCompleted to reclaim that buffer.
+            return;
+        }
         let stream = Self::markdown_stream_kind(notification.stream);
         let key = Self::item_markdown_buffer_key(
             notification.thread_id.as_str(),

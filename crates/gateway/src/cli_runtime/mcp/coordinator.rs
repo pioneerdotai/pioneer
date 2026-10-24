@@ -199,6 +199,7 @@ impl Default for CoordinatorState {
 #[derive(Default)]
 pub(crate) struct CliMcpCoordinator {
     state: Mutex<CoordinatorState>,
+    pub(crate) native_turn_changed: Notify,
 }
 
 impl CliMcpCoordinator {
@@ -460,40 +461,130 @@ impl CliMcpCoordinator {
         activation_generation: CliMcpActivationGeneration,
     ) -> Result<CliMcpCallAuthorization, CliMcpCoordinatorError> {
         let state = self.state.lock().await;
-        state.grants.validate_bound(bound, now_unix_ms())?;
+        authorize_call_locked(&state, bound, activation_generation)
+    }
+
+    /// Revalidate the existing binding and mark one native item atomically with
+    /// respect to terminal/revoke/retarget. The claim is synchronous: no await,
+    /// execution or I/O while the coordinator lock is held.
+    pub(crate) async fn claim_correlated_call(
+        &self,
+        bound: &CliMcpBoundGrant,
+        invocation: &crate::turn_mcp::invoker::TurnMcpInvocation,
+        cancellation: &CancellationToken,
+        claim: impl FnOnce() -> Result<bool, crate::turn_mcp::invoker::TurnMcpInvocationError> + Send,
+    ) -> Result<bool, crate::turn_mcp::invoker::TurnMcpInvocationError> {
+        use crate::turn_mcp::invoker::{
+            TurnMcpInvocationError as Error, TurnMcpInvocationErrorCode as Code,
+        };
+        let state = self.state.lock().await;
+        if cancellation.is_cancelled() {
+            return Err(Error::new(Code::Cancelled, "MCP admission cancelled"));
+        }
+        let identity = invocation
+            .native_call
+            .as_ref()
+            .ok_or_else(|| Error::new(Code::InvalidRequest, "MCP native identity is missing"))?;
+        let deadline = invocation
+            .admission_deadline
+            .ok_or_else(|| Error::new(Code::InvalidRequest, "MCP admission deadline is missing"))?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::new(Code::TimedOut, "MCP admission timed out"));
+        }
         let turn = state
             .active_turns
             .get(&bound.grant_id())
-            .ok_or(CliMcpCoordinatorError::MissingTurn)?;
-        validate_turn_binding(turn, bound, activation_generation)?;
-        if turn.state != CliMcpActiveTurnState::Active {
-            return Err(CliMcpCoordinatorError::CallsNotActive);
+            .ok_or_else(|| Error::new(Code::TurnNotActive, "MCP turn is not active"))?;
+        let authorization = authorize_call_locked(&state, bound, turn.activation_generation)
+            .map_err(|error| {
+                Error::new(
+                    match error {
+                        CliMcpCoordinatorError::MissingTurn
+                        | CliMcpCoordinatorError::CallsNotActive => Code::TurnNotActive,
+                        _ => Code::SessionBindingUnavailable,
+                    },
+                    "MCP session binding is unavailable",
+                )
+            })?;
+        let instance = &bound.scope().process_instance;
+        if invocation.workspace_id != instance.key().workspace_id
+            || invocation.thread_id != authorization.thread_id
+            || invocation.turn_id != authorization.turn_id
+            || invocation.runtime_id.as_deref() != Some(instance.key().runtime_id.as_str())
+            || invocation.session_generation != Some(instance.generation())
+            || identity.native_thread_id != authorization.native_thread_id
+            || identity.native_turn_id != authorization.native_turn_id
+        {
+            return Err(Error::new(
+                Code::ScopeMismatch,
+                "MCP native invocation does not belong to the active binding",
+            ));
         }
-        let projection = state
-            .projections
+        claim()
+    }
+
+    /// Checks the same grant, projection and active Pioneer turn as facade
+    /// admission. Retarget and the exact item claim serialize on this lock.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn claim_codex_native_item(
+        &self,
+        bound: &CliMcpBoundGrant,
+        invocation: &crate::turn_mcp::invoker::TurnMcpInvocation,
+        key: &super::native_correlation::NativeMcpItemKey,
+        items: &super::native_correlation::NativeMcpCorrelationLedger,
+        fingerprint: &str,
+        cancellation: &CancellationToken,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, crate::turn_mcp::invoker::TurnMcpInvocationError> {
+        use crate::turn_mcp::invoker::{
+            TurnMcpInvocationError as Error, TurnMcpInvocationErrorCode as Code,
+        };
+        let state = self.state.lock().await;
+        if cancellation.is_cancelled() {
+            return Err(Error::new(Code::Cancelled, "Codex MCP admission cancelled"));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::new(Code::TimedOut, "Codex MCP admission timed out"));
+        }
+        let turn = state
+            .active_turns
             .get(&bound.grant_id())
-            .ok_or(CliMcpCoordinatorError::MissingProjection)?;
-        validate_projection_binding(projection, bound, turn.projection_generation)?;
-        if projection.readiness != CliMcpProjectionReadiness::Active {
-            return Err(CliMcpCoordinatorError::CallsNotActive);
+            .ok_or_else(|| Error::new(Code::TurnNotActive, "Codex MCP turn is not active"))?;
+        let authorization = authorize_call_locked(&state, bound, turn.activation_generation)
+            .map_err(|error| {
+                Error::new(
+                    match error {
+                        CliMcpCoordinatorError::MissingTurn
+                        | CliMcpCoordinatorError::CallsNotActive => Code::TurnNotActive,
+                        _ => Code::SessionBindingUnavailable,
+                    },
+                    "Codex MCP binding is unavailable",
+                )
+            })?;
+        let instance = &bound.scope().process_instance;
+        if authorization.thread_id != invocation.thread_id
+            || authorization.turn_id != invocation.turn_id
+            || instance.key().workspace_id != invocation.workspace_id
+            || Some(instance.key().runtime_id.as_str()) != invocation.runtime_id.as_deref()
+            || Some(instance.generation()) != invocation.session_generation
+            || authorization.native_thread_id != key.native_thread_id
+        {
+            return Err(Error::new(
+                Code::ScopeMismatch,
+                "Codex MCP native scope does not match the active turn",
+            ));
         }
-        Ok(CliMcpCallAuthorization {
-            grant_id: turn.grant_id,
-            projection_generation: projection.generation,
-            activation_generation: turn.activation_generation,
-            fingerprint: projection.fingerprint.clone(),
-            thread_id: turn.thread_id.clone(),
-            turn_id: turn.turn_id.clone(),
-            native_thread_id: turn
-                .native_thread_id
-                .clone()
-                .ok_or(CliMcpCoordinatorError::CallsNotActive)?,
-            native_turn_id: turn
-                .native_turn_id
-                .clone()
-                .ok_or(CliMcpCoordinatorError::CallsNotActive)?,
-            cancellation: turn.cancellation.clone(),
-        })
+        if authorization.native_turn_id != key.native_turn_id {
+            return Ok(false);
+        }
+        items.claim_codex_exact(
+            key,
+            &invocation.canonical_callable_name,
+            fingerprint,
+            &invocation.provider_call_id,
+            cancellation,
+            deadline,
+        )
     }
 
     pub(crate) async fn retarget_turn(
@@ -533,6 +624,7 @@ impl CliMcpCoordinator {
                 return Err(CliMcpCoordinatorError::InvalidTransition);
             }
         }
+        self.native_turn_changed.notify_waiters();
         Ok(())
     }
 
@@ -683,6 +775,47 @@ fn next_activation_generation(
         .checked_add(1)
         .ok_or(CliMcpCoordinatorError::GenerationExhausted)?;
     Ok(CliMcpActivationGeneration(current))
+}
+
+fn authorize_call_locked(
+    state: &CoordinatorState,
+    bound: &CliMcpBoundGrant,
+    activation_generation: CliMcpActivationGeneration,
+) -> Result<CliMcpCallAuthorization, CliMcpCoordinatorError> {
+    state.grants.validate_bound(bound, now_unix_ms())?;
+    let turn = state
+        .active_turns
+        .get(&bound.grant_id())
+        .ok_or(CliMcpCoordinatorError::MissingTurn)?;
+    validate_turn_binding(turn, bound, activation_generation)?;
+    if turn.state != CliMcpActiveTurnState::Active {
+        return Err(CliMcpCoordinatorError::CallsNotActive);
+    }
+    let projection = state
+        .projections
+        .get(&bound.grant_id())
+        .ok_or(CliMcpCoordinatorError::MissingProjection)?;
+    validate_projection_binding(projection, bound, turn.projection_generation)?;
+    if projection.readiness != CliMcpProjectionReadiness::Active {
+        return Err(CliMcpCoordinatorError::CallsNotActive);
+    }
+    Ok(CliMcpCallAuthorization {
+        grant_id: turn.grant_id,
+        projection_generation: projection.generation,
+        activation_generation: turn.activation_generation,
+        fingerprint: projection.fingerprint.clone(),
+        thread_id: turn.thread_id.clone(),
+        turn_id: turn.turn_id.clone(),
+        native_thread_id: turn
+            .native_thread_id
+            .clone()
+            .ok_or(CliMcpCoordinatorError::CallsNotActive)?,
+        native_turn_id: turn
+            .native_turn_id
+            .clone()
+            .ok_or(CliMcpCoordinatorError::CallsNotActive)?,
+        cancellation: turn.cancellation.clone(),
+    })
 }
 
 fn normalize_identity(value: String) -> Result<String, CliMcpCoordinatorError> {

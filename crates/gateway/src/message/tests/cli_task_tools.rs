@@ -273,6 +273,8 @@ async fn invoke_task(
                 runtime_id: Some(binding.runtime_id),
                 session_generation: Some(generation),
                 provider_call_id: call_id.to_owned(),
+                native_call: None,
+                admission_deadline: None,
                 canonical_callable_name: name.to_owned(),
                 arguments,
                 origin: TurnMcpInvocationOrigin::CliFacade,

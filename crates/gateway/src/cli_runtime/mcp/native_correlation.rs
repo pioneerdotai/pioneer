@@ -1,13 +1,15 @@
 //! Native item correlation shared by the Codex and OpenCode MCP adapters.
 //! The facade execution ledger remains the sole execution/replay journal.
-use crate::turn_mcp::invoker::TurnMcpInvoker;
+use super::coordinator::CliMcpCoordinator;
+use super::grants::CliMcpBoundGrant;
+use crate::turn_mcp::invoker::{
+    TurnMcpInvocation, TurnMcpInvocationError, TurnMcpInvocationErrorCode, TurnMcpInvoker,
+};
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
-use tokio::time::{Instant, timeout_at};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,45 +21,24 @@ pub(crate) struct NativeMcpItemBinding {
     pub(crate) arguments_fingerprint: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct NativeMcpItemKey {
-    pub(crate) native_thread_id: String,
-    pub(crate) native_turn_id: String,
-    pub(crate) native_item_id: String,
-}
+pub(crate) use crate::turn_mcp::invoker::NativeMcpCallIdentity as NativeMcpItemKey;
 
 struct NativeMcpItemCorrelation {
     canonical_callable_name: String,
     arguments_fingerprint: String,
-    sequence: u64,
     facade_request_id: Option<String>,
 }
 
 #[derive(Default)]
 pub(crate) struct NativeMcpCorrelationLedger {
     items: StdMutex<HashMap<NativeMcpItemKey, NativeMcpItemCorrelation>>,
-    next_sequence: AtomicU64,
-    // None preserves the existing Codex claim semantics. OpenCode explicitly
-    // activates one native turn before sending its deferred prompt.
-    scope: StdMutex<Option<Option<(String, String)>>>,
     pub(crate) changed: tokio::sync::Notify,
 }
 
 impl NativeMcpCorrelationLedger {
-    pub(crate) fn scoped() -> Self {
-        Self {
-            scope: StdMutex::new(Some(None)),
-            ..Self::default()
-        }
-    }
-
-    pub(crate) fn activate_scope(&self, thread: &str, turn: &str) {
-        *self.scope.lock().unwrap() = Some(Some((thread.into(), turn.into())));
+    /// Drop previous-turn items when OpenCode activates its coordinator binding.
+    pub(crate) fn clear(&self) {
         self.items.lock().unwrap().clear();
-    }
-
-    pub(crate) fn deactivate_scope(&self) {
-        *self.scope.lock().unwrap() = Some(None);
     }
 
     pub(crate) fn register(&self, binding: NativeMcpItemBinding) -> Result<()> {
@@ -83,7 +64,6 @@ impl NativeMcpCorrelationLedger {
             NativeMcpItemCorrelation {
                 canonical_callable_name: binding.canonical_callable_name,
                 arguments_fingerprint: binding.arguments_fingerprint,
-                sequence: self.next_sequence.fetch_add(1, AtomicOrdering::Relaxed),
                 facade_request_id: None,
             },
         );
@@ -107,69 +87,105 @@ impl NativeMcpCorrelationLedger {
             .contains_key(key)
     }
 
-    pub(crate) async fn claim(
+    /// OpenCode claims its exact item within the active coordinator binding.
+    pub(crate) fn claim_exact(
         &self,
-        canonical_callable_name: &str,
-        arguments_fingerprint: &str,
-        facade_request_id: &str,
-    ) -> Option<NativeMcpItemKey> {
-        let deadline = Instant::now() + Duration::from_millis(250);
-        loop {
-            // notify_waiters() reaches a Notified created before registration,
-            // even if it has not been polled yet. Create it before checking.
-            let notified = self.changed.notified();
-            if let Some(key) = self.claim_now(
-                canonical_callable_name,
-                arguments_fingerprint,
-                facade_request_id,
-            ) {
-                return Some(key);
-            }
-            // A ready notification must not keep us looping past the deadline.
-            if Instant::now() >= deadline || timeout_at(deadline, notified).await.is_err() {
-                return self.claim_now(
-                    canonical_callable_name,
-                    arguments_fingerprint,
-                    facade_request_id,
-                );
-            }
-        }
-    }
-
-    fn claim_now(
-        &self,
-        canonical_callable_name: &str,
-        arguments_fingerprint: &str,
-        facade_request_id: &str,
-    ) -> Option<NativeMcpItemKey> {
-        let scope = self.scope.lock().unwrap().clone();
-        if scope == Some(None) {
-            return None;
-        }
+        invocation: &TurnMcpInvocation,
+        fingerprint: &str,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<bool, TurnMcpInvocationError> {
+        let identity = invocation.native_call.as_ref().ok_or_else(|| {
+            TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::InvalidRequest,
+                "OpenCode native identity is missing",
+            )
+        })?;
+        let key = NativeMcpItemKey {
+            native_thread_id: identity.native_thread_id.clone(),
+            native_turn_id: identity.native_turn_id.clone(),
+            native_item_id: identity.native_item_id.clone(),
+        };
         let mut items = self
             .items
             .lock()
-            .expect("Codex native MCP correlation ledger should not be poisoned");
-        let key = items
-            .iter()
-            .filter(|(key, item)| {
-                scope
-                    .as_ref()
-                    .and_then(|scope| scope.as_ref())
-                    .is_none_or(|(thread, turn)| {
-                        &key.native_thread_id == thread && &key.native_turn_id == turn
-                    })
-                    && item.facade_request_id.is_none()
-                    && item.canonical_callable_name == canonical_callable_name
-                    && item.arguments_fingerprint == arguments_fingerprint
-            })
-            .min_by_key(|(_, item)| item.sequence)
-            .map(|(key, _)| key.clone())?;
-        items
-            .get_mut(&key)
-            .expect("selected Codex MCP correlation must exist")
-            .facade_request_id = Some(facade_request_id.to_owned());
-        Some(key)
+            .expect("native MCP ledger should not be poisoned");
+        if cancellation.is_cancelled() {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::Cancelled,
+                "OpenCode MCP admission cancelled",
+            ));
+        }
+        if invocation
+            .admission_deadline
+            .is_none_or(|deadline| Instant::now() >= deadline)
+        {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::TimedOut,
+                "OpenCode MCP admission timed out",
+            ));
+        }
+        let Some(item) = items.get_mut(&key) else {
+            return Ok(false);
+        };
+        if item.canonical_callable_name != invocation.canonical_callable_name
+            || item.arguments_fingerprint != fingerprint
+            || item.facade_request_id.is_some()
+        {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::InvalidRequest,
+                "OpenCode native item mismatches this invocation or is already used",
+            ));
+        }
+        item.facade_request_id = Some(invocation.provider_call_id.clone());
+        Ok(true)
+    }
+
+    /// Exact Codex claim. The caller checks the existing coordinator binding
+    /// before calling this, under the coordinator lock. Used marks live here,
+    /// independently of the facade's bounded full-result cache.
+    pub(crate) fn claim_codex_exact(
+        &self,
+        key: &NativeMcpItemKey,
+        callable: &str,
+        fingerprint: &str,
+        request_id: &str,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> std::result::Result<bool, TurnMcpInvocationError> {
+        let mut items = self
+            .items
+            .lock()
+            .expect("native MCP ledger should not be poisoned");
+        // Recheck after acquiring the item lock, immediately before admission.
+        if cancellation.is_cancelled() {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::Cancelled,
+                "Codex MCP admission cancelled",
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::TimedOut,
+                "Codex MCP admission timed out",
+            ));
+        }
+        let Some(item) = items.get_mut(key) else {
+            return Ok(false);
+        };
+        if item.canonical_callable_name != callable || item.arguments_fingerprint != fingerprint {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::InvalidRequest,
+                "Codex MCP native item does not match the requested tool and arguments",
+            ));
+        }
+        if item.facade_request_id.is_some() {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::InvalidRequest,
+                "Codex MCP native item has already been used",
+            ));
+        }
+        item.facade_request_id = Some(request_id.to_owned());
+        Ok(true)
     }
 
     pub(crate) fn clear_turn(&self, native_thread_id: Option<&str>, native_turn_id: Option<&str>) {
@@ -186,9 +202,109 @@ impl NativeMcpCorrelationLedger {
     }
 }
 
+/// References to the existing authorization owner; no separate native scope.
+pub(crate) struct CodexMcpCorrelationBinding {
+    pub(crate) coordinator: Arc<CliMcpCoordinator>,
+    pub(crate) bound_grant: CliMcpBoundGrant,
+}
+
 pub(crate) struct CorrelatingTurnMcpInvoker {
     pub(crate) inner: Arc<dyn TurnMcpInvoker>,
     pub(crate) native_items: Arc<NativeMcpCorrelationLedger>,
+    // Factory-owned binding references, independent of the instance's name.
+    pub(crate) opencode_binding: Option<(Arc<CliMcpCoordinator>, CliMcpBoundGrant)>,
+    pub(crate) codex_binding: Option<CodexMcpCorrelationBinding>,
+}
+
+impl CorrelatingTurnMcpInvoker {
+    async fn claim_codex(
+        &self,
+        invocation: &TurnMcpInvocation,
+        fingerprint: &str,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<NativeMcpItemKey, TurnMcpInvocationError> {
+        let invalid = || {
+            TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::InvalidRequest,
+                "Codex MCP invocation is missing native admission metadata",
+            )
+        };
+        let identity = invocation.native_call.as_ref().ok_or_else(invalid)?;
+        let deadline = invocation.admission_deadline.ok_or_else(invalid)?;
+        let binding = self.codex_binding.as_ref().ok_or_else(invalid)?;
+        let key = identity.clone();
+        loop {
+            // Subscribe before inspecting either source; no lost wakeup between
+            // durable retarget/native registration and the next wait.
+            let item_changed = self.native_items.changed.notified();
+            let turn_changed = binding.coordinator.native_turn_changed.notified();
+            let claim = binding.coordinator.claim_codex_native_item(
+                &binding.bound_grant,
+                invocation,
+                &key,
+                &self.native_items,
+                fingerprint,
+                cancellation,
+                deadline,
+            );
+            let claimed = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::Cancelled, "Codex MCP admission cancelled")),
+                () = tokio::time::sleep_until(deadline) => return Err(TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::TimedOut, "Codex MCP native confirmation timed out")),
+                claimed = claim => claimed?,
+            };
+            if claimed {
+                return Ok(key);
+            }
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::Cancelled, "Codex MCP admission cancelled")),
+                () = tokio::time::sleep_until(deadline) => return Err(TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::TimedOut, "Codex MCP native confirmation timed out")),
+                () = item_changed => {},
+                () = turn_changed => {},
+            }
+        }
+    }
+
+    async fn claim_opencode(
+        &self,
+        invocation: &TurnMcpInvocation,
+        fingerprint: &str,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<(), TurnMcpInvocationError> {
+        let (coordinator, bound) = self
+            .opencode_binding
+            .as_ref()
+            .expect("OpenCode factory binding");
+        let deadline = invocation.admission_deadline.ok_or_else(|| {
+            TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::InvalidRequest,
+                "OpenCode admission deadline is missing",
+            )
+        })?;
+        loop {
+            let notified = self.native_items.changed.notified();
+            let claim = coordinator.claim_correlated_call(bound, invocation, cancellation, || {
+                self.native_items
+                    .claim_exact(invocation, fingerprint, cancellation)
+            });
+            let claimed = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::Cancelled, "OpenCode MCP admission cancelled")),
+                () = tokio::time::sleep_until(deadline) => return Err(TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::TimedOut, "OpenCode MCP confirmation timed out")),
+                claimed = claim => claimed?,
+            };
+            if claimed {
+                return Ok(());
+            }
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::Cancelled, "OpenCode MCP admission cancelled")),
+                () = tokio::time::sleep_until(deadline) => return Err(TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::TimedOut, "OpenCode MCP confirmation timed out")),
+                () = notified => {},
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -209,252 +325,38 @@ impl TurnMcpInvoker for CorrelatingTurnMcpInvoker {
                         "CLI MCP invocation arguments are not canonicalizable",
                     )
                 })?;
-        let facade_request_id = invocation.provider_call_id.clone();
-        let native_item = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => None,
-            native_item = self.native_items.claim(
-                invocation.canonical_callable_name.as_str(),
-                arguments_fingerprint.as_str(),
-                facade_request_id.as_str(),
-            ) => native_item,
+        if self.opencode_binding.is_some() {
+            self.claim_opencode(&invocation, &arguments_fingerprint, &cancellation)
+                .await?;
+            invocation.provider_call_id = invocation
+                .native_call
+                .as_ref()
+                .expect("claimed OpenCode identity")
+                .native_item_id
+                .clone();
+            return self.inner.invoke(invocation, cancellation).await;
         }
-        .ok_or_else(|| {
-            crate::turn_mcp::invoker::TurnMcpInvocationError::new(
-                crate::turn_mcp::invoker::TurnMcpInvocationErrorCode::SessionBindingUnavailable,
-                "CLI MCP facade call has no matching native lifecycle item",
-            )
-        })?;
-        invocation.provider_call_id = native_item.native_item_id;
-        self.inner.invoke(invocation, cancellation).await
+        if self.codex_binding.is_some() {
+            let item = self
+                .claim_codex(&invocation, &arguments_fingerprint, &cancellation)
+                .await?;
+            invocation.provider_call_id = item.native_item_id;
+            return self.inner.invoke(invocation, cancellation).await;
+        }
+        Err(TurnMcpInvocationError::new(
+            TurnMcpInvocationErrorCode::SessionBindingUnavailable,
+            "CLI MCP provider correlation binding is unavailable",
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::turn_mcp::invoker::{
-        TurnMcpInvocation, TurnMcpInvocationError, TurnMcpInvocationErrorCode,
-        TurnMcpInvocationOrigin,
-    };
+    use crate::turn_mcp::invoker::TurnMcpInvocationOrigin;
     use crate::turn_mcp::result::CanonicalMcpToolResult;
-    use futures_util::poll;
     use serde_json::json;
-    use std::task::Poll;
-    use tokio::time::advance;
-
-    const CALLABLE: &str = "test.echo";
-
-    fn fingerprint(value: &str) -> String {
-        crate::cli_runtime::codex_mcp::canonical_value_fingerprint(&json!({ "value": value }))
-            .expect("canonical test arguments")
-    }
-
-    fn binding(item: &str, value: &str) -> NativeMcpItemBinding {
-        NativeMcpItemBinding {
-            native_thread_id: "native-thread".into(),
-            native_turn_id: "native-turn".into(),
-            native_item_id: item.into(),
-            canonical_callable_name: CALLABLE.into(),
-            arguments_fingerprint: fingerprint(value),
-        }
-    }
-
-    fn key(item: &str) -> NativeMcpItemKey {
-        NativeMcpItemKey {
-            native_thread_id: "native-thread".into(),
-            native_turn_id: "native-turn".into(),
-            native_item_id: item.into(),
-        }
-    }
-
-    fn ledger(scoped: bool) -> NativeMcpCorrelationLedger {
-        if scoped {
-            let ledger = NativeMcpCorrelationLedger::scoped();
-            ledger.activate_scope("native-thread", "native-turn");
-            ledger
-        } else {
-            NativeMcpCorrelationLedger::default()
-        }
-    }
-
-    // Poll each future explicitly to establish the registration/wakeup order.
-    // Paused time keeps pending assertions independent of scheduler timing.
-    #[tokio::test(start_paused = true)]
-    async fn three_claims_wait_for_their_own_separately_registered_items() {
-        for scoped in [false, true] {
-            let ledger = ledger(scoped);
-            let [a, b, c] = [fingerprint("a"), fingerprint("b"), fingerprint("c")];
-            let mut claim_a = Box::pin(ledger.claim(CALLABLE, &a, "request-a"));
-            let mut claim_b = Box::pin(ledger.claim(CALLABLE, &b, "request-b"));
-            let mut claim_c = Box::pin(ledger.claim(CALLABLE, &c, "request-c"));
-            assert!(poll!(claim_a.as_mut()).is_pending());
-            assert!(poll!(claim_b.as_mut()).is_pending());
-            assert!(poll!(claim_c.as_mut()).is_pending());
-
-            ledger.register(binding("item-a", "a")).unwrap();
-            assert_eq!(poll!(claim_a.as_mut()), Poll::Ready(Some(key("item-a"))));
-            assert!(poll!(claim_b.as_mut()).is_pending());
-            assert!(poll!(claim_c.as_mut()).is_pending());
-
-            ledger.register(binding("item-b", "b")).unwrap();
-            assert_eq!(poll!(claim_b.as_mut()), Poll::Ready(Some(key("item-b"))));
-            assert!(poll!(claim_c.as_mut()).is_pending());
-
-            ledger.register(binding("item-c", "c")).unwrap();
-            assert_eq!(poll!(claim_c.as_mut()), Poll::Ready(Some(key("item-c"))));
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn multiple_foreign_notifications_do_not_finish_claim() {
-        let ledger = ledger(false);
-        let arguments = fingerprint("own");
-        let mut claim = Box::pin(ledger.claim(CALLABLE, &arguments, "request"));
-        assert!(poll!(claim.as_mut()).is_pending());
-
-        for item in ["foreign-a", "foreign-b", "foreign-c"] {
-            ledger.register(binding(item, "foreign")).unwrap();
-            assert!(poll!(claim.as_mut()).is_pending());
-        }
-
-        ledger.register(binding("own", "own")).unwrap();
-        assert_eq!(poll!(claim.as_mut()), Poll::Ready(Some(key("own"))));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn already_registered_item_is_claimed_immediately() {
-        for scoped in [false, true] {
-            let ledger = ledger(scoped);
-            ledger.register(binding("own", "own")).unwrap();
-            let arguments = fingerprint("own");
-            let started = Instant::now();
-            let mut claim = Box::pin(ledger.claim(CALLABLE, &arguments, "request"));
-
-            assert_eq!(poll!(claim.as_mut()), Poll::Ready(Some(key("own"))));
-            assert_eq!(Instant::now(), started);
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn missing_item_waits_until_the_deadline() {
-        let ledger = ledger(false);
-        let arguments = fingerprint("missing");
-        let mut claim = Box::pin(ledger.claim(CALLABLE, &arguments, "request"));
-        assert!(poll!(claim.as_mut()).is_pending());
-
-        advance(Duration::from_millis(249)).await;
-        assert!(poll!(claim.as_mut()).is_pending());
-        advance(Duration::from_millis(1)).await;
-        assert_eq!(poll!(claim.as_mut()), Poll::Ready(None));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn foreign_notifications_do_not_restart_the_wait_budget() {
-        let ledger = ledger(false);
-        let arguments = fingerprint("missing");
-        let started = Instant::now();
-        let mut claim = Box::pin(ledger.claim(CALLABLE, &arguments, "request"));
-        assert!(poll!(claim.as_mut()).is_pending());
-
-        for (index, millis) in [50, 50, 50, 50, 49].into_iter().enumerate() {
-            advance(Duration::from_millis(millis)).await;
-            ledger
-                .register(binding(&format!("foreign-{index}"), "foreign"))
-                .unwrap();
-            assert!(poll!(claim.as_mut()).is_pending());
-        }
-
-        advance(Duration::from_millis(1)).await;
-        // Leave a ready notification at the deadline as well.
-        ledger.register(binding("last-foreign", "foreign")).unwrap();
-        assert_eq!(poll!(claim.as_mut()), Poll::Ready(None));
-        assert_eq!(Instant::now() - started, Duration::from_millis(250));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn item_published_before_notification_is_found_when_wait_times_out() {
-        let ledger = ledger(false);
-        let arguments = fingerprint("own");
-        let mut claim = Box::pin(ledger.claim(CALLABLE, &arguments, "request"));
-        assert!(poll!(claim.as_mut()).is_pending());
-
-        advance(Duration::from_millis(250)).await;
-        // Model register() after inserting the item but before notify_waiters().
-        // The notification remains pending, so the timeout's final lookup must
-        // find the item rather than relying on a notification to retry.
-        ledger.items.lock().unwrap().insert(
-            key("own"),
-            NativeMcpItemCorrelation {
-                canonical_callable_name: CALLABLE.into(),
-                arguments_fingerprint: arguments.clone(),
-                sequence: 0,
-                facade_request_id: None,
-            },
-        );
-        assert_eq!(poll!(claim.as_mut()), Poll::Ready(Some(key("own"))));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn one_item_cannot_be_claimed_by_two_waiting_calls() {
-        for scoped in [false, true] {
-            let ledger = ledger(scoped);
-            let arguments = fingerprint("same");
-            let mut first = Box::pin(ledger.claim(CALLABLE, &arguments, "first"));
-            let mut second = Box::pin(ledger.claim(CALLABLE, &arguments, "second"));
-            assert!(poll!(first.as_mut()).is_pending());
-            assert!(poll!(second.as_mut()).is_pending());
-
-            let item = binding("shared", "same");
-            ledger.register(item.clone()).unwrap();
-            assert_eq!(poll!(first.as_mut()), Poll::Ready(Some(key("shared"))));
-            assert!(poll!(second.as_mut()).is_pending());
-            // Replaying the registration must not make a claimed item available.
-            ledger.register(item).unwrap();
-            advance(Duration::from_millis(250)).await;
-            assert_eq!(poll!(second.as_mut()), Poll::Ready(None));
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn claim_rejects_foreign_scope_callable_and_arguments() {
-        let ledger = ledger(true);
-        let arguments = fingerprint("own");
-        let mut claim = Box::pin(ledger.claim(CALLABLE, &arguments, "request"));
-        assert!(poll!(claim.as_mut()).is_pending());
-
-        let mut wrong_thread = binding("wrong-thread", "own");
-        wrong_thread.native_thread_id = "foreign-thread".into();
-        let mut wrong_turn = binding("wrong-turn", "own");
-        wrong_turn.native_turn_id = "foreign-turn".into();
-        let mut wrong_callable = binding("wrong-callable", "own");
-        wrong_callable.canonical_callable_name = "test.other".into();
-        for item in [
-            wrong_thread,
-            wrong_turn,
-            wrong_callable,
-            binding("wrong-args", "foreign"),
-        ] {
-            ledger.register(item).unwrap();
-            assert!(poll!(claim.as_mut()).is_pending());
-        }
-
-        ledger.register(binding("own", "own")).unwrap();
-        assert_eq!(poll!(claim.as_mut()), Poll::Ready(Some(key("own"))));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn inactive_scope_cannot_claim_an_item() {
-        let ledger = ledger(true);
-        ledger.register(binding("own", "own")).unwrap();
-        ledger.deactivate_scope();
-        let arguments = fingerprint("own");
-        let mut claim = Box::pin(ledger.claim(CALLABLE, &arguments, "request"));
-        assert!(poll!(claim.as_mut()).is_pending());
-
-        advance(Duration::from_millis(250)).await;
-        assert_eq!(poll!(claim.as_mut()), Poll::Ready(None));
-    }
+    use std::time::Duration;
 
     struct UnexpectedInvoker;
 
@@ -465,52 +367,70 @@ mod tests {
             _invocation: TurnMcpInvocation,
             _cancellation: CancellationToken,
         ) -> std::result::Result<CanonicalMcpToolResult, TurnMcpInvocationError> {
-            panic!("cancelled correlation must not invoke the inner MCP invoker");
+            panic!("unbound correlation must not invoke the inner MCP invoker");
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancellation_drops_the_pending_invocation_without_claiming_a_later_item() {
-        let native_items = Arc::new(ledger(true));
+    async fn missing_provider_binding_rejects_matching_item_without_execution_or_claim() {
+        let native_items = Arc::new(NativeMcpCorrelationLedger::default());
+        let arguments = json!({"value": "own"});
+        let fingerprint =
+            crate::cli_runtime::codex_mcp::canonical_value_fingerprint(&arguments).unwrap();
+        let key = NativeMcpItemKey {
+            native_thread_id: "native-thread".into(),
+            native_turn_id: "native-turn".into(),
+            native_item_id: "native-item".into(),
+        };
+        native_items
+            .register(NativeMcpItemBinding {
+                native_thread_id: key.native_thread_id.clone(),
+                native_turn_id: key.native_turn_id.clone(),
+                native_item_id: key.native_item_id.clone(),
+                canonical_callable_name: "test.echo".into(),
+                arguments_fingerprint: fingerprint.clone(),
+            })
+            .unwrap();
         let invoker = CorrelatingTurnMcpInvoker {
             inner: Arc::new(UnexpectedInvoker),
             native_items: native_items.clone(),
+            opencode_binding: None,
+            codex_binding: None,
         };
-        let cancellation = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
         let invocation = TurnMcpInvocation {
             workspace_id: "workspace".into(),
             thread_id: "thread".into(),
             turn_id: "turn".into(),
-            runtime_id: Some("opencode".into()),
+            runtime_id: Some("codex".into()),
             session_generation: Some(1),
-            provider_call_id: "cancelled-request".into(),
-            canonical_callable_name: CALLABLE.into(),
-            arguments: json!({ "value": "own" }),
+            provider_call_id: "request".into(),
+            native_call: Some(key.clone()),
+            admission_deadline: Some(deadline),
+            canonical_callable_name: "test.echo".into(),
+            arguments,
             origin: TurnMcpInvocationOrigin::CliFacade,
         };
-        let started = Instant::now();
-        let mut pending = Box::pin(invoker.invoke(invocation, cancellation.clone()));
-        assert!(poll!(pending.as_mut()).is_pending());
-        native_items
-            .register(binding("foreign", "foreign"))
-            .unwrap();
-        assert!(poll!(pending.as_mut()).is_pending());
-
-        cancellation.cancel();
-        assert!(matches!(
-            poll!(pending.as_mut()),
-            Poll::Ready(Err(TurnMcpInvocationError {
-                code: TurnMcpInvocationErrorCode::SessionBindingUnavailable,
-                ..
-            }))
-        ));
-        assert_eq!(Instant::now(), started);
-        drop(pending);
-
-        native_items.register(binding("own", "own")).unwrap();
-        advance(Duration::from_millis(250)).await;
-        let arguments = fingerprint("own");
-        let mut later = Box::pin(native_items.claim(CALLABLE, &arguments, "later-request"));
-        assert_eq!(poll!(later.as_mut()), Poll::Ready(Some(key("own"))));
+        let cancellation = CancellationToken::new();
+        let error = invoker
+            .invoke(invocation, cancellation.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            TurnMcpInvocationErrorCode::SessionBindingUnavailable
+        );
+        assert!(
+            native_items
+                .claim_codex_exact(
+                    &key,
+                    "test.echo",
+                    &fingerprint,
+                    "later-request",
+                    &cancellation,
+                    deadline
+                )
+                .unwrap()
+        );
     }
 }

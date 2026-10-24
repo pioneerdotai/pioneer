@@ -313,13 +313,22 @@ async fn prepare_messages_async(
         let fixture_catalog = state.as_ref().and_then(|s| s.catalog.clone());
         #[cfg(not(test))]
         let fixture_catalog: Option<Arc<crate::catalog::ModelCatalog>> = None;
-        let catalog = fixture_catalog
-            .map(Ok)
-            .unwrap_or_else(crate::catalog::model_catalog)
-            .context(MediaInputRejection(
-                "model catalog is unavailable; retry after catalog refresh",
-            ))?;
-        let entry = admission::effective_model(provider_name, model, &catalog);
+        let native = crate::generation::native_model(provider_name, model);
+        let entry = if native.is_some() {
+            native
+        } else if provider_name != "vercel-ai-gateway"
+            || crate::generation::uses_public_catalog(provider_name)
+        {
+            let catalog = fixture_catalog
+                .map(Ok)
+                .unwrap_or_else(crate::catalog::model_catalog)
+                .context(MediaInputRejection(
+                    "model catalog is unavailable; retry after catalog refresh",
+                ))?;
+            admission::effective_model(provider_name, model, &catalog)
+        } else {
+            None
+        };
         contracts::validate_effective_model_inputs_for_profile(
             provider_name,
             capabilities,

@@ -69,11 +69,25 @@ impl ProviderStreamDiagnostics {
     }
 }
 
+/// How live result text may be projected into the consumer UI. Semantic phase
+/// still comes exclusively from message events; previews never accept history.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProviderMessageDelivery {
+    /// Preserve the existing incremental result-item delivery.
+    #[default]
+    Incremental,
+    /// Show typed message text as previews and publish the result only after
+    /// successful request termination, including messages whose phase is already
+    /// known. StartProvisional also opts into this behavior when first observed.
+    Provisional,
+}
+
 /// A provider stream and its request-owned facts, consumed by agent deadlines.
 /// Facts do not produce chunks or reset the first/inter-chunk deadline.
 pub struct ProviderStream {
     pub stream: futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>,
     pub diagnostics: ProviderStreamDiagnostics,
+    pub message_delivery: ProviderMessageDelivery,
 }
 
 impl ProviderStream {
@@ -83,6 +97,7 @@ impl ProviderStream {
         Self {
             stream,
             diagnostics: ProviderStreamDiagnostics::default(),
+            message_delivery: ProviderMessageDelivery::default(),
         }
     }
 }
