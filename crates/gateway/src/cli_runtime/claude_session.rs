@@ -5684,8 +5684,10 @@ done
         let instance = claude_instance(temp.path().join("home").display().to_string());
         let mut selected = Vec::new();
         for name in [
+            "html",
             "tasks",
             "subagents",
+            "pioneer-system-html",
             "pioneer-system-tasks",
             "pioneer-system-subagents",
         ] {
@@ -5704,6 +5706,8 @@ done
             selected.push(selected_skill_fixture(&path, name));
         }
         let expected_names = [
+            "html",
+            "pioneer-system-html",
             "pioneer-system-subagents",
             "pioneer-system-tasks",
             "subagents",
@@ -5720,7 +5724,7 @@ done
             )
             .unwrap();
             let plugins = arg_values_after(&config.args, "--plugin-dir");
-            assert_eq!(plugins.len(), 4);
+            assert_eq!(plugins.len(), 6);
             let mut bindings = Vec::new();
             for (index, (plugin, name)) in plugins.iter().zip(expected_names).enumerate() {
                 let skill = selected

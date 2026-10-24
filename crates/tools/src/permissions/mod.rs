@@ -2214,6 +2214,7 @@ mod tests {
             .map(str::to_owned),
         );
 
+        assert_eq!(registered.len(), 68, "native tool inventory changed");
         let unknown = registered
             .iter()
             .filter(|name| {
@@ -2272,6 +2273,7 @@ mod tests {
             ("threads_tools_result_read", PermissionActionKind::Internal),
             ("threads_list", PermissionActionKind::Internal),
             ("threads_history_read", PermissionActionKind::Internal),
+            ("threads_search", PermissionActionKind::Internal),
             ("threads_children_list", PermissionActionKind::Internal),
             ("cua_click", PermissionActionKind::ComputerUse),
             ("cua_clipboard_read", PermissionActionKind::ComputerUse),
@@ -2330,6 +2332,7 @@ mod tests {
             .map(str::to_owned),
         );
 
+        assert_eq!(registered.len(), 68, "native tool inventory changed");
         assert_eq!(
             registered,
             expected_actions

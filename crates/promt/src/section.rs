@@ -176,6 +176,7 @@ pub enum PromptSectionId {
     UserPersona,
     ToolRecoveryPolicy,
     TaskOrchestrationPolicy,
+    HtmlPolicy,
     SubagentsPolicy,
     TasksPolicy,
     PioneerCliRuntimeInstructions,
@@ -206,6 +207,7 @@ impl PromptSectionId {
             Self::IdentityCore => "identity_core",
             Self::UserPersona => "user_persona",
             Self::ToolRecoveryPolicy => "tool_recovery_policy",
+            Self::HtmlPolicy => "html_policy",
             Self::TaskOrchestrationPolicy => "task_orchestration_policy",
             Self::SubagentsPolicy => "subagents_policy",
             Self::TasksPolicy => "tasks_policy",
@@ -239,6 +241,7 @@ impl PromptSectionId {
                 | "identity_core"
                 | "user_persona"
                 | "tool_recovery_policy"
+                | "html_policy"
                 | "task_orchestration_policy"
                 | "subagents_policy"
                 | "tasks_policy"

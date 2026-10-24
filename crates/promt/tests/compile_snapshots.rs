@@ -134,6 +134,7 @@ fn compile_continuation_prompt(
         retry_instruction: None,
         include_tool_recovery_policy: true,
         include_task_orchestration_policy: false,
+        include_html_policy: false,
         continue_generation_hint: true,
         runtime_sections: runtime_sections_with_request_tools_catalog(
             &[continuation_section],
@@ -216,6 +217,7 @@ fn assistant_full_snapshot() {
         retry_instruction: Some("retry with corrected arguments".to_owned()),
         include_tool_recovery_policy: true,
         include_task_orchestration_policy: false,
+        include_html_policy: false,
         continue_generation_hint: true,
         runtime_sections: Vec::new(),
         dynamic_sections: Vec::new(),
@@ -258,6 +260,7 @@ fn assistant_minimal_snapshot() {
         retry_instruction: None,
         include_tool_recovery_policy: true,
         include_task_orchestration_policy: false,
+        include_html_policy: false,
         continue_generation_hint: false,
         runtime_sections: Vec::new(),
         dynamic_sections: Vec::new(),
@@ -282,6 +285,7 @@ fn assistant_none_snapshot() {
         retry_instruction: Some("retry with corrected arguments".to_owned()),
         include_tool_recovery_policy: true,
         include_task_orchestration_policy: false,
+        include_html_policy: false,
         continue_generation_hint: true,
         runtime_sections: Vec::new(),
         dynamic_sections: Vec::new(),
@@ -311,6 +315,7 @@ fn native_delivery_plan_preserves_compiled_prompt_bytes_for_every_profile() {
             retry_instruction: Some("retry with corrected arguments".to_owned()),
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: true,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -368,7 +373,7 @@ For hidden tools, call request_tools to open their domain.
 Shared tools become visible when any listed domain opens.
 
 Domains:
-- threads: threads_tools_result_read, threads_list, threads_history_read, threads_children_list, threads_start_options, threads_identity_models_list, thread_message_send, thread_create, threads_turn_start.
+- threads: threads_tools_result_read, threads_list, threads_history_read, threads_search, threads_children_list, threads_start_options, threads_identity_models_list, thread_message_send, thread_create, threads_turn_start.
 - memory: memory_search, memory_list, memory_get, memory_remember, memory_forget.
 - task: threads_start_options, task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_finish, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
 - artifact: artifact_prepare, artifact_register, artifact_read.
@@ -434,7 +439,7 @@ For hidden tools, call request_tools to open their domain.
 Shared tools become visible when any listed domain opens.
 
 Domains:
-- threads: threads_tools_result_read, threads_list, threads_history_read, threads_children_list, threads_start_options, threads_identity_models_list, thread_message_send, thread_create, threads_turn_start.
+- threads: threads_tools_result_read, threads_list, threads_history_read, threads_search, threads_children_list, threads_start_options, threads_identity_models_list, thread_message_send, thread_create, threads_turn_start.
 - memory: memory_search, memory_list, memory_get, memory_remember, memory_forget.
 - task: threads_start_options, task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_finish, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
 - artifact: artifact_prepare, artifact_register, artifact_read.
@@ -494,6 +499,7 @@ fn continuation_window_facts_are_bounded() {
         retry_instruction: None,
         include_tool_recovery_policy: true,
         include_task_orchestration_policy: false,
+        include_html_policy: false,
         continue_generation_hint: true,
         runtime_sections: runtime_sections_with_request_tools_catalog(
             &[continuation_section],
@@ -532,6 +538,7 @@ fn truncation_snapshot() {
         retry_instruction: None,
         include_tool_recovery_policy: true,
         include_task_orchestration_policy: false,
+        include_html_policy: false,
         continue_generation_hint: false,
         runtime_sections: Vec::new(),
         dynamic_sections: Vec::new(),

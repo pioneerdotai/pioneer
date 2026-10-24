@@ -996,6 +996,26 @@ pub async fn list_all_capsules_for_workspace<C: ConnectionTrait>(
         })
 }
 
+/// Read the complete catalog in bounded quanta, releasing the reader between pages.
+pub async fn list_capsules_for_workspace_after<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    after: Option<&str>,
+    limit: u64,
+) -> Result<Vec<thread_episodic_capsules::Model>> {
+    let mut query = thread_episodic_capsules::Entity::find()
+        .filter(thread_episodic_capsules::Column::WorkspaceId.eq(workspace_id.to_owned()));
+    if let Some(after) = after {
+        query = query.filter(thread_episodic_capsules::Column::Id.gt(after.to_owned()));
+    }
+    query
+        .order_by_asc(thread_episodic_capsules::Column::Id)
+        .limit(limit)
+        .all(db)
+        .await
+        .context("failed to page thread episodic index catalog")
+}
+
 pub async fn delete_all_capsules<C: ConnectionTrait>(db: &C) -> Result<u64> {
     let result = thread_episodic_capsules::Entity::delete_many()
         .exec(db)

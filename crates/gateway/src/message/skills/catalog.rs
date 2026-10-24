@@ -454,8 +454,9 @@ impl MessageProcessor {
         attachments: &[crate::cli_runtime::skills::CliRuntimeSkillAttachment],
         mcp_availability: &pioneer_agent::AgentMcpAvailability,
         include_task_orchestration: bool,
+        include_html: bool,
     ) -> anyhow::Result<Vec<pioneer_skills::ResolvedSkill>> {
-        if attachments.is_empty() && !include_task_orchestration {
+        if attachments.is_empty() && !include_task_orchestration && !include_html {
             return Ok(Vec::new());
         }
         let context = self.skills_runtime_context(workspace_id)?;
@@ -496,8 +497,15 @@ impl MessageProcessor {
             &catalog,
             &resolution,
         )?;
-        if include_task_orchestration {
-            for slug in ["tasks", "subagents"] {
+        {
+            let mut required = Vec::new();
+            if include_task_orchestration {
+                required.extend(["tasks", "subagents"]);
+            }
+            if include_html {
+                required.push("html");
+            }
+            for slug in required {
                 let skill = resolution
                     .active
                     .iter()
@@ -506,9 +514,7 @@ impl MessageProcessor {
                             && skill.definition.identity.slug == slug
                     })
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "required CLI orchestration skill pioneer/{slug} is unavailable"
-                        )
+                        anyhow::anyhow!("required CLI system skill pioneer/{slug} is unavailable")
                     })?;
                 if !selected
                     .iter()

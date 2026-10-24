@@ -3575,7 +3575,6 @@ impl McpService {
         validated: &ValidatedTurnMcpInvocation,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<CanonicalMcpToolResult, TurnMcpInvocationError> {
-        use base64::Engine;
         let processor = self
             .inner
             .native_tool_processor
@@ -3588,7 +3587,7 @@ impl McpService {
                     "HTML Gateway handler is unavailable",
                 )
             })?;
-        // Includes all three image reads and MCP result construction, even if
+        // Includes all six image reads and MCP result construction, even if
         // terminal cancellation releases the durable runtime in parallel.
         let _activity = tokio::select! { biased;
             _ = cancel.cancelled() => return Err(TurnMcpInvocationError::new(
@@ -3629,72 +3628,18 @@ impl McpService {
                     bounded_invocation_diagnostic(&e.to_string()),
                 )
             })?;
-        let mut content = vec![json!({"type":"text","text":value.to_string()})];
-        if validated.invocation.canonical_callable_name == pioneer_tools::html::HTML_PREVIEW {
-            content.clear();
-            let images = value
-                .pointer("/llm_context/images")
-                .and_then(JsonValue::as_array)
-                .ok_or_else(|| {
-                    TurnMcpInvocationError::new(
-                        TurnMcpInvocationErrorCode::ResultInvalid,
-                        "three image references missing",
-                    )
-                })?;
-            if images.len() != 3
-                || images
-                    .iter()
-                    .zip(pioneer_tools::html::PREVIEW_WIDTHS)
-                    .any(|(image, width)| image["width"] != width)
-            {
-                return Err(TurnMcpInvocationError::new(
-                    TurnMcpInvocationErrorCode::ResultInvalid,
-                    "three ordered preview image references are required",
-                ));
-            }
-            let mut budget = crate::message::html_tools::screenshot_budget();
-            for image in images {
-                let artifact = &image["attachment"]["artifact"];
-                let reading = processor.artifact_service.read_bounded_artifact(
-                    pioneer_artifacts::ArtifactBoundedReadRequest {
-                        workspace_id: context.workspace_id.clone(),
-                        artifact_id: artifact["artifact_id"].as_str().unwrap_or_default().into(),
-                        version_id: artifact["artifact_version_id"].as_str().map(str::to_owned),
-                        projection_kind: None,
-                        offset: None,
-                        max_bytes: Some(budget as u64),
-                    },
-                    budget as u64,
-                );
-                let read = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return Err(TurnMcpInvocationError::new(
-                        TurnMcpInvocationErrorCode::Cancelled, "HTML image delivery was cancelled")),
-                    read = reading => read,
-                }.map_err(|_| {
-                        TurnMcpInvocationError::new(
-                            TurnMcpInvocationErrorCode::ResultInvalid,
-                            "exact screenshot read failed",
-                        )
-                    })?;
-                if read.truncated {
-                    return Err(TurnMcpInvocationError::new(
-                        TurnMcpInvocationErrorCode::ResourceExhausted,
-                        "preview images exceed transport budget",
-                    ));
-                }
-                budget = budget.saturating_sub(read.bytes.len());
-                content.push(
-                    json!({"type":"text","text":format!("HTML preview: {} CSS px",image["width"])}),
-                );
-                content.push(json!({"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(read.bytes)}));
-            }
-            value
-                .as_object_mut()
-                .expect("HTML result object")
-                .remove("llm_context");
-            content.push(json!({"type":"text","text":value.to_string()}));
-        }
+        let content =
+            if validated.invocation.canonical_callable_name == pioneer_tools::html::HTML_PREVIEW {
+                html_preview_mcp_content(
+                    &processor.artifact_service,
+                    &context.workspace_id,
+                    &mut value,
+                    &cancel,
+                )
+                .await?
+            } else {
+                vec![json!({"type":"text","text":value.to_string()})]
+            };
         if cancel.is_cancelled() {
             return Err(TurnMcpInvocationError::new(
                 TurnMcpInvocationErrorCode::Cancelled,
@@ -4545,6 +4490,93 @@ fn runtime_generation_seed() -> u64 {
         .unwrap_or(0)
 }
 
+/// Assemble the complete MCP media result while the caller holds HTML activity
+/// ownership. No partial content escapes on a failed exact read or cancellation.
+async fn html_preview_mcp_content(
+    artifacts: &pioneer_artifacts::ArtifactService,
+    workspace_id: &str,
+    value: &mut JsonValue,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Vec<JsonValue>, TurnMcpInvocationError> {
+    use base64::Engine;
+    let mut content = Vec::new();
+    let images = value
+        .pointer("/llm_context/images")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::ResultInvalid,
+                "preview image references missing",
+            )
+        })?;
+    if pioneer_tools::html::preview_image_layout(value).is_none() {
+        return Err(TurnMcpInvocationError::new(
+            TurnMcpInvocationErrorCode::ResultInvalid,
+            "six ordered preview image references are required",
+        ));
+    }
+    let mut identities = std::collections::HashSet::new();
+    let mut budget = crate::message::html_tools::screenshot_budget();
+    for image in images {
+        let artifact = &image["attachment"]["artifact"];
+        if artifact["artifact_version_id"]
+            .as_str()
+            .is_none_or(str::is_empty)
+            || !identities.insert((
+                artifact["artifact_id"].to_string(),
+                artifact["artifact_version_id"].to_string(),
+            ))
+        {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::ResultInvalid,
+                "distinct exact screenshot versions are required",
+            ));
+        }
+        let reading = artifacts.read_bounded_artifact(
+            pioneer_artifacts::ArtifactBoundedReadRequest {
+                workspace_id: workspace_id.to_owned(),
+                artifact_id: artifact["artifact_id"].as_str().unwrap_or_default().into(),
+                version_id: artifact["artifact_version_id"].as_str().map(str::to_owned),
+                projection_kind: None,
+                offset: None,
+                max_bytes: Some(budget as u64),
+            },
+            budget as u64,
+        );
+        let read = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::Cancelled, "HTML image delivery was cancelled")),
+            read = reading => read,
+        }
+        .map_err(|_| {
+            TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::ResultInvalid,
+                "exact screenshot read failed",
+            )
+        })?;
+        if read.truncated {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::ResourceExhausted,
+                "preview images exceed transport budget",
+            ));
+        }
+        budget = budget.saturating_sub(read.bytes.len());
+        let caption = match image["appearance"].as_str() {
+            Some(appearance) => format!("HTML preview: {appearance} {} CSS px", image["width"]),
+            None => format!("HTML preview: {} CSS px", image["width"]),
+        };
+        content.push(json!({"type":"text","text":caption}));
+        content.push(json!({"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(read.bytes)}));
+    }
+    value
+        .as_object_mut()
+        .expect("HTML result object")
+        .remove("llm_context");
+    content.push(json!({"type":"text","text":value.to_string()}));
+    Ok(content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4580,9 +4612,450 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use tokio_util::sync::CancellationToken;
 
+    #[tokio::test]
+    async fn html_mcp_projects_six_exact_pngs_and_diagnostics_atomically() {
+        use base64::Engine;
+        use pioneer_artifacts::{
+            ArtifactService, IngestArtifactBytesRequest, LocalArtifactBlobStore,
+        };
+        let (_mcp, store, workspace, _secrets) = test_mcp_service_with_secrets().await;
+        let root = tempfile::tempdir().unwrap();
+        let artifacts =
+            ArtifactService::new(store, Arc::new(LocalArtifactBlobStore::new(root.path())));
+        // Match the production caller's retention protection across every read.
+        let _activity = artifacts.html_preview_activity().await;
+        let frames = [
+            ("light", 360u32),
+            ("light", 768),
+            ("light", 1024),
+            ("dark", 360),
+            ("dark", 768),
+            ("dark", 1024),
+        ];
+        let mut images = Vec::new();
+        let mut previews = Vec::new();
+        let mut expected_pngs = Vec::new();
+        for (index, (appearance, width)) in frames.into_iter().enumerate() {
+            let mut encoded = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                width,
+                1,
+                image::Rgba([index as u8 * 30, 10, 200, 255]),
+            ))
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+            let png = encoded.into_inner();
+            let summary = artifacts.ingest_bytes(IngestArtifactBytesRequest {
+                workspace_id: workspace.clone(), primary_thread_id: None,
+                bytes: png.clone(), display_name: format!("{appearance}-{width}.png"),
+                kind: pioneer_protocol::ArtifactKind::Screenshot, mime_type: Some("image/png".into()),
+                created_by_kind: pioneer_protocol::ArtifactCreatedByKind::Tool,
+                created_by_actor_id: Some("html_preview".into()), binding: None,
+                metadata: BTreeMap::from([("htmlTool".into(), json!({"version":2,"publication":false,
+                    "turnId":"fixture-turn","callId":"fixture-call","index":format!("{appearance}-{width}")}))]),
+            }).await.unwrap();
+            let resolved = artifacts
+                .resolve_provider_attachment(
+                    &workspace,
+                    &summary.artifact.artifact_id,
+                    summary.artifact.version_id.as_deref(),
+                )
+                .await
+                .unwrap();
+            images.push(
+                json!({"appearance":appearance,"width":width,"attachment":resolved.attachment}),
+            );
+            previews.push(json!({"appearance":appearance,"width":width,"contentHeight":1,"capturedHeight":1,
+                "diagnostics":[format!("diagnostic-{appearance}-{width}")],"artifact":summary.artifact}));
+            expected_pngs.push(png);
+        }
+        let payload =
+            json!({"formatVersion":2,"previews":previews,"llm_context":{"images":images}});
+        let mut delivered = payload.clone();
+        let content = html_preview_mcp_content(
+            &artifacts,
+            &workspace,
+            &mut delivered,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(content.len(), 13);
+        for (index, (appearance, width)) in frames.into_iter().enumerate() {
+            assert_eq!(
+                content[index * 2],
+                json!({"type":"text","text":format!("HTML preview: {appearance} {width} CSS px")})
+            );
+            assert_eq!(content[index * 2 + 1]["type"], "image");
+            assert_eq!(content[index * 2 + 1]["mimeType"], "image/png");
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(content[index * 2 + 1]["data"].as_str().unwrap())
+                    .unwrap(),
+                expected_pngs[index]
+            );
+        }
+        assert!(delivered.get("llm_context").is_none());
+        assert_eq!(delivered["previews"], payload["previews"]);
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(content[12]["text"].as_str().unwrap()).unwrap(),
+            delivered
+        );
+
+        // Recorded legacy wire captions must remain byte-for-byte stable.
+        let mut legacy = payload.clone();
+        legacy.as_object_mut().unwrap().remove("formatVersion");
+        legacy["previews"].as_array_mut().unwrap().truncate(3);
+        for preview in legacy["previews"].as_array_mut().unwrap() {
+            preview.as_object_mut().unwrap().remove("appearance");
+        }
+        legacy["llm_context"]["images"]
+            .as_array_mut()
+            .unwrap()
+            .truncate(3);
+        for entry in legacy["llm_context"]["images"].as_array_mut().unwrap() {
+            entry.as_object_mut().unwrap().remove("appearance");
+        }
+        let legacy_content = html_preview_mcp_content(
+            &artifacts,
+            &workspace,
+            &mut legacy,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        for (index, width) in [360, 768, 1024].into_iter().enumerate() {
+            assert_eq!(
+                legacy_content[index * 2],
+                json!({"type":"text","text":format!("HTML preview: {width} CSS px")})
+            );
+        }
+
+        // Shape failure is rejected, never treated as a legacy or partial result.
+        let mut incomplete = payload.clone();
+        incomplete["llm_context"]["images"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        let original = incomplete.clone();
+        let error = html_preview_mcp_content(
+            &artifacts,
+            &workspace,
+            &mut incomplete,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, TurnMcpInvocationErrorCode::ResultInvalid);
+        assert_eq!(incomplete, original);
+
+        // A real but foreign version id cannot silently fall back to the last
+        // artifact's current bytes after five successful image reads.
+        let mut wrong_version = payload.clone();
+        wrong_version["llm_context"]["images"][5]["attachment"]["artifact"]["artifact_version_id"] =
+            payload["llm_context"]["images"][0]["attachment"]["artifact"]["artifact_version_id"]
+                .clone();
+        let original = wrong_version.clone();
+        let error = html_preview_mcp_content(
+            &artifacts,
+            &workspace,
+            &mut wrong_version,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, TurnMcpInvocationErrorCode::ResultInvalid);
+        assert_eq!(wrong_version, original);
+    }
+
+    #[tokio::test]
+    async fn frozen_legacy_html_session_recovers_and_invokes_retained_three_frame_preview() {
+        use crate::cli_runtime::codex_mcp::build_codex_mcp_session_launch_projection;
+        use crate::cli_runtime::continuation::CliMcpSessionLaunch;
+        use crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits;
+        use crate::cli_runtime::mcp::recovery::restore_cli_mcp_session_launch;
+        use crate::turn_mcp::persistence::TurnMcpProviderBindingIdentity;
+        use crate::turn_mcp::projection::ResolvedMcpTurnTool;
+        use base64::Engine;
+        use pioneer_artifacts::{
+            ArtifactService, IngestArtifactBytesRequest, LocalArtifactBlobStore,
+        };
+        use pioneer_tools::html::{HTML_PREVIEW, HTML_SERVER_ID, HTML_SERVER_NAME};
+
+        // This is the actual pre-six-preview contract copied from the original base,
+        // including description and appearance, not a modification of today's schema.
+        let recorded = pioneer_tools::html::legacy_preview_definition();
+        let limits = McpProjectionLimits::default();
+        let facade_limits = CliMcpFacadeProjectionLimits::transport_bounded(limits.max_tools);
+        for changed_schema in [false, true] {
+            let (service, store, workspace, _secrets) = test_mcp_service_with_secrets().await;
+            let thread = "T00000000000000000001";
+            let turn = "U00000000000000000001";
+            seed_started_turn(&store, &workspace, thread, turn).await;
+            let mut schema = recorded["inputSchema"].clone();
+            if changed_schema {
+                schema["properties"]["html"]["maxLength"] = json!(512001);
+            }
+            let mut projection = ResolvedMcpTurnProjection::empty(&workspace, turn);
+            projection.tools.push(ResolvedMcpTurnTool {
+                canonical_callable_name: String::new(),
+                workspace_id: workspace.clone(),
+                server_installation_id: HTML_SERVER_ID.into(),
+                server_name: HTML_SERVER_NAME.into(),
+                raw_tool_name: HTML_PREVIEW.into(),
+                description: Some(recorded["description"].as_str().unwrap().into()),
+                input_schema: schema,
+                annotations: None,
+                timeout_ms: 120_000,
+                catalog_version: HTML_SERVER_ID.into(),
+                installation_fingerprint: HTML_SERVER_ID.into(),
+                schema_fingerprint: String::new(),
+                runtime_generation: 1,
+                selection_reason: crate::turn_mcp::McpSelectionReason::ImplicitPolicy,
+                capability_id: None,
+            });
+            projection.finalize_identity(limits).unwrap();
+            if !changed_schema {
+                assert_eq!(projection.tools[0].canonical_callable_name, HTML_PREVIEW);
+                let mut forged_description = projection.tools[0].clone();
+                forged_description.description = Some("different first-party contract".into());
+                assert!(
+                    crate::turn_mcp::native_tools::exact_definition(&forged_description).is_none()
+                );
+            }
+            let original =
+                build_codex_mcp_session_launch_projection(projection.clone(), "a".repeat(64))
+                    .unwrap();
+            let facade_fingerprint = original
+                .facade_projection(facade_limits)
+                .unwrap()
+                .fingerprint()
+                .as_str()
+                .to_owned();
+            let provider_bindings = original
+                .preflight
+                .tools
+                .iter()
+                .map(|tool| TurnMcpProviderBindingIdentity {
+                    canonical_callable_name: tool.canonical_callable_name.clone(),
+                    provider_callable_name: format!(
+                        "mcp__pioneer__{}",
+                        tool.canonical_callable_name
+                    ),
+                    provider_schema_fingerprint: tool.transformed_schema_fingerprint.clone(),
+                })
+                .collect::<Vec<_>>();
+            service
+                .persist_cli_resolved_mcp_turn_projection(&projection, &provider_bindings)
+                .await
+                .unwrap();
+            let frozen_bindings = store.list_turn_mcp_bindings(turn).await.unwrap();
+            let now = chrono::Utc::now().fixed_offset();
+            store
+                .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+                    turn_id: turn.into(),
+                    thread_id: thread.into(),
+                    continuation_thread_id: thread.into(),
+                    workspace_id: workspace.clone(),
+                    runtime_id: "runtime-codex".into(),
+                    runtime_kind: "codex".into(),
+                    native_thread_id: "native-thread".into(),
+                    native_turn_id: Some("native-turn".into()),
+                    request_id: None,
+                    status: "running".into(),
+                    model: None,
+                    cwd: None,
+                    sandbox_json: None,
+                    approval_policy: None,
+                    input_mapping_json: "{}".into(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await
+                .unwrap();
+            store
+                .set_cli_runtime_turn_mcp_metadata(
+                    turn,
+                    Some(CliRuntimeTurnMcpMetadata {
+                        adapter_kind: "codex_synthetic_mcp".into(),
+                        manifest_hash: projection.manifest_hash.clone(),
+                        projection_fingerprint: facade_fingerprint.clone(),
+                        provider_contract_fingerprint: "a".repeat(64),
+                        isolation_contract_fingerprint: original
+                            .semantic_restart_fingerprint()
+                            .into(),
+                        session_generation: 1,
+                        projection_activation_generation: frozen_bindings[0]
+                            .projection_activation_generation,
+                    }),
+                )
+                .await
+                .unwrap();
+            let session = store
+                .get_cli_runtime_turn_binding(turn)
+                .await
+                .unwrap()
+                .unwrap();
+            let restored = restore_cli_mcp_session_launch(
+                &store,
+                &service,
+                &session,
+                pioneer_protocol::CLIAgentRuntimeKind::Codex,
+                limits,
+            )
+            .await;
+            if changed_schema {
+                // Do not let the changed schema's prefixed projection name mask
+                // a permissive fingerprint fallback: the original raw callable
+                // with this unknown fingerprint must also fail identity lookup.
+                let mut unknown = frozen_bindings[0].clone();
+                unknown.canonical_callable_name = HTML_PREVIEW.into();
+                unknown.callable_name = HTML_PREVIEW.into();
+                assert_eq!(
+                    crate::turn_mcp::native_tools::current_identity(&workspace, &unknown)
+                        .unwrap_err()
+                        .code,
+                    TurnMcpInvocationErrorCode::ToolDrift,
+                );
+                assert!(
+                    format!("{:#}", restored.unwrap_err())
+                        .contains(TurnMcpInvocationErrorCode::ToolDrift.as_str())
+                );
+                continue;
+            }
+            let CliMcpSessionLaunch::Codex(restored) = restored.unwrap() else {
+                panic!("Codex expected")
+            };
+            // Includes the original input schema, fingerprint, description and raw
+            // callable. Recovery must not rewrite the durable bindings or manifest.
+            assert_eq!(restored.canonical_projection, projection);
+            assert_eq!(restored.preflight, original.preflight);
+            assert_eq!(
+                restored.semantic_restart_fingerprint(),
+                original.semantic_restart_fingerprint()
+            );
+            assert_eq!(
+                restored
+                    .facade_projection(facade_limits)
+                    .unwrap()
+                    .fingerprint()
+                    .as_str(),
+                facade_fingerprint
+            );
+            assert_eq!(
+                store.list_turn_mcp_bindings(turn).await.unwrap(),
+                frozen_bindings
+            );
+            assert_eq!(
+                store
+                    .get_turn_mcp_projection(turn)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .manifest_hash,
+                projection.manifest_hash
+            );
+
+            let root = tempfile::tempdir().unwrap();
+            let artifacts = Arc::new(ArtifactService::new(
+                store.clone(),
+                Arc::new(LocalArtifactBlobStore::new(root.path())),
+            ));
+            let mut previews = Vec::new();
+            let mut images = Vec::new();
+            let mut pngs = Vec::new();
+            for (index, width) in [360u32, 768, 1024].into_iter().enumerate() {
+                let mut encoded = std::io::Cursor::new(Vec::new());
+                image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                    width,
+                    1,
+                    image::Rgba([index as u8 * 60, 10, 200, 255]),
+                ))
+                .write_to(&mut encoded, image::ImageFormat::Png)
+                .unwrap();
+                let png = encoded.into_inner();
+                let summary = artifacts
+                    .ingest_bytes(IngestArtifactBytesRequest {
+                        workspace_id: workspace.clone(),
+                        primary_thread_id: Some(thread.into()),
+                        bytes: png.clone(),
+                        display_name: format!("legacy-{width}.png"),
+                        kind: pioneer_protocol::ArtifactKind::Screenshot,
+                        mime_type: Some("image/png".into()),
+                        created_by_kind: pioneer_protocol::ArtifactCreatedByKind::Tool,
+                        created_by_actor_id: Some(HTML_PREVIEW.into()),
+                        binding: None,
+                        metadata: BTreeMap::from([(
+                            "htmlTool".into(),
+                            json!({"version":1,"publication":false,
+                        "turnId":turn,"callId":"legacy-preview-call","index":width.to_string()}),
+                        )]),
+                    })
+                    .await
+                    .unwrap();
+                let resolved = artifacts
+                    .resolve_provider_attachment(
+                        &workspace,
+                        &summary.artifact.artifact_id,
+                        summary.artifact.version_id.as_deref(),
+                    )
+                    .await
+                    .unwrap();
+                images.push(json!({"width":width,"attachment":resolved.attachment}));
+                previews.push(json!({"width":width,"contentHeight":1,"capturedHeight":1,
+                    "diagnostics":[format!("legacy-{width}")],"artifact":summary.artifact}));
+                pngs.push(png);
+            }
+            // The existing execution seam supplies retained v1 output. Real invocation
+            // validation and real exact-version MCP image reads run on either side;
+            // this test never captures or regenerates a legacy frame in a browser.
+            let payload = json!({"previews":previews,"llm_context":{"images":images}});
+            let execution = Arc::new(TestValidatedMcpExecution {
+                replay: Some((artifacts, payload.clone())),
+                ..Default::default()
+            });
+            let invoker = GatewayTurnMcpInvoker::new(
+                store.clone(),
+                Arc::new(service.clone()),
+                execution.clone(),
+                service.inner.authorization_invalidation_hub.clone(),
+                service.inner.execution_leases.clone(),
+                service.inner.invocation_governor.clone(),
+            );
+            let result = invoker.invoke(TurnMcpInvocation {
+                workspace_id: workspace.clone(), thread_id: thread.into(), turn_id: turn.into(),
+                runtime_id: Some("runtime-codex".into()), session_generation: Some(1),
+                provider_call_id: "legacy-preview-call".into(), native_call: None, admission_deadline: None,
+                canonical_callable_name: HTML_PREVIEW.into(),
+                arguments: json!({"html":"<!doctype html><html></html>","appearance":"dark"}),
+                origin: TurnMcpInvocationOrigin::CliFacade,
+            }, CancellationToken::new()).await.unwrap();
+            assert_eq!(execution.calls.load(Ordering::SeqCst), 1);
+            assert!(!result.is_error);
+            assert_eq!(result.content.as_array().unwrap().len(), 7);
+            for (index, width) in [360, 768, 1024].into_iter().enumerate() {
+                assert_eq!(
+                    result.content[index * 2]["text"],
+                    format!("HTML preview: {width} CSS px")
+                );
+                assert_eq!(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(result.content[index * 2 + 1]["data"].as_str().unwrap())
+                        .unwrap(),
+                    pngs[index]
+                );
+            }
+            assert_eq!(
+                result.structured_content.unwrap()["previews"],
+                payload["previews"]
+            );
+        }
+    }
+
     #[derive(Default)]
     struct TestValidatedMcpExecution {
         calls: AtomicUsize,
+        replay: Option<(Arc<pioneer_artifacts::ArtifactService>, JsonValue)>,
     }
 
     struct CountingPermissionApprovalBroker {
@@ -4653,6 +5126,24 @@ mod tests {
                 u64::try_from(validated.binding.runtime_generation).unwrap()
             );
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some((artifacts, retained)) = &self.replay {
+                let _activity = artifacts.html_preview_activity().await;
+                let mut value = retained.clone();
+                let content = html_preview_mcp_content(
+                    artifacts,
+                    &validated.invocation.workspace_id,
+                    &mut value,
+                    &cancellation,
+                )
+                .await?;
+                return Ok(CanonicalMcpToolResult {
+                    content: JsonValue::Array(content),
+                    structured_content: Some(value),
+                    is_error: false,
+                    duration_ms: 1,
+                    meta: None,
+                });
+            }
             Ok(CanonicalMcpToolResult {
                 content: json!([{"type": "text", "text": "validated"}]),
                 structured_content: None,

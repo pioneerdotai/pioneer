@@ -43,6 +43,25 @@ pub fn project_tool_result(input: ToolProjectionInput<'_>) -> ToolResultEnvelope
     }
 }
 
+/// Measure a successful built-in JSON result using its complete LLM projection.
+pub fn builtin_json_llm_payload_size(
+    tool_name: &str,
+    value: &JsonValue,
+) -> serde_json::Result<usize> {
+    let projection = project_tool_result(ToolProjectionInput {
+        call_id: "",
+        tool_name,
+        arguments: &JsonValue::Null,
+        raw_output_text: "",
+        raw_output_json: value,
+        success: true,
+        outcome: &ToolOutcome::ok(),
+        output_policy: &ToolOutputPolicySnapshot::for_tool_name(tool_name),
+        output_projection: &ToolOutputProjectionKind::Builtin,
+    });
+    Ok(serde_json::to_vec(&projection.llm_payload())?.len())
+}
+
 fn project_builtin(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
     match input.tool_name {
         "exec_command" | "write_stdin" => project_shell(input),

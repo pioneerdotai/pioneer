@@ -68,6 +68,7 @@ impl NativeToolFamily {
             Self::ComputerUse => &[],
             Self::Threads => THREADS.get_or_init(|| {
                 let mut specs = crate::message::thread_read_tools::thread_read_tool_specs();
+                specs.extend(crate::message::thread_search_tools::thread_search_tool_specs());
                 specs.extend(crate::message::thread_tool_results::thread_result_tool_specs());
                 let capabilities = [
                     pioneer_protocol::AgentToolCapability::ChildStart,
@@ -150,7 +151,8 @@ impl NativeToolFamily {
     pub(crate) fn is_thread_reader(self, name: &str) -> bool {
         self == Self::Threads
             && (crate::message::thread_read_tools::THREAD_READ_TOOL_NAMES.contains(&name)
-                || name == "threads_tools_result_read")
+                || name == "threads_tools_result_read"
+                || name == "threads_search")
     }
 
     pub(crate) fn timeout_ms(self, name: &str) -> u64 {
@@ -165,6 +167,23 @@ impl NativeToolFamily {
     }
 }
 
+// A frozen binding identifies the immutable schema, not the latest catalog.
+// Keep its description too: exact_definition controls the unprefixed callable.
+fn legacy_html_preview_spec() -> &'static ToolSpec {
+    static LEGACY: std::sync::OnceLock<ToolSpec> = std::sync::OnceLock::new();
+    LEGACY.get_or_init(|| {
+        let definition = pioneer_tools::html::legacy_preview_definition();
+        ToolSpec::new(
+            pioneer_tools::html::HTML_PREVIEW,
+            definition["description"]
+                .as_str()
+                .expect("recorded description"),
+            definition["inputSchema"].clone(),
+            PayloadKind::Function,
+        )
+    })
+}
+
 pub(crate) fn exact_definition(tool: &ResolvedMcpTurnTool) -> Option<NativeToolFamily> {
     let family = NativeToolFamily::from_server_id(&tool.server_installation_id)?;
     (tool.server_name == family.server_name()
@@ -173,11 +192,15 @@ pub(crate) fn exact_definition(tool: &ResolvedMcpTurnTool) -> Option<NativeToolF
         && tool.runtime_generation == 1
         && tool.timeout_ms == family.timeout_ms(&tool.raw_tool_name)
         && tool.annotations.is_none()
-        && family.catalog().iter().any(|spec| {
+        && (family.catalog().iter().any(|spec| {
             spec.spec.name == tool.raw_tool_name
                 && spec.spec.parameters == tool.input_schema
                 && tool.description.as_deref() == Some(spec.spec.description.as_str())
-        }))
+        }) || (family == NativeToolFamily::Html
+            && tool.raw_tool_name == pioneer_tools::html::HTML_PREVIEW
+            && legacy_html_preview_spec().parameters == tool.input_schema
+            && tool.description.as_deref()
+                == Some(legacy_html_preview_spec().description.as_str()))))
     .then_some(family)
 }
 
@@ -215,15 +238,28 @@ pub(crate) fn current_identity(
     };
     let family =
         NativeToolFamily::from_server_id(&binding.server_installation_id).ok_or_else(drift)?;
-    let spec = family
+    let mut spec = family
         .catalog()
         .iter()
         .find(|spec| spec.spec.name == binding.raw_tool_name)
         .ok_or_else(drift)?
         .spec
         .clone();
-    let (schema, fingerprint, _) =
+    let (mut schema, mut fingerprint, _) =
         canonical_schema_identity(&spec.parameters).map_err(|_| drift())?;
+    if binding.canonical_schema_fingerprint != fingerprint
+        && family == NativeToolFamily::Html
+        && binding.raw_tool_name == pioneer_tools::html::HTML_PREVIEW
+    {
+        let legacy = legacy_html_preview_spec();
+        let (legacy_schema, legacy_fingerprint, _) =
+            canonical_schema_identity(&legacy.parameters).map_err(|_| drift())?;
+        if binding.canonical_schema_fingerprint == legacy_fingerprint {
+            spec = legacy.clone();
+            schema = legacy_schema;
+            fingerprint = legacy_fingerprint;
+        }
+    }
     if workspace_id.is_empty()
         || binding.server_name != family.server_name()
         || binding.catalog_version != family.server_id()
@@ -311,6 +347,7 @@ pub(crate) fn materialize_thread_tools(
 ) -> Vec<pioneer_tools::ToolExtensionBundle> {
     vec![
         processor.thread_read_tools(context.clone()),
+        processor.thread_search_tools(context.clone()),
         processor.thread_result_tools(context),
     ]
 }
@@ -320,6 +357,22 @@ mod tests {
     use super::*;
     use crate::turn_mcp::{McpSelectionReason, ResolvedMcpTurnProjection};
     use serde_json::json;
+
+    #[test]
+    fn search_is_a_thread_reader_with_a_bounded_page_and_unbounded_query_schema() {
+        let spec = NativeToolFamily::Threads
+            .definitions()
+            .into_iter()
+            .find(|spec| spec.spec.name == "threads_search")
+            .unwrap();
+        assert_eq!(
+            NativeToolFamily::Threads.action("threads_search").unwrap(),
+            ResourceAction::ThreadRead
+        );
+        let properties = &spec.spec.parameters["properties"];
+        assert_eq!(properties["limit"]["maximum"], 100);
+        assert!(properties["query"].get("maxLength").is_none());
+    }
 
     #[test]
     fn every_provider_preserves_native_catalog_with_full_external_allowance() {

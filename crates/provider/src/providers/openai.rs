@@ -2652,12 +2652,12 @@ mod html_preview_contract_tests {
             if replay {
                 request
                     .messages
-                    .push(ChatMessage::user("Explain the three captures"));
+                    .push(ChatMessage::user("Explain the six captures"));
             }
             let budget = scoped(state.clone(), provider.prepare_input_budget(request))
                 .await
                 .unwrap();
-            assert_eq!(budget.media.len(), 3);
+            assert_eq!(budget.media.len(), 6);
             assert!(budget.media.iter().all(|media| media.message == 3));
             assert_eq!(
                 budget
@@ -2665,7 +2665,7 @@ mod html_preview_contract_tests {
                     .iter()
                     .map(|media| media.part)
                     .collect::<Vec<_>>(),
-                vec![1, 3, 5]
+                vec![1, 3, 5, 7, 9, 11]
             );
             let mut prepared = scoped(
                 state.clone(),
@@ -2679,8 +2679,15 @@ mod html_preview_contract_tests {
             .await
             .unwrap();
             crate::tools::policy::prepare_history(provider.name(), &mut prepared.messages).unwrap();
-            assert_eq!(prepared.attachments.len(), 3);
-            for (attachment, width) in prepared.attachments.iter().zip([360, 768, 1024]) {
+            assert_eq!(prepared.attachments.len(), 6);
+            for (attachment, (appearance, width)) in prepared.attachments.iter().zip([
+                ("light", 360),
+                ("light", 768),
+                ("light", 1024),
+                ("dark", 360),
+                ("dark", 768),
+                ("dark", 1024),
+            ]) {
                 assert_eq!(attachment.message_index, 3);
                 assert_eq!(
                     attachment
@@ -2689,7 +2696,7 @@ mod html_preview_contract_tests {
                         .unwrap()
                         .artifact_version_id
                         .as_deref(),
-                    Some(format!("version-{width}").as_str())
+                    Some(format!("version-{appearance}-{width}").as_str())
                 );
             }
             let wire =
@@ -2716,7 +2723,7 @@ mod html_preview_contract_tests {
                     .contains("resource load error")
             );
             let parts = wire[3]["content"].as_array().unwrap();
-            assert_eq!(parts.iter().filter(|p| p["type"] == "image_url").count(), 3);
+            assert_eq!(parts.iter().filter(|p| p["type"] == "image_url").count(), 6);
             assert!(parts.iter().filter(|p| p["type"] == "image_url").all(|p| {
                 p["image_url"]["url"]
                     .as_str()
@@ -2724,8 +2731,10 @@ mod html_preview_contract_tests {
                     .starts_with("data:image/png;base64,")
             }));
             let caption = parts[0]["text"].as_str().unwrap();
-            for width in [360, 768, 1024] {
-                assert!(caption.contains(&format!("{width} CSS px")));
+            for appearance in ["light", "dark"] {
+                for width in [360, 768, 1024] {
+                    assert!(caption.contains(&format!("{appearance}, {width} CSS px")));
+                }
             }
         }
         assert_eq!(serde_json::to_value(&canonical.messages).unwrap(), before);

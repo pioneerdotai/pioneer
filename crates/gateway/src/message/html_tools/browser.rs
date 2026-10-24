@@ -48,6 +48,7 @@ const INITIAL_LOAD: &str = "<script>Object.defineProperty(window,'__pioneerIniti
 const DOCUMENT_EXTENT: &str = "(()=>{const b=document.body;if(!b)return 1;const r=b.getBoundingClientRect();let bottom=Math.max(1,r.bottom+scrollY,r.top+scrollY+b.scrollHeight);for(const e of b.children)bottom=Math.max(bottom,e.getBoundingClientRect().bottom+scrollY);return Math.ceil(bottom)})()";
 
 pub(super) struct Capture {
+    pub appearance: &'static str,
     pub width: u32,
     pub content_height: u64,
     pub captured_height: u32,
@@ -350,7 +351,6 @@ impl Drop for CancelOnDrop {
 
 pub(super) async fn capture(
     html: &str,
-    dark: bool,
     scratch_root: &Path,
     cancel: &CancellationToken,
 ) -> Result<Vec<Capture>> {
@@ -360,12 +360,11 @@ pub(super) async fn capture(
     let _guard = CancelOnDrop(local.clone());
     let html = html.to_owned();
     let scratch = scratch_root.to_owned();
-    tokio::spawn(async move { capture_owned(&html, dark, &scratch, &local).await }).await?
+    tokio::spawn(async move { capture_owned(&html, &scratch, &local).await }).await?
 }
 
 async fn capture_owned(
     html: &str,
-    dark: bool,
     scratch_root: &Path,
     cancel: &CancellationToken,
 ) -> Result<Vec<Capture>> {
@@ -416,7 +415,6 @@ async fn capture_owned(
         .stderr()
         .take()
         .context("browser stderr unavailable")?;
-    let document = super::prepared_document(&format!("{INITIAL_LOAD}{html}"), dark);
     let operation = async {
         let mut reader = BufReader::new(stderr);
         let mut endpoint = None;
@@ -456,9 +454,11 @@ async fn capture_owned(
             diagnostics: Vec::new(),
             diagnostic_bytes: 0,
         };
-        let mut captures = Vec::with_capacity(3);
+        let mut captures = Vec::with_capacity(6);
         let mut bytes_left = SCREENSHOT_BUDGET;
-        for width in pioneer_tools::html::PREVIEW_WIDTHS {
+        for (appearance, width) in pioneer_tools::html::PREVIEW_FRAMES {
+            let dark = appearance == "dark";
+            let document = super::prepared_document(&format!("{INITIAL_LOAD}{html}"), dark);
             cdp.diagnostics.clear();
             cdp.diagnostic_bytes = 0;
             let context = cdp
@@ -535,20 +535,21 @@ async fn capture_owned(
             let screenshot = cdp.call("Page.captureScreenshot", json!({"format":"png","captureBeyondViewport":true,"clip":{"x":0,"y":0,"width":width,"height":height,"scale":1}}), Some(session)).await?;
             let encoded = screenshot["data"].as_str().context("screenshot missing")?;
             if encoded.len() > bytes_left.saturating_mul(4) / 3 + 4 {
-                bail!("three preview images exceed the shared transport budget");
+                bail!("six preview images exceed the shared transport budget");
             }
             let png = base64::engine::general_purpose::STANDARD.decode(encoded)?;
             bytes_left = bytes_left
                 .checked_sub(png.len())
-                .context("three preview images exceed the shared transport budget")?;
+                .context("six preview images exceed the shared transport budget")?;
             if cdp.diagnostic_bytes >= MAX_DIAGNOSTICS {
                 cdp.diagnostics
-                    .push("Console/page diagnostics truncated at the per-width budget".into());
+                    .push("Console/page diagnostics truncated at the per-frame budget".into());
             }
             if content_height > u64::from(height) {
                 cdp.diagnostics.push(format!("Screenshot truncated at {height}px; document is {content_height}px. Publication height is unaffected."));
             }
             captures.push(Capture {
+                appearance,
                 width,
                 content_height,
                 captured_height: height,
@@ -640,10 +641,19 @@ mod tests {
         let html = format!(
             r#"<style>body{{position:relative;top:100px}}#content{{height:10px}}img{{display:none}}</style><div id='content'>Page</div><img src='http://{address}/slow.svg' onload="document.getElementById('content').style.height='260px';console.log('initial-image',innerWidth)"><img src='http://{address}/missing.svg' onerror="console.error('initial-error',innerWidth)"><script src='http://{address}/slow.js'></script>"#
         );
-        let captures = capture(&html, true, scratch.path(), &CancellationToken::new())
+        let captures = capture(&html, scratch.path(), &CancellationToken::new())
             .await
             .unwrap();
-        for (capture, width) in captures.iter().zip([360, 768, 1024]) {
+        assert_eq!(captures.len(), 6);
+        for (capture, (appearance, width)) in captures.iter().zip([
+            ("light", 360),
+            ("light", 768),
+            ("light", 1024),
+            ("dark", 360),
+            ("dark", 768),
+            ("dark", 1024),
+        ]) {
+            assert_eq!(capture.appearance, appearance);
             assert_eq!(capture.content_height, 360);
             assert_eq!(
                 u32::from_be_bytes(capture.png[20..24].try_into().unwrap()),
@@ -666,7 +676,7 @@ mod tests {
         let child_cancel = cancel.clone();
         let root = scratch.path().to_owned();
         let pending =
-            tokio::spawn(async move { capture(&blocked_html, true, &root, &child_cancel).await });
+            tokio::spawn(async move { capture(&blocked_html, &root, &child_cancel).await });
         tokio::time::timeout(Duration::from_secs(10), blocked.notified())
             .await
             .unwrap();
@@ -682,15 +692,10 @@ mod tests {
                 .contains("cancel")
         );
         let timeout_html = format!("<img src='http://{address}/blocked'>");
-        let error = capture(
-            &timeout_html,
-            true,
-            scratch.path(),
-            &CancellationToken::new(),
-        )
-        .await
-        .err()
-        .expect("initial load must time out");
+        let error = capture(&timeout_html, scratch.path(), &CancellationToken::new())
+            .await
+            .err()
+            .expect("initial load must time out");
         assert!(
             error
                 .to_string()
@@ -705,11 +710,19 @@ mod tests {
         let _fixture = BROWSER_FIXTURE.lock().await;
         let scratch = tempfile::tempdir().unwrap();
         let html = r#"<!doctype html><style>body{margin:0;position:relative;top:100px}div{height:260px}</style><script>window.fixtureCount=(window.fixtureCount||0)+1;console.log('html-capture-fixture',window.fixtureCount,window.innerWidth,getComputedStyle(document.documentElement).colorScheme)</script><div>Page</div>"#;
-        let captures = capture(html, true, scratch.path(), &CancellationToken::new())
+        let captures = capture(html, scratch.path(), &CancellationToken::new())
             .await
             .unwrap();
-        assert_eq!(captures.len(), 3);
-        for (capture, width) in captures.iter().zip([360, 768, 1024]) {
+        assert_eq!(captures.len(), 6);
+        for (capture, (appearance, width)) in captures.iter().zip([
+            ("light", 360),
+            ("light", 768),
+            ("light", 1024),
+            ("dark", 360),
+            ("dark", 768),
+            ("dark", 1024),
+        ]) {
+            assert_eq!(capture.appearance, appearance);
             assert_eq!(capture.width, width);
             assert_eq!(&capture.png[..8], b"\x89PNG\r\n\x1a\n");
             assert_eq!(
@@ -728,14 +741,14 @@ mod tests {
                     .any(|event| event["args"][0]["value"] == "html-capture-fixture"
                         && event["args"][1]["value"] == 1
                         && event["args"][2]["value"] == width
-                        && event["args"][3]["value"] == "dark")
+                        && event["args"][3]["value"] == appearance)
             );
         }
         let cancel = CancellationToken::new();
         let cancellation = cancel.clone();
         let root = scratch.path().to_owned();
         let pending = tokio::spawn(async move {
-            capture("<script>while(true){}</script>", true, &root, &cancellation).await
+            capture("<script>while(true){}</script>", &root, &cancellation).await
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
         cancel.cancel();

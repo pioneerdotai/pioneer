@@ -991,3 +991,46 @@ the observed CI failure supplies the baseline and fresh CI must validate repair.
 Cargo.lock, CUA pin and all accepted product contracts are unchanged. After the
 test-only batch, this handoff records its evidence. Fetched main
 `12fb677bc996957b64471a4b88acb08e1efc3eb4`; merge-tree reports no conflicts.
+
+
+## 2026-10-24 — refresh PR #172 with current main, without landing the PR
+
+The user requested conflict resolution, a normal merge of current main into the
+feature branch, another push to the existing PR and fresh remote CI. This reply
+also authorizes accepting main's memvid-core 3.1.8 → 4.0.1 lockfile change, which
+was the outstanding permission question. It does not authorize landing PR #172.
+Entry HEAD was `80aebf10ace77a9ffa466213572ecbac398bc6d7`; worktree and index were
+clean and matched the open PR. Fetched main is
+`f20032b7efd403b76130f44539c33812a20f4986`.
+
+A normal `git merge --no-commit --no-ff origin/main` exposed four conflicts.
+Agent result preparation keeps CUA cancellation, typed receipt commit/revocation
+and attempt cleanup while incorporating main's durable threads_search page
+retention. Prompt compilation retains both main's HTML-policy input and CUA
+availability at all six runtime callers and five test callers. Artifact resolution
+accepts HTML preview metadata versions 1/2 and keeps immutable CUA capture paths.
+Gateway capability persistence retains feature-dependent CUA bindings and adds
+main's thread search binding. Permission owners retain the complete per-tool
+three-mode matrix and unknown-action check; main's exact inventory expectations
+are updated from 44 to 68 for the 25 native CUA operations replacing computer_use.
+No assertion was removed.
+
+Test-audit was applied as a separate test-only batch after production conflict
+resolution. Protected tracked source hashes and production prefixes of mixed
+files matched the batch-entry bytes through the edits and check-only formatting.
+All 103 feature-only paths match entry HEAD and all 64 main-only paths match
+fetched main; overlapping paths were reviewed for both sides' changes. The only
+Cargo.lock delta from entry is main's memvid-core version/source. The CUA pin
+`688c5fd62a9f13dddc309970c948df494e7de33f` and R01–R08 release/server/CU/update
+contracts remain unchanged.
+
+Actual validation: source/diff/hash analysis, `cargo fmt --all --check`, and
+`git diff --check`. Initial formatting-only indentation in the test conflict
+was corrected, then formatting passed. No local build, test, compiler, resolver,
+linter, package/install script or runtime/platform probe ran. Fresh remote CI
+is pending publication of this merge.
+
+Existing monitor `1EuSrEXDwGwWI6UvduAfp` could not be inspected: Pioneer task_get
+returned `session_binding_unavailable` / MCP turn not active. No monitor was
+created, paused, cancelled or rescheduled; run 40's outcome and current schedule
+remain unconfirmed in this execution.

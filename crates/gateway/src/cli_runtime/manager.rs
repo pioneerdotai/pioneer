@@ -2083,12 +2083,16 @@ mod tests {
         let manager = manager_with_factory(factory.clone());
         let key = CLIAgentRuntimeSessionKey::new("ws", "claude", "restored-skills").unwrap();
         let selected = normalize_cli_runtime_selected_skills(
-            ["pioneer-system-tasks", "pioneer-system-subagents"].map(|name| {
-                CliRuntimeSelectedSkill {
-                    install_name: name.to_owned(),
-                    installed_path: std::path::PathBuf::from("/native/skills").join(name),
-                    source_folder_hash: format!("hash-{name}"),
-                }
+            [
+                "html",
+                "pioneer-system-html",
+                "pioneer-system-tasks",
+                "pioneer-system-subagents",
+            ]
+            .map(|name| CliRuntimeSelectedSkill {
+                install_name: name.to_owned(),
+                installed_path: std::path::PathBuf::from("/native/skills").join(name),
+                source_folder_hash: format!("hash-{name}"),
             }),
         )
         .unwrap();
@@ -2130,15 +2134,28 @@ mod tests {
             let mut changed = current.clone();
             match change {
                 "composition" => {
-                    changed.options.selected_skills.pop();
+                    changed
+                        .options
+                        .selected_skills
+                        .retain(|skill| skill.install_name != "html");
                 }
                 "path" => {
-                    changed.options.selected_skills[0].installed_path =
-                        "/native/replaced-skill".into()
+                    changed
+                        .options
+                        .selected_skills
+                        .iter_mut()
+                        .find(|skill| skill.install_name == "pioneer-system-html")
+                        .unwrap()
+                        .installed_path = "/native/replaced-skill".into()
                 }
                 _ => {
-                    changed.options.selected_skills[0].source_folder_hash =
-                        "changed-content".to_owned()
+                    changed
+                        .options
+                        .selected_skills
+                        .iter_mut()
+                        .find(|skill| skill.install_name == "pioneer-system-html")
+                        .unwrap()
+                        .source_folder_hash = "changed-content".to_owned()
                 }
             }
             assert!(requires_restart(&current, &changed), "{change}");
