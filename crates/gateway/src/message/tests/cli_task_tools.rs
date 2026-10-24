@@ -3520,7 +3520,7 @@ fn admitted_cli_production_recall_hook_searches_another_accessible_conversation(
             diagnostics: Vec::new(),
         }]);
         let input=TurnPostPreflightPromptContextHookInput::from_parts("searchneedle",Some("test-model"),Some("openai"))
-            .with_active_memory_recall_preflight_plan(json!({"durable":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":[],"targets":[]},"episodic":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"queries":[]}}));
+            .with_active_memory_recall_preflight_plan(json!({"durable":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":[],"targets":[]},"episodic":{"status":"run","reasonCode":"provider_run","confidence":1.0,"queries":[{"mode":"workspace_thread","query":"searchneedle","targets":[]}]}}));
         let request = HookPhaseRequest::new(
             HookPhase::TurnPostPreflightPromptContext,
             HookContext {
