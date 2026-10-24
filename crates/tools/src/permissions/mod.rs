@@ -2214,7 +2214,6 @@ mod tests {
             .map(str::to_owned),
         );
 
-        assert_eq!(registered.len(), 43, "native tool inventory changed");
         let unknown = registered
             .iter()
             .filter(|name| {
@@ -2275,6 +2274,30 @@ mod tests {
             ("threads_history_read", PermissionActionKind::Internal),
             ("threads_children_list", PermissionActionKind::Internal),
             ("cua_click", PermissionActionKind::ComputerUse),
+            ("cua_clipboard_read", PermissionActionKind::ComputerUse),
+            ("cua_clipboard_write", PermissionActionKind::ComputerUse),
+            ("cua_drag", PermissionActionKind::ComputerUse),
+            ("cua_get_cursor_position", PermissionActionKind::ComputerUse),
+            ("cua_get_desktop_state", PermissionActionKind::ComputerUse),
+            ("cua_get_screen_size", PermissionActionKind::ComputerUse),
+            ("cua_get_window_state", PermissionActionKind::ComputerUse),
+            ("cua_hotkey", PermissionActionKind::ComputerUse),
+            ("cua_invoke_menu", PermissionActionKind::ComputerUse),
+            ("cua_list_apps", PermissionActionKind::ComputerUse),
+            ("cua_list_windows", PermissionActionKind::ComputerUse),
+            ("cua_press_key", PermissionActionKind::ComputerUse),
+            ("cua_scroll", PermissionActionKind::ComputerUse),
+            ("cua_set_window_frame", PermissionActionKind::ComputerUse),
+            ("cua_type_text", PermissionActionKind::ComputerUse),
+            ("cua_verify_state", PermissionActionKind::ComputerUse),
+            ("cua_get_browser_state", PermissionActionKind::ComputerUse),
+            ("cua_browser_prepare", PermissionActionKind::ComputerUse),
+            ("cua_browser_navigate", PermissionActionKind::ComputerUse),
+            ("cua_browser_click", PermissionActionKind::ComputerUse),
+            ("cua_browser_type", PermissionActionKind::ComputerUse),
+            ("cua_browser_select", PermissionActionKind::ComputerUse),
+            ("cua_browser_dialog", PermissionActionKind::ComputerUse),
+            ("cua_browser_set_input_files", PermissionActionKind::ComputerUse),
             ("read_skill", PermissionActionKind::Internal),
             ("threads_start_options", PermissionActionKind::Internal),
             (
@@ -2304,7 +2327,6 @@ mod tests {
             .map(str::to_owned),
         );
 
-        assert_eq!(registered.len(), 43, "native tool inventory changed");
         assert_eq!(
             registered,
             expected_actions
