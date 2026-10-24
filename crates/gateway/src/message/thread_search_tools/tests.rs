@@ -444,8 +444,8 @@ async fn production_bound_recall_provider_uses_indexed_sources_and_trusted_execu
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
-            "UPDATE turn SET status='in_progress' WHERE id=?",
-            [turn.into()],
+            "UPDATE turn SET status='in_progress',initiated_by_actor_kind='principal',initiated_by_actor_id=? WHERE id=?",
+            [MEMBER_A_ID.into(), turn.into()],
         ))
         .await
         .unwrap();
