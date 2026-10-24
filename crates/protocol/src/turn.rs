@@ -4628,14 +4628,14 @@ fn external_runtime_tool_output_policy_snapshot() -> ToolOutputPolicySnapshot {
 }
 
 fn html_output_policy_snapshot() -> ToolOutputPolicySnapshot {
-    // Three bounded diagnostic sets plus exact screenshot references. Actual PNG
+    // Six bounded diagnostic sets plus exact screenshot references. Actual PNG
     // bytes travel as media parts, never in timeline/storage JSON.
     let mut policy = dynamic_unknown_output_policy_snapshot();
     policy.llm = LlmOutputPolicy::Structured {
-        max_bytes: 96 * 1024,
+        max_bytes: 192 * 1024,
     };
     policy.llm_retention = LlmRetentionPolicy::UntilTurnTerminal {
-        max_bytes: 96 * 1024,
+        max_bytes: 192 * 1024,
     };
     policy
 }

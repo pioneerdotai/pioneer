@@ -770,7 +770,7 @@ async fn tool_media_and_pdf_use_the_owned_prepared_positions_and_no_second_prepa
             .iter()
             .filter(|p| p["type"] == "input_image")
             .count(),
-        3
+        6
     );
     let pdf = fixture::pdf(1);
     let req = fixture::request(

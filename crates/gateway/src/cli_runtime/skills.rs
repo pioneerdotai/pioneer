@@ -70,6 +70,7 @@ impl std::error::Error for CliRuntimeClaudeSkillNotModelInvocable {}
 
 // Provider-visible aliases are deliberately independent of ordinary user skill names.
 const CLI_TASKS_SKILL_EXPORT_NAME: &str = "pioneer-system-tasks";
+const CLI_HTML_SKILL_EXPORT_NAME: &str = "pioneer-system-html";
 const CLI_SUBAGENTS_SKILL_EXPORT_NAME: &str = "pioneer-system-subagents";
 
 fn cli_orchestration_export_name(
@@ -78,6 +79,7 @@ fn cli_orchestration_export_name(
     slug: &str,
 ) -> Option<&'static str> {
     match (source_kind, owner, slug) {
+        ("system", Some("pioneer"), "html") => Some(CLI_HTML_SKILL_EXPORT_NAME),
         ("system", Some("pioneer"), "tasks") => Some(CLI_TASKS_SKILL_EXPORT_NAME),
         ("system", Some("pioneer"), "subagents") => Some(CLI_SUBAGENTS_SKILL_EXPORT_NAME),
         _ => None,
@@ -707,9 +709,13 @@ pub(crate) async fn install_one_cli_runtime_skill(
         let (receipt, converted) = prepare_external_runtime_receipt_v2(
             &plan.receipt_path,
             receipt_conversion_candidates,
-            // An explicit user plan can precede the automatic plans. Neither
+            // An explicit user plan can precede the automatic plans. No
             // reserved receipt may be discarded by that earlier conversion.
             &[
+                (
+                    plan.native_skills_root.as_path(),
+                    CLI_HTML_SKILL_EXPORT_NAME,
+                ),
                 (
                     plan.native_skills_root.as_path(),
                     CLI_TASKS_SKILL_EXPORT_NAME,
@@ -1099,7 +1105,7 @@ mod tests {
 
     #[test]
     fn cli_required_task_skills_are_supported_without_enabling_other_required_skills() {
-        for slug in ["tasks", "subagents"] {
+        for slug in ["tasks", "subagents", "html"] {
             let mut skill = resolved_skill(slug, SkillSourceKind::System);
             skill.definition.identity.owner = Some("pioneer".to_owned());
             skill.definition.policy_hints.implicit_invocation =
@@ -1117,7 +1123,7 @@ mod tests {
     }
 
     fn canonical_orchestration_skills() -> Vec<pioneer_skills::ResolvedSkill> {
-        ["tasks", "subagents"]
+        ["tasks", "subagents", "html"]
             .into_iter()
             .map(|slug| {
                 let mut skill = resolved_skill(slug, SkillSourceKind::System);
@@ -1154,7 +1160,7 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let home = temp.path().join("native");
             let runtime = runtime_instance(config_kind, home.display().to_string(), None);
-            for name in ["tasks", "subagents"] {
+            for name in ["tasks", "subagents", "html"] {
                 let foreign = home.join("skills").join(name);
                 fs::create_dir_all(&foreign).unwrap();
                 fs::write(foreign.join("SKILL.md"), format!("user {name}")).unwrap();
@@ -1220,7 +1226,7 @@ mod tests {
                 &receipt_path,
             )
             .unwrap();
-            assert_eq!(restored.len(), 2);
+            assert_eq!(restored.len(), 3);
             let initial = normalize_cli_runtime_selected_skills(
                 installed.iter().map(CliRuntimeSelectedSkill::from),
             )
@@ -1231,12 +1237,16 @@ mod tests {
                     .iter()
                     .map(|skill| skill.install_name.as_str())
                     .collect::<Vec<_>>(),
-                ["pioneer-system-subagents", "pioneer-system-tasks"]
+                [
+                    "pioneer-system-html",
+                    "pioneer-system-subagents",
+                    "pioneer-system-tasks"
+                ]
             );
             if kind == pioneer_protocol::CLIAgentRuntimeKind::Claude {
                 assert_claude_skill_projection_reuses_process(initial, restored);
             }
-            for name in ["tasks", "subagents"] {
+            for name in ["tasks", "subagents", "html"] {
                 let foreign = home.join("skills").join(name);
                 assert_eq!(
                     fs::read_to_string(foreign.join("SKILL.md")).unwrap(),
@@ -1326,7 +1336,12 @@ mod tests {
                 .iter()
                 .map(|skill| skill.install_name.as_str())
                 .collect::<Vec<_>>(),
-            ["pioneer-system-subagents", "pioneer-system-tasks", "z-user"]
+            [
+                "pioneer-system-html",
+                "pioneer-system-subagents",
+                "pioneer-system-tasks",
+                "z-user"
+            ]
         );
         // The separate application-order list is not reordered for instructions.
         assert_eq!(
@@ -1334,7 +1349,12 @@ mod tests {
                 .iter()
                 .map(|skill| skill.install_name.as_str())
                 .collect::<Vec<_>>(),
-            ["z-user", "pioneer-system-tasks", "pioneer-system-subagents"]
+            [
+                "z-user",
+                "pioneer-system-tasks",
+                "pioneer-system-subagents",
+                "pioneer-system-html"
+            ]
         );
         assert_claude_skill_projection_reuses_process(initial, restored);
     }

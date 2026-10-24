@@ -52,6 +52,7 @@ pub struct CliRuntimeSelectedServerInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliRuntimeSelectedCapabilitiesInput {
     pub native_task_tools: Vec<String>,
+    pub native_html_tools: Vec<String>,
     pub total_tool_count: usize,
     pub explicit_servers: Vec<CliRuntimeSelectedServerInput>,
     pub explicit_tool_names: Vec<String>,
@@ -72,6 +73,10 @@ pub fn compile_cli_runtime_delivery_plan(
             .selected_capabilities
             .as_ref()
             .is_some_and(|capabilities| !capabilities.native_task_tools.is_empty()),
+        include_html_policy: input
+            .selected_capabilities
+            .as_ref()
+            .is_some_and(|capabilities| !capabilities.native_html_tools.is_empty()),
         continue_generation_hint: false,
         runtime_sections: cli_runtime_context_sections(&input),
         dynamic_sections: Vec::new(),
@@ -313,6 +318,16 @@ fn render_selected_capabilities(
         );
         lines.push("Names in the tasks/subagents skills refer to these operations. Codex and Claude qualify them as mcp__pioneer__<name>; OpenCode qualifies them as pioneer_<name>. Use only the operations actually present, and obey their current schemas and permissions.".to_owned());
     }
+    if !input.native_html_tools.is_empty() {
+        lines.push("Available Pioneer HTML operations (use the matching callable in the current runtime MCP catalog):".to_owned());
+        lines.extend(
+            input
+                .native_html_tools
+                .iter()
+                .map(|name| format!("- {}", safe_context_label(name))),
+        );
+        lines.push("HTML skill tool names identify these canonical operations. Call only the matching qualified callable actually exposed by the current runtime MCP catalog, using its current schema and permissions.".to_owned());
+    }
     if !servers.is_empty() {
         lines.push(String::new());
         lines.push("Attached MCP servers:".to_owned());
@@ -474,6 +489,7 @@ mod tests {
             skill_names: vec!["mail-helper".to_owned()],
         });
         input.selected_capabilities = Some(CliRuntimeSelectedCapabilitiesInput {
+            native_html_tools: Vec::new(),
             native_task_tools: Vec::new(),
             total_tool_count: 1,
             explicit_servers: vec![CliRuntimeSelectedServerInput {
@@ -561,6 +577,7 @@ mod tests {
                 ],
             });
             input.selected_capabilities = Some(CliRuntimeSelectedCapabilitiesInput {
+                native_html_tools: Vec::new(),
                 native_task_tools: vec!["task_get".to_owned(), "task_wait".to_owned()],
                 total_tool_count: 2,
                 explicit_servers: Vec::new(),
@@ -593,6 +610,49 @@ mod tests {
                     .contains("call `read_skill`")
             );
         }
+    }
+
+    #[test]
+    fn html_policy_is_delivered_without_tasks_or_selected_skills() {
+        let root = temp_workspace("html_only_policy");
+        let mut input = base_input();
+        input.selected_skills = None;
+        input.selected_capabilities = Some(CliRuntimeSelectedCapabilitiesInput {
+            native_task_tools: Vec::new(),
+            native_html_tools: vec!["html_preview".to_owned(), "html_render".to_owned()],
+            total_tool_count: 2,
+            explicit_servers: Vec::new(),
+            explicit_tool_names: Vec::new(),
+            implicit_policy_tool_count: 2,
+        });
+        let plan = compile_cli_runtime_delivery_plan(&root, input).unwrap();
+        let section = plan
+            .sections
+            .iter()
+            .find(|section| section.section_id == "html_policy")
+            .unwrap();
+        assert_eq!(section.trust, crate::InstructionTrust::Pioneer);
+        assert_eq!(
+            section.channel,
+            crate::InstructionDeliveryChannel::ProviderInstructions
+        );
+        assert!(
+            plan.provider_instructions
+                .text
+                .contains("pioneer-system-html")
+        );
+        assert!(
+            !plan
+                .sections
+                .iter()
+                .any(|section| section.section_id == "tasks_policy")
+        );
+        assert!(plan.provider_instructions.text.contains("html_preview"));
+        assert!(
+            plan.provider_instructions
+                .text
+                .contains("matching callable in the current runtime MCP catalog")
+        );
     }
 
     #[test]
@@ -642,6 +702,7 @@ mod tests {
         let root = temp_workspace("sanitized_mcp");
         let mut input = base_input();
         input.selected_capabilities = Some(CliRuntimeSelectedCapabilitiesInput {
+            native_html_tools: Vec::new(),
             native_task_tools: Vec::new(),
             total_tool_count: 1,
             explicit_servers: vec![CliRuntimeSelectedServerInput {

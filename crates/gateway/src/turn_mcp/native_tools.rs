@@ -148,6 +148,23 @@ impl NativeToolFamily {
     }
 }
 
+// A frozen binding identifies the immutable schema, not the latest catalog.
+// Keep its description too: exact_definition controls the unprefixed callable.
+fn legacy_html_preview_spec() -> &'static ToolSpec {
+    static LEGACY: std::sync::OnceLock<ToolSpec> = std::sync::OnceLock::new();
+    LEGACY.get_or_init(|| {
+        let definition = pioneer_tools::html::legacy_preview_definition();
+        ToolSpec::new(
+            pioneer_tools::html::HTML_PREVIEW,
+            definition["description"]
+                .as_str()
+                .expect("recorded description"),
+            definition["inputSchema"].clone(),
+            PayloadKind::Function,
+        )
+    })
+}
+
 pub(crate) fn exact_definition(tool: &ResolvedMcpTurnTool) -> Option<NativeToolFamily> {
     let family = NativeToolFamily::from_server_id(&tool.server_installation_id)?;
     (tool.server_name == family.server_name()
@@ -156,11 +173,15 @@ pub(crate) fn exact_definition(tool: &ResolvedMcpTurnTool) -> Option<NativeToolF
         && tool.runtime_generation == 1
         && tool.timeout_ms == family.timeout_ms(&tool.raw_tool_name)
         && tool.annotations.is_none()
-        && family.catalog().iter().any(|spec| {
+        && (family.catalog().iter().any(|spec| {
             spec.spec.name == tool.raw_tool_name
                 && spec.spec.parameters == tool.input_schema
                 && tool.description.as_deref() == Some(spec.spec.description.as_str())
-        }))
+        }) || (family == NativeToolFamily::Html
+            && tool.raw_tool_name == pioneer_tools::html::HTML_PREVIEW
+            && legacy_html_preview_spec().parameters == tool.input_schema
+            && tool.description.as_deref()
+                == Some(legacy_html_preview_spec().description.as_str()))))
     .then_some(family)
 }
 
@@ -198,15 +219,28 @@ pub(crate) fn current_identity(
     };
     let family =
         NativeToolFamily::from_server_id(&binding.server_installation_id).ok_or_else(drift)?;
-    let spec = family
+    let mut spec = family
         .catalog()
         .iter()
         .find(|spec| spec.spec.name == binding.raw_tool_name)
         .ok_or_else(drift)?
         .spec
         .clone();
-    let (schema, fingerprint, _) =
+    let (mut schema, mut fingerprint, _) =
         canonical_schema_identity(&spec.parameters).map_err(|_| drift())?;
+    if binding.canonical_schema_fingerprint != fingerprint
+        && family == NativeToolFamily::Html
+        && binding.raw_tool_name == pioneer_tools::html::HTML_PREVIEW
+    {
+        let legacy = legacy_html_preview_spec();
+        let (legacy_schema, legacy_fingerprint, _) =
+            canonical_schema_identity(&legacy.parameters).map_err(|_| drift())?;
+        if binding.canonical_schema_fingerprint == legacy_fingerprint {
+            spec = legacy.clone();
+            schema = legacy_schema;
+            fingerprint = legacy_fingerprint;
+        }
+    }
     if workspace_id.is_empty()
         || binding.server_name != family.server_name()
         || binding.catalog_version != family.server_id()

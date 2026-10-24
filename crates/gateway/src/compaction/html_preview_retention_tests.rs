@@ -146,6 +146,11 @@ async fn drain_preview_worker(store: &CrudStore, service: &ArtifactService) {
 
 #[tokio::test]
 async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_frozen_replay() {
+    preview_history_replay(1).await;
+    preview_history_replay(2).await;
+}
+
+async fn preview_history_replay(format_version: u32) {
     let f = fixture("answer", vec![Reply::Success], true, false).await;
     // The shared fixture starts a raw compaction operation. Publish its exact
     // checkpoint before adding preview history, so it does not remain an
@@ -237,7 +242,19 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
     let mut previews = Vec::new();
     let mut images = Vec::new();
     let mut preview_paths = Vec::new();
-    for width in [360u32, 768, 1024] {
+    let frames = if format_version == 2 {
+        vec![
+            (Some("light"), 360u32),
+            (Some("light"), 768),
+            (Some("light"), 1024),
+            (Some("dark"), 360),
+            (Some("dark"), 768),
+            (Some("dark"), 1024),
+        ]
+    } else {
+        vec![(None, 360u32), (None, 768), (None, 1024)]
+    };
+    for &(appearance, width) in &frames {
         let mut png = std::io::Cursor::new(Vec::new());
         image::DynamicImage::new_rgba8(width, 1)
             .write_to(&mut png, image::ImageFormat::Png)
@@ -266,7 +283,7 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
             }),
             metadata: std::collections::BTreeMap::from([(
                 "htmlTool".into(),
-                json!({"version":1,"publication":false,"turnId":"turn","callId":"tool-item","index":width.to_string(),"details":{"width":width}}),
+                json!({"version":format_version,"publication":false,"turnId":"turn","callId":"tool-item","index":appearance.map_or_else(||width.to_string(), |theme|format!("{theme}-{width}")),"details":{"width":width}}),
             )]),
         };
         adoption_request = Some(request.clone());
@@ -289,8 +306,14 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
                 .blob_path("ws", &blob.storage_key)
                 .unwrap(),
         );
-        previews.push(json!({"width":width,"artifact":summary.artifact}));
-        images.push(json!({"width":width,"attachment":resolved.attachment}));
+        let mut preview = json!({"width":width,"artifact":summary.artifact});
+        let mut image = json!({"width":width,"attachment":resolved.attachment});
+        if let Some(appearance) = appearance {
+            preview["appearance"] = json!(appearance);
+            image["appearance"] = json!(appearance);
+        }
+        previews.push(preview);
+        images.push(image);
         parts.push(MessageContentPart::image(resolved.attachment));
     }
     let round = CanonicalProviderRoundEnvelope {
@@ -312,11 +335,11 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
             ordinal: 0,
         }],
     };
-    let mut message = ChatMessage::tool_result(
-        "provider-call",
-        "html_preview",
-        json!({"previews":previews,"llm_context":{"images":images}}).to_string(),
-    );
+    let mut result = json!({"previews":previews,"llm_context":{"images":images}});
+    if format_version == 2 {
+        result["formatVersion"] = json!(2);
+    }
+    let mut message = ChatMessage::tool_result("provider-call", "html_preview", result.to_string());
     message.content_parts = parts;
     for (item, source, payload) in [
         (
@@ -367,7 +390,7 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
             .flat_map(|m| &m.content_parts)
             .filter(|p| matches!(p, MessageContentPart::Image { .. }))
             .count(),
-        3
+        frames.len()
     );
     // The real completion capture records the permanent compaction_task_output
     // root while the Task is running. This also represents a persisted pre-upgrade
@@ -411,7 +434,7 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
             .flat_map(|m| &m.content_parts)
             .filter(|p| matches!(p, MessageContentPart::Image { .. }))
             .count(),
-        3
+        frames.len()
     );
     let live_manifest = live.descriptor.manifest_id.clone();
     drop(live);
