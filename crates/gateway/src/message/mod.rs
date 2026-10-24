@@ -40,6 +40,7 @@ mod task_handlers;
 mod tasks;
 #[cfg(test)]
 mod tests;
+mod webhook_endpoint;
 #[cfg(test)]
 pub(crate) use tests::{test_summary_config, test_tool_loop_config};
 mod thread_agents_doc_handlers;
@@ -591,6 +592,7 @@ pub struct MessageProcessor {
     pub(crate) crud_store: Arc<CrudStore>,
     gateway_secrets: Arc<GatewaySecrets>,
     invitation_gateway_base_url: Arc<pioneer_protocol::GatewayBaseUrl>,
+    gateway_listen_addr: Arc<std::sync::RwLock<Option<std::net::SocketAddr>>>,
     summary_config: Arc<summary::SummaryConfig>,
     compaction_settings: Arc<StdRwLock<pioneer_compaction::CompactionSettings>>,
     completed_history_checks: Arc<Mutex<HashMap<(String, String), compaction_background::OwnedHistoryCheck>>>,
@@ -1234,6 +1236,7 @@ impl MessageProcessor {
             workspace_manager,
             crud_store: crud_store.clone(),
             gateway_secrets,
+            gateway_listen_addr: Arc::new(std::sync::RwLock::new(None)),
             invitation_gateway_base_url: Arc::new(
                 pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
                     .expect("static Gateway base URL is valid"),
@@ -1435,15 +1438,28 @@ impl MessageProcessor {
                     break;
                 }
 
-                let status = status_rx.borrow().clone();
+                let Some(processor) = processor.upgrade() else {
+                    break;
+                };
+                let status = match processor
+                    .persist_current_remote_access_public_base_url()
+                    .await
+                {
+                    Ok(status) => status,
+                    Err(_) => {
+                        tracing::warn!("failed to persist current relay public address");
+                        processor
+                            .remote_access_supervisor
+                            .as_ref()
+                            .expect("remote access supervisor")
+                            .status_snapshot()
+                    }
+                };
                 if status == previous {
                     continue;
                 }
                 previous = status.clone();
 
-                let Some(processor) = processor.upgrade() else {
-                    break;
-                };
                 processor
                     .send_gateway_management_notification(
                         events::GATEWAY_REMOTE_ACCESS_STATUS_CHANGED,
@@ -4912,6 +4928,7 @@ impl MessageProcessor {
             workspace_manager,
             crud_store: crud_store.clone(),
             gateway_secrets,
+            gateway_listen_addr: Arc::new(std::sync::RwLock::new(None)),
             invitation_gateway_base_url: Arc::new(
                 pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
                     .expect("static Gateway base URL is valid"),

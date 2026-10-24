@@ -148,7 +148,7 @@ async fn serve(
             socket.write_all(&0u32.to_le_bytes()).await?; // StartForwardTcp
         }
     } else {
-        assert_eq!(&hello[..5], &[0, 0, 0, 0, 1]);
+        assert_eq!(&hello[..5], &[0, 0, 0, 0, 2]);
         counts.controls.fetch_add(1, Ordering::SeqCst);
         let selected = mode.load(Ordering::SeqCst);
         if selected == NETWORK_FAILURE {
@@ -156,7 +156,7 @@ async fn serve(
         }
         if selected != STALL_HANDSHAKE {
             let nonce = [7; 32];
-            socket.write_all(&[0, 0, 0, 0, 1]).await?;
+            socket.write_all(&[0, 0, 0, 0, 2]).await?;
             socket.write_all(&nonce).await?;
             let mut proof = [0; 32];
             socket.read_exact(&mut proof).await?;
@@ -171,6 +171,9 @@ async fn serve(
             if ack != ACCEPT {
                 return Ok(());
             }
+            let public_url = "https://gateway.example/";
+            socket.write_u16(public_url.len() as u16).await?;
+            socket.write_all(public_url.as_bytes()).await?;
             if matches!(selected, OPEN_DATA | STALL_DATA) {
                 socket.write_all(&0u32.to_le_bytes()).await?; // CreateDataChannel
             }

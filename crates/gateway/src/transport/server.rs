@@ -115,6 +115,7 @@ pub async fn spawn_server(
         .local_addr()
         .context("failed to read bound gateway server address")?;
 
+    message_processor.set_gateway_listen_addr(local_addr);
     let state = GatewayHttpState::new(
         config,
         auth,

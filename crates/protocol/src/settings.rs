@@ -676,6 +676,9 @@ impl Default for GatewayRemoteAccessTransport {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayRemoteAccessStatusSnapshot {
+    /// Present only for the currently authenticated relay connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_base_url: Option<crate::GatewayBaseUrl>,
     #[serde(default)]
     pub state: GatewayRemoteAccessState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -694,6 +697,7 @@ pub struct GatewayRemoteAccessStatusChangedNotification {
 impl Default for GatewayRemoteAccessStatusSnapshot {
     fn default() -> Self {
         Self {
+            public_base_url: None,
             state: GatewayRemoteAccessState::Disabled,
             error_kind: None,
             message: None,

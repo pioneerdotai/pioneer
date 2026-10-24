@@ -46,6 +46,15 @@ impl std::fmt::Display for FinishTerminalRace {
 }
 impl std::error::Error for FinishTerminalRace {}
 
+#[derive(Debug)]
+struct WebhookProgressTerminalRace;
+impl std::fmt::Display for WebhookProgressTerminalRace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("webhook queue or sibling activity changed during terminal preparation")
+    }
+}
+impl std::error::Error for WebhookProgressTerminalRace {}
+
 fn conflict<T>(reason: &'static str) -> Result<T> {
     Err(TaskTerminalConflict(reason).into())
 }
@@ -273,7 +282,16 @@ impl CrudStore {
                     },
                 );
             } else if !finishing && let Some(mut trigger) = response.triggers.first().cloned() {
-                trigger.updated_at = at;
+                // A webhook's trigger facts describe admission, not completion.
+                // Keep them stable while parallel runs independently terminalize;
+                // the refresh event still updates aggregate status on the writer
+                // after the last live sibling ends. All snapshot fences remain.
+                if !matches!(&trigger.spec, pioneer_protocol::TaskTriggerSpec::External {
+                    source, event_type: None, filter: None
+                } if source == "webhook")
+                {
+                    trigger.updated_at = at;
+                }
                 events.push(TaskEventPayload::TaskRescheduled {
                     task_id: response.task.id.clone(),
                     trigger,
@@ -375,10 +393,29 @@ impl CrudStore {
                         return conflict("execution fence changed while reconciling finish");
                     }
                 }
+                Err(error)
+                    if error
+                        .downcast_ref::<WebhookProgressTerminalRace>()
+                        .is_some() =>
+                {
+                    let refreshed = self
+                        .prepare_task_terminal_transition(terminal.clone())
+                        .await?;
+                    // The reader may race again after the rejected writer. Do
+                    // not adopt a changed policy, run/occurrence, resume, actor
+                    // or attempt merely because preparation was repeated.
+                    validate_terminal_policy(&prepared.state, &refreshed.state)?;
+                    if !same_after_webhook_progress(&prepared.state, &refreshed.state) {
+                        return conflict(
+                            "protected terminal facts changed while reloading webhook progress",
+                        );
+                    }
+                    prepared = refreshed;
+                }
                 outcome => return outcome,
             }
         }
-        conflict("finish transition changed repeatedly")
+        conflict("finish or webhook progress changed repeatedly")
     }
 
     async fn commit_task_terminal_transition_once(
@@ -822,6 +859,11 @@ impl CrudStore {
             });
         }
         if !same_transition_state(&prepared.state, &current) {
+            if same_after_webhook_progress(&prepared.state, &current)
+                && webhook_progress_is_proven(db, &prepared.state, &current).await?
+            {
+                return Err(WebhookProgressTerminalRace.into());
+            }
             return conflict("transition facts changed during preparation");
         }
         let delivery_id = if let Some(delivery) =
@@ -882,6 +924,13 @@ async fn load_terminal_state<C: ConnectionTrait>(
     task_id: &str,
     run_id: &str,
 ) -> Result<TerminalState> {
+    // Capture the queue watermark before mutable aggregate/trigger facts. On
+    // the preparation reader these are separate reads: an admission between
+    // them must still count as queue growth at the final writer comparison.
+    let latest_run_number = task_run::find_latest_numbered_run(db, task_id)
+        .await?
+        .map(|r| r.run_number)
+        .unwrap_or(0);
     let task = task_repository::find_task_by_id(db, task_id)
         .await?
         .context("terminal Task disappeared")?;
@@ -895,10 +944,6 @@ async fn load_terminal_state<C: ConnectionTrait>(
         Some(id) => task_trigger::find_trigger_by_id(db, id).await?,
         None => None,
     };
-    let latest_run_number = task_run::find_latest_numbered_run(db, task_id)
-        .await?
-        .map(|r| r.run_number)
-        .unwrap_or(0);
     let agent_spec = task_agent_spec::find_terminal_agent_spec(db, task_id, run_id).await?;
     let locks = task_write_lock::list_terminal_locks_by_run(db, run_id).await?;
     let actor = task_actor_contract::find_task_actor_contract(db, task_id)
@@ -985,6 +1030,100 @@ fn same_transition_state(expected: &TerminalState, current: &TerminalState) -> b
         expected.task.status = current.task.status.clone();
     }
     expected == current
+}
+
+/// Permit only webhook queue growth and the sibling activity labels below. The
+/// existing snapshot comparison still owns every other field, including the
+/// source run, frozen spec/occurrence, locks, task revision and attempt fence.
+fn same_after_webhook_progress(expected: &TerminalState, current: &TerminalState) -> bool {
+    let queue_grew = current.latest_run_number > expected.latest_run_number;
+    let sibling_activity =
+        matches!(
+            expected.task.status.as_str(),
+            "queued" | "running" | "waiting_review"
+        ) && matches!(current.task.status.as_str(), "running" | "waiting_review");
+    if current.latest_run_number < expected.latest_run_number
+        || current.finish_first_run != expected.finish_first_run
+        || !(current.task.status == expected.task.status
+            || (queue_grew && current.task.status == "queued")
+            || sibling_activity)
+    {
+        return false;
+    }
+    let (Some(before), Some(after)) = (&expected.trigger, &current.trigger) else {
+        return false;
+    };
+    // Match the exact durable webhook spec without decoding a body or allowing
+    // pause/resume/reschedule/cancellation to masquerade as queue growth.
+    let Ok(pioneer_protocol::TaskTriggerSpec::External {
+        source,
+        event_type: None,
+        filter: None,
+    }) = serde_json::from_str::<pioneer_protocol::TaskTriggerSpec>(&before.spec_json)
+    else {
+        return false;
+    };
+    if source != "webhook"
+        || before.status != "active"
+        || after.status != "active"
+        || before.webhook_secret_ref.is_none()
+        || before.next_fire_at.is_some()
+        || after.next_fire_at.is_some()
+        || after.last_fire_at.is_none()
+        || after.last_fire_at < before.last_fire_at
+        || after.updated_at < before.updated_at
+    {
+        return false;
+    }
+    let mut normalized = expected.clone();
+    normalized.latest_run_number = current.latest_run_number;
+    normalized.task.status = current.task.status.clone();
+    if queue_grew {
+        let trigger = normalized.trigger.as_mut().expect("checked trigger");
+        trigger.last_fire_at = after.last_fire_at;
+        trigger.updated_at = after.updated_at;
+    }
+    same_transition_state(&normalized, current)
+}
+
+/// These bounded proofs are read in the same writer snapshot as the protected
+/// comparison, before any terminal projection. They do not deserialize bodies.
+async fn webhook_progress_is_proven<C: ConnectionTrait>(
+    db: &C,
+    expected: &TerminalState,
+    current: &TerminalState,
+) -> Result<bool> {
+    let trigger_id = &current
+        .trigger
+        .as_ref()
+        .expect("validated webhook trigger")
+        .id;
+    let queue_grew = current.latest_run_number > expected.latest_run_number;
+    if queue_grew
+        && !task_run::is_webhook_queue_run(
+            db,
+            &current.task.id,
+            trigger_id,
+            &current.run.id,
+            current.latest_run_number,
+        )
+        .await?
+    {
+        return Ok(false);
+    }
+    if current.task.status != expected.task.status
+        && !(queue_grew && current.task.status == "queued")
+    {
+        return task_run::has_webhook_sibling_activity(
+            db,
+            &current.task.id,
+            trigger_id,
+            &current.run.id,
+            &current.task.status,
+        )
+        .await;
+    }
+    Ok(true)
 }
 
 fn terminal_facts(
@@ -1092,6 +1231,7 @@ fn prepare_retry(
     let delay_seconds = retry_delay_seconds(policy, next_attempt)?;
     let ready_at = completed_at.saturating_add(delay_seconds);
     let retry_run = TaskRun {
+        trigger_input: failed_run.trigger_input.clone(),
         id: generate_id(ID_LEN),
         task_id: task_response.task.id.clone(),
         trigger_id: failed_run.trigger_id.clone(),
