@@ -2181,10 +2181,10 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
                 .unwrap();
             assert_eq!(
                 skills.len(),
-                2,
-                "orchestration skills are automatic even without user attachments"
+                3,
+                "orchestration and HTML skills are automatic even without user attachments"
             );
-            for slug in ["tasks", "subagents"] {
+            for slug in ["tasks", "subagents", "html"] {
                 assert!(
                     skills
                         .iter()
