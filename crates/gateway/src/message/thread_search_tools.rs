@@ -438,7 +438,7 @@ impl MessageProcessor {
                 &scope,
             )?;
             let candidate = search_response(&proposed, Some(cursor), false, incomplete);
-            if serde_json::to_vec(&candidate)?.len() > PAGE_BYTES {
+            if !search_page_fits_output(&candidate)? {
                 if accepted.is_empty() {
                     let fragment = CardFragmentCursor {
                         index_item_id: source.fragment["source"]["indexItemId"]
@@ -620,11 +620,36 @@ impl MessageProcessor {
             "nextCursor":next,"eof":false,"coverageIncomplete":incomplete,
             "warnings":if incomplete {vec!["Some indexes or semantic retrieval were unavailable; coverage is incomplete."]} else {vec![]}});
         ensure!(
-            serde_json::to_vec(&response)?.len() <= PAGE_BYTES,
+            search_page_fits_output(&response)?,
             "search page exceeds byte limit"
         );
         Ok(response)
     }
+}
+
+/// Measure the representation used by shared native/CLI output projection,
+/// including its JSON view wrapper and the metadata delivered to the CLI.
+/// A raw response that fits alone can otherwise be replaced by a preview.
+fn search_page_fits_output(response: &Value) -> Result<bool> {
+    let view = pioneer_tools::ToolResultView::Json {
+        value: response.clone(),
+        truncated: false,
+    };
+    if view.serialized_size_bytes() > PAGE_BYTES {
+        return Ok(false);
+    }
+    let projection = pioneer_tools::project_tool_result(pioneer_tools::ToolProjectionInput {
+        call_id: "",
+        tool_name: SEARCH_TOOL,
+        arguments: &Value::Null,
+        raw_output_text: "",
+        raw_output_json: response,
+        success: true,
+        outcome: &pioneer_tools::ToolOutcome::ok(),
+        output_policy: &pioneer_protocol::ToolOutputPolicySnapshot::for_tool_name(SEARCH_TOOL),
+        output_projection: &pioneer_tools::ToolOutputProjectionKind::Builtin,
+    });
+    Ok(serde_json::to_vec(&projection.llm_payload())?.len() <= PAGE_BYTES)
 }
 
 fn source_order(a: &FoundSource, b: &FoundSource) -> std::cmp::Ordering {
@@ -691,7 +716,9 @@ impl ToolHandler for ThreadSearchHandler {
             })?;
         let text = serde_json::to_string(&result)
             .map_err(|_| ToolError::execution_failed("response encoding failed"))?;
-        if text.len() > PAGE_BYTES {
+        if !search_page_fits_output(&result)
+            .map_err(|_| ToolError::execution_failed("response encoding failed"))?
+        {
             return Err(ToolError::execution_failed(
                 "search page exceeds byte limit",
             ));

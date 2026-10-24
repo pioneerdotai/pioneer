@@ -3619,7 +3619,7 @@ fn admitted_cli_production_recall_hook_searches_another_accessible_conversation(
 }
 
 #[test]
-fn protected_search_cursor_continues_at_byte_boundary_and_rechecks_access() {
+fn admitted_cli_search_preserves_structured_pages_at_projection_byte_boundary() {
     run_standard_stack_message_test("search byte boundary continuation", async {
         let (_harness, processor, turn_id) =
             start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
@@ -3641,8 +3641,8 @@ fn protected_search_cursor_continues_at_byte_boundary_and_rechecks_access() {
             )
             .await
             .unwrap();
-        let titles = ["A".repeat(1_250_000), "B".repeat(1_250_000)];
-        for (n, thread) in ["byte-boundary-a", "byte-boundary-b"]
+        let mut titles = ["A".to_owned(), "B".to_owned(), "C".to_owned()];
+        for (n, thread) in ["byte-boundary-a", "byte-boundary-b", "byte-boundary-c"]
             .into_iter()
             .enumerate()
         {
@@ -3663,51 +3663,109 @@ fn protected_search_cursor_continues_at_byte_boundary_and_rechecks_access() {
             thread_id: binding.thread_id.clone(),
             turn_id,
         };
-        let params = pioneer_protocol::ThreadsSearchParams {
-            query: "boundaryneedle".into(),
-            limit: 100,
-            cursor: None,
-        };
-        let first = processor
-            .search_threads_page(&context, params.clone())
+        let params = json!({"query":"boundaryneedle", "limit":2, "cursor":null});
+        // Calibrate with the actual CLI response: two cards plus a nextCursor.
+        // Enlarge the first title so those same two raw cards fit by one byte,
+        // but their ToolResultView wrapper would exceed the policy limit.
+        let calibration = invoke_task(
+            &processor,
+            &context.turn_id,
+            "search-calibration",
+            "threads_search",
+            params.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!calibration.is_error);
+        let mut raw = calibration.structured_content.unwrap();
+        for key in ["tool_outcome", "partial_output", "truncated"] {
+            raw.as_object_mut().unwrap().remove(key);
+        }
+        assert_eq!(raw["threads"].as_array().unwrap().len(), 2);
+        assert!(raw["nextCursor"].is_string());
+        let limit = 2 * 1024 * 1024;
+        let overhead = serde_json::to_vec(&raw).unwrap().len() - titles[0].len();
+        titles[0] = "A".repeat(limit - 1 - overhead);
+        raw["threads"][0]["title"] = titles[0].clone().into();
+        assert_eq!(serde_json::to_vec(&raw).unwrap().len(), limit - 1);
+        assert!(
+            pioneer_tools::ToolResultView::Json {
+                value: raw,
+                truncated: false
+            }
+            .serialized_size_bytes()
+                > limit
+        );
+        processor
+            .crud_store
+            .database_connection()
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "UPDATE thread SET name=? WHERE id=?",
+                [titles[0].clone().into(), "byte-boundary-a".into()],
+            ))
             .await
             .unwrap();
-        assert!(serde_json::to_vec(&first).unwrap().len() <= 2 * 1024 * 1024);
+
+        let first = invoke_task(
+            &processor,
+            &context.turn_id,
+            "search-first",
+            "threads_search",
+            params.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!first.is_error);
+        let first_text = first.content[0]["text"].as_str().unwrap();
+        assert!(first_text.len() <= limit);
+        let first = first.structured_content.unwrap();
+        assert!(serde_json::to_vec(&first).unwrap().len() <= limit);
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(first_text).unwrap(),
+            first
+        );
+        assert!(first.get("preview").is_none());
+        assert_eq!(first["truncated"], false);
         assert_eq!(first["threads"].as_array().unwrap().len(), 1);
         assert_eq!(first["threads"][0]["threadId"], "byte-boundary-a");
         assert_eq!(first["threads"][0]["title"], titles[0]);
-        assert_eq!(
-            first["threads"][0]["fragments"].as_array().unwrap().len(),
-            1
-        );
         assert_eq!(first["eof"], false);
         let cursor = first["nextCursor"].as_str().unwrap().to_owned();
-        let next_params = pioneer_protocol::ThreadsSearchParams {
-            cursor: Some(cursor.clone()),
-            ..params.clone()
-        };
-        let second = processor
-            .search_threads_page(&context, next_params.clone())
-            .await
-            .unwrap();
-        assert!(serde_json::to_vec(&second).unwrap().len() <= 2 * 1024 * 1024);
-        assert_eq!(second["threads"].as_array().unwrap().len(), 1);
+        let mut next_params = params.clone();
+        next_params["cursor"] = cursor.clone().into();
+        let second = invoke_task(
+            &processor,
+            &context.turn_id,
+            "search-second",
+            "threads_search",
+            next_params.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!second.is_error);
+        let second = second.structured_content.unwrap();
+        assert!(serde_json::to_vec(&second).unwrap().len() <= limit);
+        assert!(second.get("preview").is_none());
+        assert_eq!(second["threads"].as_array().unwrap().len(), 2);
         assert_eq!(second["threads"][0]["threadId"], "byte-boundary-b");
         assert_eq!(second["threads"][0]["title"], titles[1]);
+        assert_eq!(second["threads"][1]["threadId"], "byte-boundary-c");
+        assert_eq!(second["threads"][1]["title"], titles[2]);
         assert_eq!(second["eof"], true);
         assert!(second["nextCursor"].is_null());
+        let mut wrong_query = next_params.clone();
+        wrong_query["query"] = "different query".into();
         assert!(
-            processor
-                .search_threads_page(
-                    &context,
-                    pioneer_protocol::ThreadsSearchParams {
-                        query: "different query".into(),
-                        cursor: Some(cursor),
-                        ..params
-                    }
-                )
-                .await
-                .is_err()
+            invoke_task(
+                &processor,
+                &context.turn_id,
+                "search-wrong-query",
+                "threads_search",
+                wrong_query,
+            )
+            .await
+            .is_err()
         );
         // The fixture's current user is a Superuser. Narrow the execution
         // through the real Agent role intersection instead of pretending a
@@ -3745,10 +3803,17 @@ fn protected_search_cursor_continues_at_byte_boundary_and_rechecks_access() {
                 ),
             )
             .await;
-        let after_revocation = processor
-            .search_threads_page(&context, next_params)
-            .await
-            .unwrap();
+        let after_revocation = invoke_task(
+            &processor,
+            &context.turn_id,
+            "search-revoked",
+            "threads_search",
+            next_params,
+        )
+        .await
+        .unwrap();
+        assert!(!after_revocation.is_error);
+        let after_revocation = after_revocation.structured_content.unwrap();
         assert!(after_revocation["threads"].as_array().unwrap().is_empty());
         assert_eq!(after_revocation["eof"], true);
         assert!(!after_revocation.to_string().contains("byte-boundary-b"));
