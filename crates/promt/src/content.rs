@@ -283,7 +283,7 @@ mod tests {
 
 macro_rules! html_policy {
     ($loading:literal) => { concat!(
-        "Use inline HTML when a document, comparison, diagram, data view, calculator, or small interactive interface makes the answer easier to use. Before creating inline HTML, ", $loading,
+        "Use inline HTML when a document, comparison, diagram, data view, calculator, or small interactive interface makes the answer easier to use. HTML documents can include CSS and embedded JavaScript for working controls and content that responds to user input. Before creating inline HTML, ", $loading,
         " Prepare a complete responsive document using host --pioneer-* tokens and supporting both themes. When html_preview is available and image input is supported, use it and inspect all six preview images (light then dark at 360, 768, 1024 CSS px) and diagnostics, fix issues, then publish with html_render. If preview is unavailable or image input is explicitly unsupported or unconfirmed, do not repeat preview without changed conditions or claim visual verification. You may use permitted html_render while clearly stating that visual verification was unavailable; use a text answer when visual verification is necessary for a reliable result. Use callable names from the current tool catalog. html_render handles publication; no extra artifact_register is needed. Follow the answer delivery and review rules."
     ) };
 }

@@ -1,6 +1,8 @@
-# Interfaces and tools
+# Interactive HTML and JavaScript
 
-Read this for editors, calculators, control panels, and other broad HTML artifacts people operate rather than read straight through.
+Read this for editors, calculators, control panels, and other HTML documents people operate rather than read straight through.
+
+Implement local behavior with plain JavaScript in the document, for example recalculating totals as inputs change, filtering or sorting a table, switching tabs, or updating a chart from a scenario slider. Include the finished CSS and JavaScript in the HTML; no separate app or build step is needed. Use real event handlers and update the visible result when the user acts. These controls operate inside the document, not through agent tools or chat messages.
 
 Lead with the current state and the next useful action. Organize the interface around the user's task, not the shape of the underlying data model.
 

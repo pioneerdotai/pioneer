@@ -2,7 +2,7 @@
 name: html
 slug: html
 owner: pioneer
-description: "Create inline HTML content in Pioneer messages when a document, comparison, diagram, data view, calculator, or small interactive interface helps the user. Do not use for ordinary application edits merely involving HTML."
+description: "Create inline HTML documents with CSS and embedded JavaScript in Pioneer messages, including interactive calculators, charts, and small working interfaces. Do not use for ordinary application edits merely involving HTML."
 version: "0.1.0"
 user-invocable: true
 disable-model-invocation: false
@@ -10,7 +10,9 @@ implicit-invocation: required
 catalog-hide: true
 ---
 
-# Pioneer Inline HTML
+# Pioneer Inline HTML and JavaScript
+
+Inline HTML supports CSS and embedded JavaScript that runs inside the document. Use JavaScript for working calculators, filters, tabs, scenario controls, and charts that respond to user input. Keep reading-focused documents static when interaction adds no value.
 
 Use inline HTML to make relationships, comparisons, data, or interactive calculations easier to understand. Choose the form from the user's question: a document for reading, aligned rows for comparison, a diagram for relationships, a chart or table for data, or a small working interface for exploration. Plain text is sufficient for simple answers.
 

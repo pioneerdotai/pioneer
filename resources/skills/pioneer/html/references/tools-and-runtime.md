@@ -1,6 +1,6 @@
 # Tools and runtime
 
-Read the live schemas before calling tools. Supply a complete document through `html`; use only supported optional fields. Geometry and themes belong to the host. A new `html_preview` always returns one atomic set: light 360/768/1024, dark 360/768/1024. An old recorded preview may contain three legacy frames; do not mistake that history for a new successful six-frame check.
+Read the live schemas before calling tools. Supply a complete document through `html`, including its CSS and any embedded JavaScript for interactive behavior; use only supported optional fields. Geometry and themes belong to the host. A new `html_preview` always returns one atomic set: light 360/768/1024, dark 360/768/1024. An old recorded preview may contain three legacy frames; do not mistake that history for a new successful six-frame check.
 
 Inspect each image, its appearance and CSS width, contentHeight/capturedHeight, and available diagnostics. A clipped capture is not proof that unseen content is correct. Preserve exact artifact/version references when discussing a specific source or image; do not substitute a latest version. Do not treat partial output or text-only image links as a complete visual review.
 

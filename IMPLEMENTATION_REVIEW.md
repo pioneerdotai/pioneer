@@ -180,3 +180,13 @@ Used the invoked pioneer-system-subagents skill to split implementation work. Sk
 - After repeated full external review and explicit acceptance only: run the new focused recovery/invocation regression, HTML-only resolver case and updated integration harness matrix, followed by the previously listed validation plan. No automatic test execution follows this handoff.
 
 The incremental changes are committed locally with hooks disabled; resolve the final revision with `git rev-parse HEAD` in the Pioneer worktree. Mobile remains at its checked HEAD. No new execution permissions are implied by this handoff.
+
+
+## Embedded JavaScript wording follow-up
+
+- User requested clearer emphasis on JavaScript after accepting the implementation and publishing PR #177. The canonical skill description/entrypoint and shared native/CLI policy now explicitly describe CSS and embedded JavaScript for working in-document controls. Interactive/runtime references name concrete behaviors such as recalculation, table filtering, tabs, and chart updates.
+- This is guidance for an existing capability, not a runtime change. The documents still require both themes, and controls do not gain agent tools, chat-send permissions, durable state, or automatic interaction verification through screenshots.
+- Tool descriptions already request finished HTML/CSS/JavaScript. Their frozen catalog bytes are deliberately unchanged: this wording clarification does not require another tool-contract compatibility path. Skill name, ID, exports, and loading paths remain unchanged.
+- Static diff review only; no tests, builds, scripts, generators, applications or preview/render calls. The existing CI monitor is paused during editing and resumes for the new PR head with a verified next check at +15 minutes.
+
+- Formatting: `cargo fmt -p pioneer-promt` and `cargo fmt -p pioneer-promt --check` completed without output (exit 0). No executable skill validator or project checks were run.
