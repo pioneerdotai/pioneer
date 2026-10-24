@@ -1,21 +1,87 @@
-# Поиск тредов и episodic recall — кандидат на внешнее ревью
+# Поиск тредов и episodic recall — кандидат на повторное внешнее ревью
 
 Статус: реализация подготовлена локально для полного внешнего ревью другой моделью. Внутренние проверки исполнителей и родительский самоаудит не являются внешней приёмкой. Разрешение на тесты или сборки не выдавалось.
 
 **Тесты, cargo check, компиляция, сборки, приложение, CLI-агенты и генераторы не запускались. Компилируемость и прохождение тестов не подтверждены.**
 
-## Репозитории и ревизии
+## Исправления пяти дефектов внешнего аудита — 2026-10-24
+
+Перед изменениями оба worktree были чистыми, фактические HEAD совпали с заданием. Ветки сохранены. Основные checkout и соседние worktree не изменялись.
+
+| Репозиторий / worktree / ветка | Начало исправлений | Итоговый commit кода |
+| --- | --- | --- |
+| Pioneer `/Users/alexander/Code/pioneer/pioneer/.worktrees/threads-search`, `feat/threads-search` | `596969d8ea5f252c49e8b81c8539b4ecde329501` | `048fec0d2ffdbab04909a8d7db2a683b881a6ee5` |
+| Memvid `/Users/alexander/Code/pioneer/memory-search-pagination`, `feat/search-pagination` | `aec587174243b95875c63a91876e3b62498ff234` | `3adcf08d6c383e0b0183f07ce6c6c6567234bcfe` |
+
+Отчёт обновлён отдельным последующим documentation commit; его HEAD указан в финальной передаче. **Новая ревизия Memvid `3adcf08d6c383e0b0183f07ce6c6c6567234bcfe` не опубликована.** `Cargo.toml` и `Cargo.lock` согласованно закрепляют её без path/vendor и без Cargo-генерации lockfile. Для внешнего получения зависимости потребуется отдельная разрешённая публикация.
+
+### Подтверждение и исправление
+
+1. **Обязательные query filters.** В исходном `search_with_embedding` lexical ветка разбирала `SearchRequest.query`, а vector ветка проверяла только отдельные поля `SearchRequest`. В `vec_search_page` добавлен существующий `parse_query` и внутренний `ParsedQuery::permits_semantic_match`. Он переиспользует `FieldTerm::matches`, включая даты, и Boolean tree AND/OR/NOT. Текстовые термы имеют неопределённую истинность; они не становятся обязательным буквальным совпадением. Проверка полей выполняется до ACL/page slicing, существующее увеличение candidate prefix продолжает искать дальние допустимые записи. Новый язык запросов и публичный API не добавлены.
+2. **URI.** Исходный vector код требовал регистрозависимое равенство `request.uri` и одновременно применял scope. Existing `uri_matches` перенесён без изменения поведения из Tantivy в общий внутренний helpers: ASCII case-insensitive prefix без `#`, ASCII case-insensitive exact с `#`. Обе ветки используют его; explicit `uri` отключает scope. Семантика отдельных query-parser полей остаётся прежней.
+3. **Нулевая страница.** Исходные vector/hybrid/ask paths вычисляли `next_cursor` через `offset + 0`. На публичных границах `search`, vector page и `ask` введена одинаковая ошибка `InvalidQuery { reason: "top_k must be positive" }`. Положительные размеры не получили нового верхнего лимита, low-level `VecIndex::search(limit=0)` не изменён.
+4. **Recall budget.** В исходном `episodic_prompt_line` текст занимал весь остаток, затем к нему добавлялась подпись с JSON reference и строка отбрасывалась целиком. Теперь сначала строится полная подпись; её число символов и newline между результатами вычитаются до усечения текста. IDs/anchor не режутся. Непоместившаяся подпись пропускается; предыдущие результаты сохраняются. `truncated` учитывает сокращение текста и пропуск непустого результата. Изменённая сигнатура приватного helper проверена по всем callers.
+5. **CLI output projection.** Исходная страница проверялась как raw JSON, а `llm_view_for_policy` затем ограничивал сериализованный `ToolResultView::Json`, заменяя допустимый raw response на preview. Новый приватный `search_page_fits_output` измеряет существующий ToolResultView и через существующий `project_tool_result` фактический `llm_payload`, включая transport metadata. Этот расчёт используется до принятия карточки, при `pageFragment` и в handler. Не поместившиеся карточки остаются за тем же cursor; одна большая карточка читает точный JSON существующим pager. Глобальные output policy, `mcp_service` и native retained-result механизм не менялись.
+
+### Регрессии — не запускались
+
+- `tests/search_pagination.rs::hybrid_query_fields_filter_semantic_candidates_before_paging`: 80 ближайших недопустимых vectors и пять дальних допустимых, страницы 2/2/1; tag, date, отрицательные/составные поля, OR branches и текст внутри NOT. Случай `NOT (semantically OR tag:denied)` использует присутствующее во всех документах слово, чтобы lexical не маскировал semantic regression.
+- `hybrid_uri_uses_lexical_prefix_case_and_scope_precedence`: одинаковые lexical/semantic URI области, дочерние URI, ASCII case, конфликтующий scope, exact `#`, продолжение страниц. Semantic query не встречается в тексте.
+- `zero_pages_are_rejected_without_nonadvancing_cursors`: непустой индекс, cursor None/0/1, lexical/vector/hybrid и все режимы ask; ожидается явная ошибка.
+- `episodic_prompt_budget_preserves_full_anchor_and_truncates_only_text`: contribution budget=400, snippet=360 Unicode-символов, полные production-подобные IDs и JSON anchor; непустой сокращённый текст, общий бюджет и остаток после предыдущего результата.
+- `episodic_prompt_skips_unfittable_reference_without_losing_prior_context`: подпись сама не помещается, предшествующий контекст сохраняется, усечение отмечено.
+- `admitted_cli_search_preserves_structured_pages_at_projection_byte_boundary`: реальный admitted CLI invocation через existing fixture/TurnMcpInvoker/MCP service/shared runtime projection. Калибровка ставит две raw карточки на границу 2 MiB минус один байт и подтверждает переполнение ToolResultView. Вызов возвращает полное название первой карточки, structured response без preview, `nextCursor`, следующие карточки по cursor и payload/text до 2 MiB. Сохранены query binding и повторная проверка Agent grants. Эта проверка заменяет прежний direct service test с двумя названиями по 1,250,000 байт.
+
+### Статические самоаудиты и команды исправлений
+
+После Memvid перечитаны parser/field matcher, candidate refill, URI priority, публичные zero guards, все три callers `vec_search_page`, feature cfg и полный diff, включая tests. Production patch находится в `f408e59cedfd0c07395d298e94c2b86ce9cee275`, уточнения Boolean-регрессии — в `e97c6099d42701f92f07ab917d27d56ac83e1ebd` и `3adcf08d6c383e0b0183f07ce6c6c6567234bcfe`.
+
+После Pioneer проверены формирование contribution с остаточным бюджетом, классификатор успешного tool outcome, `ToolResultView::bounded_to_bytes`, projection, фактическая CLI доставка и реальный admitted fixture. Нет нового API/provider/index/session, query cap или ограничения корпуса. Полные названия, source authorization, immutable grants, frozen CLI catalog, повторное использование embedding и приблизительная позиционная ANN-пагинация сохранены. Финально перечитан совокупный diff **этого исправления** обоих репозиториев от указанных исходных HEAD, включая тесты, dependency pin и этот отчёт. Новых изменений первоначальной реализации вне пяти дефектов нет.
+
+Для исправлений использованы attached tasks `GgI9VqujnThKdccWEz7hZ` (Memvid) и `7PtiRG0FT4lQ9hcpYl8d0` (recall). Родитель прочитал точные candidates через `task_result`, просмотрел исходники; Memvid-регрессия дважды уточнена. Recall candidate принят внутренним reviewer. Последний финальный текст Memvid сохранён в истории дочернего треда, но Task Service не сформировал candidate этого раунда. Родитель прочитал текст и сам перечитал весь diff, включая последнюю правку; дополнительная работа исполнителя больше не нужна. Подзадача Memvid отменена через Task Service (receipt `Rbd4c300a6c65b52c7a72`), без заявления о принятии отсутствующего candidate. Финальный `task_wait` подтвердил обе задачи терминальными, pending=0 и reviewRequired=0; вложенная ошибка отмены class=cancelled/code=conflict относится к task lifecycle. Самоаудит и внутреннее принятие recall не являются повторной внешней приёмкой.
+
+Точные значимые команды этого этапа (read-only инспекция — `git status --short`, `git rev-parse HEAD`, `git branch --show-current`, `git log`, `git diff`, `rg`, `sed`, `cat`; текстовые edits через apply_patch/Python, без исполнения кода проекта):
+
+```text
+# Memvid:
+cargo +1.98.1 fmt
+cargo +1.98.1 fmt --check
+git diff --check
+git -c core.hooksPath=/dev/null commit -m "fix(search): enforce semantic query filters and consistent page boundaries"
+git -c core.hooksPath=/dev/null commit -m "test(search): cover unknown text in Boolean filter branches"
+git -c core.hooksPath=/dev/null commit -m "test(search): isolate semantic unknown negation regression"
+git diff aec587174243b95875c63a91876e3b62498ff234 HEAD --check
+
+# Pioneer:
+cargo +1.98.1 fmt -p pioneer-memory
+cargo +1.98.1 fmt -p pioneer-memory -- --check
+cargo fmt -p pioneer-gateway
+cargo fmt -p pioneer-gateway -p pioneer-memory -- --check
+git diff --check
+git add Cargo.toml Cargo.lock crates/gateway/src/message/thread_search_tools.rs crates/gateway/src/message/tests/cli_task_tools.rs crates/memory/src/hooks/active_recall.rs crates/memory/src/hooks/tests/episodic_recall.rs
+git diff --cached --check
+git -c core.hooksPath=/dev/null commit -m "fix(threads): preserve search pages and recall within output budgets"
+git add docs/reviews/threads-search-recall.md
+git -c core.hooksPath=/dev/null commit -m "docs: record five search audit fixes for external review"
+git diff 596969d8ea5f252c49e8b81c8539b4ecde329501 HEAD --check
+```
+
+Форматирование и whitespace-проверки выполнены успешно. Верхние ограничения остаются прежними: до 100 fragments и 2 MiB представления страницы; обычные слова query не получают нового ограничения длины. Low-level продолжения oversized records и native retained result используют прежние quanta, описанные ниже. Абсолютная стабильность ANN не обещается. Глобальные бюджеты recall и остальных tools не повышались.
+
+**Тесты, cargo check, компиляция, сборки, приложение, CLI-агенты и генераторы не запускались. Компилируемость и прохождение тестов не подтверждены.** Все новые и ранее написанные тесты остаются незапущенными до отдельного разрешения после внешней приёмки. Кандидат передаётся на повторное внешнее ревью.
+
+## Исходный этап: репозитории и ревизии
 
 | Репозиторий | Рабочая ветка | Изолированное рабочее дерево | Исходный commit | Итоговый commit кода |
 | --- | --- | --- | --- | --- |
 | Pioneer | `feat/threads-search` | `/Users/alexander/Code/pioneer/pioneer/.worktrees/threads-search` | `6c1e6b2c49359c76e49624c0545bbafc4a3d310a` | `7b11f2a145ef692937e8b87a001c2c2c8e7a3af4` |
 | Memvid, существующий форк | `feat/search-pagination` | `/Users/alexander/Code/pioneer/memory-search-pagination` | `fe0b3d9ac883c667587c262f7b372bf06eb605d5` | aec587174243b95875c63a91876e3b62498ff234 |
 
-Pioneer commit в таблице содержит реализацию и незапущенные регрессии. Этот отчёт добавлен следующим отдельным documentation commit в той же ветке; его точный HEAD передаётся в финальном сообщении, чтобы избежать самоссылки SHA в содержимом commit. Memvid история содержит два локальных commits: `da735d06816032c718df419fedd9fe4c23ada633` и итоговый `aec587174243b95875c63a91876e3b62498ff234`.
+Pioneer commit в таблице содержит реализацию и незапущенные регрессии. Этот отчёт добавлен следующим отдельным documentation commit в той же ветке; его точный HEAD передаётся в финальном сообщении, чтобы избежать самоссылки SHA в содержимом commit. На момент первого этапа Memvid история содержала два локальных commits: `da735d06816032c718df419fedd9fe4c23ada633` и итоговый `aec587174243b95875c63a91876e3b62498ff234`.
 
 При начале основной checkout Pioneer был чистым, `main` и локальная ссылка `origin/main` указывали на `6c1e6b2c49359c76e49624c0545bbafc4a3d310a`, уже после указанного в задании `fdc1b069df0fdca80690e759b596a2626f5619da`. Основной checkout Memvid был чистым на `main` = `b827f174eab60bcfe3deb8412f507e4990d4c341`; origin — `https://github.com/pioneerdotai/memory.git`. Работа Memvid начата с закреплённой в Pioneer версии 3.1.8, а не со старого main. Соседние ветки и worktree не очищались и не использовались как база поиска.
 
-Pioneer `Cargo.toml` и `Cargo.lock` статически переведены с tag `v3.1.8` / `fe0b3d9ac883c667587c262f7b372bf06eb605d5` на одну и ту же Git-ревизию aec587174243b95875c63a91876e3b62498ff234. Версия пакета остаётся 3.1.8. Абсолютной path-зависимости, vendor-копии или второго форка нет.
+На первом этапе Pioneer `Cargo.toml` и `Cargo.lock` статически переведены с tag `v3.1.8` / `fe0b3d9ac883c667587c262f7b372bf06eb605d5` на одну и ту же Git-ревизию aec587174243b95875c63a91876e3b62498ff234. Версия пакета остаётся 3.1.8. Абсолютной path-зависимости, vendor-копии или второго форка нет.
 
 **Новая ревизия Memvid не опубликована на GitHub.** Для последующей проверки внешним Git-потребителем потребуется отдельная разрешённая публикация этой ревизии. Локальная готовность к ревью не означает доступность Git-зависимости извне. Push, merge, release tags, deploy и CI не выполнялись.
 
@@ -68,7 +134,7 @@ Vector retrieval расширяет внутреннее число кандид
 
 Пагинация позиционная: 1–100, затем 101–200 и далее при limit=100. Внутри повторно ищется нужный префикс; наружу выдаётся только текущая страница. ANN может менять порядок при росте префикса, поэтому допустимы некоторое пересечение и пропуски из-за приблизительного порядка. Сессии с зафиксированной полной выдачей не создаются.
 
-При достижении 2 MiB готовой JSON-страницы не поместившиеся источники остаются за `nextCursor`. Если одна карточка сама больше 2 MiB из-за полного названия, существующий exact-result pager отдаёт её JSON через `pageFragment.text`; части конкатенируются до `complete=true`, затем тот же защищённый cursor продолжает общую выдачу. Версия карточки и текущий источник проверяются повторно. Название не усекается.
+При достижении 2 MiB сериализованного ToolResultView или фактического CLI payload не поместившиеся источники остаются за `nextCursor`. Если одна карточка с обёрткой не помещается в 2 MiB из-за полного названия, существующий exact-result pager отдаёт её JSON через `pageFragment.text`; части конкатенируются до `complete=true`, затем тот же защищённый cursor продолжает общую выдачу. Версия карточки и текущий источник проверяются повторно. Название не усекается.
 
 ## Реальный production recall
 
@@ -100,7 +166,7 @@ Native/CLI preflight может формироваться до разрешен
 
 ## Оставшиеся ограничения
 
-- 1–100 найденных фрагментов на обычную страницу; группировка по беседам не меняет счёт. Сериализованный ответ инструмента не больше 2,097,152 байт.
+- 1–100 найденных фрагментов на обычную страницу; группировка по беседам не меняет счёт. Сериализованный ToolResultView и фактический CLI payload не больше 2,097,152 байт каждый; размер обёртки измеряется непосредственно, без фиксированного запаса.
 - Используется существующий профиль engine snippet: 360 символов вокруг совпадений; у vector snippet сохраняется library minimum 80 символов. Полное сообщение доступно через history anchor.
 - Внутренний каталог и кандидаты читаются порциями 100 без максимума числа порций, файлов или бесед.
 - Oversized-card continuation и saved-result reader переиспользуют существующий pager с квантами до 32,768 байт / 4,096 токенов. Это продолжение точного текста, а не потеря остатка и не общий token cap страницы поиска.
@@ -119,7 +185,7 @@ Native/CLI preflight может формироваться до разрешен
 - Pioneer `memory/src/thread_episodic.rs`: реальные lexical страницы 3/3/1 при прежнем profile cap=1, segment_index=25; несовместимость provider/model/dimension/normalization; неизвестная persisted vector identity; один prepared vector для двух файлов. Существующая fake-embedder проверка теперь требует ровно один вызов embedding для нескольких файлов.
 - `protocol/src/thread_search.rs`: blank query, limit=0/101, длинный query из 100,000 кириллических символов, запрет model-supplied principal, nullable title и typed oversized-card envelope.
 - `gateway/message/thread_search_tools/tests.rs`: 18 файлов и 10 бесед; 7/7/4 страницы, каноническая дедупликация между файлами; 105 недоступных кандидатов перед разрешённым; личные беседы Member, чужой источник, текущая authority; реальные committed item IDs/history anchors; отзыв ACL, исключение и удаление. Полное Unicode-название больше 2 MiB восстанавливается по fragment continuation. Сохранённая выдача больше 256 KiB дочитывается точно и повторно авторизуется. Production-bound provider игнорирует подставной principal hint и сохраняет текущий источник.
-- `gateway/message/tests/cli_task_tools.rs`: реальная admitted CLI fixture и установленный production recall hook находят другую доступную беседу даже при preflight episodic skip; реальная материализация Agent role intersection ограничивает поиск текущей беседой. Это проверка production binding/role policy, а не полный lifecycle отдельного child task. Replay/recovery фиксированного каталога без search не получает новые полномочия. Защищённый cursor разделяет две полные карточки с названиями по 1,250,000 байт, связывает query и повторно учитывает сужение Agent grants.
+- `gateway/message/tests/cli_task_tools.rs`: реальная admitted CLI fixture и установленный production recall hook находят другую доступную беседу даже при preflight episodic skip; реальная материализация Agent role intersection ограничивает поиск текущей беседой. Это проверка production binding/role policy, а не полный lifecycle отдельного child task. Replay/recovery фиксированного каталога без search не получает новые полномочия. После аудита проверка границы заменена настоящим admitted CLI invocation: размер названия калибруется так, чтобы две исходные карточки занимали 2,097,151 байт, но превышали лимит после обёртки. Первая полная карточка доставляется структурированно, остальные читаются по cursor; сохраняются проверки query binding и сужения Agent grants.
 - `memory/hooks/recall.rs`: host-owned full-input episodic retrieval заменяет устаревший preflight skip, сохраняя policy no_use.
 - `agent/src/chat/mod.rs`: большая Unicode-страница сохраняется полностью, reference появляется после durable ack, типизированный result-reader reference восстанавливает исходный payload.
 - `tools/{domain,visibility,permissions}` и `gateway/turn_mcp/native_tools.rs`: скрытость до открытия threads, catalog/action/schema и регистрация native; существующие CLI catalog assertions дополнены новым инструментом.
