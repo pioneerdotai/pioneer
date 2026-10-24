@@ -8753,7 +8753,7 @@ async fn phase_10_prompt_compile_receives_final_visible_tools_not_registered_mem
     assert!(
         prompt
             .full_system_text
-            .contains("Some tool domains and their tools are hidden until requested.")
+            .contains("For hidden tools, call request_tools to open their domain.")
     );
     assert!(
         !prompt.full_system_text.contains("Available memory tools:"),

@@ -971,3 +971,23 @@ builds, compilers, resolvers or platform probes ran; fresh CI must validate this
 repair. Fetched main `12fb677bc996957b64471a4b88acb08e1efc3eb4` merges without
 conflicts (`git merge-tree --write-tree`); GitHub reports MERGEABLE. CUA pin,
 server/CU variants, update/recovery and release assets remain unchanged.
+
+## 2026-10-24 — hidden-domain prompt integration expectation
+
+Monitor run 31 inspected HEAD `6920cfa7993a58acc037864c1cfc794099dc8e76`
+and CI `40099119611`: Windows, macOS, Linux build and shards 1–3 passed.
+Shard 4 had one failure: the agent prompt integration test still expected the
+hidden-domain introduction replaced by accepted compact catalog wording.
+Paused future firings before editing. Updated only that literal in the existing
+`phase_10_prompt_compile_receives_final_visible_tools_not_registered_memory_tools`
+owner; retained exact hook/provider visibility equality, core tools, hidden memory
+exclusion and the explicit hidden-domain activation instruction. No assertions
+were removed and no new test layer or production seam was added.
+
+Applied test-audit: the file is included only under `cfg(test)`; all other tracked
+bytes matched the entry hash snapshot before and after `cargo fmt --all --check`.
+`git diff --check` passed. No local builds/tests/resolvers/platform probes ran;
+the observed CI failure supplies the baseline and fresh CI must validate repair.
+Cargo.lock, CUA pin and all accepted product contracts are unchanged. After the
+test-only batch, this handoff records its evidence. Fetched main
+`12fb677bc996957b64471a4b88acb08e1efc3eb4`; merge-tree reports no conflicts.
