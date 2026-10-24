@@ -2319,15 +2319,15 @@ mod tests {
                 .iter()
                 .all(|estimate| estimate.input_tokens > 0)
         );
-        assert_eq!(budgeted.request.messages[1].content_parts.len(), 2);
+        assert_eq!(budgeted.request.messages[2].content_parts.len(), 2);
         assert!(matches!(
-            &budgeted.request.messages[1].content_parts[0],
+            &budgeted.request.messages[2].content_parts[0],
             MessageContentPart::Image { image }
                 if image.sha256.is_some()
                     && image.artifact.as_ref().is_some_and(|artifact| artifact.artifact_id == "artifact-image")
         ));
         assert!(matches!(
-            &budgeted.request.messages[1].content_parts[1],
+            &budgeted.request.messages[2].content_parts[1],
             MessageContentPart::File { file }
                 if file.sha256.is_some()
                     && file.artifact.as_ref().is_some_and(|artifact| artifact.artifact_id == "artifact-file")

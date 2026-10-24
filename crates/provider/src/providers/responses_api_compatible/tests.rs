@@ -1465,7 +1465,7 @@ async fn generic_responses_replay_survives_budget_media_and_render_for_chat_poli
                     );
                     assert_eq!(budget.media.len(), usize::from(with_media));
                     if with_media {
-                        assert_eq!((budget.media[0].message, budget.media[0].part), (1, 0));
+                        assert_eq!((budget.media[0].message, budget.media[0].part), (2, 0));
                     }
                     let prepared = provider
                         .prepare(budget.request, &provider.capabilities())
@@ -1505,9 +1505,10 @@ async fn generic_responses_replay_survives_budget_media_and_render_for_chat_poli
                         assert_eq!(input[3]["call_id"], "call_binding");
                         assert_eq!(input[3]["output"][0]["text"], "actual tool result");
                         if with_media {
-                            assert_eq!(input[3]["output"][1]["type"], "input_image");
+                            assert_eq!(input[4]["role"], "user");
+                            assert_eq!(input[4]["content"][1]["type"], "input_image");
                             assert!(
-                                input[3]["output"][1]["image_url"]
+                                input[4]["content"][1]["image_url"]
                                     .as_str()
                                     .unwrap()
                                     .starts_with("data:image/png;base64,")
