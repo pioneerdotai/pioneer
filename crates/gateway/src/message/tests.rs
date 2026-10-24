@@ -26380,8 +26380,8 @@ fn composer_cli_skill_pack_matches_individual_members_and_preserves_presentation
                     .list_turn_skill_bindings(&lineage.child_turn_id)
                     .await
                     .unwrap();
-                assert_eq!(bindings.len(), skill_ids.len() + 3);
-                for slug in ["tasks", "subagents", "html"] {
+                assert_eq!(bindings.len(), skill_ids.len() + 4);
+                for slug in ["tasks", "subagents", "html", "threads"] {
                     assert!(bindings.iter().any(|binding| {
                         binding.source_kind == "system"
                             && binding.skill_owner.as_deref() == Some("pioneer")
