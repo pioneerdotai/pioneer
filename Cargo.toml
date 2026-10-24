@@ -175,7 +175,7 @@ tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 transcribe-rs = { version = "0.3.11", features = ["onnx", "whisper-cpp"] }
 
 # Agent memory capsule store
-memvid-core = { git = "https://github.com/pioneerdotai/memory", rev = "6951277fe9a912fd1343880e2e51a4af21b748bb", default-features = false, features = ["lex", "temporal_track", "simd", "vec"] }
+memvid-core = { git = "https://github.com/pioneerdotai/memory", rev = "e0f971d667fa6f3b37eaeffa6a08a7a4d6af96a0", default-features = false, features = ["lex", "temporal_track", "simd", "vec"] }
 
 # Embed
 rust-embed = "8"

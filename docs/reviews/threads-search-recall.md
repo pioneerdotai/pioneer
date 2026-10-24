@@ -1,6 +1,19 @@
-# Поиск тредов и episodic recall — кандидат на повторное внешнее ревью
+# Thread search and episodic recall: review and publication record
 
-Статус: кандидат остаётся предметом внешнего ревью. После предыдущего статического аудита пользователь отдельно разрешил полный запуск тестов Memvid и исправление найденных ошибок. Тесты и компиляция Pioneer по-прежнему не разрешены и не выполнялись. Исторические разделы ниже описывают состояние до этого разрешения; актуальная проверка приведена первой.
+## Publication and CI follow-up (2026-10-24)
+
+The user accepted the result and authorized publication. Both existing feature branches are now published:
+
+- Pioneer: https://github.com/pioneerdotai/pioneer/pull/174 (`feat/threads-search`).
+- Memvid: https://github.com/pioneerdotai/memory/pull/1 (`feat/search-pagination`).
+
+Pioneer now pins the published Memvid revision `e0f971d667fa6f3b37eaeffa6a08a7a4d6af96a0` in both Cargo.toml and Cargo.lock. The first GitHub CI run found three lint errors in footer lifetime annotations and snapshot fingerprint reads. Commit `e0f971d667fa6f3b37eaeffa6a08a7a4d6af96a0` elides the lifetime, allocates the 64 KiB read buffer on the heap, and propagates an invalid-size error instead of calling `expect`. The new Lint job succeeded; the remaining CI jobs were still running at publication time.
+
+One durable monitor, `G2dk4ksihOwuhHcY6NR6s`, follows both PRs every 15 minutes. It pauses future launches during repairs, pushes fixes to the same branches, checks conflicts with main, and stops permanently after all expected checks succeed on the current heads with no conflicts, or after the primary PR closes. Local builds and tests are forbidden during this follow-up; GitHub CI provides validation.
+
+Publication and repair used `gh pr create`, `gh pr edit --body-file`, `gh pr view`, `gh run view`, the GitHub job-log API, `git fetch origin main`, ancestry checks, `git -c core.hooksPath=/dev/null commit`, and ordinary feature-branch pushes with hooks disabled. The Memvid repair also used `cargo fmt` and `git diff --check`. The dependency revision was edited statically without running Cargo lockfile generation. PR descriptions were edited with the humanizer skill. Earlier review, local-only publication statements, and validation results below describe their historical stages.
+
+Historical review and validation record follows. Publication and the current CI policy are described above.
 
 ## Разрешённая проверка всей библиотеки Memvid — 24 октября 2026
 
