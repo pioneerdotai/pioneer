@@ -1,8 +1,94 @@
 # Поиск тредов и episodic recall — кандидат на повторное внешнее ревью
 
-Статус: реализация подготовлена локально для полного внешнего ревью другой моделью. Внутренние проверки исполнителей и родительский самоаудит не являются внешней приёмкой. Разрешение на тесты или сборки не выдавалось.
+Статус: кандидат остаётся предметом внешнего ревью. После предыдущего статического аудита пользователь отдельно разрешил полный запуск тестов Memvid и исправление найденных ошибок. Тесты и компиляция Pioneer по-прежнему не разрешены и не выполнялись. Исторические разделы ниже описывают состояние до этого разрешения; актуальная проверка приведена первой.
 
-**Тесты, cargo check, компиляция, сборки, приложение, CLI-агенты и генераторы не запускались. Компилируемость и прохождение тестов не подтверждены.**
+## Разрешённая проверка всей библиотеки Memvid — 24 октября 2026
+
+Использованы только существующие изолированные worktree:
+
+| Репозиторий | Ветка / worktree | Исходный HEAD этого этапа | Итог |
+| --- | --- | --- | --- |
+| Memvid | `feat/search-pagination`, `/Users/alexander/Code/pioneer/memory-search-pagination` | `d71c077a8c5144fb4eec99a86e7ca457443e8b68` | `6951277fe9a912fd1343880e2e51a4af21b748bb` |
+| Pioneer | `feat/threads-search`, `/Users/alexander/Code/pioneer/pioneer/.worktrees/threads-search` | `c273b91dfe625a1c85d08874953fd77c85bcbc81` | dependency commit `c5191250fdd1893fb03afa40c62d6c976d8d9504`; этот отчёт — последующий docs commit |
+
+Проверяемый source tree Memvid: `48f7f0303174d18c41523b00225337dc4e4cd849`, совпадает с tree итогового commit. Cargo.toml и Cargo.lock Pioneer статически согласованы с новым Git commit; другие зависимости не менялись.
+
+В начале оба worktree были чистыми. Основные checkout и соседние worktree не менялись. Закреплённый Rust 1.90.0 восстановлен rustup при первом тестовом запуске. Cargo.lock Memvid не менялся; все тестовые команды использовали `--locked`.
+
+### Найденные ошибки и исправления
+
+1. **Потеря pending WAL на границе sentinel** (`src/io/wal.rs`). На полном корпусе обнаружено исчезновение 22 документов: после 133 insertions оставалось 111 frames. При остатке меньше 48 байт запись sentinel переносила write head в начало даже при pending records. Линейный scanner переставал видеть хвост, а следующий append обходил проверку необходимости WAL growth. Теперь head сохраняет позицию конца региона, пока записи не закоммичены; sentinel не оборачивается через pending tail. Повторное открытие и `records_after` сохраняют эту позицию. Header checkpoint position остаётся нормализованной; формат WAL / `.mv2` не менялся.
+2. **Wildcard в Tantivy** (`src/search/tantivy/query.rs`). FST regex отвергал явные anchors из существующего parser regex, и hybrid `(need* OR tag:allowed) AND NOT need*` завершался `LexNotEnabled`. Для FST удаляются только внешние `^` / `$`: этот backend уже сопоставляет целый term. Авторитетный parser/evaluator и Boolean-семантика не менялись. Прежняя behavioral regression теперь проходит, а не пропускается.
+3. **Optional inference code не компилировался с закреплённым ort rc.12** (`src/clip.rs`, `src/analysis/ner.rs`). Исправлены обращения к закрытым полям Session/Outlet на действующие методы; Tensor получает прежнюю shape и owned data без зависимости от совпадения версий ndarray. Ровно такой контракт уже использует `src/text_embed.rs`. Версии зависимостей и публичные API не менялись.
+4. **Неверные fixtures**, без ослабления production-контрактов. В `tests/mutation.rs` writer явно закрывается перед повторным reader open; прежние тесты ждали недоступный собственный exclusive lock. Поисковые регрессии используют явные URI вместо возвращаемых WAL sequence numbers как frame IDs. Тест пересборки использует постоянный заголовок, чтобы старое слово не оставалось в законно сохраняемой metadata. Для snippet-count fixtures убраны inferred query words и непреднамеренное automatic chunking; zero-page AskRequest содержит обязательный `snippet_chars`. Корпуса 1,320/1,100, URI/ACL фильтры и ожидаемые размеры страниц сохранены. В search-only fixtures отключена не проверяемая ими triplet extraction; тесты instant indexing и triplets остаются в своих владельцах.
+
+### Регрессии и самоаудит
+
+Добавлен один тест WAL `pending_tail_survives_short_sentinel_space_and_reopen`: остаток 0/1/47 байт, видимость pending записи, reopen, отказ от перезаписи и успешное продолжение после checkpoint. Он дополняет существующие append/checkpoint/corruption сценарии. Существующий Tantivy postfilter test сохраняет 133 документа и страницы 5/5/3 с полным набором 13 ожидаемых URI. Доработаны существующие `tests/search_pagination.rs`, `tests/mutation.rs` и rebuild fixture; тесты не удалялись, новых ignore/skip/retry нет.
+
+После каждого исправления проверены владельцы и callers. Фокусированный набор WAL/mutation: **20 passed, 0 failed**; все pagination regressions: **11 passed, 0 failed**. Перечитан полный diff всех девяти изменённых файлов, включая mixed production/test modules. Проверены WAL open/scan/checkpoint/growth callers, две inference модели и существующий text embedder, parser/FST compatibility. Новых публичных методов, формата, поисковых ограничений и изменений Pioneer runtime нет. `cargo fmt --check`, `git diff --check` и `git diff --cached --check` проходят.
+
+### Полные прогоны
+
+Завершены полные unit/integration suites через nextest и отдельные doctests. Все шесть итоговых команд завершились с exit code 0. Исходники после начала этих итоговых прогонов не менялись; commit содержит ровно проверенный source tree. Логи: `/tmp/memvid-default-final.log`, `/tmp/memvid-pioneer-features-final.log`, `/tmp/memvid-extended-features-final.log` и соответствующие `*-doctests*.log`.
+
+| Конфигурация Memvid | Unit/integration | Doctests |
+| --- | --- | --- |
+| default (`lex,pdf_extract,simd`) | 502 passed / 0 failed / 0 skipped; exit 0 | 1 passed / 0 failed / 17 ignored |
+| конфигурация зависимости Pioneer (`lex,temporal_track,simd,vec`, без defaults) | 527 passed / 0 failed / 1 ignored; exit 0 | 1 passed / 0 failed / 18 ignored |
+| расширенный CPU набор | 597 passed / 0 failed / 5 ignored; exit 0 | 1 passed / 0 failed / 20 ignored |
+
+Расширенный CPU набор: `vec,clip,tokenizers_esaxx_fast,mmap,pdf_oxide,pdfium,temporal_track,temporal_enrich,parallel_segments,logic_mesh,whisper,replay,encryption,symspell_cleanup,api_embed,hnsw_bench,jsonwebtoken,rustfft,accelerate` плюс default features. Это полные suites для трёх явно указанных конфигураций, не все возможные комбинации flags. Варианты CUDA, Metal и Extractous/GraalVM не запускались. Существующие ignored-тесты требуют model files, внешнего OpenAI API или отсутствующего `legacy_test.mv2`; ignored doctests — прежние примеры документации. Новых исключений не добавлено.
+
+Отдельная существующая граница покрытия: все 14 тестов `tests/xlsx_structured.rs` зависят от не поставляемого в репозитории `/Users/olow/Desktop/memvid-org/arden.xlsx`. Файл отсутствует, и прежние guards возвращаются до assertions. Nextest считает их PASS; это не подтверждает выполнение содержательных XLSX-проверок. Fixture/guards не подменялись, данные не выдумывались.
+
+### Команды этого этапа
+
+Все следующие команды выполнялись только в Memvid worktree; перенаправления сохраняли полные логи в `/tmp/memvid-*.log`.
+
+```text
+cargo test --locked --no-fail-fast
+cargo test --locked --lib both_full_branches_rebuild_once_and_publish_current_ids_and_vectors -- --nocapture
+RUST_BACKTRACE=1 cargo test --locked --lib both_full_branches_rebuild_once_and_publish_current_ids_and_vectors -- --nocapture
+cargo test --locked --lib postfilter_rejections_do_not_end_the_initial_document_window -- --nocapture
+cargo nextest run --locked --test-threads 2 --no-fail-fast --retries 0 postfilter_rejections_do_not_end_the_initial_document_window
+cargo nextest run --locked --test-threads 2 --no-fail-fast --retries 0 -E 'test(io::wal::tests) | test(postfilter_rejections_do_not_end_the_initial_document_window) | binary(mutation)'
+cargo nextest run --locked --test-threads 2 --no-fail-fast --retries 0 -E 'test(hybrid_query_fields_filter_semantic_candidates_before_paging) | test(ask_pages_grow_past_duplicate_snippets_before_later_sources)'
+cargo nextest run --locked --test-threads 2 --no-fail-fast --retries 0 --test search_pagination
+cargo nextest run --locked --test-threads 2 --no-fail-fast --retries 0
+cargo nextest run --locked --no-default-features --features lex,temporal_track,simd,vec --test-threads 2 --no-fail-fast --retries 0
+cargo nextest run --locked --features vec,clip,tokenizers_esaxx_fast,mmap,pdf_oxide,pdfium,temporal_track,temporal_enrich,parallel_segments,logic_mesh,whisper,replay,encryption,symspell_cleanup,api_embed,hnsw_bench --test-threads 2 --no-fail-fast --retries 0
+cargo nextest run --locked --features vec,clip,tokenizers_esaxx_fast,mmap,pdf_oxide,pdfium,temporal_track,temporal_enrich,parallel_segments,logic_mesh,whisper,replay,encryption,symspell_cleanup,api_embed,hnsw_bench,jsonwebtoken,rustfft,accelerate --test-threads 2 --no-fail-fast --retries 0
+cargo test --locked --doc
+cargo test --locked --no-default-features --features lex,temporal_track,simd,vec --doc
+cargo test --locked --features vec,clip,tokenizers_esaxx_fast,mmap,pdf_oxide,pdfium,temporal_track,temporal_enrich,parallel_segments,logic_mesh,whisper,replay,encryption,symspell_cleanup,api_embed,hnsw_bench,jsonwebtoken,rustfft,accelerate --doc
+cargo fmt
+cargo fmt --check
+git diff --check
+git diff --cached --check
+```
+
+Первый default run и промежуточные full runs со старыми fixtures уже подтвердили ошибки и были остановлены после запуска заменяющих их полных suites на окончательном source tree. Они не объявляются успешными. Для остановки только собственных устаревших процессов выполнено `kill -TERM 92432 98789 98949 95962 99597 84352 89483 93201`; собраны их terminal результаты (143/100/100). Диагностика длительных процессов выполнена `sample 86435 1 -file /tmp/memvid-default-sample.txt` и `sample 92432 1 -file /tmp/memvid-search-pagination-sample.txt`; это наблюдение тестовых процессов, не запуск приложения. Остальные read-only команды: `git status/rev-parse/diff`, `rg`, `cat`, `sed`, `ps`, `tail`, `lsof`, `df`, `du`, `rustup toolchain list`, `command -v`, `xcrun --find metal`, `/usr/libexec/java_home -V`. Редактирование — apply_patch и Python text edits; код Pioneer не выполнялся.
+
+Локальные commits созданы с отключёнными hooks:
+
+```text
+# Memvid worktree
+git add src/analysis/ner.rs src/clip.rs src/io/wal.rs src/memvid/search/tantivy.rs src/memvid/tantivy_rebuild_tests.rs src/search/tantivy/query.rs src/tests_lex_flag.rs tests/mutation.rs tests/search_pagination.rs
+git write-tree
+git -c core.hooksPath=/dev/null commit -m "fix: preserve pending WAL tail and repair search test failures" -m "Use supported ort session and tensor APIs for optional inference features. Correct retrieval fixtures without weakening page, filter, or persistence assertions."
+# Pioneer worktree (revision заменена Python text edit, без Cargo)
+git add Cargo.toml Cargo.lock
+git diff --cached --check
+git -c core.hooksPath=/dev/null commit -m "chore(memory): pin Memvid WAL and search regression fixes"
+git add docs/reviews/threads-search-recall.md
+git diff --cached --check
+git -c core.hooksPath=/dev/null commit -m "docs: record Memvid library test validation"
+```
+
+Итоговый самоаудит: перечитаны полный Memvid diff от `d71c077` и полный Pioneer diff от `c273b91`, включая зависимости и отчёт. Проверены соответствие tree, hooks-disabled commits и согласованность Git revision. После commit отчёта оба выделенных worktree должны быть чистыми; точный docs HEAD Pioneer получается `git rev-parse HEAD` и передаётся в финальном сообщении. Тесты Pioneer, Gateway, приложение, CLI-агенты, генераторы, cargo check/build/clippy/bench/run и CI не запускались. Компиляция выполнялась только как часть разрешённых тестовых команд Memvid.
+
+Новая ревизия Memvid `6951277fe9a912fd1343880e2e51a4af21b748bb` остаётся локальной: push, merge, release, tags, deploy, CI и публикация не выполнялись. Проверка зависимости извне потребует отдельной публикации. Тесты и компиляция Pioneer не подтверждены; внешняя приёмка всей реализации остаётся отдельным этапом.
 
 ## Два оставшихся дефекта аудита — URI-prefilter и повторяющиеся предикаты
 
@@ -253,9 +339,9 @@ Native/CLI preflight может формироваться до разрешен
 - При изменении прав/источника cursor не фиксирует прежний корпус; изменившуюся большую карточку нужно начать читать заново. Абсолютная стабильность ANN и поколения не обещается.
 - Chroma, выбор provider в UI и миграция данных не реализованы. Caller-facing request/scope/page/source contract не требует `.mv2`, frame ID или file generation; эти поля остаются в Memvid adapter. Будущий backend может сам выделять префикс/диапазон и обеспечить lexical fusion, без предположения о native hybrid в обычной Chroma.
 
-## Незапущенные регрессии
+## Исторический перечень регрессий до разрешения тестов Memvid
 
-Все перечисленные проверки написаны и **не запускались**.
+На момент первичного внешнего ревью перечисленные проверки были написаны и не запускались. Актуальные результаты Memvid приведены в начале отчёта; тесты Pioneer по-прежнему не запускались.
 
 - Memvid `src/vec.rs`: HNSW >1,000 векторов, limit=100/200, запрос больше индекса, zero/empty, короткий достижимый пул одинаковых векторов, clone/decode и неизменность сериализации. ANN-порядок разных префиксов не сравнивается на точное равенство.
 - Memvid `tests/search_pagination.rs`: страницы после scope/ACL отбрасывания 1,100 из 1,320 векторных кандидатов; hybrid 100/100/20; lexical scope/ACL, продолжение нескольких snippets одного документа; raw обычный и аналитический запрос; ask combined continuation, дедупликация и timestamp postfilters. Внутренний Tantivy тест помещает 120 авторитетно непригодных документов перед 13 подходящими и проверяет страницы 5/5/3 за первоначальным окном.
@@ -323,4 +409,4 @@ git diff fe0b3d9 HEAD --check
 
 Первый `cargo fmt` Memvid начал rustup download закреплённого toolchain 1.90.0 и был прерван; затем использован установленный formatter 1.98.1. Проект при этом не компилировался. Промежуточный format check мог находить различия во время редактирования; итоговые результаты указаны выше.
 
-Кандидат передаётся на полное внешнее ревью кода. До отдельного разрешения после внешней приёмки запрет тестов/сборок сохраняется.
+Историческая передача: кандидат передавался на полное внешнее ревью кода с запретом тестов/сборок. Последующее отдельное разрешение для Memvid и его результаты описаны в начале отчёта; запрет для Pioneer сохраняется.
