@@ -445,6 +445,8 @@ pub enum GatewayThreadEpisodicVectorProvider {
     OpenAi,
     #[serde(rename = "openrouter")]
     OpenRouter,
+    #[serde(rename = "vercel-ai-gateway")]
+    VercelAiGateway,
     #[serde(rename = "local")]
     Local,
 }
@@ -1228,6 +1230,10 @@ mod tests {
             (
                 GatewayThreadEpisodicVectorProvider::OpenRouter,
                 "openai/text-embedding-3-small",
+            ),
+            (
+                GatewayThreadEpisodicVectorProvider::VercelAiGateway,
+                "private/team-embedding",
             ),
         ] {
             let settings = GatewayThreadEpisodicVectorSearchSettings {

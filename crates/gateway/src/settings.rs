@@ -1536,7 +1536,8 @@ pub fn thread_episodic_vector_refill_is_startable(
 
     match vector_search.provider {
         Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenAi)
-        | Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter) => {
+        | Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter)
+        | Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::VercelAiGateway) => {
             if vector_search
                 .model
                 .as_deref()
@@ -1628,6 +1629,9 @@ fn vector_provider_to_protocol(
         GatewayThreadEpisodicVectorProviderConfig::OpenRouter => {
             pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter
         }
+        GatewayThreadEpisodicVectorProviderConfig::VercelAiGateway => {
+            pioneer_protocol::GatewayThreadEpisodicVectorProvider::VercelAiGateway
+        }
         GatewayThreadEpisodicVectorProviderConfig::Local => {
             pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local
         }
@@ -1644,6 +1648,9 @@ fn vector_provider_from_protocol(
         pioneer_protocol::GatewayThreadEpisodicVectorProvider::OpenRouter => {
             GatewayThreadEpisodicVectorProviderConfig::OpenRouter
         }
+        pioneer_protocol::GatewayThreadEpisodicVectorProvider::VercelAiGateway => {
+            GatewayThreadEpisodicVectorProviderConfig::VercelAiGateway
+        }
         pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local => {
             GatewayThreadEpisodicVectorProviderConfig::Local
         }
@@ -1655,6 +1662,7 @@ fn vector_provider_requires_key(provider: GatewayThreadEpisodicVectorProviderCon
         provider,
         GatewayThreadEpisodicVectorProviderConfig::OpenAi
             | GatewayThreadEpisodicVectorProviderConfig::OpenRouter
+            | GatewayThreadEpisodicVectorProviderConfig::VercelAiGateway
     )
 }
 
@@ -1664,6 +1672,7 @@ pub(crate) fn vector_provider_identity_name(
     match provider {
         GatewayThreadEpisodicVectorProviderConfig::OpenAi => "openai",
         GatewayThreadEpisodicVectorProviderConfig::OpenRouter => "openrouter",
+        GatewayThreadEpisodicVectorProviderConfig::VercelAiGateway => "vercel-ai-gateway",
         GatewayThreadEpisodicVectorProviderConfig::Local => "local",
     }
 }
@@ -1694,6 +1703,7 @@ pub(crate) fn resolved_vector_embedding_dimension(
                 _ => None,
             }
         }
+        Some(GatewayThreadEpisodicVectorProviderConfig::VercelAiGateway) => None,
         None => None,
     }
 }
@@ -1703,7 +1713,10 @@ fn vector_provider_allows_runtime_dimension_probe(
 ) -> bool {
     matches!(
         config.provider,
-        Some(GatewayThreadEpisodicVectorProviderConfig::OpenRouter)
+        Some(
+            GatewayThreadEpisodicVectorProviderConfig::OpenRouter
+                | GatewayThreadEpisodicVectorProviderConfig::VercelAiGateway
+        )
     ) && config
         .model
         .as_deref()
@@ -2610,6 +2623,39 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn vercel_vector_settings_roundtrip_and_allow_dynamic_dimension() {
+        use pioneer_protocol::{
+            GatewayThreadEpisodicVectorProvider, GatewayThreadEpisodicVectorSearchSettingsUpdate,
+        };
+        let mut config = GatewayThreadEpisodicVectorSearchConfig::default();
+        super::apply_vector_search_protocol_update(
+            &mut config,
+            GatewayThreadEpisodicVectorSearchSettingsUpdate {
+                enabled: Some(true),
+                provider: Some(Some(GatewayThreadEpisodicVectorProvider::VercelAiGateway)),
+                model: Some(Some("private/team-embedding".into())),
+                ..Default::default()
+            },
+        );
+        let serialized = toml::to_string(&config).expect("serialize Vercel vector config");
+        assert!(serialized.contains("vercel-ai-gateway"));
+        let restored: GatewayThreadEpisodicVectorSearchConfig =
+            toml::from_str(&serialized).expect("restore config");
+        assert_eq!(
+            super::vector_provider_to_protocol(restored.provider.unwrap()),
+            GatewayThreadEpisodicVectorProvider::VercelAiGateway
+        );
+        assert_eq!(restored.model.as_deref(), Some("private/team-embedding"));
+        assert!(super::vector_provider_requires_key(
+            restored.provider.unwrap()
+        ));
+        assert!(super::vector_provider_allows_runtime_dimension_probe(
+            &restored
+        ));
+        assert_eq!(super::resolved_vector_embedding_dimension(&restored), None);
+    }
 
     #[test]
     fn creates_sanitized_gateway_settings_without_jwt_or_provider_secrets() {

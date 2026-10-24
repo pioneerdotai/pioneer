@@ -312,6 +312,9 @@ impl AuthorityBoundProvider {
         model: &str,
         catalog: Option<&crate::catalog::ModelCatalog>,
     ) -> bool {
+        if self.inner.name() == "vercel-ai-gateway" {
+            return self.inner.model_tool_calling(model);
+        }
         let discovery = self
             .discovery_tools
             .read()
@@ -332,7 +335,11 @@ impl AuthorityBoundProvider {
         models: &mut [ProviderModelInfo],
     ) {
         self.remember_discovery(models);
-        catalog.enrich_for_tool_scope(self.inner.name(), models, self.use_public_catalog);
+        // Vercel discovery is authority-owned source evidence. A
+        // public row must not fill native unknown limits, modalities or tariffs.
+        if self.inner.name() != "vercel-ai-gateway" {
+            catalog.enrich_for_tool_scope(self.inner.name(), models, self.use_public_catalog);
+        }
     }
 
     fn remember_discovery(&self, models: &[ProviderModelInfo]) {
@@ -469,6 +476,10 @@ impl Provider for AuthorityBoundProvider {
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         self.ensure_not_revoked()?;
+        if self.inner.name() == "vercel-ai-gateway" {
+            self.public_result(self.inner.model_limits(&request.model).await)?;
+            self.ensure_not_revoked()?;
+        }
         let context = crate::usage::UsageContext::capture_request(self.inner.as_ref(), &request)?;
         let mut response = self
             .public_result(
@@ -512,6 +523,10 @@ impl Provider for AuthorityBoundProvider {
         request: ChatRequest,
     ) -> Result<crate::ProviderStream> {
         self.ensure_not_revoked()?;
+        if self.inner.name() == "vercel-ai-gateway" {
+            self.public_result(self.inner.model_limits(&request.model).await)?;
+            self.ensure_not_revoked()?;
+        }
         let context = crate::usage::UsageContext::capture_request(self.inner.as_ref(), &request)?;
         let mut response = self
             .public_result(
@@ -569,6 +584,17 @@ impl Provider for AuthorityBoundProvider {
             })
         }));
         Ok(response)
+    }
+
+    async fn model_limits(&self, model: &str) -> Result<crate::catalog::CatalogLimits> {
+        self.ensure_not_revoked()?;
+        self.public_result(self.inner.model_limits(model).await)
+    }
+    fn model_catalog_entry(&self, model: &str) -> Option<crate::catalog::CatalogModel> {
+        if self.ensure_not_revoked().is_err() {
+            return None;
+        }
+        self.inner.model_catalog_entry(model)
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
@@ -1872,6 +1898,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn vercel_authority_discovery_preserves_unknowns_against_public_catalog() {
+        let raw = serde_json::json!({"id":"private/model","type":"language","tags":["tool-use"],"context_window":12345,"max_tokens":500,"modalities":{"input":["text","image"],"output":["text"]},"pricing":{"input":"0.000002"}});
+        let model = crate::catalog::generator::vercel_model(&raw).unwrap();
+        let catalog = crate::catalog::ModelCatalog::parse(
+            &serde_json::json!({"vercel-ai-gateway":{"private/model":model}}).to_string(),
+            &serde_json::json!({"vercel-ai-gateway":{"private/model":{"contextWindow":{"kind":"source","expression":"fixture"},"maxTokens":{"kind":"source","expression":"fixture"}}}}).to_string(),
+        ).unwrap();
+        let wrapper = AuthorityBoundProvider {
+            inner: Arc::new(crate::providers::VercelAiGatewayProvider::new(
+                "fixture-key",
+            )),
+            authority_fingerprint: ProviderAuthorityFingerprint("fixture-authority".into()),
+            revoked: Arc::new(AtomicBool::new(false)),
+            redact_endpoint_errors: false,
+            input_admission: Arc::new(Default::default()),
+            use_public_catalog: true,
+            discovery_tools: RwLock::new(BTreeMap::new()),
+            discovery_reasoning: RwLock::new(BTreeMap::new()),
+        };
+        let mut native = crate::catalog::tool_tests::discovered("private/model", Some(false));
+        native.provider = "vercel-ai-gateway".into();
+        native.limits = Default::default();
+        native.pricing = None;
+        native.capabilities.input_modalities = None;
+        let mut models = vec![native];
+        wrapper.enrich_discovery(&catalog, &mut models);
+        assert!(models[0].limits.context_window.is_none());
+        assert!(models[0].pricing.is_none());
+        assert!(models[0].capabilities.input_modalities.is_none());
+        assert_eq!(models[0].capabilities.tool_calling, Some(false));
     }
 
     struct ToolDiscoveryProvider;

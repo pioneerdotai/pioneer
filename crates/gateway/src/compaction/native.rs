@@ -325,7 +325,6 @@ async fn prepare_native_projection_with_prepared(
     }
     // This deadline includes reader/writer queues and admission, not just LLM time.
     let prepared = async {
-        let catalog = pioneer_provider::catalog::model_catalog()?;
         let version = store
             .compaction_projection_version(workspace, thread)
             .await?;
@@ -504,7 +503,7 @@ async fn prepare_native_projection_with_prepared(
         if matches!(&accepted_projection, Some(AcceptedProjection::Prepared(_))) {
             observe_reused_projection(store, workspace, thread);
         }
-        let limits = catalog.limits(context.provider.name(), &request.model);
+        let limits = context.provider.model_limits(&request.model).await?;
         let budget = ModelBudget::new(
             Some(limits.context_window),
             limits.max_input,

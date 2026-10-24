@@ -10050,6 +10050,63 @@ fn web_fetch_item(item_id: &str) -> TurnItem {
     }
 }
 
+#[tokio::test]
+async fn provider_preview_deltas_do_not_pollute_canonical_markdown_or_retain_a_draft_buffer() {
+    let harness = setup_progress_delta_harness(
+        "provider_preview",
+        TurnItem::Reasoning {
+            id: "thinking_preview".into(),
+            summary: vec![],
+            content: vec![],
+        },
+        false,
+    )
+    .await;
+    let mut preview = progress_delta_notification(&harness, "working", ItemDeltaStream::Generic);
+    preview.item_id = "provider_preview".into();
+    preview.payload = Some(json!({"runtimeDeltaKind":"provider_message_preview"}));
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut preview)
+        .await;
+    assert!(preview.markdown.is_none());
+    assert!(preview.markdown_version.is_none());
+    let mut resolved = ItemStartedNotification {
+        workspace_id: harness.workspace_id.clone(),
+        thread_id: harness.thread_id.clone(),
+        turn_id: harness.turn_id.clone(),
+        item: TurnItem::AgentMessage {
+            id: "provider_preview".into(),
+            text: "working".into(),
+            phase: pioneer_protocol::AgentMessagePhase::Commentary,
+            markdown: None,
+            markdown_version: None,
+        },
+    };
+    harness
+        .processor
+        .enrich_item_started_markdown(&mut resolved)
+        .await;
+    preview.delta = "stale preview".into();
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut preview)
+        .await;
+    assert!(preview.markdown.is_none());
+    let mut delta = progress_delta_notification(&harness, " more", ItemDeltaStream::AgentMessage);
+    delta.item_id = "provider_preview".into();
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut delta)
+        .await;
+    assert_eq!(
+        delta.markdown,
+        Some(pioneer_protocol::MarkdownDocument::from_plain_text(
+            "working more"
+        ))
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn assistant_progress_delta_is_live_only_and_completed_item_is_durable() {
     let mut harness = setup_progress_delta_harness(

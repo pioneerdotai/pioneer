@@ -327,7 +327,15 @@ pub(crate) async fn prepare_completed_history_owned(
         } else {
             &current.model
         };
-        let limits = pioneer_provider::catalog::model_catalog()?.limits(&catalog, catalog_model);
+        let limits = if current.transport == Transport::Api {
+            processor
+                .provider_registry()
+                .get_or_create_for_workspace(workspace, &current.instance)?
+                .model_limits(catalog_model)
+                .await?
+        } else {
+            pioneer_provider::catalog::model_catalog()?.limits(&catalog, catalog_model)
+        };
         let budget = ModelBudget::new(
             Some(limits.context_window),
             limits.max_input,

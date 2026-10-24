@@ -244,6 +244,7 @@ impl SettingsIntent {
                 {
                     "openai" => GatewayThreadEpisodicVectorProvider::OpenAi,
                     "openrouter" => GatewayThreadEpisodicVectorProvider::OpenRouter,
+                    "vercel-ai-gateway" => GatewayThreadEpisodicVectorProvider::VercelAiGateway,
                     "local" => GatewayThreadEpisodicVectorProvider::Local,
                     _ => return None,
                 };
@@ -1228,6 +1229,33 @@ mod tests {
             ..Default::default()
         }
     }
+    #[test]
+    fn vercel_vector_selection_preserves_full_model_and_requires_its_key() {
+        let snapshot = store().settings.unwrap();
+        let update = SettingsIntent::VectorModel {
+            selection: crate::composer::model_selection::ModelSelectorSelection {
+                provider: Some("vercel-ai-gateway".into()),
+                model: Some("private/team-embedding".into()),
+                selected_reasoning_effort: None,
+            },
+        }
+        .update(&snapshot)
+        .expect("Vercel selection update");
+        let vector = update.thread_episodic.unwrap().vector_search.unwrap();
+        assert_eq!(
+            vector.provider,
+            Some(Some(GatewayThreadEpisodicVectorProvider::VercelAiGateway))
+        );
+        assert_eq!(vector.model, Some(Some("private/team-embedding".into())));
+        assert_eq!(vector.enabled, Some(true));
+        assert_eq!(
+            super::super::gateway::vector_provider_key_provider_id(
+                GatewayThreadEpisodicVectorProvider::VercelAiGateway
+            ),
+            Some("vercel-ai-gateway")
+        );
+    }
+
     #[test]
     fn saved_profile_policy_hint_preserves_devices_without_reloading() {
         for demand in [ClientDemand::Visible, ClientDemand::Suspended] {

@@ -923,6 +923,8 @@ pub enum GatewayThreadEpisodicVectorProviderConfig {
     OpenAi,
     #[serde(rename = "openrouter")]
     OpenRouter,
+    #[serde(rename = "vercel-ai-gateway")]
+    VercelAiGateway,
     #[serde(rename = "local")]
     Local,
 }

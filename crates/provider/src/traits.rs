@@ -61,6 +61,18 @@ pub trait Provider: Send + Sync {
         ProviderCapabilities::default()
     }
 
+    /// Budget facts for the selected connection, including discovered private
+    /// models. Public providers retain the existing catalog resolution.
+    async fn model_limits(&self, model: &str) -> Result<crate::catalog::CatalogLimits> {
+        Ok(crate::catalog::model_catalog()?.limits(self.name(), model))
+    }
+
+    /// Optional authority-owned catalog evidence captured for usage accounting.
+    /// It must never be published into the process-wide public model catalog.
+    fn model_catalog_entry(&self, _model: &str) -> Option<crate::catalog::CatalogModel> {
+        None
+    }
+
     /// Adapter capability is a protocol ceiling; known catalog model support
     /// can narrow it. Absence remains unknown, not evidence for every model.
     fn model_tool_calling(&self, model: &str) -> bool {

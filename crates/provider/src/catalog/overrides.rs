@@ -99,9 +99,7 @@ pub(super) fn apply(models: &mut Vec<Candidate>) -> anyhow::Result<()> {
         if p == "openai" && id == "gpt-5-pro" {
             m.override_limit("maxTokens", 128_000, "GPT-5 Pro output");
         }
-        if (p == "openrouter" && rules::OPENROUTER_KIMI_K3_MODEL_IDS.contains(&id.as_str()))
-            || (p == "vercel-ai-gateway" && id == "moonshotai/kimi-k3")
-        {
+        if p == "openrouter" && rules::OPENROUTER_KIMI_K3_MODEL_IDS.contains(&id.as_str()) {
             m.override_limit("maxTokens", 131_072, "Kimi K3 output");
         }
         if p == "openrouter" && id == "moonshotai/kimi-k2.5" {

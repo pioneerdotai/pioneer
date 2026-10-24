@@ -63,7 +63,22 @@ pub(crate) fn validate_cap_with_catalog(
 ) -> Result<()> {
     if let Some(cap) = request.max_tokens {
         ensure!(cap > 0, "generation cap must be positive");
-        let limit = catalog.and_then(|c| c.limits(provider, &request.model).max_output);
+        let native = native_model(provider, &request.model);
+        let limit = native
+            .as_ref()
+            .filter(|m| {
+                provider != "vercel-ai-gateway"
+                    || m.metadata
+                        .get("vercelLimitOrigins")
+                        .is_some_and(|origins| origins["maxTokens"]["kind"] == "source")
+            })
+            .map(|m| m.max_tokens)
+            .filter(|limit| *limit > 0)
+            .or_else(|| {
+                (native.is_none() && uses_public_catalog(provider))
+                    .then(|| catalog.and_then(|c| c.limits(provider, &request.model).max_output))
+                    .flatten()
+            });
         ensure!(
             limit.is_none_or(|limit| u64::from(cap) <= limit),
             "generation cap exceeds the current catalog limit for {provider}/{}",
@@ -82,6 +97,34 @@ pub(crate) fn chat_fields(provider: &str, request: &ChatRequest) -> Result<Field
 pub(crate) type NativeReasoning = std::collections::BTreeMap<String, Option<bool>>;
 tokio::task_local! {
     static NATIVE_REASONING: (String, bool, std::collections::BTreeMap<String, NativeReasoning>);
+    static NATIVE_MODELS: (String, bool, std::collections::BTreeMap<String, CatalogModel>);
+}
+/// Model source facts, including unknowns, from the selected authority. Never installed
+/// in the public catalog, and are retained only through request preparation.
+pub(crate) async fn with_native_models<T>(
+    provider: &str,
+    public_catalog: bool,
+    models: std::collections::BTreeMap<String, CatalogModel>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    NATIVE_MODELS
+        .scope((provider.into(), public_catalog, models), future)
+        .await
+}
+pub(crate) fn native_model(provider: &str, model: &str) -> Option<CatalogModel> {
+    NATIVE_MODELS
+        .try_with(|(owner, _, models)| {
+            (owner == provider)
+                .then(|| models.get(model).cloned())
+                .flatten()
+        })
+        .ok()
+        .flatten()
+}
+pub(crate) fn uses_public_catalog(provider: &str) -> bool {
+    NATIVE_MODELS
+        .try_with(|(owner, public, _)| owner != provider || *public)
+        .unwrap_or_else(|_| public_reasoning_catalog(provider))
 }
 pub(crate) async fn with_native_reasoning<T>(
     provider: &str,
@@ -395,9 +438,30 @@ fn responses_fields_from_catalog(
     request: &ChatRequest,
 ) -> Result<Fields> {
     validate_cap_with_catalog(catalog, provider, request)?;
-    let model = catalog.and_then(|c| c.model(provider, &request.model));
+    let native = native_model(provider, &request.model);
+    let model = native.as_ref().or_else(|| {
+        uses_public_catalog(provider)
+            .then(|| catalog.and_then(|c| c.model(provider, &request.model)))
+            .flatten()
+    });
     if provider == "openai" {
         return openai_api_fields(provider, request, model, true);
+    }
+    responses_fields_with_model(provider, request, model)
+}
+
+fn responses_fields_with_model(
+    provider: &str,
+    request: &ChatRequest,
+    model: Option<&CatalogModel>,
+) -> Result<Fields> {
+    if provider == "vercel-ai-gateway" {
+        ensure!(
+            request
+                .temperature
+                .is_none_or(|value| value.is_finite() && (0.0..=2.0).contains(&value)),
+            "Responses temperature must be finite and within 0..=2"
+        );
     }
     validate_temperature(model, request)?;
     let mut fields = Fields::new();
@@ -413,15 +477,30 @@ fn responses_fields_from_catalog(
     }
     if let Some(reasoning) = request.reasoning {
         ensure!(model.reasoning, "selected model does not support reasoning");
-        ensure!(
-            model
+        let toggle_off = provider == "vercel-ai-gateway"
+            && selected_off(Some(reasoning))
+            && model
                 .metadata
-                .get("compat")
-                .is_none_or(|c| c["supportsReasoningEffort"] != false),
+                .get("sourceGeneration")
+                .and_then(|source| source["reasoningOptions"].as_array())
+                .is_some_and(|options| options.iter().any(|option| option["type"] == "toggle"));
+        ensure!(
+            toggle_off
+                || model
+                    .metadata
+                    .get("compat")
+                    .is_none_or(|c| c["supportsReasoningEffort"] != false),
             "selected model explicitly does not support reasoning effort"
         );
-        let effort = mapped_effort(Some(model), reasoning)?
-            .ok_or_else(|| anyhow::anyhow!("unverified Responses effort contract"))?;
+        let effort = if toggle_off {
+            // Encode the catalog's off control using the chosen shared `none`
+            // mapping (see compatibility.rs). An effort enum alone cannot
+            // establish an off control or a reasoning default.
+            Some("none".into())
+        } else {
+            mapped_effort(Some(model), reasoning)?
+        }
+        .ok_or_else(|| anyhow::anyhow!("unverified Responses effort contract"))?;
         let native = native_reasoning(provider, &request.model);
         let denies = |key: &str| native.get(key) == Some(&Some(false));
         let selected = match reasoning {
@@ -430,8 +509,7 @@ fn responses_fields_from_catalog(
         };
         ensure!(
             !denies("reasoning.supported")
-                && !denies("effort.supported")
-                && !denies("effort.enum")
+                && (toggle_off || !denies("effort.supported") && !denies("effort.enum"))
                 && !denies(&format!("effort.{selected}"))
                 && !denies(&format!("effort.{effort}")),
             "native model facts deny selected Responses effort"
@@ -1357,6 +1435,7 @@ pub(crate) fn effort_supported_with_native(
     let fields = match provider {
         "anthropic" | "bedrock" => anthropic_fields_with_model(provider, &request, model),
         "gemini" => gemini_thinking_with_model(model, &request).map(|_| Fields::new()),
+        "vercel-ai-gateway" => responses_fields_with_model(provider, &request, model),
         _ => chat_fields_with_model(provider, &request, model),
     };
     fields

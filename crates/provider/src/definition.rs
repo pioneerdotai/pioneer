@@ -3,6 +3,7 @@
 //! the endpoint advertised by the gateway have the same owner.
 use crate::providers::{
     anthropic, copilot, deepseek, gemini, glm, ollama, openai, openrouter, telnyx,
+    vercel_ai_gateway,
 };
 use anyhow::{Result, bail};
 
@@ -170,6 +171,7 @@ const COMPATIBLE: &[ProviderEndpointDefinition] = &[
 ];
 
 const SPECIAL: &[ProviderEndpointDefinition] = &[
+    ProviderEndpointDefinition::fixed("vercel-ai-gateway", vercel_ai_gateway::BASE_URL, true),
     ProviderEndpointDefinition::fixed("openai", openai::BASE_URL, true),
     ProviderEndpointDefinition::fixed("anthropic", anthropic::BASE_URL, true),
     ProviderEndpointDefinition::fixed("openrouter", openrouter::BASE_URL, true),
@@ -200,6 +202,8 @@ pub fn provider_definition(name: &str) -> Option<ProviderEndpointDefinition> {
     let name = name.trim().to_ascii_lowercase();
     let canonical = match name.as_str() {
         "google" | "google-gemini" => "gemini",
+        "vercel" | "vercel_ai_gateway" | "vercel-gateway" | "vercelaigateway"
+        | "vercel ai gateway" => "vercel-ai-gateway",
         "github-copilot" => "copilot",
         "zhipu" | "bigmodel" | "glm-cn" | "zhipu-cn" => "glm",
         "glm-global" | "zhipu-global" | "z.ai" | "z-ai" => "zai",

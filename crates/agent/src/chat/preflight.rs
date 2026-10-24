@@ -997,9 +997,24 @@ async fn request_turn_preflight_provider_json(
     max_output_chars: usize,
     _attempt: u32,
 ) -> anyhow::Result<String> {
-    let model_catalog = pioneer_provider::catalog::model_catalog()
-        .map_err(TurnPreflightProviderRequestFailure::model_catalog_error)?;
-    let model_limits = model_catalog.limits(provider.name(), &request.model);
+    let model_limits = provider
+        .model_limits(&request.model)
+        .await
+        .map_err(|error| {
+            if provider.name() == "vercel-ai-gateway" {
+                if let Some(observation) = observation {
+                    observation.observe_error(&error);
+                }
+                TurnPreflightProviderRequestFailure::provider_error(
+                    provider,
+                    "model_capability_discovery",
+                    ProviderFailureStage::Connect,
+                    error,
+                )
+            } else {
+                TurnPreflightProviderRequestFailure::model_catalog_error(error)
+            }
+        })?;
     let evaluated = crate::compaction::request::NativeRequestProjection::full(
         request,
         vec![],

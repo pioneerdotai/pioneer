@@ -201,6 +201,10 @@ description = "GPT и другие модели OpenAI"
 title = "OpenRouter"
 description = "Маршрутизатор для множества провайдеров моделей"
 
+[providers.catalog.vercel-ai-gateway]
+title = "Vercel AI Gateway"
+description = "Доступ к моделям через Vercel AI Gateway"
+
 [providers.catalog.telnyx]
 title = "Telnyx"
 description = "Конечная точка вывода Telnyx"

@@ -342,7 +342,10 @@ impl ResponsesApiCompatibleProvider {
             &self.authority,
             prepared.request.parallel_tool_calls,
             id.as_deref(),
-        );
+        )
+        // Opt in only for Vercel. OpenAI retains its accepted late-phase
+        // buffering; JSON and every completed message/replay contract are shared.
+        .with_provisional_messages(self.name == "vercel-ai-gateway");
         reducer.bind_request(&prepared.request);
         reducer.usage.api = Some("responses".into());
         reducer.usage.route = crate::usage::route(&self.root, "/responses");

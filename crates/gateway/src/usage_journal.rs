@@ -122,6 +122,12 @@ impl Provider for JournalProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         self.inner.capabilities()
     }
+    async fn model_limits(&self, model: &str) -> Result<pioneer_provider::catalog::CatalogLimits> {
+        self.inner.model_limits(model).await
+    }
+    fn model_catalog_entry(&self, model: &str) -> Option<pioneer_provider::catalog::CatalogModel> {
+        self.inner.model_catalog_entry(model)
+    }
     fn model_tool_calling(&self, model: &str) -> bool {
         self.inner.model_tool_calling(model)
     }
