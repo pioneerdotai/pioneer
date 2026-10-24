@@ -3936,6 +3936,8 @@ async fn start_threads_cli_fixture(
         )
         .await
         .unwrap();
+    let mut security = test_full_access_execution_security_snapshot();
+    security.permission_profile = profile.clone();
     let revalidation = processor
         .execution_leases
         .revalidate_context(
@@ -3950,6 +3952,26 @@ async fn start_threads_cli_fixture(
         )
         .await
         .unwrap();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    // Durable authority must use the committed-agent response and activation
+    // path; a fresh TurnStart response is rejected before native preparation.
+    let response = crate::message::turn_handlers::TurnStartSuccessResponse::DurableAgent {
+        permission_profile: profile,
+        execution_security_snapshot: security,
+        continuation_thread_id: thread.clone(),
+        context_thread_id: thread.clone(),
+        agent_author: pioneer_protocol::TurnAuthorSnapshot {
+            actor: pioneer_protocol::PersistedActorRef::Principal(
+                connection.principal().principal_id.clone(),
+            ),
+            display_name: "Threads fixture".to_owned(),
+            nickname: "threads-fixture".to_owned(),
+            avatar_revision: None,
+            cli_runtime_kind: Some(kind),
+            agent: None,
+        },
+        completion: Arc::new(std::sync::Mutex::new(Some(sender))),
+    };
     processor
         .turn_start_cli_runtime(
             harness.connection_id,
@@ -3964,9 +3986,17 @@ async fn start_threads_cli_fixture(
                 context,
                 revalidation: Arc::new(revalidation),
             },
-            crate::message::turn_handlers::TurnStartSuccessResponse::TurnStart,
+            response,
         )
         .await;
+    let prepared = receiver
+        .await
+        .expect("Threads fixture preparation should return a result")
+        .expect("Threads fixture durable CLI preparation should succeed");
+    processor
+        .activate_prepared_committed_agent_cli_runtime_turn(prepared)
+        .await
+        .expect("Threads fixture durable CLI activation should succeed");
     wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
     wait_for_task_cli_activation(&processor, &turn).await;
     (harness, processor, turn)
