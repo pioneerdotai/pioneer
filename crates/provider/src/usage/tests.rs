@@ -380,6 +380,7 @@ fn billing_context(
         ),
         attempt: "physical-attempt".into(),
         catalog: Some(catalog),
+        native: None,
     }
 }
 fn billing_usage() -> TokenUsage {
