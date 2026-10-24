@@ -1284,6 +1284,7 @@ async fn hidden_composer_defers_root_warmup_until_its_answer_is_delivered() {
         .await
         .unwrap();
     let receipt = receipts
+        .deliveries
         .first()
         .expect("actual Composer delivery must be acknowledged");
     let acknowledgement = harness.crud_store.database_connection().query_one_raw(
