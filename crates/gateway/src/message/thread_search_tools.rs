@@ -638,18 +638,7 @@ fn search_page_fits_output(response: &Value) -> Result<bool> {
     if view.serialized_size_bytes() > PAGE_BYTES {
         return Ok(false);
     }
-    let projection = pioneer_tools::project_tool_result(pioneer_tools::ToolProjectionInput {
-        call_id: "",
-        tool_name: SEARCH_TOOL,
-        arguments: &Value::Null,
-        raw_output_text: "",
-        raw_output_json: response,
-        success: true,
-        outcome: &pioneer_tools::ToolOutcome::ok(),
-        output_policy: &pioneer_protocol::ToolOutputPolicySnapshot::for_tool_name(SEARCH_TOOL),
-        output_projection: &pioneer_tools::ToolOutputProjectionKind::Builtin,
-    });
-    Ok(serde_json::to_vec(&projection.llm_payload())?.len() <= PAGE_BYTES)
+    Ok(pioneer_tools::builtin_json_llm_payload_size(SEARCH_TOOL, response)? <= PAGE_BYTES)
 }
 
 fn source_order(a: &FoundSource, b: &FoundSource) -> std::cmp::Ordering {
