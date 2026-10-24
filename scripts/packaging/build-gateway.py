@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""Build and retain one Gateway variant without mutating Cargo's cached executable."""
+"""Build and retain the Gateway without mutating Cargo's cached executable."""
 import argparse
-import gzip
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import time
-import zipfile
 
 SYMBOLS = Path(__file__).with_name("symbol-inputs.py")
 
@@ -29,8 +27,6 @@ def configure(target):
 def build(args):
     command = ["cargo", "build", "--locked", "--release", "-p", "pioneer-cli",
                "--target", args.target]
-    if args.variant == "computer-use":
-        command += ["--features", "computer-use"]
     started = time.monotonic()
     subprocess.run(command, check=True)
     print(f"Gateway compilation completed in {time.monotonic() - started:.1f}s", flush=True)
@@ -53,19 +49,11 @@ def build(args):
                     str(inputs / "packaged.json")], check=True)
     assets = args.out / "assets"
     assets.mkdir()
-    if args.asset.endswith(".gz"):
-        with binary.open("rb") as source_file, gzip.open(assets / args.asset, "wb", compresslevel=9) as archive:
-            shutil.copyfileobj(source_file, archive)
-    else:
-        with zipfile.ZipFile(assets / args.asset, "w", compression=zipfile.ZIP_DEFLATED,
-                             compresslevel=9) as archive:
-            archive.write(binary, binary.name)
-            if args.target == "x86_64-apple-darwin":
-                libs = list(Path(os.environ["PIONEER_ONNXRUNTIME_DYLIB_DIR"]).glob("libonnxruntime*.dylib"))
-                if not libs:
-                    raise ValueError("ONNX Runtime dylibs missing")
-                for lib in libs:
-                    archive.write(lib, lib.name)
+    packaging_environment = os.environ.copy()
+    packaging_environment["PIONEER_SYMBOL_INPUTS_DIR"] = str(inputs.resolve())
+    subprocess.run([sys.executable, str(Path(__file__).with_name("cua-driver.py")),
+                    "--target", args.target, "--binary", str(binary),
+                    "--archive", str(assets / args.asset)], env=packaging_environment, check=True)
     print(f"Gateway packaging completed in {time.monotonic() - started:.1f}s", flush=True)
 
 
@@ -73,13 +61,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", required=True)
     parser.add_argument("--configure", action="store_true")
-    parser.add_argument("--variant", choices=("default", "computer-use"))
     parser.add_argument("--asset")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
     if args.configure:
         configure(args.target)
     else:
-        if not args.variant or not args.asset or not args.out:
-            parser.error("build requires --variant, --asset and --out")
+        if not args.asset or not args.out:
+            parser.error("build requires --asset and --out")
         build(args)

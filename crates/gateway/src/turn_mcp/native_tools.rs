@@ -15,6 +15,7 @@ use pioneer_tools::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeToolFamily {
     Html,
+    ComputerUse,
     Tasks,
     Threads,
 }
@@ -23,6 +24,7 @@ impl NativeToolFamily {
     pub(crate) fn from_server_id(id: &str) -> Option<Self> {
         match id {
             pioneer_tools::html::HTML_SERVER_ID => Some(Self::Html),
+            "pioneer-cua-688c5fd62a9f-v1" => Some(Self::ComputerUse),
             "pioneer-task-tools-v1" => Some(Self::Tasks),
             "pioneer-thread-tools-v1" => Some(Self::Threads),
             _ => None,
@@ -32,6 +34,7 @@ impl NativeToolFamily {
     pub(crate) fn server_id(self) -> &'static str {
         match self {
             Self::Html => pioneer_tools::html::HTML_SERVER_ID,
+            Self::ComputerUse => "pioneer-cua-688c5fd62a9f-v1",
             Self::Tasks => "pioneer-task-tools-v1",
             Self::Threads => "pioneer-thread-tools-v1",
         }
@@ -40,6 +43,7 @@ impl NativeToolFamily {
     pub(crate) fn server_name(self) -> &'static str {
         match self {
             Self::Html => pioneer_tools::html::HTML_SERVER_NAME,
+            Self::ComputerUse => "pioneer_cua",
             Self::Tasks => "pioneer_tasks",
             Self::Threads => "pioneer_threads",
         }
@@ -51,10 +55,12 @@ impl NativeToolFamily {
 
     fn catalog(self) -> &'static [ConfiguredToolSpec] {
         static HTML: std::sync::OnceLock<Vec<ConfiguredToolSpec>> = std::sync::OnceLock::new();
+        static CUA: std::sync::OnceLock<Vec<ConfiguredToolSpec>> = std::sync::OnceLock::new();
         static THREADS: std::sync::OnceLock<Vec<ConfiguredToolSpec>> = std::sync::OnceLock::new();
         static TASKS: std::sync::OnceLock<Vec<ConfiguredToolSpec>> = std::sync::OnceLock::new();
         match self {
             Self::Html => HTML.get_or_init(pioneer_tools::html::html_tool_specs),
+            Self::ComputerUse => CUA.get_or_init(pioneer_tools::computer_use_tool_specs),
             Self::Threads => THREADS.get_or_init(|| {
                 let mut specs = crate::message::thread_read_tools::thread_read_tool_specs();
                 specs.extend(crate::message::thread_tool_results::thread_result_tool_specs());
@@ -109,6 +115,12 @@ impl NativeToolFamily {
     pub(crate) fn action(self, name: &str) -> Result<ResourceAction, pioneer_tools::ToolError> {
         match self {
             Self::Html => Ok(ResourceAction::McpUse),
+            Self::ComputerUse if pioneer_tools::is_computer_use_tool(name) => {
+                Ok(ResourceAction::McpUse)
+            }
+            Self::ComputerUse => Err(pioneer_tools::ToolError::NotFound(
+                "unknown computer-use operation".into(),
+            )),
             Self::Threads
                 if self.is_thread_reader(name) || name == "threads_identity_models_list" =>
             {
@@ -333,6 +345,7 @@ mod tests {
             }
             let definitions = [
                 NativeToolFamily::Html,
+                NativeToolFamily::ComputerUse,
                 NativeToolFamily::Tasks,
                 NativeToolFamily::Threads,
             ]
@@ -386,6 +399,7 @@ mod tests {
             );
             for family in [
                 NativeToolFamily::Html,
+                NativeToolFamily::ComputerUse,
                 NativeToolFamily::Tasks,
                 NativeToolFamily::Threads,
             ] {

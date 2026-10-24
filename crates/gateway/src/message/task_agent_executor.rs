@@ -11960,7 +11960,6 @@ mod tests {
             },
             computer_use: ComputerUseToolsConfig {
                 runtime_home_dir: std::env::temp_dir().join("pioneer-task-artifact-tests"),
-                artifacts_subdir: "tools/computer_use".to_owned(),
                 ..ComputerUseToolsConfig::default()
             },
             skills: SkillsLoopConfig {

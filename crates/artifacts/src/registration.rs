@@ -34,7 +34,6 @@ pub enum ArtifactRegistrationSource {
     DownloadTool,
     ApplyPatchAddFile,
     GeneratedImage,
-    ComputerUseSnapshot,
     ExplicitArtifactRegister,
 }
 
@@ -64,7 +63,6 @@ impl ArtifactRegistrationSource {
             Self::DownloadTool => "download_tool",
             Self::ApplyPatchAddFile => "apply_patch_add_file",
             Self::GeneratedImage => "generated_image",
-            Self::ComputerUseSnapshot => "computer_use_snapshot",
             Self::ExplicitArtifactRegister => "explicit_artifact_register",
         }
     }
@@ -73,7 +71,6 @@ impl ArtifactRegistrationSource {
         match self {
             Self::ApplyPatchAddFile => Some(ArtifactKind::WorkspaceFile),
             Self::GeneratedImage => Some(ArtifactKind::GeneratedImage),
-            Self::ComputerUseSnapshot => Some(ArtifactKind::Screenshot),
             Self::DownloadTool | Self::ExplicitArtifactRegister => None,
         }
     }

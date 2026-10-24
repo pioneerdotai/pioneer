@@ -9,9 +9,9 @@ authors.workspace = true
 # Compile only deterministic native OAuth audit fixtures.
 oauth-test-support = ["pioneer-mcp-oauth/test-support"]
 default = []
-computer-use = ["pioneer-tools/computer-use"]
 
 [dependencies]
+cua-driver-sdk = { git = "https://github.com/trycua/cua", rev = "688c5fd62a9f13dddc309970c948df494e7de33f" }
 pioneer-compaction.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
@@ -83,6 +83,9 @@ uuid.workspace = true
 zeroize.workspace = true
 tempfile.workspace = true
 tokio-tungstenite.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [build-dependencies]
 pioneer-protocol.workspace = true

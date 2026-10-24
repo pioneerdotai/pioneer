@@ -38,8 +38,9 @@ pub use argument_normalizer::{
 pub use classifier::{DefaultErrorClassifier, ErrorClassifier, classify_tool_error};
 pub use context::{
     AnyToolResult, CallToolResult, ExecCommandArgs, FunctionToolOutput, LocalShellPayload,
-    ToolCallSource, ToolErrorClass, ToolInvocation, ToolOutcome, ToolOutcomeStatus, ToolOutput,
-    ToolPayload, ToolSearchOutput, ToolSearchResultTool, ToolSuggestOutput, WriteStdinArgs,
+    ToolCallSource, ToolDeliveryReceipt, ToolErrorClass, ToolInvocation, ToolOutcome,
+    ToolOutcomeStatus, ToolOutput, ToolPayload, ToolSearchOutput, ToolSearchResultTool,
+    ToolSuggestOutput, WriteStdinArgs,
 };
 pub use domain::{
     ARTIFACT_DOMAIN_TOOL_NAMES, BUILTIN_TOOL_DOMAIN_MAP, BuiltinToolDomain,
@@ -150,7 +151,9 @@ pub use windows_restricted_token_backend::{
     configure_windows_restricted_token_command,
 };
 
-#[cfg(feature = "computer-use")]
+pub use handlers::computer_use::{
+    ComputerUseBackend, computer_use_tool_specs, is_computer_use_tool,
+};
 use handlers::materialize_computer_use_domain_bundle;
 
 use handlers::{
@@ -160,7 +163,7 @@ use handlers::{
 use pioneer_protocol::TurnExecutionSecuritySnapshot;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Display, Formatter};
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone)]
@@ -247,128 +250,30 @@ impl WebToolsConfig {
 
 #[derive(Debug, Clone)]
 pub struct ComputerUseToolsConfig {
+    pub image_admission: handlers::computer_use::ComputerUseImageAdmission,
     pub runtime_home_dir: PathBuf,
-    pub artifacts_subdir: String,
-    pub retention_hours: u64,
     pub max_total_bytes: u64,
-    pub run_max_steps_default: u32,
-    pub snapshot_transport_max_bytes: usize,
-    pub snapshot_transport_max_side_px: u32,
-    pub snapshot_transport_min_side_px: u32,
-    pub snapshot_downscale_factor: f64,
-    pub accessibility_tree_max_depth: usize,
-    pub accessibility_tree_max_nodes: usize,
-    pub accessibility_tree_max_serialized_bytes: usize,
-    pub accessibility_tree_text_max_chars: usize,
-    pub semantic_action_timeout_ms: u64,
-    pub app_activation_timeout_ms: u64,
-    pub input_simulation_enabled: bool,
-    pub launch_if_missing_default: bool,
-    pub allowed_launch_commands: Vec<String>,
-    pub preflight_screenshot_probe_enabled: bool,
-    pub max_consecutive_same_snapshot_hash: u32,
-    pub max_consecutive_same_action_signature: u32,
-    pub max_consecutive_no_progress_steps: u32,
-    pub max_recovery_attempts_per_step: u32,
-    pub max_recovery_attempts_per_run: u32,
+    pub backend: Option<Arc<dyn ComputerUseBackend>>,
 }
-
 impl ComputerUseToolsConfig {
     pub fn normalized(&self) -> Self {
-        let artifacts_subdir = normalize_artifacts_subdir(self.artifacts_subdir.as_str());
-        let runtime_home_dir = self.runtime_home_dir.clone();
-
         Self {
-            runtime_home_dir,
-            artifacts_subdir,
-            retention_hours: self.retention_hours.max(1),
+            image_admission: self.image_admission.clone(),
+            runtime_home_dir: self.runtime_home_dir.clone(),
             max_total_bytes: self.max_total_bytes.max(1),
-            run_max_steps_default: self.run_max_steps_default.max(1),
-            snapshot_transport_max_bytes: self.snapshot_transport_max_bytes.max(256 * 1024),
-            snapshot_transport_max_side_px: self.snapshot_transport_max_side_px.clamp(320, 4096),
-            snapshot_transport_min_side_px: self.snapshot_transport_min_side_px.clamp(160, 2048),
-            snapshot_downscale_factor: self.snapshot_downscale_factor.clamp(0.5, 0.95),
-            accessibility_tree_max_depth: self.accessibility_tree_max_depth.clamp(1, 50),
-            accessibility_tree_max_nodes: self.accessibility_tree_max_nodes.clamp(1, 5_000),
-            accessibility_tree_max_serialized_bytes: self
-                .accessibility_tree_max_serialized_bytes
-                .clamp(4 * 1024, 2 * 1024 * 1024),
-            accessibility_tree_text_max_chars: self
-                .accessibility_tree_text_max_chars
-                .clamp(16, 4096),
-            semantic_action_timeout_ms: self.semantic_action_timeout_ms.clamp(1, 120_000),
-            app_activation_timeout_ms: self.app_activation_timeout_ms.clamp(0, 120_000),
-            input_simulation_enabled: self.input_simulation_enabled,
-            launch_if_missing_default: self.launch_if_missing_default,
-            allowed_launch_commands: self
-                .allowed_launch_commands
-                .iter()
-                .map(|value| value.trim())
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-                .collect(),
-            preflight_screenshot_probe_enabled: self.preflight_screenshot_probe_enabled,
-            max_consecutive_same_snapshot_hash: self.max_consecutive_same_snapshot_hash.max(1),
-            max_consecutive_same_action_signature: self
-                .max_consecutive_same_action_signature
-                .max(1),
-            max_consecutive_no_progress_steps: self.max_consecutive_no_progress_steps.max(1),
-            max_recovery_attempts_per_step: self.max_recovery_attempts_per_step.max(1),
-            max_recovery_attempts_per_run: self.max_recovery_attempts_per_run.max(1),
+            backend: self.backend.clone(),
         }
     }
 }
-
 impl Default for ComputerUseToolsConfig {
     fn default() -> Self {
         Self {
+            image_admission: Default::default(),
             runtime_home_dir: PathBuf::new(),
-            artifacts_subdir: "tools/computer_use".to_owned(),
-            retention_hours: 24,
             max_total_bytes: 1024 * 1024 * 1024,
-            run_max_steps_default: 300,
-            snapshot_transport_max_bytes: 8 * 1024 * 1024,
-            snapshot_transport_max_side_px: 1280,
-            snapshot_transport_min_side_px: 320,
-            snapshot_downscale_factor: 0.85,
-            accessibility_tree_max_depth: 6,
-            accessibility_tree_max_nodes: 200,
-            accessibility_tree_max_serialized_bytes: 192 * 1024,
-            accessibility_tree_text_max_chars: 160,
-            semantic_action_timeout_ms: 30_000,
-            app_activation_timeout_ms: 5_000,
-            input_simulation_enabled: true,
-            launch_if_missing_default: false,
-            allowed_launch_commands: Vec::new(),
-            preflight_screenshot_probe_enabled: true,
-            max_consecutive_same_snapshot_hash: 6,
-            max_consecutive_same_action_signature: 8,
-            max_consecutive_no_progress_steps: 4,
-            max_recovery_attempts_per_step: 2,
-            max_recovery_attempts_per_run: 12,
+            backend: None,
         }
     }
-}
-
-fn normalize_artifacts_subdir(input: &str) -> String {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return "tools/computer_use".to_owned();
-    }
-
-    let candidate = Path::new(trimmed);
-    if candidate.is_absolute() || candidate.components().any(is_disallowed_component) {
-        return "tools/computer_use".to_owned();
-    }
-
-    trimmed.to_owned()
-}
-
-fn is_disallowed_component(component: Component<'_>) -> bool {
-    matches!(
-        component,
-        Component::ParentDir | Component::RootDir | Component::Prefix(_)
-    )
 }
 
 pub struct BuiltinTools {
@@ -483,18 +388,12 @@ pub fn build_tools_with_environment_and_security_snapshot(
     validate_permission_context(&turn_id, &permission_context)?;
     let web_tools_config = web_tools_config.normalized();
 
-    #[cfg(feature = "computer-use")]
     let extensions = {
         let mut extensions = extensions;
         extensions.push(materialize_computer_use_domain_bundle(
             computer_use_tools_config.normalized(),
+            turn_id.clone(),
         ));
-        extensions
-    };
-
-    #[cfg(not(feature = "computer-use"))]
-    let extensions = {
-        let _ = computer_use_tools_config;
         extensions
     };
 
@@ -882,10 +781,7 @@ mod tests {
     fn test_computer_use_config() -> ComputerUseToolsConfig {
         ComputerUseToolsConfig {
             runtime_home_dir: std::env::temp_dir().join("pioneer-tools-tests"),
-            artifacts_subdir: "tools/computer_use".to_owned(),
-            retention_hours: 24,
             max_total_bytes: 1024 * 1024 * 1024,
-            run_max_steps_default: 30,
             ..ComputerUseToolsConfig::default()
         }
     }
@@ -1897,25 +1793,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn computer_use_config_normalization_rejects_absolute_and_traversal_artifact_dirs() {
-        for artifacts_subdir in ["/tmp/computer_use", "../computer_use", "tools/../x"] {
-            let config = ComputerUseToolsConfig {
-                artifacts_subdir: artifacts_subdir.to_owned(),
-                semantic_action_timeout_ms: 0,
-                app_activation_timeout_ms: 130_000,
-                allowed_launch_commands: vec!["".to_owned(), "open -a ExampleApp".to_owned()],
-                ..ComputerUseToolsConfig::default()
-            }
-            .normalized();
-
-            assert_eq!(config.artifacts_subdir, "tools/computer_use");
-            assert_eq!(config.semantic_action_timeout_ms, 1);
-            assert_eq!(config.app_activation_timeout_ms, 120_000);
-            assert_eq!(config.allowed_launch_commands, vec!["open -a ExampleApp"]);
-        }
-    }
-
     #[tokio::test]
     async fn build_tools_merges_builtin_and_extension_specs() {
         let extension_spec = ConfiguredToolSpec::new(
@@ -2064,140 +1941,10 @@ mod tests {
 
         let visible = built.router.model_visible_specs().await;
         assert!(
-            !visible.iter().any(|spec| spec.name == "computer_use"),
+            !visible
+                .iter()
+                .any(|spec| crate::is_computer_use_tool(&spec.name)),
             "computer_use schema must not be visible in the default provider catalog"
-        );
-    }
-
-    #[cfg(feature = "computer-use")]
-    #[tokio::test]
-    async fn computer_use_remains_registered_and_reaches_handler_when_visible() {
-        let built = build_builtin_tools(
-            ".",
-            "turn_computer_use_visible_handler",
-            test_permission_context("turn_computer_use_visible_handler"),
-            test_web_config(),
-            test_computer_use_config(),
-        );
-
-        assert!(
-            built.router.find_spec("computer_use").is_some(),
-            "computer_use spec should remain registered when feature-enabled"
-        );
-        assert!(
-            built.router.has_handler("computer_use"),
-            "computer_use handler should remain registered when feature-enabled"
-        );
-        let index = built.router.preflight_tool_index();
-        assert!(index.candidate_tools.iter().any(|candidate| {
-            candidate.name == "computer_use"
-                && candidate.domain == crate::BuiltinToolDomain::ComputerUse
-        }));
-
-        built
-            .router
-            .set_model_visible_tools(&["computer_use".to_owned()])
-            .await;
-        let call = built
-            .router
-            .build_model_tool_call(RawToolCall {
-                call_id: "call_computer_use_status".to_owned(),
-                tool_name: "computer_use".to_owned(),
-                arguments: serde_json::json!({
-                    "action": "status",
-                    "session_id": 999_999_u64
-                })
-                .to_string(),
-            })
-            .await
-            .expect("visible computer_use call should pass model visibility gate");
-
-        let error = match built.runtime.execute_tool_call(call).await {
-            Ok(_) => panic!("unknown computer_use session should not succeed"),
-            Err(error) => error,
-        };
-        assert!(matches!(error, crate::ToolError::NotFound(_)));
-    }
-
-    #[cfg(feature = "computer-use")]
-    #[tokio::test]
-    async fn request_tools_resolves_computer_use_domain_when_feature_enabled() {
-        let built = build_builtin_tools(
-            ".",
-            "turn_request_tools_computer_use_available",
-            test_permission_context("turn_request_tools_computer_use_available"),
-            test_web_config(),
-            test_computer_use_config(),
-        );
-
-        let call = built
-            .router
-            .build_model_tool_call(RawToolCall {
-                call_id: "call_request_tools_computer_use".to_owned(),
-                tool_name: REQUEST_TOOLS_TOOL_NAME.to_owned(),
-                arguments: serde_json::json!({
-                    "domains": ["computer_use"],
-                    "reason": "Need GUI control."
-                })
-                .to_string(),
-            })
-            .await
-            .expect("request_tools call should parse");
-
-        let result = built
-            .runtime
-            .execute_tool_call(call)
-            .await
-            .expect("request_tools should execute");
-        let output = serde_json::from_value::<crate::RequestToolsResult>(result.raw_output_json())
-            .expect("request_tools output should match compact result contract");
-
-        assert_eq!(
-            output.added.get("computer_use"),
-            Some(&vec!["computer_use".to_owned()])
-        );
-        assert!(output.unknown_or_unavailable.is_empty());
-    }
-
-    #[cfg(not(feature = "computer-use"))]
-    #[tokio::test]
-    async fn request_tools_reports_computer_use_unavailable_without_feature() {
-        let built = build_builtin_tools(
-            ".",
-            "turn_request_tools_computer_use_unavailable",
-            test_permission_context("turn_request_tools_computer_use_unavailable"),
-            test_web_config(),
-            test_computer_use_config(),
-        );
-
-        let call = built
-            .router
-            .build_model_tool_call(RawToolCall {
-                call_id: "call_request_tools_computer_use_unavailable".to_owned(),
-                tool_name: REQUEST_TOOLS_TOOL_NAME.to_owned(),
-                arguments: serde_json::json!({
-                    "domains": ["computer_use"],
-                    "reason": "Need GUI control."
-                })
-                .to_string(),
-            })
-            .await
-            .expect("request_tools call should parse");
-
-        let result = built
-            .runtime
-            .execute_tool_call(call)
-            .await
-            .expect("request_tools should execute");
-        let output = serde_json::from_value::<crate::RequestToolsResult>(result.raw_output_json())
-            .expect("request_tools output should match compact result contract");
-
-        assert!(output.added.is_empty());
-        assert_eq!(output.unknown_or_unavailable.len(), 1);
-        assert_eq!(output.unknown_or_unavailable[0].domain, "computer_use");
-        assert_eq!(
-            output.unknown_or_unavailable[0].tools,
-            vec!["computer_use".to_owned()]
         );
     }
 
@@ -2462,6 +2209,389 @@ mod tests {
             error,
             BuildToolsError::InvalidPermissionContext(_)
         ));
+    }
+    #[derive(Debug, Default)]
+    struct UnconfirmedCuaBackend {
+        failure: std::sync::atomic::AtomicUsize,
+        calls: std::sync::atomic::AtomicUsize,
+        releases: std::sync::atomic::AtomicUsize,
+        observations_delivered: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl crate::ComputerUseBackend for UnconfirmedCuaBackend {
+        async fn execute(
+            &self,
+            _owner: &str,
+            name: &str,
+            _arguments: serde_json::Value,
+            _cancellation: tokio_util::sync::CancellationToken,
+        ) -> Result<serde_json::Value, crate::ToolError> {
+            if name == "get_window_state" {
+                return Ok(
+                    serde_json::json!({"content":[{"type":"image","mimeType":"image/png","data":"AAECAw=="}],"structuredContent":{"fixture_observation":true},"isError":false}),
+                );
+            }
+            assert_eq!(name, "type_text");
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.failure.load(std::sync::atomic::Ordering::SeqCst) {
+                1 => return Err(crate::ToolError::execution_failed("mutation response lost")),
+                2 => return Err(crate::ToolError::cancelled("mutation response cancelled")),
+                _ => {}
+            }
+            // Transport fixture: no OS capability or successful GUI effect is claimed.
+            Ok(
+                serde_json::json!({"content":[{"type":"text","text":"input delivery unverified"},{"type":"image","mimeType":"image/png","data":"AAECAw=="}],"structuredContent":{"action":{"effect":"unverifiable"},"capture_origin":{"x":-8,"y":3}},"isError":false}),
+            )
+        }
+        fn observation_delivered(&self, _owner: &str, _context: &serde_json::Value) -> bool {
+            self.observations_delivered.fetch_add(1, Ordering::SeqCst);
+            true // Transport fixture only; no OS readiness claim.
+        }
+        fn release_owner(&self, _owner: &str) {
+            self.releases
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    #[derive(Debug, Default)]
+    struct ProxyImageSink {
+        block_next: AtomicBool,
+        reject: AtomicBool,
+        entered: Notify,
+        resume: Notify,
+    }
+    #[async_trait]
+    impl crate::handlers::computer_use::ComputerUseImageSink for ProxyImageSink {
+        async fn admit(
+            &self,
+            _owner: &str,
+            _call_id: &str,
+            _index: usize,
+            _bytes: Vec<u8>,
+            mime: &str,
+            _cancellation: tokio_util::sync::CancellationToken,
+        ) -> Result<pioneer_provider::MessageAttachment, crate::ToolError> {
+            if self.block_next.swap(false, Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.resume.notified().await;
+            }
+            if self.reject.load(Ordering::SeqCst) {
+                return Err(crate::ToolError::execution_failed(
+                    "artifact admission denied",
+                ));
+            }
+            let mut image = pioneer_provider::MessageAttachment::from_path(
+                "/artifacts/proxy-capture.png",
+                mime,
+            );
+            image.artifact = Some(pioneer_provider::AttachmentArtifactContext {
+                workspace_id: "workspace".into(),
+                artifact_id: "capture".into(),
+                artifact_version_id: Some("v1".into()),
+            });
+            Ok(image)
+        }
+    }
+    // The existing transport owner fixture exercises the real CUA handler,
+    // artifact admission and runtime publication; it claims no GUI/OS success.
+    #[tokio::test]
+    async fn cua_observation_delivery_guards_admission_and_publication() {
+        use std::future::Future;
+        use tokio_util::sync::CancellationToken;
+
+        fn fixture_tools(
+            root: &Path,
+            backend: Arc<UnconfirmedCuaBackend>,
+            sink: Arc<ProxyImageSink>,
+        ) -> BuiltinTools {
+            let image_admission =
+                crate::handlers::computer_use::ComputerUseImageAdmission::default();
+            image_admission.set(sink);
+            super::build_tools_with_environment_and_security_snapshot(
+                root,
+                "turn_delivery",
+                supervised_test_context("turn_delivery"),
+                test_web_config(),
+                ComputerUseToolsConfig {
+                    backend: Some(backend),
+                    image_admission,
+                    ..test_computer_use_config()
+                },
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+                Some(supervised_native_snapshot(root, None)),
+            )
+            .unwrap()
+            .with_permission_approval_broker(Arc::new(RecordingApprovalBroker {
+                actions: Arc::new(Mutex::new(Vec::new())),
+            }))
+        }
+        fn call(tools: &BuiltinTools, capture: bool) -> crate::ToolCall {
+            tools.router.build_tool_call(RawToolCall {
+                call_id: if capture { "observation" } else { "input" }.into(),
+                tool_name: if capture { "cua_get_window_state" } else { "cua_type_text" }.into(),
+                arguments: if capture {
+                    serde_json::json!({"pid":7,"window_id":9,"include_screenshot":true})
+                } else {
+                    serde_json::json!({"text":"private input","target":{"kind":"window","pid":7,"window_id":9}})
+                }.to_string(),
+            }).unwrap()
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(UnconfirmedCuaBackend::default());
+        let sink = Arc::new(ProxyImageSink::default());
+        sink.block_next.store(true, Ordering::SeqCst);
+        sink.reject.store(true, Ordering::SeqCst);
+        let tools = fixture_tools(root.path(), backend.clone(), sink.clone());
+        let mut observation = Box::pin(tools.runtime.execute_tool_call(call(&tools, true)));
+        tokio::select! {
+            _ = sink.entered.notified() => {},
+            _ = &mut observation => panic!("capture must wait for artifact admission"),
+        }
+        let mut input = Box::pin(tools.runtime.execute_tool_call(call(&tools, false)));
+        std::future::poll_fn(|cx| {
+            assert!(input.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.observations_delivered.load(Ordering::SeqCst), 0);
+        sink.resume.notify_one();
+        assert!(observation.await.is_err());
+        assert!(matches!(input.await, Err(crate::ToolError::Rejected(_))));
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert!(backend.releases.load(Ordering::SeqCst) > 0);
+
+        // Admission succeeded, but the real durable completion boundary can
+        // still reject, lose its acknowledgement, cancel, or lose its caller.
+        for fault in ["rejected", "ack_dropped", "cancelled", "caller_dropped"] {
+            let backend = Arc::new(UnconfirmedCuaBackend::default());
+            let tools = fixture_tools(
+                root.path(),
+                backend.clone(),
+                Arc::new(ProxyImageSink::default()),
+            );
+            let mut durable = tools.runtime.event_bus().take_durable_receiver().unwrap();
+            let cancellation = CancellationToken::new();
+            let mut observation = Box::pin(
+                tools
+                    .runtime
+                    .execute_tool_call_with_cancellation(call(&tools, true), cancellation.clone()),
+            );
+            let completion = loop {
+                tokio::select! {
+                    envelope = durable.recv() => {
+                        let envelope = envelope.unwrap();
+                        if envelope.event.kind() == crate::ToolEventKind::CallCompleted {
+                            break envelope;
+                        }
+                        envelope.acknowledge(Ok(()));
+                    },
+                    _ = &mut observation => panic!("observation must wait for durable completion"),
+                }
+            };
+            assert_eq!(backend.observations_delivered.load(Ordering::SeqCst), 0);
+            match fault {
+                "rejected" => {
+                    completion.acknowledge(Err("storage unavailable".into()));
+                    assert!(observation.await.is_err());
+                }
+                "ack_dropped" => {
+                    drop(completion);
+                    assert!(observation.await.is_err());
+                }
+                "cancelled" => {
+                    cancellation.cancel();
+                    completion.acknowledge(Ok(()));
+                    assert!(observation.await.is_err());
+                }
+                _ => {
+                    drop(observation);
+                    drop(completion);
+                }
+            }
+            assert_eq!(backend.observations_delivered.load(Ordering::SeqCst), 0);
+            assert!(backend.releases.load(Ordering::SeqCst) > 0);
+            let mut input = Box::pin(tools.runtime.execute_tool_call(call(&tools, false)));
+            let result = loop {
+                tokio::select! {
+                    envelope = durable.recv() => envelope.unwrap().acknowledge(Ok(())),
+                    result = &mut input => break result,
+                }
+            };
+            assert!(
+                matches!(result, Err(crate::ToolError::Rejected(_))),
+                "{fault}"
+            );
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 0, "{fault}");
+        }
+    }
+
+    #[tokio::test]
+    async fn two_skill_proxies_preserve_cua_permission_unknown_outcome_and_owner_cleanup() {
+        let fixture = tempfile::tempdir().unwrap();
+        let outer = "skill.SSSSSSSSSSSSSSSSSSSSS.outer_cua";
+        let inner = "skill.SSSSSSSSSSSSSSSSSSSSS.inner_cua";
+        let materialization = materialize_skill_runtime_tools(
+            &[
+                dynamic_skill_descriptor(
+                    outer,
+                    fixture.path(),
+                    SkillDynamicToolKind::FunctionProxy,
+                    serde_json::json!({"target_tool":inner}),
+                ),
+                dynamic_skill_descriptor(
+                    inner,
+                    fixture.path(),
+                    SkillDynamicToolKind::FunctionProxy,
+                    serde_json::json!({"target_tool":"cua_type_text"}),
+                ),
+                dynamic_skill_descriptor(
+                    "skill.SSSSSSSSSSSSSSSSSSSSS.unrelated",
+                    fixture.path(),
+                    SkillDynamicToolKind::FunctionProxy,
+                    serde_json::json!({"target_tool":"read_file"}),
+                ),
+            ],
+            None,
+            DynamicToolOutputPolicyCaps::default(),
+        );
+        let backend = Arc::new(UnconfirmedCuaBackend::default());
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let image_admission = crate::handlers::computer_use::ComputerUseImageAdmission::default();
+        image_admission.set(Arc::new(ProxyImageSink::default()));
+        let tools = super::build_tools_with_environment_and_security_snapshot(
+            fixture.path(),
+            "turn_proxy_cua",
+            supervised_test_context("turn_proxy_cua"),
+            test_web_config(),
+            ComputerUseToolsConfig {
+                backend: Some(backend.clone()),
+                image_admission,
+                ..test_computer_use_config()
+            },
+            materialization.bundles.clone(),
+            std::collections::BTreeMap::new(),
+            Some(supervised_native_snapshot(fixture.path(), None)),
+        )
+        .unwrap()
+        .with_permission_approval_broker(Arc::new(RecordingApprovalBroker {
+            actions: actions.clone(),
+        }));
+        materialization
+            .bind_function_proxy_runtime(tools.router.clone(), tools.runtime.clone())
+            .await;
+        async fn observe(tools: &super::BuiltinTools) {
+            let call = tools
+                .router
+                .build_tool_call(RawToolCall {
+                    call_id: "fresh_observation".into(),
+                    tool_name: "cua_get_window_state".into(),
+                    arguments: serde_json::json!({"pid":7,"window_id":9,"include_screenshot":true})
+                        .to_string(),
+                })
+                .unwrap();
+            tools
+                .runtime
+                .execute_tool_call(call)
+                .await
+                .expect("transport observation delivered");
+        }
+        observe(&tools).await;
+        actions.lock().unwrap().clear();
+        let call = tools.router.build_tool_call(RawToolCall { call_id:"proxy_cua".to_owned(), tool_name:outer.to_owned(), arguments:serde_json::json!({"arguments":{"text":"private input", "target":{"kind":"window","pid":7,"window_id":9}}}).to_string() }).unwrap();
+        let result = tools.runtime.execute_tool_call(call).await.unwrap();
+        assert_eq!(
+            result.outcome.status,
+            crate::ToolOutcomeStatus::PartialSuccess
+        );
+        assert!(!result.outcome.should_retry);
+        assert!(result.outcome.incomplete);
+        let message = result.to_model_input_item().into_chat_message();
+        assert_eq!(message.tool_call_id.as_deref(), Some("proxy_cua"));
+        assert_eq!(message.name.as_deref(), Some(outer));
+        assert!(message.content_parts.iter().any(|part| matches!(part,
+            pioneer_provider::MessageContentPart::Image { image }
+            if image.artifact.as_ref().is_some_and(|artifact| artifact.artifact_version_id.as_deref() == Some("v1")))));
+        assert!(message.content_parts.iter().any(|part| matches!(part,
+            pioneer_provider::MessageContentPart::Text { text } if text.contains("capture_origin"))));
+        let technical = serde_json::to_string(&result.projection().unwrap().storage).unwrap();
+        assert!(!technical.contains("capture_origin"));
+        assert!(!technical.contains("private input"));
+        assert_eq!(
+            *actions.lock().unwrap(),
+            vec![PermissionActionKind::ComputerUse]
+        );
+        assert_eq!(backend.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Real backend Err must retain no-replay through both configured depths,
+        // including the classifier used by the agent's model/history boundary.
+        for failure in [1, 2] {
+            backend
+                .failure
+                .store(failure, std::sync::atomic::Ordering::SeqCst);
+            for name in [inner, outer] {
+                observe(&tools).await;
+                let call = tools.router.build_tool_call(RawToolCall {
+                    call_id: format!("proxy_err_{failure}_{name}"),
+                    tool_name: name.to_owned(),
+                    arguments: serde_json::json!({"arguments":{"text":"private input", "target":{"kind":"window","pid":7,"window_id":9}}}).to_string(),
+                }).unwrap();
+                assert_eq!(call.recovery.retry_class, crate::ToolRetryClass::Never);
+                let mut events = tools.runtime.event_bus().subscribe();
+                let error = tools
+                    .runtime
+                    .execute_tool_call(call)
+                    .await
+                    .err()
+                    .expect("backend Err");
+                assert!(matches!(
+                    error,
+                    crate::ToolError::ExecutionFailed(_) | crate::ToolError::Cancelled(_)
+                ));
+                let outcome = tools.router.classify_tool_error(name, &error);
+                assert!(!outcome.should_retry);
+                assert_eq!(outcome.status, crate::ToolOutcomeStatus::FatalError);
+                let mut failed = 0;
+                while let Ok(event) = events.try_recv() {
+                    if let crate::ToolEventPayload::CallFailed(event) = event.payload {
+                        failed += 1;
+                        assert!(!event.outcome.should_retry);
+                        assert_eq!(event.outcome.status, crate::ToolOutcomeStatus::FatalError);
+                    }
+                }
+                assert_eq!(failed, if name == inner { 2 } else { 3 });
+            }
+        }
+        assert_eq!(backend.calls.load(std::sync::atomic::Ordering::SeqCst), 5);
+        let unrelated = tools.router.classify_tool_error(
+            "skill.SSSSSSSSSSSSSSSSSSSSS.unrelated",
+            &crate::ToolError::execution_failed("mutation response lost"),
+        );
+        assert!(unrelated.should_retry);
+        let unrelated_call = tools
+            .router
+            .build_tool_call(RawToolCall {
+                call_id: "unrelated_control".into(),
+                tool_name: "skill.SSSSSSSSSSSSSSSSSSSSS.unrelated".into(),
+                arguments: "{}".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            unrelated_call.recovery,
+            tools
+                .router
+                .find_spec(&unrelated_call.tool_name)
+                .unwrap()
+                .spec
+                .recovery
+        );
+        let releases = backend.releases.load(std::sync::atomic::Ordering::SeqCst);
+        materialization.clear_function_proxy_runtime().await;
+        drop(tools);
+        assert_eq!(
+            backend.releases.load(std::sync::atomic::Ordering::SeqCst),
+            releases + 1
+        );
     }
 }
 

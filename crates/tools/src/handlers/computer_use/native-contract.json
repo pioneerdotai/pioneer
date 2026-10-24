@@ -1,0 +1,896 @@
+{
+  "revision": "688c5fd62a9f13dddc309970c948df494e7de33f",
+  "tools": [
+    {
+      "name": "click",
+      "description": "Click coordinates or a snapshot-bound element with an explicit target and delivery mode.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "button": {
+            "enum": [
+              "left",
+              "right",
+              "middle"
+            ],
+            "type": "string"
+          },
+          "capture_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "count": {
+            "maximum": 3,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "delivery_mode": {
+            "enum": [
+              "background",
+              "foreground"
+            ],
+            "type": "string"
+          },
+          "element_token": {
+            "pattern": "^s[0-9a-f]{8}:[0-9]+$",
+            "type": "string"
+          },
+          "session": {
+            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "type": "string"
+          },
+          "target": {
+            "additionalProperties": true,
+            "description": "Exact window (kind \"window\", with pid and window_id) or desktop (kind \"desktop\", with display_id). \"primary\" is the portable desktop target.",
+            "properties": {
+              "display_id": {
+                "description": "Display id. Required when kind is desktop; use \"primary\".",
+                "type": "string"
+              },
+              "kind": {
+                "description": "window requires pid and window_id; desktop requires display_id.",
+                "enum": [
+                  "window",
+                  "desktop"
+                ],
+                "type": "string"
+              },
+              "pid": {
+                "description": "Process id. Required when kind is window.",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "window_id": {
+                "description": "Window id from list_windows. Required when kind is window.",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          "x": {
+            "type": "number"
+          },
+          "y": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "target",
+          "delivery_mode"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "clipboard_read",
+      "description": "List available system clipboard types and optionally return privacy-sensitive plain text. Clipboard content is never retained in telemetry.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "include_text": {
+            "default": false,
+            "description": "Return plain-text clipboard content in addition to the available types.\nClipboard content is privacy-sensitive and is never retained in telemetry.",
+            "type": "boolean"
+          },
+          "session": {
+            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      }
+    },
+    {
+      "name": "clipboard_write",
+      "description": "Replace the system clipboard with exactly one value: plain text, an image from an absolute local path, or a file URL from an absolute local path. Returns the available types for read-back before paste.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "file_path": {
+            "description": "Absolute path to a local file to place on the clipboard as a file URL.",
+            "type": "string"
+          },
+          "image_path": {
+            "description": "Absolute path to a local image to place on the clipboard.",
+            "type": "string"
+          },
+          "session": {
+            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "type": "string"
+          },
+          "text": {
+            "description": "Plain text to place on the clipboard.",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      }
+    },
+    {
+      "name": "drag",
+      "description": "Drag between two absolute points in get_desktop_state coordinates.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "button": {
+            "enum": [
+              "left",
+              "right",
+              "middle"
+            ],
+            "type": "string"
+          },
+          "duration_ms": {
+            "maximum": 10000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "from_x": {
+            "type": "number"
+          },
+          "from_y": {
+            "type": "number"
+          },
+          "modifier": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "scope": {
+            "description": "Deprecated flat desktop target retained for wire compatibility.",
+            "enum": [
+              "desktop"
+            ],
+            "type": "string"
+          },
+          "session": {
+            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "type": "string"
+          },
+          "steps": {
+            "maximum": 200,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "target": {
+            "additionalProperties": true,
+            "description": "Preferred per-call target: an exact window (`kind=\"window\"`, `pid`, `window_id`) or the\nprimary desktop (`kind=\"desktop\"`, `display_id=\"primary\"`).",
+            "properties": {
+              "display_id": {
+                "description": "Display id. Required when kind is desktop; use \"primary\".",
+                "type": "string"
+              },
+              "kind": {
+                "description": "window requires pid and window_id; desktop requires display_id.",
+                "enum": [
+                  "window",
+                  "desktop"
+                ],
+                "type": "string"
+              },
+              "pid": {
+                "description": "Process id. Required when kind is window.",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "window_id": {
+                "description": "Window id from list_windows. Required when kind is window.",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          "to_x": {
+            "type": "number"
+          },
+          "to_y": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "from_x",
+          "from_y",
+          "to_x",
+          "to_y"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_cursor_position",
+      "description": "Return the OS cursor position when the platform can observe it.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "session": {
+            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_desktop_state",
+      "description": "Capture the complete primary display at native resolution for a desktop-scope GUI loop.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_image_dimension": {
+            "description": "Optional long-edge cap for the returned PNG, in pixels. Omitted or 0\nreturns the full-size capture. When the cap downsizes the image,\ndesktop-scope x/y taken from it are mapped back automatically.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "screenshot_out_file": {
+            "description": "Write the PNG here instead of returning base64.",
+            "type": "string"
+          },
+          "session": {
+            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_screen_size",
+      "description": "Return the primary display dimensions and scale factor in the platform's desktop coordinate space.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "session": {
+            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_window_state",
+      "description": "Observe an exact native window with snapshot-bound elements and optional screenshots.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "full_output": {
+            "description": "Restore the previous full response (both representations, all\nmetadata, platform walk limits).",
+            "type": "boolean"
+          },
+          "include_accessibility_tree": {
+            "type": "boolean"
+          },
+          "include_screenshot": {
+            "type": "boolean"
+          },
+          "max_depth": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_dimension": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_elements": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_image_dimension": {
+            "description": "Optional per-call long-edge ceiling. Zero requests native resolution;\nomit it to preserve the configured session or global behavior.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pid": {
+            "maximum": 4294967295,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "query": {
+            "type": "string"
+          },
+          "screenshot_out_file": {
+            "type": "string"
+          },
+          "session": {
+            "type": "string"
+          },
+          "since": {
+            "description": "Return only what changed since this earlier `snapshot_id`.",
+            "type": "string"
+          },
+          "timeout_ms": {
+            "description": "Wall-clock budget for the accessibility walk in milliseconds\n(default 1000 on every platform). A walk that runs out returns a\npartial tree flagged `truncated` rather than failing.",
+            "maximum": 120000,
+            "minimum": 100,
+            "type": "integer"
+          },
+          "tree_format": {
+            "description": "Tree representation to return: `markdown` (default), `elements`, or\n`both`.",
+            "enum": [
+              "markdown",
+              "elements",
+              "both"
+            ],
+            "type": "string"
+          },
+          "verbose": {
+            "description": "Include `_note` and the full `background_input` report.",
+            "type": "boolean"
+          },
+          "window_id": {
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pid",
+          "window_id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "hotkey",
+      "description": "Press a key chord in the foreground desktop application.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "keys": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 2,
+            "type": "array"
+          },
+          "scope": {
+            "description": "Deprecated flat desktop target retained for wire compatibility.",
+            "enum": [
+              "desktop"
+            ],
+            "type": "string"
+          },
+          "session": {
+            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "type": "string"
+          },
+          "target": {
+            "additionalProperties": true,
+            "description": "Preferred per-call target: an exact window (`kind=\"window\"`, `pid`, `window_id`) or the\nprimary desktop (`kind=\"desktop\"`, `display_id=\"primary\"`).",
+            "properties": {
+              "display_id": {
+                "description": "Display id. Required when kind is desktop; use \"primary\".",
+                "type": "string"
+              },
+              "kind": {
+                "description": "window requires pid and window_id; desktop requires display_id.",
+                "enum": [
+                  "window",
+                  "desktop"
+                ],
+                "type": "string"
+              },
+              "pid": {
+                "description": "Process id. Required when kind is window.",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "window_id": {
+                "description": "Window id from list_windows. Required when kind is window.",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "keys"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "invoke_menu",
+      "description": "Resolve an exact application-menu path one live native level at a time and invoke its final item through accessibility APIs. Missing, ambiguous, disabled, or structurally mismatched segments fail closed; this tool never falls back to pixels.",
+      "input_schema": {
+        "additionalProperties": false,
+        "description": "Exact, immediate-child application menu path to resolve and invoke through\nthe operating system's accessibility API. Path labels are matched after\ntrimming surrounding whitespace and otherwise remain case-sensitive. On\nmacOS, three periods in a label also match the ellipsis character that\nnative menu titles use (`Save As...` finds `Save As\u2026`).",
+        "properties": {
+          "path": {
+            "description": "Menu labels from the top-level menu to the item, e.g. `[\"File\", \"Save As...\"]`\n(1 to 16 labels).",
+            "items": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "type": "array"
+          },
+          "pid": {
+            "description": "Process ID of the application that owns the menu.",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "session": {
+            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "type": "string"
+          },
+          "window_id": {
+            "description": "Window ID from list_windows whose menu is invoked.",
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pid",
+          "window_id",
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_apps",
+      "description": "Discover installed and running native applications.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {},
+        "required": [],
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_windows",
+      "description": "Discover exact native windows and observable bounds and stacking order.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "on_screen_only": {
+            "type": "boolean"
+          },
+          "pid": {
+            "maximum": 4294967295,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      }
+    },
+    {
+      "name": "press_key",
+      "description": "Press one key, with optional modifiers, in the foreground desktop application.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "modifiers": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "scope": {
+            "description": "Deprecated flat desktop target retained for wire compatibility.",
+            "enum": [
+              "desktop"
+            ],
+            "type": "string"
+          },
+          "session": {
+            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "type": "string"
+          },
+          "target": {
+            "additionalProperties": true,
+            "description": "Preferred per-call target: an exact window (`kind=\"window\"`, `pid`, `window_id`) or the\nprimary desktop (`kind=\"desktop\"`, `display_id=\"primary\"`).",
+            "properties": {
+              "display_id": {
+                "description": "Display id. Required when kind is desktop; use \"primary\".",
+                "type": "string"
+              },
+              "kind": {
+                "description": "window requires pid and window_id; desktop requires display_id.",
+                "enum": [
+                  "window",
+                  "desktop"
+                ],
+                "type": "string"
+              },
+              "pid": {
+                "description": "Process id. Required when kind is window.",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "window_id": {
+                "description": "Window id from list_windows. Required when kind is window.",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "scroll",
+      "description": "Scroll at an absolute point in get_desktop_state coordinates.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "amount": {
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "by": {
+            "enum": [
+              "line",
+              "page"
+            ],
+            "type": "string"
+          },
+          "direction": {
+            "enum": [
+              "up",
+              "down",
+              "left",
+              "right"
+            ],
+            "type": "string"
+          },
+          "scope": {
+            "description": "Deprecated flat desktop target retained for wire compatibility.",
+            "enum": [
+              "desktop"
+            ],
+            "type": "string"
+          },
+          "session": {
+            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "type": "string"
+          },
+          "target": {
+            "additionalProperties": true,
+            "description": "Preferred per-call target: an exact window (`kind=\"window\"`, `pid`, `window_id`) or the\nprimary desktop (`kind=\"desktop\"`, `display_id=\"primary\"`).",
+            "properties": {
+              "display_id": {
+                "description": "Display id. Required when kind is desktop; use \"primary\".",
+                "type": "string"
+              },
+              "kind": {
+                "description": "window requires pid and window_id; desktop requires display_id.",
+                "enum": [
+                  "window",
+                  "desktop"
+                ],
+                "type": "string"
+              },
+              "pid": {
+                "description": "Process id. Required when kind is window.",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "window_id": {
+                "description": "Window id from list_windows. Required when kind is window.",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          "x": {
+            "type": "number"
+          },
+          "y": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "x",
+          "y",
+          "direction"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "set_window_frame",
+      "description": "Set one exact top-level window's frame in the desktop-coordinate space reported by list_windows and verify the resulting geometry through an independent readback.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "height": {
+            "description": "New height, in the same units as list_windows bounds.",
+            "minimum": 1,
+            "type": "number"
+          },
+          "pid": {
+            "description": "Process ID that owns the window.",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "session": {
+            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "type": "string"
+          },
+          "width": {
+            "description": "New width, in the same units as list_windows bounds.",
+            "minimum": 1,
+            "type": "number"
+          },
+          "window_id": {
+            "description": "Window ID from list_windows.",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "x": {
+            "description": "New left edge in the desktop coordinate space reported by list_windows.",
+            "type": "number"
+          },
+          "y": {
+            "description": "New top edge in the desktop coordinate space reported by list_windows.",
+            "type": "number"
+          }
+        },
+        "required": [
+          "pid",
+          "window_id",
+          "x",
+          "y",
+          "width",
+          "height"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "type_text",
+      "description": "Type text into the current foreground desktop application.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "scope": {
+            "description": "Deprecated flat desktop target retained for wire compatibility.",
+            "enum": [
+              "desktop"
+            ],
+            "type": "string"
+          },
+          "session": {
+            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "type": "string"
+          },
+          "target": {
+            "additionalProperties": true,
+            "description": "Preferred per-call target: an exact window (`kind=\"window\"`, `pid`, `window_id`) or the\nprimary desktop (`kind=\"desktop\"`, `display_id=\"primary\"`).",
+            "properties": {
+              "display_id": {
+                "description": "Display id. Required when kind is desktop; use \"primary\".",
+                "type": "string"
+              },
+              "kind": {
+                "description": "window requires pid and window_id; desktop requires display_id.",
+                "enum": [
+                  "window",
+                  "desktop"
+                ],
+                "type": "string"
+              },
+              "pid": {
+                "description": "Process id. Required when kind is window.",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "window_id": {
+                "description": "Window id from list_windows. Required when kind is window.",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "verify_state",
+      "description": "Deterministically verify bounded predicates against one exact window. The driver evaluates structured window/accessibility state and may return the final screenshot as uninterpreted visual evidence for a multimodal caller. Predicate results are satisfied, unsatisfied, or unknown; unknown never implies success. Accessibility projections are conservative: absence remains unknown unless the observed search domain is proven exhaustive.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "expect": {
+            "description": "One to eight predicates, combined with logical AND.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "element": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean"
+                    },
+                    "exists": {
+                      "description": "Assert that at least one trusted element matches the selector.\n\nElement walks are not yet exhaustive on every platform, so absence\ncannot be proven. `false` is rejected instead of returning an\nindefinitely-unknown predicate.",
+                      "type": "boolean"
+                    },
+                    "selected": {
+                      "type": "boolean"
+                    },
+                    "selector": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "label_contains": {
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "role": {
+                          "minLength": 1,
+                          "type": "string"
+                        }
+                      },
+                      "required": [],
+                      "type": "object"
+                    },
+                    "value_equals": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "selector"
+                  ],
+                  "type": "object"
+                },
+                "window": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "bounds": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "height": {
+                          "type": "number"
+                        },
+                        "tolerance_px": {
+                          "maximum": 100,
+                          "minimum": 0,
+                          "type": "number"
+                        },
+                        "width": {
+                          "type": "number"
+                        },
+                        "x": {
+                          "type": "number"
+                        },
+                        "y": {
+                          "type": "number"
+                        }
+                      },
+                      "required": [
+                        "x",
+                        "y",
+                        "width",
+                        "height"
+                      ],
+                      "type": "object"
+                    },
+                    "exists": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [],
+                  "type": "object"
+                }
+              },
+              "required": [],
+              "type": "object"
+            },
+            "maxItems": 8,
+            "minItems": 1,
+            "type": "array"
+          },
+          "include_screenshot": {
+            "description": "Return the final window screenshot as image content for a multimodal\ncaller. The driver does not interpret that image.",
+            "type": "boolean"
+          },
+          "pid": {
+            "description": "Exact process whose window may be observed.",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "session": {
+            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session. This\nfield never selects capture modality or authorization.",
+            "type": "string"
+          },
+          "stable_samples": {
+            "default": 2,
+            "description": "Consecutive satisfied samples required before returning success.",
+            "maximum": 5,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "timeout_ms": {
+            "default": 5000,
+            "description": "Bounded wait. Zero performs one sample.",
+            "maximum": 10000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "window_id": {
+            "description": "Exact native window identifier.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pid",
+          "window_id",
+          "expect"
+        ],
+        "type": "object"
+      }
+    }
+  ],
+  "license": "MIT",
+  "source": "libs/cua-driver/contract/manifest.json"
+}

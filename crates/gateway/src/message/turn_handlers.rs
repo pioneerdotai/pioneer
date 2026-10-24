@@ -3917,6 +3917,44 @@ impl MessageProcessor {
         };
         let permission = pioneer_protocol::task_permission_cap_snapshot(permission_cap);
 
+        // Freeze the same passive CUA catalog that native/provider tools use.
+        // Runtime ComputerUse approval still evaluates every complete call.
+        if permission.effective_policy.computer_use != pioneer_protocol::PermissionBehavior::Deny {
+            let allowed = match authority {
+                TurnExecutionAuthority::Fresh(admission) => {
+                    admission
+                        .project_root_action(
+                            self.crud_store.as_ref(),
+                            crate::authorization::ResourceAction::McpUse,
+                        )
+                        .await?
+                }
+                TurnExecutionAuthority::Durable { context, .. } => {
+                    context.grants_action(crate::authorization::ResourceAction::McpUse)
+                }
+            };
+            if allowed {
+                definitions.extend(
+                    NativeToolFamily::ComputerUse
+                        .definitions()
+                        .into_iter()
+                        .filter(|spec| {
+                            (!(permission.effective_policy.allowed_tools_restricted
+                                || !permission.effective_policy.allowed_tools.is_empty())
+                                || permission
+                                    .effective_policy
+                                    .allowed_tools
+                                    .contains(&spec.spec.name))
+                                && !permission
+                                    .effective_policy
+                                    .denied_tools
+                                    .contains(&spec.spec.name)
+                        })
+                        .map(|spec| (NativeToolFamily::ComputerUse, spec)),
+                );
+            }
+        }
+
         for (family, spec) in [NativeToolFamily::Tasks, NativeToolFamily::Threads]
             .into_iter()
             .flat_map(|family| {

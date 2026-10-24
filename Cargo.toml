@@ -159,8 +159,6 @@ nono = { git = "https://github.com/nolabs-ai/nono", tag = "v0.66.0", default-fea
 scraper = "0.27"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chrono-tz = "0.10"
-xcap = "0.9"
-xa11y = "0.15"
 tempfile = "3"
 fs4 = "1.1"
 lazy_static = "1.5"

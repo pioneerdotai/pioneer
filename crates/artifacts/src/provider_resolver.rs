@@ -47,7 +47,11 @@ impl ArtifactService {
                 .metadata
                 .get("htmlTool")
                 .is_some_and(|meta| meta["version"] == 1 && meta["publication"] == false);
-        let original = if temporary_preview {
+        // CUA canonical history retains the admitted immutable original, never
+        // a readable copy whose independent TTL can expire during replay.
+        let cua_capture = summary.created_by_kind == pioneer_protocol::ArtifactCreatedByKind::Tool
+            && summary.created_by_actor_id.as_deref() == Some("cua_capture");
+        let original = if temporary_preview || cua_capture {
             self.blob_store
                 .local_blob_path(workspace_id, &blob.storage_key)?
         } else {

@@ -75,6 +75,7 @@ pub(crate) struct McpService {
 }
 
 pub(crate) struct McpServiceInner {
+    cua_turn_tools: std::sync::Mutex<HashMap<String, Arc<pioneer_tools::BuiltinTools>>>,
     pub(crate) native_tool_processor: RwLock<std::sync::Weak<crate::message::MessageProcessor>>,
     pub(crate) crud_store: Arc<CrudStore>,
     authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
@@ -394,6 +395,7 @@ impl McpService {
             )
             .expect("OAuth HTTP client");
             McpServiceInner {
+                cua_turn_tools: std::sync::Mutex::new(HashMap::new()),
                 native_tool_processor: RwLock::new(std::sync::Weak::new()),
                 oauth: oauth.clone(),
                 oauth_events: std::sync::Mutex::new(None),
@@ -587,7 +589,28 @@ impl McpService {
     }
 
     pub(crate) fn cancel_turn_mcp_invocations(&self, turn_id: &str) -> usize {
-        self.cancel_active_mcp_invocations(|invocation| invocation.turn_id == turn_id)
+        // Turn lifecycle, never client connection lifecycle, owns CUA sessions.
+        // Serialize cancellation with CUA cache admission: a registered waiter
+        // either inserts before this cleanup or observes cancellation under the
+        // same lock. No finished-turn tombstones are retained.
+        let cancelled = {
+            let mut cache = self.inner.cua_turn_tools.lock().unwrap();
+            let cancelled =
+                self.cancel_active_mcp_invocations(|invocation| invocation.turn_id == turn_id);
+            cache.remove(turn_id);
+            cancelled
+        };
+        if let Some(processor) = self
+            .inner
+            .native_tool_processor
+            .read()
+            .expect("native processor lock")
+            .upgrade()
+            && let Some(backend) = processor.computer_use_config().backend
+        {
+            backend.release_owner(turn_id);
+        }
+        cancelled
     }
 
     fn cancel_installation_mcp_invocations(&self, installation_id: &str) -> usize {
@@ -685,6 +708,7 @@ impl McpService {
             worker.abort();
         }
         self.cancel_all_mcp_invocations();
+        self.inner.cua_turn_tools.lock().unwrap().clear();
         let installation_ids = self
             .inner
             .tasks
@@ -3028,6 +3052,26 @@ impl TurnMcpValidatedExecution for McpService {
             cancellation.clone(),
         );
         let result = async {
+            // Validation may have waited before active registration. Re-read
+            // authoritative CUA turn liveness after registration, so terminal
+            // cleanup either cancels this token or is already visible here.
+            if crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(
+                &validated.binding.server_installation_id,
+            ) == Some(crate::turn_mcp::native_tools::NativeToolFamily::ComputerUse)
+            {
+                let live = self.inner.crud_store.get_turn(
+                    &validated.invocation.thread_id, &validated.invocation.turn_id,
+                ).await.map_err(|_| TurnMcpInvocationError::new(
+                    TurnMcpInvocationErrorCode::Internal, "cannot revalidate computer-use turn liveness",
+                ))?;
+                if !live.is_some_and(|(workspace, turn)| workspace == validated.invocation.workspace_id
+                    && turn.status == pioneer_protocol::TurnStatus::InProgress)
+                {
+                    return Err(TurnMcpInvocationError::new(
+                        TurnMcpInvocationErrorCode::TurnNotActive, "computer-use turn is no longer active",
+                    ));
+                }
+            }
             let security = self
                 .inner
                 .crud_store
@@ -3054,6 +3098,19 @@ impl TurnMcpValidatedExecution for McpService {
                 return self
                     .execute_first_party_file_tool(&validated, &security, cancellation.clone())
                     .await;
+            }
+            if crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(&validated.binding.server_installation_id)
+                == Some(crate::turn_mcp::native_tools::NativeToolFamily::ComputerUse) {
+                return match self.execute_cua_tool(&validated, &security.snapshot, cancellation.clone()).await {
+                    Ok(result) => Ok(result),
+                    Err(error) => Ok(CanonicalMcpToolResult {
+                        content: json!([{"type":"text","text":format!("{}. Do not replay the operation; obtain a fresh observation before any new action.", bounded_invocation_diagnostic(&error.message))}]),
+                        structured_content: None,
+                        is_error: true,
+                        duration_ms: 0,
+                        meta: Some(json!({"pioneer":{"reasonCode":error.reason_code(),"outcome":"unknown","noReplay":true,"retryable":false}})),
+                    }),
+                };
             }
             let native_family = crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(
                 &validated.binding.server_installation_id,
@@ -3215,7 +3272,248 @@ impl TurnMcpValidatedExecution for McpService {
     }
 }
 
+// A result that fails CLI artifact/framing preparation must revoke its private
+// turn session just like a dropped backend waiter. Client lifetime does not own
+// the daemon; this guard only covers an individual undelivered invocation.
+pub(crate) struct CuaCliDeliveryGuard {
+    backend: Option<Arc<dyn pioneer_tools::ComputerUseBackend>>,
+    owner: String,
+    delivered: bool,
+    receipt: Option<Arc<dyn pioneer_tools::ToolDeliveryReceipt>>,
+}
+
+impl CuaCliDeliveryGuard {
+    pub(crate) fn new(
+        backend: Option<Arc<dyn pioneer_tools::ComputerUseBackend>>,
+        owner: String,
+    ) -> Self {
+        Self {
+            backend,
+            owner,
+            delivered: false,
+            receipt: None,
+        }
+    }
+
+    pub(crate) fn hold_receipt(
+        &mut self,
+        receipt: Option<Arc<dyn pioneer_tools::ToolDeliveryReceipt>>,
+    ) {
+        self.receipt = receipt;
+    }
+
+    pub(crate) fn commit(&mut self) {
+        if let Some(receipt) = &self.receipt {
+            receipt.commit();
+        }
+        self.delivered = true;
+    }
+}
+
+impl Drop for CuaCliDeliveryGuard {
+    fn drop(&mut self) {
+        if !self.delivered
+            && let Some(backend) = &self.backend
+        {
+            backend.release_owner(&self.owner);
+        }
+    }
+}
+
 impl McpService {
+    fn admit_cua_turn_tools(
+        &self,
+        turn_id: &str,
+        cancellation: &tokio_util::sync::CancellationToken,
+        materialize: impl FnOnce() -> Result<Arc<pioneer_tools::BuiltinTools>, TurnMcpInvocationError>,
+    ) -> Result<Arc<pioneer_tools::BuiltinTools>, TurnMcpInvocationError> {
+        let mut cache = self.inner.cua_turn_tools.lock().unwrap();
+        if cancellation.is_cancelled() || self.inner.stopping.load(Ordering::Acquire) {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::Cancelled,
+                "computer-use turn was cancelled before cache admission",
+            ));
+        }
+        if let Some(tools) = cache.get(turn_id) {
+            return Ok(tools.clone());
+        }
+        if cache.len() >= 32 {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::ResourceExhausted,
+                "Gateway computer-use turn admission is full",
+            ));
+        }
+        let tools = materialize()?;
+        cache.insert(turn_id.to_owned(), tools.clone());
+        Ok(tools)
+    }
+
+    async fn execute_cua_tool(
+        &self,
+        validated: &ValidatedTurnMcpInvocation,
+        security: &pioneer_protocol::TurnExecutionSecuritySnapshot,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<CanonicalMcpToolResult, TurnMcpInvocationError> {
+        use base64::Engine;
+        let processor = self
+            .inner
+            .native_tool_processor
+            .read()
+            .expect("native processor lock")
+            .upgrade()
+            .ok_or_else(|| {
+                TurnMcpInvocationError::new(
+                    TurnMcpInvocationErrorCode::RuntimeNotLive,
+                    "Gateway computer-use runtime is unavailable",
+                )
+            })?;
+        let broker = self.inner.permission_approval_broker.read().await.clone();
+        let tools =
+            self.admit_cua_turn_tools(&validated.invocation.turn_id, &cancellation, || {
+                let tools = pioneer_tools::build_tools_with_environment_and_security_snapshot(
+                    std::path::PathBuf::from(&security.sandbox.cwd),
+                    validated.invocation.turn_id.clone(),
+                    pioneer_tools::PermissionEvaluationContext::for_turn(
+                        validated.invocation.workspace_id.clone(),
+                        validated.invocation.thread_id.clone(),
+                        validated.invocation.turn_id.clone(),
+                        security.permission_profile.clone(),
+                    ),
+                    pioneer_tools::WebToolsConfig::default(),
+                    processor.computer_use_config(),
+                    Vec::new(),
+                    std::collections::BTreeMap::new(),
+                    Some(security.clone()),
+                )
+                .map_err(|_| {
+                    TurnMcpInvocationError::new(
+                        TurnMcpInvocationErrorCode::Internal,
+                        "cannot materialize Gateway computer-use tools",
+                    )
+                })?
+                .with_permission_approval_broker(broker);
+                let tools = Arc::new(tools);
+                Ok(tools)
+            })?;
+        let mut delivery = CuaCliDeliveryGuard::new(
+            processor.computer_use_config().backend,
+            validated.invocation.turn_id.clone(),
+        );
+        // The binding was verified against the immutable native catalog by the
+        // shared TurnMcpInvoker. Never dispatch external CUA-looking names here.
+        let call = tools
+            .router
+            .build_tool_call(pioneer_tools::RawToolCall {
+                call_id: validated.invocation.provider_call_id.clone(),
+                tool_name: validated.binding.raw_tool_name.clone(),
+                arguments: validated.invocation.arguments.to_string(),
+            })
+            .map_err(map_shared_tool_error)?;
+        let started = std::time::Instant::now();
+        let result = tools
+            .runtime
+            .execute_tool_call_with_deferred_delivery(call, cancellation.clone())
+            .await
+            .map_err(map_shared_tool_error)?;
+        delivery.hold_receipt(result.output.delivery_receipt());
+        let projection = result.projection().ok_or_else(|| {
+            TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::Internal,
+                "CUA result projection is unavailable",
+            )
+        })?;
+        let payload = projection.llm_payload();
+        let mut content = vec![json!({"type":"text", "text":payload.to_string()})];
+        let media_policy = pioneer_provider::default_attachment_pipeline_config();
+        let mut remaining = media_policy.max_total_bytes_per_request;
+        let parts = result.output.model_content_parts();
+        if parts
+            .iter()
+            .filter(|part| matches!(part, pioneer_provider::MessageContentPart::Image { .. }))
+            .count()
+            > media_policy.max_attachments_per_request
+        {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::ResourceExhausted,
+                "CUA image count exceeds the delivery budget; do not replay the action",
+            ));
+        }
+        for part in parts {
+            if let pioneer_provider::MessageContentPart::Text { text } = &part {
+                content.push(json!({"type":"text", "text":text}));
+            }
+            let pioneer_provider::MessageContentPart::Image { image } = part else {
+                continue;
+            };
+            let maximum = remaining.min(media_policy.max_bytes_per_attachment);
+            let bytes = if let Some(artifact) = &image.artifact {
+                if artifact.workspace_id != validated.invocation.workspace_id {
+                    return Err(TurnMcpInvocationError::new(
+                        TurnMcpInvocationErrorCode::ScopeMismatch,
+                        "CUA media belongs to another workspace",
+                    ));
+                }
+                let read = processor.artifact_service.read_bounded_artifact(
+                    pioneer_artifacts::ArtifactBoundedReadRequest {
+                        workspace_id: artifact.workspace_id.clone(),
+                        artifact_id: artifact.artifact_id.clone(),
+                        version_id: artifact.artifact_version_id.clone(),
+                        projection_kind: None,
+                        offset: None,
+                        max_bytes: Some(maximum as u64),
+                    },
+                    maximum as u64,
+                );
+                let read = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Err(TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::Cancelled, "CUA image delivery cancelled; do not replay the action")),
+                    read = read => read,
+                }.map_err(|_| TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::ResultInvalid, "CUA artifact read failed; do not replay the action"))?;
+                if read.truncated {
+                    return Err(TurnMcpInvocationError::new(
+                        TurnMcpInvocationErrorCode::ResourceExhausted,
+                        "CUA image exceeds the delivery budget; do not replay the action",
+                    ));
+                }
+                read.bytes
+            } else {
+                // Native CUA images must have crossed authorized artifact
+                // admission; a raw external JSON/base64 field grants no trust.
+                return Err(TurnMcpInvocationError::new(
+                    TurnMcpInvocationErrorCode::ResultInvalid,
+                    "CUA image has no admitted artifact identity",
+                ));
+            };
+            remaining = remaining.checked_sub(bytes.len()).ok_or_else(|| {
+                TurnMcpInvocationError::new(
+                    TurnMcpInvocationErrorCode::ResourceExhausted,
+                    "CUA image delivery budget exhausted",
+                )
+            })?;
+            content.push(json!({"type":"image", "mimeType":image.mime_type, "data":base64::engine::general_purpose::STANDARD.encode(bytes)}));
+        }
+        let result = CanonicalMcpToolResult {
+            content: JsonValue::Array(content),
+            structured_content: Some(payload),
+            is_error: !result.success(),
+            duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            meta: None,
+        };
+        if cancellation.is_cancelled() {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::Cancelled,
+                "CUA delivery cancelled; its session was revoked",
+            ));
+        }
+        // The facade owns the final encoded frame boundary. Moving the typed
+        // guard there preserves revocation on oversize, cancellation or drop.
+        match crate::cli_runtime::mcp::facade::defer_cua_delivery(delivery) {
+            Ok(()) => {}
+            Err(mut direct_delivery) => direct_delivery.commit(),
+        }
+        Ok(result)
+    }
+
     async fn materialize_cli_task_tools(
         &self,
         validated: &ValidatedTurnMcpInvocation,
@@ -6657,6 +6955,75 @@ mod tests {
 
         assert_eq!(error.code, TurnMcpInvocationErrorCode::Cancelled);
         assert_turn_mcp_outcome_reason(&fixture, "cancelled").await;
+    }
+
+    #[tokio::test]
+    async fn terminal_cua_cache_admission_closes_both_registered_call_orders() {
+        let (service, _, _) = test_mcp_service().await;
+        let tools = Arc::new(
+            pioneer_tools::build_tools(
+                std::env::temp_dir(),
+                "cache-fixture",
+                pioneer_tools::PermissionEvaluationContext::for_turn(
+                    "workspace",
+                    "thread",
+                    "cache-fixture",
+                    pioneer_protocol::default_turn_permission_profile_snapshot(),
+                ),
+                pioneer_tools::WebToolsConfig::default(),
+                pioneer_tools::ComputerUseToolsConfig::default(),
+                Vec::new(),
+            )
+            .expect("cache owner tools"),
+        );
+        // The call is already registered but has not materialized tools yet
+        // (e.g. it is waiting at the security/approval boundary).
+        for insert_first in [false, true] {
+            for index in 0..32 {
+                let turn = format!("finished-{insert_first}-{index}");
+                let cancellation = CancellationToken::new();
+                let _active = service.register_active_mcp_invocation(
+                    &turn,
+                    "cua-fixture",
+                    "call",
+                    cancellation.clone(),
+                );
+                if insert_first {
+                    service
+                        .admit_cua_turn_tools(&turn, &cancellation, || Ok(tools.clone()))
+                        .expect("insert before terminal");
+                }
+                assert_eq!(service.cancel_turn_mcp_invocations(&turn), 1);
+                assert!(cancellation.is_cancelled());
+                let late = service.admit_cua_turn_tools(&turn, &cancellation, || {
+                    panic!("cancelled registered call must never materialize a cache entry")
+                });
+                assert!(
+                    matches!(late, Err(error) if error.code == TurnMcpInvocationErrorCode::Cancelled)
+                );
+                assert!(
+                    !service
+                        .inner
+                        .cua_turn_tools
+                        .lock()
+                        .unwrap()
+                        .contains_key(&turn)
+                );
+            }
+            let live = format!("live-{insert_first}");
+            let cancellation = CancellationToken::new();
+            let _active = service.register_active_mcp_invocation(
+                &live,
+                "cua-fixture",
+                "call",
+                cancellation.clone(),
+            );
+            service
+                .admit_cua_turn_tools(&live, &cancellation, || Ok(tools.clone()))
+                .expect("finished turns cannot exhaust live admission");
+            assert_eq!(service.inner.cua_turn_tools.lock().unwrap().len(), 1);
+            service.cancel_turn_mcp_invocations(&live);
+        }
     }
 
     #[tokio::test]

@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, bail};
-use flate2::read::GzDecoder;
 use pioneer_config::{AppConfig, InstallManagedBy, InstallState, save_install_state};
 use reqwest::{StatusCode, blocking::Client, header::RETRY_AFTER};
 use serde::{Deserialize, Serialize};
@@ -312,10 +311,18 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
             if staged_binary.exists() {
                 let _ = fs::remove_file(&staged_binary);
             }
+            if bin_dir.join("cua.rollback").exists() {
+                bail!("CUA rollback payload exists; explicit recovery is required before updating");
+            }
             unpack_asset_to_binary(&source.asset_path, &staged_binary)?;
             make_binary_executable(&staged_binary)
         },
     )?;
+
+    // Keep the exact candidate that will be activated beside its own libraries
+    // during schema admission; live libraries must remain untouched until then.
+    #[cfg(target_os = "macos")]
+    let (_candidate_layout, staged_binary) = prepare_candidate_probe_layout(&staged_binary)?;
 
     let existing = match fs::symlink_metadata(&target_binary) {
         Ok(metadata) if metadata.is_file() => true,
@@ -428,7 +435,9 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
                 })?;
             }
 
-            if let Err(error) = fs::rename(&staged_binary, &target_binary) {
+            if let Err(error) = activate_cua_payload(&bin_dir)
+                .and_then(|()| fs::rename(&staged_binary, &target_binary).map_err(Into::into))
+            {
                 let rollback = rollback_and_restore(
                     &target_binary,
                     &rollback_binary,
@@ -439,7 +448,7 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
                     RollbackSafety::BeforeGatewayStart,
                 );
                 return Err(InstallRecoveryFailure::error(
-                    anyhow::Error::new(error).context("failed to replace staged binary"),
+                    error.context("failed to replace staged Gateway payload"),
                     rollback,
                 ));
             }
@@ -599,6 +608,7 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
             if rollback_binary.exists() {
                 let _ = fs::remove_file(&rollback_binary);
             }
+            let _ = fs::remove_dir_all(bin_dir.join("cua.rollback"));
             if let Some(backup_dir) = config_backup_dir.as_ref() {
                 let _ = fs::remove_dir_all(&backup_dir.directory);
             }
@@ -1024,17 +1034,7 @@ fn gateway_asset_file_name() -> Result<String> {
         other => bail!("unsupported OS `{other}` for release installer source"),
     };
 
-    let variant = if cfg!(feature = "computer-use") {
-        "-computer-use"
-    } else {
-        ""
-    };
-    let ext = if os == "windows" || (os == "macos" && arch == "x86_64") {
-        "zip"
-    } else {
-        "gz"
-    };
-    Ok(format!("pioneer-gateway-{os}-{arch}{variant}.{ext}"))
+    Ok(format!("pioneer-gateway-{os}-{arch}.zip"))
 }
 
 fn persist_install_state(
@@ -1188,6 +1188,13 @@ fn rollback_and_restore(
         runtime_home,
         config_backup_dir,
     );
+    if let Some(directory) = target_binary.parent() {
+        if let Err(error) = restore_cua_payload(directory) {
+            outcome.binary = RestoreOutcome::Failed {
+                kind: restore_error_kind(&error),
+            };
+        }
+    }
     // A failed binary/config restore must not start the candidate as if it were
     // the old installation. No backup is deleted on partial recovery.
     if was_active && outcome.performed() {
@@ -1265,6 +1272,23 @@ fn query_gateway_status(binary: &Path) -> Result<Option<ServiceSnapshot>> {
         Err(GatewayHealthFailure::StatusCommand) => Err(GatewayHealthFailure::StatusCommand.into()),
         Err(_) => Ok(None), // Preserve existing initial-install inspection semantics.
     }
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_candidate_probe_layout(binary: &Path) -> Result<(tempfile::TempDir, PathBuf)> {
+    let directory = binary.parent().context("candidate binary has no parent")?;
+    let layout = tempfile::Builder::new()
+        .prefix(".pioneer-candidate-")
+        .tempdir_in(directory)
+        .context("failed to create isolated candidate probe layout")?;
+    restore_bootstrap_libraries(&directory.join("cua.next"), layout.path())?;
+    let candidate = layout
+        .path()
+        .join(binary.file_name().context("candidate binary has no name")?);
+    // Move rather than choose another packaged executable: probe and activation
+    // use this same file, with its existing executable permissions preserved.
+    fs::rename(binary, &candidate).context("failed to stage candidate for version probe")?;
+    Ok((layout, candidate))
 }
 
 fn query_binary_version_output(binary: &Path) -> Result<VersionOutput> {
@@ -1495,27 +1519,8 @@ fn unpack_asset_to_binary(asset_path: &Path, target_binary: &Path) -> Result<()>
     if is_zip {
         unpack_zip_asset(asset_path, target_binary)
     } else {
-        unpack_gzip_asset(asset_path, target_binary)
+        bail!("Gateway installation requires a complete ZIP with its CUA companion payload")
     }
-}
-
-fn unpack_gzip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
-    let input = File::open(asset_path)
-        .with_context(|| format!("failed to open asset `{}`", asset_path.display()))?;
-    let mut decoder = GzDecoder::new(input);
-    let mut output = File::create(target_binary).with_context(|| {
-        format!(
-            "failed to create staged binary `{}`",
-            target_binary.display()
-        )
-    })?;
-    std::io::copy(&mut decoder, &mut output).with_context(|| {
-        format!(
-            "failed to unpack gateway archive into `{}`",
-            target_binary.display()
-        )
-    })?;
-    Ok(())
 }
 
 fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
@@ -1529,10 +1534,16 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
     } else {
         "pioneer"
     };
-    #[cfg(target_os = "macos")]
     let target_dir = target_binary
         .parent()
         .context("staged binary path has no parent directory")?;
+    let payload = target_dir.join("cua.next");
+    if payload.exists() {
+        fs::remove_dir_all(&payload).context("failed to clear staged CUA payload")?;
+    }
+    fs::create_dir(&payload).context("failed to create staged CUA payload")?;
+    let mut total_bytes = 0u64;
+    let mut seen = std::collections::BTreeSet::new();
     let mut found = false;
     #[cfg(target_os = "macos")]
     let mut companion_dylibs = 0usize;
@@ -1543,6 +1554,44 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
                 asset_path.display()
             )
         })?;
+        let relative = entry
+            .enclosed_name()
+            .context("invalid Gateway archive path")?;
+        if !seen.insert(relative.to_path_buf()) {
+            bail!("duplicate Gateway archive member");
+        }
+        if entry.is_dir() {
+            continue;
+        }
+        if entry
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            bail!("Gateway archive symlinks are not permitted");
+        }
+        total_bytes = total_bytes.saturating_add(entry.size());
+        if entry.size() > 512 * 1024 * 1024 || total_bytes > 2 * 1024 * 1024 * 1024 {
+            bail!("Gateway archive exceeds payload budget");
+        }
+        if let Ok(companion) = relative.strip_prefix("cua") {
+            if companion.as_os_str().is_empty() {
+                bail!("invalid CUA payload member");
+            }
+            let destination = payload.join(companion);
+            fs::create_dir_all(destination.parent().context("CUA member has no parent")?)?;
+            let mut output = File::create(&destination)?;
+            std::io::copy(&mut entry, &mut output)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = entry.unix_mode().unwrap_or(0o644) & 0o777;
+                fs::set_permissions(&destination, fs::Permissions::from_mode(mode))?;
+            }
+            continue;
+        }
+        if relative.components().count() != 1 {
+            bail!("unexpected Gateway archive member outside CUA payload");
+        }
         let file_name = Path::new(entry.name())
             .file_name()
             .and_then(OsStr::to_str)
@@ -1569,7 +1618,9 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
             if file_name.starts_with("libonnxruntime") && file_name.ends_with(".dylib") {
-                let dylib_path = target_dir.join(file_name.as_str());
+                let libraries = payload.join("bootstrap-libs");
+                fs::create_dir_all(&libraries)?;
+                let dylib_path = libraries.join(file_name.as_str());
                 let mut output = File::create(&dylib_path).with_context(|| {
                     format!(
                         "failed to create companion dylib `{}`",
@@ -1601,6 +1652,143 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
         );
     }
 
+    validate_cua_payload(&payload)?;
+    Ok(())
+}
+
+fn validate_cua_payload(payload: &Path) -> Result<()> {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(payload.join("manifest.json"))?)?;
+    let daemon = if cfg!(target_os = "macos") {
+        "Pioneer Gateway.app/Contents/Helpers/cua-driver"
+    } else if cfg!(windows) {
+        "cua-driver.exe"
+    } else {
+        "cua-driver"
+    };
+    let os = match std::env::consts::OS {
+        "macos" => "apple-darwin",
+        "linux" => "unknown-linux-gnu",
+        "windows" => "pc-windows-msvc",
+        _ => bail!("unsupported Gateway CUA platform"),
+    };
+    let target = format!("{}-{os}", std::env::consts::ARCH);
+    if manifest["schema_version"] != 1
+        || manifest["repository"] != "https://github.com/trycua/cua"
+        || manifest["target"].as_str() != Some(target.as_str())
+        || manifest["revision"] != "688c5fd62a9f13dddc309970c948df494e7de33f"
+        || manifest["version"] != "0.38.0"
+        || manifest["daemon"] != daemon
+        || manifest["permission_owner"] != "gateway"
+        || manifest["sha256"].as_str() != Some(sha256_file(&payload.join(daemon))?.as_str())
+        || !payload.join("LICENSE.cua-driver.md").is_file()
+        || !payload.join("THIRD_PARTY_NOTICES.md").is_file()
+    {
+        bail!("Gateway CUA package identity or contents mismatch");
+    }
+    #[cfg(windows)]
+    if !payload.join("cua-driver-uia.exe").is_file() {
+        bail!("Gateway CUA Windows UIA companion is missing");
+    }
+    #[cfg(target_os = "macos")]
+    if !payload
+        .join("Pioneer Gateway.app/Contents/MacOS/pioneer")
+        .is_file()
+        || !payload
+            .join("Pioneer Gateway.app/Contents/Info.plist")
+            .is_file()
+    {
+        bail!("Gateway responsible application is missing");
+    }
+    Ok(())
+}
+
+fn activate_cua_payload(directory: &Path) -> Result<()> {
+    let current = directory.join("cua");
+    let backup = directory.join("cua.rollback");
+    let next = directory.join("cua.next");
+    validate_cua_payload(&next)?;
+    if backup.exists() {
+        bail!("CUA rollback payload exists; retain it for explicit recovery before updating");
+    }
+    if current.exists() {
+        fs::rename(&current, &backup)?;
+    } else {
+        // An empty backup represents an installation that previously had no CUA.
+        fs::create_dir(&backup)?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Root bootstrap libraries belong to the same recovery unit. Do not
+        // overwrite a running installation while merely unpacking an archive.
+        let libraries = backup.join("bootstrap-libs");
+        fs::create_dir_all(&libraries)?;
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("libonnxruntime") && name.ends_with(".dylib") {
+                fs::copy(entry.path(), libraries.join(name.as_ref()))?;
+            }
+        }
+    }
+    fs::rename(next, &current).context("failed to activate staged CUA payload")?;
+    #[cfg(target_os = "macos")]
+    restore_bootstrap_libraries(&current, directory)?;
+    Ok(())
+}
+
+fn restore_cua_payload(directory: &Path) -> Result<()> {
+    let backup = directory.join("cua.rollback");
+    if backup.exists() {
+        let current = directory.join("cua");
+        if current.exists() {
+            #[cfg(target_os = "macos")]
+            if current.join("bootstrap-libs").is_dir() {
+                for entry in fs::read_dir(current.join("bootstrap-libs"))? {
+                    let path = directory.join(entry?.file_name());
+                    if path.is_file() {
+                        fs::remove_file(path)?;
+                    }
+                }
+            }
+            fs::remove_dir_all(&current)?;
+        }
+        // Preserve the sole known-good payload if a later config/service restore
+        // fails, just as restore_binary_preserving_backup retains the executable.
+        copy_cua_payload(&backup, &current).context("failed to restore CUA rollback payload")?;
+        #[cfg(target_os = "macos")]
+        restore_bootstrap_libraries(&backup, directory)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn restore_bootstrap_libraries(payload: &Path, directory: &Path) -> Result<()> {
+    let libraries = payload.join("bootstrap-libs");
+    if libraries.is_dir() {
+        for entry in fs::read_dir(libraries)? {
+            let entry = entry?;
+            fs::copy(entry.path(), directory.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_cua_payload(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let target = destination.join(entry.file_name());
+        if kind.is_dir() {
+            copy_cua_payload(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            fs::copy(entry.path(), target)?;
+        } else {
+            bail!("invalid CUA rollback payload member");
+        }
+    }
     Ok(())
 }
 
@@ -2578,11 +2766,11 @@ mod tests {
         let path = unique_temp_path("checksum-prefixed");
         fs::write(
             &path,
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa pioneer-gateway-linux-x86_64.gz\n",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa pioneer-gateway-linux-x86_64.zip\n",
         )
         .expect("write checksums file");
 
-        let parsed = expected_checksum_for_asset(&path, "pioneer-gateway-linux-x86_64.gz")
+        let parsed = expected_checksum_for_asset(&path, "pioneer-gateway-linux-x86_64.zip")
             .expect("parse checksum");
 
         assert_eq!(
@@ -2597,11 +2785,11 @@ mod tests {
         let path = unique_temp_path("checksum-missing");
         fs::write(
             &path,
-            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb pioneer-gateway-linux-aarch64.gz\n",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb pioneer-gateway-linux-aarch64.zip\n",
         )
         .expect("write checksums file");
 
-        let error = expected_checksum_for_asset(&path, "pioneer-gateway-linux-x86_64.gz")
+        let error = expected_checksum_for_asset(&path, "pioneer-gateway-linux-x86_64.zip")
             .expect_err("missing asset should fail");
 
         assert!(format!("{error:#}").contains("checksum for"));
@@ -2609,7 +2797,195 @@ mod tests {
     }
 
     #[test]
-    fn release_asset_name_matches_build_variant() {
+    fn installer_rollback_restores_the_prior_daemon_payload() {
+        for previously_installed in [false, true] {
+            let temporary = tempfile::tempdir().expect("installer directory");
+            let directory = temporary.path();
+            if previously_installed {
+                fs::create_dir(directory.join("cua")).unwrap();
+                fs::write(directory.join("cua/prior-daemon"), b"prior release").unwrap();
+            }
+            let next = directory.join("cua.next");
+            let daemon = if cfg!(target_os = "macos") {
+                "Pioneer Gateway.app/Contents/Helpers/cua-driver"
+            } else if cfg!(windows) {
+                "cua-driver.exe"
+            } else {
+                "cua-driver"
+            };
+            fs::create_dir_all(next.join(daemon).parent().unwrap()).unwrap();
+            fs::write(next.join(daemon), b"candidate daemon bytes").unwrap();
+            fs::write(next.join("LICENSE.cua-driver.md"), b"fixture notice").unwrap();
+            fs::write(next.join("THIRD_PARTY_NOTICES.md"), b"fixture notices").unwrap();
+            #[cfg(target_os = "macos")]
+            {
+                let app = next.join("Pioneer Gateway.app/Contents");
+                fs::create_dir_all(app.join("MacOS")).unwrap();
+                fs::write(app.join("MacOS/pioneer"), b"candidate Gateway bytes").unwrap();
+                fs::write(app.join("Info.plist"), b"fixture identity").unwrap();
+                if previously_installed {
+                    fs::write(directory.join("pioneer"), b"prior executable").unwrap();
+                    fs::write(directory.join("libonnxruntime.dylib"), b"prior library").unwrap();
+                    fs::write(directory.join("libonnxruntime.prior.dylib"), b"prior only").unwrap();
+                }
+                fs::create_dir(next.join("bootstrap-libs")).unwrap();
+                fs::write(
+                    next.join("bootstrap-libs/libonnxruntime.dylib"),
+                    b"candidate library",
+                )
+                .unwrap();
+                fs::write(
+                    next.join("bootstrap-libs/libonnxruntime.candidate.dylib"),
+                    b"candidate only",
+                )
+                .unwrap();
+            }
+            fs::write(
+                next.join("manifest.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "schema_version": 1,
+                    "repository": "https://github.com/trycua/cua",
+                    "target": format!("{}-{}", std::env::consts::ARCH,
+                        if cfg!(target_os = "macos") {
+                            "apple-darwin"
+                        } else if cfg!(windows) {
+                            "pc-windows-msvc"
+                        } else {
+                            "unknown-linux-gnu"
+                        }),
+                    "revision": "688c5fd62a9f13dddc309970c948df494e7de33f",
+                    "version": "0.38.0",
+                    "daemon": daemon,
+                    "permission_owner": "gateway",
+                    "sha256": super::sha256_file(&next.join(daemon)).unwrap(),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            #[cfg(windows)]
+            fs::write(next.join("cua-driver-uia.exe"), b"fixture UIA companion").unwrap();
+            #[cfg(target_os = "macos")]
+            let (_layout, candidate, candidate_bytes) = {
+                // This fixture observes the actual version-command boundary and
+                // adjacent files; it does not simulate or qualify native dyld.
+                let bytes = br#"#!/bin/sh
+set -eu
+base=${0%/*}
+[ "$1" = version ] && [ "$2" = --json ]
+[ "$(cat "$base/libonnxruntime.dylib")" = 'candidate library' ]
+[ "$(cat "$base/libonnxruntime.candidate.dylib")" = 'candidate only' ]
+[ ! -e "$base/libonnxruntime.prior.dylib" ]
+printf '%s\n' '{"version":"candidate","compiled_database_migrations":["candidate-migration"]}'
+"#;
+                let staged = directory.join("pioneer.next");
+                fs::write(&staged, bytes).unwrap();
+                super::make_binary_executable(&staged).unwrap();
+                let (layout, candidate) = super::prepare_candidate_probe_layout(&staged).unwrap();
+                let version = super::query_binary_version_output(&candidate).unwrap();
+                assert_eq!(version.version, "candidate");
+                let compiled = version.compiled_database_migrations.as_deref();
+                assert!(
+                    super::ensure_candidate_schema_compatible(
+                        &["unavailable-migration".into()],
+                        compiled,
+                    )
+                    .is_err()
+                );
+                assert_eq!(directory.join("pioneer").exists(), previously_installed);
+                assert_eq!(
+                    directory.join("libonnxruntime.dylib").exists(),
+                    previously_installed
+                );
+                if previously_installed {
+                    assert_eq!(
+                        fs::read(directory.join("pioneer")).unwrap(),
+                        b"prior executable"
+                    );
+                    assert_eq!(
+                        fs::read(directory.join("libonnxruntime.dylib")).unwrap(),
+                        b"prior library"
+                    );
+                    assert_eq!(
+                        fs::read(directory.join("libonnxruntime.prior.dylib")).unwrap(),
+                        b"prior only"
+                    );
+                    assert_eq!(
+                        fs::read(directory.join("cua/prior-daemon")).unwrap(),
+                        b"prior release"
+                    );
+                }
+                assert!(!directory.join("libonnxruntime.candidate.dylib").exists());
+                assert!(!directory.join("cua.rollback").exists());
+                super::ensure_candidate_schema_compatible(
+                    &["candidate-migration".into()],
+                    compiled,
+                )
+                .unwrap();
+                (layout, candidate, bytes)
+            };
+            #[cfg(target_os = "macos")]
+            if previously_installed {
+                fs::rename(
+                    directory.join("pioneer"),
+                    directory.join("pioneer.rollback"),
+                )
+                .unwrap();
+            }
+            super::activate_cua_payload(directory).expect("activate candidate");
+            #[cfg(target_os = "macos")]
+            {
+                fs::rename(&candidate, directory.join("pioneer")).unwrap();
+                assert_eq!(
+                    fs::read(directory.join("pioneer")).unwrap(),
+                    candidate_bytes
+                );
+                assert_eq!(
+                    fs::read(directory.join("libonnxruntime.candidate.dylib")).unwrap(),
+                    b"candidate only"
+                );
+            }
+            #[cfg(target_os = "macos")]
+            assert_eq!(
+                fs::read(directory.join("libonnxruntime.dylib")).unwrap(),
+                b"candidate library"
+            );
+            assert_eq!(
+                fs::read(directory.join("cua").join(daemon)).unwrap(),
+                b"candidate daemon bytes"
+            );
+            super::restore_cua_payload(directory).expect("restore prior payload");
+            assert!(!directory.join("cua").join(daemon).exists());
+            assert!(directory.join("cua.rollback").is_dir());
+            super::restore_cua_payload(directory).expect("retry retained payload restore");
+            #[cfg(target_os = "macos")]
+            {
+                assert!(!directory.join("libonnxruntime.candidate.dylib").exists());
+                assert_eq!(
+                    directory.join("libonnxruntime.dylib").exists(),
+                    previously_installed
+                );
+                if previously_installed {
+                    assert_eq!(
+                        fs::read(directory.join("libonnxruntime.dylib")).unwrap(),
+                        b"prior library"
+                    );
+                    assert_eq!(
+                        fs::read(directory.join("libonnxruntime.prior.dylib")).unwrap(),
+                        b"prior only"
+                    );
+                }
+            }
+            if previously_installed {
+                assert_eq!(
+                    fs::read(directory.join("cua/prior-daemon")).unwrap(),
+                    b"prior release"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn release_asset_name_is_the_complete_gateway_zip() {
         let asset_name = super::gateway_asset_file_name().expect("asset name");
 
         let expected_os = match std::env::consts::OS {
@@ -2623,23 +2999,9 @@ mod tests {
             "aarch64" | "arm64" => "aarch64",
             other => panic!("unexpected test arch: {other}"),
         };
-        let expected_variant = if cfg!(feature = "computer-use") {
-            "-computer-use"
-        } else {
-            ""
-        };
-        let expected_ext =
-            if cfg!(windows) || (std::env::consts::OS == "macos" && expected_arch == "x86_64") {
-                "zip"
-            } else {
-                "gz"
-            };
-
         assert_eq!(
             asset_name,
-            format!(
-                "pioneer-gateway-{expected_os}-{expected_arch}{expected_variant}.{expected_ext}"
-            )
+            format!("pioneer-gateway-{expected_os}-{expected_arch}.zip")
         );
     }
 
@@ -2656,14 +3018,14 @@ mod tests {
             release(
                 "0.53.11",
                 false,
-                &["pioneer-gateway-linux-x86_64.gz", "SHA256SUMS"],
+                &["pioneer-gateway-linux-x86_64.zip", "SHA256SUMS"],
             ),
         ];
 
         let selected = select_ready_release_tag(
             ReleaseChannel::Stable,
             releases.iter(),
-            "pioneer-gateway-linux-x86_64.gz",
+            "pioneer-gateway-linux-x86_64.zip",
         )
         .expect("previous complete stable release should be selected");
 
@@ -2675,13 +3037,13 @@ mod tests {
         let releases = vec![release(
             "0.53.12",
             false,
-            &["pioneer-gateway-linux-x86_64.gz"],
+            &["pioneer-gateway-linux-x86_64.zip"],
         )];
 
         let error = select_ready_release_tag(
             ReleaseChannel::Stable,
             releases.iter(),
-            "pioneer-gateway-linux-x86_64.gz",
+            "pioneer-gateway-linux-x86_64.zip",
         )
         .expect_err("release without checksums must remain unavailable");
 
@@ -2694,19 +3056,19 @@ mod tests {
             release(
                 "0.54.0-beta.1",
                 true,
-                &["pioneer-gateway-linux-x86_64.gz", "SHA256SUMS"],
+                &["pioneer-gateway-linux-x86_64.zip", "SHA256SUMS"],
             ),
             release(
                 "0.53.12",
                 false,
-                &["pioneer-gateway-linux-x86_64.gz", "SHA256SUMS"],
+                &["pioneer-gateway-linux-x86_64.zip", "SHA256SUMS"],
             ),
         ];
 
         let selected = select_ready_release_tag(
             ReleaseChannel::Stable,
             releases.iter(),
-            "pioneer-gateway-linux-x86_64.gz",
+            "pioneer-gateway-linux-x86_64.zip",
         )
         .expect("stable release should be selected");
 

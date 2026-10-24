@@ -222,6 +222,18 @@ struct AgentRoundResponse {
     termination: pioneer_provider::ProviderTermination,
 }
 
+// Owned only by an actual CUA result, through native exact-history delivery.
+// Neither the receipt nor its cancellation authority is serialized.
+struct NativeToolDelivery {
+    receipt: Arc<dyn pioneer_tools::ToolDeliveryReceipt>,
+    cancellation: CancellationToken,
+}
+impl std::fmt::Debug for NativeToolDelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeToolDelivery").finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug)]
 struct ExecutedToolResult {
     item_id: String,
@@ -239,6 +251,7 @@ struct ExecutedToolResult {
     request_tools_result: Option<RequestToolsResult>,
     full_message: Option<ChatMessage>,
     full_source_in_item: bool,
+    delivery: Option<NativeToolDelivery>,
     message: ChatMessage,
 }
 
@@ -275,6 +288,7 @@ fn unknown_tool_task_result(
         retained_llm_context: None,
         full_message: None,
         full_source_in_item: false,
+        delivery: None,
         request_tools_result: None,
         message: tooling::build_tool_error_message(provider_call_id, tool_name, message, outcome),
     }
@@ -1099,8 +1113,16 @@ pub(crate) fn bounded_tool_result_message_with_budget(
     let token_limit = available_tokens.min(pioneer_compaction::RESULT_TOKENS);
     let mut message = source.clone();
     let mut text = message.content.clone();
+    let preserve_media_text = source.content_parts.iter().any(|part| {
+        matches!(part,
+        MessageContentPart::Image { image } if image.artifact.is_some())
+    });
     message.content_parts = message.content_parts.into_iter().enumerate().filter_map(|(index, part)| {
         if let pioneer_provider::MessageContentPart::Text { text: part } = &part {
+            // Typed capture metadata/captions stay paired with their admitted
+            // image. If they cannot fit, report the existing bounded framing
+            // error instead of silently dropping capture geometry or tokens.
+            if preserve_media_text { return Some(MessageContentPart::text(part.clone())); }
             if !text.is_empty() { text.push('\n'); }
             text.push_str(part);
             return None;
@@ -5922,6 +5944,7 @@ async fn execute_agent_provider_response(
                                 retained_llm_context: None,
             full_message: None,
         full_source_in_item: false,
+        delivery: None,
                                 request_tools_result: None,
                                 message: tooling::build_tool_error_message(
                                     provider_call_id,
@@ -6083,6 +6106,7 @@ async fn execute_agent_provider_response(
                                     retained_llm_context: None,
             full_message: None,
         full_source_in_item: false,
+        delivery: None,
                                     request_tools_result: None,
                                     message: tooling::build_tool_error_message(
                                         provider_call_id,
@@ -6112,7 +6136,7 @@ async fn execute_agent_provider_response(
                                 let output_policy = router
                                     .find_spec(tool_name.as_str())
                                     .map(|configured| configured.output_policy.clone());
-                                let outcome = classify_tool_error(tool_name.as_str(), &error);
+                                let outcome = runtime.router().classify_tool_error(tool_name.as_str(), &error);
                                 if !suppress_partial_unknown_tool_ui {
                                     emit_durable_event(
                                         event_tx.as_ref(),
@@ -6172,6 +6196,7 @@ async fn execute_agent_provider_response(
                                     retained_llm_context: None,
             full_message: None,
         full_source_in_item: false,
+        delivery: None,
                                     request_tools_result: None,
                                     message: tooling::build_tool_error_message(
                                         provider_call_id,
@@ -6214,9 +6239,17 @@ async fn execute_agent_provider_response(
                         });
 
                         let tool_attempt_started = Instant::now();
-                        let dispatch_result = runtime
-                            .execute_tool_call_with_cancellation(tool_call, attempt_token.clone())
-                            .await;
+                        let dispatch_result = if runtime.router().computer_use_leaf(&tool_name).is_some() {
+                            runtime.execute_tool_call_with_deferred_delivery(tool_call, attempt_token.clone()).await
+                        } else {
+                            runtime.execute_tool_call_with_cancellation(tool_call, attempt_token.clone()).await
+                        };
+                        let delivery = dispatch_result.as_ref().ok()
+                            .and_then(|result| result.output.delivery_receipt())
+                            .map(|receipt| NativeToolDelivery {
+                                receipt,
+                                cancellation: attempt_token.clone(),
+                            });
 
                         heartbeat_stop.cancel();
                         if let Err(error) = heartbeat_task.await
@@ -6224,9 +6257,9 @@ async fn execute_agent_provider_response(
                         {
                             error!(error = %error, "tool heartbeat task failed");
                         }
-                        turn_control
-                            .complete_attempt(turn_id.as_str(), item_id.as_str())
-                            .await;
+                        if delivery.is_none() {
+                            turn_control.complete_attempt(turn_id.as_str(), item_id.as_str()).await;
+                        }
 
                         let full_source_in_item = dispatch_result.as_ref().ok().and_then(|r| r.projection()).is_some_and(|p| matches!(p.storage, pioneer_protocol::ToolStoragePayload::Shell { .. }) && matches!(p.output_policy.storage, pioneer_protocol::StorageOutputPolicy::Full { .. }));
                         let full_message = dispatch_result.as_ref().ok().map(|result| {
@@ -6276,7 +6309,7 @@ async fn execute_agent_provider_response(
                                 }
                                 Err(error) => {
                                     let output = error.to_string();
-                                    let outcome = classify_tool_error(tool_name.as_str(), &error);
+                                    let outcome = runtime.router().classify_tool_error(tool_name.as_str(), &error);
                                     let message = tooling::build_tool_error_message(
                                         provider_call_id.clone(),
                                         tool_name.clone(),
@@ -6316,6 +6349,7 @@ async fn execute_agent_provider_response(
                             request_tools_result,
                             full_message,
                             full_source_in_item,
+                            delivery,
                             message,
                         })
                     });
@@ -6335,6 +6369,7 @@ async fn execute_agent_provider_response(
             let mut executed_results = stream::iter(tool_tasks)
                 .map(|task| {
                     let event_tx = event_tx.clone();
+                    let turn_control = turn_control.clone();
                     let workspace_id = workspace_id.to_owned();
                     let thread_id = thread_id.to_owned();
                     let turn_id = turn_id.to_owned();
@@ -6400,18 +6435,45 @@ async fn execute_agent_provider_response(
                     let mut result = result;
                     let reference = serde_json::json!({"workspace_id": workspace_id, "thread_id": thread_id,
                         "turn_id": turn_id, "item_id": result.item_id}).to_string();
-                    if !result.full_source_in_item {
-                        persist_retained_tool_result(event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &result).await?;
+                    let delivery_cancellation = result.delivery.as_ref().map(|delivery| delivery.cancellation.clone());
+                    let prepare = async {
+                        if !result.full_source_in_item {
+                            persist_retained_tool_result(event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &result).await?;
+                        }
+                        result.message = bounded_tool_result_message(
+                            result.full_message.as_ref().unwrap_or(&result.message), &reference,
+                        )?;
+                        // The durable terminal item already owns full shell output. Retain only
+                        // its bounded provider representation in canonical replay history.
+                        if result.full_source_in_item {
+                            result.full_message = None;
+                            persist_retained_tool_result(event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &result).await?;
+                        }
+                        Ok::<(), ChatTurnError>(())
+                    };
+                    let mut prepared = if let Some(cancellation) = &delivery_cancellation {
+                        tokio::select! {
+                            biased;
+                            _ = cancellation.cancelled() => Err(ChatTurnError::Terminal("CUA native result delivery cancelled; do not replay the operation".into())),
+                            prepared = prepare => prepared,
+                        }
+                    } else {
+                        prepare.await
+                    };
+                    if let Some(delivery) = result.delivery.take() {
+                        if delivery.cancellation.is_cancelled() {
+                            prepared = Err(ChatTurnError::Terminal("CUA native result delivery cancelled; do not replay the operation".into()));
+                        }
+                        if prepared.is_ok() {
+                            // Commit each capture before waiting for the whole batch:
+                            // parallel input may itself be waiting on this receipt.
+                            // ItemCompleted ACK alone did not retain the typed message.
+                            delivery.receipt.commit();
+                        }
+                        drop(delivery); // failed/undelivered result revokes before cleanup awaits
+                        turn_control.complete_attempt(turn_id.as_str(), result.item_id.as_str()).await;
                     }
-                    result.message = bounded_tool_result_message(
-                        result.full_message.as_ref().unwrap_or(&result.message), &reference,
-                    )?;
-                    // The durable terminal item already owns full shell output. Retain only
-                    // its bounded provider representation in canonical replay history.
-                    if result.full_source_in_item {
-                        result.full_message = None;
-                        persist_retained_tool_result(event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &result).await?;
-                    }
+                    prepared?;
                     if let Some(error) = unknown_side_effect {
                         return Err(ChatTurnError::Terminal(error));
                     }
@@ -6854,38 +6916,6 @@ fn content_part_for_resolved_artifact(resolved: &ResolvedArtifactInput) -> Messa
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum ComputerUseSnapshotScope {
-    Session(u64),
-    UnknownSnapshot,
-}
-
-fn computer_use_snapshot_scope(message: &ChatMessage) -> Option<ComputerUseSnapshotScope> {
-    if message.role != pioneer_provider::Role::Tool
-        || message.name.as_deref() != Some("computer_use")
-        || !message.has_attachments()
-    {
-        return None;
-    }
-
-    let payload = match serde_json::from_str::<JsonValue>(message.content.as_str()) {
-        Ok(payload) => payload,
-        Err(_) => return Some(ComputerUseSnapshotScope::UnknownSnapshot),
-    };
-
-    match payload.get("action").and_then(JsonValue::as_str) {
-        Some("snapshot") | None => {
-            let session_id = payload.get("session_id").and_then(JsonValue::as_u64);
-            Some(
-                session_id
-                    .map(ComputerUseSnapshotScope::Session)
-                    .unwrap_or(ComputerUseSnapshotScope::UnknownSnapshot),
-            )
-        }
-        _ => None,
-    }
-}
-
 fn retain_agent_attachment_messages(messages: &mut [ChatMessage]) {
     let attachment_budget_bytes = pioneer_provider::default_attachment_pipeline_config()
         .max_total_bytes_per_request
@@ -6897,48 +6927,60 @@ fn retain_agent_attachment_messages_with_budget(
     messages: &mut [ChatMessage],
     attachment_budget_bytes: usize,
 ) {
-    let mut latest_snapshot_index: HashMap<ComputerUseSnapshotScope, usize> = HashMap::new();
-
-    for (index, message) in messages.iter().enumerate().rev() {
-        if let Some(scope) = computer_use_snapshot_scope(message) {
-            latest_snapshot_index.entry(scope).or_insert(index);
-        }
-    }
-
-    for (index, message) in messages.iter_mut().enumerate() {
-        if !message.has_attachments() {
-            continue;
-        }
-
-        if let Some(scope) = computer_use_snapshot_scope(message)
-            && latest_snapshot_index.get(&scope).copied() != Some(index)
-        {
-            message.content_parts.clear();
-        }
-    }
-
     let mut total_attachment_bytes = estimated_total_attachment_bytes(messages);
-    if total_attachment_bytes <= attachment_budget_bytes {
+    let mut total_attachment_count = messages
+        .iter()
+        .map(|message| {
+            message
+                .content_parts
+                .iter()
+                .filter(|part| !matches!(part, MessageContentPart::Text { .. }))
+                .count()
+        })
+        .sum::<usize>();
+    let count_budget =
+        pioneer_provider::default_attachment_pipeline_config().max_attachments_per_request;
+    if total_attachment_bytes <= attachment_budget_bytes && total_attachment_count <= count_budget {
         return;
     }
 
-    let snapshot_indices = messages
+    // Preserve the current complete tool-result group for its next provider
+    // request. User inputs are pinned too. If both cannot fit, the existing
+    // provider attachment validator must report the budget failure explicitly.
+    let current_group_start = messages
+        .iter()
+        .rposition(|message| message.role != pioneer_provider::Role::Tool)
+        .map_or(0, |index| index + 1);
+    // Only older tool media may be evicted from this request projection;
+    // neither names nor raw JSON grant session/snapshot semantics.
+    let tool_media_indices = messages
         .iter()
         .enumerate()
         .filter_map(|(index, message)| {
-            (message.has_attachments() && computer_use_snapshot_scope(message).is_some())
+            (index < current_group_start
+                && message.has_attachments()
+                && message.role == pioneer_provider::Role::Tool)
                 .then_some(index)
         })
         .collect::<Vec<_>>();
 
-    for index in snapshot_indices {
-        if total_attachment_bytes <= attachment_budget_bytes {
+    for index in tool_media_indices {
+        if total_attachment_bytes <= attachment_budget_bytes
+            && total_attachment_count <= count_budget
+        {
             break;
         }
         if messages[index].content_parts.is_empty() {
             continue;
         }
         let removed_bytes = estimated_message_attachment_bytes(&messages[index]);
+        total_attachment_count = total_attachment_count.saturating_sub(
+            messages[index]
+                .content_parts
+                .iter()
+                .filter(|part| !matches!(part, MessageContentPart::Text { .. }))
+                .count(),
+        );
         messages[index].content_parts.clear();
         if removed_bytes > 0 {
             total_attachment_bytes = total_attachment_bytes.saturating_sub(removed_bytes);
@@ -7019,10 +7061,9 @@ mod tests {
         compiled_prompt_payload_from_delivery_plan, deterministic_final_message_item_id,
         deterministic_tool_item_id, materialize_mcp_tooling, native_filesystem_scope,
         native_provider_tool_definition, normalize_turn_capabilities, readable_agent_skill_overlay,
-        resolve_skill_capability_summary, retain_agent_attachment_messages,
-        retain_agent_attachment_messages_with_budget, retain_chat_mode_attachment_messages,
-        review_required_observation_payload, review_required_observation_signature,
-        runtime_sections_with_artifact_reference_policy,
+        resolve_skill_capability_summary, retain_agent_attachment_messages_with_budget,
+        retain_chat_mode_attachment_messages, review_required_observation_payload,
+        review_required_observation_signature, runtime_sections_with_artifact_reference_policy,
         runtime_sections_with_execution_continuation_context,
         sync_review_action_tools_to_observations, workdir_from_execution_security_snapshot,
     };
@@ -8181,6 +8222,7 @@ mod tests {
             retained_llm_context: None,
             full_message: None,
             full_source_in_item: false,
+            delivery: None,
             request_tools_result: None,
             message: ChatMessage::tool_result("provider_call_1", tool_name, text),
         }
@@ -8217,10 +8259,8 @@ mod tests {
     fn test_computer_use_config() -> ComputerUseToolsConfig {
         ComputerUseToolsConfig {
             runtime_home_dir: std::env::temp_dir().join("pioneer-agent-request-tools-tests"),
-            artifacts_subdir: "tools/computer_use".to_owned(),
-            retention_hours: 24,
+
             max_total_bytes: 1024 * 1024 * 1024,
-            run_max_steps_default: 30,
             ..ComputerUseToolsConfig::default()
         }
     }
@@ -8261,12 +8301,12 @@ mod tests {
             vec![ToolExtensionBundle {
                 specs: names
                     .iter()
-                    .filter(|name| **name != "computer_use")
+                    .filter(|name| !pioneer_tools::is_computer_use_tool(name))
                     .map(|name| configured_test_tool(name))
                     .collect(),
                 handlers: names
                     .iter()
-                    .filter(|name| **name != "computer_use")
+                    .filter(|name| !pioneer_tools::is_computer_use_tool(name))
                     .map(|name| {
                         (
                             (*name).to_owned(),
@@ -8284,7 +8324,7 @@ mod tests {
     ) -> pioneer_tools::BuiltinTools {
         let specs = specs
             .into_iter()
-            .filter(|configured| configured.spec.name != "computer_use")
+            .filter(|configured| !pioneer_tools::is_computer_use_tool(&configured.spec.name))
             .collect::<Vec<_>>();
         let handlers = specs
             .iter()
@@ -8793,13 +8833,9 @@ mod tests {
             built.router.as_ref(),
         );
 
-        if built.router.find_spec("computer_use").is_some() {
-            assert_eq!(added, vec!["computer_use".to_owned()]);
-            assert!(visible_tool_names.contains(&"computer_use".to_owned()));
-        } else {
-            assert!(added.is_empty());
-            assert!(!visible_tool_names.contains(&"computer_use".to_owned()));
-        }
+        assert!(added.contains(&"cua_get_window_state".to_owned()));
+        assert!(visible_tool_names.contains(&"cua_get_window_state".to_owned()));
+        assert!(!visible_tool_names.contains(&"computer_use".to_owned()));
         assert!(visible_tool_names.contains(&"request_tools".to_owned()));
         assert!(visible_tool_names.contains(&"read_file".to_owned()));
     }
@@ -8820,31 +8856,23 @@ mod tests {
             .router
             .compute_final_visible_tools(&core_tools, &[], &[]);
         assert!(
-            !core_only.visible_tools.contains(&"computer_use".to_owned()),
-            "computer_use must not be visible by default"
+            !core_only
+                .visible_tools
+                .contains(&"cua_get_window_state".to_owned()),
+            "CUA must not be visible by default"
         );
 
         let selected = built.router.compute_final_visible_tools(
             &core_tools,
-            &["computer_use".to_owned()],
+            &["cua_get_window_state".to_owned()],
             &[],
         );
-        if built.router.find_spec("computer_use").is_some() {
-            assert!(
-                selected.visible_tools.contains(&"computer_use".to_owned()),
-                "registered computer_use must become visible when preflight selects it"
-            );
-        } else {
-            assert!(
-                !selected.visible_tools.contains(&"computer_use".to_owned()),
-                "unregistered computer_use must not become visible"
-            );
-            assert!(selected.diagnostics.iter().any(|diagnostic| {
-                diagnostic.tool_name == "computer_use"
-                    && diagnostic.code
-                        == pioneer_tools::ToolVisibilityDiagnosticCode::UnknownToolDropped
-            }));
-        }
+        assert!(
+            selected
+                .visible_tools
+                .contains(&"cua_get_window_state".to_owned())
+        );
+        assert!(!selected.visible_tools.contains(&"computer_use".to_owned()));
     }
 
     #[test]
@@ -9078,11 +9106,6 @@ mod tests {
         let lazy_domain_tools = all_lazy_domain_tool_names();
         let built = build_tools_with_extension_names(&lazy_domain_tools);
         let core_tools = built.router.preflight_tool_index().core_tools;
-        let computer_use_expected = if built.router.has_handler("computer_use") {
-            vec!["computer_use"]
-        } else {
-            Vec::new()
-        };
 
         let mut cases = vec![
             (
@@ -9117,10 +9140,10 @@ mod tests {
             ),
         ];
         cases.push((
-            "computer operation uses computer_use",
+            "computer operation uses canonical CUA tool",
             "открой браузер и проверь сайт",
-            vec!["computer_use"],
-            computer_use_expected,
+            vec!["cua_get_window_state"],
+            vec!["cua_get_window_state"],
         ));
 
         for (label, _user_text, selected, expected_extra) in cases {
@@ -9505,20 +9528,15 @@ mod tests {
         })
     }
 
-    fn computer_use_snapshot_message(call_id: &str, session_id: u64, path: &str) -> ChatMessage {
+    fn tool_image_message(call_id: &str, path: &str) -> ChatMessage {
         ChatMessage {
             provenance: None,
             role: pioneer_provider::Role::Tool,
-            content: serde_json::json!({
-                "action": "snapshot",
-                "session_id": session_id,
-                "snapshot": { "path": path },
-            })
-            .to_string(),
+            content: "Capture metadata".to_owned(),
             reasoning_content: None,
             content_parts: vec![image_part(path, Some(512 * 1024))],
             tool_call_id: Some(call_id.to_owned()),
-            name: Some("computer_use".to_owned()),
+            name: Some("cua_get_window_state".to_owned()),
             tool_calls: None,
             provider_replay_state: None,
         }
@@ -9802,34 +9820,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_policy_keeps_latest_snapshot_per_session_and_preserves_user_files() {
-        let mut messages = vec![
-            ChatMessage {
-                provenance: None,
-                role: pioneer_provider::Role::User,
-                content: "Analyze this file".to_owned(),
-                reasoning_content: None,
-                content_parts: vec![file_part("/tmp/task.pdf", Some(1024 * 1024))],
-                tool_call_id: None,
-                name: None,
-                tool_calls: None,
-                provider_replay_state: None,
-            },
-            computer_use_snapshot_message("call_1", 1, "/tmp/s1-1.png"),
-            computer_use_snapshot_message("call_2", 2, "/tmp/s2-1.png"),
-            computer_use_snapshot_message("call_3", 1, "/tmp/s1-2.png"),
-        ];
-
-        retain_agent_attachment_messages(&mut messages);
-
-        assert_eq!(messages[0].content_parts.len(), 1);
-        assert!(messages[1].content_parts.is_empty());
-        assert_eq!(messages[2].content_parts.len(), 1);
-        assert_eq!(messages[3].content_parts.len(), 1);
-    }
-
-    #[test]
-    fn agent_policy_prunes_snapshots_before_pinned_files_when_budget_exceeded() {
+    fn agent_policy_prunes_old_tool_media_before_pinned_files_when_budget_exceeded() {
         let mut messages = vec![
             ChatMessage {
                 provenance: None,
@@ -9842,17 +9833,21 @@ mod tests {
                 tool_calls: None,
                 provider_replay_state: None,
             },
-            computer_use_snapshot_message("call_1", 1, "/tmp/s1-1.png"),
-            computer_use_snapshot_message("call_2", 2, "/tmp/s2-1.png"),
-            computer_use_snapshot_message("call_3", 1, "/tmp/s1-2.png"),
+            tool_image_message("call_1", "/tmp/capture1.png"),
+            ChatMessage::assistant("observe again"),
+            tool_image_message("call_2", "/tmp/capture2.png"),
+            ChatMessage::assistant("observe current state"),
+            tool_image_message("call_3", "/tmp/capture3.png"),
+            tool_image_message("call_4", "/tmp/parallel-capture.png"),
         ];
 
         retain_agent_attachment_messages_with_budget(&mut messages, 700_000);
 
         assert_eq!(messages[0].content_parts.len(), 1);
         assert!(messages[1].content_parts.is_empty());
-        assert!(messages[2].content_parts.is_empty());
-        assert_eq!(messages[3].content_parts.len(), 1);
+        assert!(messages[3].content_parts.is_empty());
+        assert_eq!(messages[5].content_parts.len(), 1);
+        assert_eq!(messages[6].content_parts.len(), 1);
     }
 
     #[test]

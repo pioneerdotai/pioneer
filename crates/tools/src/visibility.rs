@@ -358,7 +358,7 @@ mod tests {
             spec("memory_search"),
             spec("task_create"),
             spec("artifact_prepare"),
-            spec("computer_use"),
+            spec("cua_get_window_state"),
             spec("threads_list"),
             spec("threads_history_read"),
             spec("threads_children_list"),
@@ -396,7 +396,7 @@ mod tests {
         assert!(!snapshot.contains_name("memory_search").await);
         assert!(!snapshot.contains_name("task_create").await);
         assert!(!snapshot.contains_name("artifact_prepare").await);
-        assert!(!snapshot.contains_name("computer_use").await);
+        assert!(!snapshot.contains_name("cua_get_window_state").await);
         for name in [
             "threads_list",
             "threads_history_read",
@@ -577,7 +577,7 @@ mod tests {
                 "memory_search".to_owned(),
                 "task_create".to_owned(),
                 "artifact_prepare".to_owned(),
-                "computer_use".to_owned(),
+                "cua_get_window_state".to_owned(),
                 "read_skill".to_owned(),
                 "skill.weather".to_owned(),
                 "mcp.browser.open".to_owned(),

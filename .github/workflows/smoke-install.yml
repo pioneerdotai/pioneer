@@ -30,9 +30,9 @@ jobs:
           smoke_dir="${RUNNER_TEMP}/pioneer-path-warning-smoke"
           mkdir -p "${smoke_dir}"
 
-          asset_name="pioneer-gateway-macos-aarch64.gz"
+          asset_name="pioneer-gateway-macos-aarch64.zip"
           asset_path="${smoke_dir}/${asset_name}"
-          gzip -f --stdout --best target/release/pioneer > "${asset_path}"
+          python3 scripts/packaging/smoke-gateway-asset.py --binary target/release/pioneer --archive "${asset_path}" --target aarch64-apple-darwin
           sha="$(shasum -a 256 "${asset_path}" | awk '{print $1}')"
           printf 'sha256:%s %s\n' "${sha}" "${asset_name}" > "${smoke_dir}/SHA256SUMS"
 
@@ -121,6 +121,8 @@ jobs:
             libssl-dev \
             libpipewire-0.3-dev \
             libwayland-dev \
+            libxi-dev \
+            libxtst-dev \
             libxkbcommon-dev
           multiarch="$(gcc -print-multiarch)"
           echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
@@ -134,9 +136,9 @@ jobs:
           smoke_dir="${RUNNER_TEMP}/pioneer-path-warning-smoke"
           mkdir -p "${smoke_dir}"
 
-          asset_name="pioneer-gateway-linux-x86_64.gz"
+          asset_name="pioneer-gateway-linux-x86_64.zip"
           asset_path="${smoke_dir}/${asset_name}"
-          gzip -f --stdout --best target/release/pioneer > "${asset_path}"
+          python3 scripts/packaging/smoke-gateway-asset.py --binary target/release/pioneer --archive "${asset_path}" --target x86_64-unknown-linux-gnu
           sha="$(sha256sum "${asset_path}" | awk '{print $1}')"
           printf 'sha256:%s %s\n' "${sha}" "${asset_name}" > "${smoke_dir}/SHA256SUMS"
 
@@ -224,7 +226,7 @@ jobs:
 
           $assetName = "pioneer-gateway-windows-x86_64.zip"
           $assetPath = Join-Path $smokeDir $assetName
-          Compress-Archive -Path "target/x86_64-pc-windows-msvc/release/pioneer.exe" -DestinationPath $assetPath -Force
+          python scripts/packaging/smoke-gateway-asset.py --binary target/x86_64-pc-windows-msvc/release/pioneer.exe --archive $assetPath --target x86_64-pc-windows-msvc
 
           $sha = (Get-FileHash -Path $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
           "sha256:$sha $assetName" | Set-Content -Path (Join-Path $smokeDir "SHA256SUMS") -NoNewline
@@ -322,6 +324,8 @@ jobs:
             libssl-dev \
             libpipewire-0.3-dev \
             libwayland-dev \
+            libxi-dev \
+            libxtst-dev \
             libxkbcommon-dev
           multiarch="$(gcc -print-multiarch)"
           echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
@@ -335,9 +339,9 @@ jobs:
           smoke_dir="${RUNNER_TEMP}/pioneer-smoke"
           mkdir -p "${smoke_dir}"
 
-          asset_name="pioneer-gateway-linux-x86_64.gz"
+          asset_name="pioneer-gateway-linux-x86_64.zip"
           asset_path="${smoke_dir}/${asset_name}"
-          gzip -f --stdout --best target/release/pioneer > "${asset_path}"
+          python3 scripts/packaging/smoke-gateway-asset.py --binary target/release/pioneer --archive "${asset_path}" --target x86_64-unknown-linux-gnu
           sha="$(sha256sum "${asset_path}" | awk '{print $1}')"
           printf 'sha256:%s %s\n' "${sha}" "${asset_name}" > "${smoke_dir}/SHA256SUMS"
 
@@ -423,7 +427,7 @@ jobs:
 
           $assetName = "pioneer-gateway-windows-x86_64.zip"
           $assetPath = Join-Path $smokeDir $assetName
-          Compress-Archive -Path "target/x86_64-pc-windows-msvc/release/pioneer.exe" -DestinationPath $assetPath -Force
+          python scripts/packaging/smoke-gateway-asset.py --binary target/x86_64-pc-windows-msvc/release/pioneer.exe --archive $assetPath --target x86_64-pc-windows-msvc
 
           $sha = (Get-FileHash -Path $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
           "sha256:$sha $assetName" | Set-Content -Path (Join-Path $smokeDir "SHA256SUMS") -NoNewline
@@ -528,6 +532,8 @@ jobs:
             libssl-dev \
             libpipewire-0.3-dev \
             libwayland-dev \
+            libxi-dev \
+            libxtst-dev \
             libxkbcommon-dev
           multiarch="$(gcc -print-multiarch)"
           echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
@@ -541,9 +547,9 @@ jobs:
           smoke_dir="${RUNNER_TEMP}/pioneer-desktop-smoke"
           mkdir -p "${smoke_dir}"
 
-          asset_name="pioneer-gateway-linux-x86_64.gz"
+          asset_name="pioneer-gateway-linux-x86_64.zip"
           asset_path="${smoke_dir}/${asset_name}"
-          gzip -f --stdout --best target/release/pioneer > "${asset_path}"
+          python3 scripts/packaging/smoke-gateway-asset.py --binary target/release/pioneer --archive "${asset_path}" --target x86_64-unknown-linux-gnu
           sha="$(sha256sum "${asset_path}" | awk '{print $1}')"
           printf 'sha256:%s %s\n' "${sha}" "${asset_name}" > "${smoke_dir}/SHA256SUMS"
 

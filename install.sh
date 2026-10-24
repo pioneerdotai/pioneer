@@ -5,7 +5,6 @@ CHANNEL="stable"
 VERSION=""
 NO_START=0
 FORCE_START=0
-COMPUTER_USE=0
 WORK_DIR=""
 
 REPO="${PIONEER_RELEASE_REPO:-pioneerdotai/pioneer}"
@@ -15,13 +14,11 @@ DOWNLOAD_BASE="${PIONEER_RELEASE_DOWNLOAD_BASE:-https://github.com/${REPO}/relea
 usage() {
   cat <<'USAGE'
 Usage:
-  install.sh [--channel stable|beta|canary] [--version x.y.z] [--computer-use] [--no-start] [--force-start]
+  install.sh [--channel stable|beta|canary] [--version x.y.z] [--no-start] [--force-start]
 
 Options:
   --channel <name>   Release channel (default: stable)
   --version <value>  Install explicit version (for example: 0.2.1 or v0.2.1)
-  --computer-use     Install the native computer-use gateway variant
-  --headless         Install the headless gateway variant (default)
   --no-start         Do not start service after install/update
   --force-start      Start service even if an existing install is currently stopped
   --help             Show this help
@@ -30,7 +27,6 @@ Environment:
   PIONEER_RELEASE_REPO          GitHub repo in owner/name format
   PIONEER_RELEASE_API_BASE      Releases API base URL
   PIONEER_RELEASE_DOWNLOAD_BASE Release download base URL
-  PIONEER_INSTALL_COMPUTER_USE  Set to 1/true/yes to install the computer-use variant
   PIONEER_LOCAL_ASSET_FILE      Local gateway archive path (skip network download)
   PIONEER_LOCAL_CHECKSUMS_FILE  Local SHA256SUMS path (skip network download)
 USAGE
@@ -55,14 +51,6 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "required command is missing: $1"
 }
 
-read_env_flags() {
-  case "${PIONEER_INSTALL_COMPUTER_USE:-}" in
-    1|true|TRUE|yes|YES|on|ON) COMPUTER_USE=1 ;;
-    ""|0|false|FALSE|no|NO|off|OFF) ;;
-    *) fail "invalid PIONEER_INSTALL_COMPUTER_USE value; expected 1/true/yes or 0/false/no" ;;
-  esac
-}
-
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -75,12 +63,6 @@ parse_args() {
         shift
         [[ $# -gt 0 ]] || fail "--version requires a value"
         VERSION="$1"
-        ;;
-      --computer-use)
-        COMPUTER_USE=1
-        ;;
-      --headless)
-        COMPUTER_USE=0
         ;;
       --no-start)
         NO_START=1
@@ -208,7 +190,10 @@ work_dir = installer.parent
 found = False
 with zipfile.ZipFile(asset) as archive:
     for entry in archive.infolist():
-        name = pathlib.Path(entry.filename).name
+        member = pathlib.PurePosixPath(entry.filename)
+        if len(member.parts) != 1:
+            continue
+        name = member.name
         if not name:
             continue
         if name == "pioneer":
@@ -222,7 +207,7 @@ if not found:
 PY
       ;;
     *)
-      gunzip -c "$asset_file" > "$installer_bin"
+      fail "Gateway installation requires a complete ZIP archive"
       ;;
   esac
   chmod 0755 "$installer_bin"
@@ -247,9 +232,7 @@ PY
 main() {
   need_cmd curl
   need_cmd python3
-  need_cmd gunzip
 
-  read_env_flags
   parse_args "$@"
   read -r os arch < <(detect_platform)
 
@@ -267,15 +250,7 @@ main() {
     asset_name="$(basename "$asset_file")"
     tag="local-bundle"
   else
-    local asset_suffix=""
-    if [[ "$COMPUTER_USE" -eq 1 ]]; then
-      asset_suffix="-computer-use"
-    fi
-    local asset_ext="gz"
-    if [[ "$os" == "macos" && "$arch" == "x86_64" ]]; then
-      asset_ext="zip"
-    fi
-    asset_name="pioneer-gateway-${os}-${arch}${asset_suffix}.${asset_ext}"
+    asset_name="pioneer-gateway-${os}-${arch}.zip"
     tag="$(resolve_release_tag)"
     [[ -n "$tag" ]] || fail "resolved release tag is empty"
     asset_file="${WORK_DIR}/${asset_name}"

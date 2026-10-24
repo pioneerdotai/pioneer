@@ -307,7 +307,7 @@ if ($Target -eq "aarch64-pc-windows-msvc") {
 if (-not $SkipBuild) {
     cargo build --locked --release -p pioneer-desktop --target $Target
     cargo build --locked --release -p pioneer-app-updater --target $Target
-    cargo build --locked --release -p pioneer-cli --features computer-use --target $Target
+    cargo build --locked --release -p pioneer-cli --target $Target
     if ($env:PIONEER_SYMBOL_INPUTS_DIR) {
         python scripts/packaging/symbol-inputs.py export --target $Target "$env:PIONEER_SYMBOL_INPUTS_DIR" "target/$Target/release/pioneer-app.exe" "target/$Target/release/pioneer.exe" "target/$Target/release/pioneer-app-updater.exe"
         if ($LASTEXITCODE -ne 0) { throw "Symbol input preservation failed" }
@@ -336,7 +336,8 @@ try {
 
     $gatewayAssetName = "pioneer-gateway-windows-$archLabel.zip"
     $gatewayAssetPath = Join-Path $gatewayStageDir $gatewayAssetName
-    Compress-Archive -Path "target/$Target/release/pioneer.exe" -DestinationPath $gatewayAssetPath -Force
+    python scripts/packaging/cua-driver.py --target $Target --binary "target/$Target/release/pioneer.exe" --archive $gatewayAssetPath
+    if ($LASTEXITCODE -ne 0) { throw "Gateway CUA packaging failed" }
 
     $gatewaySha256 = (Get-FileHash -Path $gatewayAssetPath -Algorithm SHA256).Hash.ToLowerInvariant()
     "sha256:$gatewaySha256 $gatewayAssetName" | Set-Content -Path (Join-Path $gatewayStageDir "SHA256SUMS") -NoNewline

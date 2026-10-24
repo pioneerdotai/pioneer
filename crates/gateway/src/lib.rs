@@ -17,6 +17,7 @@ pub mod cli_mcp_client_validation;
 mod cli_runtime;
 pub mod codex_mcp_conformance;
 pub(crate) mod compaction;
+mod computer_use;
 mod database;
 mod epic5_observability;
 mod helpers;
@@ -522,6 +523,7 @@ async fn run_gateway_until_shutdown_inner(
 
     let web_cfg = &config.gateway.tools.web;
     let computer_use_cfg = &config.gateway.tools.computer_use;
+    let mut computer_use_runtime = computer_use::GatewayComputerUse::new(&runtime_home);
     let tool_retry_cfg = &config.gateway.tools.retry;
     let provider_attachments_cfg = &config.gateway.provider.attachments;
     let skills_cfg = &config.gateway.skills;
@@ -653,31 +655,9 @@ async fn run_gateway_until_shutdown_inner(
         },
         computer_use: ComputerUseToolsConfig {
             runtime_home_dir: runtime_home.clone(),
-            artifacts_subdir: computer_use_cfg.artifacts_subdir.clone(),
-            retention_hours: computer_use_cfg.retention_hours,
             max_total_bytes: computer_use_cfg.max_total_bytes,
-            run_max_steps_default: computer_use_cfg.run_max_steps_default,
-            snapshot_transport_max_bytes: computer_use_cfg.snapshot_transport_max_bytes,
-            snapshot_transport_max_side_px: computer_use_cfg.snapshot_transport_max_side_px,
-            snapshot_transport_min_side_px: computer_use_cfg.snapshot_transport_min_side_px,
-            snapshot_downscale_factor: computer_use_cfg.snapshot_downscale_factor,
-            accessibility_tree_max_depth: computer_use_cfg.accessibility_tree_max_depth,
-            accessibility_tree_max_nodes: computer_use_cfg.accessibility_tree_max_nodes,
-            accessibility_tree_max_serialized_bytes: computer_use_cfg
-                .accessibility_tree_max_serialized_bytes,
-            accessibility_tree_text_max_chars: computer_use_cfg.accessibility_tree_text_max_chars,
-            semantic_action_timeout_ms: computer_use_cfg.semantic_action_timeout_ms,
-            app_activation_timeout_ms: computer_use_cfg.app_activation_timeout_ms,
-            input_simulation_enabled: computer_use_cfg.input_simulation_enabled,
-            launch_if_missing_default: computer_use_cfg.launch_if_missing_default,
-            allowed_launch_commands: computer_use_cfg.allowed_launch_commands.clone(),
-            preflight_screenshot_probe_enabled: computer_use_cfg.preflight_screenshot_probe_enabled,
-            max_consecutive_same_snapshot_hash: computer_use_cfg.max_consecutive_same_snapshot_hash,
-            max_consecutive_same_action_signature: computer_use_cfg
-                .max_consecutive_same_action_signature,
-            max_consecutive_no_progress_steps: computer_use_cfg.max_consecutive_no_progress_steps,
-            max_recovery_attempts_per_step: computer_use_cfg.max_recovery_attempts_per_step,
-            max_recovery_attempts_per_run: computer_use_cfg.max_recovery_attempts_per_run,
+            backend: Some(computer_use_runtime.backend()),
+            image_admission: Default::default(),
         },
         skills: pioneer_agent::SkillsLoopConfig {
             enabled: skills_cfg.enabled,
@@ -1118,6 +1098,7 @@ async fn run_gateway_until_shutdown_inner(
 
     info!("gateway daemon stopping with telemetry snapshot");
     handle.set_readiness(GatewayReadinessStatus::Starting);
+    computer_use_runtime.shutdown().await;
     message_processor
         .shutdown_thread_episodic_index_runner()
         .await;

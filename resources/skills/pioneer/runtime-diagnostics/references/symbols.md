@@ -44,7 +44,7 @@ GitHub symbol artifacts are still retained.
 
 Identify the exact Release **run ID and commit** (or Release Gateway / Release App
 for older releases), target
-triple, and Gateway feature variant (`default` or `computer-use`). Use installed
+triple, and Gateway package identity. Use installed
 build provenance, the release tag, module ID and manifest hashes to disambiguate.
 Do not just download the newest successful run. The same commit may have multiple
 release/symbol attempts or different package variants.
@@ -82,8 +82,7 @@ gh api --paginate "repos/$diag_repo/actions/runs/$diag_symbols_run/artifacts" \
 
 Output names are derived from the input artifact names:
 
-- Gateway: `debug-symbol-inputs-gateway-TARGET-default` or
-  `debug-symbol-inputs-gateway-TARGET-computer-use`.
+- Gateway: `debug-symbol-inputs-gateway-TARGET`.
 - Desktop: `debug-symbol-inputs-desktop-TARGET`. This artifact includes the
   desktop executable, updater and bundled Gateway symbol inventories. Select
   the inventory for the actual process being analyzed.
@@ -122,7 +121,7 @@ Before using a directory, check:
    other executable shipped in the same desktop artifact.
 5. Inventory files, byte sizes and checksums validate; retain the directory layout.
 
-Desktop packaging reuses the `computer-use` Gateway from the same Release run.
+Desktop packaging reuses the Gateway from the same Release run.
 Older releases can reference a separate Release Gateway run from the same commit.
 In both cases, `release-inputs.json.reused_gateway` and
 `gateway-release-inputs.json` identify its original producer. For its executable

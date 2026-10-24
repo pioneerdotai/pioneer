@@ -2961,7 +2961,7 @@ mod tests {
     fn direct_convert_tool_attachment_splits_into_tool_and_user_messages() {
         let provider = test_provider().with_vision(true);
         let mut tool_message =
-            ChatMessage::tool_result("call_1", "computer_use", "{\"status\":\"ok\"}");
+            ChatMessage::tool_result("call_1", "cua_get_window_state", "{\"status\":\"ok\"}");
         tool_message.content_parts.push(MessageContentPart::image(MessageAttachment {
             mime_type: "image/png".to_owned(),
             name: Some("snapshot.png".to_owned()),
@@ -2982,7 +2982,10 @@ mod tests {
         assert_eq!(api_messages[0].role, "user");
         assert_eq!(api_messages[1].role, "tool");
         assert_eq!(api_messages[1].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(api_messages[1].name.as_deref(), Some("computer_use"));
+        assert_eq!(
+            api_messages[1].name.as_deref(),
+            Some("cua_get_window_state")
+        );
         assert_eq!(api_messages[2].role, "user");
         match api_messages[2].content.as_ref() {
             Some(ApiMessageContent::Parts(parts)) => {

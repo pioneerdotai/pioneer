@@ -189,65 +189,20 @@ fn render_launchd_plist(
     )
 }
 
-fn launchd_executable_path(settings: &ServiceSettings, executable: &Path) -> Result<PathBuf> {
-    let Some(background_item_name) =
-        normalize_background_item_name(settings.macos_background_item_name.as_str())?
-    else {
-        return Ok(executable.to_path_buf());
-    };
-
-    if executable
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .is_some_and(|stem| stem == background_item_name)
-    {
-        return Ok(executable.to_path_buf());
+fn launchd_executable_path(_settings: &ServiceSettings, executable: &Path) -> Result<PathBuf> {
+    // This signed application is the Gateway itself, not the Desktop app. The
+    // driver is its direct child; AssociatedBundleIdentifiers is only UI metadata.
+    let bundle_executable = executable
+        .parent()
+        .context("gateway executable has no parent directory")?
+        .join("cua/Pioneer Gateway.app/Contents/MacOS/pioneer");
+    if bundle_executable.is_file() {
+        Ok(bundle_executable)
+    } else {
+        // Developer/non-packaged Gateways still run other services. CUA readiness
+        // must reject a missing responsible application rather than borrow UI grants.
+        Ok(executable.to_path_buf())
     }
-
-    let launchd_dir = settings.runtime_home_dir.join("launchd");
-    fs::create_dir_all(&launchd_dir).with_context(|| {
-        format!(
-            "failed to create launchd executable directory `{}`",
-            launchd_dir.display()
-        )
-    })?;
-
-    let link_path = launchd_dir.join(background_item_name);
-    recreate_symlink(executable, &link_path)?;
-    Ok(link_path)
-}
-
-fn normalize_background_item_name(value: &str) -> Result<Option<String>> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    if trimmed.contains('/') || trimmed.contains('\0') {
-        bail!("install.macos_background_item_name must not contain path separators or NUL bytes");
-    }
-    if trimmed == "." || trimmed == ".." {
-        bail!("install.macos_background_item_name must be a file name");
-    }
-    Ok(Some(trimmed.to_owned()))
-}
-
-fn recreate_symlink(target: &Path, link_path: &Path) -> Result<()> {
-    if link_path.exists() || fs::symlink_metadata(link_path).is_ok() {
-        fs::remove_file(link_path).with_context(|| {
-            format!(
-                "failed to remove existing launchd executable link `{}`",
-                link_path.display()
-            )
-        })?;
-    }
-
-    std::os::unix::fs::symlink(target, link_path).with_context(|| {
-        format!(
-            "failed to create launchd executable link `{}` -> `{}`",
-            link_path.display(),
-            target.display()
-        )
-    })
 }
 
 fn remove_legacy_services(domain: &str, legacy_service_names: &[String]) -> Result<()> {

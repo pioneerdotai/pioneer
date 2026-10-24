@@ -109,7 +109,14 @@ impl ToolResultEnvelope {
 
     pub fn to_model_input_item(&self, call_id: &str, tool_name: &str) -> ModelInputItem {
         let payload = self.llm_payload();
-        let parts = attachment_parts_from_llm_context(&payload);
+        // Retain the existing artifact/HTML producers' attachment contract.
+        // Other tools (including external proxies and CUA-looking JSON) get
+        // media only through their executing handler's typed output channel.
+        let parts = if matches!(tool_name, crate::html::HTML_PREVIEW | "artifact_read") {
+            attachment_parts_from_llm_context(&payload)
+        } else {
+            Vec::new()
+        };
         if tool_name == crate::html::HTML_PREVIEW && parts.is_empty() && self.success {
             return ModelInputItem::tool_result(
                 call_id,
@@ -380,7 +387,7 @@ pub fn download_output_policy() -> ToolOutputPolicy {
 }
 
 pub fn computer_use_output_policy() -> ToolOutputPolicy {
-    ToolOutputPolicySnapshot::for_tool_name("computer_use")
+    ToolOutputPolicySnapshot::for_tool_name("cua_click")
 }
 
 pub fn dynamic_unknown_output_policy() -> ToolOutputPolicy {

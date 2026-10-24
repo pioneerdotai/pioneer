@@ -2524,6 +2524,7 @@ async fn capability_persistence_order_impl() {
         // Thread actions/model options require explicit selection; this turn
         // admits only the readers alongside the default HTML and task tools.
         let expected_mcp_bindings = 2
+            + pioneer_protocol::CUA_TOOL_NAMES.len()
             + crate::turn_mcp::native_tools::NativeToolFamily::Tasks
                 .definitions()
                 .len()
@@ -9306,7 +9307,7 @@ pub(crate) fn test_tool_loop_config() -> ToolLoopConfig {
         },
         computer_use: ComputerUseToolsConfig {
             runtime_home_dir: std::env::temp_dir().join("pioneer-gateway-message-tests"),
-            artifacts_subdir: "tools/computer_use".to_owned(),
+
             ..ComputerUseToolsConfig::default()
         },
         skills: SkillsLoopConfig {

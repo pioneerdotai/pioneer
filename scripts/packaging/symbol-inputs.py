@@ -172,7 +172,7 @@ def process(args, expected_run_id=None, packaged_override=None, inventory_name="
             raise ValueError("nested Gateway reuse is not supported")
         receipt = json.loads((gateway / "reuse.json").read_text())
         original = json.loads((gateway / "inputs.json").read_text())
-        if (receipt.get("schema_version") != 1 or receipt.get("variant") != "computer-use"
+        if (receipt.get("schema_version") != 1
                 or receipt.get("commit") != metadata["commit"] or receipt.get("target") != metadata["target"]
                 or str(receipt.get("run_id")) != str(original["run_id"])
                 or len(original["binaries"]) != 1

@@ -371,7 +371,7 @@ Domains:
 - memory: memory_search, memory_list, memory_get, memory_remember, memory_forget.
 - task: threads_start_options, task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_finish, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
 - artifact: artifact_prepare, artifact_register, artifact_read.
-- computer_use: computer_use.
+- computer_use: cua_click, cua_clipboard_read, cua_clipboard_write, cua_drag, cua_get_cursor_position, cua_get_desktop_state, cua_get_screen_size, cua_get_window_state, cua_hotkey, cua_invoke_menu, cua_list_apps, cua_list_windows, cua_press_key, cua_scroll, cua_set_window_frame, cua_type_text, cua_verify_state, cua_get_browser_state, cua_browser_prepare, cua_browser_navigate, cua_browser_click, cua_browser_type, cua_browser_select, cua_browser_dialog, cua_browser_set_input_files.
 
 ## Recovery Continuation
 Previous attempt was interrupted by output limits. Continue from where it stopped without repeating prior text.
@@ -422,7 +422,7 @@ Domains:
 - memory: memory_search, memory_list, memory_get, memory_remember, memory_forget.
 - task: threads_start_options, task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_finish, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
 - artifact: artifact_prepare, artifact_register, artifact_read.
-- computer_use: computer_use.
+- computer_use: cua_click, cua_clipboard_read, cua_clipboard_write, cua_drag, cua_get_cursor_position, cua_get_desktop_state, cua_get_screen_size, cua_get_window_state, cua_hotkey, cua_invoke_menu, cua_list_apps, cua_list_windows, cua_press_key, cua_scroll, cua_set_window_frame, cua_type_text, cua_verify_state, cua_get_browser_state, cua_browser_prepare, cua_browser_navigate, cua_browser_click, cua_browser_type, cua_browser_select, cua_browser_dialog, cua_browser_set_input_files.
 
 ## Recovery Continuation
 Previous attempt was interrupted by output limits. Continue from where it stopped without repeating prior text.

@@ -113,6 +113,22 @@ cd pioneer
 cargo build --workspace
 ```
 
+Gateway releases contain one ZIP per OS and architecture, including the pinned
+CUA companion payload. Install or update the complete archive with `install.sh`
+or `install.ps1`; copying only `pioneer` does not install computer use. The
+installer keeps the executable and `bin/cua` payload together during updates
+and retains recovery files when schema compatibility is unknown.
+
+macOS 13.0 or later is required for Desktop and Gateway, including source builds.
+On macOS the service runs `Pioneer Gateway.app` (`ai.pioneer.gateway`) as a
+per-user GUI LaunchAgent. Grant permissions to that signed Gateway application
+on the Gateway machine. Desktop permissions do not authorize a remote Gateway.
+Source builds without this package can run other Gateway functions, but do not
+establish CUA readiness. Linux needs a compatible graphical user session and
+its capture/input dependencies; Windows runs in the current interactive user
+session with Limited privileges. Packaged binaries and OS permissions still
+require platform qualification.
+
 Run these in separate terminals:
 
 ```bash

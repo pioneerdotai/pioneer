@@ -51,9 +51,8 @@ def restore(inputs, names, target, commit, catalog):
                     raise ValueError("Release executable module mismatch")
                 if entry["filename"] in ("pioneer", "pioneer.exe"):
                     build = SYMBOLS["native"]["build_manifest"](data)
-                    if (build["revision"] != commit or build["target"] != target
-                            or "COMPUTER_USE" not in build["features"]):
-                        raise ValueError("Desktop requires this release's computer-use Gateway")
+                    if build["revision"] != commit or build["target"] != target:
+                        raise ValueError("Desktop requires this release's Gateway")
                 binary.chmod(0o755)
                 seen.add(member.name)
                 # Binaries sort before objects; do not decompress multi-GiB symbol objects.
@@ -83,7 +82,7 @@ def main():
     entry = metadata["binaries"][0]
     (gateway / "reuse.json").write_text(json.dumps(dict(schema_version=1,
         run_id=str(metadata["run_id"]), commit=commit, target=args.target,
-        variant="computer-use", module_id=entry["module_id"], binary_sha256=entry["sha256"]),
+        module_id=entry["module_id"], binary_sha256=entry["sha256"]),
         indent=2) + "\n")
 
 

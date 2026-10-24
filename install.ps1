@@ -9,10 +9,6 @@ param(
 
     [switch]$ForceStart,
 
-    [switch]$ComputerUse,
-
-    [switch]$Headless,
-
     [string]$LocalAssetFile,
 
     [string]$LocalChecksumsFile
@@ -132,22 +128,7 @@ $releaseDownloadBase = if ($env:PIONEER_RELEASE_DOWNLOAD_BASE) { $env:PIONEER_RE
 $assetPath = ""
 $checksumsPath = ""
 $arch = Get-ArchSuffix
-$computerUseEnabled = $false
-if ($env:PIONEER_INSTALL_COMPUTER_USE) {
-    switch -Regex ($env:PIONEER_INSTALL_COMPUTER_USE) {
-        "^(1|true|yes|on)$" { $computerUseEnabled = $true; break }
-        "^(0|false|no|off)$" { $computerUseEnabled = $false; break }
-        default { Fail "invalid PIONEER_INSTALL_COMPUTER_USE value; expected 1/true/yes or 0/false/no" }
-    }
-}
-if ($ComputerUse.IsPresent) {
-    $computerUseEnabled = $true
-}
-if ($Headless.IsPresent) {
-    $computerUseEnabled = $false
-}
-$assetSuffix = if ($computerUseEnabled) { "-computer-use" } else { "" }
-$assetName = "pioneer-gateway-windows-$arch$assetSuffix.zip"
+$assetName = "pioneer-gateway-windows-$arch.zip"
 
 $tempDir = Join-Path $env:TEMP ("pioneer-install-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $tempDir | Out-Null
@@ -212,12 +193,12 @@ try {
     New-Item -ItemType Directory -Path $extractDir | Out-Null
     Expand-Archive -Path $assetPath -DestinationPath $extractDir -Force
 
-    $installerBinary = Get-ChildItem -Path $extractDir -Filter "pioneer.exe" -Recurse | Select-Object -First 1
-    if (-not $installerBinary) {
+    $installerBinary = Join-Path $extractDir "pioneer.exe"
+    if (-not (Test-Path -Path $installerBinary -PathType Leaf)) {
         Fail "downloaded archive does not contain pioneer.exe"
     }
 
-    Run-BootstrapInstaller -InstallerBinary $installerBinary.FullName -AssetPath $assetPath -ChecksumsPath $checksumsPath
+    Run-BootstrapInstaller -InstallerBinary $installerBinary -AssetPath $assetPath -ChecksumsPath $checksumsPath
 }
 finally {
     Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue

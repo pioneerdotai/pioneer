@@ -1,5 +1,4 @@
-#[cfg(feature = "computer-use")]
-mod computer_use;
+pub mod computer_use;
 
 pub(crate) mod apply_patch;
 mod fff_grep;
@@ -11,8 +10,7 @@ mod shell;
 mod skill;
 mod web;
 
-#[cfg(feature = "computer-use")]
-pub use computer_use::{ComputerUseHandler, materialize_computer_use_domain_bundle};
+pub use computer_use::materialize_computer_use_domain_bundle;
 
 pub use apply_patch::ApplyPatchHandler;
 pub use files::{GrepHandler, ListDirHandler, ReadFileHandler};
