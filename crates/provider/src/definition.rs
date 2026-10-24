@@ -320,7 +320,7 @@ mod tests {
                 "https://example.test/private/v7"
             );
         }
-        assert_eq!(provider_definitions().count(), 56);
+        assert_eq!(provider_definitions().count(), 57);
     }
 
     #[test]

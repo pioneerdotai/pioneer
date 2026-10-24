@@ -987,7 +987,7 @@ mod tests {
             provider.chat(ChatRequest {
                 model: "private/agent".into(),
                 messages: vec![crate::ChatMessage::user("hello")],
-                temperature: Some(0.4),
+                temperature: Some(0.5),
                 max_tokens: Some(200),
                 tools: None,
                 tool_choice: None,
@@ -1005,7 +1005,7 @@ mod tests {
             serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
         assert_eq!(body["model"], "private/agent");
         assert_eq!(body["max_output_tokens"], 200);
-        assert_eq!(body["temperature"], 0.4);
+        assert_eq!(body["temperature"], 0.5);
         assert_eq!(body["store"], false);
         assert!(body.get("reasoning").is_none());
     }

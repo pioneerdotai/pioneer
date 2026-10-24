@@ -318,7 +318,9 @@ async fn prepare_messages_async(
         let native = crate::generation::native_model(provider_name, model);
         let entry = if native.is_some() {
             native
-        } else if crate::generation::uses_public_catalog(provider_name) {
+        } else if provider_name != "vercel-ai-gateway"
+            || crate::generation::uses_public_catalog(provider_name)
+        {
             let catalog = fixture_catalog
                 .map(Ok)
                 .unwrap_or_else(crate::catalog::model_catalog)

@@ -1444,6 +1444,11 @@ mod tests {
         fn name(&self) -> &str {
             self.0
         }
+        fn model_tool_calling(&self, _model: &str) -> bool {
+            // Authority-owned adapters expose the same explicit negative fact
+            // synchronously as through discovery; the adapter ceiling is wider.
+            false
+        }
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {
                 tool_calling: true,
