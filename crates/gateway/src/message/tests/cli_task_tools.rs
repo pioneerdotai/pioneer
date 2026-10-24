@@ -3753,7 +3753,7 @@ fn admitted_cli_search_preserves_structured_pages_at_projection_byte_boundary() 
         assert_eq!(second["threads"][1]["threadId"], "byte-boundary-c");
         assert_eq!(second["threads"][1]["title"], titles[2]);
         assert_eq!(second["eof"], true);
-        assert!(second["nextCursor"].is_null());
+        assert_eq!(second["nextCursor"], JsonValue::Null);
         let mut wrong_query = next_params.clone();
         wrong_query["query"] = "different query".into();
         assert!(

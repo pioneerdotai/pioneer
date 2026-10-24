@@ -10,7 +10,7 @@ use pioneer_memory::{
     thread_episodic_memvid_metadata,
 };
 use pioneer_protocol::{ItemCompletedNotification, TurnItem};
-use sea_orm::{DatabaseBackend, Statement};
+use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 
 async fn capsule(p: &MessageProcessor, root: &str) -> ThreadEpisodicCapsuleRecord {
     p.crud_store
