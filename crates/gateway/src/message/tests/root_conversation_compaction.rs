@@ -1296,7 +1296,7 @@ async fn hidden_composer_defers_root_warmup_until_its_answer_is_delivered() {
         acknowledgement.try_get("", "created_at").unwrap();
     assert_eq!(
         delivered_activity,
-        activity.max(ready_at.timestamp_millis()),
+        std::cmp::max(activity, ready_at.timestamp_millis()),
         "Composer activity follows original publication, even if receipt processing crosses a clock second"
     );
     assert!(

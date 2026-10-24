@@ -289,7 +289,7 @@ pub(crate) async fn recover_root_activity_quantum(store: &crate::CrudStore) -> R
         let mut next_ms = before_ms;
         let mut next_id = before_id.clone();
         for row in &rows {
-            confirmed = confirmed.max(row.try_get("", "confirmed_ms")?);
+            confirmed = std::cmp::max(confirmed, row.try_get("", "confirmed_ms")?);
             next_ms = row.try_get("", "event_ms")?;
             next_id = row.try_get("", "id")?;
         }
