@@ -419,6 +419,12 @@ pub(crate) fn cli_runtime_mcp_capabilities_input(
             })
             .map(|tool| tool.canonical_callable_name.clone())
             .collect(),
+        native_html_tools: projection
+            .tools
+            .iter()
+            .filter(|tool| tool.server_installation_id == pioneer_tools::html::HTML_SERVER_ID)
+            .map(|tool| tool.canonical_callable_name.clone())
+            .collect(),
         native_task_tools: projection
             .tools
             .iter()

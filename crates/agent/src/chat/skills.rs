@@ -556,6 +556,7 @@ mod tests {
                 &permission,
                 false,
                 enabled,
+                false,
                 true,
                 continuing,
                 Some("root"),

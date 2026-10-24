@@ -4250,6 +4250,14 @@ impl MessageProcessor {
                         .iter()
                         .any(crate::turn_mcp::native_tools::is_task_operation)
                 });
+            let include_html = combined_preflight_input
+                .mcp_projection
+                .as_ref()
+                .is_some_and(|projection| {
+                    projection.tools.iter().any(|tool| {
+                        tool.server_installation_id == pioneer_tools::html::HTML_SERVER_ID
+                    })
+                });
             let include_threads = combined_preflight_input
                 .mcp_projection
                 .as_ref()
@@ -4262,6 +4270,7 @@ impl MessageProcessor {
             let (skill_install_plans, resolved_skill_bindings) = if attachments.is_empty()
                 && !include_task_orchestration
                 && !include_threads
+                && !include_html
             {
                 (Vec::new(), Vec::new())
             } else {
@@ -4274,6 +4283,7 @@ impl MessageProcessor {
                         &projected_mcp_availability,
                         include_task_orchestration,
                         include_threads,
+                        include_html,
                     ),
                 )
                 .await

@@ -13,6 +13,7 @@ pub struct PromptCompileInput {
     pub include_tool_recovery_policy: bool,
     pub include_task_orchestration_policy: bool,
     pub include_threads_policy: bool,
+    pub include_html_policy: bool,
     pub continue_generation_hint: bool,
     pub runtime_sections: Vec<PromptRuntimeSectionInput>,
     pub dynamic_sections: Vec<DynamicPromptSectionInput>,

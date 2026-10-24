@@ -70,6 +70,7 @@ impl std::error::Error for CliRuntimeClaudeSkillNotModelInvocable {}
 
 // Provider-visible aliases are deliberately independent of ordinary user skill names.
 const CLI_TASKS_SKILL_EXPORT_NAME: &str = "pioneer-system-tasks";
+const CLI_HTML_SKILL_EXPORT_NAME: &str = "pioneer-system-html";
 const CLI_SUBAGENTS_SKILL_EXPORT_NAME: &str = "pioneer-system-subagents";
 const CLI_THREADS_SKILL_EXPORT_NAME: &str = "pioneer-system-threads";
 
@@ -79,6 +80,7 @@ fn cli_orchestration_export_name(
     slug: &str,
 ) -> Option<&'static str> {
     match (source_kind, owner, slug) {
+        ("system", Some("pioneer"), "html") => Some(CLI_HTML_SKILL_EXPORT_NAME),
         ("system", Some("pioneer"), "tasks") => Some(CLI_TASKS_SKILL_EXPORT_NAME),
         ("system", Some("pioneer"), "subagents") => Some(CLI_SUBAGENTS_SKILL_EXPORT_NAME),
         ("system", Some("pioneer"), "threads") => Some(CLI_THREADS_SKILL_EXPORT_NAME),
@@ -775,6 +777,10 @@ pub(crate) async fn install_one_cli_runtime_skill(
             &[
                 (
                     plan.native_skills_root.as_path(),
+                    CLI_HTML_SKILL_EXPORT_NAME,
+                ),
+                (
+                    plan.native_skills_root.as_path(),
                     CLI_TASKS_SKILL_EXPORT_NAME,
                 ),
                 (
@@ -1184,7 +1190,7 @@ mod tests {
 
     #[test]
     fn cli_required_task_skills_are_supported_without_enabling_other_required_skills() {
-        for slug in ["tasks", "subagents", "threads"] {
+        for slug in ["tasks", "subagents", "html", "threads"] {
             let mut skill = resolved_skill(slug, SkillSourceKind::System);
             skill.definition.identity.owner = Some("pioneer".to_owned());
             skill.definition.policy_hints.implicit_invocation =
@@ -1202,7 +1208,7 @@ mod tests {
     }
 
     fn canonical_orchestration_skills() -> Vec<pioneer_skills::ResolvedSkill> {
-        ["tasks", "subagents", "threads"]
+        ["tasks", "subagents", "html", "threads"]
             .into_iter()
             .map(|slug| {
                 let mut skill = resolved_skill(slug, SkillSourceKind::System);
@@ -1239,7 +1245,7 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let home = temp.path().join("native");
             let runtime = runtime_instance(config_kind, home.display().to_string(), None);
-            for name in ["tasks", "subagents", "threads"] {
+            for name in ["tasks", "subagents", "html", "threads"] {
                 let foreign = home.join("skills").join(name);
                 fs::create_dir_all(&foreign).unwrap();
                 fs::write(foreign.join("SKILL.md"), format!("user {name}")).unwrap();
@@ -1305,7 +1311,7 @@ mod tests {
                 &receipt_path,
             )
             .unwrap();
-            assert_eq!(restored.len(), 3);
+            assert_eq!(restored.len(), 4);
             let initial = normalize_cli_runtime_selected_skills(
                 installed.iter().map(CliRuntimeSelectedSkill::from),
             )
@@ -1317,6 +1323,7 @@ mod tests {
                     .map(|skill| skill.install_name.as_str())
                     .collect::<Vec<_>>(),
                 [
+                    "pioneer-system-html",
                     "pioneer-system-subagents",
                     "pioneer-system-tasks",
                     "pioneer-system-threads"
@@ -1354,7 +1361,7 @@ mod tests {
                 .unwrap(),
                 restored
             );
-            for name in ["tasks", "subagents", "threads"] {
+            for name in ["tasks", "subagents", "html", "threads"] {
                 let foreign = home.join("skills").join(name);
                 assert_eq!(
                     fs::read_to_string(foreign.join("SKILL.md")).unwrap(),
@@ -1445,6 +1452,7 @@ mod tests {
                 .map(|skill| skill.install_name.as_str())
                 .collect::<Vec<_>>(),
             [
+                "pioneer-system-html",
                 "pioneer-system-subagents",
                 "pioneer-system-tasks",
                 "pioneer-system-threads",
@@ -1461,6 +1469,7 @@ mod tests {
                 "z-user",
                 "pioneer-system-tasks",
                 "pioneer-system-subagents",
+                "pioneer-system-html",
                 "pioneer-system-threads"
             ]
         );
@@ -1641,7 +1650,7 @@ mod tests {
 
     #[tokio::test]
     async fn orchestration_export_update_recovers_after_copy_without_receipt_commit() {
-        for skill_index in 0..3 {
+        for skill_index in 0..4 {
             let temp = tempfile::tempdir().unwrap();
             let runtime = runtime_instance(
                 pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude,
@@ -1714,7 +1723,7 @@ mod tests {
 
     #[tokio::test]
     async fn orchestration_exports_refuse_foreign_destinations_receipts_and_local_edits() {
-        for skill_index in 0..3 {
+        for skill_index in 0..4 {
             for case in [
                 "unreceipted",
                 "foreign-receipt",
@@ -1785,6 +1794,7 @@ mod tests {
                         entry.install_name = [
                             CLI_TASKS_SKILL_EXPORT_NAME,
                             CLI_SUBAGENTS_SKILL_EXPORT_NAME,
+                            CLI_HTML_SKILL_EXPORT_NAME,
                             CLI_THREADS_SKILL_EXPORT_NAME,
                         ][skill_index]
                             .to_owned();
@@ -1848,7 +1858,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn orchestration_exports_never_replace_or_follow_foreign_symlinks() {
-        for skill_index in 0..3 {
+        for skill_index in 0..4 {
             use std::os::unix::fs::symlink;
             for case in ["destination", "receipt", "root", "nested"] {
                 let temp = tempfile::tempdir().unwrap();

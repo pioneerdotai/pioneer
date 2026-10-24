@@ -761,9 +761,15 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
     let metadata: Value = serde_json::from_str(&candidate.metadata_json)?;
     let origin = &metadata["htmlTool"];
     ensure!(
-        origin["version"] == 1 && origin["publication"] == false,
+        matches!(origin["version"].as_u64(), Some(1 | 2)) && origin["publication"] == false,
         "unknown preview provenance"
     );
+    // Version one is the persisted single-theme, three-width layout. Version
+    // two names each frame by appearance and width; formats cannot be mixed.
+    let preview_format = origin["version"]
+        .as_u64()
+        .expect("validated preview version");
+    let six_frames = preview_format == 2;
     let turn = origin["turnId"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -823,10 +829,14 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
             )
             .eq(call),
         )
-        .limit(5)
+        // Source plus six frames, with one sentinel to reject ambiguity.
+        .limit(8)
         .all(&store.connection)
         .await?;
-    ensure!(artifacts.len() <= 4, "ambiguous preview artifact group");
+    ensure!(
+        artifacts.len() <= if six_frames { 7 } else { 4 },
+        "ambiguous preview artifact group"
+    );
     if artifacts.is_empty() {
         return Ok(());
     }
@@ -837,7 +847,25 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
         let meta: Value = serde_json::from_str(&a.metadata_json)?;
         let index = meta["htmlTool"]["index"].as_str().unwrap_or("");
         ensure!(
-            matches!(index, "input" | "360" | "768" | "1024") && indices.insert(index.to_owned()),
+            meta["htmlTool"]["version"].as_u64() == Some(preview_format),
+            "mixed preview capture formats"
+        );
+        let valid_index = if six_frames {
+            matches!(
+                index,
+                "input"
+                    | "light-360"
+                    | "light-768"
+                    | "light-1024"
+                    | "dark-360"
+                    | "dark-768"
+                    | "dark-1024"
+            )
+        } else {
+            matches!(index, "input" | "360" | "768" | "1024")
+        };
+        ensure!(
+            valid_index && indices.insert(index.to_owned()),
             "invalid preview index"
         );
         let v = artifact_version::Entity::find()
