@@ -2297,7 +2297,10 @@ mod tests {
             ("cua_browser_type", PermissionActionKind::ComputerUse),
             ("cua_browser_select", PermissionActionKind::ComputerUse),
             ("cua_browser_dialog", PermissionActionKind::ComputerUse),
-            ("cua_browser_set_input_files", PermissionActionKind::ComputerUse),
+            (
+                "cua_browser_set_input_files",
+                PermissionActionKind::ComputerUse,
+            ),
             ("read_skill", PermissionActionKind::Internal),
             ("threads_start_options", PermissionActionKind::Internal),
             (
