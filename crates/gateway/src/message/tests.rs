@@ -25572,6 +25572,27 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         }
     })
     .await;
+    if settled.is_err() {
+        let operations = pioneer_entity::compaction_operation::Entity::find()
+            .all(&crud_store.database_connection())
+            .await
+            .unwrap();
+        let progress: Vec<_> = operations
+            .iter()
+            .map(|operation| {
+                (
+                    &operation.status,
+                    operation.attempts,
+                    operation.next_portion,
+                    &operation.outcome,
+                )
+            })
+            .collect();
+        eprintln!(
+            "Native history operations: {progress:?}; provider calls: {}",
+            provider.call_count()
+        );
+    }
     assert!(
         settled.is_ok(),
         "released Native history worker should finish; barrier: {barrier:?}; checks: {:?}",

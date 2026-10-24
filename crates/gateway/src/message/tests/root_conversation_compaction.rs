@@ -152,6 +152,24 @@ async fn drain_worker(processor: &MessageProcessor) {
         }
     })
     .await;
+    if settled.is_err() {
+        let operations = pioneer_entity::compaction_operation::Entity::find()
+            .all(&processor.crud_store.database_connection())
+            .await
+            .unwrap();
+        let progress: Vec<_> = operations
+            .iter()
+            .map(|operation| {
+                (
+                    &operation.status,
+                    operation.attempts,
+                    operation.next_portion,
+                    &operation.outcome,
+                )
+            })
+            .collect();
+        eprintln!("Root history operations: {progress:?}");
+    }
     assert!(
         settled.is_ok(),
         "history worker did not settle; durable checks: {:?}",
@@ -1681,6 +1699,20 @@ async fn real_composer_native_start_preempts_background_owned_by_the_visible_roo
         .await
         .unwrap()
         .unwrap();
+    if status != TaskStatus::Completed {
+        let turns: Vec<_> = state
+            .task_run_turns
+            .iter()
+            .map(|turn| turn.turn_id.clone())
+            .collect();
+        let events = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.is_in(turns))
+            .filter(pioneer_entity::turn_event::Column::EventType.eq("turn/blocked"))
+            .all(&harness.crud_store.database_connection())
+            .await
+            .unwrap();
+        eprintln!("Composer blocked events: {events:?}");
+    }
     assert_eq!(status, TaskStatus::Completed, "Composer state: {state:?}");
     let lineage =
         wait_for_child_lineage_for_run(harness.crud_store.clone(), &state.runs.last().unwrap().id)
