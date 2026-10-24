@@ -1857,86 +1857,14 @@ impl Default for GatewayWebToolsConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayComputerUseToolsConfig {
-    #[serde(default = "default_computer_use_artifacts_subdir")]
-    pub artifacts_subdir: String,
-    #[serde(default = "default_computer_use_retention_hours")]
-    pub retention_hours: u64,
     #[serde(default = "default_computer_use_max_total_bytes")]
     pub max_total_bytes: u64,
-    #[serde(default = "default_computer_use_run_max_steps_default")]
-    pub run_max_steps_default: u32,
-    #[serde(default = "default_computer_use_snapshot_transport_max_bytes")]
-    pub snapshot_transport_max_bytes: usize,
-    #[serde(default = "default_computer_use_snapshot_transport_max_side_px")]
-    pub snapshot_transport_max_side_px: u32,
-    #[serde(default = "default_computer_use_snapshot_transport_min_side_px")]
-    pub snapshot_transport_min_side_px: u32,
-    #[serde(default = "default_computer_use_snapshot_downscale_factor")]
-    pub snapshot_downscale_factor: f64,
-    #[serde(default = "default_computer_use_accessibility_tree_max_depth")]
-    pub accessibility_tree_max_depth: usize,
-    #[serde(default = "default_computer_use_accessibility_tree_max_nodes")]
-    pub accessibility_tree_max_nodes: usize,
-    #[serde(default = "default_computer_use_accessibility_tree_max_serialized_bytes")]
-    pub accessibility_tree_max_serialized_bytes: usize,
-    #[serde(default = "default_computer_use_accessibility_tree_text_max_chars")]
-    pub accessibility_tree_text_max_chars: usize,
-    #[serde(default = "default_computer_use_semantic_action_timeout_ms")]
-    pub semantic_action_timeout_ms: u64,
-    #[serde(default = "default_computer_use_app_activation_timeout_ms")]
-    pub app_activation_timeout_ms: u64,
-    #[serde(default = "default_computer_use_input_simulation_enabled")]
-    pub input_simulation_enabled: bool,
-    #[serde(default = "default_computer_use_launch_if_missing_default")]
-    pub launch_if_missing_default: bool,
-    #[serde(default)]
-    pub allowed_launch_commands: Vec<String>,
-    #[serde(default = "default_computer_use_preflight_screenshot_probe_enabled")]
-    pub preflight_screenshot_probe_enabled: bool,
-    #[serde(default = "default_computer_use_max_consecutive_same_snapshot_hash")]
-    pub max_consecutive_same_snapshot_hash: u32,
-    #[serde(default = "default_computer_use_max_consecutive_same_action_signature")]
-    pub max_consecutive_same_action_signature: u32,
-    #[serde(default = "default_computer_use_max_consecutive_no_progress_steps")]
-    pub max_consecutive_no_progress_steps: u32,
-    #[serde(default = "default_computer_use_max_recovery_attempts_per_step")]
-    pub max_recovery_attempts_per_step: u32,
-    #[serde(default = "default_computer_use_max_recovery_attempts_per_run")]
-    pub max_recovery_attempts_per_run: u32,
 }
 
 impl Default for GatewayComputerUseToolsConfig {
     fn default() -> Self {
         Self {
-            artifacts_subdir: default_computer_use_artifacts_subdir(),
-            retention_hours: default_computer_use_retention_hours(),
             max_total_bytes: default_computer_use_max_total_bytes(),
-            run_max_steps_default: default_computer_use_run_max_steps_default(),
-            snapshot_transport_max_bytes: default_computer_use_snapshot_transport_max_bytes(),
-            snapshot_transport_max_side_px: default_computer_use_snapshot_transport_max_side_px(),
-            snapshot_transport_min_side_px: default_computer_use_snapshot_transport_min_side_px(),
-            snapshot_downscale_factor: default_computer_use_snapshot_downscale_factor(),
-            accessibility_tree_max_depth: default_computer_use_accessibility_tree_max_depth(),
-            accessibility_tree_max_nodes: default_computer_use_accessibility_tree_max_nodes(),
-            accessibility_tree_max_serialized_bytes:
-                default_computer_use_accessibility_tree_max_serialized_bytes(),
-            accessibility_tree_text_max_chars:
-                default_computer_use_accessibility_tree_text_max_chars(),
-            semantic_action_timeout_ms: default_computer_use_semantic_action_timeout_ms(),
-            app_activation_timeout_ms: default_computer_use_app_activation_timeout_ms(),
-            input_simulation_enabled: default_computer_use_input_simulation_enabled(),
-            launch_if_missing_default: default_computer_use_launch_if_missing_default(),
-            allowed_launch_commands: Vec::new(),
-            preflight_screenshot_probe_enabled:
-                default_computer_use_preflight_screenshot_probe_enabled(),
-            max_consecutive_same_snapshot_hash:
-                default_computer_use_max_consecutive_same_snapshot_hash(),
-            max_consecutive_same_action_signature:
-                default_computer_use_max_consecutive_same_action_signature(),
-            max_consecutive_no_progress_steps:
-                default_computer_use_max_consecutive_no_progress_steps(),
-            max_recovery_attempts_per_step: default_computer_use_max_recovery_attempts_per_step(),
-            max_recovery_attempts_per_run: default_computer_use_max_recovery_attempts_per_run(),
         }
     }
 }
@@ -2041,20 +1969,8 @@ const fn default_tool_retry_max_retries_per_tool_name_per_episode() -> u32 {
     16
 }
 
-fn default_computer_use_artifacts_subdir() -> String {
-    "tools/computer_use".to_owned()
-}
-
-const fn default_computer_use_retention_hours() -> u64 {
-    24
-}
-
 const fn default_computer_use_max_total_bytes() -> u64 {
     1024 * 1024 * 1024
-}
-
-const fn default_computer_use_run_max_steps_default() -> u32 {
-    300
 }
 
 const fn default_gateway_keepawake() -> bool {
@@ -2202,78 +2118,6 @@ const fn default_gateway_hook_recovery_max_concurrent() -> usize {
 
 const fn default_gateway_hook_recovery_stale_running_after_ms() -> u64 {
     120_000
-}
-
-const fn default_computer_use_snapshot_transport_max_bytes() -> usize {
-    8 * 1024 * 1024
-}
-
-const fn default_computer_use_snapshot_transport_max_side_px() -> u32 {
-    1280
-}
-
-const fn default_computer_use_snapshot_transport_min_side_px() -> u32 {
-    320
-}
-
-const fn default_computer_use_snapshot_downscale_factor() -> f64 {
-    0.85
-}
-
-const fn default_computer_use_accessibility_tree_max_depth() -> usize {
-    6
-}
-
-const fn default_computer_use_accessibility_tree_max_nodes() -> usize {
-    200
-}
-
-const fn default_computer_use_accessibility_tree_max_serialized_bytes() -> usize {
-    192 * 1024
-}
-
-const fn default_computer_use_accessibility_tree_text_max_chars() -> usize {
-    160
-}
-
-const fn default_computer_use_semantic_action_timeout_ms() -> u64 {
-    30_000
-}
-
-const fn default_computer_use_app_activation_timeout_ms() -> u64 {
-    5_000
-}
-
-const fn default_computer_use_input_simulation_enabled() -> bool {
-    true
-}
-
-const fn default_computer_use_launch_if_missing_default() -> bool {
-    false
-}
-
-const fn default_computer_use_preflight_screenshot_probe_enabled() -> bool {
-    true
-}
-
-const fn default_computer_use_max_consecutive_same_snapshot_hash() -> u32 {
-    6
-}
-
-const fn default_computer_use_max_consecutive_same_action_signature() -> u32 {
-    8
-}
-
-const fn default_computer_use_max_consecutive_no_progress_steps() -> u32 {
-    4
-}
-
-const fn default_computer_use_max_recovery_attempts_per_step() -> u32 {
-    2
-}
-
-const fn default_computer_use_max_recovery_attempts_per_run() -> u32 {
-    12
 }
 
 const fn default_provider_non_stream_request_timeout_secs() -> u64 {
@@ -4321,139 +4165,8 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
                 .runtime_recheck_on_tool_call
         );
         assert_eq!(
-            config.gateway.tools.computer_use.artifacts_subdir,
-            "tools/computer_use"
-        );
-        assert_eq!(config.gateway.tools.computer_use.retention_hours, 24);
-        assert_eq!(
             config.gateway.tools.computer_use.max_total_bytes,
             1024 * 1024 * 1024
-        );
-        assert_eq!(config.gateway.tools.computer_use.run_max_steps_default, 300);
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .snapshot_transport_max_bytes,
-            8 * 1024 * 1024
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .snapshot_transport_max_side_px,
-            1280
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .snapshot_transport_min_side_px,
-            320
-        );
-        assert_eq!(
-            config.gateway.tools.computer_use.snapshot_downscale_factor,
-            0.85
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .accessibility_tree_max_depth,
-            6
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .accessibility_tree_max_nodes,
-            200
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .accessibility_tree_max_serialized_bytes,
-            192 * 1024
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .accessibility_tree_text_max_chars,
-            160
-        );
-        assert_eq!(
-            config.gateway.tools.computer_use.semantic_action_timeout_ms,
-            30_000
-        );
-        assert_eq!(
-            config.gateway.tools.computer_use.app_activation_timeout_ms,
-            5_000
-        );
-        assert!(config.gateway.tools.computer_use.input_simulation_enabled);
-        assert!(!config.gateway.tools.computer_use.launch_if_missing_default);
-        assert!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .allowed_launch_commands
-                .is_empty()
-        );
-        assert!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .preflight_screenshot_probe_enabled
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .max_consecutive_same_snapshot_hash,
-            6
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .max_consecutive_same_action_signature,
-            8
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .max_consecutive_no_progress_steps,
-            4
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .max_recovery_attempts_per_step,
-            2
-        );
-        assert_eq!(
-            config
-                .gateway
-                .tools
-                .computer_use
-                .max_recovery_attempts_per_run,
-            12
         );
         assert_eq!(
             config.gateway.provider.attachments.max_bytes_per_attachment,

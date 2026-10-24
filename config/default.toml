@@ -8,8 +8,8 @@ windows_root_directory_name = "Pioneer"
 managed_directory_name = "managed"
 binary_name = "pioneer"
 command_name = "pioneer"
-macos_background_item_name = "Pioneer"
-macos_associated_bundle_identifier = "ai.pioneer.macos"
+macos_background_item_name = "Pioneer Gateway"
+macos_associated_bundle_identifier = "ai.pioneer.gateway"
 
 [gateway]
 settings_version = 1
@@ -118,31 +118,7 @@ ddg_instant_api_url = "https://api.duckduckgo.com/"
 default_user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
 [gateway.tools.computer_use]
-artifacts_subdir = "tools/computer_use"
-retention_hours = 24
 max_total_bytes = 1073741824
-run_max_steps_default = 300
-snapshot_transport_max_bytes = 8388608
-snapshot_transport_max_side_px = 1280
-snapshot_transport_min_side_px = 320
-snapshot_downscale_factor = 0.85
-accessibility_tree_max_depth = 6
-accessibility_tree_max_nodes = 200
-accessibility_tree_max_serialized_bytes = 196608
-accessibility_tree_text_max_chars = 160
-semantic_action_timeout_ms = 30000
-app_activation_timeout_ms = 5000
-input_simulation_enabled = true
-launch_if_missing_default = false
-# Empty allows any explicit launch_command. Non-empty allows only exact commands.
-# List each intended variant explicitly; prefix matching would let shell syntax append another command.
-allowed_launch_commands = []
-preflight_screenshot_probe_enabled = true
-max_consecutive_same_snapshot_hash = 6
-max_consecutive_same_action_signature = 8
-max_consecutive_no_progress_steps = 4
-max_recovery_attempts_per_step = 2
-max_recovery_attempts_per_run = 12
 
 [gateway.tools.budget]
 max_agent_rounds_per_turn = 32

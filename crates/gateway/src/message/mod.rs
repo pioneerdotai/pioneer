@@ -1035,6 +1035,9 @@ struct TaskEventFanoutSummary {
 }
 
 impl MessageProcessor {
+    pub(crate) fn computer_use_config(&self) -> pioneer_tools::ComputerUseToolsConfig {
+        self.tool_loop_config.computer_use.clone()
+    }
     #[cfg(test)]
     pub fn new_with_memory_runtime(
         thread_manager: Arc<ThreadManager>,
@@ -1897,6 +1900,12 @@ impl MessageProcessor {
     }
 
     pub async fn bind_agent_tool_bridges(self: &Arc<Self>) {
+        self.tool_loop_config
+            .computer_use
+            .image_admission
+            .set(Arc::new(artifact_tools::GatewayCuaImageSink(
+                Arc::downgrade(self),
+            )));
         self.bind_permission_approval_bridge().await;
         self.bind_task_bridge().await;
         self.bind_artifact_tool_bridge().await;
@@ -4770,7 +4779,6 @@ impl MessageProcessor {
             },
             computer_use: pioneer_tools::ComputerUseToolsConfig {
                 runtime_home_dir: std::env::temp_dir().join("pioneer-message-tests"),
-                artifacts_subdir: "tools/computer_use".to_owned(),
                 ..pioneer_tools::ComputerUseToolsConfig::default()
             },
             skills: pioneer_agent::SkillsLoopConfig {

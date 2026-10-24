@@ -69,7 +69,19 @@ impl ErrorClassifier for DefaultErrorClassifier {
             return classify_web_result(invocation.tool_name.as_str(), raw_output_json, success);
         }
 
-        if is_computer_use_tool(invocation.tool_name.as_str()) {
+        if is_computer_use_tool(invocation.tool_name.as_str())
+            || invocation
+                .permission_metadata
+                .dynamic_skill
+                .as_ref()
+                .is_some_and(|metadata| {
+                    metadata.kind == crate::spec::DynamicSkillPermissionKind::FunctionProxy
+                        && metadata
+                            .target_tool
+                            .as_deref()
+                            .is_some_and(crate::is_computer_use_tool)
+                })
+        {
             return classify_computer_use_result(raw_output_json, success);
         }
 
@@ -134,7 +146,20 @@ impl ErrorClassifier for DefaultErrorClassifier {
             return classify_shell_error(error);
         }
 
-        if is_computer_use_tool(invocation.tool_name.as_str()) {
+        if is_computer_use_tool(invocation.tool_name.as_str())
+            || crate::runtime::is_active_computer_use_dispatch(&invocation.tool_name)
+            || invocation
+                .permission_metadata
+                .dynamic_skill
+                .as_ref()
+                .is_some_and(|metadata| {
+                    metadata.kind == crate::spec::DynamicSkillPermissionKind::FunctionProxy
+                        && metadata
+                            .target_tool
+                            .as_deref()
+                            .is_some_and(crate::is_computer_use_tool)
+                })
+        {
             return classify_computer_use_error(error);
         }
 
@@ -385,7 +410,7 @@ fn is_web_tool(tool_name: &str) -> bool {
 }
 
 fn is_computer_use_tool(tool_name: &str) -> bool {
-    tool_name == "computer_use"
+    crate::is_computer_use_tool(tool_name)
 }
 
 fn is_mcp_invocation(invocation: &ToolInvocation) -> bool {
@@ -678,305 +703,43 @@ fn classify_status_code(status_code: u16, success: bool) -> ToolOutcome {
     }
 }
 
-fn classify_computer_use_result(raw_output_json: &JsonValue, success: bool) -> ToolOutcome {
-    let action = raw_output_json
-        .get("action")
-        .and_then(JsonValue::as_str)
-        .unwrap_or_default();
-    let status = raw_output_json
-        .get("status")
-        .and_then(JsonValue::as_str)
-        .unwrap_or_default();
-    let loop_state = raw_output_json
-        .get("loop_state")
-        .and_then(JsonValue::as_str)
-        .unwrap_or_default();
-    let failure_class = raw_output_json
-        .get("failure_class")
-        .and_then(JsonValue::as_str)
-        .unwrap_or_default();
-
-    if action == "act" && computer_use_act_failed(raw_output_json) {
-        if let Some(failure_class) = computer_use_result_failure_class(raw_output_json) {
-            return computer_use_failure_outcome(failure_class, false);
-        }
-        return ToolOutcome::recoverable(
+fn classify_computer_use_result(raw: &JsonValue, success: bool) -> ToolOutcome {
+    let structured = raw.get("structuredContent").unwrap_or(raw);
+    if !success
+        || raw.get("isError").and_then(JsonValue::as_bool) == Some(true)
+        || structured.get("status").and_then(JsonValue::as_str) == Some("refused")
+    {
+        return ToolOutcome::fatal(ToolErrorClass::ExecutionFailed, Some("CUA refused or failed. Observe fresh state before choosing a new action; never replay an unknown mutation.".to_owned()));
+    }
+    let effect = structured
+        .pointer("/action/effect")
+        .or_else(|| structured.get("effect"))
+        .and_then(JsonValue::as_str);
+    if effect == Some("refused") {
+        return ToolOutcome::fatal(
             ToolErrorClass::ExecutionFailed,
-            "computer_use action failed without a structured failure_class. Request a fresh snapshot and choose a corrected action.",
-            true,
-            Some("runtime_action_error".to_owned()),
+            Some(
+                "CUA refused the action. Choose a permitted action after fresh observation."
+                    .to_owned(),
+            ),
         );
     }
-
-    if action == "snapshot" {
-        let has_attachment = raw_output_json
-            .get("llm_context")
-            .and_then(|value| value.get("attachment"))
-            .and_then(|value| value.get("path"))
-            .and_then(JsonValue::as_str)
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false);
-        if status == "running" && !has_attachment {
-            return ToolOutcome::recoverable(
-                ToolErrorClass::ExecutionFailed,
-                "computer_use snapshot result is missing llm_context attachment path. Retry snapshot.",
-                true,
-                Some("attachment_transport_failure".to_owned()),
-            );
-        }
+    if matches!(
+        effect,
+        Some("unknown" | "partial" | "unverifiable" | "suspected_noop")
+    ) {
+        return ToolOutcome { status: ToolOutcomeStatus::PartialSuccess, error_class: Some(ToolErrorClass::Unknown), should_retry: false, retry_hint: Some("Input delivery does not prove completion. Obtain a fresh observation before a new action.".to_owned()), incomplete: true, incomplete_reason: Some("action effect is not confirmed".to_owned()) };
     }
-
-    if status == "stopped" && loop_state == "completed" {
-        return ToolOutcome::ok();
-    }
-
-    if status == "stopped" {
-        if action == "stop" && (failure_class.is_empty() || loop_state == "stopped") {
-            return ToolOutcome::ok();
-        }
-        if let Some(failure_class) = canonical_computer_use_failure_class(failure_class) {
-            return computer_use_failure_outcome(failure_class, true);
-        }
-        return ToolOutcome::recoverable(
-            ToolErrorClass::ExecutionFailed,
-            "computer_use session stopped. Inspect stop_reason and decide whether to start a new session.",
-            false,
-            None,
-        );
-    }
-
-    if success {
-        ToolOutcome::ok()
-    } else {
-        ToolOutcome::recoverable(
-            ToolErrorClass::ExecutionFailed,
-            "computer_use returned unsuccessful result. Diagnose output and retry.",
-            false,
-            None,
-        )
-    }
+    ToolOutcome::ok()
 }
-
 fn classify_computer_use_error(error: &ToolError) -> ToolOutcome {
-    match error {
-        ToolError::InvalidArguments(message) => {
-            let lower = message.to_lowercase();
-            if lower.contains("session_id") {
-                return ToolOutcome::fatal(
-                    ToolErrorClass::InvalidArguments,
-                    Some(
-                        "computer_use requires a valid session_id from a successful start call before snapshot/act/verify/status/stop."
-                            .to_owned(),
-                    ),
-                );
-            }
-            ToolOutcome::recoverable(
-                ToolErrorClass::InvalidArguments,
-                "Fix computer_use arguments according to the schema and retry.",
-                false,
-                None,
-            )
-        }
-        ToolError::NotFound(message) => {
-            let lower = message.to_lowercase();
-            if lower.contains("computer_use session") && lower.contains("not found") {
-                return ToolOutcome::fatal(
-                    ToolErrorClass::InvalidArguments,
-                    Some(
-                        "computer_use session_id is invalid or stale. Do not call snapshot/act/verify/status/stop until start returns a new successful session_id."
-                            .to_owned(),
-                    ),
-                );
-            }
-            if lower.contains("app target")
-                || lower.contains("target app")
-                || lower.contains("app_not_found")
-            {
-                return ToolOutcome::fatal(
-                    ToolErrorClass::NotFound,
-                    Some(
-                        "computer_use target app was not found. Do not retry the same target blindly; use list_apps or provide a stable bundle_id/executable_path/launch_command."
-                            .to_owned(),
-                    ),
-                );
-            }
-            ToolOutcome::fatal(
-                ToolErrorClass::NotFound,
-                Some(
-                    "computer_use resource was not found. Correct the target before retrying."
-                        .to_owned(),
-                ),
-            )
-        }
-        ToolError::ExecutionFailed(message) => {
-            let lower = message.to_lowercase();
-            if lower.contains("failed to activate computer_use target")
-                || lower.contains("failed to launch computer_use target")
-            {
-                return ToolOutcome::fatal(
-                    ToolErrorClass::ExecutionFailed,
-                    Some(
-                        "computer_use could not launch or activate the requested app target. Do not retry the same target blindly; resolve a stable app identity first."
-                            .to_owned(),
-                    ),
-                );
-            }
-            ToolOutcome::recoverable(
-                ToolErrorClass::ExecutionFailed,
-                "computer_use execution failed. Inspect the structured error and retry with corrected state.",
-                false,
-                None,
-            )
-        }
-        ToolError::NotVisible(_) => ToolOutcome::recoverable(
-            ToolErrorClass::ToolNotVisible,
-            "computer_use is registered but hidden in this provider round. Request the computer_use domain before retrying.",
-            false,
-            None,
-        ),
-        ToolError::Cancelled(_) => ToolOutcome::recoverable(
-            ToolErrorClass::Cancelled,
-            "computer_use call was cancelled. Retry only if the desktop task is still needed.",
-            false,
-            None,
-        ),
-        ToolError::Rejected(_) => permission_denied_outcome(),
-        ToolError::Internal(_) => ToolOutcome::fatal(
-            ToolErrorClass::Internal,
-            Some("computer_use failed with an internal error.".to_owned()),
-        ),
-    }
-}
-
-fn computer_use_act_failed(raw_output_json: &JsonValue) -> bool {
-    raw_output_json
-        .pointer("/result/status")
-        .and_then(JsonValue::as_str)
-        == Some("failed")
-        || raw_output_json
-            .pointer("/result/execution/status")
-            .and_then(JsonValue::as_str)
-            == Some("failed")
-}
-
-fn computer_use_result_failure_class(raw_output_json: &JsonValue) -> Option<&'static str> {
-    raw_output_json
-        .pointer("/result/execution/failure_class")
-        .and_then(JsonValue::as_str)
-        .or_else(|| {
-            raw_output_json
-                .pointer("/result/failure_class")
-                .and_then(JsonValue::as_str)
-        })
-        .or_else(|| {
-            raw_output_json
-                .get("failure_class")
-                .and_then(JsonValue::as_str)
-        })
-        .and_then(canonical_computer_use_failure_class)
-}
-
-fn canonical_computer_use_failure_class(value: &str) -> Option<&'static str> {
-    match normalize_computer_use_failure_class(value).as_str() {
-        "permissiondenied" => Some("permission_denied"),
-        "accessibilityunavailable" => Some("accessibility_unavailable"),
-        "accessibilitynotenabled" => Some("accessibility_not_enabled"),
-        "appnotfound" => Some("app_not_found"),
-        "elementnotfound" => Some("element_not_found"),
-        "elementstale" => Some("element_stale"),
-        "actionnotsupported" => Some("action_not_supported"),
-        "inputsimulationunavailable" => Some("input_simulation_unavailable"),
-        "screenshotunavailable" => Some("screenshot_unavailable"),
-        "attachmenttransportfailure" => Some("attachment_transport_failure"),
-        "providertimeout" => Some("provider_timeout"),
-        "providerratelimit" => Some("provider_rate_limit"),
-        "loopguardtriggered" => Some("loop_guard_triggered"),
-        "recoverybudgetexceeded" => Some("recovery_budget_exceeded"),
-        "runtimeactionerror" => Some("runtime_action_error"),
-        _ => None,
-    }
-}
-
-fn normalize_computer_use_failure_class(value: &str) -> String {
-    value
-        .trim()
-        .chars()
-        .filter(|ch| *ch != '_' && *ch != '-')
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
-fn computer_use_failure_outcome(failure_class: &'static str, stopped: bool) -> ToolOutcome {
-    match failure_class {
-        "provider_timeout" | "provider_rate_limit" => ToolOutcome::recoverable(
-            ToolErrorClass::Timeout,
-            if stopped {
-                "computer_use stopped due provider timeout/rate-limit. Start a new session and retry."
-            } else {
-                "computer_use hit a provider timeout/rate-limit. Retry after a fresh snapshot."
-            },
-            true,
-            Some(failure_class.to_owned()),
-        ),
-        "attachment_transport_failure" | "screenshot_unavailable" => ToolOutcome::recoverable(
-            ToolErrorClass::ExecutionFailed,
-            "computer_use hit a recoverable screenshot/attachment transport issue. Retry snapshot before acting again.",
-            true,
-            Some(failure_class.to_owned()),
-        ),
-        "element_not_found" | "element_stale" => ToolOutcome::recoverable(
-            ToolErrorClass::ExecutionFailed,
-            "computer_use target is missing or stale. Request a new snapshot, re-resolve the target, and do not retry the stale node_id blindly.",
-            true,
-            Some(failure_class.to_owned()),
-        ),
-        "permission_denied" | "accessibility_not_enabled" => permission_denied_outcome(),
-        "accessibility_unavailable" => ToolOutcome::fatal(
-            ToolErrorClass::ExecutionFailed,
-            Some("computer_use accessibility backend is unavailable on this host.".to_owned()),
-        ),
-        "app_not_found" => ToolOutcome::fatal(
-            ToolErrorClass::NotFound,
-            Some(
-                "computer_use target app was not found. Retry only after providing launch_if_missing/launch_command or starting the app."
-                    .to_owned(),
-            ),
-        ),
-        "action_not_supported" => ToolOutcome::fatal(
-            ToolErrorClass::ExecutionFailed,
-            Some(
-                "computer_use action is unsupported for the target. Do not retry the same action."
-                    .to_owned(),
-            ),
-        ),
-        "input_simulation_unavailable" => ToolOutcome::fatal(
-            ToolErrorClass::ExecutionFailed,
-            Some(
-                "computer_use input simulation is unavailable. Use semantic accessibility actions instead of input_*."
-                    .to_owned(),
-            ),
-        ),
-        "loop_guard_triggered" | "recovery_budget_exceeded" => ToolOutcome::fatal(
-            ToolErrorClass::ExecutionFailed,
-            Some(
-                "computer_use stopped by loop/recovery guard. Adjust task plan or start a fresh session."
-                    .to_owned(),
-            ),
-        ),
-        "runtime_action_error" => ToolOutcome::fatal(
-            ToolErrorClass::ExecutionFailed,
-            Some(
-                "computer_use action failed at runtime. Inspect execution details before starting a new plan."
-                    .to_owned(),
-            ),
-        ),
-        _ => ToolOutcome::recoverable(
-            ToolErrorClass::ExecutionFailed,
-            "computer_use failed. Inspect failure_class and retry with corrected state.",
-            false,
-            Some(failure_class.to_owned()),
-        ),
-    }
+    let class = match error {
+        ToolError::InvalidArguments(_) => ToolErrorClass::InvalidArguments,
+        ToolError::Rejected(_) => ToolErrorClass::PermissionDenied,
+        ToolError::Cancelled(_) => ToolErrorClass::Cancelled,
+        _ => ToolErrorClass::Unknown,
+    };
+    ToolOutcome::fatal(class, Some("CUA execution was not confirmed. Never replay the operation; obtain a fresh observation before choosing a new action.".to_owned()))
 }
 
 fn classify_shell_error(error: &ToolError) -> ToolOutcome {
@@ -1145,26 +908,6 @@ mod tests {
         ToolInvocation {
             call_id: "call".to_owned(),
             tool_name: tool_name.to_owned(),
-            source: crate::context::ToolCallSource::Model,
-            payload: crate::context::ToolPayload::Function {
-                arguments: serde_json::json!({}),
-            },
-            workdir: std::path::PathBuf::from("."),
-            environment: Default::default(),
-            attempt_id: 1,
-            idempotency_key: None,
-            recovery: crate::spec::ToolRecoveryMetadata::default(),
-            permission_metadata: crate::spec::ToolPermissionMetadata::default(),
-            execution_security_snapshot: None,
-            apply_patch_preflight: None,
-            cancellation: tokio_util::sync::CancellationToken::new(),
-        }
-    }
-
-    fn computer_use_invocation() -> ToolInvocation {
-        ToolInvocation {
-            call_id: "call".to_owned(),
-            tool_name: "computer_use".to_owned(),
             source: crate::context::ToolCallSource::Model,
             payload: crate::context::ToolPayload::Function {
                 arguments: serde_json::json!({}),
@@ -1505,179 +1248,5 @@ mod tests {
         assert_eq!(outcome.status, ToolOutcomeStatus::FatalError);
         assert_eq!(outcome.error_class, Some(ToolErrorClass::PermissionDenied));
         assert!(!outcome.should_retry);
-    }
-
-    #[test]
-    fn computer_use_snapshot_without_attachment_is_recoverable() {
-        let classifier = DefaultErrorClassifier;
-        let invocation = computer_use_invocation();
-        let outcome = classifier.classify_result(
-            &invocation,
-            &serde_json::json!({
-                "action": "snapshot",
-                "status": "running",
-                "loop_state": "planner_request_built"
-            }),
-            true,
-        );
-        assert_eq!(outcome.status, ToolOutcomeStatus::RecoverableError);
-        assert_eq!(
-            outcome.incomplete_reason.as_deref(),
-            Some("attachment_transport_failure")
-        );
-    }
-
-    #[test]
-    fn computer_use_completed_outcome_is_ok() {
-        let classifier = DefaultErrorClassifier;
-        let invocation = computer_use_invocation();
-        let outcome = classifier.classify_result(
-            &invocation,
-            &serde_json::json!({
-                "action": "stop",
-                "status": "stopped",
-                "loop_state": "completed"
-            }),
-            true,
-        );
-        assert_eq!(outcome.status, ToolOutcomeStatus::Ok);
-    }
-
-    #[test]
-    fn computer_use_stale_session_error_is_terminal() {
-        let classifier = DefaultErrorClassifier;
-        let invocation = computer_use_invocation();
-        let outcome = classifier.classify_error(
-            &invocation,
-            &ToolError::NotFound("computer_use session 2 not found".to_owned()),
-        );
-        assert_eq!(outcome.status, ToolOutcomeStatus::FatalError);
-        assert_eq!(outcome.error_class, Some(ToolErrorClass::InvalidArguments));
-        assert!(!outcome.should_retry);
-    }
-
-    #[test]
-    fn computer_use_app_target_not_found_error_is_terminal() {
-        let classifier = DefaultErrorClassifier;
-        let invocation = computer_use_invocation();
-        let outcome = classifier.classify_error(
-            &invocation,
-            &ToolError::NotFound(
-                "computer_use app target not found; failure_class=app_not_found".to_owned(),
-            ),
-        );
-        assert_eq!(outcome.status, ToolOutcomeStatus::FatalError);
-        assert_eq!(outcome.error_class, Some(ToolErrorClass::NotFound));
-        assert!(!outcome.should_retry);
-    }
-
-    #[test]
-    fn computer_use_classifier_covers_every_failure_class_for_act_failures() {
-        let classifier = DefaultErrorClassifier;
-        let invocation = computer_use_invocation();
-        let expected = [
-            ("permission_denied", ToolOutcomeStatus::FatalError),
-            ("accessibility_unavailable", ToolOutcomeStatus::FatalError),
-            ("accessibility_not_enabled", ToolOutcomeStatus::FatalError),
-            ("app_not_found", ToolOutcomeStatus::FatalError),
-            ("element_not_found", ToolOutcomeStatus::RecoverableError),
-            ("element_stale", ToolOutcomeStatus::RecoverableError),
-            ("action_not_supported", ToolOutcomeStatus::FatalError),
-            (
-                "input_simulation_unavailable",
-                ToolOutcomeStatus::FatalError,
-            ),
-            (
-                "screenshot_unavailable",
-                ToolOutcomeStatus::RecoverableError,
-            ),
-            (
-                "attachment_transport_failure",
-                ToolOutcomeStatus::RecoverableError,
-            ),
-            ("provider_timeout", ToolOutcomeStatus::RecoverableError),
-            ("provider_rate_limit", ToolOutcomeStatus::RecoverableError),
-            ("loop_guard_triggered", ToolOutcomeStatus::FatalError),
-            ("recovery_budget_exceeded", ToolOutcomeStatus::FatalError),
-            ("runtime_action_error", ToolOutcomeStatus::FatalError),
-        ];
-
-        for (failure_class, expected_status) in expected {
-            let outcome = classifier.classify_result(
-                &invocation,
-                &serde_json::json!({
-                    "action": "act",
-                    "status": "running",
-                    "loop_state": "post_action_result_reported",
-                    "result": {
-                        "status": "failed",
-                        "execution": {
-                            "status": "failed",
-                            "failure_class": failure_class
-                        }
-                    }
-                }),
-                true,
-            );
-            assert_eq!(
-                outcome.status, expected_status,
-                "unexpected outcome for {failure_class}"
-            );
-            assert_eq!(outcome.incomplete_reason.as_deref(), {
-                match expected_status {
-                    ToolOutcomeStatus::RecoverableError => Some(failure_class),
-                    _ => None,
-                }
-            });
-        }
-    }
-
-    #[test]
-    fn computer_use_classifier_covers_every_failure_class_for_stopped_sessions() {
-        let classifier = DefaultErrorClassifier;
-        let invocation = computer_use_invocation();
-        let expected = [
-            ("permission_denied", ToolOutcomeStatus::FatalError),
-            ("accessibility_unavailable", ToolOutcomeStatus::FatalError),
-            ("accessibility_not_enabled", ToolOutcomeStatus::FatalError),
-            ("app_not_found", ToolOutcomeStatus::FatalError),
-            ("element_not_found", ToolOutcomeStatus::RecoverableError),
-            ("element_stale", ToolOutcomeStatus::RecoverableError),
-            ("action_not_supported", ToolOutcomeStatus::FatalError),
-            (
-                "input_simulation_unavailable",
-                ToolOutcomeStatus::FatalError,
-            ),
-            (
-                "screenshot_unavailable",
-                ToolOutcomeStatus::RecoverableError,
-            ),
-            (
-                "attachment_transport_failure",
-                ToolOutcomeStatus::RecoverableError,
-            ),
-            ("provider_timeout", ToolOutcomeStatus::RecoverableError),
-            ("provider_rate_limit", ToolOutcomeStatus::RecoverableError),
-            ("loop_guard_triggered", ToolOutcomeStatus::FatalError),
-            ("recovery_budget_exceeded", ToolOutcomeStatus::FatalError),
-            ("runtime_action_error", ToolOutcomeStatus::FatalError),
-        ];
-
-        for (failure_class, expected_status) in expected {
-            let outcome = classifier.classify_result(
-                &invocation,
-                &serde_json::json!({
-                    "action": "act",
-                    "status": "stopped",
-                    "loop_state": "failed",
-                    "failure_class": failure_class
-                }),
-                true,
-            );
-            assert_eq!(
-                outcome.status, expected_status,
-                "unexpected outcome for {failure_class}"
-            );
-        }
     }
 }

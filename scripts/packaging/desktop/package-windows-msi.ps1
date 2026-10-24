@@ -334,9 +334,10 @@ try {
     $gatewayStageDir = Join-Path $stageDir "gateway"
     New-Item -ItemType Directory -Path $gatewayStageDir -Force | Out-Null
 
-    $gatewayAssetName = "pioneer-gateway-windows-$archLabel.zip"
+    $gatewayAssetName = "pioneer-gateway-windows-$archLabel-computer-use-package.zip"
     $gatewayAssetPath = Join-Path $gatewayStageDir $gatewayAssetName
-    Compress-Archive -Path "target/$Target/release/pioneer.exe" -DestinationPath $gatewayAssetPath -Force
+    python scripts/packaging/cua-driver.py --target $Target --binary "target/$Target/release/pioneer.exe" --archive $gatewayAssetPath
+    if ($LASTEXITCODE -ne 0) { throw "Gateway CUA packaging failed" }
 
     $gatewaySha256 = (Get-FileHash -Path $gatewayAssetPath -Algorithm SHA256).Hash.ToLowerInvariant()
     "sha256:$gatewaySha256 $gatewayAssetName" | Set-Content -Path (Join-Path $gatewayStageDir "SHA256SUMS") -NoNewline

@@ -243,6 +243,7 @@ fn runtime_descriptor_to_spec(
         PayloadKind::Function,
     )
     .with_permission_metadata(permission_metadata_for_descriptor(descriptor));
+
     let resolution = resolve_dynamic_tool_output_policy(
         dynamic_policy_context(descriptor, output_policy_caps),
         descriptor.requested_output_policy.clone(),
@@ -336,6 +337,9 @@ fn dynamic_policy_context(
 }
 
 fn builtin_target_policy(tool_name: &str) -> Option<ToolOutputPolicySnapshot> {
+    if crate::is_computer_use_tool(tool_name) {
+        return Some(crate::computer_use_output_policy());
+    }
     if matches!(
         tool_name,
         "exec_command"
@@ -349,7 +353,6 @@ fn builtin_target_policy(tool_name: &str) -> Option<ToolOutputPolicySnapshot> {
             | "web_search"
             | "download_url"
             | "download"
-            | "computer_use"
     ) {
         Some(ToolOutputPolicySnapshot::for_tool_name(tool_name))
     } else {
@@ -795,6 +798,48 @@ fn expand_skill_asset_placeholders(value: &str, skill_asset_root: &str) -> Strin
         .replace("${skill_dir}", skill_asset_root)
 }
 
+/// Owns the real nested runtime result, preserving typed media and no-replay outcome.
+struct ForwardedToolOutput {
+    output: Box<dyn ToolOutput>,
+    outcome: crate::ToolOutcome,
+    parts: Vec<pioneer_provider::MessageContentPart>,
+}
+impl ToolOutput for ForwardedToolOutput {
+    fn delivery_receipt(&self) -> Option<Arc<dyn crate::context::ToolDeliveryReceipt>> {
+        self.output.delivery_receipt()
+    }
+    fn is_computer_use_output(&self) -> bool {
+        self.output.is_computer_use_output()
+    }
+    fn success(&self) -> bool {
+        self.output.success()
+    }
+    fn raw_text(&self) -> String {
+        self.output.raw_text()
+    }
+    fn raw_json(&self) -> JsonValue {
+        self.output.raw_json()
+    }
+    fn to_model_input_item(
+        &self,
+        call_id: &str,
+        tool_name: &str,
+    ) -> pioneer_provider::ModelInputItem {
+        let mut message = self
+            .output
+            .to_model_input_item(call_id, tool_name)
+            .into_chat_message();
+        message.content_parts = self.parts.clone();
+        pioneer_provider::ModelInputItem::message(message)
+    }
+    fn model_content_parts(&self) -> Vec<pioneer_provider::MessageContentPart> {
+        self.parts.clone()
+    }
+    fn delegated_outcome(&self) -> Option<crate::ToolOutcome> {
+        Some(self.outcome.clone())
+    }
+}
+
 struct SkillFunctionProxyHandler {
     descriptor: SkillDynamicToolDescriptor,
     bridge: FunctionProxyRuntimeBridge,
@@ -835,12 +880,17 @@ impl ToolHandler for SkillFunctionProxyHandler {
         )
         .await?;
 
-        let payload = nested.raw_output_json();
-        Ok(Box::new(FunctionToolOutput::with_payload(
-            nested.raw_output_text(),
-            nested.success(),
-            payload,
-        )))
+        // Preserve the actual nested runtime's admitted media, including the
+        // existing artifact/HTML projection. Never infer it from outer JSON.
+        let parts = nested
+            .to_model_input_item()
+            .into_chat_message()
+            .content_parts;
+        Ok(Box::new(ForwardedToolOutput {
+            output: nested.output,
+            outcome: nested.outcome,
+            parts,
+        }))
     }
 }
 

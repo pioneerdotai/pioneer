@@ -1,3 +1,14 @@
+<#
+.SYNOPSIS
+Install or update the Pioneer Gateway (server variant by default).
+.PARAMETER Headless
+Install the server Gateway without computer use. Overrides PIONEER_INSTALL_COMPUTER_USE.
+.PARAMETER ComputerUse
+Install the Gateway with its complete CUA driver package. Overrides PIONEER_INSTALL_COMPUTER_USE.
+.DESCRIPTION
+PIONEER_INSTALL_COMPUTER_USE=1/true/yes/on selects computer use when no variant
+switch is supplied. Use Get-Help ./install.ps1 -Detailed for parameter help.
+#>
 [CmdletBinding()]
 param(
     [ValidateSet("stable", "beta", "canary")]
@@ -146,7 +157,7 @@ if ($ComputerUse.IsPresent) {
 if ($Headless.IsPresent) {
     $computerUseEnabled = $false
 }
-$assetSuffix = if ($computerUseEnabled) { "-computer-use" } else { "" }
+$assetSuffix = if ($computerUseEnabled) { "-computer-use-package" } else { "" }
 $assetName = "pioneer-gateway-windows-$arch$assetSuffix.zip"
 
 $tempDir = Join-Path $env:TEMP ("pioneer-install-" + [guid]::NewGuid().ToString("N"))
@@ -212,12 +223,12 @@ try {
     New-Item -ItemType Directory -Path $extractDir | Out-Null
     Expand-Archive -Path $assetPath -DestinationPath $extractDir -Force
 
-    $installerBinary = Get-ChildItem -Path $extractDir -Filter "pioneer.exe" -Recurse | Select-Object -First 1
-    if (-not $installerBinary) {
+    $installerBinary = Join-Path $extractDir "pioneer.exe"
+    if (-not (Test-Path -Path $installerBinary -PathType Leaf)) {
         Fail "downloaded archive does not contain pioneer.exe"
     }
 
-    Run-BootstrapInstaller -InstallerBinary $installerBinary.FullName -AssetPath $assetPath -ChecksumsPath $checksumsPath
+    Run-BootstrapInstaller -InstallerBinary $installerBinary -AssetPath $assetPath -ChecksumsPath $checksumsPath
 }
 finally {
     Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue

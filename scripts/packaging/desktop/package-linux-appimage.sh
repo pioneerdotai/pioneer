@@ -144,9 +144,9 @@ fi
 GATEWAY_BUNDLE_DIR="$APPDIR/usr/bin/gateway"
 mkdir -p "$GATEWAY_BUNDLE_DIR"
 
-GATEWAY_ASSET_NAME="pioneer-gateway-linux-${ARCH}.gz"
+GATEWAY_ASSET_NAME="pioneer-gateway-linux-${ARCH}-computer-use-package.zip"
 GATEWAY_ASSET_PATH="$GATEWAY_BUNDLE_DIR/$GATEWAY_ASSET_NAME"
-gzip -f --stdout --best "target/$TARGET/release/pioneer" > "$GATEWAY_ASSET_PATH"
+python3 scripts/packaging/cua-driver.py --target "$TARGET" --binary "target/$TARGET/release/pioneer" --archive "$GATEWAY_ASSET_PATH"
 
 GATEWAY_SHA256="$(sha256_file "$GATEWAY_ASSET_PATH")"
 printf 'sha256:%s %s\n' "$GATEWAY_SHA256" "$GATEWAY_ASSET_NAME" > "$GATEWAY_BUNDLE_DIR/SHA256SUMS"

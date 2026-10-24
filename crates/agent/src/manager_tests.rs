@@ -76,6 +76,34 @@ use tokio::task::yield_now;
 use tokio::time::{Duration, Instant, advance, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
+#[derive(Debug)]
+struct VisibilityCuaBackend;
+
+#[async_trait::async_trait]
+impl pioneer_tools::ComputerUseBackend for VisibilityCuaBackend {
+    async fn execute(
+        &self,
+        _owner: &str,
+        _name: &str,
+        _arguments: serde_json::Value,
+        _cancellation: CancellationToken,
+    ) -> Result<serde_json::Value, ToolError> {
+        panic!("visibility fixtures must not execute computer use")
+    }
+
+    fn observation_delivered(&self, _owner: &str, _context: &serde_json::Value) -> bool {
+        false
+    }
+
+    fn release_owner(&self, _owner: &str) {}
+}
+
+fn test_tool_loop_config_with_computer_use() -> ToolLoopConfig {
+    let mut config = test_tool_loop_config();
+    config.computer_use.backend = Some(Arc::new(VisibilityCuaBackend));
+    config
+}
+
 fn test_tool_loop_config() -> ToolLoopConfig {
     crate::chat::preflight::load_test_catalog();
     ToolLoopConfig {
@@ -101,7 +129,7 @@ fn test_tool_loop_config() -> ToolLoopConfig {
         },
         computer_use: ComputerUseToolsConfig {
             runtime_home_dir: std::env::temp_dir().join("pioneer-agent-tests"),
-            artifacts_subdir: "tools/computer_use".to_owned(),
+
             ..ComputerUseToolsConfig::default()
         },
         skills: super::SkillsLoopConfig {
@@ -1709,7 +1737,7 @@ fn optional_domain_preflight_response() -> String {
         "task_create",
         "artifact_prepare",
         "artifact_register",
-        "computer_use",
+        "cua_get_window_state",
     ])
 }
 
@@ -8725,7 +8753,7 @@ async fn phase_10_prompt_compile_receives_final_visible_tools_not_registered_mem
     assert!(
         prompt
             .full_system_text
-            .contains("Some tool domains and their tools are hidden until requested.")
+            .contains("For hidden tools, call request_tools to open their domain.")
     );
     assert!(
         !prompt.full_system_text.contains("Available memory tools:"),
@@ -8799,7 +8827,7 @@ async fn phase_10_preflight_selected_optional_domain_tool_schemas_are_serialized
         optional_domain_preflight_response(),
     ));
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let manager = AgentManager::new(registry, test_tool_loop_config_with_computer_use());
     manager
         .set_task_tool_provider(Some(Arc::new(StaticTaskToolProvider {
             bundle: fake_memory_tool_bundle_for_names(&registered_optional_tools, handler),
@@ -8828,17 +8856,6 @@ async fn phase_10_preflight_selected_optional_domain_tool_schemas_are_serialized
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    let probe_tool_loop_config = test_tool_loop_config();
-    let computer_use_available = pioneer_tools::build_builtin_tools_with_security_snapshot(
-        ".",
-        "turn_phase10_computer_use_probe",
-        test_tools_permission_context("turn_phase10_computer_use_probe"),
-        probe_tool_loop_config.web,
-        probe_tool_loop_config.computer_use,
-        Some(test_full_access_security_snapshot()),
-    )
-    .router
-    .has_handler("computer_use");
 
     for selected in [
         "memory_search",
@@ -8851,17 +8868,11 @@ async fn phase_10_preflight_selected_optional_domain_tool_schemas_are_serialized
             "selected optional tool `{selected}` should be serialized"
         );
     }
-    if computer_use_available {
-        assert!(
-            request_tool_names.contains(&"computer_use"),
-            "selected optional tool `computer_use` should be serialized when registered"
-        );
-    } else {
-        assert!(
-            !request_tool_names.contains(&"computer_use"),
-            "unregistered optional tool `computer_use` must stay hidden"
-        );
-    }
+    assert_eq!(
+        request_tool_names.contains(&"cua_get_window_state"),
+        !pioneer_tools::computer_use_tool_specs().is_empty(),
+        "selected optional tool `computer_use` should be serialized when registered"
+    );
     for hidden in ["memory_get", "task_wait"] {
         assert!(
             !request_tool_names.contains(&hidden),
@@ -9131,13 +9142,13 @@ async fn phase_11_repeated_review_observation_does_not_spam_or_complete() {
 #[tokio::test]
 async fn computer_use_text_only_model_does_not_gate_computer_use() {
     let provider = Arc::new(TextOnlyAgentProvider::with_preflight_response(
-        preflight_response_with_visible_tools(&["computer_use"]),
+        preflight_response_with_visible_tools(&["cua_get_window_state"]),
     ));
     let registry = Arc::new(ProviderRegistry::with_provider(
         "text-only",
         provider.clone(),
     ));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let manager = AgentManager::new(registry, test_tool_loop_config_with_computer_use());
 
     let observed = start_simple_turn(
         &manager,
@@ -9160,37 +9171,20 @@ async fn computer_use_text_only_model_does_not_gate_computer_use() {
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    let probe_tool_loop_config = test_tool_loop_config();
-    let computer_use_available = pioneer_tools::build_builtin_tools_with_security_snapshot(
-        ".",
-        "turn_computer_use_text_only_no_gate_probe",
-        test_tools_permission_context("turn_computer_use_text_only_no_gate_probe"),
-        probe_tool_loop_config.web,
-        probe_tool_loop_config.computer_use,
-        Some(test_full_access_security_snapshot()),
-    )
-    .router
-    .has_handler("computer_use");
-    if computer_use_available {
-        assert!(
-            request_tool_names.contains(&"computer_use"),
-            "computer_use must not be provider-gated by image capability"
-        );
-    } else {
-        assert!(
-            !request_tool_names.contains(&"computer_use"),
-            "unregistered computer_use must stay hidden"
-        );
-    }
+    assert_eq!(
+        request_tool_names.contains(&"cua_get_window_state"),
+        !pioneer_tools::computer_use_tool_specs().is_empty(),
+        "computer_use must not be provider-gated by image capability"
+    );
 }
 
 #[tokio::test]
 async fn computer_use_registered_tool_exposes_when_preflight_selects_it() {
     let provider = Arc::new(CaptureAgentProvider::with_preflight_response(
-        preflight_response_with_visible_tools(&["computer_use"]),
+        preflight_response_with_visible_tools(&["cua_get_window_state"]),
     ));
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
-    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let manager = AgentManager::new(registry, test_tool_loop_config_with_computer_use());
 
     let observed = start_simple_turn(
         &manager,
@@ -9213,28 +9207,11 @@ async fn computer_use_registered_tool_exposes_when_preflight_selects_it() {
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    let probe_tool_loop_config = test_tool_loop_config();
-    let computer_use_available = pioneer_tools::build_builtin_tools_with_security_snapshot(
-        ".",
-        "turn_computer_use_registered_tool_probe",
-        test_tools_permission_context("turn_computer_use_registered_tool_probe"),
-        probe_tool_loop_config.web,
-        probe_tool_loop_config.computer_use,
-        Some(test_full_access_security_snapshot()),
-    )
-    .router
-    .has_handler("computer_use");
-    if computer_use_available {
-        assert!(
-            request_tool_names.contains(&"computer_use"),
-            "image-capable providers may expose computer_use when preflight selects it"
-        );
-    } else {
-        assert!(
-            !request_tool_names.contains(&"computer_use"),
-            "unregistered computer_use must stay hidden even for image-capable providers"
-        );
-    }
+    assert_eq!(
+        request_tool_names.contains(&"cua_get_window_state"),
+        !pioneer_tools::computer_use_tool_specs().is_empty(),
+        "image-capable providers may expose computer_use when preflight selects it"
+    );
 }
 
 #[tokio::test]
@@ -12255,6 +12232,399 @@ async fn completed_parallel_tool_result_is_journaled_before_the_batch_finishes()
         AgentEvent::TurnLlmContextAppended { tool_name, .. }
             if tool_name == "batch_slow"
     )));
+
+    // Same parallel-result owner, now with a real CUA handler/receipt. The
+    // lifecycle ItemCompleted ACK is deliberately distinct from exact history.
+    // The generic fast/slow proof above runs in every build. Keep the complete
+    // receipt matrix when the real tools feature is enabled (including via
+    // workspace unification), without introducing an agent-only CU feature.
+    if !pioneer_tools::computer_use_tool_specs().is_empty() {
+        for delivery in [
+            "success",
+            "rejected",
+            "receiver_dropped",
+            "cancelled",
+            "caller_dropped",
+            "bounded_rejected",
+        ] {
+            cua_parallel_result_history_delivery(delivery).await;
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct JournalCuaBackend {
+    inputs: AtomicUsize,
+    delivered: AtomicUsize,
+    released: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl pioneer_tools::ComputerUseBackend for JournalCuaBackend {
+    async fn execute(
+        &self,
+        _owner: &str,
+        name: &str,
+        _arguments: serde_json::Value,
+        _cancellation: CancellationToken,
+    ) -> Result<serde_json::Value, ToolError> {
+        if name == "get_window_state" {
+            return Ok(json!({
+                "content": [{"type":"image", "mimeType":"image/png", "data":"AAECAw==", "width":320, "height":240}],
+                "structuredContent": {"generation":7, "elementToken":"opaque", "origin":{"x":-8,"y":3}, "scale":2},
+                "pioneer_cua_context":{"generation":7,"delivery_nonce":"private"},
+                "isError":false
+            }));
+        }
+        assert_eq!(name, "type_text");
+        self.inputs.fetch_add(1, Ordering::SeqCst);
+        // Transport fixture only: no successful GUI action or OS grant claim.
+        Ok(json!({"content":[{"type":"text","text":"input delivery unverified"}], "isError":false}))
+    }
+
+    fn observation_delivered(&self, _owner: &str, context: &serde_json::Value) -> bool {
+        assert_eq!(context, &json!({"generation":7,"delivery_nonce":"private"}));
+        self.delivered.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    fn release_owner(&self, _owner: &str) {
+        self.released.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug)]
+struct JournalCuaAdmission {
+    capture_entered: tokio::sync::Semaphore,
+    input_requested: tokio::sync::Semaphore,
+}
+
+#[async_trait::async_trait]
+impl pioneer_tools::PermissionApprovalBroker for JournalCuaAdmission {
+    async fn revalidate_permission_context(
+        &self,
+        context: &pioneer_tools::PermissionEvaluationContext,
+        invocation: &ToolInvocation,
+    ) -> Result<pioneer_tools::PermissionEvaluationContext, String> {
+        if invocation.tool_name == "cua_type_text" {
+            // Revalidation always precedes dispatch, including profiles that
+            // need no approval. The real image sink signals with capture's
+            // actual CUA gate held, so input can never win that gate first.
+            let permit = tokio::select! {
+                biased;
+                _ = invocation.cancellation.cancelled() => return Err("fixture input cancelled".into()),
+                permit = self.capture_entered.acquire() => permit.map_err(|error| error.to_string())?,
+            };
+            drop(permit); // A latch: repeated revalidation must not consume it.
+            self.input_requested.add_permits(1);
+        }
+        Ok(context.clone())
+    }
+
+    async fn request_approval(
+        &self,
+        _context: &pioneer_tools::PermissionEvaluationContext,
+        _invocation: &ToolInvocation,
+        _intent: &pioneer_tools::PermissionIntent,
+        _key: &pioneer_tools::PermissionRequestKey,
+        _reason: pioneer_tools::PermissionDecisionReason,
+    ) -> pioneer_tools::PermissionApprovalResolution {
+        pioneer_tools::PermissionApprovalResolution::AllowOnce
+    }
+}
+
+#[derive(Debug)]
+struct JournalCuaImageSink {
+    oversized: bool,
+    admission: Arc<JournalCuaAdmission>,
+}
+
+#[async_trait::async_trait]
+impl pioneer_tools::handlers::computer_use::ComputerUseImageSink for JournalCuaImageSink {
+    async fn admit(
+        &self,
+        _owner: &str,
+        _call_id: &str,
+        _index: usize,
+        bytes: Vec<u8>,
+        mime: &str,
+        cancellation: CancellationToken,
+    ) -> Result<pioneer_provider::MessageAttachment, ToolError> {
+        assert_eq!(bytes, [0, 1, 2, 3]);
+        assert_eq!(mime, "image/png");
+        self.admission.capture_entered.add_permits(1);
+        // Hold real capture admission until the parallel input has requested
+        // permission; this is scheduling only, never observation authority.
+        let permit = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(ToolError::cancelled("fixture capture cancelled")),
+            permit = self.admission.input_requested.acquire() => permit.map_err(|error| ToolError::execution_failed(error.to_string()))?,
+        };
+        drop(permit);
+        let path = if self.oversized {
+            format!(
+                "/artifacts/{}",
+                "x".repeat(pioneer_compaction::RESULT_BYTES + 1)
+            )
+        } else {
+            "/artifacts/journal-capture.png".into()
+        };
+        let mut image = pioneer_provider::MessageAttachment::from_path(path, mime);
+        image.artifact = Some(pioneer_provider::AttachmentArtifactContext {
+            workspace_id: "ws_parallel_cua_journal".into(),
+            artifact_id: "journal-capture".into(),
+            artifact_version_id: Some("v1".into()),
+        });
+        Ok(image)
+    }
+}
+
+async fn cua_parallel_result_history_delivery(delivery: &str) {
+    let backend = Arc::new(JournalCuaBackend::default());
+    let admission = Arc::new(JournalCuaAdmission {
+        capture_entered: tokio::sync::Semaphore::new(0),
+        input_requested: tokio::sync::Semaphore::new(0),
+    });
+    let mut config = test_tool_loop_config();
+    config.computer_use.backend = Some(backend.clone());
+    config
+        .computer_use
+        .image_admission
+        .set(Arc::new(JournalCuaImageSink {
+            oversized: delivery == "bounded_rejected",
+            admission: admission.clone(),
+        }));
+    let provider = Arc::new(SequencedToolProvider::with_preflight_response(
+        vec![
+            ProviderToolCall {
+                id: "capture".into(),
+                name: "cua_get_window_state".into(),
+                arguments: json!({"pid":7,"window_id":9,"include_screenshot":true}).to_string(),
+            },
+            ProviderToolCall {
+                id: "input".into(),
+                name: "cua_type_text".into(),
+                arguments:
+                    json!({"text":"private input","target":{"kind":"window","pid":7,"window_id":9}})
+                        .to_string(),
+            },
+        ],
+        "final after CUA batch",
+        preflight_response_with_visible_tools(&["cua_get_window_state", "cua_type_text"]),
+    ));
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::with_provider(
+            "sequenced-tools",
+            provider.clone(),
+        )),
+        config,
+    );
+    manager
+        .set_permission_approval_broker(admission.clone())
+        .await;
+    let thread = "thr_parallel_cua_journal";
+    let turn = "turn_parallel_cua_journal";
+    manager
+        .ensure_thread(thread, "ws_parallel_cua_journal")
+        .await
+        .unwrap();
+    let mut events = manager.take_durable_receiver(thread).await.unwrap();
+    manager
+        .start_test_turn_with_default_profile_and_capabilities(
+            thread,
+            turn,
+            ThreadMode::Agent,
+            "test-model",
+            "sequenced-tools",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "observe the window, then enter text".into(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let mut early_completion = false;
+    let history = loop {
+        let event = timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("exact CUA history must arrive before the parallel batch finishes")
+            .unwrap();
+        if let AgentDurableEvent::TurnLlmContextAppended {
+            tool_name, payload, ..
+        } = &event
+            && tool_name == "cua_get_window_state"
+        {
+            let pioneer_protocol::ToolResultView::Json { value, .. } = payload else {
+                panic!("exact ChatMessage retained");
+            };
+            break serde_json::from_value::<ChatMessage>(value.clone()).unwrap();
+        }
+        if let AgentDurableEvent::ItemCompleted { notification } = &event {
+            if let TurnItem::DynamicToolCall { tool_name, .. } = &notification.item
+                && tool_name == "cua_get_window_state"
+            {
+                early_completion = true;
+            }
+        }
+        events.acknowledge_last(Ok(()));
+    };
+    assert!(
+        early_completion,
+        "early lifecycle accepted before exact typed history"
+    );
+    assert!(
+        admission.input_requested.available_permits() > 0,
+        "parallel input requested permission before capture reached the held exact history ACK"
+    );
+    let image = history
+        .content_parts
+        .iter()
+        .find_map(|part| match part {
+            MessageContentPart::Image { image } => Some(image),
+            _ => None,
+        })
+        .expect("typed image survives into exact history");
+    assert_eq!(
+        image.artifact.as_ref().unwrap().artifact_id,
+        "journal-capture"
+    );
+    let metadata = history
+        .content_parts
+        .iter()
+        .find_map(|part| match part {
+            MessageContentPart::Text { text } => {
+                serde_json::from_str::<serde_json::Value>(text).ok()
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        metadata["structuredContent"],
+        json!({"generation":7,"elementToken":"opaque","origin":{"x":-8,"y":3},"scale":2})
+    );
+    assert_eq!(metadata["content"][0]["width"], 320);
+    assert!(
+        metadata["pioneer_cua_context"]
+            .get("delivery_nonce")
+            .is_none()
+    );
+    assert_eq!(
+        backend.delivered.load(Ordering::SeqCst),
+        0,
+        "ItemCompleted ACK cannot commit observation"
+    );
+    assert_eq!(
+        backend.inputs.load(Ordering::SeqCst),
+        0,
+        "parallel input cannot reach backend while exact history ACK is held"
+    );
+    match delivery {
+        "success" | "bounded_rejected" => events.acknowledge_last(Ok(())),
+        "rejected" => events.acknowledge_last(Err(
+            pioneer_runtime_events::DurableCommitRejection::permanent(
+                "fixture_history_rejected",
+                "exact history append rejected",
+            ),
+        )),
+        "receiver_dropped" => {
+            drop(events);
+            timeout(Duration::from_secs(5), async {
+                while backend.released.load(Ordering::SeqCst) == 0 {
+                    yield_now().await;
+                }
+            })
+            .await
+            .expect("lost history ACK revokes receipt");
+            assert_eq!(backend.delivered.load(Ordering::SeqCst), 0);
+            assert_eq!(backend.inputs.load(Ordering::SeqCst), 0);
+            manager.remove_thread(thread).await;
+            return;
+        }
+        "caller_dropped" => {
+            // Abrupt loss of the actor drops its owned native turn future;
+            // do not simulate this by rejecting the early lifecycle event.
+            manager
+                .state
+                .read()
+                .await
+                .threads
+                .get(thread)
+                .unwrap()
+                .loop_handle
+                .abort();
+            timeout(Duration::from_secs(5), async {
+                while backend.released.load(Ordering::SeqCst) == 0 {
+                    yield_now().await;
+                }
+            })
+            .await
+            .expect("lost native caller revokes pending receipt");
+            drop(events);
+            assert_eq!(backend.delivered.load(Ordering::SeqCst), 0);
+            assert_eq!(backend.inputs.load(Ordering::SeqCst), 0);
+            manager.remove_thread(thread).await;
+            return;
+        }
+        "cancelled" => {
+            timeout(
+                Duration::from_secs(5),
+                manager.cancel_turn(thread, turn, "cancel during exact result append"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            // A late successful storage ACK cannot revive cancelled authority.
+            events.acknowledge_last(Ok(()));
+        }
+        _ => unreachable!(),
+    }
+    let mut observed = Vec::new();
+    loop {
+        let event = timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("parallel batch must finish after delivery resolution")
+            .unwrap();
+        let terminal = matches!(
+            &event,
+            AgentDurableEvent::TurnCompleted { .. }
+                | AgentDurableEvent::TurnFailed { .. }
+                | AgentDurableEvent::TurnBlocked { .. }
+                | AgentDurableEvent::TurnInterrupted { .. }
+        );
+        events.acknowledge_last(Ok(()));
+        if let Some(event) = test_agent_event_from_durable(event) {
+            observed.push(event);
+        }
+        if terminal {
+            break;
+        }
+    }
+    if delivery == "success" {
+        assert_turn_completed(&observed);
+        assert_eq!(backend.delivered.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            backend.inputs.load(Ordering::SeqCst),
+            1,
+            "input blocked by capture receipt must resume before batch gather"
+        );
+        let requests = provider.snapshot_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].messages.iter().any(|message| message.role == Role::Tool && message.content_parts.iter().any(|part| matches!(part, MessageContentPart::Image { image: delivered } if delivered == image))), "next provider request retains the original typed image");
+    } else {
+        assert_eq!(backend.delivered.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.inputs.load(Ordering::SeqCst), 0);
+        assert!(backend.released.load(Ordering::SeqCst) > 0);
+        if delivery == "bounded_rejected" {
+            assert!(observed.iter().any(|event| matches!(event,
+                AgentEvent::TurnBlocked { reason, .. }
+                    if reason.contains("tool result attachment references exceed available context")
+            )), "negative control must reach the bounded provider-message guard");
+        }
+    }
+    manager.remove_thread(thread).await;
 }
 
 #[tokio::test]
