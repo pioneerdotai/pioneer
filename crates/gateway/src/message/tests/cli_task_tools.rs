@@ -4103,7 +4103,7 @@ impl ThreadsFacade {
         let claude_items = Arc::new(
             crate::cli_runtime::claude_session::ClaudeNativeMcpCorrelationLedger::default(),
         );
-        let inner = processor.mcp_service.turn_mcp_invoker();
+        let inner: Arc<dyn TurnMcpInvoker> = Arc::new(processor.mcp_service.turn_mcp_invoker());
         let invoker: Arc<dyn TurnMcpInvoker> = match kind {
             CLIAgentRuntimeKind::Claude => Arc::new(
                 crate::cli_runtime::claude_session::ClaudeCorrelatingTurnMcpInvoker {
