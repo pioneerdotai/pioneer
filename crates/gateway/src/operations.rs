@@ -51,6 +51,7 @@ pub struct SecretKindCounts {
     pub gateway_auth_credential_hmac_key: usize,
     pub user_jwt_token: usize,
     pub gateway_remote_access_secret: usize,
+    pub task_webhook_secret: usize,
     pub desktop_gateway_session: usize,
     pub unknown: usize,
 }
@@ -284,6 +285,9 @@ fn count_secret_kinds(entries: &[SecretEntryMeta]) -> SecretKindCounts {
             Some(SecretKind::GatewayRemoteAccessSecret) => {
                 counts.gateway_remote_access_secret =
                     counts.gateway_remote_access_secret.saturating_add(1)
+            }
+            Some(SecretKind::TaskWebhookSecret) => {
+                counts.task_webhook_secret = counts.task_webhook_secret.saturating_add(1)
             }
             Some(SecretKind::DesktopGatewaySession) => {
                 counts.desktop_gateway_session = counts.desktop_gateway_session.saturating_add(1)

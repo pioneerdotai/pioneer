@@ -3,20 +3,49 @@
   "title": "AgentIdentityModelsToolResult",
   "type": "object",
   "properties": {
+    "eof": {
+      "type": "boolean"
+    },
     "executors": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/AgentToolExecutorModels"
       }
     },
+    "fragments": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/AgentCatalogFragment"
+      }
+    },
     "identity": {
-      "$ref": "#/$defs/AgentToolIdentityOption"
+      "description": "Present on its catalog segment; oversized headers use fragments.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AgentToolIdentityOption"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "identityId": {
+      "$ref": "#/$defs/AgentIdentityId"
+    },
+    "nextCursor": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
     }
   },
   "additionalProperties": false,
   "required": [
-    "identity",
-    "executors"
+    "eof",
+    "executors",
+    "identityId"
   ],
   "$defs": {
     "AgentIdentityId": {
@@ -198,6 +227,59 @@
         "static_registry",
         "config_override",
         "unknown"
+      ]
+    },
+    "AgentCatalogFragment": {
+      "description": "Concatenate text in offset order and decode JSON to recover one catalog entry.",
+      "type": "object",
+      "properties": {
+        "collection": {
+          "type": "string"
+        },
+        "encoding": {
+          "type": "string"
+        },
+        "eof": {
+          "type": "boolean"
+        },
+        "index": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "modelIndex": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "nextOffset": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "offset": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "text": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "collection",
+        "encoding",
+        "eof",
+        "index",
+        "modelIndex",
+        "nextOffset",
+        "offset",
+        "text",
+        "version"
       ]
     }
   }

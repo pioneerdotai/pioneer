@@ -49,6 +49,8 @@ mod task_capsule;
 
 #[path = "tests/task_launch_continuity.rs"]
 mod task_launch_continuity;
+#[path = "tests/task_webhooks.rs"]
+mod task_webhooks;
 
 #[path = "tests/thread_launch_choices.rs"]
 mod thread_launch_choices;
@@ -8762,6 +8764,13 @@ async fn create_task_for_test(
         );
     }
     let mut context = processor.task_create_context_for_params(&params).await?;
+    if crate::task_tools::is_webhook_trigger(&params.trigger.spec) {
+        let secret_ref = pioneer_protocol::generate_id(21);
+        processor
+            .gateway_secrets
+            .ensure_task_webhook_secret(&secret_ref)?;
+        context.webhook_secret_ref = Some(secret_ref);
+    }
     let principal = authenticated_test_superuser();
     context.actor_id = Some(principal.principal_id.to_string());
     if params.executor_kind == pioneer_protocol::TaskExecutorKind::Agent {
@@ -85505,4 +85514,42 @@ async fn neutral_provider_preparation_and_delivery_survive_registry_and_journal(
     assert_eq!(chunks.len(), 2);
     assert_eq!(chunks[0].as_ref().unwrap().delta, "prepared connection");
     assert!(chunks[1].as_ref().unwrap().is_final);
+}
+
+#[tokio::test]
+async fn task_webhook_url_uses_actual_bind_and_rejects_persisted_disconnected_relay_cache() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = crate::isolated_test_app_config().unwrap();
+    let settings_path = directory.path().join(&config.gateway.settings_file_name);
+    let mut settings = crate::settings::load_or_create_gateway_settings(
+        &settings_path,
+        config.gateway.settings_version,
+        &config.gateway.settings_file_name,
+    )
+    .unwrap();
+    settings.set_remote_access_public_base_url(Some(
+        pioneer_protocol::GatewayBaseUrl::parse_presentation("https://obsolete.example/old-key")
+            .unwrap(),
+    ));
+    crate::settings::save_gateway_settings(&settings_path, &settings).unwrap();
+    let supervisor = Arc::new(
+        pioneer_tunnel::RemoteAccessSupervisor::new(directory.path(), config.gateway.remote_access)
+            .unwrap(),
+    );
+    let (processor, _) = fanout_test_processor().await;
+    let processor = Arc::try_unwrap(processor)
+        .unwrap_or_else(|_| panic!("fixture should have a single processor owner"))
+        .with_runtime_home_for_tests(directory.path().to_path_buf())
+        .with_remote_access_supervisor(supervisor);
+    processor.set_gateway_listen_addr("[::1]:41234".parse().unwrap());
+    let (base, scope) = processor.task_webhook_base_url().await.unwrap();
+    assert_eq!(base.as_str(), "http://[::1]:41234/");
+    assert_eq!(scope, "loopback");
+    processor
+        .persist_current_remote_access_public_base_url()
+        .await
+        .unwrap();
+    let persisted = std::fs::read_to_string(&settings_path).unwrap();
+    assert!(!persisted.contains("public_base_url"));
+    assert!(!persisted.contains("obsolete.example"));
 }

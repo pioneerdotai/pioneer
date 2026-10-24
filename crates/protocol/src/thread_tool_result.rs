@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ThreadToolResultCursor {
+    /// Opaque authenticated source-version and offset token for thread tools; do not edit. Old tool cursors require restarting.
     pub version: String,
     /// Unicode scalar offset in the source, not a UTF-8 byte offset.
     pub offset: u64,

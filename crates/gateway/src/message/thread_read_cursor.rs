@@ -37,7 +37,12 @@ impl ThreadReadCursorCodec {
         envelope.push(1);
         envelope.extend_from_slice(&nonce);
         envelope.extend_from_slice(&payload);
-        Ok(URL_SAFE_NO_PAD.encode(envelope))
+        let cursor = URL_SAFE_NO_PAD.encode(envelope);
+        ensure!(
+            cursor.len() <= 16384,
+            "cursor exceeds 16 KiB; restart reading"
+        );
+        Ok(cursor)
     }
 
     pub(super) fn decode<T: DeserializeOwned>(&self, cursor: &str, scope: &str) -> Result<T> {

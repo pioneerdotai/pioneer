@@ -4,6 +4,8 @@ mod m20261018_000001_frozen_sweep_work;
 mod m20261018_000001_html_preview_work_selection;
 pub use sea_orm_migration::prelude::*;
 
+mod m20261023_000001_task_webhook;
+
 pub struct Migrator;
 
 pub mod stable_skill_id;
@@ -203,6 +205,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261016_000001_task_completion_inbox::access_start::Migration),
             Box::new(m20261018_000001_frozen_sweep_work::Migration),
             Box::new(m20261018_000001_thread_unread_start::Migration),
+            Box::new(m20261023_000001_task_webhook::Migration),
         ]
     }
 }

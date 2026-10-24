@@ -14,7 +14,18 @@ pub(crate) const MAX_WEBSOCKET_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const VIEW_GRANT_PATH_PREFIX: &str = "/storage/views/";
 
 pub(super) async fn enforce(request: Request<Body>, next: Next) -> Response {
-    let is_view_grant_request = request.uri().path().starts_with(VIEW_GRANT_PATH_PREFIX);
+    enforce_policy(request, next, false).await
+}
+
+/// Only the explicitly mounted webhook router permits request bodies. All
+/// established routes continue to reject non-empty bodies before route work.
+pub(super) async fn enforce_webhook(request: Request<Body>, next: Next) -> Response {
+    enforce_policy(request, next, true).await
+}
+
+async fn enforce_policy(request: Request<Body>, next: Next, allow_body: bool) -> Response {
+    let is_view_grant_request = request.uri().path().starts_with(VIEW_GRANT_PATH_PREFIX)
+        || request.uri().path().starts_with("/webhooks/tasks/");
     // Count the serialized `name: value\r\n` representation plus the final
     // empty line. Hyper also bounds header count; this limit owns aggregate
     // bytes and must not omit per-field framing overhead.
@@ -35,9 +46,10 @@ pub(super) async fn enforce(request: Request<Body>, next: Next) -> Response {
             None => true,
             Some(value) => value.as_bytes() == b"0" && content_lengths.next().is_none(),
         };
-        if !content_length_is_valid
-            || request.headers().contains_key(header::TRANSFER_ENCODING)
-            || !request.body().is_end_stream()
+        if !allow_body
+            && (!content_length_is_valid
+                || request.headers().contains_key(header::TRANSFER_ENCODING)
+                || !request.body().is_end_stream())
         {
             HttpError::bad_request(new_request_id()).into_response()
         } else {
@@ -140,5 +152,49 @@ mod tests {
             .await
             .unwrap();
         assert!(ordinary.headers().get(header::REFERRER_POLICY).is_none());
+    }
+    #[tokio::test]
+    async fn only_the_webhook_router_accepts_bodies_and_retains_header_bounds() {
+        use axum::routing::post;
+        let ordinary = Router::new()
+            .route("/ordinary", post(|| async { StatusCode::NO_CONTENT }))
+            .layer(middleware::from_fn(enforce));
+        let webhook = Router::new()
+            .route(
+                "/webhooks/tasks/{trigger}/{secret}",
+                post(|| async { StatusCode::ACCEPTED }),
+            )
+            .layer(middleware::from_fn(enforce_webhook));
+        let app = ordinary.merge(webhook);
+        for (path, expected) in [
+            ("/ordinary", StatusCode::BAD_REQUEST),
+            ("/webhooks/tasks/opaque/secret", StatusCode::ACCEPTED),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header(header::CONTENT_LENGTH, "7")
+                        .body(Body::from("payload"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::ACCEPTED {
+                assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
+            }
+        }
+        let response = app
+            .oneshot(
+                Request::post("/webhooks/tasks/opaque/secret")
+                    .header("x-large", "x".repeat(MAX_REQUEST_HEADER_BYTES))
+                    .body(Body::from("payload"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
     }
 }

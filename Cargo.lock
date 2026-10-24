@@ -10794,6 +10794,7 @@ dependencies = [
  "transcribe-rs",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
  "zeroize",
  "zstd 0.14.3",
 ]
@@ -11968,7 +11969,7 @@ dependencies = [
 [[package]]
 name = "rathole"
 version = "0.6.1"
-source = "git+https://github.com/pioneerdotai/relay.git#b2cf57dc01cc04e0ea012fa316ad7b669ad6275a"
+source = "git+https://github.com/pioneerdotai/relay.git?rev=62103cbd83e9533304e62cba6c14fb4871a08c43#62103cbd83e9533304e62cba6c14fb4871a08c43"
 dependencies = [
  "anyhow",
  "async-http-proxy",

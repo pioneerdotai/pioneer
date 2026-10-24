@@ -220,8 +220,6 @@ pub struct ChildAgentLaunchGrantSet {
 
 impl ChildAgentLaunchGrantSet {
     pub const VERSION: u32 = CHILD_LAUNCH_GRANT_VERSION_V2;
-    pub const MAX_IDENTITIES: usize = 128;
-    pub const MAX_PROFILES: usize = 256;
     pub const MAX_SKILLS: usize = 256;
     pub const MAX_MCP_SERVERS: usize = 256;
 
@@ -369,11 +367,6 @@ fn validate_child_launch_grant_entries(
 ) -> Result<(), ChildAgentLaunchGrantSetError> {
     if identities.is_empty() {
         return Err(ChildAgentLaunchGrantSetError::EmptyIdentitySet);
-    }
-    if identities.len() > ChildAgentLaunchGrantSet::MAX_IDENTITIES
-        || profiles.len() > ChildAgentLaunchGrantSet::MAX_PROFILES
-    {
-        return Err(ChildAgentLaunchGrantSetError::CapacityExceeded);
     }
     if identities
         .windows(2)
@@ -1253,6 +1246,39 @@ mod tests {
         tampered.profiles[0].model_id = "other-model".to_owned();
         assert_eq!(
             tampered.validate(),
+            Err(ChildAgentLaunchGrantSetError::FingerprintMismatch)
+        );
+    }
+
+    #[test]
+    fn large_admitted_grants_round_trip_without_capacity_loss_or_widening() {
+        let seed = child_grant();
+        let identities = (0..140)
+            .map(|n| {
+                AgentIdentityProjection::pioneer(identity_id(&format!("A{n:020}")), 3, "source")
+            })
+            .collect::<Vec<_>>();
+        let profiles = (0..300)
+            .map(|n| {
+                let mut profile = seed.profiles[0].clone();
+                profile.id = profile_id(&format!("P{n:020}"));
+                profile.compatible_agent_identity_ids =
+                    vec![identities[n % identities.len()].id.clone()];
+                profile.model_id = format!("model-{n}");
+                profile
+            })
+            .collect::<Vec<_>>();
+        let admitted = ChildAgentLaunchGrantSet::new(identities, profiles).unwrap();
+        let stored = serde_json::to_string(&admitted).unwrap();
+        let restored: ChildAgentLaunchGrantSet = serde_json::from_str(&stored).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored, admitted);
+        assert_eq!(restored.identities.len(), 140);
+        assert_eq!(restored.profiles.len(), 300);
+        let mut widened = restored;
+        widened.profiles.last_mut().unwrap().model_id = "not-admitted".into();
+        assert_eq!(
+            widened.validate(),
             Err(ChildAgentLaunchGrantSetError::FingerprintMismatch)
         );
     }
