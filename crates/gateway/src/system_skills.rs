@@ -550,6 +550,68 @@ mod tests {
             Some(expected_tasks_asset_root.as_str())
         );
 
+        let threads = catalog
+            .skills
+            .iter()
+            .find(|skill| skill.identity.slug == "threads")
+            .expect("bundled Threads skill");
+        assert_eq!(threads.identity.skill_id.as_str(), "Th7kE4qP9mNs2vX6aR8cZ");
+        assert_eq!(
+            threads.policy_hints.implicit_invocation,
+            SkillImplicitInvocationPolicy::Required
+        );
+        assert!(threads.policy_hints.catalog_hidden);
+        assert!(!threads.runtime.disable_model_invocation);
+        let threads_active = [ResolvedSkill {
+            skill_id: threads.identity.skill_id.clone(),
+            slug: "pioneer/threads".to_owned(),
+            reason: SkillResolvedReason::Implicit,
+            definition: threads.clone(),
+        }];
+        let prompt = build_skill_prompt(
+            &threads_active,
+            SkillPromptBudget {
+                max_chars: 4_000,
+                compact_mode_threshold: 6,
+                include_read_skill_hint: true,
+            },
+        );
+        assert!(
+            prompt
+                .text
+                .lines()
+                .any(|line| line == "- pioneer/threads: `skill:Th7kE4qP9mNs2vX6aR8cZ`")
+        );
+        assert!(!prompt.text.contains("Use when:"));
+        for reference in ["tool-schemas.md", "workflows.md", "troubleshooting.md"] {
+            assert!(
+                std::path::Path::new(&threads.identity.skill_dir)
+                    .join("references")
+                    .join(reference)
+                    .is_file()
+            );
+        }
+        let plan = build_skill_runtime_plan(
+            &threads_active,
+            SkillRuntimeBudget {
+                enable_dynamic_tools: false,
+                max_dynamic_tools_per_skill: 16,
+                allow_shell_tools: false,
+                allow_http_tools: false,
+                allow_function_proxy_tools: false,
+                allow_untrusted_install: false,
+                min_trust_for_shell_tools: SkillTrustLevel::Verified,
+                min_trust_for_http_tools: SkillTrustLevel::Community,
+                min_trust_for_function_proxy_tools: SkillTrustLevel::Community,
+            },
+        );
+        assert_eq!(
+            plan.read_skill_index["skill:Th7kE4qP9mNs2vX6aR8cZ"]
+                .source
+                .package_asset_root(),
+            Some(threads.identity.skill_dir.as_str())
+        );
+
         let memory = catalog
             .skills
             .iter()
@@ -586,7 +648,7 @@ mod tests {
             if skill.policy_hints.implicit_invocation == SkillImplicitInvocationPolicy::Required
                 && !matches!(
                     skill.identity.slug.as_str(),
-                    "tasks" | "subagents" | "memory"
+                    "tasks" | "subagents" | "threads" | "memory"
                 )
             {
                 let unsupported = [ResolvedSkill {
@@ -701,6 +763,12 @@ mod tests {
                 "pioneer/subagents",
             ),
             ("AzBYfaNgS6u1tiPaSlwnm", "pioneer", "tasks", "pioneer/tasks"),
+            (
+                "Th7kE4qP9mNs2vX6aR8cZ",
+                "pioneer",
+                "threads",
+                "pioneer/threads",
+            ),
         ];
         let actual = BUNDLED_SYSTEM_SKILLS
             .iter()

@@ -438,6 +438,151 @@ mod tests {
     }
 
     #[test]
+    fn native_threads_policy_requires_readable_hidden_skill_and_delivered_exact_reference() {
+        let root = temp_case("threads-policy");
+        let package_root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources/skills");
+        let catalog = load_catalog(&SkillCatalogLoadParams {
+            installations: vec![],
+            bundled: vec![pioneer_skills::BundledSkillCatalogEntry {
+                skill_id: pioneer_protocol::SkillId::new("Th7kE4qP9mNs2vX6aR8cZ").unwrap(),
+                owner: Some("pioneer".to_owned()),
+                slug: "threads".to_owned(),
+                source_root: package_root.clone(),
+                install_path: package_root.join("pioneer/threads"),
+            }],
+            max_file_bytes: 1024 * 1024,
+        })
+        .unwrap();
+        let resolution = resolve_turn_skills_with_explicit_refs(
+            &[],
+            &[],
+            &catalog,
+            &[],
+            &test_skills_config(&root),
+            &HashMap::new(),
+            &crate::AgentMcpAvailability::default(),
+        )
+        .unwrap();
+        assert_eq!(resolution.result.active.len(), 1);
+        let specifications = [
+            "read_skill",
+            "request_tools",
+            "threads_list",
+            "threads_start_options",
+        ]
+        .map(|name| {
+            pioneer_tools::ConfiguredToolSpec::new(
+                pioneer_tools::ToolSpec::new(
+                    name,
+                    "fixture",
+                    serde_json::json!({"type":"object"}),
+                    pioneer_tools::PayloadKind::Function,
+                ),
+                pioneer_tools::ExecutionClass::Shared,
+                pioneer_tools::dynamic_unknown_output_policy(),
+            )
+        });
+        let index = pioneer_tools::build_preflight_tool_index(&specifications);
+        let visible = vec!["read_skill".to_owned(), "request_tools".to_owned()];
+        let permission = pioneer_protocol::default_turn_permission_profile_snapshot();
+        // No Threads operation has been opened. request_tools makes the hidden
+        // registered reader reachable, so the agent learns of Threads first.
+        assert!(super::super::native_threads_policy_available(
+            &resolution,
+            Some(&resolution.prompt),
+            &index,
+            &visible,
+            &permission
+        ));
+        for missing in [
+            "skill",
+            "reader",
+            "reference",
+            "read-index",
+            "request-tools",
+            "capability",
+            "denied",
+            "allow-empty",
+        ] {
+            let mut candidate = resolution.clone();
+            let mut prompt = resolution.prompt.clone();
+            let mut visible = visible.clone();
+            let mut index = index.clone();
+            let mut permission = permission.clone();
+            match missing {
+                "skill" => candidate.result.active.clear(),
+                "reader" => visible.retain(|name| name != "read_skill"),
+                "reference" => {
+                    prompt =
+                        prompt.replace("skill:Th7kE4qP9mNs2vX6aR8cZ", "skill:AAAAAAAAAAAAAAAAAAAAA")
+                }
+                "read-index" => candidate.runtime_plan.read_skill_index.clear(),
+                "request-tools" => visible.retain(|name| name != "request_tools"),
+                "capability" => index
+                    .candidate_tools
+                    .retain(|tool| tool.name == "threads_start_options"),
+                "denied" => permission
+                    .effective_policy
+                    .denied_tools
+                    .push("threads_list".to_owned()),
+                "allow-empty" => permission.effective_policy.allowed_tools_restricted = true,
+                _ => unreachable!(),
+            }
+            assert!(
+                !super::super::native_threads_policy_available(
+                    &candidate,
+                    Some(&prompt),
+                    &index,
+                    &visible,
+                    &permission
+                ),
+                "{missing}"
+            );
+        }
+        for continuing in [false, true] {
+            let enabled = super::super::native_threads_policy_available(
+                &resolution,
+                Some(&resolution.prompt),
+                &index,
+                &visible,
+                &permission,
+            );
+            let plan = super::super::compile_agent_instruction_delivery_plan_with_prompt_root(
+                &root,
+                Some(resolution.prompt.clone()),
+                None,
+                &[],
+                &permission,
+                false,
+                enabled,
+                true,
+                continuing,
+                Some("root"),
+                "root",
+                "turn",
+            )
+            .unwrap();
+            assert!(
+                plan.bundle
+                    .sections
+                    .iter()
+                    .any(|section| section.id == pioneer_promt::PromptSectionId::ThreadsPolicy)
+            );
+            assert!(!plan.bundle.sections.iter().any(|section| matches!(
+                section.id,
+                pioneer_promt::PromptSectionId::TasksPolicy
+                    | pioneer_promt::PromptSectionId::SubagentsPolicy
+            )));
+            assert!(
+                plan.provider_instructions
+                    .text
+                    .contains("- pioneer/threads: `skill:Th7kE4qP9mNs2vX6aR8cZ`")
+            );
+        }
+    }
+
+    #[test]
     fn skill_activates_when_dependency_exists_only_in_metadata() {
         let root = temp_case("metadata-pass");
         let skill_dir = root.join("tests").join("agent-browser");

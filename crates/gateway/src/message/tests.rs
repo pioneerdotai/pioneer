@@ -2182,7 +2182,7 @@ async fn setup_cli_runtime_skill_preflight_harness(
     for entry in
         crate::system_skills::bundled_system_skill_catalog_entries(&harness.system_root).unwrap()
     {
-        if matches!(entry.slug.as_str(), "tasks" | "subagents") {
+        if matches!(entry.slug.as_str(), "tasks" | "subagents" | "threads") {
             let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../resources/skills/pioneer")
                 .join(&entry.slug);
@@ -2570,7 +2570,11 @@ async fn capability_persistence_order_impl() {
                     item["type"] == "skill"
                         && !matches!(
                             item["name"].as_str(),
-                            Some("pioneer-system-tasks" | "pioneer-system-subagents")
+                            Some(
+                                "pioneer-system-tasks"
+                                    | "pioneer-system-subagents"
+                                    | "pioneer-system-threads"
+                            )
                         )
                 })
                 .cloned()
@@ -33968,7 +33972,11 @@ async fn cli_task_bootstrap_honors_empty_parent_context_policy_impl() {
         .collect::<Vec<_>>();
     assert_eq!(
         skill_names,
-        vec!["pioneer-system-tasks", "pioneer-system-subagents"]
+        vec![
+            "pioneer-system-tasks",
+            "pioneer-system-subagents",
+            "pioneer-system-threads"
+        ]
     );
     let adapter_messages = adapter_input
         .iter()

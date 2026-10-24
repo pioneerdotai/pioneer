@@ -409,6 +409,16 @@ pub(crate) fn cli_runtime_mcp_capabilities_input(
     explicit_tools.sort();
     explicit_tools.dedup();
     Some(CliRuntimeSelectedCapabilitiesInput {
+        native_threads_tools: projection
+            .tools
+            .iter()
+            .filter(|tool| {
+                crate::turn_mcp::native_tools::is_threads_operation(tool)
+                    || (tool.raw_tool_name == "threads_start_options"
+                        && crate::turn_mcp::native_tools::exact_definition(tool).is_some())
+            })
+            .map(|tool| tool.canonical_callable_name.clone())
+            .collect(),
         native_task_tools: projection
             .tools
             .iter()
