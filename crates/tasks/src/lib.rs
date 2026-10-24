@@ -37,7 +37,8 @@ pub use notifications::TaskNotificationMapper;
 pub use policy::{
     TaskAgentAuthorizationGrantSeed, TaskCreateContext, TaskExecutionAdmissionSeed,
     TaskMutationContext, TaskRunConversationSnapshotSeed, TaskWaitActivityObserver,
-    TaskWaitContext, default_delivery_policy, default_lifecycle_policy,
+    TaskWaitContext, default_delivery_policy, default_delivery_policy_for_trigger,
+    default_lifecycle_policy, default_lifecycle_policy_for_trigger,
 };
 pub use projector::TaskProjector;
 pub use reconciliation::{ReconciliationReport, TaskStartupReconciler};

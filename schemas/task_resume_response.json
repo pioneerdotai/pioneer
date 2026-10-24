@@ -1371,6 +1371,13 @@
         "updatedAt": {
           "type": "integer",
           "format": "int64"
+        },
+        "webhookSecretRef": {
+          "description": "Opaque keystore reference; the bearer secret is never persisted here.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

@@ -709,7 +709,10 @@ impl TaskProjector {
                 {
                     return Ok(());
                 }
-                let status = if trigger.next_fire_at.is_some() {
+                let status = if matches!(&trigger.spec, pioneer_protocol::TaskTriggerSpec::External { source, .. } if source == "webhook")
+                {
+                    TaskStatus::Waiting
+                } else if trigger.next_fire_at.is_some() {
                     TaskStatus::Scheduled
                 } else {
                     TaskStatus::Queued

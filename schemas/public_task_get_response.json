@@ -46,6 +46,22 @@
       "items": {
         "$ref": "#/$defs/PublicTaskTrigger"
       }
+    },
+    "webhookScope": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TaskWebhookScope"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "webhookUrl": {
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "required": [
@@ -3615,6 +3631,14 @@
             "value"
           ]
         }
+      ]
+    },
+    "TaskWebhookScope": {
+      "type": "string",
+      "enum": [
+        "public",
+        "lan",
+        "loopback"
       ]
     },
     "TaskWriteLock": {

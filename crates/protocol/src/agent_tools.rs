@@ -128,24 +128,92 @@ pub struct AgentToolOptionsProjection {
     pub generation_fingerprint: String,
 }
 
-/// Read-only options lookup takes no model-controlled selector.  Target and
-/// execution context come exclusively from the execution-bound provider.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// Read-only catalog pagination. Target and execution context are server-owned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AgentStartOptionsToolInput {}
+pub struct AgentStartOptionsToolInput {
+    #[serde(default = "default_catalog_page_limit")]
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: u32,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+fn default_catalog_page_limit() -> u32 {
+    100
+}
+impl Default for AgentStartOptionsToolInput {
+    fn default() -> Self {
+        Self {
+            limit: default_catalog_page_limit(),
+            cursor: None,
+        }
+    }
+}
 
 /// Model discovery is scoped to an identity already admitted to this execution.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentIdentityModelsToolInput {
     pub identity_id: AgentIdentityId,
+    #[serde(default = "default_catalog_page_limit")]
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: u32,
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentIdentityModelsToolResult {
-    pub identity: AgentToolIdentityOption,
+    pub identity_id: AgentIdentityId,
+    /// Present on its catalog segment; oversized headers use fragments.
+    pub identity: Option<AgentToolIdentityOption>,
     pub executors: Vec<AgentToolExecutorModels>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    pub eof: bool,
+    #[serde(default)]
+    pub fragments: Vec<AgentCatalogFragment>,
+}
+
+/// Concatenate text in offset order and decode JSON to recover one catalog entry.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentCatalogFragment {
+    pub collection: String,
+    pub index: usize,
+    pub model_index: usize,
+    pub encoding: String,
+    pub version: String,
+    pub offset: usize,
+    pub next_offset: usize,
+    pub eof: bool,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentStartOptionsToolResult {
+    pub identities: Vec<AgentToolIdentityOption>,
+    pub profiles: Vec<AgentToolProfileOption>,
+    pub inherit_parent_identity_available: bool,
+    pub default_pioneer_identity_available: bool,
+    pub derived_ephemeral_identity_available: bool,
+    pub inherit_parent_profile_available: bool,
+    #[serde(default)]
+    pub allowed_skill_ids: Vec<crate::SkillId>,
+    #[serde(default)]
+    pub allowed_mcp_server_ids: Vec<String>,
+    pub max_permission_profile: crate::TurnPermissionProfileCap,
+    #[serde(default)]
+    pub thread_creation_options: Vec<AgentToolThreadCreationOption>,
+    #[serde(default)]
+    pub target_options: Vec<AgentToolTargetOption>,
+    pub generation_fingerprint: String,
+    pub next_cursor: Option<String>,
+    pub eof: bool,
+    #[serde(default)]
+    pub fragments: Vec<AgentCatalogFragment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -506,7 +574,7 @@ pub fn agent_start_options_catalog_entry() -> AgentModelToolCatalogEntry {
     AgentModelToolCatalogEntry {
         name: AgentModelToolName::AgentStartOptions,
         capability: AgentToolCapability::ChildStart,
-        description: "List permitted identity, execution profile, thread creation, and target options. Use these when explicitly selecting a task launch or a thread action; options do not grant permission to execute it.".to_owned(),
+        description: "List permitted identity, execution profile, thread creation, and target options. Use these when explicitly selecting a task launch or a thread action; options do not grant permission to execute it. Follow nextCursor with the same limit until eof; arrays are page segments. Catalog changes require restarting. Oversized entries use fragments: concatenate text by offsets, then decode JSON.".to_owned(),
         parameters: schema::<AgentStartOptionsToolInput>(),
     }
 }
@@ -524,7 +592,7 @@ pub fn agent_identity_models_catalog_entry() -> AgentModelToolCatalogEntry {
     AgentModelToolCatalogEntry {
         name: AgentModelToolName::IdentityModelsList,
         capability: AgentToolCapability::ChildStart,
-        description: "List the admitted executors and models for an available identity, with per-model reasoning metadata. Select a model with launch.profile={kind: model, providerId, modelId}; identity uses launch.identity={kind: exact, id}. Set launch.useDefaultReasoning=true to avoid inheriting an effort, including for models without reasoning controls. Catalogs do not grant launch authority.".to_owned(),
+        description: "List the admitted executors and models for an available identity, with per-model reasoning metadata. Select a model with launch.profile={kind: model, providerId, modelId}; identity uses launch.identity={kind: exact, id}. Set launch.useDefaultReasoning=true to avoid inheriting an effort, including for models without reasoning controls. Catalogs do not grant launch authority. Follow nextCursor with the same identityId and limit until eof; an executor may continue its models across pages. identityId is stable; the identity header appears on its segment or through fragments. Catalog changes require restarting. Concatenate oversized entry fragments by offsets and decode JSON.".to_owned(),
         parameters: schema::<AgentIdentityModelsToolInput>(),
     }
 }

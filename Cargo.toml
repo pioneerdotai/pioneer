@@ -188,7 +188,7 @@ sys-locale = "0.3"
 reqwest = { version = "0.13", features = ["json", "query", "stream", "multipart", "blocking", "socks", "gzip"] }
 bytes = "1"
 http = "1"
-rathole = { git = "https://github.com/pioneerdotai/relay.git", version = "0.6.1", default-features = false, features = ["client"] }
+rathole = { git = "https://github.com/pioneerdotai/relay.git", rev = "62103cbd83e9533304e62cba6c14fb4871a08c43", version = "0.6.1", default-features = false, features = ["client"] }
 
 # Crypto
 hmac = "0.13"

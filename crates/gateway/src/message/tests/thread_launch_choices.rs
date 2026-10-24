@@ -153,12 +153,13 @@ async fn fixture() -> (
     (processor, context, tools)
 }
 
-async fn call(
+async fn invoke_with_mutation(
     tools: &pioneer_agent::TurnToolMaterialization,
     name: &str,
     id: &str,
     arguments: serde_json::Value,
-) -> serde_json::Value {
+    mutation_key: Option<&str>,
+) -> Result<serde_json::Value, pioneer_tools::ToolError> {
     let handler = tools
         .bundles
         .iter()
@@ -177,7 +178,7 @@ async fn call(
                 workdir: PathBuf::new(),
                 environment: Default::default(),
                 attempt_id: 0,
-                idempotency_key: None,
+                idempotency_key: mutation_key.map(str::to_owned),
                 recovery: Default::default(),
                 permission_metadata: Default::default(),
                 execution_security_snapshot: None,
@@ -186,10 +187,20 @@ async fn call(
             },
             ToolEventBus::new(8).start_trace("choices-parent", id, name),
         )
-        .await
-        .unwrap_or_else(|error| panic!("{name} ({id}) failed: {error}"));
+        .await?;
     assert!(output.success(), "{name} ({id}): {}", output.raw_text());
-    output.raw_json()
+    Ok(output.raw_json())
+}
+
+async fn call(
+    tools: &pioneer_agent::TurnToolMaterialization,
+    name: &str,
+    id: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    invoke_with_mutation(tools, name, id, arguments, None)
+        .await
+        .unwrap_or_else(|error| panic!("{name} ({id}) failed: {error}"))
 }
 
 #[tokio::test]
@@ -651,4 +662,205 @@ async fn identity_models_catalog_exposes_model_reasoning_without_secrets_and_rej
         .await
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn webhook_task_tools_create_get_and_replay_require_current_task_read() {
+    use crate::authorization::ResourceAction;
+    use pioneer_agent::TaskToolProvider;
+    for attached in [false, true] {
+        let (processor, context, _) = fixture().await;
+        processor.set_gateway_listen_addr("[::1]:41234".parse().unwrap());
+        let materialized =
+            crate::task_tools::GatewayTaskToolProvider::for_cli(Arc::downgrade(&processor))
+                .materialize_task_tools(pioneer_agent::TaskTurnContext {
+                    workspace_id: context.workspace_id.clone(),
+                    thread_id: context.thread_id.clone(),
+                    turn_id: context.turn_id.clone(),
+                })
+                .await
+                .unwrap();
+        let tools = pioneer_agent::TurnToolMaterialization {
+            bundles: materialized.bundles,
+            ..Default::default()
+        };
+        let mut arguments = json!({
+            "title":"Webhook tool contract", "goal":"Interpret each request independently",
+            "instructions":["Interpret the external webhook input using the saved objective."],
+            "outputInstructions":"Return a concise result for this request.",
+            "trigger":{"kind":"external","source":"webhook"}
+        });
+        if attached {
+            arguments["lifecyclePolicy"] = json!({"attachment":"attached", "onParentCancel":"cancel",
+                "onParentFailure":"cancel", "completion":"keep_active_for_recurring"});
+        }
+        let mutation = Some("webhook-create-stable-mutation");
+        let created = invoke_with_mutation(
+            &tools,
+            "task_create",
+            "webhook-create",
+            arguments.clone(),
+            mutation,
+        )
+        .await
+        .unwrap();
+        assert!(serde_json::Value::is_null(&created["runId"]));
+        assert_eq!(created["waitable"], false);
+        assert_eq!(
+            created["attachment"],
+            if attached { "attached" } else { "detached" }
+        );
+        let task_id = created["taskId"].as_str().unwrap();
+        let initial = url::Url::parse(created["webhookUrl"].as_str().unwrap()).unwrap();
+        assert_eq!(initial.scheme(), "http");
+        assert_eq!(initial.host_str(), Some("[::1]"));
+        assert_eq!(initial.port(), Some(41234));
+        assert_eq!(created["webhookScope"], "loopback");
+        let segments = initial.path_segments().unwrap().collect::<Vec<_>>();
+        assert_eq!(&segments[..2], &["webhooks", "tasks"]);
+        let trigger_id = segments[2];
+        let secret = segments[3];
+        assert_eq!(trigger_id.len(), 21);
+        assert_eq!(secret.len(), 64);
+        let fetched = call(&tools, "task_get", "webhook-get", json!({"taskId":task_id})).await;
+        assert_eq!(fetched["webhookUrl"], created["webhookUrl"]);
+        assert_eq!(fetched["triggers"][0]["id"], trigger_id);
+        assert!(fetched["runs"].as_array().unwrap().is_empty());
+        // Re-reading a task does not provision a new capability. Replaying the
+        // real create handler recomputes its host using the same mutation key.
+        let again = call(
+            &tools,
+            "task_get",
+            "webhook-get-again",
+            json!({"taskId":task_id}),
+        )
+        .await;
+        assert_eq!(again["webhookUrl"], created["webhookUrl"]);
+        processor.set_gateway_listen_addr("[::1]:41235".parse().unwrap());
+        let replay = invoke_with_mutation(
+            &tools,
+            "task_create",
+            "webhook-create",
+            arguments.clone(),
+            mutation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay["taskId"], created["taskId"]);
+        assert_eq!(replay["waitable"], false);
+        let replay_url = url::Url::parse(replay["webhookUrl"].as_str().unwrap()).unwrap();
+        assert_eq!(replay_url.port(), Some(41235));
+        assert_eq!(replay_url.path(), initial.path());
+        let persisted = processor
+            .crud_store
+            .get_task(task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(persisted.runs.is_empty());
+        assert_eq!(persisted.triggers[0].id, trigger_id);
+        assert_eq!(
+            persisted.task.lifecycle_policy.as_ref().unwrap().attachment,
+            if attached {
+                pioneer_protocol::TaskAttachmentMode::Attached
+            } else {
+                pioneer_protocol::TaskAttachmentMode::Detached
+            }
+        );
+
+        // Drop every handler holding the CLI mutation cache. Re-materializing
+        // now must recover the committed create receipt from the database.
+        drop(tools);
+        let materialized =
+            crate::task_tools::GatewayTaskToolProvider::for_cli(Arc::downgrade(&processor))
+                .materialize_task_tools(pioneer_agent::TaskTurnContext {
+                    workspace_id: context.workspace_id.clone(),
+                    thread_id: context.thread_id.clone(),
+                    turn_id: context.turn_id.clone(),
+                })
+                .await
+                .unwrap();
+        let tools = pioneer_agent::TurnToolMaterialization {
+            bundles: materialized.bundles,
+            ..Default::default()
+        };
+
+        // Narrow the existing execution authorization fixture: TaskCreate stays
+        // admitted, but TaskRead is absent even though the initiating user has
+        // broader rights. The actual handlers must honor that current ceiling.
+        let original = processor
+            .load_turn_execution_authorization_context(&context.turn_id)
+            .await
+            .unwrap()
+            .to_persisted_json()
+            .unwrap();
+        let mut narrowed: serde_json::Value = serde_json::from_str(&original).unwrap();
+        let actions = narrowed["grant_manifest"]["actions"]
+            .as_array_mut()
+            .unwrap();
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.as_str() == Some(ResourceAction::TaskRead.safe_name()))
+        );
+        actions.retain(|action| action.as_str() != Some(ResourceAction::TaskRead.safe_name()));
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.as_str() == Some(ResourceAction::TaskCreate.safe_name()))
+        );
+        processor
+            .crud_store
+            .set_turn_execution_authorization_context(&context.turn_id, &narrowed.to_string())
+            .await
+            .unwrap();
+        let denial = invoke_with_mutation(
+            &tools,
+            "task_get",
+            "webhook-get-denied",
+            json!({"taskId":task_id}),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(denial.to_string().contains("task_access_denied"));
+        let withheld =
+            invoke_with_mutation(&tools, "task_create", "webhook-create", arguments, mutation)
+                .await
+                .unwrap();
+        assert_eq!(withheld["alreadyCommitted"], true);
+        assert_eq!(withheld["taskId"], created["taskId"]);
+        assert!(withheld.get("webhookUrl").is_none());
+        assert!(withheld.get("webhookScope").is_none());
+        assert!(!withheld.to_string().contains(secret));
+        let tasks = processor
+            .crud_store
+            .list_tasks(pioneer_protocol::TaskListParams {
+                workspace_id: context.workspace_id.clone(),
+                limit: Some(20),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            tasks
+                .iter()
+                .filter(|task| task.title == "Webhook tool contract")
+                .count(),
+            1
+        );
+        processor
+            .crud_store
+            .set_turn_execution_authorization_context(&context.turn_id, &original)
+            .await
+            .unwrap();
+        let restored = call(
+            &tools,
+            "task_get",
+            "webhook-get-restored",
+            json!({"taskId":task_id}),
+        )
+        .await;
+        assert_eq!(restored["webhookUrl"], replay["webhookUrl"]);
+    }
 }

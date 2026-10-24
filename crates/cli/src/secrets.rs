@@ -399,6 +399,7 @@ mod tests {
                 gateway_access_jwt_signing_key: 1,
                 gateway_auth_credential_hmac_key: 1,
                 gateway_remote_access_secret: 0,
+                task_webhook_secret: 0,
                 desktop_gateway_session: 1,
                 unknown: 0,
             },

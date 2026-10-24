@@ -1131,6 +1131,7 @@ mod tests {
         let notification = GatewayNotification::GatewayRemoteAccessStatusChanged(
             GatewayRemoteAccessStatusChangedNotification {
                 status: GatewayRemoteAccessStatusSnapshot {
+                    public_base_url: None,
                     state: GatewayRemoteAccessState::Failed,
                     error_kind: Some(GatewayRemoteAccessErrorKind::RelayConnectFailed),
                     message: Some("failed to connect".to_owned()),

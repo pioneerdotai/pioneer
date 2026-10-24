@@ -2040,6 +2040,9 @@
         "failed"
       ]
     },
+    "GatewayBaseUrl": {
+      "type": "string"
+    },
     "GatewayEndpointKind": {
       "type": "string",
       "enum": [
@@ -3691,6 +3694,17 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "public_base_url": {
+          "description": "Present only for the currently authenticated relay connection.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayBaseUrl"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "state": {
@@ -9113,6 +9127,17 @@
         "updatedAt": {
           "type": "integer",
           "format": "int64"
+        },
+        "triggerInput": {
+          "description": "External data accepted for this occurrence, preserved across retries.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskRunTriggerInput"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -9328,6 +9353,13 @@
         "updatedAt": {
           "type": "integer",
           "format": "int64"
+        },
+        "webhookSecretRef": {
+          "description": "Opaque keystore reference; the bearer secret is never persisted here.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -14802,6 +14834,34 @@
       "required": [
         "revision",
         "workspace_id"
+      ]
+    },
+    "TaskRunTriggerInput": {
+      "type": "object",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "contentType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "encoding": {
+          "$ref": "#/$defs/TaskRunInputEncoding"
+        }
+      },
+      "required": [
+        "encoding",
+        "body"
+      ]
+    },
+    "TaskRunInputEncoding": {
+      "type": "string",
+      "enum": [
+        "utf8",
+        "base64"
       ]
     }
   }

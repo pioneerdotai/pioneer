@@ -1,3 +1,5 @@
+> Актуальное продолжение этого аудита: [threads-pagination-implementation.md](threads-pagination-implementation.md). Исторические команды и результаты ниже относятся к прежним ревизиям; новые тесты и сборки не запускались.
+
 # Передача инструментов чтения тредов на внешнее ревью
 
 Worktree: `/Users/alexander/Code/pioneer/pioneer/.worktrees/threads-history-reading`.
@@ -34,7 +36,7 @@ binding, поколения и канонической схемы; катало
 `ThreadMetadata`:
 
 - `threadId`, `title: string/null`, `titleTruncated: boolean`;
-- `preview` — до 160 Unicode-символов; title до 256 с явным флагом сокращения;
+- `preview` — до 160 Unicode-символов; полное title, `previewTruncated` явно отмечает сокращённый preview;
 - `createdAt`, `updatedAt` — Unix seconds;
 - `visibility` — сохранённое `visible`/`hidden` sidebar visibility;
 - `status` — сохранённое состояние; `archived` соответствует `status == closed`;
@@ -113,17 +115,18 @@ exclusive child position и hash пути. Память O(depth), размер c
 
 Все курсоры зашифрованы и аутентифицированы ChaCha20-Poly1305 с operation/user/
 workspace/resource/recursive/limit в associated data; история дополнительно
-привязана к direction. Состояние history cursor имеет version=2. Курсоры
-прежней реализации требуют нового начального чтения и не интерпретируются как v2. Это необходимо, поскольку
+привязана к direction. Состояние history cursor имеет version=3. Курсоры
+прежней реализации требуют нового начального чтения и не интерпретируются как v3. Это необходимо, поскольку
 позиция фильтрации может содержать недоступный candidate ID. Добавлена прямая
 зависимость gateway на уже существующий в Cargo.lock `ring 0.17.14`; новые
 миграции, индексы и постоянные таблицы не добавлялись.
 
-Вызов списка просматривает максимум 200 candidate ID, основной history scan —
-100 metadata records, детей — 200 шагов. Начальное открытие anchor дополнительно
+Выдача списка за шаг просматривает до 200 candidate ID, основной history scan —
+100 metadata records, детей — 200 шагов. Проверка fingerprint списков дополнительно
+проходит metadata/lineage workspace ограниченными порциями по 200, не удерживая
+между запросами reader или полное дерево в памяти. Начальное открытие anchor дополнительно
 читает до 50 neighboring metadata records и отдельные newest/anchor locators. Пустая страница с `eof=false` законна: нужно продолжить.
-Страницы дополнительно ограничены сериализованными байтами и token budget,
-с резервом для cursor framing; наружный handler проверяет 32768 bytes/4096 tokens.
+Страницы формируются до общей проекции ответа Pioneer и помещаются в её существующий предел 2 * 1024 * 1024 байт с учётом JSON escaping, метаданных и курсоров. Малые токенные/байтовые бюджеты удалены; это не утверждение о физическом пределе MCP/CLI. Большая запись делится по фактической вместимости ответа, на границах UTF-8. Изменения metadata/lineage workspace явно делают list/children cursor stale; fingerprint вычисляется ограниченными чтениями, без сохранения полного каталога в курсоре.
 `eof=true` и `nextCursor=null` явно завершают доступный сохранённый набор.
 Ошибки invalid/scope-mismatched cursor, stale cursor и unavailable/access-denied
 различаются. Сырые SQL errors/IDs наружу не передаются.
