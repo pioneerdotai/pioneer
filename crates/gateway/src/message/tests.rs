@@ -2525,13 +2525,16 @@ async fn capability_persistence_order_impl() {
             .expect("committed lane should stay open");
         // Thread actions/model options require explicit selection; this turn
         // admits only the readers alongside the default HTML and task tools.
-        let expected_mcp_bindings = 2
-            + pioneer_protocol::CUA_TOOL_NAMES.len()
-            + crate::turn_mcp::native_tools::NativeToolFamily::Tasks
+        let expected_mcp_bindings =
+            2 + if cfg!(feature = "computer-use") {
+                pioneer_protocol::CUA_TOOL_NAMES.len()
+            } else {
+                0
+            } + crate::turn_mcp::native_tools::NativeToolFamily::Tasks
                 .definitions()
                 .len()
-            + super::thread_read_tools::thread_read_tool_specs().len()
-            + super::thread_tool_results::thread_result_tool_specs().len();
+                + super::thread_read_tools::thread_read_tool_specs().len()
+                + super::thread_tool_results::thread_result_tool_specs().len();
         assert!(matches!(
             committed_capabilities,
             AgentDurableEvent::TurnCapabilitiesResolved {

@@ -9,7 +9,7 @@ permissions:
 jobs:
   smoke-path-warning-macos:
     name: smoke-path-warning-macos
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 35
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -18,6 +18,13 @@ jobs:
         with:
           submodules: recursive
 
+      - name: select-cua-xcode
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
+          echo 'DEVELOPER_DIR=/Applications/Xcode_26.2.app/Contents/Developer' >> "$GITHUB_ENV"
+
       - name: setup-rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -25,12 +32,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --locked --release -p pioneer-cli
+          MACOSX_DEPLOYMENT_TARGET=13.0 cargo build --locked --release -p pioneer-cli --features computer-use
 
           smoke_dir="${RUNNER_TEMP}/pioneer-path-warning-smoke"
           mkdir -p "${smoke_dir}"
 
-          asset_name="pioneer-gateway-macos-aarch64.zip"
+          asset_name="pioneer-gateway-macos-aarch64-computer-use-package.zip"
           asset_path="${smoke_dir}/${asset_name}"
           python3 scripts/packaging/smoke-gateway-asset.py --binary target/release/pioneer --archive "${asset_path}" --target aarch64-apple-darwin
           sha="$(shasum -a 256 "${asset_path}" | awk '{print $1}')"
@@ -131,12 +138,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --locked --release -p pioneer-cli
+          cargo build --locked --release -p pioneer-cli --features computer-use
 
           smoke_dir="${RUNNER_TEMP}/pioneer-path-warning-smoke"
           mkdir -p "${smoke_dir}"
 
-          asset_name="pioneer-gateway-linux-x86_64.zip"
+          asset_name="pioneer-gateway-linux-x86_64-computer-use-package.zip"
           asset_path="${smoke_dir}/${asset_name}"
           python3 scripts/packaging/smoke-gateway-asset.py --binary target/release/pioneer --archive "${asset_path}" --target x86_64-unknown-linux-gnu
           sha="$(sha256sum "${asset_path}" | awk '{print $1}')"
@@ -219,12 +226,12 @@ jobs:
       - name: build-cli-and-prepare-local-assets
         shell: pwsh
         run: |
-          cargo build --locked --release -p pioneer-cli --target x86_64-pc-windows-msvc
+          cargo build --locked --release -p pioneer-cli --features computer-use --target x86_64-pc-windows-msvc
 
           $smokeDir = Join-Path $env:RUNNER_TEMP "pioneer-path-warning-smoke"
           New-Item -ItemType Directory -Path $smokeDir -Force | Out-Null
 
-          $assetName = "pioneer-gateway-windows-x86_64.zip"
+          $assetName = "pioneer-gateway-windows-x86_64-computer-use-package.zip"
           $assetPath = Join-Path $smokeDir $assetName
           python scripts/packaging/smoke-gateway-asset.py --binary target/x86_64-pc-windows-msvc/release/pioneer.exe --archive $assetPath --target x86_64-pc-windows-msvc
 
@@ -334,12 +341,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --locked --release -p pioneer-cli
+          cargo build --locked --release -p pioneer-cli --features computer-use
 
           smoke_dir="${RUNNER_TEMP}/pioneer-smoke"
           mkdir -p "${smoke_dir}"
 
-          asset_name="pioneer-gateway-linux-x86_64.zip"
+          asset_name="pioneer-gateway-linux-x86_64-computer-use-package.zip"
           asset_path="${smoke_dir}/${asset_name}"
           python3 scripts/packaging/smoke-gateway-asset.py --binary target/release/pioneer --archive "${asset_path}" --target x86_64-unknown-linux-gnu
           sha="$(sha256sum "${asset_path}" | awk '{print $1}')"
@@ -361,7 +368,7 @@ jobs:
             PIONEER_LOCAL_CHECKSUMS_FILE="${SMOKE_CHECKSUMS}" \
             PIONEER_INSTALL_ROOT="${SMOKE_INSTALL_ROOT}" \
             PIONEER_LINK_PATH="${SMOKE_LINK_PATH}" \
-            bash ./install.sh --force-start
+            bash ./install.sh --computer-use --force-start
 
       - name: verify-running
         shell: bash
@@ -380,7 +387,7 @@ jobs:
             PIONEER_LOCAL_CHECKSUMS_FILE="${SMOKE_CHECKSUMS}" \
             PIONEER_INSTALL_ROOT="${SMOKE_INSTALL_ROOT}" \
             PIONEER_LINK_PATH="${SMOKE_LINK_PATH}" \
-            bash ./install.sh --force-start
+            bash ./install.sh --computer-use --force-start
 
       - name: stop-and-verify
         shell: bash
@@ -420,12 +427,12 @@ jobs:
       - name: build-cli-and-prepare-local-assets
         shell: pwsh
         run: |
-          cargo build --locked --release -p pioneer-cli --target x86_64-pc-windows-msvc
+          cargo build --locked --release -p pioneer-cli --features computer-use --target x86_64-pc-windows-msvc
 
           $smokeDir = Join-Path $env:RUNNER_TEMP "pioneer-smoke"
           New-Item -ItemType Directory -Path $smokeDir -Force | Out-Null
 
-          $assetName = "pioneer-gateway-windows-x86_64.zip"
+          $assetName = "pioneer-gateway-windows-x86_64-computer-use-package.zip"
           $assetPath = Join-Path $smokeDir $assetName
           python scripts/packaging/smoke-gateway-asset.py --binary target/x86_64-pc-windows-msvc/release/pioneer.exe --archive $assetPath --target x86_64-pc-windows-msvc
 
@@ -446,7 +453,7 @@ jobs:
           $env:PIONEER_LOCAL_ASSET_FILE = $env:SMOKE_ASSET
           $env:PIONEER_LOCAL_CHECKSUMS_FILE = $env:SMOKE_CHECKSUMS
           $env:PIONEER_INSTALL_ROOT = $env:SMOKE_INSTALL_ROOT
-          ./install.ps1 -ForceStart
+          ./install.ps1 -ComputerUse -ForceStart
 
           if (-not (Test-Path -Path $env:SMOKE_BINARY -PathType Leaf)) {
             throw "expected installed binary at $env:SMOKE_BINARY"
@@ -481,7 +488,7 @@ jobs:
           $env:PIONEER_LOCAL_ASSET_FILE = $env:SMOKE_ASSET
           $env:PIONEER_LOCAL_CHECKSUMS_FILE = $env:SMOKE_CHECKSUMS
           $env:PIONEER_INSTALL_ROOT = $env:SMOKE_INSTALL_ROOT
-          ./install.ps1 -ForceStart
+          ./install.ps1 -ComputerUse -ForceStart
 
       - name: stop-and-verify
         shell: pwsh
@@ -542,12 +549,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --locked --release -p pioneer-cli
+          cargo build --locked --release -p pioneer-cli --features computer-use
 
           smoke_dir="${RUNNER_TEMP}/pioneer-desktop-smoke"
           mkdir -p "${smoke_dir}"
 
-          asset_name="pioneer-gateway-linux-x86_64.zip"
+          asset_name="pioneer-gateway-linux-x86_64-computer-use-package.zip"
           asset_path="${smoke_dir}/${asset_name}"
           python3 scripts/packaging/smoke-gateway-asset.py --binary target/release/pioneer --archive "${asset_path}" --target x86_64-unknown-linux-gnu
           sha="$(sha256sum "${asset_path}" | awk '{print $1}')"

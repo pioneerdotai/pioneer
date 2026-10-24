@@ -155,6 +155,7 @@ pub use windows_restricted_token_backend::{
 pub use handlers::computer_use::{
     ComputerUseBackend, computer_use_tool_specs, is_computer_use_tool,
 };
+#[cfg(feature = "computer-use")]
 use handlers::materialize_computer_use_domain_bundle;
 
 use handlers::{
@@ -389,6 +390,7 @@ pub fn build_tools_with_environment_and_security_snapshot(
     validate_permission_context(&turn_id, &permission_context)?;
     let web_tools_config = web_tools_config.normalized();
 
+    #[cfg(feature = "computer-use")]
     let extensions = {
         let mut extensions = extensions;
         extensions.push(materialize_computer_use_domain_bundle(
@@ -397,6 +399,9 @@ pub fn build_tools_with_environment_and_security_snapshot(
         ));
         extensions
     };
+
+    #[cfg(not(feature = "computer-use"))]
+    let _ = computer_use_tools_config;
 
     let mut configured_specs = builtin_tool_specs();
     if let Some(search) = configured_specs
@@ -1931,22 +1936,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn computer_use_is_not_in_default_model_visible_specs() {
-        let built = build_builtin_tools(
-            ".",
-            "turn_computer_use_hidden_default",
-            test_permission_context("turn_computer_use_hidden_default"),
-            test_web_config(),
-            test_computer_use_config(),
-        );
+    async fn computer_use_registration_matches_build_and_backend_and_starts_hidden() {
+        for backend_available in [false, true] {
+            let mut config = test_computer_use_config();
+            if backend_available {
+                config.backend = Some(Arc::new(UnconfirmedCuaBackend::default()));
+            }
+            let built = build_builtin_tools(
+                ".",
+                "turn_computer_use_hidden_default",
+                test_permission_context("turn_computer_use_hidden_default"),
+                test_web_config(),
+                config,
+            );
 
-        let visible = built.router.model_visible_specs().await;
-        assert!(
-            !visible
-                .iter()
-                .any(|spec| crate::is_computer_use_tool(&spec.name)),
-            "computer_use schema must not be visible in the default provider catalog"
-        );
+            // A unified tools feature alone cannot make backend-less execution
+            // available. The real registry owns this contract, before visibility.
+            assert_eq!(
+                built.router.find_spec("cua_type_text").is_some(),
+                cfg!(feature = "computer-use") && backend_available
+            );
+            let visible = built.router.model_visible_specs().await;
+            assert!(
+                !visible
+                    .iter()
+                    .any(|spec| crate::is_computer_use_tool(&spec.name)),
+                "computer_use schema must not be visible in the default provider catalog"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2294,6 +2311,7 @@ mod tests {
     }
     // The existing transport owner fixture exercises the real CUA handler,
     // artifact admission and runtime publication; it claims no GUI/OS success.
+    #[cfg(feature = "computer-use")]
     #[tokio::test]
     async fn cua_observation_delivery_guards_admission_and_publication() {
         use std::future::Future;
@@ -2428,6 +2446,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "computer-use")]
     #[tokio::test]
     async fn two_skill_proxies_preserve_cua_permission_unknown_outcome_and_owner_cleanup() {
         let fixture = tempfile::tempdir().unwrap();

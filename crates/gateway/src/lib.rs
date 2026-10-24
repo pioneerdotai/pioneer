@@ -17,6 +17,7 @@ pub mod cli_mcp_client_validation;
 mod cli_runtime;
 pub mod codex_mcp_conformance;
 pub(crate) mod compaction;
+#[cfg(feature = "computer-use")]
 mod computer_use;
 mod database;
 mod epic5_observability;
@@ -524,6 +525,7 @@ async fn run_gateway_until_shutdown_inner(
 
     let web_cfg = &config.gateway.tools.web;
     let computer_use_cfg = &config.gateway.tools.computer_use;
+    #[cfg(feature = "computer-use")]
     let mut computer_use_runtime = computer_use::GatewayComputerUse::new(&runtime_home);
     let tool_retry_cfg = &config.gateway.tools.retry;
     let provider_attachments_cfg = &config.gateway.provider.attachments;
@@ -657,7 +659,10 @@ async fn run_gateway_until_shutdown_inner(
         computer_use: ComputerUseToolsConfig {
             runtime_home_dir: runtime_home.clone(),
             max_total_bytes: computer_use_cfg.max_total_bytes,
+            #[cfg(feature = "computer-use")]
             backend: Some(computer_use_runtime.backend()),
+            #[cfg(not(feature = "computer-use"))]
+            backend: None,
             image_admission: Default::default(),
         },
         skills: pioneer_agent::SkillsLoopConfig {
@@ -1082,6 +1087,7 @@ async fn run_gateway_until_shutdown_inner(
 
     info!("gateway daemon stopping with telemetry snapshot");
     handle.set_readiness(GatewayReadinessStatus::Starting);
+    #[cfg(feature = "computer-use")]
     computer_use_runtime.shutdown().await;
     message_processor
         .shutdown_thread_episodic_index_runner()

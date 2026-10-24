@@ -82,9 +82,11 @@ gh api --paginate "repos/$diag_repo/actions/runs/$diag_symbols_run/artifacts" \
 
 Output names are derived from the input artifact names:
 
-- Gateway: `debug-symbol-inputs-gateway-TARGET`.
+- Gateway: `debug-symbol-inputs-gateway-TARGET-default` or
+  `debug-symbol-inputs-gateway-TARGET-computer-use`, matching the installed variant.
+  The unsuffixed name is a historical input generation supported by the consumer.
 - Desktop: `debug-symbol-inputs-desktop-TARGET`. This artifact includes the
-  desktop executable, updater and bundled Gateway symbol inventories. Select
+  desktop executable, updater and bundled computer-use Gateway symbol inventories. Select
   the inventory for the actual process being analyzed.
 - Targets: `x86_64-apple-darwin`, `aarch64-apple-darwin`,
   `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,

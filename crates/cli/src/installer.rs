@@ -142,6 +142,12 @@ struct VersionOutput {
     version: String,
     #[serde(default)]
     compiled_database_migrations: Option<Vec<String>>,
+    #[serde(default)]
+    os: Option<String>,
+    #[serde(default)]
+    arch: Option<String>,
+    #[serde(default)]
+    computer_use: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -435,7 +441,7 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
                 })?;
             }
 
-            if let Err(error) = activate_cua_payload(&bin_dir)
+            if let Err(error) = activate_install_companions(&bin_dir)
                 .and_then(|()| fs::rename(&staged_binary, &target_binary).map_err(Into::into))
             {
                 let rollback = rollback_and_restore(
@@ -1021,20 +1027,36 @@ fn retry_after_delay(response: &reqwest::blocking::Response) -> Option<Duration>
 }
 
 fn gateway_asset_file_name() -> Result<String> {
-    let arch = match std::env::consts::ARCH {
+    gateway_asset_file_name_for(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        cfg!(feature = "computer-use"),
+    )
+}
+
+fn gateway_asset_file_name_for(os: &str, arch: &str, computer_use: bool) -> Result<String> {
+    let arch = match arch {
         "x86_64" | "amd64" => "x86_64",
         "aarch64" | "arm64" => "aarch64",
         other => bail!("unsupported architecture `{other}` for release installer source"),
     };
-
-    let os = match std::env::consts::OS {
+    let os = match os {
         "linux" => "linux",
         "macos" => "macos",
         "windows" => "windows",
         other => bail!("unsupported OS `{other}` for release installer source"),
     };
-
-    Ok(format!("pioneer-gateway-{os}-{arch}.zip"))
+    let suffix = if computer_use {
+        "-computer-use-package"
+    } else {
+        ""
+    };
+    let extension = if computer_use || os == "windows" || (os == "macos" && arch == "x86_64") {
+        "zip"
+    } else {
+        "gz"
+    };
+    Ok(format!("pioneer-gateway-{os}-{arch}{suffix}.{extension}"))
 }
 
 fn persist_install_state(
@@ -1518,8 +1540,27 @@ fn unpack_asset_to_binary(asset_path: &Path, target_binary: &Path) -> Result<()>
 
     if is_zip {
         unpack_zip_asset(asset_path, target_binary)
+    } else if !cfg!(feature = "computer-use")
+        && !cfg!(windows)
+        && !cfg!(all(target_os = "macos", target_arch = "x86_64"))
+        && asset_path.extension().and_then(OsStr::to_str) == Some("gz")
+    {
+        let payload = target_binary
+            .parent()
+            .context("candidate has no parent")?
+            .join("cua.next");
+        if payload.exists() {
+            fs::remove_dir_all(&payload)?;
+        }
+        let input = File::open(asset_path)?;
+        let mut decoder = flate2::read::GzDecoder::new(input).take(512 * 1024 * 1024 + 1);
+        let mut output = File::create(target_binary)?;
+        if std::io::copy(&mut decoder, &mut output)? > 512 * 1024 * 1024 {
+            bail!("Gateway archive exceeds binary budget");
+        }
+        Ok(())
     } else {
-        bail!("Gateway installation requires a complete ZIP with its CUA companion payload")
+        bail!("Gateway archive format does not match this build variant and target")
     }
 }
 
@@ -1574,6 +1615,9 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
             bail!("Gateway archive exceeds payload budget");
         }
         if let Ok(companion) = relative.strip_prefix("cua") {
+            if !cfg!(feature = "computer-use") {
+                bail!("server archive must not contain a CUA payload");
+            }
             if companion.as_os_str().is_empty() {
                 bail!("invalid CUA payload member");
             }
@@ -1652,8 +1696,152 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
         );
     }
 
-    validate_cua_payload(&payload)?;
+    if cfg!(feature = "computer-use") {
+        validate_cua_payload(&payload)?;
+    }
     Ok(())
+}
+
+// Used only by the legacy CU bridge. No live binary/payload, service, runtime
+// home, config or database is changed here. The package hash is compiled into
+// the checksum-authenticated compatibility executable, not read from the network.
+#[cfg(feature = "computer-use")]
+pub(crate) fn prepare_legacy_cu_package(directory: &Path, package: &[u8]) -> Result<PathBuf> {
+    if package.is_empty() || package.len() > 2 * 1024 * 1024 * 1024 {
+        bail!("invalid embedded CU package size");
+    }
+    let generation = directory.join(format!(
+        ".pioneer-cu-{}",
+        hex::encode(Sha256::digest(package))
+    ));
+    let binary_name = if cfg!(windows) {
+        "pioneer.exe"
+    } else {
+        "pioneer"
+    };
+    match fs::symlink_metadata(&generation) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => bail!("CU package generation must be a real directory"),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let staging = tempfile::Builder::new()
+                .prefix(".pioneer-cu-prepare-")
+                .tempdir_in(directory)?;
+            let asset = staging.path().join("package.zip");
+            fs::write(&asset, package)?;
+            let candidate = staging.path().join(binary_name);
+            unpack_asset_to_binary(&asset, &candidate)?;
+            make_binary_executable(&candidate)?;
+            activate_cua_payload(staging.path())?;
+            fs::remove_dir_all(staging.path().join("cua.rollback"))?;
+            #[cfg(target_os = "macos")]
+            if staging.path().join("cua/bootstrap-libs").exists() {
+                fs::remove_dir_all(staging.path().join("cua/bootstrap-libs"))?;
+            }
+            fs::remove_file(asset)?;
+            // A single rename publishes a complete generation. On races never
+            // replace a published generation; validate the winner below.
+            if let Err(error) = fs::rename(staging.path(), &generation) {
+                if !generation.is_dir() {
+                    return Err(error).context("publish legacy CU package generation");
+                }
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    validate_legacy_cu_generation(&generation, package)?;
+    Ok(generation.join(binary_name))
+}
+
+// Kept immediately before command delegation by the bridge. File preparation
+// remains platform-neutral; this phase executes only the exact verified Gateway.
+#[cfg(feature = "computer-use")]
+pub(crate) fn probe_legacy_cu_package(gateway: &Path) -> Result<()> {
+    let version = query_binary_version_output(gateway)?;
+    if version.version != env!("CARGO_PKG_VERSION")
+        || version.os.as_deref() != Some(std::env::consts::OS)
+        || version.arch.as_deref() != Some(std::env::consts::ARCH)
+        || version.computer_use != Some(true)
+        || version.compiled_database_migrations.is_none()
+    {
+        bail!("embedded Gateway version/target/variant mismatch");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "computer-use")]
+fn validate_legacy_cu_generation(generation: &Path, package: &[u8]) -> Result<()> {
+    if !fs::symlink_metadata(generation)?.is_dir() {
+        bail!("CU package generation must be a real directory");
+    }
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(package))?;
+    let mut expected = std::collections::BTreeSet::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        let relative = entry.enclosed_name().context("invalid embedded CU path")?;
+        if entry.is_dir() {
+            continue;
+        }
+        expected.insert(relative.to_path_buf());
+        let mut path = generation.to_owned();
+        for component in relative.components() {
+            path.push(component.as_os_str());
+            if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+                bail!("CU package generation contains a symlink");
+            }
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || metadata.len() != entry.size() {
+            bail!("CU package generation member mismatch");
+        }
+        let mut digest = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = entry.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        if sha256_file(&path)? != hex::encode(digest.finalize()) {
+            bail!("CU package generation hash mismatch");
+        }
+    }
+    let mut pending = vec![generation.to_owned()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if !kind.is_file() || !expected.remove(entry.path().strip_prefix(generation)?) {
+                bail!("unexpected CU package generation member");
+            }
+        }
+    }
+    if !expected.is_empty() {
+        bail!("incomplete CU package generation");
+    }
+    validate_cua_payload(&generation.join("cua"))
+}
+
+// Server installs do not require a CUA package. A transition from CU still
+// retires its managed payload in the same recovery unit as the executable.
+fn activate_install_companions(directory: &Path) -> Result<()> {
+    if cfg!(feature = "computer-use") {
+        return activate_cua_payload(directory);
+    }
+    let current = directory.join("cua");
+    let next = directory.join("cua.next");
+    if !current.exists() && !next.join("bootstrap-libs").exists() {
+        if next.exists() {
+            fs::remove_dir_all(next)?;
+        }
+        return Ok(());
+    }
+    if !next.exists() {
+        fs::create_dir(&next)?;
+    }
+    replace_install_companions(directory)
 }
 
 fn validate_cua_payload(payload: &Path) -> Result<()> {
@@ -1704,10 +1892,15 @@ fn validate_cua_payload(payload: &Path) -> Result<()> {
 }
 
 fn activate_cua_payload(directory: &Path) -> Result<()> {
+    let next = directory.join("cua.next");
+    validate_cua_payload(&next)?;
+    replace_install_companions(directory)
+}
+
+fn replace_install_companions(directory: &Path) -> Result<()> {
     let current = directory.join("cua");
     let backup = directory.join("cua.rollback");
     let next = directory.join("cua.next");
-    validate_cua_payload(&next)?;
     if backup.exists() {
         bail!("CUA rollback payload exists; retain it for explicit recovery before updating");
     }
@@ -2797,6 +2990,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "computer-use")]
     fn installer_rollback_restores_the_prior_daemon_payload() {
         for previously_installed in [false, true] {
             let temporary = tempfile::tempdir().expect("installer directory");
@@ -2864,6 +3058,183 @@ mod tests {
             .unwrap();
             #[cfg(windows)]
             fs::write(next.join("cua-driver-uia.exe"), b"fixture UIA companion").unwrap();
+            // Exercise the archive boundary, including identity and completeness
+            // failures, before using its staged output for activation/recovery.
+            let manifest_bytes = fs::read(next.join("manifest.json")).unwrap();
+            #[cfg(not(windows))]
+            let archive_gateway = format!(
+                "#!/bin/sh\nprintf '%s\\n' '{}'\n",
+                serde_json::json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "os": std::env::consts::OS,
+                    "arch": std::env::consts::ARCH,
+                    "computer_use": true,
+                    "compiled_database_migrations": ["candidate-migration"]
+                })
+            )
+            .into_bytes();
+            #[cfg(windows)]
+            let archive_gateway = b"candidate Gateway bytes".to_vec();
+
+            for defect in ["manifest", "pin", "hash", "companion", "none"] {
+                let mut manifest: serde_json::Value =
+                    serde_json::from_slice(&manifest_bytes).unwrap();
+                if defect == "pin" {
+                    manifest["revision"] = "wrong-pin".into();
+                }
+                if defect == "hash" {
+                    manifest["sha256"] = "wrong-hash".into();
+                }
+                let asset = directory.join("candidate.zip");
+                let mut zip = zip::ZipWriter::new(fs::File::create(&asset).unwrap());
+                let options = zip::write::SimpleFileOptions::default();
+                zip.start_file(
+                    if cfg!(windows) {
+                        "pioneer.exe"
+                    } else {
+                        "pioneer"
+                    },
+                    options,
+                )
+                .unwrap();
+                zip.write_all(&archive_gateway).unwrap();
+                let mut pending = vec![next.clone()];
+                while let Some(folder) = pending.pop() {
+                    for entry in fs::read_dir(folder).unwrap() {
+                        let path = entry.unwrap().path();
+                        if path.is_dir() {
+                            pending.push(path);
+                            continue;
+                        }
+                        let relative = path.strip_prefix(&next).unwrap();
+                        let name = relative.to_string_lossy().replace('\\', "/");
+                        let required_companion = if cfg!(windows) {
+                            "cua-driver-uia.exe"
+                        } else if cfg!(target_os = "macos") {
+                            "Pioneer Gateway.app/Contents/Info.plist"
+                        } else {
+                            "THIRD_PARTY_NOTICES.md"
+                        };
+                        if (defect == "companion" && name == required_companion)
+                            || (defect == "manifest" && name == "manifest.json")
+                        {
+                            continue;
+                        }
+                        // Bootstrap libraries are root archive members in real packages.
+                        let member = name
+                            .strip_prefix("bootstrap-libs/")
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("cua/{name}"));
+                        zip.start_file(member, options).unwrap();
+                        let bytes = if name == "manifest.json" {
+                            serde_json::to_vec(&manifest).unwrap()
+                        } else {
+                            fs::read(&path).unwrap()
+                        };
+                        zip.write_all(&bytes).unwrap();
+                    }
+                }
+                zip.finish().unwrap();
+                let admission = tempfile::tempdir_in(directory).unwrap();
+                let candidate = admission.path().join("pioneer.next");
+                let result = super::unpack_asset_to_binary(&asset, &candidate);
+                let legacy = tempfile::tempdir_in(directory).unwrap();
+                let prior_binary = if cfg!(windows) {
+                    "pioneer.exe"
+                } else {
+                    "pioneer"
+                };
+                let prior = [
+                    (prior_binary, b"prior executable".as_slice()),
+                    ("settings.toml", b"prior settings".as_slice()),
+                    ("credentials", b"prior credential fixture".as_slice()),
+                    ("history.db", b"prior data fixture".as_slice()),
+                ];
+                for (name, bytes) in prior {
+                    fs::write(legacy.path().join(name), bytes).unwrap();
+                }
+                let package = fs::read(&asset).unwrap();
+                if defect != "none" {
+                    assert!(super::prepare_legacy_cu_package(legacy.path(), &package).is_err());
+                }
+                if defect == "none" {
+                    let prepared =
+                        super::prepare_legacy_cu_package(legacy.path(), &package).unwrap();
+                    let generation = prepared.parent().unwrap();
+                    assert!(generation.join("cua").is_dir());
+                    assert_eq!(
+                        super::prepare_legacy_cu_package(legacy.path(), &package).unwrap(),
+                        prepared
+                    );
+                    assert!(!legacy.path().join("cua").exists());
+                    assert!(!legacy.path().join("cua.rollback").exists());
+                    #[cfg(not(windows))]
+                    {
+                        super::probe_legacy_cu_package(&prepared).unwrap();
+                        for (field, value) in [
+                            ("version", serde_json::json!("wrong-version")),
+                            ("os", serde_json::json!("wrong-os")),
+                            ("arch", serde_json::json!("wrong-architecture")),
+                            ("computer_use", serde_json::json!(false)),
+                            ("compiled_database_migrations", serde_json::Value::Null),
+                        ] {
+                            let mut metadata = serde_json::json!({
+                                "version": env!("CARGO_PKG_VERSION"),
+                                "os": std::env::consts::OS,
+                                "arch": std::env::consts::ARCH,
+                                "computer_use": true,
+                                "compiled_database_migrations": ["candidate-migration"]
+                            });
+                            metadata[field] = value;
+                            fs::write(
+                                &prepared,
+                                format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", metadata),
+                            )
+                            .unwrap();
+                            assert!(
+                                super::probe_legacy_cu_package(&prepared).is_err(),
+                                "accepted {field}"
+                            );
+                        }
+                        fs::write(&prepared, &archive_gateway).unwrap();
+
+                        assert!(
+                            super::ensure_candidate_schema_compatible(
+                                &["unavailable-migration".into()],
+                                super::query_binary_version_output(&prepared)
+                                    .unwrap()
+                                    .compiled_database_migrations
+                                    .as_deref(),
+                            )
+                            .is_err()
+                        );
+                    }
+                    // Reuse must reject tampering before launching that executable.
+                    fs::write(&prepared, b"tampered Gateway").unwrap();
+                    assert!(super::prepare_legacy_cu_package(legacy.path(), &package).is_err());
+                    fs::write(&prepared, &archive_gateway).unwrap();
+                    super::make_binary_executable(&prepared).unwrap();
+                    fs::write(generation.join("unexpected.dll"), b"untrusted library").unwrap();
+                    assert!(super::prepare_legacy_cu_package(legacy.path(), &package).is_err());
+                }
+                for (name, bytes) in prior {
+                    assert_eq!(fs::read(legacy.path().join(name)).unwrap(), bytes);
+                }
+
+                if defect != "none" {
+                    assert!(result.is_err(), "accepted corrupt {defect} archive");
+                    assert!(!directory.join("cua.rollback").exists());
+                    assert_eq!(
+                        directory.join("cua/prior-daemon").exists(),
+                        previously_installed
+                    );
+                } else {
+                    result.unwrap();
+                    assert_eq!(fs::read(candidate).unwrap(), archive_gateway);
+                    fs::remove_dir_all(&next).unwrap();
+                    fs::rename(admission.path().join("cua.next"), &next).unwrap();
+                }
+            }
             #[cfg(target_os = "macos")]
             let (_layout, candidate, candidate_bytes) = {
                 // This fixture observes the actual version-command boundary and
@@ -2931,7 +3302,7 @@ printf '%s\n' '{"version":"candidate","compiled_database_migrations":["candidate
                 )
                 .unwrap();
             }
-            super::activate_cua_payload(directory).expect("activate candidate");
+            super::activate_install_companions(directory).expect("activate candidate");
             #[cfg(target_os = "macos")]
             {
                 fs::rename(&candidate, directory.join("pioneer")).unwrap();
@@ -2985,24 +3356,184 @@ printf '%s\n' '{"version":"candidate","compiled_database_migrations":["candidate
     }
 
     #[test]
-    fn release_asset_name_is_the_complete_gateway_zip() {
-        let asset_name = super::gateway_asset_file_name().expect("asset name");
-
-        let expected_os = match std::env::consts::OS {
-            "linux" => "linux",
-            "macos" => "macos",
-            "windows" => "windows",
-            other => panic!("unexpected test OS: {other}"),
-        };
-        let expected_arch = match std::env::consts::ARCH {
-            "x86_64" | "amd64" => "x86_64",
-            "aarch64" | "arm64" => "aarch64",
-            other => panic!("unexpected test arch: {other}"),
-        };
+    fn release_asset_name_preserves_server_updater_contract_and_cu_opt_in() {
+        for (os, arch, server, computer_use) in [
+            (
+                "linux",
+                "x86_64",
+                "pioneer-gateway-linux-x86_64.gz",
+                "pioneer-gateway-linux-x86_64-computer-use-package.zip",
+            ),
+            (
+                "linux",
+                "aarch64",
+                "pioneer-gateway-linux-aarch64.gz",
+                "pioneer-gateway-linux-aarch64-computer-use-package.zip",
+            ),
+            (
+                "macos",
+                "aarch64",
+                "pioneer-gateway-macos-aarch64.gz",
+                "pioneer-gateway-macos-aarch64-computer-use-package.zip",
+            ),
+            (
+                "macos",
+                "x86_64",
+                "pioneer-gateway-macos-x86_64.zip",
+                "pioneer-gateway-macos-x86_64-computer-use-package.zip",
+            ),
+            (
+                "windows",
+                "x86_64",
+                "pioneer-gateway-windows-x86_64.zip",
+                "pioneer-gateway-windows-x86_64-computer-use-package.zip",
+            ),
+            (
+                "windows",
+                "aarch64",
+                "pioneer-gateway-windows-aarch64.zip",
+                "pioneer-gateway-windows-aarch64-computer-use-package.zip",
+            ),
+        ] {
+            assert_eq!(
+                super::gateway_asset_file_name_for(os, arch, false).unwrap(),
+                server
+            );
+            assert_eq!(
+                super::gateway_asset_file_name_for(os, arch, true).unwrap(),
+                computer_use
+            );
+        }
         assert_eq!(
-            asset_name,
-            format!("pioneer-gateway-{expected_os}-{expected_arch}.zip")
+            super::gateway_asset_file_name().unwrap(),
+            super::gateway_asset_file_name_for(
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                cfg!(feature = "computer-use")
+            )
+            .unwrap()
         );
+    }
+
+    #[test]
+    fn server_zip_admission_needs_no_daemon_but_rejects_cu_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let gzip = temp.path().join("gateway.gz");
+        let mut encoder = flate2::write::GzEncoder::new(
+            fs::File::create(&gzip).unwrap(),
+            flate2::Compression::default(),
+        );
+        encoder.write_all(b"server gzip executable").unwrap();
+        encoder.finish().unwrap();
+        let candidate = temp.path().join("gzip-candidate");
+        let result = super::unpack_asset_to_binary(&gzip, &candidate);
+        if !cfg!(feature = "computer-use")
+            && !cfg!(windows)
+            && !cfg!(all(target_os = "macos", target_arch = "x86_64"))
+        {
+            result.unwrap();
+            assert_eq!(fs::read(&candidate).unwrap(), b"server gzip executable");
+        } else {
+            assert!(result.unwrap_err().to_string().contains("format"));
+        }
+        let wrong_format = temp.path().join("gateway.tar");
+        fs::copy(&gzip, &wrong_format).unwrap();
+        assert!(
+            super::unpack_asset_to_binary(&wrong_format, &candidate)
+                .unwrap_err()
+                .to_string()
+                .contains("format")
+        );
+        if cfg!(feature = "computer-use") {
+            return;
+        }
+        for with_cua in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let asset = temp.path().join("gateway.zip");
+            let mut zip = zip::ZipWriter::new(fs::File::create(&asset).unwrap());
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file(
+                if cfg!(windows) {
+                    "pioneer.exe"
+                } else {
+                    "pioneer"
+                },
+                options,
+            )
+            .unwrap();
+            zip.write_all(b"server executable fixture").unwrap();
+            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+            {
+                zip.start_file("libonnxruntime.dylib", options).unwrap();
+                zip.write_all(b"existing Intel companion").unwrap();
+            }
+            if with_cua {
+                zip.start_file("cua/manifest.json", options).unwrap();
+                zip.write_all(b"{}").unwrap();
+            }
+            zip.finish().unwrap();
+            let candidate = temp.path().join("candidate");
+            let result = super::unpack_asset_to_binary(&asset, &candidate);
+            if with_cua {
+                assert!(result.unwrap_err().to_string().contains("server archive"));
+            } else {
+                result.unwrap();
+                assert_eq!(fs::read(&candidate).unwrap(), b"server executable fixture");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "computer-use"))]
+    fn server_transition_retires_cu_app_and_preserves_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path();
+        super::activate_install_companions(directory).unwrap();
+        assert!(!directory.join("cua").exists());
+        assert!(!directory.join("cua.rollback").exists());
+        fs::create_dir_all(directory.join("cua/Pioneer Gateway.app")).unwrap();
+        fs::write(directory.join("cua/prior-daemon"), b"prior").unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            fs::write(
+                directory.join("libonnxruntime.dylib"),
+                b"prior Intel library",
+            )
+            .unwrap();
+            fs::create_dir_all(directory.join("cua.next/bootstrap-libs")).unwrap();
+            fs::write(
+                directory.join("cua.next/bootstrap-libs/libonnxruntime.dylib"),
+                b"server Intel library",
+            )
+            .unwrap();
+        }
+        super::activate_install_companions(directory).unwrap();
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            fs::read(directory.join("libonnxruntime.dylib")).unwrap(),
+            b"server Intel library"
+        );
+        assert!(!directory.join("cua/Pioneer Gateway.app").exists());
+        assert!(!directory.join("cua/prior-daemon").exists());
+        super::restore_cua_payload(directory).unwrap();
+        assert_eq!(
+            fs::read(directory.join("cua/prior-daemon")).unwrap(),
+            b"prior"
+        );
+        assert!(directory.join("cua/Pioneer Gateway.app").is_dir());
+        assert!(directory.join("cua.rollback/prior-daemon").is_file());
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                fs::read(directory.join("libonnxruntime.dylib")).unwrap(),
+                b"prior Intel library"
+            );
+            assert_eq!(
+                fs::read(directory.join("cua.rollback/bootstrap-libs/libonnxruntime.dylib"))
+                    .unwrap(),
+                b"prior Intel library"
+            );
+        }
     }
 
     #[test]

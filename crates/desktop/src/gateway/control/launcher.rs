@@ -507,7 +507,9 @@ fn make_development_pioneer_command(
     command.arg("-p");
     command.arg("pioneer-cli");
     command.arg("--features");
-    command.arg("dev");
+    command.arg("dev,computer-use");
+    #[cfg(target_os = "macos")]
+    command.env("MACOSX_DEPLOYMENT_TARGET", "13.0");
     command.arg("--bin");
     command.arg("pioneer-dev");
     command.arg("--");
@@ -607,18 +609,23 @@ fn bundled_gateway_asset_file_name() -> Option<String> {
 
     #[cfg(target_os = "windows")]
     {
-        return Some(format!("pioneer-gateway-windows-{arch}.zip"));
+        return Some(format!(
+            "pioneer-gateway-windows-{arch}-computer-use-package.zip"
+        ));
     }
 
     #[cfg(target_os = "macos")]
     {
-        let extension = if arch == "x86_64" { "zip" } else { "gz" };
-        return Some(format!("pioneer-gateway-macos-{arch}.{extension}"));
+        return Some(format!(
+            "pioneer-gateway-macos-{arch}-computer-use-package.zip"
+        ));
     }
 
     #[cfg(target_os = "linux")]
     {
-        return Some(format!("pioneer-gateway-linux-{arch}.gz"));
+        return Some(format!(
+            "pioneer-gateway-linux-{arch}-computer-use-package.zip"
+        ));
     }
 
     #[allow(unreachable_code)]
@@ -1111,7 +1118,7 @@ mod tests {
     fn bundled_installer_command_uses_assets_and_desktop_context() {
         let bundle = BundledGatewayBootstrap {
             bootstrap_binary_path: PathBuf::from("/tmp/pioneer-bootstrap"),
-            asset_path: PathBuf::from("/tmp/pioneer-gateway-linux-x86_64.gz"),
+            asset_path: PathBuf::from("/tmp/pioneer-gateway-linux-x86_64-computer-use-package.zip"),
             checksums_path: PathBuf::from("/tmp/SHA256SUMS"),
         };
         let expected_asset_path = bundle.asset_path.to_string_lossy().into_owned();

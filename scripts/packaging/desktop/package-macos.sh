@@ -377,7 +377,7 @@ mkdir -p "$OUT_DIR"
 if [[ "$SKIP_BUILD" != true ]]; then
   cargo build --locked --release -p pioneer-desktop --target "$TARGET"
   cargo build --locked --release -p pioneer-app-updater --target "$TARGET"
-  cargo build --locked --release -p pioneer-cli --target "$TARGET"
+  MACOSX_DEPLOYMENT_TARGET=13.0 cargo build --locked --release -p pioneer-cli --features computer-use --target "$TARGET"
   if [[ -n "${PIONEER_SYMBOL_INPUTS_DIR:-}" ]]; then
     python3 scripts/packaging/symbol-inputs.py export --target "$TARGET" "$PIONEER_SYMBOL_INPUTS_DIR" \
       "target/$TARGET/release/pioneer-app" "target/$TARGET/release/pioneer" "target/$TARGET/release/pioneer-app-updater"
@@ -435,7 +435,7 @@ GATEWAY_BUNDLE_DIR="$RESOURCES_DIR/gateway"
 mkdir -p "$GATEWAY_BUNDLE_DIR"
 copy_macos_x86_64_onnxruntime_dylibs "$GATEWAY_BUNDLE_DIR"
 
-GATEWAY_ASSET_NAME="pioneer-gateway-macos-${ARCH}.zip"
+GATEWAY_ASSET_NAME="pioneer-gateway-macos-${ARCH}-computer-use-package.zip"
 GATEWAY_ASSET_PATH="$GATEWAY_BUNDLE_DIR/$GATEWAY_ASSET_NAME"
 GATEWAY_BINARY_RAW="$WORK_DIR/pioneer-gateway-${ARCH}"
 cp "target/$TARGET/release/pioneer" "$GATEWAY_BINARY_RAW"

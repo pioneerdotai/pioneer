@@ -307,7 +307,7 @@ if ($Target -eq "aarch64-pc-windows-msvc") {
 if (-not $SkipBuild) {
     cargo build --locked --release -p pioneer-desktop --target $Target
     cargo build --locked --release -p pioneer-app-updater --target $Target
-    cargo build --locked --release -p pioneer-cli --target $Target
+    cargo build --locked --release -p pioneer-cli --features computer-use --target $Target
     if ($env:PIONEER_SYMBOL_INPUTS_DIR) {
         python scripts/packaging/symbol-inputs.py export --target $Target "$env:PIONEER_SYMBOL_INPUTS_DIR" "target/$Target/release/pioneer-app.exe" "target/$Target/release/pioneer.exe" "target/$Target/release/pioneer-app-updater.exe"
         if ($LASTEXITCODE -ne 0) { throw "Symbol input preservation failed" }
@@ -334,7 +334,7 @@ try {
     $gatewayStageDir = Join-Path $stageDir "gateway"
     New-Item -ItemType Directory -Path $gatewayStageDir -Force | Out-Null
 
-    $gatewayAssetName = "pioneer-gateway-windows-$archLabel.zip"
+    $gatewayAssetName = "pioneer-gateway-windows-$archLabel-computer-use-package.zip"
     $gatewayAssetPath = Join-Path $gatewayStageDir $gatewayAssetName
     python scripts/packaging/cua-driver.py --target $Target --binary "target/$Target/release/pioneer.exe" --archive $gatewayAssetPath
     if ($LASTEXITCODE -ne 0) { throw "Gateway CUA packaging failed" }

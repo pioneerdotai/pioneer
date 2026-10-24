@@ -23,7 +23,14 @@ pub fn is_computer_use_tool(name: &str) -> bool {
 }
 
 pub fn computer_use_tool_specs() -> Vec<crate::ConfiguredToolSpec> {
-    catalog::configured_specs()
+    #[cfg(feature = "computer-use")]
+    {
+        catalog::configured_specs()
+    }
+    #[cfg(not(feature = "computer-use"))]
+    {
+        Vec::new()
+    }
 }
 
 /// Trusted Gateway ingress. `name` is the unprefixed upstream allowlisted operation.
@@ -121,13 +128,21 @@ pub fn materialize_computer_use_domain_bundle(
     config: ComputerUseToolsConfig,
     owner: String,
 ) -> ToolExtensionBundle {
+    // Feature unification can enable the tools catalog without enabling the
+    // Gateway supervisor. Advertise execution only when an owner supplied it.
+    if config.backend.is_none() {
+        return ToolExtensionBundle {
+            specs: Vec::new(),
+            handlers: Vec::new(),
+        };
+    }
     let lease = Arc::new(OwnerLease {
         owner,
         backend: config.backend.clone(),
         gate: Arc::default(),
     });
     let handler: Arc<dyn ToolHandler> = Arc::new(ComputerUseHandler { lease, config });
-    let specs = catalog::configured_specs();
+    let specs = computer_use_tool_specs();
     let handlers = specs
         .iter()
         .map(|spec| (spec.spec.name.clone(), handler.clone()))

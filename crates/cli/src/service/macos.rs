@@ -196,7 +196,7 @@ fn launchd_executable_path(_settings: &ServiceSettings, executable: &Path) -> Re
         .parent()
         .context("gateway executable has no parent directory")?
         .join("cua/Pioneer Gateway.app/Contents/MacOS/pioneer");
-    if bundle_executable.is_file() {
+    if cfg!(feature = "computer-use") && bundle_executable.is_file() {
         Ok(bundle_executable)
     } else {
         // Developer/non-packaged Gateways still run other services. CUA readiness

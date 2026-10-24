@@ -70,12 +70,12 @@ jobs:
           if-no-files-found: error
 
   build-gateway:
-    name: gateway-${{ matrix.platform.target }}
+    name: gateway-${{ matrix.platform.target }}-${{ matrix.variant }}
     needs: generate-model-catalog
     defaults:
       run:
         shell: ${{ startsWith(matrix.platform.os, 'windows') && 'pwsh' || 'bash' }}
-    runs-on: ${{ matrix.platform.os }}
+    runs-on: ${{ matrix.variant == 'computer-use' && matrix.platform.cu_os || matrix.platform.os }}
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       PIONEER_SENTRY_DSN: ${{ secrets.PIONEER_SENTRY_DSN }}
@@ -90,18 +90,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        variant: [default, computer-use]
         platform:
-          - {os: ubuntu-latest, target: x86_64-unknown-linux-gnu, asset: pioneer-gateway-linux-x86_64.zip}
-          - {os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, asset: pioneer-gateway-linux-aarch64.zip}
-          - {os: macos-latest, target: aarch64-apple-darwin, asset: pioneer-gateway-macos-aarch64.zip}
-          - {os: macos-latest, target: x86_64-apple-darwin, asset: pioneer-gateway-macos-x86_64.zip}
-          - {os: windows-latest, target: x86_64-pc-windows-msvc, asset: pioneer-gateway-windows-x86_64.zip}
-          - {os: windows-11-arm, target: aarch64-pc-windows-msvc, asset: pioneer-gateway-windows-aarch64.zip}
+          - {os: ubuntu-latest, target: x86_64-unknown-linux-gnu, asset: pioneer-gateway-linux-x86_64.gz, cu_asset: pioneer-gateway-linux-x86_64-computer-use-package.zip}
+          - {os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, asset: pioneer-gateway-linux-aarch64.gz, cu_asset: pioneer-gateway-linux-aarch64-computer-use-package.zip}
+          - {os: macos-latest, cu_os: macos-15, target: aarch64-apple-darwin, asset: pioneer-gateway-macos-aarch64.gz, cu_asset: pioneer-gateway-macos-aarch64-computer-use-package.zip}
+          - {os: macos-latest, cu_os: macos-15-intel, target: x86_64-apple-darwin, asset: pioneer-gateway-macos-x86_64.zip, cu_asset: pioneer-gateway-macos-x86_64-computer-use-package.zip}
+          - {os: windows-latest, target: x86_64-pc-windows-msvc, asset: pioneer-gateway-windows-x86_64.zip, cu_asset: pioneer-gateway-windows-x86_64-computer-use-package.zip}
+          - {os: windows-11-arm, target: aarch64-pc-windows-msvc, asset: pioneer-gateway-windows-aarch64.zip, cu_asset: pioneer-gateway-windows-aarch64-computer-use-package.zip}
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.sha }}
           submodules: recursive
+      - name: select-cua-xcode
+        if: runner.os == 'macOS' && matrix.variant == 'computer-use'
+        shell: bash
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
+          echo 'DEVELOPER_DIR=/Applications/Xcode_26.2.app/Contents/Developer' >> "$GITHUB_ENV"
       - name: download-model-catalog
         uses: actions/download-artifact@v7
         with:
@@ -118,19 +125,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          packages=(
-            pkg-config
-            libssl-dev
-            libegl1-mesa-dev
-            libgbm-dev
-            libpipewire-0.3-dev
-            libwayland-dev
-            libxkbcommon-dev
-            libx11-dev
-            libxi-dev
-            libxtst-dev
-            libxext-dev
-          )
+          packages=(pkg-config libssl-dev libegl1-mesa-dev libgbm-dev
+                    libpipewire-0.3-dev libwayland-dev libxkbcommon-dev)
+          if [[ "${{ matrix.variant }}" == "computer-use" ]]; then
+            packages+=(libx11-dev libxi-dev libxtst-dev libxext-dev)
+          fi
           sudo apt-get update
           sudo apt-get install -y "${packages[@]}"
           multiarch="$(gcc -print-multiarch)"
@@ -157,11 +156,11 @@ jobs:
       - name: restore-release-dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-gateway-${{ matrix.platform.target }}-v1
+          shared-key: release-gateway-${{ matrix.platform.target }}-${{ matrix.variant }}-v1
           cache-workspace-crates: false
 
       - name: setup-macos-signing-keychain
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && matrix.variant == 'computer-use'
         shell: bash
         env:
           MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
@@ -229,13 +228,14 @@ jobs:
           APPLE_NOTARIZATION_KEY_BASE64: ${{ secrets.APPLE_NOTARIZATION_KEY_BASE64 }}
         run: >-
           python scripts/packaging/build-gateway.py --target "${{ matrix.platform.target }}"
-          --asset "${{ matrix.platform.asset }}"
+          --variant "${{ matrix.variant }}"
+          --asset "${{ matrix.variant == 'computer-use' && matrix.platform.cu_asset || matrix.platform.asset }}"
           --out "release-gateway"
 
       - name: retain-symbol-inputs
         uses: actions/upload-artifact@v6
         with:
-          name: symbol-inputs-gateway-${{ matrix.platform.target }}
+          name: symbol-inputs-gateway-${{ matrix.platform.target }}-${{ matrix.variant }}
           path: release-gateway/symbol-inputs/
           compression-level: 0
           retention-days: 7
@@ -243,14 +243,14 @@ jobs:
       - name: retain-release-asset
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ matrix.platform.asset }}
+          name: ${{ matrix.variant == 'computer-use' && matrix.platform.cu_asset || matrix.platform.asset }}
           path: release-gateway/assets/
           if-no-files-found: error
       - name: remove-uploaded-transfer-copy
         run: python -c 'import shutil; shutil.rmtree("release-gateway")'
 
       - name: cleanup-macos-signing-keychain
-        if: always() && runner.os == 'macOS'
+        if: always() && runner.os == 'macOS' && matrix.variant == 'computer-use'
         shell: bash
         run: |
           set -euo pipefail
@@ -300,12 +300,12 @@ jobs:
             asset_name: pioneer-linux-aarch64.AppImage
             update_asset_name: pioneer-linux-aarch64.AppImage
             appimagetool_arch: aarch64
-          - os: macos-14
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             package_kind: macos_dmg
             asset_name: Pioneer-x86_64.dmg
             update_asset_name: Pioneer-x86_64.app.zip
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             package_kind: macos_dmg
             asset_name: Pioneer-aarch64.dmg
@@ -329,6 +329,12 @@ jobs:
           ref: ${{ github.sha }}
           submodules: recursive
 
+      - name: select-cua-xcode
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
+          echo 'DEVELOPER_DIR=/Applications/Xcode_26.2.app/Contents/Developer' >> "$GITHUB_ENV"
       - name: download-model-catalog
         uses: actions/download-artifact@v7
         with:
@@ -425,6 +431,12 @@ jobs:
         with:
           ref: ${{ github.sha }}
           submodules: recursive
+      - name: select-cua-xcode
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
+          echo 'DEVELOPER_DIR=/Applications/Xcode_26.2.app/Contents/Developer' >> "$GITHUB_ENV"
       - name: download-model-catalog
         uses: actions/download-artifact@v7
         with:
@@ -438,7 +450,7 @@ jobs:
       - name: download-gateway
         uses: actions/download-artifact@v7
         with:
-          name: symbol-inputs-gateway-${{ matrix.target }}
+          name: symbol-inputs-gateway-${{ matrix.target }}-computer-use
           path: desktop-symbol-inputs/gateway
       - name: restore-exact-release-binaries
         run: python scripts/packaging/release-inputs.py --target "${{ matrix.target }}" --inputs desktop-symbol-inputs
@@ -678,11 +690,18 @@ jobs:
           cd dist
           rm -f SHA256SUMS
           shopt -s nullglob
-          files=(pioneer-gateway-*.zip)
-          if [[ ${#files[@]} -ne 6 ]]; then
-            echo "expected all 6 Gateway assets before publication, found ${#files[@]}"
+          files=(pioneer-gateway-*.gz pioneer-gateway-*.zip)
+          if [[ ${#files[@]} -ne 18 ]]; then
+            echo "expected all 18 Gateway assets before publication, found ${#files[@]}"
             exit 1
           fi
+          for platform in linux-x86_64 linux-aarch64 macos-aarch64 macos-x86_64 windows-x86_64 windows-aarch64; do
+            extension=zip
+            case "$platform" in linux-*|macos-aarch64) extension=gz ;; esac
+            test -f "pioneer-gateway-${platform}.${extension}"
+            test -f "pioneer-gateway-${platform}-computer-use-package.zip"
+            test -f "pioneer-gateway-${platform}-computer-use.${extension}"
+          done
           for file in "${files[@]}"; do
             sha="$(sha256sum "$file" | awk '{print $1}')"
             printf 'sha256:%s %s\n' "$sha" "$file" >> SHA256SUMS
@@ -876,6 +895,7 @@ jobs:
             test -f "dist/Pioneer-${arch}.msi"
           done
           files=(
+            dist/pioneer-gateway-*.gz
             dist/pioneer-gateway-*.zip
             dist/SHA256SUMS
             dist/Pioneer-*.app.zip

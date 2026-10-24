@@ -2304,6 +2304,7 @@ fn compile_agent_instruction_delivery_plan_with_prompt_root(
     permission_profile: &TurnPermissionProfileSnapshot,
     include_task_orchestration_policy: bool,
     include_request_tools_catalog: bool,
+    computer_use_available: bool,
     continue_generation_hint: bool,
     initiating_thread_id: Option<&str>,
     thread_id: &str,
@@ -2324,6 +2325,7 @@ fn compile_agent_instruction_delivery_plan_with_prompt_root(
     let runtime_sections = runtime_sections_with_request_tools_catalog(
         runtime_sections.as_slice(),
         include_request_tools_catalog,
+        computer_use_available,
     );
 
     let bundle = compile_prompt(PromptCompileInput {
@@ -3981,6 +3983,7 @@ async fn execute_agent_provider_response(
             &permission_profile,
             include_task_orchestration_policy,
             false,
+            false,
             continue_generation_hint,
             turn_tool_materialization.initiating_thread_id.as_deref(),
             thread_id,
@@ -4411,6 +4414,7 @@ async fn execute_agent_provider_response(
         &permission_profile,
         include_task_orchestration_policy,
         true,
+        router.find_spec("cua_get_window_state").is_some(),
         continue_generation_hint,
         turn_tool_materialization.initiating_thread_id.as_deref(),
         thread_id,
@@ -4788,6 +4792,7 @@ async fn execute_agent_provider_response(
                         &permission_profile,
                         include_task_orchestration_policy,
                         round_plan.tools_enabled,
+                        router.find_spec("cua_get_window_state").is_some(),
                         continue_generation_hint,
                         turn_tool_materialization.initiating_thread_id.as_deref(),
                         thread_id,
@@ -4881,6 +4886,7 @@ async fn execute_agent_provider_response(
                     no_tool_runtime_sections.as_slice(),
                     &permission_profile,
                     include_task_orchestration_policy,
+                    false,
                     false,
                     continue_generation_hint,
                     turn_tool_materialization.initiating_thread_id.as_deref(),
@@ -5235,6 +5241,7 @@ async fn execute_agent_provider_response(
                             prompt_runtime_sections.as_slice(),
                             &permission_profile,
                             include_task_orchestration_policy,
+                            false,
                             false,
                             continue_generation_hint,
                             turn_tool_materialization.initiating_thread_id.as_deref(),
@@ -6643,6 +6650,7 @@ async fn execute_agent_provider_response(
                     &permission_profile,
                     include_task_orchestration_policy,
                     next_round_tools_enabled,
+                    router.find_spec("cua_get_window_state").is_some(),
                     continue_generation_hint,
                     turn_tool_materialization.initiating_thread_id.as_deref(),
                     thread_id,
@@ -8272,10 +8280,35 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct VisibilityCuaBackend;
+
+    #[async_trait::async_trait]
+    impl pioneer_tools::ComputerUseBackend for VisibilityCuaBackend {
+        async fn execute(
+            &self,
+            _owner: &str,
+            _name: &str,
+            _arguments: serde_json::Value,
+            _cancellation: tokio_util::sync::CancellationToken,
+        ) -> Result<serde_json::Value, ToolError> {
+            panic!("visibility fixtures must not execute computer use")
+        }
+
+        fn observation_delivered(&self, _owner: &str, _context: &serde_json::Value) -> bool {
+            false
+        }
+
+        fn release_owner(&self, _owner: &str) {}
+    }
+
     fn test_computer_use_config() -> ComputerUseToolsConfig {
         ComputerUseToolsConfig {
             runtime_home_dir: std::env::temp_dir().join("pioneer-agent-request-tools-tests"),
-
+            backend: (!pioneer_tools::computer_use_tool_specs().is_empty()).then(|| {
+                std::sync::Arc::new(VisibilityCuaBackend)
+                    as std::sync::Arc<dyn pioneer_tools::ComputerUseBackend>
+            }),
             max_total_bytes: 1024 * 1024 * 1024,
             ..ComputerUseToolsConfig::default()
         }
@@ -8849,8 +8882,15 @@ mod tests {
             built.router.as_ref(),
         );
 
-        assert!(added.contains(&"cua_get_window_state".to_owned()));
-        assert!(visible_tool_names.contains(&"cua_get_window_state".to_owned()));
+        let cua_available = !pioneer_tools::computer_use_tool_specs().is_empty();
+        assert_eq!(
+            added.contains(&"cua_get_window_state".to_owned()),
+            cua_available
+        );
+        assert_eq!(
+            visible_tool_names.contains(&"cua_get_window_state".to_owned()),
+            cua_available
+        );
         assert!(!visible_tool_names.contains(&"computer_use".to_owned()));
         assert!(visible_tool_names.contains(&"request_tools".to_owned()));
         assert!(visible_tool_names.contains(&"read_file".to_owned()));
@@ -8883,10 +8923,11 @@ mod tests {
             &["cua_get_window_state".to_owned()],
             &[],
         );
-        assert!(
+        assert_eq!(
             selected
                 .visible_tools
-                .contains(&"cua_get_window_state".to_owned())
+                .contains(&"cua_get_window_state".to_owned()),
+            !pioneer_tools::computer_use_tool_specs().is_empty()
         );
         assert!(!selected.visible_tools.contains(&"computer_use".to_owned()));
     }
@@ -9159,7 +9200,11 @@ mod tests {
             "computer operation uses canonical CUA tool",
             "открой браузер и проверь сайт",
             vec!["cua_get_window_state"],
-            vec!["cua_get_window_state"],
+            if pioneer_tools::computer_use_tool_specs().is_empty() {
+                Vec::new()
+            } else {
+                vec!["cua_get_window_state"]
+            },
         ));
 
         for (label, _user_text, selected, expected_extra) in cases {
@@ -9579,6 +9624,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             Some("thread_test"),
             "thread_test",
             "turn_test",
@@ -9626,6 +9672,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             Some("thread_agents_md"),
             "thread_agents_md",
             "turn_agents_md",
@@ -9659,6 +9706,7 @@ mod tests {
             &profile,
             false,
             true,
+            false,
             false,
             Some("thread_permissions"),
             "thread_permissions",
@@ -9700,54 +9748,83 @@ mod tests {
     fn request_tools_catalog_is_compiled_for_tool_enabled_native_delivery_plan() {
         let runtime_home = temp_dir("request_tools_catalog_prompt");
 
-        let plan = compile_agent_instruction_delivery_plan_with_prompt_root(
-            runtime_home.as_path(),
-            None,
-            None,
-            &[],
-            &pioneer_protocol::default_turn_permission_profile_snapshot(),
-            false,
-            true,
-            false,
-            Some("thread_request_tools_catalog"),
-            "thread_request_tools_catalog",
-            "turn_request_tools_catalog",
-        )
-        .expect("compile native delivery plan");
+        for backend_available in [false, true] {
+            let mut config = test_computer_use_config();
+            config.backend = backend_available.then(|| {
+                std::sync::Arc::new(VisibilityCuaBackend)
+                    as std::sync::Arc<dyn pioneer_tools::ComputerUseBackend>
+            });
+            let tools = pioneer_tools::build_tools(
+                ".",
+                "turn_request_tools_catalog",
+                test_tools_permission_context("turn_request_tools_catalog"),
+                test_web_config(),
+                config,
+                Vec::new(),
+            )
+            .expect("test tools must build");
+            let cua_available = tools.router.find_spec("cua_get_window_state").is_some();
+            assert_eq!(
+                cua_available,
+                backend_available && !pioneer_tools::computer_use_tool_specs().is_empty()
+            );
 
-        let catalog_section = plan
-            .bundle
-            .sections
-            .iter()
-            .find(|section| {
-                section.id.manifest_id() == pioneer_promt::REQUEST_TOOLS_HIDDEN_DOMAIN_SECTION_ID
-            })
-            .expect("request_tools catalog section should be compiled");
-        assert_eq!(
-            catalog_section.title,
-            pioneer_promt::REQUEST_TOOLS_HIDDEN_DOMAIN_SECTION_TITLE
-        );
-        assert!(plan.bundle.dynamic_system_text.contains(
-            "If you need a hidden domain and its tools are not currently visible, call request_tools"
-        ));
-        for (domain, tool_names) in pioneer_tools::builtin_tool_domain_map() {
-            let expected = format!("- {}: {}.", domain.as_str(), tool_names.join(", "));
+            let plan = compile_agent_instruction_delivery_plan_with_prompt_root(
+                runtime_home.as_path(),
+                None,
+                None,
+                &[],
+                &pioneer_protocol::default_turn_permission_profile_snapshot(),
+                false,
+                true,
+                cua_available,
+                false,
+                Some("thread_request_tools_catalog"),
+                "thread_request_tools_catalog",
+                "turn_request_tools_catalog",
+            )
+            .expect("compile native delivery plan");
+
+            let catalog_section = plan
+                .bundle
+                .sections
+                .iter()
+                .find(|section| {
+                    section.id.manifest_id()
+                        == pioneer_promt::REQUEST_TOOLS_HIDDEN_DOMAIN_SECTION_ID
+                })
+                .expect("request_tools catalog section should be compiled");
+            assert_eq!(
+                catalog_section.title,
+                pioneer_promt::REQUEST_TOOLS_HIDDEN_DOMAIN_SECTION_TITLE
+            );
             assert!(
-                plan.bundle.dynamic_system_text.contains(expected.as_str()),
-                "catalog missing domain line `{expected}`"
+                plan.bundle
+                    .dynamic_system_text
+                    .contains("call request_tools"),
+                "tool-enabled instructions must explain how to open hidden domains"
+            );
+            for (domain, tool_names) in pioneer_tools::builtin_tool_domain_map() {
+                let expected = format!("- {}: {}.", domain.as_str(), tool_names.join(", "));
+                let available = *domain != BuiltinToolDomain::ComputerUse || cua_available;
+                assert_eq!(
+                    plan.bundle.dynamic_system_text.contains(expected.as_str()),
+                    available,
+                    "catalog availability mismatch for `{expected}`"
+                );
+            }
+            assert!(!plan.bundle.dynamic_system_text.contains("mcp_"));
+            assert!(!plan.bundle.dynamic_system_text.contains("mcp."));
+            assert!(!plan.bundle.dynamic_system_text.contains("skill."));
+            assert!(!plan.bundle.dynamic_system_text.contains("\"parameters\""));
+            assert!(!plan.bundle.dynamic_system_text.contains("\"properties\""));
+            assert!(
+                !plan
+                    .bundle
+                    .dynamic_system_text
+                    .contains("\"additionalProperties\"")
             );
         }
-        assert!(!plan.bundle.dynamic_system_text.contains("mcp_"));
-        assert!(!plan.bundle.dynamic_system_text.contains("mcp."));
-        assert!(!plan.bundle.dynamic_system_text.contains("skill."));
-        assert!(!plan.bundle.dynamic_system_text.contains("\"parameters\""));
-        assert!(!plan.bundle.dynamic_system_text.contains("\"properties\""));
-        assert!(
-            !plan
-                .bundle
-                .dynamic_system_text
-                .contains("\"additionalProperties\"")
-        );
     }
 
     #[test]
@@ -9760,6 +9837,7 @@ mod tests {
             None,
             &[],
             &pioneer_protocol::default_turn_permission_profile_snapshot(),
+            false,
             false,
             false,
             false,

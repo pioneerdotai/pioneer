@@ -4,6 +4,11 @@
 // crates/tools/src/handlers/computer_use/LICENSE.cua).
 // Transitive rustc-link-arg directives do not reach Pioneer executables.
 pub fn macos_link_inputs() {
+    // Each final binary must opt in explicitly; dependency features do not
+    // propagate Cargo feature environment variables to its build script.
+    if std::env::var_os("CARGO_FEATURE_COMPUTER_USE").is_none() {
+        return;
+    }
     let manifest = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     println!(
         "cargo:rerun-if-changed={}",

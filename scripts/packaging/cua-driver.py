@@ -48,12 +48,43 @@ def build(target):
         command += ["-p", "cua-driver-uia"]
     environment = os.environ.copy()
     environment["CARGO_TARGET_DIR"] = str(Path("target/cua-build").resolve())
+    if "apple-darwin" in target:
+        environment["MACOSX_DEPLOYMENT_TARGET"] = "13.0"
     # Pioneer owns its telemetry. Never compile a daemon with an inherited DSN.
     for name in ("PIONEER_SENTRY_DSN", "PIONEER_DESKTOP_SENTRY_DSN"):
         environment.pop(name, None)
     subprocess.run(command, cwd=workspace, env=environment, check=True)
     suffix = ".exe" if "windows" in target else ""
     return source, Path(environment["CARGO_TARGET_DIR"]) / target / "release" / ("cua-driver" + suffix)
+
+
+def notarize(path):
+    with tempfile.TemporaryDirectory(prefix="pioneer-cua-notary-") as temporary:
+        root = Path(temporary)
+        key_id = os.environ.get("APPLE_NOTARIZATION_KEY_ID", "")
+        issuer = os.environ.get("APPLE_NOTARIZATION_ISSUER_ID", "")
+        key = os.environ.get("APPLE_NOTARIZATION_KEY", "")
+        if not key and os.environ.get("APPLE_NOTARIZATION_KEY_BASE64"):
+            key = base64.b64decode(os.environ["APPLE_NOTARIZATION_KEY_BASE64"], validate=True).decode()
+        if not key_id or not issuer or not key:
+            raise ValueError("Gateway package requires notarization credentials")
+        key_file = root / "notary-key.p8"
+        key_file.write_text(key)
+        key_file.chmod(0o600)
+        notary_archive = root / "gateway-notary.zip"
+        try:
+            subprocess.run(["ditto", "-c", "-k", "--keepParent", str(path), str(notary_archive)], check=True)
+            response = subprocess.check_output(["xcrun", "notarytool", "submit", str(notary_archive),
+                "--key", str(key_file), "--key-id", key_id, "--issuer", issuer,
+                "--wait", "--output-format", "json"], text=True)
+            if json.loads(response).get("status") != "Accepted":
+                raise ValueError("Gateway package notarization was not accepted")
+            # Apple supports stapling the app, not a standalone Mach-O bridge.
+            if path.suffix == ".app":
+                subprocess.run(["xcrun", "stapler", "staple", str(path)], check=True)
+        finally:
+            key_file.unlink(missing_ok=True)
+            notary_archive.unlink(missing_ok=True)
 
 
 def package(target, binary, archive):
@@ -113,28 +144,7 @@ def package(target, binary, archive):
             subprocess.run(["codesign", "--force", "--timestamp", "--options", "runtime",
                             "--sign", identity, str(app)], check=True)
             subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
-            key_id = os.environ.get("APPLE_NOTARIZATION_KEY_ID", "")
-            issuer = os.environ.get("APPLE_NOTARIZATION_ISSUER_ID", "")
-            key = os.environ.get("APPLE_NOTARIZATION_KEY", "")
-            if not key and os.environ.get("APPLE_NOTARIZATION_KEY_BASE64"):
-                key = base64.b64decode(os.environ["APPLE_NOTARIZATION_KEY_BASE64"], validate=True).decode()
-            if not key_id or not issuer or not key:
-                raise ValueError("Standalone Gateway app requires notarization credentials")
-            key_file = root / "notary-key.p8"
-            key_file.write_text(key)
-            key_file.chmod(0o600)
-            notary_archive = root / "gateway-notary.zip"
-            try:
-                subprocess.run(["ditto", "-c", "-k", "--keepParent", str(app), str(notary_archive)], check=True)
-                response = subprocess.check_output(["xcrun", "notarytool", "submit", str(notary_archive),
-                    "--key", str(key_file), "--key-id", key_id, "--issuer", issuer,
-                    "--wait", "--output-format", "json"], text=True)
-                if json.loads(response).get("status") != "Accepted":
-                    raise ValueError("Gateway app notarization was not accepted")
-                subprocess.run(["xcrun", "stapler", "staple", str(app)], check=True)
-            finally:
-                key_file.unlink(missing_ok=True)
-                notary_archive.unlink(missing_ok=True)
+            notarize(app)
             if os.environ.get("PIONEER_SYMBOL_INPUTS_DIR"):
                 subprocess.run([sys.executable, str(Path(__file__).with_name("symbol-inputs.py")),
                     "record", str(gateway),
@@ -158,6 +168,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", required=True, choices=sorted(TARGETS))
     parser.add_argument("--binary", required=True, type=Path)
-    parser.add_argument("--archive", required=True, type=Path)
+    parser.add_argument("--archive", type=Path)
+    parser.add_argument("--sign-bootstrap", action="store_true")
     arguments = parser.parse_args()
-    package(arguments.target, arguments.binary, arguments.archive)
+    if arguments.sign_bootstrap:
+        identity = os.environ.get("MACOS_DESKTOP_SIGN_IDENTITY", "")
+        if "apple-darwin" not in arguments.target or not identity:
+            raise ValueError("macOS compatibility bridge requires the Gateway signing identity")
+        subprocess.run(["codesign", "--force", "--timestamp", "--options", "runtime",
+                        "--sign", identity, str(arguments.binary)], check=True)
+        subprocess.run(["codesign", "--verify", "--strict", str(arguments.binary)], check=True)
+        notarize(arguments.binary)
+    else:
+        if arguments.archive is None:
+            parser.error("--archive is required for CU packaging")
+        package(arguments.target, arguments.binary, arguments.archive)

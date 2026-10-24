@@ -9,9 +9,10 @@ authors.workspace = true
 # Compile only deterministic native OAuth audit fixtures.
 oauth-test-support = ["pioneer-mcp-oauth/test-support"]
 default = []
+computer-use = ["dep:cua-driver-sdk", "pioneer-tools/computer-use"]
 
 [dependencies]
-cua-driver-sdk = { git = "https://github.com/trycua/cua", rev = "688c5fd62a9f13dddc309970c948df494e7de33f" }
+cua-driver-sdk = { git = "https://github.com/trycua/cua", rev = "688c5fd62a9f13dddc309970c948df494e7de33f", optional = true }
 pioneer-compaction.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true

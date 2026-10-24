@@ -12,9 +12,10 @@ import tarfile
 SYMBOLS = runpy.run_path(str(Path(__file__).with_name("symbol-inputs.py")))
 
 
-def restore(inputs, names, target, commit, catalog):
+def restore(inputs, names, target, commit, catalog, variant=None):
     metadata = json.loads((inputs / "inputs.json").read_text())
-    if (metadata["commit"] != commit or str(metadata["run_id"]) != os.environ["GITHUB_RUN_ID"]
+    if ((variant is not None and metadata.get("variant") != variant)
+            or metadata["commit"] != commit or str(metadata["run_id"]) != os.environ["GITHUB_RUN_ID"]
             or metadata["target"] != target
             or metadata.get("catalog_sha256") != SYMBOLS["digest"](catalog)
             or {row["filename"] for row in metadata["binaries"]} != set(names)
@@ -51,7 +52,9 @@ def restore(inputs, names, target, commit, catalog):
                     raise ValueError("Release executable module mismatch")
                 if entry["filename"] in ("pioneer", "pioneer.exe"):
                     build = SYMBOLS["native"]["build_manifest"](data)
-                    if build["revision"] != commit or build["target"] != target:
+                    if (build["revision"] != commit or build["target"] != target
+                            or (variant is not None and
+                                ("COMPUTER_USE" in build["features"]) != (variant == "computer-use"))):
                         raise ValueError("Desktop requires this release's Gateway")
                 binary.chmod(0o755)
                 seen.add(member.name)
@@ -78,10 +81,10 @@ def main():
     restore(args.inputs, [name + suffix for name in ("pioneer-app", "pioneer-app-updater")],
             args.target, commit, catalog)
     gateway = args.inputs / "gateway"
-    metadata = restore(gateway, ["pioneer" + suffix], args.target, commit, catalog)
+    metadata = restore(gateway, ["pioneer" + suffix], args.target, commit, catalog, "computer-use")
     entry = metadata["binaries"][0]
     (gateway / "reuse.json").write_text(json.dumps(dict(schema_version=1,
-        run_id=str(metadata["run_id"]), commit=commit, target=args.target,
+        run_id=str(metadata["run_id"]), commit=commit, target=args.target, variant="computer-use",
         module_id=entry["module_id"], binary_sha256=entry["sha256"]),
         indent=2) + "\n")
 

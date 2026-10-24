@@ -3919,6 +3919,7 @@ impl MessageProcessor {
 
         // Freeze the same passive CUA catalog that native/provider tools use.
         // Runtime ComputerUse approval still evaluates every complete call.
+        #[cfg(feature = "computer-use")]
         if permission.effective_policy.computer_use != pioneer_protocol::PermissionBehavior::Deny {
             let allowed = match authority {
                 TurnExecutionAuthority::Fresh(admission) => {

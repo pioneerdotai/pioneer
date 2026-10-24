@@ -1,5 +1,7 @@
 # CUA Gateway migration — handoff
 
+Current status (2026-10-24): the prior migration acceptance is superseded for the server product by the server-contract audit. The restoration below is an uncommitted candidate for full external static review; no execution phase is authorized. Historical review/publication records are preserved unchanged. See the final “Server/computer-use contract restoration” section.
+
 Publication update: the user accepted this implementation and authorized commit/push, PR creation and CI repairs. PR: https://github.com/pioneerdotai/pioneer/pull/172. The review-round statuses and repository snapshots below are preserved historical records from before publication. The accepted implementation was committed as `7e208b9912d3615392d83aeb25e7f92137711f2b`. Current CI follow-up is recorded at the end.
 
 **Готово к повторному внешнему статическому ревью; компиляция и тесты не запускались.** Round 2 residual G02 and G12 fixes are unstaged over the unchanged 114-path reviewed index and preserved round-1 fixes. G01 and G03–G11 were closed by the external round-2 static audit; they were not rewritten. The existing untracked build-support file is preserved and listed below. Daemon, inventory, UI, signing, packaging and installation were not executed. Round-1 task history and round-2 task resolution are recorded below; internal integration is not external acceptance or permission to execute.
@@ -395,3 +397,511 @@ Current main `fa0ec29bfd19f9ada8f66be9665d77f5e51e0095` introduced confirmed con
 ## CI follow-up: hidden-domain catalog budget
 
 Run `40074335763` at `6526d6e4` failed Linux shard 4 in `request_tools_hidden_domain_catalog_token_guard_stays_compact`: the complete catalog grew to 1,297 characters with the CUA allowlist, exceeding the existing 1,200-character budget. Shortened only the two introductory sentences, preserving the request_tools instruction, overlapping-domain visibility semantics and every domain/tool name. Source-text accounting gives 1,172 characters; this is static text analysis, not test execution. The existing budget and all assertions remain unchanged. Future monitor firings were verified paused before editing; no local builds/tests or platform probes were run. Full CI on the repair head remains required.
+
+
+## Server/computer-use contract restoration — 2026-10-24
+
+This section supersedes the historical decision to replace default/computer-use variants with six CU ZIPs. Removing the old engine did not authorize removing the server product. Source-review inputs were `../cua-server-contract-audit-20261024/AUDIT.md` and its Windows, macOS and matrix/Linux reports. Those historical audit files were read only and are not rewritten.
+
+### State and review boundary
+
+- Worktree: `/Users/alexander/Code/pioneer/pioneer/.worktrees/cua-gateway-migration`; branch `feature/cua-gateway-migration`.
+- Original behavior baseline: `6c1e6b2c49359c76e49624c0545bbafc4a3d310a`; first migration: `7e208b9912d3615392d83aeb25e7f92137711f2b`.
+- Entry and final committed HEAD: `747f60be0aa1718f8f294a924a6a39b9d9a80f39`. Entry status was clean. Restoration remains unstaged; no commit/push/staging/reset/rebase/merge was performed in this round. Existing main merge and CI/media/permission fixes are preserved.
+- Last integrated main / merge-base with the observed local origin/main: `fa0ec29bfd19f9ada8f66be9665d77f5e51e0095`. Observed local tracking origin/main is `4bc0ba4fb220e9b4aad8f23b9215b96d4e4dd962`; it was not fetched or merged this round. No claim of current remote mergeability follows.
+- The original CI monitor `1EuSrEXDwGwWI6UvduAfp` was verified paused with no active runs; its stale nextFireAt is not an active schedule. It was not resumed, cancelled or replaced.
+- This is a reviewable source candidate, not external acceptance. Compilation, test results, actual native dependency closure, minimum OS versions, installation/update/recovery and platform/runtime compatibility remain unverified.
+
+### Requirement → owner map (planned before edits)
+
+| Requirement | Owner / changed area |
+| --- | --- |
+| CU-free default dependency graph; optional CU backend | CLI/Gateway/tools manifests; Gateway lifecycle/native MCP; shared build helper |
+| Catalogs agree with available execution | tools registry/materializer and prompt renderer; existing tools/agent/prompt test owners |
+| Twelve producers and matching consumers | Gateway packager, release and symbols workflows, release/symbol input helpers |
+| Desktop explicitly consumes CU | Desktop packagers, package-content guard and Rust bundled/development launcher |
+| Server/CU archive and recovery boundaries | CLI installer and macOS executable selection; existing installer regressions |
+| Public selection and supported legacy CU migration | install.sh/install.ps1 and README |
+
+All owners received the execution ban and the same six-target/two-variant matrix. Scope stayed within restoring this contract; no new protocol, SDK fork, engine, service, display virtualization, storage or scheduler was added.
+
+### Final producer / consumer matrix
+
+All assets have prefix `pioneer-gateway-`. Producer is `.github/workflows/release.yml:93` → `scripts/packaging/build-gateway.py:29`; selectors are `installer.rs:1023`, the root bootstrap scripts, and Desktop `launcher.rs:607`.
+
+| Target | Default/server asset | Computer-use asset |
+| --- | --- | --- |
+| x86_64-unknown-linux-gnu | linux-x86_64.gz | linux-x86_64-computer-use.zip |
+| aarch64-unknown-linux-gnu | linux-aarch64.gz | linux-aarch64-computer-use.zip |
+| aarch64-apple-darwin | macos-aarch64.gz | macos-aarch64-computer-use.zip |
+| x86_64-apple-darwin | macos-x86_64.zip | macos-x86_64-computer-use.zip |
+| x86_64-pc-windows-msvc | windows-x86_64.zip | windows-x86_64-computer-use.zip |
+| aarch64-pc-windows-msvc | windows-aarch64.zip | windows-aarch64-computer-use.zip |
+
+The unsuffixed Windows and macOS Intel ZIPs contain a real server executable, not a CU executable under a compatible name. Server gzip remains a gzip-compressed executable, never a renamed ZIP. Existing Intel ONNX dylibs remain in both ZIP variants.
+
+### Static evidence and coherent-block self-audit
+
+1. **Dependency / lifecycle boundary.** `cli/Cargo.toml:11` forwards computer-use to Gateway; `gateway/Cargo.toml:12` enables the optional pinned SDK and tools feature. Tools consumers in agent/artifacts/memory/promt do not enable CU themselves. No other manifest owns the SDK. Gateway's module, supervisor construction, injected backend and shutdown are gated (`gateway/src/lib.rs:20,528,662,1090`). Default backend is None. Both existing final executable build-helper consumers (`cli/build.rs:6`, `gateway/build.rs:45`) reach a shared early CU-feature guard (`gateway/build_support.rs:9`) before any Swift/framework discovery. The workspace-wide forced deployment target is removed. Explicit CLI/Gateway CU builds, CI and Desktop development/packaging consumers opt into CU and its macOS deployment input. Cargo.lock and CUA pin `688c5fd62a9f13dddc309970c948df494e7de33f` are unchanged. No resolver was run; any later --locked resolution issue must be handled in a separately authorized phase, without invented entries.
+2. **Catalog / authorization boundary.** Tools specs are empty without CU; the materializer also requires an injected backend. This closes the provider/direct registration leak under tools-only feature unification while Gateway's own CU feature is disabled. Native MCP identity/catalog and its per-turn CUA admission block (`gateway/src/message/turn_handlers.rs:3921`) are independently gated by Gateway's feature. The default prompt omits the CU domain; the known domain/permission vocabulary remains for existing classification and unavailable-domain diagnostics. Existing request_tools visibility and per-call authorization semantics remain. The supervisor body, media/image admission, original image bytes, durable delivery receipts, cursor, cancellation and no-replay implementation were not rewritten.
+3. **Release / platform inputs.** build-gateway.py validates each target/variant/name before building. Only CU adds `--features computer-use` and invokes cua-driver.py; server takes the old gzip/standalone-ZIP branches. CUA signing/notarization setup is CU-only. Linux retains baseline prerequisites; newly added Xi/Xtst/X11 inputs are CU-only. CUA daemon portal features are not treated as the host SDK graph. There is no new Windows Service, macOS LaunchDaemon or Linux service mechanism. Windows AtLogOn/Limited and Linux systemd user service source is unchanged. macOS retains the existing GUI LaunchAgent; the server selects the standalone executable even if an old CUA app remains.
+4. **Packaging / provenance.** Publication requires all 12 exact assets and checksums include both gzip and ZIP. Retained Gateway inventories carry target and variant. Desktop selects CU explicitly in packaging and its Rust runtime asset lookup. Reuse and symbol processing retain run/commit/target/catalog/hash/module checks and additionally verify variant against embedded build features. The symbols workflow still rejects mixed/duplicate/incomplete inventories and supports historical inventory generations. It never rebuilds release binaries to obtain symbols. Existing CU package signing, daemon/companions, manifest and pin validation remain intact.
+5. **Install / recovery.** `installer.rs:1525` accepts bounded server gzip on its original targets; `:1557` preserves safe ZIP paths, duplicate/symlink and size guards. Server ZIPs need no CUA manifest/daemon/app and reject CUA payload entries; Intel ONNX remains required. CU keeps the complete-package checks (`:1715`) and repeat validation before activation. Server dispatch never calls CUA validation/activation. Clean server installs without companion libraries bypass companion replacement; Intel ONNX updates use the existing common recovery unit without requiring a driver/app/manifest. A CU→server transition retires the old managed app/daemon into the existing backup unit while activating server libraries; a server→CU transition installs the complete validated package. Candidate-local macOS libraries (`:1290`), schema preflight (`:352`) before service stop (`:408`), retained backup guards and the no-rollback-after-possible-schema-advancement rule (`:1184`) remain. No foreign-process actions were added. Source inspection does not demonstrate successful recovery.
+6. **Three update paths.** Old server self-updaters keep all six original asset names/formats and receive a server binary. Root scripts run the downloaded executable as bootstrap after checksum verification, so they use the new payload-aware installer. New CLI local-archive installation uses the new extractor and its own compiled variant. Switching variants uses the bootstrap of the desired variant. Old CU Linux/macOS ARM updaters look for -computer-use.gz; old CU Windows/macOS Intel updaters can match the ZIP name but discard sidecars. Neither can install the new full package; README gives the supported explicit bootstrap migration using the script from the desired release tag's repository source and SHA256SUMS from that release (scripts are not assumed to be published release assets). No transparent binary-only CU migration is claimed.
+7. **Scope preservation.** Production changes are limited to feature/build/catalog gates, packaging/selector/provenance, archive/companion transitions and the macOS selector. Agent changes are test-only. New supervisor/SDK transport, authorization and image/cancel/cursor bodies are unchanged. Historical reports and neighboring worktrees are unchanged. Prior CI Xcode/media/permission fixes and the shortened prompt introduction/budget remain; CI now explicitly includes CU for its existing CU regressions while retaining default compile checks.
+
+### Authored regressions, never run
+
+Applied `test-audit` to existing owners, with production/test editing separated and protected regions compared. Registry coverage now distinguishes build-feature and backend availability. Agent generic parallel journaling remains unconditional; its complete six-case CUA delivery matrix remains when CU is available. Existing visibility/prompt fixtures reflect the build and use a nonexecuting backend only where registration is required. Prompt coverage now owns the server/CU availability difference; duplicate exact-map assertions were consolidated within that affected owner, with the 1,200-character budget unchanged.
+
+The installer owner covers target asset names, server gzip/ZIP admission and wrong-format/CU rejection, complete CU ZIP admission with missing manifest/wrong pin/hash/missing companion, actual activation/recovery and Intel library/app restoration. Existing schema uncertainty and retained-backup cases remain. The symbol-input owner adds wrong-variant rejection before extraction/native tooling. Desktop's existing command fixture uses the CU archive name. These are authored regressions and source traces, not passing results or native qualification.
+
+### Commands and deferred execution
+
+Performed only source/Git/skill/audit reads (`pwd`, `ls`, `cat`, `sed`, `rg`, `git show/status/diff/rev-parse/merge-base`), standard-library text editing/hash/snapshot scripts, `cargo fmt` / `cargo fmt --check`, `git diff --check` and read-only task inspection/review operations. No project Python code was imported or executed. Child formatter observations included transient differences while another owner was editing; the final check is recorded below. No Cargo metadata/fetch/resolver, compiler, tests, linter/typecheck, packaging/install/CI/dev scripts, SDK/daemon or OS probes were run or triggered. No commit or push was made.
+
+Deferred until full external source review and separate explicit execution permission: locked server and CU compilation on all six native targets; default and CU installer/catalog/agent regressions (nextest with --test-threads 2 --no-fail-fast --retries 0); doctests separately; symbol-input regressions; package/signature/provenance checks; old-server update, explicit old-CU bootstrap, both variant transitions and recovery before/after potential schema advancement; real PE/Mach-O/ELF closure and minimum OS qualification; CU graphical-session/permission/cursor/media/cancellation readiness. Compilation or runtime compatibility is not inferred from Cargo manifests, newer SDKs, test source or child acceptance.
+
+Review exports will be saved under ignored `.cua-source/`: `server-contract-restoration.patch` (HEAD → current tree), `server-contract-full-integrated-main.patch` (fa0ec29b → current tree, complete corrected migration), and `server-contract-full-original-base.patch` (6c1e6b2 → current tree, including the already committed main merge). They contain all tracked source changes; this round introduces no new source paths. They are source artifacts, not builds.
+
+
+### Attached work resolution and final source state
+
+| Task / run | Exact review resolution |
+| --- | --- |
+| Packaging `XOdwsVuE0D4BsnC4rgzEa` / `6rZeYuW7GFQx7xJZIdWSW` | Exact revision `trc_6rZeYuW7GFQx7xJZIdWSW_revise_trc_6rZeYuW7GFQx7xJZIdWSW_Xs8XzHVhnE6JFwepisYXn_1` read through task_result (SHA256 `ebca69e526e303a55450ec4bd212c5a8ceff955ab5537b9cee230bca974a359d`), independently compared with source, accepted; completed/succeeded. |
+| Installer `wkyUYuZA2yTTOC9bNAi3s` / `Y4pWNwfMEF6lxpgZHWrkJ` | Exact revision `trc_Y4pWNwfMEF6lxpgZHWrkJ_revise_trc_Y4pWNwfMEF6lxpgZHWrkJ_zBqig0fRfDxTSvoVEW4Tj_1` read through task_result (SHA256 `c79e774eb58a259d04f3836d04dc3372f35d8e72f03058605726643eb15b40ad`), independently compared with source, accepted; completed/succeeded. |
+| Compile/catalog `DfsaplxB7MmkqSt64F8EX` / `B7gkAWZdZc9j7uwUdGhFL` | Initial and first revised exact candidates were read, then revised for missing default/CU test-fixture boundaries. During the second revision, runtime terminated the task as cancelled with execution `conflict` (“The operation conflicts with current state.”); no final candidate was returned or accepted. Parent directly reviewed the final manifests/build gates/registry and test-only agent changes and completed prompt/Desktop/per-turn gates. The cancelled child's unaccepted report is not treated as final evidence. |
+
+Final task_wait confirmed **3 terminal tasks, 0 pending and 0 review-required**; no child was detached or replaced. Runtime cancellation of the compile/catalog child is recorded rather than disguised as acceptance. Internal acceptance of the other two is not external source acceptance and does not authorize execution.
+
+Final branch/HEAD remain `feature/cua-gateway-migration` / `747f60be0aa1718f8f294a924a6a39b9d9a80f39`: **33 unstaged tracked files, 0 staged files, 0 untracked source files**. The final `cargo fmt --all --check`, `git diff --check`, `git diff --cached --check` and `git diff --exit-code -- Cargo.lock` returned exit 0. The agent chat production prefix was compared with HEAD and is identical; its changes are confined to the existing test module. Protected parent test-phase prefixes remained identical to their snapshots. Complete final source diffs were read, including the final agent fixtures and the one-line per-turn native CU gate. No tests or compiled/runtime/platform checks were run. Full external review and separate explicit execution permission remain outstanding.
+
+
+## Server contract: external review round 1 corrections (R01–R07, 2026-10-24)
+
+This section records the source candidate correcting the seven findings in
+`../cua-server-restoration-review-round1/AUDIT.md`. Earlier review records above
+remain historical. **This candidate has not received external acceptance. Tests,
+compilation, packaging and runtime checks remain prohibited until full external
+source acceptance and separate explicit permission for execution.**
+
+### Entry identity and preservation
+
+Worktree remains `/Users/alexander/Code/pioneer/pioneer/.worktrees/cua-gateway-migration`,
+branch `feature/cua-gateway-migration`, HEAD
+`747f60be0aa1718f8f294a924a6a39b9d9a80f39`. Original base is
+`6c1e6b2c49359c76e49624c0545bbafc4a3d310a`; integrated main is
+`fa0ec29bfd19f9ada8f66be9665d77f5e51e0095`. Entry had 33 unstaged tracked files,
+zero staged files and zero untracked source files, matching the reviewer snapshot.
+No branch, worktree, merge, commit, push, reset, stash or monitor operation occurred.
+The paused CI monitor was not changed. No subagents or task-backed work were created
+or reviewed in this correction round; the earlier task resolutions above remain historical.
+
+Entry copies and patches are retained under ignored
+`.cua-source/server-review-r01-r07-entry/`. SHA256 at entry:
+
+| Input | SHA256 |
+| --- | --- |
+| HEAD → entry restoration patch | `3c3d68104785da2f5feb9b3eff1a34ccb951e3d1413fe39a9ec4edce05cdfd0f` |
+| Integrated main → entry patch | `21a4b7b5b04243cc46067b4d9c6c4238629ce75c862949291aed62948d75305f` |
+| Original base → entry patch | `f8128fc325f591339dbcd8410bd1578620545ca2a87d1c1bd06339354d15bfa3` |
+| Empty staged patch | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
+| Raw Git index bytes | `09a4be787e9a7cf1005dc4325e273816d7b7c1bfe9efca19620aab9be86a04ce` |
+| Cargo.lock (equals HEAD) | `f76eb868626c41ddf0da43d9db28ed2bb918c0e55c6ed666ed0b30733617abe5` |
+
+The raw index and Cargo.lock hashes remain identical. The CUA revision remains
+`688c5fd62a9f13dddc309970c948df494e7de33f`; no manifest, dependency version,
+checksum, lock entry or `--locked` policy was changed in this round.
+
+### Requirement → owner → source resolution
+
+All seven findings are addressed in source, pending external review and execution.
+
+| Finding | Existing owners changed | Decision and static evidence |
+| --- | --- | --- |
+| R01 / P1 | `.github/workflows/release.yml`, `.github/workflows/smoke-install.yml` | CU standalone Gateway uses `macos-15` for aarch64 and native `macos-15-intel` for x86_64; server retains its existing host selection. Both Desktop build and the separate packaging job use these architecture-specific hosts through their shared matrix. Each of these jobs and macOS smoke explicitly selects Xcode 26.2 and exports DEVELOPER_DIR for subprocesses. Target values, archive names, ONNX companions, signing, catalog and symbol provenance paths are unchanged. |
+| R02 / P2 | `crates/promt/src/render/request_tools.rs`, `crates/agent/src/chat/mod.rs` | Existing prompt functions receive a narrow `computer_use_available` argument. All six real native-plan callers supply the current router's registered `cua_get_window_state` presence for tool-enabled plans, or false for no-tool plans. The renderer additionally retains its tools-feature guard. Initial prompt, refreshed continuation and retry paths agree. No capability framework or registration change was added. |
+| R03 / P2 | `crates/agent/src/manager_tests.rs` | Only the three reported visibility scenarios opt into a nonexecuting backend fixture. Their existing provider requests require CU when the tools feature registers it and require its absence in server builds. Selected/unselected memory/task/artifact checks and text-only versus image-capable provider behavior remain. The generic tool-loop fixture stays backend-less. |
+| R04 / P2 | `crates/gateway/src/message/tests.rs` | Only the expected CUA binding contribution depends on Gateway's own `computer-use` feature. The persistence, ordering, complete binding count and native-start scenario remain unconditional. |
+| R05 / P2 | `crates/promt/tests/compile_snapshots.rs` | Both existing continuation owners use the final short intro and exercise availability false/true. The manually maintained complete expectation retains all domain/tool names. Exact full-string equality replaces the inline insta assertion to express the two expected variants without duplicating both large literals. Only the expected CU line is omitted for unavailable builds/runtimes; actual output is never filtered or normalized. A literal-format trailing newline is removed from the expectation only. No snapshot generator/auto-accept was run. |
+| R06 / P2 | `.github/workflows/ci.yml` | Adds one Linux default/server nextest invocation before the existing CU archive. Explicit packages are CLI/Gateway/tools/promt/agent, `--no-default-features`, no CU feature arguments. Filters select existing installer tests, registry availability, request_tools/continuation prompts, the three agent visibility scenarios/native prompt owner, and Gateway capability persistence. `--locked --test-threads 2 --no-fail-fast --retries 0` retained. CU archive, four shards and doctests remain. This edits future CI configuration only. |
+| R07 / P3 | `resources/skills/pioneer/runtime-diagnostics/references/symbols.md` | Documents `debug-symbol-inputs-gateway-TARGET-default` and `...-computer-use`, Desktop's CU Gateway, and the historical unsuffixed generation. No symbol producer, consumer or trust check changed for this finding. |
+
+R01 uses the already selected Xcode/SDK policy, supported by the primary
+[runner label table](https://github.com/actions/runner-images#available-images),
+[Intel inventory](https://github.com/actions/runner-images/blob/main/images/macos/macos-15-Readme.md),
+[ARM inventory](https://github.com/actions/runner-images/blob/main/images/macos/macos-15-arm64-Readme.md)
+and [Apple Xcode 26.2 requirements](https://developer.apple.com/documentation/xcode-release-notes/xcode-26_2-release-notes).
+Both runner inventories list Xcode 26.2 at the explicit path; Apple requires
+macOS 15.6 or newer for its host. The new host selection is a build policy, not
+an increased runtime minimum or a platform compatibility claim. CU's existing
+scoped deployment input is unchanged; no global MACOSX_DEPLOYMENT_TARGET was restored.
+
+### Complete target / variant matrix retained
+
+Names below follow `pioneer-gateway-`. All six server assets retain the old
+updater contract; all six CU assets contain the complete driver package.
+
+| Target | Server asset | CU asset | macOS CU host, where applicable |
+| --- | --- | --- | --- |
+| x86_64-unknown-linux-gnu | linux-x86_64.gz | linux-x86_64-computer-use.zip | — |
+| aarch64-unknown-linux-gnu | linux-aarch64.gz | linux-aarch64-computer-use.zip | — |
+| aarch64-apple-darwin | macos-aarch64.gz | macos-aarch64-computer-use.zip | macos-15 / ARM64 |
+| x86_64-apple-darwin | macos-x86_64.zip | macos-x86_64-computer-use.zip | macos-15-intel / x86_64 |
+| x86_64-pc-windows-msvc | windows-x86_64.zip | windows-x86_64-computer-use.zip | — |
+| aarch64-pc-windows-msvc | windows-aarch64.zip | windows-aarch64-computer-use.zip | — |
+
+### Final static self-review and test authorship
+
+The complete HEAD → candidate restoration diff was reviewed, including the
+pre-existing restoration. Source traces reconfirm the following boundaries:
+
+1. CLI default → Gateway default → tools default has no CUA activation. The only
+   CU manifest edges are CLI forwarding to Gateway and Gateway enabling optional
+   SDK/tools. Neither the five selected server CI packages nor their manifest
+   consumers request CU. Both final-binary build helper consumers reach the early
+   CU guard before Swift/framework discovery. This is manifest/source analysis;
+   actual Cargo resolution and linking remain deferred.
+2. Gateway still owns the supervisor, backend injection and shutdown. Server
+   injects None; mixed tools-on/Gateway-off still has empty materialization and
+   no native admission. Prompt now uses that real registry. Known permission/domain
+   vocabulary, per-call approval, request_tools selection and the 1200-character
+   guard remain. The hand-written CU catalog expectation contains 25 operations
+   and 1172 characters; this count is text analysis, not renderer execution.
+3. Producer, CLI selector, root bootstraps, Desktop selector, checksums/publication,
+   retained inventories and symbol consumers still agree on all 12 assets. Server
+   gzip is a standalone compressed executable; server ZIP contains a server
+   executable plus existing Intel ONNX libraries where required. Only CU invokes
+   the daemon/app packager. Desktop explicitly restores and packages CU.
+4. Installer extraction, candidate-local libraries, complete CU identity/hash/pin/
+   target/companion checks, schema preflight before stopping the old service,
+   activation, retained backups and schema-advancement rollback prohibition are
+   unchanged this round. CU→server and server→CU boundaries remain as described
+   in the restoration section. Old server names/formats are retained on every OS;
+   old CU binary-only extractors still require the documented payload-aware
+   bootstrap, not a promise of transparent update compatibility.
+5. Supervisor/private IPC/identity, authorization, original image bytes/geometry/
+   tokens, cursor, native/CLI/proxy delivery, cancellation/generation fencing and
+   no-replay bodies were not changed. Snapshot comparison retains these reviewed
+   bytes. Windows AtLogOn/Limited, macOS GUI LaunchAgent and Linux systemd user
+   service boundaries remain; no new service, SDK fork, legacy engine or display
+   infrastructure was introduced.
+6. Compared with all 267 audit snapshot path states, only these nine code/config/
+   instruction files and this appended handoff differ; the other 257 path states
+   are byte-for-byte unchanged, including all 143 inherited-main states. Historical
+   reviewer materials were read only. This self-review is not reviewer acceptance.
+
+Applied test-audit to exclusively test regions/files after completing production
+and CI edits. Protected mixed-file production prefixes were saved before the
+separate test phase and remained identical through its edits/checks. The existing
+prompt compiler owner covers backend None/injected with the real tool registry;
+feature-off is covered by its server build. The three manager fixtures own
+provider/preflight visibility; the Gateway owner retains persistence/order; the
+two continuation owners retain exact prompt bytes. These address distinct existing
+boundaries without new harnesses, source-grep tests, skipped scenarios or test-only
+production seams. None of these regressions was executed; no pre/post passing
+comparison is claimed.
+
+### Files, commands and deferred execution
+
+This round changes ten existing tracked files: the nine owners listed in the table
+and this handoff. Final state is **36 unstaged tracked files, 0 staged files,
+0 untracked source files**. In addition to this round's files, the following 26
+entry-restoration files remain unchanged from the incoming candidate:
+
+- `.cargo/config.toml`; `.github/workflows/build-debug-symbols.yml`; `README.md`.
+- `crates/cli/Cargo.toml`; `crates/cli/src/installer.rs`; `crates/cli/src/service/macos.rs`.
+- `crates/desktop/src/gateway/control/launcher.rs`.
+- `crates/gateway/Cargo.toml`; `crates/gateway/build_support.rs`; `crates/gateway/src/lib.rs`;
+  `crates/gateway/src/message/turn_handlers.rs`; `crates/gateway/src/turn_mcp/native_tools.rs`.
+- `crates/tools/Cargo.toml`; `crates/tools/src/lib.rs`;
+  `crates/tools/src/handlers/computer_use/mod.rs`.
+- `install.sh`; `install.ps1`.
+- `scripts/packaging/build-gateway.py`; `scripts/packaging/cua-driver.py`;
+  `scripts/packaging/desktop/check-package-contents.sh`;
+  `scripts/packaging/desktop/package-linux-appimage.sh`;
+  `scripts/packaging/desktop/package-macos.sh`;
+  `scripts/packaging/desktop/package-windows-msi.ps1`;
+  `scripts/packaging/release-inputs.py`; `scripts/packaging/symbol-inputs.py`;
+  `scripts/packaging/test_symbol_inputs.py`.
+
+Performed source/skill/audit reads with `rg`, `cat`, `sed`, read-only Git
+status/diff/show/rev-parse, browser reads of official Apple/GitHub/nextest documentation,
+and Python standard-library text/hash/JSON/TOML analysis and edits. No project code
+was imported. `cargo fmt --all` ran before the test-only phase; later formatting
+checks were check-only, with reported test-region formatting corrected as text.
+The final `cargo fmt --all --check`, `git diff --check`, `git diff --cached --check`
+and `git diff --exit-code -- Cargo.lock` returned exit 0. Earlier fmt checks reported
+only formatting differences subsequently corrected; they were not test runs.
+
+Complete final source exports under `.cua-source/server-review-r01-r07-entry/`:
+`findings.patch` (entry → corrected candidate), `final-restoration.patch`
+(HEAD → candidate), `final-integrated.patch` (integrated main → candidate),
+`final-original.patch` (original base → candidate). `final-state.json` records
+exact export hashes, source hashes, Git state and preservation checks. These are
+source artifacts only; ignored entry/evidence files are not untracked source.
+
+Still deferred: all locked server/CU compilation across six targets; executing
+selected nextest owners in both configurations (including tools-on/backend-None),
+CU archive/shards/doctests; snapshot execution; packaging/signature/provenance and
+native dependency closure; old-server update, old-CU bootstrap, both variant
+transitions/recovery; OS minimum/session/permission/cursor/media/cancellation
+qualification. No Cargo resolver, tests, builds, compiler, linter, typecheck,
+CI/workflow dispatch, packaging/install/dev scripts, SDK/daemon, GUI actions or
+OS/native probes ran. Actual compilation/runtime/platform compatibility remains
+unverified. Execution stays prohibited pending full external source acceptance
+and separate explicit authorization.
+
+
+## R08 implementation: legacy CU update compatibility (2026-10-24)
+
+Round 2 rejected manual bootstrap as a replacement for ordinary old-CU update.
+The minimal integration is the existing executable boundary: old selectors and
+extractors deliver a compatibility executable; it carries the complete signed
+CU package, prepares it without changing live installation state during version
+probe, and delegates commands to that package. Immutable package-identity directories
+keep the old updater's binary-only rollback paired with its own payload generation.
+There is no recursive installer, Desktop dependency or daemon execution in the bridge.
+Modern consumers select a distinct complete-package ZIP; legacy names retain real
+gzip-executable/ZIP formats. The producer/publication and existing installer/symbol
+owners own these changes; R01–R07 remain preserved. Implementation evidence, matrix,
+regressions and final state follow below after the final source self-review.
+
+
+### R08 final compatibility design and exact old consumer
+
+R08 is addressed in this source candidate, pending the external reviewer. The
+round 1 manual-bootstrap exception and the older handoff's twelve-physical-files
+assumption are superseded here. There are still twelve product combinations,
+with six additional compatibility assets for old binary-only CU consumers.
+
+The integration is the **existing executable version/command boundary**, not a
+new updater framework. `crates/cli/src/cu_update.rs` is a release-only entry point;
+`legacy-cu-bootstrap` forwards CU and is not a default feature. `cli/build.rs`
+binds the already completed CU ZIP with include_bytes before bridge compilation.
+No executable overlay is appended after signing. Ordinary/default and ordinary
+CU builds do not require this build input or build the bridge entry point.
+
+Exact baseline `6c1e6b2c49359c76e49624c0545bbafc4a3d310a` installer source trace:
+
+| Old boundary | Exact baseline installer.rs evidence | R08 integration |
+| --- | --- | --- |
+| Release/asset readiness | 725–737, 753–781, 796–802 | All six old CU names and SHA256SUMS are published again. |
+| Compiled selector | 1013–1037 | Real gzip executable for Linux/ARM macOS; ZIP for Windows/Intel macOS. |
+| Archive checksum | 283–304 | Old updater authenticates the bridge including all embedded package bytes. |
+| Extractor | 1500–1604 | Outer ZIP has one executable basename; the complete signed app/UIA/daemon/manifest stays inside its embedded ZIP. |
+| Status / runtime home / schema | 329–382 | Bridge prepares a private generation and returns the real new Gateway's version/migration metadata; old updater retains its own schema preflight before stop. |
+| Backup/stop/replace/probe/link/start/persist | 385–594 | No nested install runs. The old parent continues its own lifecycle while bridge commands delegate to the verified packaged Gateway. |
+| Unsafe rollback prohibition | 1172–1183, callers 517–553 | The old baseline's schema-advancement rule is unchanged; the bridge does not intercept or relax it. |
+
+Local tag `0.64.0` has installer bytes identical to this baseline (SHA256
+`bd876a9dc03c5d260e699d170e512fbebc7e00843c93f97efd3513931bedccf3`).
+The staged schema-preflight flow was also inspected in local tags `0.62.0` and
+`0.63.0`. Earlier local tags have different flows: `0.61.0` probes after replacement;
+`v0.1.0` has no pre-start candidate version probe, and pre-v0.22 Intel macOS
+selectors use gzip. These are source observations, not an invented support cutoff
+or evidence of installed/released binaries. No repository support policy defining
+all supported historical installations was found. The six compatibility inputs
+below correspond to the exact consumer specified by R08 and locally tagged 0.64.0;
+this handoff does not claim qualification of every historical tag or of those older
+rollback policies. Release/installed-version inventory and platform execution
+remain deferred, not silently replaced with a manual migration instruction.
+
+### Six legacy inputs and the modern/server matrix
+
+All names below have prefix `pioneer-gateway-`. Publication requires all eighteen
+exact archives; SHA256SUMS and upload include them all.
+
+| Target | Unchanged server | Old CU consumer / compatibility archive | New CU installer / Desktop package |
+| --- | --- | --- | --- |
+| x86_64-unknown-linux-gnu | linux-x86_64.gz | linux-x86_64-computer-use.gz | linux-x86_64-computer-use-package.zip |
+| aarch64-unknown-linux-gnu | linux-aarch64.gz | linux-aarch64-computer-use.gz | linux-aarch64-computer-use-package.zip |
+| aarch64-apple-darwin | macos-aarch64.gz | macos-aarch64-computer-use.gz | macos-aarch64-computer-use-package.zip |
+| x86_64-apple-darwin | macos-x86_64.zip | macos-x86_64-computer-use.zip | macos-x86_64-computer-use-package.zip |
+| x86_64-pc-windows-msvc | windows-x86_64.zip | windows-x86_64-computer-use.zip | windows-x86_64-computer-use-package.zip |
+| aarch64-pc-windows-msvc | windows-aarch64.zip | windows-aarch64-computer-use.zip | windows-aarch64-computer-use-package.zip |
+
+The Intel compatibility ZIP supplies a genuine ONNX dylib copied from the complete
+package, under `libonnxruntime.pioneer-cu-SHA256.dylib`. The legacy extractor counts
+it as required but does not overwrite existing loaded library names before schema
+admission. This is not a fake library or substitution of the driver. Actual Gateway
+execution/probes use the full standard-named libraries in the private generation.
+The additional hash-named compatibility library is retained; no automatic cleanup
+of recovery-related files was introduced.
+
+### Preparation, activation, subsequent update and recovery
+
+`legacy_cu_update_main` → `prepare_legacy_cu_package` → `probe_legacy_cu_package`
+→ same original CLI arguments to the actual Gateway. Environment and stdio inherit.
+Unix uses exec; Windows waits for the verified child and propagates its exit code.
+The bridge has no driver/session/cursor implementation and starts no daemon itself.
+
+Preparation uses the existing bounded ZIP extractor and full pin/target/manifest/
+daemon hash/companion checks in an owner-private temporary directory next to the
+old candidate. It activates companions only inside that new directory, then
+publishes the whole package via one rename to `.pioneer-cu-PACKAGE_SHA256`.
+It never changes live executable/cua/libraries/service, runtime home, settings,
+connections, credentials, histories, tasks or databases. Before any Gateway command,
+reuse validates every expected regular file against embedded archive bytes and
+rejects symlinks, missing/changed files and extra files (including loadable DLLs).
+The real executable probe requires exact release version, OS, architecture, CU
+flag and migration metadata. Normal version JSON gains only the backward-compatible
+`computer_use` boolean; legacy readers ignore unknown fields.
+
+For the old updater's staged probe, this is preparation only. The parent still
+checks schema and replaces its installed executable normally. For start, the
+verified real CLI installs/starts the existing platform service from that generation;
+on macOS its existing selector chooses the signed Gateway app and matching helper.
+No Desktop process is required. Runtime-home/config resolution remains the existing
+AppConfig path; the bridge does not supply a new home or copy user data.
+
+A pre-start outer rollback restores the old executable and leaves the unused new
+private generation separate; no old live payload was replaced. A bridge restored
+by a later new-installer rollback resolves its own embedded package hash, not a
+shared mutable payload of another version. Old and new generation files are retained.
+After possible schema advancement, the existing automatic rollback prohibition
+remains. Real filesystem/service failure and recovery behavior is still unrun.
+
+The first and later normal `update/self-update` commands delegate to the actual
+CU CLI, whose selector uses the complete-package ZIP and whose installer still
+uses the configured managed install root. It can replace the outer bridge with
+the real new executable and coherent `bin/cua` payload. Existing server→server,
+server→CU and CU→server extraction/activation/schema/backup logic remains; old private
+packages may remain as retained recovery inputs and are not executed by server.
+
+### Producer, provenance and preserved contracts (C01–C12 self-review)
+
+- **C01/C07/C08:** Gateway supervisor, SDK pin, private IPC, driver sessions/cursor,
+  cancellation and shutdown bodies remain byte-identical to the accepted R01–R07
+  candidate. The new entry point forwards to that actual Gateway; no legacy engine,
+  SDK fork, service, remote transport or display infrastructure was added.
+- **C02:** default feature graphs and both final-binary early CU guards remain.
+  The new bridge requires explicit legacy-cu-bootstrap → computer-use; ordinary
+  server/default builds do not embed packages, discover CUA Swift/frameworks or
+  build/sign/package the daemon. All six unchanged server names/formats remain.
+- **C03/C04:** build-gateway.py produces the complete CU ZIP first, compiles the
+  bridge with those exact bytes, then creates genuine legacy gzip/ZIP archives.
+  New CLI, shell/PowerShell scripts, all Desktop packagers/selectors/content guards
+  and synthetic smoke asset names consistently use the complete-package suffix.
+  Twelve product combinations remain; publication now checks eighteen files.
+- **C05:** no recursive run_install or schema bypass. Existing new installer
+  preflight-before-stop, candidate-local libraries, full extraction validation,
+  retained backups and schema-uncertain rollback guard are unchanged. Private
+  generations avoid mixing old executable recovery with a new mutable payload.
+- **C06:** R01 native macOS hosts and Xcode 26.2/DEVELOPER_DIR remain. Existing signed,
+  notarized/stapled app packaging is preserved; the bridge is separately signed and
+  notarized after embedding. The existing notarization owner is shared, not duplicated.
+  Apple documents the two notarization passes for custom installers and that
+  standalone binaries cannot have tickets stapled:
+  [Customizing the notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow).
+  System permission prompts/grant transfer, actual signing/TCC/OS minimum and native
+  dependency closure are explicitly unqualified. No automatic OS-grant migration
+  is promised. Existing Windows AtLogOn/Limited, macOS LaunchAgent and Linux systemd
+  user service mechanisms are retained.
+- **C09/C10/C11:** authorization, frozen CLI/MCP bindings, permitted proxies, typed
+  image bytes/geometry/tokens, delivery safeguards, no-replay and generation fencing
+  source is unchanged. The package generation only changes the installed path of
+  the same signed/verified binaries; native/CLI/proxy media paths are not rewritten.
+- **C12 / R01–R07:** no unrelated main cleanup. Accepted SDK policy, runtime prompt
+  availability, visibility/binding fixtures, exact continuation expectations, server
+  CI owner run and variant symbol names are preserved. New scope beyond the prior
+  inventory is the necessary CLI dispatch owner and release-only entry point.
+
+The bridge gets its own exact-input inventory under the existing CU Gateway
+`symbol-inputs...-computer-use/compatibility/` artifact. It retains source run/commit/
+target/catalog identity, native module/PDB/object inputs and final signed-byte
+ledger. The symbols consumer validates its association with the parent CU inventory,
+then processes it without rebuilding. Desktop's reuse still restores the real CU
+Gateway, with its unchanged hash/module/run/catalog checks; it does not substitute
+the bridge or claim it shipped the standalone compatibility executable.
+
+### Authored regressions and internal review resolutions
+
+Applied test-audit to existing owners, with protected production prefixes saved
+for each test-only batch. The Windows preparation gap found by the second reviewer
+was corrected by separating file preparation from the mandatory real executable
+probe, then extending the same tests on every platform. This is not a test-only
+production seam: the actual bridge calls both phases consecutively.
+
+- Existing installer asset-name owner now checks all six server and six modern CU
+  selectors, independent of the host used for a future test run.
+- Existing complete archive/rollback owner retains its original activation/recovery
+  assertions and adds corrupt manifest/pin/hash/missing-companion preparation errors,
+  success/reuse, executable tamper/extra DLL rejection, and preservation of prior
+  executable/settings/credentials/data fixtures. File assertions apply on Windows
+  as well. Only shell-based subprocess/version/schema cases are Unix-specific;
+  they include wrong version/OS/architecture/variant and missing migration metadata.
+- Existing ReleaseInputTests calls the real compatibility archive producer across
+  all six targets, then models the exact old gzip or flattened ZIP consumer. It
+  proves one executable basename, opaque payload survival, real Intel companion
+  placement and unchanged prior libraries/settings. It does not pretend that this
+  consumer can install new sidecar layouts. The same owner adds wrong bridge
+  run/commit/target/catalog/variant provenance rejection before child native tools.
+- Existing Desktop command fixture expects the modern complete-package name. The
+  already accepted server/CU CI owners and archive/sharding configuration remain.
+
+No test was run, no snapshot generated and no pre/post passing comparison claimed.
+The archive fixtures use opaque executable/library bytes; they do not establish
+native executable validity, successful restart, DLL closure or OS permission readiness.
+
+| Attached task / run | Exact resolution |
+| --- | --- |
+| Legacy trace `qUVVSAEMFtpTFK1sfUHP4` / `H3VoVam3ESxV05GQHucwo` | Candidate `trc_H3VoVam3ESxV05GQHucwo_NX0yWxshiMS29ps1JeU2B`, content SHA256 `1eb4293321c14894f8e4baa98ed2550bc3d40275b4215995e8ac4ee94fa30e74`, read in full and independently checked; accepted, completed/succeeded. |
+| Candidate source review `VRvD38Cl1bfbewzpYOjuH` / `OEHqtD8pnnzNIvgrETUui` | Initial candidate `trc_OEHqtD8pnnzNIvgrETUui_5Hm30jrLJ8t1r0YD20htF` (SHA256 `138509b2a62c7a29742162755f6774af646fefc0daa34b80cbee234e2410428d`) read and revised for Windows file/preparation coverage. Exact revision `trc_OEHqtD8pnnzNIvgrETUui_revise_trc_OEHqtD8pnnzNIvgrETUui_5Hm30jrLJ8t1r0YD20htF_1` (SHA256 `07f2a8d9ed72c852ba111b88538ee7254f44479e840b89f6ad3e2b5d3d99ee18`) read, compared with source and accepted; completed/succeeded. Parent additionally reviewed the final metadata/provenance test expansions. |
+
+Both were read-only and received the complete execution ban. No attached work
+was detached or left unresolved. Internal acceptance is not external source acceptance.
+
+### Final files, hashes, permitted commands and deferred execution
+
+Branch/HEAD remain `feature/cua-gateway-migration` /
+`747f60be0aa1718f8f294a924a6a39b9d9a80f39`; original base and integrated main are
+unchanged. Final tree has **38 unstaged tracked files, zero staged files and one
+untracked source file** (`crates/cli/src/cu_update.rs`). Nothing was committed/pushed,
+no branch/worktree/reset/clean/stash/merge/rebase operation ran, and the paused monitor
+was not inspected or changed. No dependency/pin/version/checksum/lock entry or
+`--locked` policy was changed. Cargo.lock still equals HEAD (SHA256
+`f76eb868626c41ddf0da43d9db28ed2bb918c0e55c6ed666ed0b30733617abe5`); raw index remains
+`09a4be787e9a7cf1005dc4325e273816d7b7c1bfe9efca19620aab9be86a04ce` and staged diff
+remains empty. All 143 inherited-main path states remain unchanged from entry.
+
+This R08 delta changes nineteen existing files and adds one entry point:
+`.github/workflows/{release,smoke-install}.yml`, `README.md`,
+`crates/cli/{Cargo.toml,build.rs,src/installer.rs,src/lib.rs,src/cu_update.rs}`,
+`crates/desktop/src/gateway/control/launcher.rs`, this handoff, `install.sh`,
+`install.ps1`, `scripts/packaging/{build-gateway.py,cua-driver.py,symbol-inputs.py,test_symbol_inputs.py}`
+and `scripts/packaging/desktop/{check-package-contents.sh,package-linux-appimage.sh,package-macos.sh,package-windows-msi.ps1}`.
+All other incoming source bytes are retained. Reviewer artifacts were read only.
+
+Entry hashes and tracked-source snapshots are in ignored `.cua-source/r08-entry/`.
+Entry restoration/integrated/original patch SHA256 values are respectively
+`abb4e5ef8359fd37bacf26909eb0d49c4fd4397e007e34e94b7cebca0f204485`,
+`d11015ba9f696831b04db3cc1df00e07f453453add8a72c30417b401e958fbc3`,
+`5ab51f09acb09a39ea08182a9e62b8f07844bdb502f6b41ac3b159d90a9ffeda`.
+`candidate.patch` is entry→R08; `final-restoration.patch`, `final-integrated.patch`
+and `final-original.patch` include the new untracked entry point as well as all
+tracked diffs. `final-state.json` records exact final source/export hashes, statuses,
+preservation and allowed-check results for external review.
+
+Actual commands were source/skill/audit reads (`cat`, `sed`, `rg`), read-only Git
+status/diff/show/rev-parse/tag/ls-files, Python standard-library text/hash/JSON/TOML
+analysis and text edits, official Apple documentation browsing, and the attached
+task create/get/wait/revise/accept calls recorded above. No project Python module
+was imported or executed. `cargo fmt --all` ran during production editing;
+`cargo fmt -p pioneer-cli -- --emit stdout` wrote temporary formatter output,
+from which only test regions were copied after checking production-prefix equality.
+Final `cargo fmt --all --check`, `git diff --check`, `git diff --cached --check`
+and `git diff --exit-code -- Cargo.lock` passed. Earlier formatting-only differences
+were corrected; no test/build outcome is implied by fmt.
+
+Deferred until complete external source acceptance and separate explicit execution
+permission: locked default/CU/bridge compilation and exact native closure on all
+six targets, the authored nextest/Python owners and platform fixtures, actual old
+0.64.0 update/self-update and supported-installed-version inventory, new CU updates,
+variant switches, preflight/activation/restart/recovery fault boundaries, complete
+release checksums/assets/signing/notarization/provenance, OS permissions/cursor/media/
+cancellation and minimum-OS qualification. No tests, compiler/build/check/typecheck/
+linter/resolver, CI/workflow, packaging/install/dev scripts, SDK/daemon, GUI or OS
+probes ran. **This is a reviewable source candidate, not external acceptance or
+passing compilation/runtime/platform evidence.**
