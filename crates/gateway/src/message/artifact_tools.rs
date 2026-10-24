@@ -136,6 +136,7 @@ impl TurnToolProvider for GatewayArtifactToolProvider {
         bundles.extend(agent_actions.bundles);
         bundles.push(processor.html_tools(context_for_results.clone()));
         bundles.push(processor.thread_read_tools(context_for_results.clone()));
+        bundles.push(processor.thread_search_tools(context_for_results.clone()));
         bundles.push(processor.thread_result_tools(context_for_results));
 
         Ok(TurnToolMaterialization {

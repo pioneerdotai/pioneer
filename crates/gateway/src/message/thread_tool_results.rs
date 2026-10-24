@@ -265,6 +265,36 @@ impl MessageProcessor {
             value = nested_item;
             target = nested;
         }
+        if value["toolName"].as_str() == Some(super::thread_search_tools::SEARCH_TOOL) {
+            if target.output_log {
+                return Ok(false);
+            }
+            let mut source = target.clone();
+            source.cursor = None;
+            source.max_bytes = Some(32768);
+            source.max_tokens = Some(4096);
+            let mut encoded = String::new();
+            loop {
+                let page = self.read_thread_tool_result(source.clone()).await?;
+                encoded.push_str(&page.text);
+                if page.eof {
+                    break;
+                }
+                ensure!(
+                    page.next.is_some()
+                        && page.next.as_ref().map(|c| (&c.version, c.offset))
+                            != source.cursor.as_ref().map(|c| (&c.version, c.offset)),
+                    "saved result continuation did not advance"
+                );
+                source.cursor = page.next;
+            }
+            let root = serde_json::from_str(&encoded)?;
+            let Some(response) = saved_read_response(root, super::thread_search_tools::SEARCH_TOOL)
+            else {
+                return Ok(false);
+            };
+            return self.search_response_readable(authority, &response).await;
+        }
         let params = &target;
         let Some(_) = value["toolName"]
             .as_str()
@@ -760,6 +790,11 @@ impl ToolHandler for ResultReadHandler {
             .thread_source_readable(&current, &source_thread_id)
             .await
             .map_err(|_| denied())?
+            || !self
+                .processor
+                .saved_thread_read_result_disclosable(&current, &params, &item)
+                .await
+                .map_err(|_| denied())?
         {
             return Err(denied());
         }
@@ -822,4 +857,56 @@ pub(crate) fn thread_result_tool_specs() -> Vec<ConfiguredToolSpec> {
         ExecutionClass::Shared,
         pioneer_protocol::ToolOutputPolicySnapshot::for_tool_name(RESULT_READ_TOOL),
     )]
+}
+
+// Search only the canonical tool-result wrapper vocabulary. A matched public
+// response terminates traversal before its user-message contents are inspected.
+fn saved_read_response(root: serde_json::Value, name: &str) -> Option<serde_json::Value> {
+    use serde_json::Value;
+    let mut pending = vec![(root, 0_u8)];
+    while let Some((value, depth)) = pending.pop() {
+        if depth > 16 {
+            continue;
+        }
+        if (name == "threads_history_read" && value["events"].is_array())
+            || (name != "threads_history_read" && value["threads"].is_array())
+        {
+            return Some(value);
+        }
+        match value {
+            Value::Object(object) => {
+                for (key, value) in object {
+                    if [
+                        "value",
+                        "output",
+                        "result",
+                        "structuredContent",
+                        "content",
+                        "text",
+                        "item",
+                        "storage",
+                        "metadata",
+                        "stdout",
+                        "aggregated_output",
+                    ]
+                    .contains(&key.as_str())
+                    {
+                        pending.push((value, depth + 1));
+                    }
+                }
+            }
+            Value::Array(array) => {
+                for value in array {
+                    pending.push((value, depth + 1));
+                }
+            }
+            Value::String(text) => {
+                if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                    pending.push((value, depth + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }

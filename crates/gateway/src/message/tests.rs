@@ -2530,6 +2530,7 @@ async fn capability_persistence_order_impl() {
                 .definitions()
                 .len()
             + super::thread_read_tools::thread_read_tool_specs().len()
+            + super::thread_search_tools::thread_search_tool_specs().len()
             + super::thread_tool_results::thread_result_tool_specs().len();
         assert!(matches!(
             committed_capabilities,

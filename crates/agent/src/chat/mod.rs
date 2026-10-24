@@ -1165,6 +1165,31 @@ pub(crate) fn bounded_tool_result_message_with_budget(
     }
 }
 
+// Search pages can exceed the working-context budget. Publish a machine-readable
+// saved reference only after the complete raw page crossed the durable lane.
+async fn retained_search_page_message(
+    event_tx: &AgentEventHub,
+    thread_id: &str,
+    turn_id: &str,
+    result: &ExecutedToolResult,
+    reference: &str,
+) -> Result<ChatMessage, ChatTurnError> {
+    persist_retained_tool_result(event_tx, thread_id, turn_id, result).await?;
+    let source = result.full_message.as_ref().unwrap_or(&result.message);
+    let mut bounded = bounded_tool_result_message(source, reference)?;
+    if bounded.content != source.content {
+        let reference: serde_json::Value =
+            serde_json::from_str(reference).map_err(|e| ChatTurnError::Blocked(e.to_string()))?;
+        bounded.content = serde_json::json!({
+            "fullPageSaved": true,
+            "readTool": "threads_tools_result_read",
+            "reference": reference,
+            "instructions": "Read the complete saved search page using reference; follow its result-reader cursor until eof before using the search nextCursor."
+        }).to_string();
+    }
+    Ok(bounded)
+}
+
 async fn persist_retained_tool_result(
     event_tx: &AgentEventHub,
     thread_id: &str,
@@ -6435,15 +6460,20 @@ async fn execute_agent_provider_response(
                     let mut result = result;
                     let reference = serde_json::json!({"workspace_id": workspace_id, "thread_id": thread_id,
                         "turn_id": turn_id, "item_id": result.item_id}).to_string();
-                    if !result.full_source_in_item {
-                        persist_retained_tool_result(event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &result).await?;
-                    }
-                    // Thread readers already fit the complete page and its continuation
-                    // to the projection limit. A second excerpt would destroy that contract.
-                    if !pioneer_tools::is_thread_paged_tool(&result.tool_name) {
-                        result.message = bounded_tool_result_message(
-                            result.full_message.as_ref().unwrap_or(&result.message), &reference,
-                        )?;
+                    if result.tool_name == "threads_search" {
+                        result.message = retained_search_page_message(
+                            event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &result, &reference,
+                        ).await?;
+                    } else {
+                        if !result.full_source_in_item {
+                            persist_retained_tool_result(event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &result).await?;
+                        }
+                        // Preserve complete reader pages and their continuation cursors.
+                        if !pioneer_tools::is_thread_paged_tool(&result.tool_name) {
+                            result.message = bounded_tool_result_message(
+                                result.full_message.as_ref().unwrap_or(&result.message), &reference,
+                            )?;
+                        }
                     }
                     // The durable terminal item already owns full shell output. Retain only
                     // its bounded provider representation in canonical replay history.
@@ -8338,6 +8368,79 @@ mod tests {
             summary.rejected[0].reason,
             TurnCapabilityRejectedReason::SecurityBlocked
         );
+    }
+
+    #[tokio::test]
+    async fn large_search_page_is_retained_before_a_readable_reference_is_published() {
+        use super::{AgentDurableEvent, AgentEventHub, retained_search_page_message};
+        use pioneer_protocol::ToolResultView;
+        use std::sync::Arc;
+
+        let hub = Arc::new(AgentEventHub::new());
+        let mut receiver = hub.take_durable_receiver().await.unwrap();
+        let page = serde_json::json!({"threads":[{"threadId":"source-thread", "title":"full title",
+            "fragments":[{"text":"日本語 search fragment ".repeat(20_000)}]}],
+            "nextCursor":"next-search-page", "eof":false})
+        .to_string();
+        assert!(page.len() > pioneer_compaction::RESULT_BYTES);
+        assert!(page.len() < 2 * 1024 * 1024);
+        let mut result = task_result("threads_search", true, &page);
+        result.full_message = Some(result.message.clone());
+        let reference = serde_json::json!({"workspace_id":"workspace", "thread_id":"thread",
+            "turn_id":"turn", "item_id":result.item_id})
+        .to_string();
+        let publisher = {
+            let hub = hub.clone();
+            let reference = reference.clone();
+            tokio::spawn(async move {
+                retained_search_page_message(&hub, "thread", "turn", &result, &reference).await
+            })
+        };
+        let event = receiver.recv().await.unwrap();
+        let AgentDurableEvent::TurnLlmContextAppended {
+            payload: ToolResultView::Json { value, truncated },
+            ..
+        } = event
+        else {
+            panic!("expected complete saved tool result");
+        };
+        assert!(!truncated);
+        assert_eq!(value["content"].as_str().unwrap(), page);
+        assert!(
+            !publisher.is_finished(),
+            "saved reference must wait for persistence acknowledgement"
+        );
+        receiver.acknowledge_last(Ok(()));
+        let message = publisher.await.unwrap().unwrap();
+        let instruction: serde_json::Value = serde_json::from_str(&message.content).unwrap();
+        assert_eq!(instruction["readTool"], "threads_tools_result_read");
+        let _: pioneer_protocol::ThreadToolResultReadParams =
+            serde_json::from_value(instruction["reference"].clone()).unwrap();
+        assert_eq!(
+            instruction["reference"],
+            serde_json::from_str::<serde_json::Value>(&reference).unwrap()
+        );
+        // The retained source, rather than the shortened model message, is the
+        // input to saved-result pagination and reconstructs the complete page.
+        let source = value["content"].as_str().unwrap();
+        let mut cursor = None;
+        let mut rebuilt = String::new();
+        loop {
+            let fragment = pioneer_compaction::results::result_page(
+                source,
+                "saved-v1",
+                cursor.as_ref(),
+                4096,
+                32768,
+            )
+            .unwrap();
+            rebuilt.push_str(&fragment.text);
+            if fragment.eof {
+                break;
+            }
+            cursor = fragment.next;
+        }
+        assert_eq!(rebuilt, page);
     }
 
     fn task_result(tool_name: &str, success: bool, text: &str) -> ExecutedToolResult {

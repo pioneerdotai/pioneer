@@ -56,6 +56,8 @@ use tokio::sync::Mutex as AsyncMutex;
 
 const THREAD_EPISODIC_INDEX_ERROR_MAX_CHARS: usize = 512;
 
+mod search;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ThreadEpisodicIngestionOutcome {
     Accepted,

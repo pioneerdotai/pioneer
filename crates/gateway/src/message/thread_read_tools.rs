@@ -62,7 +62,7 @@ pub(crate) fn thread_read_tool_specs() -> Vec<ConfiguredToolSpec> {
 
 pub(super) struct ThreadReadAuthority {
     principal: AuthenticatedSessionPrincipal,
-    workspace_id: String,
+    pub(super) workspace_id: String,
     root_thread_id: String,
     current_thread_id: String,
     observe_children: bool,
@@ -946,7 +946,7 @@ fn safe_read_error(error: &anyhow::Error) -> ToolError {
 
 #[cfg(test)]
 #[path = "thread_read_tools/tests.rs"]
-mod tests;
+pub(in crate::message) mod tests;
 
 // Only one metadata record is fragmented. No accumulated rows enter the cursor.
 fn metadata_page_record<F>(

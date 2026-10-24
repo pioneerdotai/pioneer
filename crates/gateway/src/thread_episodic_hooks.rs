@@ -1,7 +1,4 @@
-use crate::thread_episodic::{
-    ThreadEpisodicRecallService, WorkspaceEpisodicRecallIntentSource, WorkspaceEpisodicRecallMode,
-    WorkspaceEpisodicRecallRequest, WorkspaceEpisodicRecallService,
-};
+use crate::thread_episodic::ThreadEpisodicRecallService;
 use async_trait::async_trait;
 use pioneer_crud::{
     ConversationArtifactRef, ConversationArtifactRefLimits, ConversationTurnArtifactRefs, CrudStore,
@@ -16,17 +13,15 @@ use pioneer_hooks::{
     HookSubscriptionVisibility,
 };
 use pioneer_memory::hooks::{
-    AgentEpisodicRecallProvider, MemoryCurrentThreadRecallRequest, MemoryEpisodicRecallBoundary,
-    MemoryEpisodicRecallCapabilities, MemoryEpisodicRecallItem, MemoryEpisodicRecallProvenance,
-    MemoryEpisodicRecallResponse, MemoryEpisodicRecallSourceKind, MemoryEpisodicRecallVisibility,
-    MemoryLoopConfig, MemoryRecallPolicy, MemoryRelatedThreadRecallRequest,
-    MemoryWorkspaceThreadRecallRequest, memory_turn_policy_from_hook_policy_set,
+    AgentEpisodicRecallProvider, MemoryCurrentThreadRecallRequest,
+    MemoryEpisodicRecallCapabilities, MemoryEpisodicRecallResponse, MemoryLoopConfig,
+    MemoryRecallPolicy, memory_turn_policy_from_hook_policy_set,
 };
 use pioneer_protocol::{
-    PrincipalId, ThreadEpisodicHit, ThreadEpisodicRecallDiagnostic,
-    ThreadEpisodicRecallDiagnosticCode, ThreadEpisodicRecallInput, ThreadEpisodicRecallOutput,
-    ThreadEpisodicRecallPolicyContext, ThreadEpisodicSourceActorRole, ThreadEpisodicThreadId,
-    ThreadEpisodicTurnId, ThreadEpisodicWorkspaceId, ThreadVisibility,
+    ThreadEpisodicHit, ThreadEpisodicRecallDiagnostic, ThreadEpisodicRecallDiagnosticCode,
+    ThreadEpisodicRecallInput, ThreadEpisodicRecallOutput, ThreadEpisodicRecallPolicyContext,
+    ThreadEpisodicSourceActorRole, ThreadEpisodicThreadId, ThreadEpisodicTurnId,
+    ThreadEpisodicWorkspaceId,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -75,301 +70,49 @@ impl ThreadContextRecallProvider for ThreadEpisodicRecallService {
     }
 }
 
+/// Production recall uses the same authorized indexed search as threads_search.
 pub(crate) struct ThreadEpisodicMemoryRecallProvider {
-    service: Arc<ThreadEpisodicRecallService>,
-    workspace_service: Option<Arc<WorkspaceEpisodicRecallService>>,
-    crud_store: Arc<CrudStore>,
+    processor: std::sync::Weak<crate::message::MessageProcessor>,
 }
-
 impl ThreadEpisodicMemoryRecallProvider {
-    #[allow(dead_code)]
-    pub(crate) fn new(
-        service: Arc<ThreadEpisodicRecallService>,
-        crud_store: Arc<CrudStore>,
-    ) -> Self {
-        Self {
-            service,
-            workspace_service: None,
-            crud_store,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn with_workspace_service(
-        service: Arc<ThreadEpisodicRecallService>,
-        workspace_service: Arc<WorkspaceEpisodicRecallService>,
-        crud_store: Arc<CrudStore>,
-    ) -> Self {
-        Self {
-            service,
-            workspace_service: Some(workspace_service),
-            crud_store,
-        }
-    }
-
-    async fn accessible_thread_ids_for_member(
-        &self,
-        workspace_id: &str,
-        principal_id: Option<&str>,
-    ) -> Option<BTreeSet<String>> {
-        self.member_thread_ids(workspace_id, principal_id, false)
-            .await
-    }
-
-    async fn workspace_visible_thread_ids_for_member(
-        &self,
-        workspace_id: &str,
-        principal_id: Option<&str>,
-    ) -> Option<BTreeSet<String>> {
-        self.member_thread_ids(workspace_id, principal_id, true)
-            .await
-    }
-
-    async fn member_thread_ids(
-        &self,
-        workspace_id: &str,
-        principal_id: Option<&str>,
-        workspace_visible_only: bool,
-    ) -> Option<BTreeSet<String>> {
-        let principal_id = principal_id?;
-        let Ok(principal_id) = PrincipalId::new(principal_id) else {
-            return Some(BTreeSet::new());
-        };
-        match self
-            .crud_store
-            .list_accessible_threads_for_principal(&principal_id, workspace_id, u64::MAX)
-            .await
-        {
-            Ok(threads) => Some(
-                threads
-                    .into_iter()
-                    .filter(|thread| {
-                        member_thread_matches_recall_boundary(thread, workspace_visible_only)
-                    })
-                    .map(|thread| thread.id)
-                    .collect(),
-            ),
-            Err(_) => Some(BTreeSet::new()),
-        }
+    pub(crate) fn new(processor: std::sync::Weak<crate::message::MessageProcessor>) -> Self {
+        Self { processor }
     }
 }
-
-fn member_thread_matches_recall_boundary(
-    thread: &pioneer_protocol::Thread,
-    workspace_visible_only: bool,
-) -> bool {
-    !workspace_visible_only || thread.visibility == Some(ThreadVisibility::Workspace)
-}
-
 #[async_trait]
 impl AgentEpisodicRecallProvider for ThreadEpisodicMemoryRecallProvider {
     async fn recall_capabilities(
         &self,
-        context: pioneer_memory::hooks::MemoryTurnContext,
+        _context: pioneer_memory::hooks::MemoryTurnContext,
     ) -> MemoryEpisodicRecallCapabilities {
+        let enabled = self
+            .processor
+            .upgrade()
+            .is_some_and(|p| p.thread_search_recall_enabled());
         MemoryEpisodicRecallCapabilities {
-            current_thread_search: true,
-            related_thread_search: self.workspace_service.is_some(),
-            workspace_thread_search: self.workspace_service.is_some(),
-            full_input_query: self
-                .service
-                .full_input_query_enabled_for_workspace(context.workspace_id.as_str()),
+            current_thread_search: enabled,
+            // The default episodic operation searches the complete authorized
+            // workspace, including the current thread. Do not run that same
+            // search again as a separate related/workspace planner operation.
+            related_thread_search: false,
+            workspace_thread_search: false,
+            full_input_query: true,
             current_task_context: false,
             completed_task_summary: false,
         }
     }
-
     async fn recall_current_thread(
         &self,
         request: MemoryCurrentThreadRecallRequest,
     ) -> Result<MemoryEpisodicRecallResponse, String> {
-        if self
-            .accessible_thread_ids_for_member(
-                request.workspace_id.as_str(),
-                request.principal_id.as_deref(),
-            )
+        let processor = self
+            .processor
+            .upgrade()
+            .ok_or_else(|| "episodic search unavailable".to_owned())?;
+        processor
+            .recall_thread_search(request)
             .await
-            .is_some_and(|thread_ids| !thread_ids.contains(request.thread_id.as_str()))
-        {
-            return Ok(MemoryEpisodicRecallResponse {
-                diagnostics: vec!["memory.episodic_recall.current_thread_inaccessible".to_owned()],
-                ..MemoryEpisodicRecallResponse::default()
-            });
-        }
-        let output = self
-            .service
-            .search_current_thread(
-                ThreadEpisodicRecallInput {
-                    workspace_id: ThreadEpisodicWorkspaceId(request.workspace_id),
-                    thread_id: ThreadEpisodicThreadId(request.thread_id),
-                    turn_id: ThreadEpisodicTurnId(request.turn_id),
-                    query_text: request.query,
-                    recent_context_summary: None,
-                    policy_context: ThreadEpisodicRecallPolicyContext {
-                        context_recall_allowed: true,
-                        include_sensitive_context: false,
-                    },
-                    max_prompt_chars: Some(request.max_chars.min(u32::MAX as usize) as u32),
-                    max_candidates: Some(request.top_k),
-                },
-                None,
-            )
-            .await;
-        let truncated = output.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == ThreadEpisodicRecallDiagnosticCode::PromptBudgetExceeded
-        });
-        let hits = enrich_thread_hits_with_artifact_refs(&self.crud_store, output.hits).await;
-        Ok(MemoryEpisodicRecallResponse {
-            items: hits
-                .into_iter()
-                .map(|hit| {
-                    thread_hit_to_memory_episodic_item(
-                        hit,
-                        MemoryEpisodicRecallSourceKind::CurrentThread,
-                    )
-                })
-                .collect(),
-            diagnostics: output
-                .diagnostics
-                .into_iter()
-                .map(|diagnostic| diagnostic.message)
-                .collect(),
-            truncated,
-        })
-    }
-
-    async fn recall_related_threads(
-        &self,
-        request: MemoryRelatedThreadRecallRequest,
-    ) -> Result<MemoryEpisodicRecallResponse, String> {
-        let Some(service) = self.workspace_service.as_ref() else {
-            return Ok(MemoryEpisodicRecallResponse {
-                diagnostics: vec!["memory.episodic_recall.related_threads_unavailable".to_owned()],
-                ..MemoryEpisodicRecallResponse::default()
-            });
-        };
-        let accessible_thread_ids = self
-            .workspace_visible_thread_ids_for_member(
-                request.workspace_id.as_str(),
-                request.principal_id.as_deref(),
-            )
-            .await;
-        let output = service
-            .search_related_threads(WorkspaceEpisodicRecallRequest {
-                workspace_id: request.workspace_id,
-                current_thread_id: request.current_thread_id,
-                turn_id: "related_thread_recall".to_owned(),
-                query_text: request.query,
-                mode: WorkspaceEpisodicRecallMode::RelatedThreads,
-                intent_source: Some(WorkspaceEpisodicRecallIntentSource::Planner),
-                task_affinity_json: None,
-                project_affinity_json: None,
-                max_threads: request.top_k.max(1).min(8),
-                max_segments_per_thread: 4,
-                max_candidates_per_thread: request.top_k.max(1).min(16),
-                max_total_candidates: request.top_k.max(1).min(32),
-                max_prompt_chars: request.max_chars.min(u32::MAX as usize) as u32,
-                policy_context: ThreadEpisodicRecallPolicyContext {
-                    context_recall_allowed: true,
-                    include_sensitive_context: false,
-                },
-                accessible_thread_ids,
-            })
-            .await;
-        let hits = enrich_thread_hits_with_artifact_refs(&self.crud_store, output.hits).await;
-        Ok(MemoryEpisodicRecallResponse {
-            items: hits
-                .into_iter()
-                .map(|hit| {
-                    thread_hit_to_memory_episodic_item(
-                        hit,
-                        MemoryEpisodicRecallSourceKind::RelatedThread,
-                    )
-                })
-                .collect(),
-            diagnostics: output.diagnostics,
-            truncated: output.fallback_used,
-        })
-    }
-
-    async fn recall_workspace_threads(
-        &self,
-        request: MemoryWorkspaceThreadRecallRequest,
-    ) -> Result<MemoryEpisodicRecallResponse, String> {
-        let Some(service) = self.workspace_service.as_ref() else {
-            return Ok(MemoryEpisodicRecallResponse {
-                diagnostics: vec![
-                    "memory.episodic_recall.workspace_threads_unavailable".to_owned(),
-                ],
-                ..MemoryEpisodicRecallResponse::default()
-            });
-        };
-        let accessible_thread_ids = self
-            .workspace_visible_thread_ids_for_member(
-                request.workspace_id.as_str(),
-                request.principal_id.as_deref(),
-            )
-            .await;
-        let output = service
-            .search_workspace_threads(WorkspaceEpisodicRecallRequest {
-                workspace_id: request.workspace_id,
-                current_thread_id: request.current_thread_id,
-                turn_id: "workspace_thread_recall".to_owned(),
-                query_text: request.query,
-                mode: WorkspaceEpisodicRecallMode::WorkspaceThreads,
-                intent_source: Some(WorkspaceEpisodicRecallIntentSource::Planner),
-                task_affinity_json: None,
-                project_affinity_json: None,
-                max_threads: request.top_k.max(1).min(8),
-                max_segments_per_thread: 4,
-                max_candidates_per_thread: request.top_k.max(1).min(16),
-                max_total_candidates: request.top_k.max(1).min(32),
-                max_prompt_chars: request.max_chars.min(u32::MAX as usize) as u32,
-                policy_context: ThreadEpisodicRecallPolicyContext {
-                    context_recall_allowed: true,
-                    include_sensitive_context: false,
-                },
-                accessible_thread_ids,
-            })
-            .await;
-        let hits = enrich_thread_hits_with_artifact_refs(&self.crud_store, output.hits).await;
-        Ok(MemoryEpisodicRecallResponse {
-            items: hits
-                .into_iter()
-                .map(|hit| {
-                    thread_hit_to_memory_episodic_item(
-                        hit,
-                        MemoryEpisodicRecallSourceKind::WorkspaceThread,
-                    )
-                })
-                .collect(),
-            diagnostics: output.diagnostics,
-            truncated: output.fallback_used,
-        })
-    }
-}
-
-fn thread_hit_to_memory_episodic_item(
-    hit: ThreadEpisodicHit,
-    source: MemoryEpisodicRecallSourceKind,
-) -> MemoryEpisodicRecallItem {
-    MemoryEpisodicRecallItem {
-        id: hit.provenance.source_id.clone(),
-        content: hit.text,
-        title: None,
-        provenance: MemoryEpisodicRecallProvenance {
-            workspace_id: hit.provenance.workspace_id.0,
-            thread_id: Some(hit.provenance.thread_id.0),
-            turn_id: Some(hit.provenance.turn_id.0),
-            task_id: None,
-            timestamp_unix: hit.created_at,
-            source,
-            retrieval_score: Some(hit.score),
-            boundary: MemoryEpisodicRecallBoundary::Snippet,
-        },
-        score: Some(hit.score),
-        updated_at_unix: hit.created_at,
-        visibility: MemoryEpisodicRecallVisibility::Public,
+            .map_err(|_| "episodic search unavailable or access denied".to_owned())
     }
 }
 
@@ -909,10 +652,9 @@ mod tests {
         MemoryTurnPolicy,
     };
     use pioneer_protocol::{
-        ArtifactBindingDirection, ArtifactBindingKind, ArtifactKind, ArtifactRole, Thread,
+        ArtifactBindingDirection, ArtifactBindingKind, ArtifactKind, ArtifactRole,
         ThreadEpisodicItemId, ThreadEpisodicScoreBreakdown, ThreadEpisodicSourceActorRole,
-        ThreadEpisodicSourceContext, ThreadEpisodicSourceProvenance, ThreadMode, ThreadOriginKind,
-        ThreadSidebarVisibility, ThreadStatus,
+        ThreadEpisodicSourceContext, ThreadEpisodicSourceProvenance,
     };
     use std::collections::BTreeMap;
     use tokio::sync::Mutex;
@@ -944,37 +686,6 @@ mod tests {
             self.inputs.lock().await.push(input);
             self.output.lock().await.clone()
         }
-    }
-
-    #[test]
-    fn cross_thread_member_recall_excludes_private_sources() {
-        let thread = |id: &str, visibility| Thread {
-            id: id.to_owned(),
-            workspace_id: "ws_1".to_owned(),
-            name: None,
-            preview: String::new(),
-            preview_author: None,
-            mode: ThreadMode::Chat,
-            model: "test".to_owned(),
-            model_provider: "test".to_owned(),
-            reasoning_effort: None,
-            created_at: 1,
-            updated_at: 1,
-            status: ThreadStatus::Idle,
-            origin_kind: ThreadOriginKind::User,
-            sidebar_visibility: ThreadSidebarVisibility::Visible,
-            agent_nickname: None,
-            agent_role: None,
-            visibility: Some(visibility),
-            turns: Vec::new(),
-        };
-        let private = thread("private", ThreadVisibility::Private);
-        let workspace = thread("workspace", ThreadVisibility::Workspace);
-
-        assert!(member_thread_matches_recall_boundary(&private, false));
-        assert!(member_thread_matches_recall_boundary(&workspace, false));
-        assert!(!member_thread_matches_recall_boundary(&private, true));
-        assert!(member_thread_matches_recall_boundary(&workspace, true));
     }
 
     #[tokio::test]
@@ -1059,30 +770,6 @@ mod tests {
             inputs[0].turn_id.0, "turn_1",
             "episodic provenance must retain the real child turn"
         );
-    }
-
-    #[test]
-    fn thread_hit_maps_to_memory_episodic_item_with_source_provenance() {
-        let item = thread_hit_to_memory_episodic_item(
-            test_hit("thread:turn_1/item_1/chunk_1", "previous decision"),
-            MemoryEpisodicRecallSourceKind::CurrentThread,
-        );
-
-        assert_eq!(item.id, "thread:turn_1/item_1/chunk_1");
-        assert_eq!(item.content, "previous decision");
-        assert_eq!(item.provenance.workspace_id, "ws_1");
-        assert_eq!(item.provenance.thread_id.as_deref(), Some("thread_1"));
-        assert_eq!(item.provenance.turn_id.as_deref(), Some("turn_1"));
-        assert_eq!(
-            item.provenance.source,
-            MemoryEpisodicRecallSourceKind::CurrentThread
-        );
-        assert_eq!(
-            item.provenance.boundary,
-            MemoryEpisodicRecallBoundary::Snippet
-        );
-        assert_eq!(item.visibility, MemoryEpisodicRecallVisibility::Public);
-        assert_eq!(item.score, Some(0.82));
     }
 
     #[tokio::test]

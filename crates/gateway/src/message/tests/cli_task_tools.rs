@@ -2093,6 +2093,7 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
                 .definitions()
                 .into_iter()
                 .chain(crate::message::thread_read_tools::thread_read_tool_specs())
+                .chain(crate::message::thread_search_tools::thread_search_tool_specs())
                 .chain(crate::message::thread_tool_results::thread_result_tool_specs())
             {
                 assert!(
@@ -3365,5 +3366,476 @@ fn cli_task_finish_round_trip_uses_the_existing_capsule_and_persisted_state() {
             read.structured_content.unwrap()["task"]["finishRequest"]["reason"],
             "User requested a permanent stop"
         );
+    });
+}
+
+#[test]
+fn cli_frozen_reader_catalog_does_not_gain_search_after_upgrade() {
+    run_standard_stack_message_test("CLI frozen search admission", async {
+        let (_harness, processor, turn_id) =
+            start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
+        let bindings = processor
+            .crud_store
+            .list_turn_mcp_bindings(&turn_id)
+            .await
+            .unwrap();
+        // A newly selected threads catalog admits the registered search reader.
+        assert!(
+            bindings
+                .iter()
+                .any(|binding| binding.raw_tool_name == "threads_search")
+        );
+        // Reproduce an older persisted selection, which admitted the other
+        // readers but predates search. Current definitions must not widen it.
+        let previous_bindings = bindings
+            .into_iter()
+            .filter(|binding| binding.raw_tool_name != "threads_search")
+            .collect::<Vec<_>>();
+        assert!(
+            previous_bindings
+                .iter()
+                .any(|binding| binding.raw_tool_name == "threads_history_read")
+        );
+        processor
+            .crud_store
+            .replace_turn_mcp_bindings(&turn_id, &previous_bindings, 1_792_781_981)
+            .await
+            .unwrap();
+        let error = invoke_task(
+            &processor,
+            &turn_id,
+            "unbound-upgrade-search",
+            "threads_search",
+            json!({"query":"prior decision","limit":1}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.code,
+            crate::turn_mcp::invoker::TurnMcpInvocationErrorCode::ToolUnbound
+        );
+        assert!(
+            !processor
+                .crud_store
+                .list_turn_mcp_bindings(&turn_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|binding| binding.raw_tool_name == "threads_search")
+        );
+    });
+}
+
+#[test]
+fn admitted_cli_production_recall_hook_searches_another_accessible_conversation() {
+    run_standard_stack_message_test("indexed workspace recall hook", async {
+        use pioneer_crud::ThreadEpisodicWorkspaceActiveWriteSegmentRequest;
+        use pioneer_hooks::*;
+        let (_harness, processor, turn_id) =
+            start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
+        let binding = processor
+            .crud_store
+            .get_cli_runtime_turn_binding(&turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let other = "indexed-recall-other-conversation";
+        processor.crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at,created_by_actor_kind,created_by_actor_id) SELECT ?,workspace_id,'Other indexed conversation','',mode,model,model_provider,status,origin_kind,sidebar_visibility,'workspace',created_at,updated_at,created_by_actor_kind,created_by_actor_id FROM thread WHERE id=?",
+            [other.into(),binding.thread_id.clone().into()])).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let capsule = processor
+            .crud_store
+            .resolve_thread_episodic_workspace_active_write_segment(
+                ThreadEpisodicWorkspaceActiveWriteSegmentRequest {
+                    workspace_id: binding.workspace_id.clone(),
+                    storage_uri_root: format!("file://{}", temp.path().display()),
+                },
+                1_800_000_000,
+            )
+            .await
+            .unwrap();
+        crate::message::thread_search_tools::tests::seed(
+            &processor,
+            &capsule,
+            other,
+            "hook-other-source",
+            "searchneedle remembered in the other conversation",
+        )
+        .await;
+        let context = pioneer_agent::TurnToolContext {
+            workspace_id: binding.workspace_id.clone(),
+            thread_id: binding.thread_id.clone(),
+            turn_id: turn_id.clone(),
+        };
+        let tool = processor
+            .search_threads_page(
+                &context,
+                pioneer_protocol::ThreadsSearchParams {
+                    query: "searchneedle".into(),
+                    limit: 10,
+                    cursor: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tool["threads"][0]["threadId"], other,
+            "positive control: admitted execution can read the other source"
+        );
+        let mut memory_config = processor.memory_loop_config();
+        memory_config.active_recall.mode = pioneer_memory::hooks::MemoryActiveRecallMode::Hybrid;
+        processor.apply_memory_loop_config(memory_config);
+        processor.bind_memory_bridge().await;
+        let runtime = processor.hook_runtime.read().await.clone().unwrap();
+        let mut policy = std::collections::BTreeMap::new();
+        for (key, value) in [
+            ("recall", "allow"),
+            ("prompt", "full"),
+            ("read_tools", "allow"),
+            ("remember_tool", "allow"),
+            ("forget_tool", "allow"),
+            ("post_turn_extraction", "allow"),
+            ("active_memory", "allow"),
+            ("reason_code", "default_allow_read"),
+            ("source", "pre_memory_classifier"),
+        ] {
+            policy.insert(
+                HookMetadataKey::new(key).unwrap(),
+                HookValue::Text(value.into()),
+            );
+        }
+        policy.insert(
+            HookMetadataKey::new("explicit_remember").unwrap(),
+            HookValue::Bool(false),
+        );
+        policy.insert(
+            HookMetadataKey::new("explicit_forget").unwrap(),
+            HookValue::Bool(false),
+        );
+        policy.insert(
+            HookMetadataKey::new("confidence").unwrap(),
+            HookValue::F64(1.0),
+        );
+        let policies = HookPolicySet::merge_contributions([PolicyContribution {
+            domain: HookDomain::new("memory").unwrap(),
+            key: HookPolicyKey::new("turn_policy").unwrap(),
+            value: HookValue::Object(policy),
+            priority: 500,
+            diagnostics: Vec::new(),
+        }]);
+        let input=TurnPostPreflightPromptContextHookInput::from_parts("searchneedle",Some("test-model"),Some("openai"))
+            .with_active_memory_recall_preflight_plan(json!({"durable":{"status":"skip","reasonCode":"provider_skip","confidence":1.0,"modes":[],"targets":[]},"episodic":{"status":"run","reasonCode":"provider_run","confidence":1.0,"queries":[{"mode":"workspace_thread","query":"searchneedle","targets":[]}]}}));
+        let request = HookPhaseRequest::new(
+            HookPhase::TurnPostPreflightPromptContext,
+            HookContext {
+                workspace_id: Some(HookWorkspaceId::new(binding.workspace_id.clone()).unwrap()),
+                thread_id: Some(HookThreadId::new(binding.thread_id.clone()).unwrap()),
+                turn_id: Some(HookTurnId::new(turn_id.clone()).unwrap()),
+                ..HookContext::default()
+            },
+            HookInput::turn_post_preflight_prompt_context(input),
+        )
+        .with_policy_set(policies);
+        let response = runtime.run_phase_to_completion(request).await.unwrap();
+        let rendered = serde_json::to_string(&response.contributions).unwrap();
+        assert!(
+            rendered.contains("remembered in the other conversation"),
+            "installed production hook must consume workspace results: {response:?}"
+        );
+        assert!(
+            rendered.contains("hook-other-source"),
+            "real source anchor must reach the hook contribution"
+        );
+        // Materialize a real restricted Agent policy intersected with the
+        // admitted root adapter. The initiating user's workspace ACL stays
+        // broad; this binding omits workspace observation by role policy.
+        crate::message::thread_search_tools::tests::seed(
+            &processor,
+            &capsule,
+            &binding.thread_id,
+            "runner-own-source",
+            "searchneedle own runner context",
+        )
+        .await;
+        let parent_binding = processor.agent_action_binding(&turn_id).await.unwrap();
+        let parent_adapter = parent_binding.adapter.lock().await;
+        let facts = parent_adapter.persistence_facts();
+        let (restricted, options, capabilities) =
+            crate::authorization::materialize_selected_task_agent_action_binding(
+                pioneer_protocol::AgentExecutionId::new("Esearchrunner12345678").unwrap(),
+                &facts.home_root_thread_id,
+                facts.root_execution_id.clone(),
+                "search-runner",
+                facts.identity.clone(),
+                facts.profile.clone(),
+                1,
+                1,
+                1,
+                "agent_runner",
+                facts.agent_authorization_policy_generation,
+                &parent_adapter,
+            )
+            .unwrap();
+        let restricted_facts = restricted.persistence_facts();
+        assert!(
+            restricted_facts
+                .agent_authorization_allowed_actions
+                .iter()
+                .any(|a| a == crate::authorization::ResourceAction::ThreadRead.safe_name())
+        );
+        assert!(
+            !restricted_facts
+                .agent_authorization_allowed_actions
+                .iter()
+                .any(|a| a
+                    == crate::authorization::ResourceAction::ThreadObserveWorkspace.safe_name())
+        );
+        drop(parent_adapter);
+        processor
+            .register_agent_action_binding(
+                turn_id.clone(),
+                crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+                    restricted,
+                    options,
+                    capabilities,
+                ),
+            )
+            .await;
+        let limited = processor
+            .search_threads_page(
+                &context,
+                pioneer_protocol::ThreadsSearchParams {
+                    query: "searchneedle".into(),
+                    limit: 10,
+                    cursor: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(limited["threads"].as_array().unwrap().len(), 1);
+        assert_eq!(limited["threads"][0]["threadId"], binding.thread_id);
+        assert_eq!(
+            limited["threads"][0]["fragments"][0]["source"]["itemId"],
+            "runner-own-source"
+        );
+        assert!(!limited.to_string().contains("hook-other-source"));
+    });
+}
+
+#[test]
+fn admitted_cli_search_preserves_structured_pages_at_projection_byte_boundary() {
+    run_standard_stack_message_test("search byte boundary continuation", async {
+        let (_harness, processor, turn_id) =
+            start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
+        let binding = processor
+            .crud_store
+            .get_cli_runtime_turn_binding(&turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let capsule = processor
+            .crud_store
+            .resolve_thread_episodic_workspace_active_write_segment(
+                pioneer_crud::ThreadEpisodicWorkspaceActiveWriteSegmentRequest {
+                    workspace_id: binding.workspace_id.clone(),
+                    storage_uri_root: format!("file://{}", temp.path().display()),
+                },
+                1_800_000_000,
+            )
+            .await
+            .unwrap();
+        let mut titles = ["A".to_owned(), "B".to_owned(), "C".to_owned()];
+        for (n, thread) in ["byte-boundary-a", "byte-boundary-b", "byte-boundary-c"]
+            .into_iter()
+            .enumerate()
+        {
+            processor.crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Sqlite,
+                "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at,created_by_actor_kind,created_by_actor_id) SELECT ?,workspace_id,?,'',mode,model,model_provider,status,origin_kind,sidebar_visibility,'workspace',created_at,updated_at,created_by_actor_kind,created_by_actor_id FROM thread WHERE id=?",
+                [thread.into(),titles[n].clone().into(),binding.thread_id.clone().into()])).await.unwrap();
+            crate::message::thread_search_tools::tests::seed(
+                &processor,
+                &capsule,
+                thread,
+                &format!("byte-source-{n}"),
+                "boundaryneedle saved decision",
+            )
+            .await;
+        }
+        let context = pioneer_agent::TurnToolContext {
+            workspace_id: binding.workspace_id.clone(),
+            thread_id: binding.thread_id.clone(),
+            turn_id,
+        };
+        let params = json!({"query":"boundaryneedle", "limit":2, "cursor":null});
+        // Calibrate with the actual CLI response: two cards plus a nextCursor.
+        // Enlarge the first title so those same two raw cards fit by one byte,
+        // but their ToolResultView wrapper would exceed the policy limit.
+        let calibration = invoke_task(
+            &processor,
+            &context.turn_id,
+            "search-calibration",
+            "threads_search",
+            params.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!calibration.is_error);
+        let mut raw = calibration.structured_content.unwrap();
+        for key in ["tool_outcome", "partial_output", "truncated"] {
+            raw.as_object_mut().unwrap().remove(key);
+        }
+        assert_eq!(raw["threads"].as_array().unwrap().len(), 2);
+        assert!(raw["nextCursor"].is_string());
+        let limit = 2 * 1024 * 1024;
+        let overhead = serde_json::to_vec(&raw).unwrap().len() - titles[0].len();
+        titles[0] = "A".repeat(limit - 1 - overhead);
+        raw["threads"][0]["title"] = titles[0].clone().into();
+        assert_eq!(serde_json::to_vec(&raw).unwrap().len(), limit - 1);
+        assert!(
+            pioneer_tools::ToolResultView::Json {
+                value: raw,
+                truncated: false
+            }
+            .serialized_size_bytes()
+                > limit
+        );
+        processor
+            .crud_store
+            .database_connection()
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "UPDATE thread SET name=? WHERE id=?",
+                [titles[0].clone().into(), "byte-boundary-a".into()],
+            ))
+            .await
+            .unwrap();
+
+        let first = invoke_task(
+            &processor,
+            &context.turn_id,
+            "search-first",
+            "threads_search",
+            params.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!first.is_error);
+        let first_text = first.content[0]["text"].as_str().unwrap();
+        assert!(first_text.len() <= limit);
+        let first = first.structured_content.unwrap();
+        assert!(serde_json::to_vec(&first).unwrap().len() <= limit);
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(first_text).unwrap(),
+            first
+        );
+        assert!(first.get("preview").is_none());
+        assert_eq!(first["truncated"], false);
+        assert_eq!(first["threads"].as_array().unwrap().len(), 1);
+        assert_eq!(first["threads"][0]["threadId"], "byte-boundary-a");
+        assert_eq!(first["threads"][0]["title"], titles[0]);
+        assert_eq!(first["eof"], false);
+        let cursor = first["nextCursor"].as_str().unwrap().to_owned();
+        let mut next_params = params.clone();
+        next_params["cursor"] = cursor.clone().into();
+        let second = invoke_task(
+            &processor,
+            &context.turn_id,
+            "search-second",
+            "threads_search",
+            next_params.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!second.is_error);
+        let second = second.structured_content.unwrap();
+        assert!(serde_json::to_vec(&second).unwrap().len() <= limit);
+        assert!(second.get("preview").is_none());
+        assert_eq!(second["threads"].as_array().unwrap().len(), 2);
+        assert_eq!(second["threads"][0]["threadId"], "byte-boundary-b");
+        assert_eq!(second["threads"][0]["title"], titles[1]);
+        assert_eq!(second["threads"][1]["threadId"], "byte-boundary-c");
+        assert_eq!(second["threads"][1]["title"], titles[2]);
+        assert_eq!(second["eof"], true);
+        assert_eq!(second["nextCursor"], JsonValue::Null);
+        let mut wrong_query = next_params.clone();
+        wrong_query["query"] = "different query".into();
+        assert!(
+            invoke_task(
+                &processor,
+                &context.turn_id,
+                "search-wrong-query",
+                "threads_search",
+                wrong_query,
+            )
+            .await
+            .is_err()
+        );
+        // The fixture's current user is a Superuser. Narrow the execution
+        // through the real Agent role intersection instead of pretending a
+        // private-thread ACL can revoke that user's absolute access.
+        let parent_binding = processor
+            .agent_action_binding(&context.turn_id)
+            .await
+            .unwrap();
+        let parent_adapter = parent_binding.adapter.lock().await;
+        let facts = parent_adapter.persistence_facts();
+        let (restricted, options, capabilities) =
+            crate::authorization::materialize_selected_task_agent_action_binding(
+                pioneer_protocol::AgentExecutionId::new("Ebyteboundary12345678").unwrap(),
+                &facts.home_root_thread_id,
+                facts.root_execution_id.clone(),
+                "byte-boundary-runner",
+                facts.identity.clone(),
+                facts.profile.clone(),
+                1,
+                1,
+                1,
+                "agent_runner",
+                facts.agent_authorization_policy_generation,
+                &parent_adapter,
+            )
+            .unwrap();
+        drop(parent_adapter);
+        processor
+            .register_agent_action_binding(
+                context.turn_id.clone(),
+                crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+                    restricted,
+                    options,
+                    capabilities,
+                ),
+            )
+            .await;
+        // Cursors are bound to the original authority. A narrower identity
+        // must restart the search rather than reuse the previous page token.
+        let stale_cursor = invoke_task(
+            &processor,
+            &context.turn_id,
+            "search-revoked-cursor",
+            "threads_search",
+            next_params,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            stale_cursor.code,
+            crate::turn_mcp::invoker::TurnMcpInvocationErrorCode::InvalidRequest
+        );
+        let after_revocation = invoke_task(
+            &processor,
+            &context.turn_id,
+            "search-revoked",
+            "threads_search",
+            params,
+        )
+        .await
+        .unwrap();
+        assert!(!after_revocation.is_error);
+        let after_revocation = after_revocation.structured_content.unwrap();
+        assert!(after_revocation["threads"].as_array().unwrap().is_empty());
+        assert_eq!(after_revocation["eof"], true);
+        assert!(!after_revocation.to_string().contains("byte-boundary-b"));
     });
 }

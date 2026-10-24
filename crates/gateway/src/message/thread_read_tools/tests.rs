@@ -11,7 +11,7 @@ use crate::tests::authorization::{
 use pioneer_protocol::{AuthSessionId, DeviceId, GatewayId, PrincipalId, PrincipalKind, RoleKey};
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 
-fn member(id: &str) -> AuthenticatedSessionPrincipal {
+pub(in crate::message) fn member(id: &str) -> AuthenticatedSessionPrincipal {
     AuthenticatedSessionPrincipal {
         gateway_id: GatewayId::new("G00000000000000000001").unwrap(),
         principal_id: PrincipalId::new(id).unwrap(),
@@ -24,7 +24,11 @@ fn member(id: &str) -> AuthenticatedSessionPrincipal {
     }
 }
 
-fn authority(id: &str, root: &str, observe_workspace: bool) -> ThreadReadAuthority {
+pub(in crate::message) fn authority(
+    id: &str,
+    root: &str,
+    observe_workspace: bool,
+) -> ThreadReadAuthority {
     ThreadReadAuthority {
         principal: member(id),
         workspace_id: WORKSPACE_RED_ID.into(),
@@ -35,7 +39,7 @@ fn authority(id: &str, root: &str, observe_workspace: bool) -> ThreadReadAuthori
     }
 }
 
-async fn fixture() -> (IsolatedEpic4Harness, MessageProcessor) {
+pub(in crate::message) async fn fixture() -> (IsolatedEpic4Harness, MessageProcessor) {
     let harness = IsolatedEpic4Harness::new().await.unwrap();
     let store = Arc::new(pioneer_crud::CrudStore::new(harness.database.clone()));
     let processor = MessageProcessor::new(
