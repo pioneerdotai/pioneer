@@ -597,13 +597,14 @@ async fn provisional_delivery_is_explicit_and_independent_of_provider_name() {
         } else {
             provider
         };
+        // Neutral providers have no verified model generation contract; leave
+        // generation controls omitted so this fixture exercises delivery only.
+        let mut req = request();
+        req.max_tokens = None;
         let chunks = crate::attachments::runtime::with_async_authority_scope(
             "delivery-fixture".into(),
             async {
-                let stream = provider
-                    .stream_chat_with_diagnostics(request())
-                    .await
-                    .unwrap();
+                let stream = provider.stream_chat_with_diagnostics(req).await.unwrap();
                 assert_eq!(
                     stream.message_delivery,
                     if provisional {
