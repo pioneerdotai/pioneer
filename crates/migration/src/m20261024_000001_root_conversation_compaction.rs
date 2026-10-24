@@ -16,11 +16,11 @@ enum Schema {
     Task,
     TurnEvent,
     TurnItem,
-    #[iden = "_task_zstd"]
+    #[sea_orm(iden = "_task_zstd")]
     TaskZstd,
-    #[iden = "_turn_event_zstd"]
+    #[sea_orm(iden = "_turn_event_zstd")]
     TurnEventZstd,
-    #[iden = "_turn_item_zstd"]
+    #[sea_orm(iden = "_turn_item_zstd")]
     TurnItemZstd,
     Id,
     ThreadId,
