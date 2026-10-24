@@ -133,7 +133,7 @@ pub(super) async fn answer(
 
 async fn drain_worker(processor: &MessageProcessor) {
     processor.poll_completed_history_checks().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(30), async {
+    let settled = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if processor
                 .completed_history_checks
@@ -151,8 +151,15 @@ async fn drain_worker(processor: &MessageProcessor) {
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .expect("history worker did not settle");
+    .await;
+    assert!(
+        settled.is_ok(),
+        "history worker did not settle; durable checks: {:?}",
+        check::Entity::find()
+            .all(&processor.crud_store.database_connection())
+            .await
+            .unwrap()
+    );
     processor.poll_completed_history_checks().await.unwrap();
 }
 
@@ -1313,24 +1320,17 @@ async fn hidden_composer_defers_root_warmup_until_its_answer_is_delivered() {
             .unwrap()
             .is_empty()
     );
-    // The CLI monitor requires a live request. Model this same pre-policy
-    // question as still in progress while its detached Composer is running;
-    // changing its status neither accepts new input nor publishes an answer.
-    db.execute_unprepared(
-        "UPDATE turn SET status='in_progress' WHERE id='composer-human-question'",
-    )
-    .await
-    .unwrap();
-    let cold_deadline = u64::try_from(chrono::Utc::now().timestamp_millis())
-        .unwrap()
-        .saturating_add(pioneer_compaction::OPERATION_MILLIS);
+    // Inspect the complete authorized conversation basis. A CLI transfer for
+    // this same turn deliberately excludes its deliveries along with its input;
+    // the next-turn CLI/Native consumer contract is covered above.
     let cold_basis = harness
         .processor
-        .capture_cli_transfer_projection(
+        .capture_current_context_basis_prepared(
+            &harness.crud_store,
             &harness.workspace_id,
             "composer-warm-root",
             "composer-human-question",
-            cold_deadline,
+            None,
         )
         .await
         .unwrap();
@@ -1362,13 +1362,8 @@ async fn hidden_composer_defers_root_warmup_until_its_answer_is_delivered() {
             .await
             .unwrap(),
         None,
-        "mandatory CLI preparation must not invent activity for the old request"
+        "authorized history capture must not invent activity for the old request"
     );
-    // Restore the actual RPC's visible status. Its detached work owner means
-    // this fixture status change cannot publish a direct ready answer.
-    db.execute_unprepared("UPDATE turn SET status='completed' WHERE id='composer-human-question'")
-        .await
-        .unwrap();
     provider.release_first.notify_one();
     assert_eq!(
         wait_for_task_status(
@@ -1674,21 +1669,19 @@ async fn real_composer_native_start_preempts_background_owned_by_the_visible_roo
         .await
         .unwrap();
     let composer = tasks.first().unwrap();
-    assert_eq!(
-        wait_for_task_status(
-            harness.crud_store.clone(),
-            &composer.id,
-            TaskStatus::Completed
-        )
-        .await,
-        TaskStatus::Completed
-    );
+    let status = wait_for_task_status(
+        harness.crud_store.clone(),
+        &composer.id,
+        TaskStatus::Completed,
+    )
+    .await;
     let state = harness
         .crud_store
         .get_task(&composer.id)
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(status, TaskStatus::Completed, "Composer state: {state:?}");
     let lineage =
         wait_for_child_lineage_for_run(harness.crud_store.clone(), &state.runs.last().unwrap().id)
             .await;

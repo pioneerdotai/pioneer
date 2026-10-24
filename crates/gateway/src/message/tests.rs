@@ -25553,7 +25553,7 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         }
         CompletedHistoryDeliveryBarrier::Summarizer => provider.release_paused_call(),
     }
-    timeout(Duration::from_secs(30), async {
+    let settled = timeout(Duration::from_secs(30), async {
         loop {
             let finished = processor
                 .completed_history_checks
@@ -25571,8 +25571,15 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
             sleep(Duration::from_millis(25)).await;
         }
     })
-    .await
-    .expect("released Native history worker should finish");
+    .await;
+    assert!(
+        settled.is_ok(),
+        "released Native history worker should finish; barrier: {barrier:?}; checks: {:?}",
+        pioneer_entity::compaction_history_check::Entity::find()
+            .all(&crud_store.database_connection())
+            .await
+            .unwrap()
+    );
     processor.poll_completed_history_checks().await.unwrap();
     assert_eq!(
         deliveries.deliveries[0].delivered_turn_id.as_deref(),
