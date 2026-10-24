@@ -6,6 +6,20 @@
   "properties": {
     "identityId": {
       "$ref": "#/$defs/AgentIdentityId"
+    },
+    "limit": {
+      "type": "integer",
+      "format": "uint32",
+      "default": 100,
+      "minimum": 1,
+      "maximum": 100
+    },
+    "cursor": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
     }
   },
   "additionalProperties": false,

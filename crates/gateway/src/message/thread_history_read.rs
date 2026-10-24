@@ -9,9 +9,6 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::future::Future;
 
-const PAGE_BYTES: usize = 28 * 1024;
-// Leave room for authenticated cursor framing within the 4096-token policy.
-const PAGE_TOKENS: u64 = 2048;
 const SCAN_QUANTUM: usize = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,7 +102,7 @@ impl MessageProcessor {
             let state: HistoryCursor = serde_json::from_value(cursor)
                 .map_err(|_| anyhow::anyhow!("invalid history cursor"))?;
             ensure!(
-                state.version == 2
+                state.version == 3
                     && state.workspace_id == workspace_id
                     && state.thread_id == thread_id
                     && state.limit == limit
@@ -180,7 +177,7 @@ impl MessageProcessor {
                 });
             }
             HistoryCursor {
-                version: 2,
+                version: 3,
                 workspace_id: workspace_id.to_owned(),
                 thread_id: thread_id.to_owned(),
                 limit,
@@ -206,7 +203,6 @@ impl MessageProcessor {
             )
             .await?;
         let mut reverse_edge = None;
-        let mut cursor_chars: usize = 0;
         let mut events = Vec::new();
         let mut exhausted = rows.len() < SCAN_QUANTUM;
         for (index, row) in rows.iter().enumerate() {
@@ -229,11 +225,18 @@ impl MessageProcessor {
                     state.fragment.is_none(),
                     "history cursor is stale; restart reading"
                 );
-                state.position = Some(row.key.clone());
-                state.inclusive = false;
-                // A filtered final candidate still exhausts a short scan. A
-                // preceding visible row must not leave EOF stuck at false.
-                exhausted = index + 1 == rows.len() && rows.len() < SCAN_QUANTUM;
+                let mut filtered = state.clone();
+                filtered.position = Some(row.key.clone());
+                filtered.inclusive = false;
+                let done = index + 1 == rows.len() && rows.len() < SCAN_QUANTUM;
+                if !events.is_empty()
+                    && !history_events_fit(&events, &filtered, reverse_edge.as_ref(), done)?
+                {
+                    exhausted = false;
+                    break;
+                }
+                state = filtered;
+                exhausted = done;
                 continue;
             };
             let encoded = serde_json::to_string(&record)?;
@@ -248,36 +251,26 @@ impl MessageProcessor {
                 );
             }
             let source_reference = record.pointer("/content/sourceThreadReference").cloned();
-            // Opaque base64 ciphertext can tokenize poorly. Reserve a
-            // conservative token per character for both public cursor
-            // fields, including the largest fragment continuation state.
-            let mut budget_state = state.clone();
-            budget_state.position = Some(row.key.clone());
-            budget_state.fragment = Some(FragmentCursor {
-                key: row.key.clone(),
-                digest: digest.clone(),
-                offset: encoded.len(),
-            });
-            cursor_chars = cursor_chars
-                .max(2 * ((serde_json::to_vec(&budget_state)?.len() + 29).div_ceil(3) * 4));
+            let last = index + 1 == rows.len() && rows.len() < SCAN_QUANTUM;
+            let mut completed = state.clone();
+            completed.position = Some(row.key.clone());
+            completed.inclusive = false;
+            completed.fragment = None;
             let mut event = record;
             let mut proposed = events.clone();
             proposed.push(event.clone());
-            if offset > 0 || !history_events_fit(&proposed, cursor_chars)? {
+            if offset > 0
+                || !history_events_fit(&proposed, &completed, reverse_edge.as_ref(), last)?
+            {
                 // Resume an oversize canonical record without dropping text or
                 // arguments. Every fragment's JSON envelope participates in the
-                // byte/token limits; UTF-8 boundaries are preserved.
+                // serialized response limit; UTF-8 boundaries are preserved.
                 if !events.is_empty() {
                     exhausted = false;
                     break;
                 }
-                let mut end = (offset + 4096).min(encoded.len());
-                loop {
-                    while !encoded.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    ensure!(end > offset, "history record metadata exceeds page budget");
-                    event = json!({"eventId":format!("{}:{}",row.key.kind,row.key.id), "kind":row.key.kind, "turnId":row.turn_id,
+                let make_fragment = |end: usize| {
+                    let mut event = json!({"eventId":format!("{}:{}",row.key.kind,row.key.id), "kind":row.key.kind, "turnId":row.turn_id,
                         "createdAt":row.key.created_at, "fragment":{"encoding":"json","version":digest,
                         "offset":offset,"nextOffset":end,"eof":end == encoded.len(),"text":&encoded[offset..end]}});
                     if let Some(reference) = &source_reference {
@@ -287,11 +280,52 @@ impl MessageProcessor {
                         event["childReference"] =
                             json!({"threadId":row.key.id,"parentThreadId":thread_id});
                     }
-                    if history_events_fit(std::slice::from_ref(&event), cursor_chars)? {
-                        break;
+                    event
+                };
+                let fragment_fits = |end: usize| -> Result<bool> {
+                    let mut continuation = completed.clone();
+                    if end < encoded.len() {
+                        continuation.inclusive = true;
+                        continuation.fragment = Some(FragmentCursor {
+                            key: row.key.clone(),
+                            digest: digest.clone(),
+                            offset: end,
+                        });
                     }
-                    end = offset + (end - offset) / 2;
+                    history_events_fit(
+                        std::slice::from_ref(&make_fragment(end)),
+                        &continuation,
+                        reverse_edge.as_ref(),
+                        last && end == encoded.len(),
+                    )
+                };
+                let mut low = offset;
+                let mut high = encoded
+                    .len()
+                    .min(offset.saturating_add(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES));
+                let mut end = offset;
+                while low <= high {
+                    let mid = low + (high - low) / 2;
+                    let mut candidate_end = mid;
+                    while !encoded.is_char_boundary(candidate_end) {
+                        candidate_end -= 1;
+                    }
+                    if fragment_fits(candidate_end)? {
+                        end = candidate_end;
+                        low = mid + 1;
+                    } else if mid == 0 {
+                        break;
+                    } else {
+                        high = mid - 1;
+                    }
                 }
+                if encoded.len() - offset <= pioneer_protocol::TOOL_RESPONSE_MAX_BYTES
+                    && fragment_fits(encoded.len())?
+                {
+                    end = encoded.len();
+                }
+                ensure!(end > offset, "history record metadata exceeds page budget");
+                event = make_fragment(end);
                 if end < encoded.len() {
                     state.position = Some(row.key.clone());
                     state.inclusive = true;
@@ -482,12 +516,47 @@ impl MessageProcessor {
     }
 }
 
-fn history_events_fit(events: &[Value], cursor_chars: usize) -> Result<bool> {
-    let encoded = serde_json::to_string(events)?;
-    Ok(encoded.len() + 128 <= PAGE_BYTES
-        && pioneer_compaction::text_tokens(&encoded) <= PAGE_TOKENS
-        && encoded.len() + cursor_chars + 256 <= 32768
-        && pioneer_compaction::text_tokens(&encoded) + cursor_chars as u64 + 256 <= 4096)
+fn history_events_fit(
+    events: &[Value],
+    state: &HistoryCursor,
+    reverse_edge: Option<&SavedHistoryKey>,
+    eof: bool,
+) -> Result<bool> {
+    let encrypted_cursor = |state: &HistoryCursor| -> Result<String> {
+        // One version byte, twelve nonce bytes and sixteen AEAD tag bytes.
+        let bytes = serde_json::to_vec(state)?.len() + 29;
+        let length = bytes / 3 * 4
+            + match bytes % 3 {
+                0 => 0,
+                1 => 2,
+                _ => 3,
+            };
+        Ok("x".repeat(length))
+    };
+    let next = if eof {
+        None
+    } else {
+        Some(encrypted_cursor(state)?)
+    };
+    let reverse_direction = if state.direction == ThreadHistoryDirection::Older {
+        ThreadHistoryDirection::Newer
+    } else {
+        ThreadHistoryDirection::Older
+    };
+    let reverse = reverse_edge
+        .map(|edge| {
+            let mut reverse = state.clone();
+            reverse.direction = reverse_direction;
+            reverse.position = Some(edge.clone());
+            reverse.inclusive = false;
+            reverse.fragment = None;
+            encrypted_cursor(&reverse)
+        })
+        .transpose()?;
+    Ok(pioneer_tools::thread_read_page_fits(&json!({
+        "threadId":state.thread_id,"events":events,"nextCursor":next,
+        "eof":eof,"reverseCursor":reverse,"reverseDirection":reverse_direction,"direction":state.direction
+    })))
 }
 
 fn project_tool_record(

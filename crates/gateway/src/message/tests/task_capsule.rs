@@ -434,6 +434,7 @@ fn task_wait_repeats_timed_out_observations_for_task_and_run_ids() {
                 .append_task_event(
                     TaskEventPayload::RunCreated {
                         run: TaskRun {
+                            trigger_input: None,
                             id: run_id.clone(),
                             task_id: task_id.clone(),
                             trigger_id: None,

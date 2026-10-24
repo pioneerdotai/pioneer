@@ -1583,6 +1583,39 @@ mod tests {
     }
 
     #[test]
+    fn thread_page_projection_preserves_large_content_and_cli_continuation() {
+        let payload = serde_json::json!({"events":[{"text":"漢字🌍\"\n".repeat(50_000)}],"nextCursor":"sealed-cursor","eof":false});
+        assert!(crate::thread_read_page_fits(&payload));
+        let policy = ToolOutputPolicySnapshot::for_tool_name("threads_history_read");
+        let envelope = project_tool_result(ToolProjectionInput {
+            call_id: "page",
+            tool_name: "threads_history_read",
+            arguments: &serde_json::json!({}),
+            raw_output_text: "",
+            raw_output_json: &payload,
+            success: true,
+            outcome: &ok_outcome(),
+            output_policy: &policy,
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+        let cli = envelope.llm_payload();
+        assert_eq!(cli["events"], payload["events"]);
+        assert_eq!(cli["nextCursor"], "sealed-cursor");
+        assert_eq!(cli["truncated"], false);
+        assert!(
+            serde_json::to_vec(&cli).unwrap().len() <= pioneer_protocol::TOOL_RESPONSE_MAX_BYTES
+        );
+        let native = envelope
+            .to_model_input_item("page", "threads_history_read")
+            .into_chat_message();
+        let native: serde_json::Value = serde_json::from_str(&native.content).unwrap();
+        assert_eq!(native, cli);
+        assert!(!crate::thread_read_page_fits(
+            &serde_json::json!({"text":"x".repeat(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES),"nextCursor":"cursor","eof":false})
+        ));
+    }
+
+    #[test]
     fn web_fetch_projection_keeps_body_only_in_llm_view() {
         let payload = serde_json::to_value(WebFetchModelPayload {
             url: "https://example.com".to_owned(),

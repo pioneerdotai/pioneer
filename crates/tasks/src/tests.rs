@@ -476,6 +476,7 @@ async fn task_event_idempotency_rejects_conflicting_duplicate_key_for_task() {
 
 fn idempotency_test_run(status: TaskRunStatus, run_number: i64) -> TaskRun {
     TaskRun {
+        trigger_input: None,
         id: "run_00000000000001".to_owned(),
         task_id: "task_0000000000001".to_owned(),
         trigger_id: None,
@@ -927,6 +928,7 @@ fn task_create_context_for(params: &TaskCreateParams) -> TaskCreateContext {
     let (launch, identity, profile, authorization) = test_agent_launch_facts();
     assert_eq!(params.launch.as_ref(), Some(&launch));
     TaskCreateContext {
+        webhook_secret_ref: None,
         conversation_frozen_hold: None,
         actor_id: Some(TEST_PRINCIPAL_ID.to_owned()),
         creator_presentation_snapshot: None,
@@ -4055,6 +4057,7 @@ async fn due_trigger_materialization_rolls_back_run_when_occurrence_contract_is_
     let task_id = response.task.id.clone();
     let trigger = response.trigger;
     let run = TaskRun {
+        trigger_input: None,
         id: pioneer_protocol::generate_id(21),
         task_id: task_id.clone(),
         trigger_id: Some(trigger.id.clone()),
@@ -8822,3 +8825,6 @@ async fn cancelled_terminal_commit_uses_saved_stop_actor_and_rolls_back_receipt_
     assert_eq!(receipts[0].principal_id, TEST_PRINCIPAL_ID);
     assert_eq!(receipts[0].run_id, run.id);
 }
+
+#[path = "tests_webhook.rs"]
+mod webhook;

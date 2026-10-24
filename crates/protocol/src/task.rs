@@ -929,6 +929,9 @@ impl Task {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskTrigger {
+    /// Opaque keystore reference; the bearer secret is never persisted here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret_ref: Option<String>,
     pub id: String,
     pub task_id: String,
     pub status: TaskTriggerStatus,
@@ -1128,8 +1131,33 @@ pub struct TaskAgentResultContract {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRunInputEncoding {
+    Utf8,
+    Base64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRunTriggerInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    pub encoding: TaskRunInputEncoding,
+    pub body: String,
+}
+
+impl std::fmt::Debug for TaskRunTriggerInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TaskRunTriggerInput([redacted])")
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskRun {
+    /// External data accepted for this occurrence, preserved across retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_input: Option<TaskRunTriggerInput>,
     pub id: String,
     pub task_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2186,9 +2214,21 @@ pub struct TaskCreateParams {
     pub metadata: Option<TaskMetadata>,
 }
 
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskWebhookScope {
+    Public,
+    Lan,
+    Loopback,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskCreateResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_scope: Option<TaskWebhookScope>,
     pub task: Task,
     pub trigger: TaskTrigger,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3012,6 +3052,10 @@ pub struct TaskOperatorDetails {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicTaskGetResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_scope: Option<TaskWebhookScope>,
     pub task: PublicTask,
     #[serde(default)]
     pub triggers: Vec<PublicTaskTrigger>,

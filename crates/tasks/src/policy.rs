@@ -39,6 +39,8 @@ pub struct TaskAgentAuthorizationGrantSeed {
 
 #[derive(Debug, Clone, Default)]
 pub struct TaskCreateContext {
+    /// Provisioned by Gateway before task creation; never contains the secret.
+    pub webhook_secret_ref: Option<String>,
     /// Capture handoff until the atomic Task/root commit; no database capacity.
     pub conversation_frozen_hold: Option<Arc<pioneer_crud::FrozenReadHold>>,
     pub actor_id: Option<String>,
@@ -170,6 +172,40 @@ pub fn default_lifecycle_policy(
     }
 }
 
+/// Future-run defaults apply to the provisionable webhook spec, not to every
+/// reserved external source. Existing kind-only callers retain their defaults.
+pub fn default_lifecycle_policy_for_trigger(
+    trigger: &pioneer_protocol::TaskTriggerSpec,
+    created_by_turn: bool,
+) -> TaskLifecyclePolicy {
+    let mut policy = default_lifecycle_policy(trigger.kind(), created_by_turn);
+    if is_webhook_spec(trigger) {
+        policy.completion = TaskCompletionBehavior::KeepActiveForRecurring;
+    }
+    policy
+}
+
+pub(crate) fn is_webhook_spec(spec: &pioneer_protocol::TaskTriggerSpec) -> bool {
+    matches!(spec, pioneer_protocol::TaskTriggerSpec::External { source, event_type: None, filter: None } if source == "webhook")
+}
+
+pub fn default_delivery_policy_for_trigger(
+    trigger: &pioneer_protocol::TaskTriggerSpec,
+    attachment: TaskAttachmentMode,
+    owner_kind: TaskOwnerKind,
+    owner_id: Option<&str>,
+    created_by_thread_id: Option<&str>,
+) -> TaskDeliveryPolicy {
+    default_delivery_policy_with_webhook(
+        trigger.kind(),
+        is_webhook_spec(trigger),
+        attachment,
+        owner_kind,
+        owner_id,
+        created_by_thread_id,
+    )
+}
+
 pub fn default_delivery_policy(
     trigger_kind: TaskTriggerKind,
     attachment: TaskAttachmentMode,
@@ -177,12 +213,31 @@ pub fn default_delivery_policy(
     owner_id: Option<&str>,
     created_by_thread_id: Option<&str>,
 ) -> TaskDeliveryPolicy {
+    default_delivery_policy_with_webhook(
+        trigger_kind,
+        false,
+        attachment,
+        owner_kind,
+        owner_id,
+        created_by_thread_id,
+    )
+}
+
+fn default_delivery_policy_with_webhook(
+    trigger_kind: TaskTriggerKind,
+    webhook: bool,
+    attachment: TaskAttachmentMode,
+    owner_kind: TaskOwnerKind,
+    owner_id: Option<&str>,
+    created_by_thread_id: Option<&str>,
+) -> TaskDeliveryPolicy {
     let has_thread_target =
         owner_kind == TaskOwnerKind::Thread && owner_id.is_some() || created_by_thread_id.is_some();
-    let is_scheduled = matches!(
-        trigger_kind,
-        TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
-    );
+    let is_scheduled = webhook
+        || matches!(
+            trigger_kind,
+            TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
+        );
     let is_immediate_detached =
         trigger_kind == TaskTriggerKind::Immediate && attachment == TaskAttachmentMode::Detached;
     TaskDeliveryPolicy {

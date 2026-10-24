@@ -58,8 +58,6 @@ const AGENT_ACTION_OUTBOX_TIMED_SQL: &str = "SELECT id FROM agent_action_outbox 
 const AGENT_ACTION_OUTBOX_FAILURE_CLASS: &str = "outbox_delivery_failed";
 pub const AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS: i64 = 30;
 pub const AGENT_ROUTE_GRAPH_MAX_EDGES: usize = 2_048;
-pub const ACTIVE_AGENT_IDENTITY_CATALOG_LIMIT: u64 =
-    pioneer_protocol::ChildAgentLaunchGrantSet::MAX_IDENTITIES as u64;
 const AGENT_PROJECTION_BATCH_LIMIT: usize = 200;
 const AGENT_BACKGROUND_BATCH_LIMIT: u64 = 512;
 pub(super) const AGENT_WORK_GRAPH_MAX_CONCURRENCY: i64 = 4_096;
@@ -566,16 +564,21 @@ pub async fn load_active_agent_identity_by_source<C: ConnectionTrait>(
         .context("failed to resolve exact active agent identity source")
 }
 
-pub async fn list_active_agent_identities<C: ConnectionTrait>(
+pub async fn list_active_agent_identities_page<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
+    after: Option<&str>,
 ) -> Result<Vec<agent_identity::Model>> {
-    agent_identity::Entity::find()
+    let mut query = agent_identity::Entity::find()
         .filter(agent_identity::Column::WorkspaceId.eq(workspace_id.to_owned()))
         .filter(agent_identity::Column::Status.eq("active"))
-        .filter(agent_identity::Column::RetiredAt.is_null())
+        .filter(agent_identity::Column::RetiredAt.is_null());
+    if let Some(after) = after {
+        query = query.filter(agent_identity::Column::Id.gt(after));
+    }
+    query
         .order_by_asc(agent_identity::Column::Id)
-        .limit(ACTIVE_AGENT_IDENTITY_CATALOG_LIMIT)
+        .limit(AGENT_PROJECTION_BATCH_LIMIT as u64)
         .all(db)
         .await
         .context("failed to list active workspace agent identities")
@@ -7439,6 +7442,54 @@ mod tests {
             .grant_json
             .replace("model-opaque", "tampered-model");
         assert!(upgrade_agent_execution_grant_model_to_current(tampered).is_err());
+    }
+
+    #[test]
+    fn persisted_execution_grant_projection_restores_large_authenticated_snapshot() {
+        let migrated = pioneer_protocol::migrate_embedded_child_launch_grant_json_to_current(
+            &serde_json::json!({"child_launch_grant":version_one_child_launch_grant()}).to_string(),
+        )
+        .unwrap();
+        let migrated: serde_json::Value = serde_json::from_str(&migrated).unwrap();
+        let seed: pioneer_protocol::ChildAgentLaunchGrantSet =
+            serde_json::from_value(migrated["child_launch_grant"].clone()).unwrap();
+        let identities = (0..140)
+            .map(|n| {
+                let mut identity = seed.identities[0].clone();
+                identity.id = pioneer_protocol::AgentIdentityId::new(format!("A{n:020}")).unwrap();
+                identity
+            })
+            .collect::<Vec<_>>();
+        let profiles = (0..300)
+            .map(|n| {
+                let mut profile = seed.profiles[0].clone();
+                profile.id =
+                    pioneer_protocol::AgentExecutionProfileId::new(format!("P{n:020}")).unwrap();
+                profile.compatible_agent_identity_ids = vec![identities[n % 140].id.clone()];
+                profile
+            })
+            .collect::<Vec<_>>();
+        let ceiling =
+            pioneer_protocol::ChildAgentLaunchGrantSet::new(identities.clone(), profiles.clone())
+                .unwrap();
+        let grant_json = serde_json::json!({"identity":identities[0],"profile":profiles[0],"child_launch_grant":ceiling}).to_string();
+        let model = agent_execution_grant::Model {
+            id: "G00000000000000000001".into(),
+            execution_id: "E00000000000000000001".into(),
+            parent_execution_id: None,
+            child_identity_id: identities[0].id.to_string(),
+            grant_fingerprint: agent_execution_grant_fingerprint(&grant_json).unwrap(),
+            grant_json,
+            created_at: utc_now(),
+        };
+        let restored = upgrade_agent_execution_grant_model_to_current(model.clone()).unwrap();
+        assert_eq!(restored.grant_json, model.grant_json);
+        assert_eq!(restored.grant_fingerprint, model.grant_fingerprint);
+        let (_, _, recovered) = parse_agent_execution_launch_grant(&restored.grant_json).unwrap();
+        assert_eq!(recovered, ceiling);
+        let mut foreign = model;
+        foreign.child_identity_id = "Z00000000000000000001".into();
+        assert!(upgrade_agent_execution_grant_model_to_current(foreign).is_err());
     }
 
     #[test]

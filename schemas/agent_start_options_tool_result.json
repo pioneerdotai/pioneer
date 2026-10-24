@@ -1,0 +1,413 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentStartOptionsToolResult",
+  "type": "object",
+  "properties": {
+    "allowedMcpServerIds": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowedSkillIds": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/SkillId"
+      }
+    },
+    "defaultPioneerIdentityAvailable": {
+      "type": "boolean"
+    },
+    "derivedEphemeralIdentityAvailable": {
+      "type": "boolean"
+    },
+    "eof": {
+      "type": "boolean"
+    },
+    "fragments": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/AgentCatalogFragment"
+      }
+    },
+    "generationFingerprint": {
+      "type": "string"
+    },
+    "identities": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AgentToolIdentityOption"
+      }
+    },
+    "inheritParentIdentityAvailable": {
+      "type": "boolean"
+    },
+    "inheritParentProfileAvailable": {
+      "type": "boolean"
+    },
+    "maxPermissionProfile": {
+      "$ref": "#/$defs/TurnPermissionProfileCap"
+    },
+    "nextCursor": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "profiles": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AgentToolProfileOption"
+      }
+    },
+    "targetOptions": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/AgentToolTargetOption"
+      }
+    },
+    "threadCreationOptions": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/AgentToolThreadCreationOption"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "defaultPioneerIdentityAvailable",
+    "derivedEphemeralIdentityAvailable",
+    "eof",
+    "generationFingerprint",
+    "identities",
+    "inheritParentIdentityAvailable",
+    "inheritParentProfileAvailable",
+    "maxPermissionProfile",
+    "profiles"
+  ],
+  "$defs": {
+    "AgentExecutionProfileId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentityId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentitySourceKind": {
+      "type": "string",
+      "enum": [
+        "native_agent",
+        "cli_runtime_instance",
+        "ephemeral"
+      ]
+    },
+    "AgentToolBackendKind": {
+      "description": "Deliberately contains only a backend class.  Runtime instance IDs and\nprovider/model configuration remain server-side implementation details.",
+      "type": "string",
+      "enum": [
+        "api",
+        "cli",
+        "acp"
+      ]
+    },
+    "AgentToolIdentityOption": {
+      "type": "object",
+      "properties": {
+        "avatarRevision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "displayName": {
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/$defs/AgentIdentityId"
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "roleLabel": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sourceKind": {
+          "$ref": "#/$defs/AgentIdentitySourceKind"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "displayName",
+        "nickname",
+        "sourceKind"
+      ]
+    },
+    "AgentToolProfileOption": {
+      "type": "object",
+      "properties": {
+        "allowedPermissionProfiles": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TurnPermissionMode"
+          }
+        },
+        "allowedReasoning": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TurnReasoningSelection"
+          }
+        },
+        "backend": {
+          "$ref": "#/$defs/AgentToolBackendKind"
+        },
+        "compatibleIdentityIds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentIdentityId"
+          }
+        },
+        "id": {
+          "$ref": "#/$defs/AgentExecutionProfileId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "compatibleIdentityIds",
+        "backend"
+      ]
+    },
+    "AgentToolTargetOption": {
+      "description": "Opaque action target projected by the server. The model never receives a\nthread, route, workspace, capsule or Gateway identifier and therefore\ncannot turn guessed infrastructure IDs into an existence oracle.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label"
+      ]
+    },
+    "AgentToolThreadCreationOption": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label"
+      ]
+    },
+    "PermissionBehavior": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "ask",
+        "deny"
+      ]
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "ToolPermissionPolicySnapshot": {
+      "type": "object",
+      "properties": {
+        "agent_action": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "allowed_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowed_paths_restricted": {
+          "description": "See `allowed_tools_restricted`.  A restricted empty path set is a\ndurable deny-all result, while an unrestricted empty set is the legacy\nwildcard.",
+          "type": "boolean"
+        },
+        "allowed_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowed_tools_restricted": {
+          "description": "`allowed_tools = []` historically means \"no allow-list\".  This bit\npreserves the distinct result of intersecting two disjoint allow-lists:\na restricted empty set must deny every tool rather than reopen all of\nthem.",
+          "type": "boolean"
+        },
+        "computer_use": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "default_behavior": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "denied_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dynamic_skill_tool": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "file_read": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "file_write": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "mcp_read": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "mcp_write_or_unknown": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "memory_write": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "network": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "shell_command": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "task_subagent": {
+          "$ref": "#/$defs/PermissionBehavior"
+        }
+      },
+      "required": [
+        "default_behavior",
+        "file_read",
+        "file_write",
+        "shell_command",
+        "network",
+        "mcp_read",
+        "mcp_write_or_unknown",
+        "dynamic_skill_tool",
+        "computer_use",
+        "task_subagent",
+        "memory_write",
+        "agent_action"
+      ]
+    },
+    "TurnPermissionMode": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "auto_accept_edits",
+        "supervised"
+      ]
+    },
+    "TurnPermissionProfileCap": {
+      "type": "object",
+      "properties": {
+        "effective_policy": {
+          "$ref": "#/$defs/ToolPermissionPolicySnapshot"
+        },
+        "mode": {
+          "$ref": "#/$defs/TurnPermissionMode"
+        }
+      },
+      "required": [
+        "mode",
+        "effective_policy"
+      ]
+    },
+    "TurnReasoningSelection": {
+      "type": "object",
+      "properties": {
+        "effort": {
+          "description": "String-valued because CLI runtimes may advertise efforts newer than\nPioneer API-provider adapters understand.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "effort"
+      ]
+    },
+    "AgentCatalogFragment": {
+      "description": "Concatenate text in offset order and decode JSON to recover one catalog entry.",
+      "type": "object",
+      "properties": {
+        "collection": {
+          "type": "string"
+        },
+        "encoding": {
+          "type": "string"
+        },
+        "eof": {
+          "type": "boolean"
+        },
+        "index": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "modelIndex": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "nextOffset": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "offset": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "text": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "collection",
+        "encoding",
+        "eof",
+        "index",
+        "modelIndex",
+        "nextOffset",
+        "offset",
+        "text",
+        "version"
+      ]
+    }
+  }
+}

@@ -28,7 +28,6 @@ pub(crate) const THREAD_READ_TOOL_NAMES: [&str; 3] = [
     "threads_children_list",
 ];
 const CANDIDATE_QUANTUM: u64 = 200;
-const RESPONSE_BYTES: usize = 32768;
 
 pub(crate) fn thread_read_tool_specs() -> Vec<ConfiguredToolSpec> {
     let limit = json!({"type":"integer","minimum":1,"maximum":100});
@@ -36,13 +35,13 @@ pub(crate) fn thread_read_tool_specs() -> Vec<ConfiguredToolSpec> {
     let definitions = [
         (
             "threads_list",
-            "List accessible saved conversations in the current workspace, including hidden internal children and archived conversations. Bounded pages ordered by immutable thread ID. Follow nextCursor until eof; an empty nonterminal page is possible. No search. Read a selected conversation with threads_history_read.",
+            "List accessible saved conversations in the current workspace, including hidden internal children and archived conversations. Bounded pages ordered by immutable thread ID. Follow nextCursor until eof; an empty nonterminal page is possible. Metadata changes invalidate cursors; restart listing. Oversized metadata uses UTF-8 JSON fragments: concatenate text by byte offsets before decoding. No search. Read a selected conversation with threads_history_read.",
             json!({"limit":limit,"cursor":cursor}),
             vec!["limit"],
         ),
         (
             "threads_history_read",
-            "Read one conversation's saved history, newest to oldest by default. Optionally open near an exact saved anchor {turnId,itemId?}; omit itemId to anchor the turn. Initial pages include bounded neighboring context. Use direction=older (default) or newer with nextCursor, or reverseCursor and its reverseDirection to continue within the same snapshot; omit anchor on continuation and retain limit. nextCursor/eof apply to the requested direction. Every page is displayed newest to oldest. Follow nextCursor to finish JSON fragments of oversized records before changing direction. Child references identify separate histories: open a child with another threads_history_read call, then resume the parent with its original cursor. Children are never loaded automatically; threads_children_list is optional. Read large saved tool results with threads_tools_result_read using the exact supplied reference; output_log=true reads saved logs.",
+            "Read one conversation's saved history, newest to oldest by default. Optionally open near an exact saved anchor {turnId,itemId?}; omit itemId to anchor the turn. Initial pages include bounded neighboring context. Use direction=older (default) or newer with nextCursor, or reverseCursor and its reverseDirection to continue within the same snapshot; omit anchor on continuation and retain limit. nextCursor/eof apply to the requested direction. Every page is displayed newest to oldest. Follow nextCursor to finish JSON fragments of oversized records before changing direction. List metadata fragments contain canonical JSON: concatenate fragment.text by byte offsets before decoding. Child references identify separate histories: open a child with another threads_history_read call, then resume the parent with its original cursor. Children are never loaded automatically; threads_children_list is optional. Read large saved tool results with threads_tools_result_read using the exact supplied reference; output_log=true reads saved logs.",
             json!({"threadId":{"type":"string"},"limit":limit,"cursor":cursor,
                 "anchor":{"type":["object","null"],"properties":{"turnId":{"type":"string"},"itemId":{"type":["string","null"]}},"required":["turnId"],"additionalProperties":false,"description":"Exact saved source in this thread; omit on cursor continuation."},
                 "direction":{"type":"string","enum":["older","newer"],"default":"older"}}),
@@ -50,7 +49,7 @@ pub(crate) fn thread_read_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         (
             "threads_children_list",
-            "Optionally list direct children (recursive=false) or every descendant of this specific conversation (recursive=true). Does not read child history. Follow nextCursor until eof even if a page is empty. Open selected children with threads_history_read; this list is not a prerequisite for reading history.",
+            "Optionally list direct children (recursive=false) or every descendant of this specific conversation (recursive=true). Does not read child history. Follow nextCursor until eof even if a page is empty. Changes to traversed parent edges or returned child metadata invalidate cursors; restart listing. Unrelated conversations and activity do not invalidate this traversal. Oversized metadata uses UTF-8 JSON fragments: concatenate text by byte offsets before decoding. Open selected children with threads_history_read; this list is not a prerequisite for reading history.",
             json!({"threadId":{"type":"string"},"recursive":{"type":"boolean"},"limit":limit,"cursor":cursor}),
             vec!["threadId", "recursive", "limit"],
         ),
@@ -70,10 +69,20 @@ pub(super) struct ThreadReadAuthority {
     observe_workspace: bool,
 }
 impl ThreadReadAuthority {
-    fn scope(&self, operation: &str, resource: &str, recursive: bool, limit: u32) -> String {
+    pub(super) fn scope(
+        &self,
+        operation: &str,
+        resource: &str,
+        recursive: bool,
+        limit: u32,
+    ) -> String {
         // JSON encoding avoids delimiter ambiguity in imported legacy IDs.
         json!([
-            "thread-read-v1",
+            "thread-read-v2",
+            self.root_thread_id,
+            self.current_thread_id,
+            self.observe_children,
+            self.observe_workspace,
             self.principal.principal_id.as_str(),
             self.workspace_id,
             operation,
@@ -88,14 +97,25 @@ impl ThreadReadAuthority {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ListCursor {
-    after: String,
+    revision: String,
+    after: Option<String>,
+    fragment: Option<MetadataFragment>,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetadataFragment {
+    thread_id: String,
+    digest: String,
+    offset: usize,
+}
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChildrenCursor {
+    revision: String,
     node: String,
     after: Option<String>,
     path_fingerprint: String,
+    fragment: Option<MetadataFragment>,
 }
 
 impl MessageProcessor {
@@ -261,11 +281,118 @@ impl MessageProcessor {
         })
     }
 
-    fn thread_read_cursor_codec(&self) -> Result<ThreadReadCursorCodec> {
+    pub(super) fn thread_read_cursor_codec(&self) -> Result<ThreadReadCursorCodec> {
         let secret = self
             .gateway_secrets
             .load_or_create_auth_credential_hmac_key(64)?;
         ThreadReadCursorCodec::new(secret.as_bytes())
+    }
+
+    // Hash bounded, released reads instead of putting a catalog/tree snapshot
+    // into the cursor. Any workspace metadata/lineage edit invalidates a list;
+    // ACLs are separately checked against the current principal on every page.
+    async fn thread_listing_revision(&self, workspace: &str) -> Result<String> {
+        let mut digest = Sha256::new();
+        let mut after = None;
+        loop {
+            let rows = self
+                .crud_store
+                .list_thread_read_candidates_page(workspace, after.as_deref(), CANDIDATE_QUANTUM)
+                .await?;
+            let done = rows.len() < CANDIDATE_QUANTUM as usize;
+            for id in &rows {
+                let row = self
+                    .crud_store
+                    .get_thread_by_id(id)
+                    .await?
+                    .ok_or_else(|| anyhow!("cursor is stale; restart reading"))?;
+                let lineage = self.crud_store.get_task_thread_lineage(id).await?;
+                digest.update(serde_json::to_vec(&json!([
+                    id,
+                    row.workspace_id,
+                    row.name,
+                    row.preview,
+                    row.status,
+                    row.sidebar_visibility,
+                    row.created_at,
+                    row.updated_at,
+                    lineage
+                ]))?);
+            }
+            after = rows.last().cloned();
+            if done {
+                break;
+            }
+        }
+        Ok(hex::encode(digest.finalize()))
+    }
+
+    // Children depend on actual parent edges within the requested traversal and
+    // the fields they return, not unrelated workspace activity. Recomputing the
+    // subtree also detects reparenting/deletion ahead of the current position.
+    // Each read releases DB capacity before hashing; only the DFS ancestor path
+    // is retained, never a complete tree or an accumulated result list.
+    async fn thread_children_revision(
+        &self,
+        workspace: &str,
+        root: &str,
+        recursive: bool,
+    ) -> Result<String> {
+        let mut digest = Sha256::new();
+        let root_workspace = self
+            .crud_store
+            .get_thread_by_id(root)
+            .await?
+            .map(|row| row.workspace_id);
+        digest.update(serde_json::to_vec(&json!([
+            "children-tree-v1",
+            workspace,
+            root,
+            recursive,
+            root_workspace
+        ]))?);
+        let mut path = vec![root.to_owned()];
+        let mut after = None;
+        loop {
+            let rows = self
+                .crud_store
+                .list_thread_child_lineage_page(path.last().unwrap(), after.as_deref(), 1)
+                .await?;
+            let Some(edge) = rows.first() else {
+                if path.len() == 1 {
+                    break;
+                }
+                after = path.pop();
+                continue;
+            };
+            digest.update(serde_json::to_vec(&json!([
+                edge.parent_thread_id,
+                edge.child_thread_id
+            ]))?);
+            if path.contains(&edge.child_thread_id) {
+                after = Some(edge.child_thread_id.clone());
+                continue;
+            }
+            let row = self
+                .crud_store
+                .get_thread_by_id(&edge.child_thread_id)
+                .await?;
+            digest.update(serde_json::to_vec(&row.map(|row| {
+                json!([
+                    row.workspace_id,
+                    row.name,
+                    row.status,
+                    row.sidebar_visibility
+                ])
+            }))?);
+            if recursive {
+                path.push(edge.child_thread_id.clone());
+                after = None;
+            } else {
+                after = Some(edge.child_thread_id.clone());
+            }
+        }
+        Ok(hex::encode(digest.finalize()))
     }
 
     async fn thread_list_page(
@@ -280,44 +407,95 @@ impl MessageProcessor {
             .as_deref()
             .map(|c| codec.decode(c, &scope))
             .transpose()?;
+        let revision = self
+            .thread_listing_revision(&authority.workspace_id)
+            .await?;
+        ensure!(
+            state
+                .as_ref()
+                .is_none_or(|state| state.revision == revision),
+            "cursor is stale; restart reading"
+        );
         let rows = self
             .crud_store
             .list_thread_read_candidates_page(
                 &authority.workspace_id,
-                state.as_ref().map(|s| s.after.as_str()),
+                state.as_ref().and_then(|s| s.after.as_deref()),
                 CANDIDATE_QUANTUM,
             )
             .await?;
         let mut threads = Vec::new();
-        let mut after = None;
+        let mut state = state.unwrap_or(ListCursor {
+            revision: revision.clone(),
+            after: None,
+            fragment: None,
+        });
         let mut done = rows.len() < CANDIDATE_QUANTUM as usize;
         for (index, row) in rows.iter().enumerate() {
-            if self.thread_source_readable(authority, &row).await? {
-                let metadata = self.thread_read_metadata(authority, &row).await?;
-                let mut proposed = threads.clone();
-                proposed.push(metadata.clone());
-                if !thread_metadata_page_fits(&proposed)? {
+            if self.thread_source_readable(authority, row).await? {
+                let metadata = self.thread_read_metadata(authority, row).await?;
+                let (metadata, fragment) = metadata_page_record(
+                    metadata,
+                    state.fragment.as_ref(),
+                    |candidate, fragment| {
+                        let next = codec.encode(
+                            &ListCursor {
+                                revision: revision.clone(),
+                                after: if fragment.is_some() {
+                                    state.after.clone()
+                                } else {
+                                    Some(row.clone())
+                                },
+                                fragment: fragment.cloned(),
+                            },
+                            &scope,
+                        )?;
+                        let done = fragment.is_none()
+                            && index + 1 == rows.len()
+                            && rows.len() < CANDIDATE_QUANTUM as usize;
+                        let next = if done { None } else { Some(next) };
+                        let mut proposed = threads.clone();
+                        proposed.push(candidate.clone());
+                        Ok(pioneer_tools::thread_read_page_fits(
+                            &json!({"threads":proposed,"nextCursor":next,"eof":done}),
+                        ))
+                    },
+                    threads.is_empty(),
+                )?;
+                let Some(metadata) = metadata else {
+                    done = false;
+                    break;
+                };
+                threads.push(metadata);
+                state.fragment = fragment;
+                if state.fragment.is_some() {
                     done = false;
                     break;
                 }
-                threads.push(metadata);
+            } else {
+                ensure!(state.fragment.is_none(), "cursor is stale; restart reading");
             }
-            after = Some(row.clone());
+            state.after = Some(row.clone());
             if threads.len() == params.limit as usize {
                 done = index + 1 == rows.len() && rows.len() < CANDIDATE_QUANTUM as usize;
                 break;
             }
         }
+        ensure!(
+            state.fragment.is_none() || !rows.is_empty(),
+            "cursor is stale; restart reading"
+        );
         let next = if done {
             None
         } else {
-            Some(codec.encode(
-                &ListCursor {
-                    after: after.ok_or_else(|| anyhow!("thread metadata exceeds page budget"))?,
-                },
-                &scope,
-            )?)
+            Some(codec.encode(&state, &scope)?)
         };
+        ensure!(
+            self.thread_listing_revision(&authority.workspace_id)
+                .await?
+                == revision,
+            "cursor is stale; restart reading"
+        );
         Ok(json!({"threads":threads,"nextCursor":next,"eof":done}))
     }
 
@@ -335,11 +513,8 @@ impl MessageProcessor {
             row.workspace_id == authority.workspace_id,
             "source unavailable or access denied"
         );
-        let title = row
-            .name
-            .as_ref()
-            .map(|s| s.chars().take(256).collect::<String>());
-        let mut value = json!({"threadId":row.id,"title":title,"titleTruncated":row.name.as_ref().is_some_and(|s| s.chars().count()>256),"preview":row.preview.chars().take(160).collect::<String>(),"createdAt":row.created_at.timestamp(),"updatedAt":row.updated_at.timestamp(),"visibility":row.sidebar_visibility,"status":row.status,"archived":row.status == "closed"});
+        let title = row.name.clone();
+        let mut value = json!({"threadId":row.id,"title":title,"titleTruncated":false,"preview":row.preview.chars().take(160).collect::<String>(),"previewTruncated":row.preview.chars().count()>160,"createdAt":row.created_at.timestamp(),"updatedAt":row.updated_at.timestamp(),"visibility":row.sidebar_visibility,"status":row.status,"archived":row.status == "closed"});
         if let Some(lineage) = self.crud_store.get_task_thread_lineage(thread_id).await? {
             if self
                 .thread_source_readable(authority, &lineage.parent_thread_id)
@@ -391,23 +566,32 @@ impl MessageProcessor {
             "source unavailable or access denied"
         );
         let scope = authority.scope(
-            "children",
+            "children-tree-v1",
             &params.thread_id,
             params.recursive,
             params.limit,
         );
+        let revision = self
+            .thread_children_revision(&authority.workspace_id, &params.thread_id, params.recursive)
+            .await?;
         let mut state = params
             .cursor
             .as_deref()
             .map(|c| codec.decode::<ChildrenCursor>(c, &scope))
             .transpose()?
             .unwrap_or(ChildrenCursor {
+                revision: revision.clone(),
                 node: params.thread_id.clone(),
                 after: None,
                 path_fingerprint: children_path_fingerprint(std::slice::from_ref(
                     &params.thread_id,
                 ))?,
+                fragment: None,
             });
+        ensure!(
+            state.revision == revision,
+            "children cursor is stale; restart reading"
+        );
         ensure!(
             params.recursive || state.node == params.thread_id,
             "invalid children cursor"
@@ -421,12 +605,19 @@ impl MessageProcessor {
         );
         let mut threads = Vec::new();
         let mut done = false;
+        let mut checkpoint = (state.clone(), path.clone());
         for _ in 0..CANDIDATE_QUANTUM {
+            if !threads.is_empty() && !children_page_fits(&threads, &state, codec, &scope)? {
+                (state, path) = checkpoint.clone();
+                break;
+            }
+            checkpoint = (state.clone(), path.clone());
             let rows = self
                 .crud_store
                 .list_thread_child_lineage_page(&state.node, state.after.as_deref(), 1)
                 .await?;
             let Some(edge) = rows.first() else {
+                ensure!(state.fragment.is_none(), "cursor is stale; restart reading");
                 if path.len() == 1 {
                     done = true;
                     break;
@@ -450,7 +641,13 @@ impl MessageProcessor {
                 // Parent may be unavailable even when a descendant is readable.
                 metadata.as_object_mut().unwrap().remove("parentThreadId");
                 metadata.as_object_mut().unwrap().remove("rootThreadId");
-                for field in ["preview", "createdAt", "updatedAt", "archived"] {
+                for field in [
+                    "preview",
+                    "previewTruncated",
+                    "createdAt",
+                    "updatedAt",
+                    "archived",
+                ] {
                     metadata.as_object_mut().unwrap().remove(field);
                 }
                 if self
@@ -460,13 +657,42 @@ impl MessageProcessor {
                     metadata["parentThreadId"] = json!(edge.parent_thread_id);
                 }
                 metadata["depth"] = json!(path.len());
-                let mut proposed = threads.clone();
-                proposed.push(metadata.clone());
-                if !thread_metadata_page_fits(&proposed)? {
+                let (metadata, fragment) = metadata_page_record(
+                    metadata,
+                    state.fragment.as_ref(),
+                    |candidate, fragment| {
+                        let mut next_state = state.clone();
+                        let mut next_path = path.clone();
+                        next_state.fragment = fragment.cloned();
+                        if fragment.is_none() {
+                            if params.recursive {
+                                next_path.push(edge.child_thread_id.clone());
+                                next_state.node = edge.child_thread_id.clone();
+                                next_state.after = None;
+                            } else {
+                                next_state.after = Some(edge.child_thread_id.clone());
+                            }
+                        }
+                        next_state.path_fingerprint = children_path_fingerprint(&next_path)?;
+                        let next = codec.encode(&next_state, &scope)?;
+                        let mut proposed = threads.clone();
+                        proposed.push(candidate.clone());
+                        Ok(pioneer_tools::thread_read_page_fits(
+                            &json!({"threads":proposed,"nextCursor":next,"eof":false}),
+                        ))
+                    },
+                    threads.is_empty(),
+                )?;
+                let Some(metadata) = metadata else {
+                    break;
+                };
+                threads.push(metadata);
+                state.fragment = fragment;
+                if state.fragment.is_some() {
                     break;
                 }
-                threads.push(metadata);
             }
+            ensure!(state.fragment.is_none(), "cursor is stale; restart reading");
             if params.recursive {
                 path.push(edge.child_thread_id.clone());
                 state.node = edge.child_thread_id.clone();
@@ -478,12 +704,25 @@ impl MessageProcessor {
                 break;
             }
         }
+        if !done && !threads.is_empty() && !children_page_fits(&threads, &state, codec, &scope)? {
+            (state, path) = checkpoint.clone();
+        }
         state.path_fingerprint = children_path_fingerprint(&path)?;
         let next = if done {
             None
         } else {
             Some(codec.encode(&state, &scope)?)
         };
+        ensure!(
+            self.thread_children_revision(
+                &authority.workspace_id,
+                &params.thread_id,
+                params.recursive,
+            )
+            .await?
+                == revision,
+            "cursor is stale; restart reading"
+        );
         Ok(json!({"threads":threads,"nextCursor":next,"eof":done}))
     }
 }
@@ -509,7 +748,7 @@ impl ToolHandler for ThreadReadHandler {
             .map_err(|e| safe_read_error(&e))?;
         let text = serde_json::to_string(&result)
             .map_err(|_| ToolError::execution_failed("response encoding failed"))?;
-        if text.len() > RESPONSE_BYTES || pioneer_compaction::text_tokens(&text) > 4096 {
+        if !pioneer_tools::thread_read_page_fits(&result) {
             return Err(ToolError::execution_failed(
                 "read response exceeds page budget",
             ));
@@ -694,7 +933,7 @@ fn safe_read_error(error: &anyhow::Error) -> ToolError {
     {
         "cursor is stale; restart reading from the first page"
     } else if message.contains("cursor") {
-        "invalid cursor or cursor scope/parameters mismatch"
+        "invalid or incompatible cursor; restart reading with the same resource and parameters"
     } else if message.starts_with("limit must") {
         "limit must be between 1 and 100"
     } else if message.starts_with("invalid ") && message.ends_with(" parameters") {
@@ -709,9 +948,94 @@ fn safe_read_error(error: &anyhow::Error) -> ToolError {
 #[path = "thread_read_tools/tests.rs"]
 mod tests;
 
-fn thread_metadata_page_fits(threads: &[Value]) -> Result<bool> {
-    let encoded = serde_json::to_string(threads)?;
-    Ok(encoded.len() <= 28 * 1024 && pioneer_compaction::text_tokens(&encoded) <= 2048)
+// Only one metadata record is fragmented. No accumulated rows enter the cursor.
+fn metadata_page_record<F>(
+    metadata: Value,
+    fragment: Option<&MetadataFragment>,
+    mut fits: F,
+    empty: bool,
+) -> Result<(Option<Value>, Option<MetadataFragment>)>
+where
+    F: FnMut(&Value, Option<&MetadataFragment>) -> Result<bool>,
+{
+    if fragment.is_none() && fits(&metadata, None)? {
+        return Ok((Some(metadata), None));
+    }
+    if !empty {
+        return Ok((None, fragment.cloned()));
+    }
+    let encoded = serde_json::to_string(&metadata)?;
+    let digest = hex::encode(Sha256::digest(encoded.as_bytes()));
+    let thread_id = metadata["threadId"]
+        .as_str()
+        .ok_or_else(|| anyhow!("metadata source unavailable"))?
+        .to_owned();
+    let offset = fragment.map_or(0, |f| f.offset);
+    if let Some(f) = fragment {
+        ensure!(
+            f.thread_id == thread_id
+                && f.digest == digest
+                && offset < encoded.len()
+                && encoded.is_char_boundary(offset),
+            "cursor is stale; restart reading"
+        );
+    }
+    let make = |end| {
+        let mut record = json!({"threadId":thread_id,"fragment":{"encoding":"json","version":digest,"offset":offset,"nextOffset":end,"eof":end == encoded.len(),"text":&encoded[offset..end]}});
+        for field in ["parentThreadId", "rootThreadId"] {
+            if let Some(id) = metadata.get(field) {
+                record[field] = id.clone();
+            }
+        }
+        let next = (end < encoded.len()).then(|| MetadataFragment {
+            thread_id: thread_id.clone(),
+            digest: digest.clone(),
+            offset: end,
+        });
+        (record, next)
+    };
+    let mut low = offset;
+    let mut high = encoded
+        .len()
+        .min(offset.saturating_add(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES));
+    let mut best = None;
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        let mut end = mid;
+        while !encoded.is_char_boundary(end) {
+            end -= 1;
+        }
+        let (record, next) = make(end);
+        if fits(&record, next.as_ref())? {
+            best = Some((end, record, next));
+            low = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+    if encoded.len() - offset <= pioneer_protocol::TOOL_RESPONSE_MAX_BYTES {
+        let (record, next) = make(encoded.len());
+        if fits(&record, next.as_ref())? {
+            best = Some((encoded.len(), record, next));
+        }
+    }
+    let (end, record, next) =
+        best.ok_or_else(|| anyhow!("metadata framing exceeds page budget"))?;
+    ensure!(end > offset, "metadata framing exceeds page budget");
+    Ok((Some(record), next))
+}
+
+fn children_page_fits(
+    threads: &[Value],
+    state: &ChildrenCursor,
+    codec: &ThreadReadCursorCodec,
+    scope: &str,
+) -> Result<bool> {
+    Ok(pioneer_tools::thread_read_page_fits(
+        &json!({"threads":threads,"nextCursor":codec.encode(state, scope)?,"eof":false}),
+    ))
 }
 
 fn children_path_fingerprint(path: &[String]) -> Result<String> {

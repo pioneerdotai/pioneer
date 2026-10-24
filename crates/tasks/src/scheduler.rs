@@ -551,6 +551,7 @@ impl TaskScheduler {
         let mut parent_run_id = task_response.runs.last().map(|run| run.id.clone());
         for _fire_at in fire_times {
             let run = TaskRun {
+                trigger_input: None,
                 id: generate_id(ID_LEN),
                 task_id: task_response.task.id.clone(),
                 trigger_id: Some(trigger.id.clone()),
@@ -704,6 +705,7 @@ impl TaskScheduler {
             .transpose()?
             .unwrap_or(1);
         let run = TaskRun {
+            trigger_input: None,
             id: generate_id(ID_LEN),
             task_id: task_response.task.id.clone(),
             trigger_id: Some(trigger.id.clone()),
@@ -885,13 +887,30 @@ impl TaskScheduler {
             .as_ref()
             .map(|policy| usize::try_from(policy.max_parallel_runs.max(1)).unwrap_or(1))
             .unwrap_or(1);
-        let active_without_queued = task_response
+        let Some(candidate) = task_response
             .runs
             .iter()
-            .filter(|run| !crate::service::is_terminal_run(run.status))
-            .filter(|run| run.id != queued_run_id)
+            .find(|run| run.id == queued_run_id)
+        else {
+            return false;
+        };
+        let now = now_timestamp_secs();
+        let occupied = task_response
+            .runs
+            .iter()
+            .filter(|run| {
+                !crate::service::is_terminal_run(run.status) && run.status != TaskRunStatus::Queued
+            })
             .count();
-        active_without_queued < max_parallel_runs
+        let earlier_ready = task_response
+            .runs
+            .iter()
+            .filter(|run| {
+                run.status == TaskRunStatus::Queued && run.run_number < candidate.run_number
+            })
+            .filter(|run| run.ready_at.is_none_or(|ready| ready <= now))
+            .count();
+        occupied.saturating_add(earlier_ready) < max_parallel_runs
     }
 
     async fn dispatch_run(

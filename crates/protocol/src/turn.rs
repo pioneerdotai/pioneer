@@ -4519,7 +4519,7 @@ impl ToolOutputPolicySnapshot {
     }
 }
 
-const DEFAULT_LLM_MAX_BYTES: usize = 2 * 1024 * 1024;
+pub const TOOL_RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_SUMMARY_CHARS: usize = 2_000;
 const DEFAULT_SHELL_CHUNK_BYTES: usize = 64 * 1024;
 const DEFAULT_SHELL_TOTAL_BYTES: usize = 4 * 1024 * 1024;
@@ -4527,7 +4527,7 @@ const DEFAULT_DIAGNOSTIC_CHARS: usize = 4_000;
 
 fn retained_llm_policy() -> LlmRetentionPolicy {
     LlmRetentionPolicy::UntilTurnTerminal {
-        max_bytes: DEFAULT_LLM_MAX_BYTES,
+        max_bytes: TOOL_RESPONSE_MAX_BYTES,
     }
 }
 
@@ -4544,7 +4544,7 @@ fn evidence_recovery_policy(diagnostic_excerpt: DiagnosticExcerptPolicy) -> Reco
 fn shell_output_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Full {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::Full {
@@ -4566,7 +4566,7 @@ fn shell_output_policy_snapshot() -> ToolOutputPolicySnapshot {
 fn model_only_metadata_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Full {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::Summary {
@@ -4581,7 +4581,7 @@ fn model_only_metadata_policy_snapshot() -> ToolOutputPolicySnapshot {
 fn web_fetch_output_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Full {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::Summary {
@@ -4596,7 +4596,7 @@ fn web_fetch_output_policy_snapshot() -> ToolOutputPolicySnapshot {
 fn web_search_output_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Structured {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::Summary {
@@ -4613,7 +4613,7 @@ fn web_search_output_policy_snapshot() -> ToolOutputPolicySnapshot {
 fn download_output_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Structured {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::Summary {
@@ -4628,7 +4628,7 @@ fn download_output_policy_snapshot() -> ToolOutputPolicySnapshot {
 fn computer_use_output_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Structured {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::Summary {
@@ -4643,7 +4643,7 @@ fn computer_use_output_policy_snapshot() -> ToolOutputPolicySnapshot {
 fn external_runtime_tool_output_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Structured {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::Summary {
@@ -4671,7 +4671,7 @@ fn html_output_policy_snapshot() -> ToolOutputPolicySnapshot {
 fn dynamic_unknown_output_policy_snapshot() -> ToolOutputPolicySnapshot {
     ToolOutputPolicySnapshot {
         llm: LlmOutputPolicy::Structured {
-            max_bytes: DEFAULT_LLM_MAX_BYTES,
+            max_bytes: TOOL_RESPONSE_MAX_BYTES,
         },
         llm_retention: retained_llm_policy(),
         timeline: TimelineOutputPolicy::MetadataOnly,

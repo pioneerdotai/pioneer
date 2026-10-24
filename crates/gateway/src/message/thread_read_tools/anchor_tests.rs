@@ -270,7 +270,7 @@ async fn oversized_anchored_unicode_item_reconstructs_in_each_direction() {
     for direction in [ThreadHistoryDirection::Older, ThreadHistoryDirection::Newer] {
         let (_harness, processor) = fixture().await;
         seed_turn(&processor).await;
-        let text = "🌍漢字\n\"".repeat(2000);
+        let text = "🌍漢字\n\"".repeat(240000);
         save_item(&processor, "large", &text).await;
         // The first candidate is filtered in either direction. Fragment resume
         // must pin the large record rather than revisit that earlier candidate.

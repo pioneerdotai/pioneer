@@ -758,8 +758,8 @@ impl MessageProcessor {
                     )
                     .attachment
                 });
-            params.delivery_policy = Some(pioneer_tasks::default_delivery_policy(
-                trigger_kind,
+            params.delivery_policy = Some(pioneer_tasks::default_delivery_policy_for_trigger(
+                &params.trigger.spec,
                 attachment,
                 params.owner_kind,
                 params.owner_id.as_deref(),
@@ -1149,10 +1149,58 @@ impl MessageProcessor {
             .await;
             return;
         }
+        if crate::task_tools::is_webhook_trigger(&params.trigger.spec) {
+            // Native RPC has no task-create mutation receipt. Keep this request's
+            // provisioning outside the Task transaction, with a dedicated ref.
+            let secret_ref = pioneer_protocol::generate_id(21);
+            if self
+                .gateway_secrets
+                .ensure_task_webhook_secret(&secret_ref)
+                .is_err()
+            {
+                self.send_error(
+                    connection_id,
+                    task_public_error(
+                        Some(request_id),
+                        pioneer_protocol::PublicErrorStage::Preparation,
+                        "task webhook provisioning unavailable",
+                    ),
+                )
+                .await;
+                return;
+            }
+            context.webhook_secret_ref = Some(secret_ref);
+        }
         match message_future(self.task_runtime.service().create_task(context, params)).await {
             Ok(response_payload) => {
-                self.send_task_response(connection_id, request_id, &response_payload)
-                    .await
+                let output = async {
+                    let mut output = serde_json::to_value(&response_payload)?;
+                    crate::task_tools::enrich_task_webhook_output(
+                        self,
+                        std::slice::from_ref(&response_payload.trigger),
+                        &mut output,
+                    )
+                    .await?;
+                    anyhow::Ok(output)
+                }
+                .await;
+                match output {
+                    Ok(output) => {
+                        self.send_task_response(connection_id, request_id, &output)
+                            .await
+                    }
+                    Err(_) => {
+                        self.send_error(
+                            connection_id,
+                            task_public_error(
+                                Some(request_id),
+                                pioneer_protocol::PublicErrorStage::Observation,
+                                "task webhook address unavailable",
+                            ),
+                        )
+                        .await
+                    }
+                }
             }
             Err(error) => {
                 self.send_error(
@@ -1214,8 +1262,34 @@ impl MessageProcessor {
             Ok(response_payload) => {
                 let projected =
                     crate::task_projection::project_task_get(&response_payload, operator_allowed);
-                self.send_task_response(connection_id, request_id, &projected)
-                    .await
+                let output = async {
+                    let mut output = serde_json::to_value(&projected)?;
+                    crate::task_tools::enrich_task_webhook_output(
+                        self,
+                        &response_payload.triggers,
+                        &mut output,
+                    )
+                    .await?;
+                    anyhow::Ok(output)
+                }
+                .await;
+                match output {
+                    Ok(output) => {
+                        self.send_task_response(connection_id, request_id, &output)
+                            .await
+                    }
+                    Err(_) => {
+                        self.send_error(
+                            connection_id,
+                            task_public_error(
+                                Some(request_id),
+                                pioneer_protocol::PublicErrorStage::Observation,
+                                "task webhook address unavailable",
+                            ),
+                        )
+                        .await
+                    }
+                }
             }
             Err(error) => {
                 self.send_error(

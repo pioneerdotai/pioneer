@@ -1,6 +1,6 @@
 use axum::Router;
 use axum::middleware;
-use axum::routing::get;
+use axum::routing::{get, post};
 
 use super::GatewayHttpState;
 use super::avatars::{agent_avatar_route, member_avatar_route};
@@ -35,6 +35,14 @@ pub(crate) fn gateway_router(state: GatewayHttpState) -> Router {
             get(agent_avatar_route).head(agent_avatar_route),
         )
         .layer(middleware::from_fn(super::header_policy::enforce))
+        .merge(
+            Router::new()
+                .route(
+                    "/webhooks/tasks/{trigger_id}/{secret}",
+                    post(super::webhooks::task_webhook_route),
+                )
+                .layer(middleware::from_fn(super::header_policy::enforce_webhook)),
+        )
         .with_state(state)
 }
 

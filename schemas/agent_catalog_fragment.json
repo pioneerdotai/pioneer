@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentCatalogFragment",
+  "description": "Concatenate text in offset order and decode JSON to recover one catalog entry.",
+  "type": "object",
+  "properties": {
+    "collection": {
+      "type": "string"
+    },
+    "encoding": {
+      "type": "string"
+    },
+    "eof": {
+      "type": "boolean"
+    },
+    "index": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
+    "modelIndex": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
+    "nextOffset": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
+    "offset": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
+    "text": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "collection",
+    "encoding",
+    "eof",
+    "index",
+    "modelIndex",
+    "nextOffset",
+    "offset",
+    "text",
+    "version"
+  ]
+}

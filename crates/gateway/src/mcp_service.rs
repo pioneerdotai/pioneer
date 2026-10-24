@@ -6187,6 +6187,7 @@ mod tests {
                     },
                     TaskEventPayload::RunCreated {
                         run: TaskRun {
+                            trigger_input: None,
                             id: run_id.to_owned(),
                             task_id: task_id.to_owned(),
                             trigger_id: None,

@@ -19,6 +19,17 @@
         "null"
       ]
     },
+    "public_base_url": {
+      "description": "Present only for the currently authenticated relay connection.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GatewayBaseUrl"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "state": {
       "$ref": "#/$defs/GatewayRemoteAccessState",
       "default": "disabled"
@@ -32,6 +43,9 @@
     }
   },
   "$defs": {
+    "GatewayBaseUrl": {
+      "type": "string"
+    },
     "GatewayRemoteAccessErrorKind": {
       "type": "string",
       "enum": [

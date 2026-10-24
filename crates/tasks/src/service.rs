@@ -7,7 +7,8 @@ use crate::executor::{
 };
 use crate::policy::{
     TaskCreateContext, TaskExecutionAdmissionSeed, TaskMutationContext, TaskWaitContext,
-    default_delivery_policy, default_lifecycle_policy, default_retry_policy,
+    default_delivery_policy_for_trigger, default_lifecycle_policy,
+    default_lifecycle_policy_for_trigger, default_retry_policy, is_webhook_spec,
 };
 use crate::projector::TaskProjector;
 use crate::reconciliation::TaskStartupReconciler;
@@ -1948,6 +1949,13 @@ impl TaskService {
             bail!("finishRequest is server-owned; use task_finish");
         }
         validate_create_params(&params)?;
+        if is_webhook_spec(&params.trigger.spec) != context.webhook_secret_ref.is_some() {
+            bail!("webhook trigger requires a provisioned keystore reference");
+        }
+        if is_webhook_spec(&params.trigger.spec) && params.executor_kind != TaskExecutorKind::Agent
+        {
+            bail!("webhook tasks require the ordinary agent executor");
+        }
         self.validate_review_policy_create_gate(&params)?;
         match (
             params.executor_kind == TaskExecutorKind::Agent,
@@ -2014,7 +2022,10 @@ impl TaskService {
         let trigger_id = generate_id(ID_LEN);
         let next_fire_at = TaskTriggerCalculator::initial_next_fire_at(&params.trigger.spec, now)?;
         let lifecycle_policy = params.lifecycle_policy.clone().unwrap_or_else(|| {
-            default_lifecycle_policy(trigger_kind, params.created_by_turn_id.is_some())
+            default_lifecycle_policy_for_trigger(
+                &params.trigger.spec,
+                params.created_by_turn_id.is_some(),
+            )
         });
         let attachment = lifecycle_policy.attachment;
         let agent_review_policy =
@@ -2029,14 +2040,18 @@ impl TaskService {
             root_task_id: parent.root_task_id.clone(),
             parent_task_id: params.parent_task_id.clone(),
             executor_kind: params.executor_kind,
-            status: TaskStatus::Draft,
+            status: if is_webhook_spec(&params.trigger.spec) {
+                TaskStatus::Waiting
+            } else {
+                TaskStatus::Draft
+            },
             title: required_trimmed(&params.title, "title")?,
             goal: required_trimmed(&params.goal, "goal")?,
             priority: params.priority,
             lifecycle_policy: Some(lifecycle_policy),
             delivery_policy: Some(params.delivery_policy.clone().unwrap_or_else(|| {
-                default_delivery_policy(
-                    trigger_kind,
+                default_delivery_policy_for_trigger(
+                    &params.trigger.spec,
                     attachment,
                     params.owner_kind,
                     params.owner_id.as_deref(),
@@ -2060,6 +2075,7 @@ impl TaskService {
             completed_at: None,
         };
         let trigger = TaskTrigger {
+            webhook_secret_ref: context.webhook_secret_ref.clone(),
             id: trigger_id.clone(),
             task_id: task_id.clone(),
             status: TaskTriggerStatus::Active,
@@ -2070,6 +2086,7 @@ impl TaskService {
             updated_at: now,
         };
         let immediate_run = (trigger_kind == TaskTriggerKind::Immediate).then(|| TaskRun {
+            trigger_input: None,
             id: generate_id(ID_LEN),
             task_id: task_id.clone(),
             trigger_id: Some(trigger_id.clone()),
@@ -2249,6 +2266,8 @@ impl TaskService {
             .await?
             .ok_or_else(|| anyhow!("task disappeared after creation"))?;
         Ok(TaskCreateResponse {
+            webhook_url: None,
+            webhook_scope: None,
             task: response.task,
             trigger: response
                 .triggers
@@ -2262,6 +2281,126 @@ impl TaskService {
                 .find(|spec| spec.run_id.is_none())
                 .or(agent_spec),
         })
+    }
+
+    /// Resolves only the endpoint metadata. Possession of an entity id never
+    /// authorizes a run; Gateway must authenticate its keystore bearer first.
+    pub async fn webhook_trigger(
+        &self,
+        trigger_id: &str,
+    ) -> TaskRuntimeResult<Option<TaskTrigger>> {
+        Ok(self
+            .store
+            .get_webhook_task_trigger(trigger_id)
+            .await?
+            .filter(|trigger| is_webhook_spec(&trigger.spec)))
+    }
+
+    pub async fn accept_webhook(
+        &self,
+        trigger_id: &str,
+        expected_secret_ref: &str,
+        input: pioneer_protocol::TaskRunTriggerInput,
+    ) -> TaskRuntimeResult<TaskRun> {
+        // Each POST owns its identity, even for identical bytes. Optimistic
+        // preparation is repeated only when a concurrent aggregate write wins.
+        let run_id = generate_id(ID_LEN);
+        let group_id = generate_id(ID_LEN);
+        for _ in 0..32 {
+            let snapshot = self
+                .store
+                .get_task_webhook_admission_snapshot(trigger_id)
+                .await?
+                .ok_or(crate::TaskOperationError::AccessDenied)?;
+            let trigger = snapshot.trigger;
+            if !is_webhook_spec(&trigger.spec) {
+                return Err(crate::TaskOperationError::AccessDenied.into());
+            }
+            if trigger.webhook_secret_ref.as_deref() != Some(expected_secret_ref) {
+                return Err(crate::TaskOperationError::AccessDenied.into());
+            }
+            if trigger.status != TaskTriggerStatus::Active {
+                return Err(crate::TaskOperationError::StateConflict.into());
+            }
+            if !matches!(
+                snapshot.task.status,
+                TaskStatus::Waiting
+                    | TaskStatus::Scheduled
+                    | TaskStatus::Queued
+                    | TaskStatus::Running
+                    | TaskStatus::WaitingReview
+            ) || snapshot.task.finish_request().is_some()
+            {
+                return Err(crate::TaskOperationError::StateConflict.into());
+            }
+            let now = now_timestamp_secs();
+            let run = TaskRun {
+                trigger_input: Some(input.clone()),
+                id: run_id.clone(),
+                task_id: snapshot.task.id.clone(),
+                trigger_id: Some(trigger.id.clone()),
+                parent_run_id: None,
+                run_group_id: group_id.clone(),
+                attempt_number: 1,
+                retry_of_run_id: None,
+                ready_at: Some(now),
+                run_number: snapshot.next_run_number,
+                status: TaskRunStatus::Queued,
+                executor_kind: snapshot.task.executor_kind,
+                started_at: None,
+                completed_at: None,
+                heartbeat_at: None,
+                locked_by: None,
+                lock_expires_at: None,
+                result: None,
+                error: None,
+                created_at: now,
+                updated_at: now,
+            };
+            let occurrence = build_occurrence_contract(
+                &snapshot.task,
+                &snapshot.actor,
+                &run.id,
+                Some(&trigger.id),
+                format!("webhook:{}", run.id),
+                snapshot.execution_generation,
+                now,
+            )?;
+            let spec = snapshot.agent_spec.map(|mut spec| {
+                spec.id = generate_id(ID_LEN);
+                spec.run_id = Some(run.id.clone());
+                spec.updated_at = now;
+                spec
+            });
+            let mut fired = trigger.clone();
+            fired.last_fire_at = Some(now);
+            fired.updated_at = now;
+            let events = vec![
+                TaskEventPayload::RunCreated {
+                    run: run.clone(),
+                    agent_spec: spec,
+                },
+                TaskEventPayload::TaskQueued {
+                    task_id: run.task_id.clone(),
+                    run_id: Some(run.id.clone()),
+                },
+                TaskEventPayload::TaskRescheduled {
+                    task_id: run.task_id.clone(),
+                    trigger: fired,
+                    rescheduled_at: now,
+                    reason: pioneer_protocol::TaskRescheduleReason::TriggerFired,
+                },
+            ];
+            if let Some(appended) = self
+                .store
+                .accept_task_webhook(&snapshot.task, &trigger, &run, occurrence, events)
+                .await?
+            {
+                self.publish_and_wake(appended).await;
+                return Ok(run);
+            }
+        }
+        bail!("webhook admission busy")
     }
 
     pub async fn wait_tasks(
@@ -2525,6 +2664,30 @@ impl TaskService {
     }
 
     pub async fn cancel_task(
+        &self,
+        context: TaskMutationContext,
+        params: TaskCancelParams,
+    ) -> TaskRuntimeResult<TaskCancelResponse> {
+        for attempt in 0..8 {
+            match self.cancel_task_once(context.clone(), params.clone()).await {
+                Err(error)
+                    if attempt < 7
+                        && error
+                            .downcast_ref::<pioneer_crud::TaskCancellationRunsChanged>()
+                            .is_some() =>
+                {
+                    // Only this pre-commit run-set conflict permits rebuilding.
+                    // Generic errors, especially post-commit cleanup failures,
+                    // must retain their ordinary unconfirmed-operation meaning.
+                    continue;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("bounded cancellation retry always returns its last outcome")
+    }
+
+    async fn cancel_task_once(
         &self,
         context: TaskMutationContext,
         params: TaskCancelParams,
@@ -2938,7 +3101,15 @@ impl TaskService {
         let mut updated_trigger = None;
         if let Some(trigger_input) = params.trigger {
             TaskTriggerCalculator::validate(&trigger_input.spec)?;
+            if is_webhook_spec(&trigger_input.spec)
+                && !current_trigger.as_ref().is_some_and(|trigger| {
+                    is_webhook_spec(&trigger.spec) && trigger.webhook_secret_ref.is_some()
+                })
+            {
+                bail!("a webhook endpoint must be provisioned by task_create");
+            }
             let mut trigger = current_trigger.clone().unwrap_or_else(|| TaskTrigger {
+                webhook_secret_ref: None,
                 id: generate_id(ID_LEN),
                 task_id: task.id.clone(),
                 status: TaskTriggerStatus::Active,
@@ -2954,6 +3125,9 @@ impl TaskService {
                 || trigger.status != TaskTriggerStatus::Active
                 || trigger.next_fire_at != next_fire_at;
             if changed {
+                if !is_webhook_spec(&trigger_input.spec) {
+                    trigger.webhook_secret_ref = None;
+                }
                 trigger.spec = trigger_input.spec;
                 trigger.status = TaskTriggerStatus::Active;
                 trigger.next_fire_at = next_fire_at;
@@ -2968,6 +3142,10 @@ impl TaskService {
             .or(current_trigger.as_ref())
             .map(TaskTrigger::kind)
             .unwrap_or(TaskTriggerKind::Immediate);
+        let final_trigger_is_webhook = updated_trigger
+            .as_ref()
+            .or(current_trigger.as_ref())
+            .is_some_and(|trigger| is_webhook_spec(&trigger.spec));
         let mut updated_agent_spec = None;
         let task_goal_changed = changed_fields.iter().any(|field| field == "goal");
         let existing_base_agent_spec = response
@@ -3124,7 +3302,11 @@ impl TaskService {
                         &mut changed_fields,
                     );
                 }
-                validate_agent_prompt_for_trigger(final_trigger_kind, &spec.prompt)?;
+                validate_agent_prompt_for_trigger(
+                    final_trigger_kind,
+                    final_trigger_is_webhook,
+                    &spec.prompt,
+                )?;
                 if materialized_base_agent_spec {
                     push_changed(&mut changed_fields, "agentSpec");
                 }
@@ -3133,7 +3315,11 @@ impl TaskService {
                     updated_agent_spec = Some(spec);
                 }
             } else if let Some(agent_spec) = base_agent_spec.as_ref() {
-                validate_agent_prompt_for_trigger(final_trigger_kind, &agent_spec.prompt)?;
+                validate_agent_prompt_for_trigger(
+                    final_trigger_kind,
+                    final_trigger_is_webhook,
+                    &agent_spec.prompt,
+                )?;
             } else if matches!(
                 final_trigger_kind,
                 TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
@@ -3217,6 +3403,13 @@ impl TaskService {
             );
         }
         TaskTriggerCalculator::validate(&params.trigger.spec)?;
+        if is_webhook_spec(&params.trigger.spec)
+            && !response.triggers.last().is_some_and(|trigger| {
+                is_webhook_spec(&trigger.spec) && trigger.webhook_secret_ref.is_some()
+            })
+        {
+            bail!("a webhook endpoint must be provisioned by task_create");
+        }
         let now = now_timestamp_secs();
         let trigger_id = response
             .triggers
@@ -3225,6 +3418,14 @@ impl TaskService {
             .unwrap_or_else(|| generate_id(ID_LEN));
         let next_fire_at = TaskTriggerCalculator::initial_next_fire_at(&params.trigger.spec, now)?;
         let trigger = TaskTrigger {
+            webhook_secret_ref: if is_webhook_spec(&params.trigger.spec) {
+                response
+                    .triggers
+                    .last()
+                    .and_then(|trigger| trigger.webhook_secret_ref.clone())
+            } else {
+                None
+            },
             id: trigger_id,
             task_id: params.task_id.clone(),
             status: TaskTriggerStatus::Active,
@@ -5244,7 +5445,7 @@ fn validate_create_params(params: &TaskCreateParams) -> TaskRuntimeResult<()> {
             bail!("agent executor requires agent_spec.security_cap");
         }
         if !has_composer_work {
-            validate_agent_spec_for_trigger(params.trigger.spec.kind(), agent_spec)?;
+            validate_agent_spec_for_trigger(&params.trigger.spec, agent_spec)?;
         }
     }
     if params.owner_kind == TaskOwnerKind::Thread && params.owner_id.is_none() {
@@ -5368,20 +5569,23 @@ fn update_has_agent_patch(params: &TaskUpdateParams) -> bool {
 }
 
 fn validate_agent_spec_for_trigger(
-    trigger_kind: TaskTriggerKind,
+    trigger: &pioneer_protocol::TaskTriggerSpec,
     agent_spec: &pioneer_protocol::TaskAgentSpecInput,
 ) -> TaskRuntimeResult<()> {
-    validate_agent_prompt_for_trigger(trigger_kind, &agent_spec.prompt)
+    validate_agent_prompt_for_trigger(trigger.kind(), is_webhook_spec(trigger), &agent_spec.prompt)
 }
 
 fn validate_agent_prompt_for_trigger(
     trigger_kind: TaskTriggerKind,
+    webhook: bool,
     prompt: &TaskAgentPrompt,
 ) -> TaskRuntimeResult<()> {
-    if !matches!(
-        trigger_kind,
-        TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
-    ) {
+    if !webhook
+        && !matches!(
+            trigger_kind,
+            TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
+        )
+    {
         return Ok(());
     }
 
@@ -6069,7 +6273,7 @@ fn new_task_execution_admission(
         matches!(
             trigger.kind(),
             TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
-        )
+        ) || is_webhook_spec(&trigger.spec)
     });
     Ok(pioneer_crud::NewTaskExecutionAdmission {
         task_id: task.id.clone(),
