@@ -692,6 +692,7 @@ impl OpenAiProvider {
         Ok(crate::ProviderStream {
             stream,
             diagnostics,
+            message_delivery: crate::ProviderMessageDelivery::default(),
         })
     }
 

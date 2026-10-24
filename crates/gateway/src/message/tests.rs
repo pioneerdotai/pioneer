@@ -85421,3 +85421,88 @@ async fn opencode_v2_summary_totals_and_native_categories_reach_completion_and_j
         );
     }
 }
+
+#[tokio::test]
+async fn neutral_provider_preparation_and_delivery_survive_registry_and_journal() {
+    use pioneer_provider::{ProviderMessageDelivery, ProviderStream};
+    struct ConnectionFactsProvider(std::sync::atomic::AtomicBool);
+    #[async_trait::async_trait]
+    impl Provider for ConnectionFactsProvider {
+        fn name(&self) -> &str {
+            "connection-facts-provider"
+        }
+        fn capabilities(&self) -> pioneer_provider::ProviderCapabilities {
+            pioneer_provider::ProviderCapabilities {
+                streaming: true,
+                tool_calling: self.0.load(std::sync::atomic::Ordering::SeqCst),
+                ..Default::default()
+            }
+        }
+        async fn prepare_model(&self, _: &str) -> anyhow::Result<()> {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn chat(
+            &self,
+            _: pioneer_provider::ChatRequest,
+        ) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            panic!("the stream path must be preserved")
+        }
+        async fn stream_chat(
+            &self,
+            _: pioneer_provider::ChatRequest,
+        ) -> anyhow::Result<
+            futures_util::stream::BoxStream<'static, anyhow::Result<pioneer_provider::StreamChunk>>,
+        > {
+            panic!("diagnostic stream must not fall back to stream_chat")
+        }
+        async fn stream_chat_with_diagnostics(
+            &self,
+            _: pioneer_provider::ChatRequest,
+        ) -> anyhow::Result<ProviderStream> {
+            assert!(self.0.load(std::sync::atomic::Ordering::SeqCst));
+            let mut response = ProviderStream::new(Box::pin(futures_util::stream::iter(vec![
+                Ok(pioneer_provider::StreamChunk::delta("prepared connection")),
+                Ok(pioneer_provider::StreamChunk::final_chunk_with(
+                    pioneer_provider::ProviderTermination::Complete,
+                )),
+            ])));
+            response.message_delivery = ProviderMessageDelivery::Provisional;
+            Ok(response)
+        }
+    }
+    let (_, store, workspace_id) = setup_workspace_manager().await;
+    let inner = Arc::new(ConnectionFactsProvider(std::sync::atomic::AtomicBool::new(
+        false,
+    )));
+    let registry =
+        pioneer_provider::ProviderRegistry::with_provider("connection-facts-provider", inner);
+    let authority = registry.get_or_create("connection-facts-provider").unwrap();
+    let provider =
+        crate::usage_journal::observe(authority, store.as_ref(), &workspace_id, "summary", "owner");
+    assert!(!provider.capabilities().tool_calling);
+    provider.prepare_model("private/model").await.unwrap();
+    assert!(provider.capabilities().tool_calling);
+    let response = provider
+        .stream_chat_with_diagnostics(pioneer_provider::ChatRequest {
+            model: "private/model".into(),
+            messages: vec![pioneer_provider::ChatMessage::user("hello")],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        response.message_delivery,
+        ProviderMessageDelivery::Provisional
+    );
+    let chunks = response.stream.collect::<Vec<_>>().await;
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].as_ref().unwrap().delta, "prepared connection");
+    assert!(chunks[1].as_ref().unwrap().is_final);
+}

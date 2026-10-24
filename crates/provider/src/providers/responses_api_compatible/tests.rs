@@ -572,6 +572,76 @@ async fn generic_root_auth_profiles_and_openai_facade_dispatch_real_http() {
 }
 
 #[tokio::test]
+async fn provisional_delivery_is_explicit_and_independent_of_provider_name() {
+    for (name, provisional) in [
+        ("neutral-responses", true),
+        ("neutral-responses", false),
+        ("openai", false),
+    ] {
+        let events = [
+            json!({"type":"response.output_item.added","output_index":0,"item":message("m",Value::Null,"")}),
+            json!({"type":"response.output_text.delta","output_index":0,"item_id":"m","content_index":0,"delta":"visible"}),
+            json!({"type":"response.completed","response":snapshot(vec![message("m",Value::Null,"visible")])}),
+        ];
+        let body = events
+            .iter()
+            .map(|e| format!("data: {e}\n\n"))
+            .collect::<String>();
+        let (root, server) =
+            super::super::usage_tests::fixture_with_headers(body, String::new(), "200 OK").await;
+        let provider =
+            ResponsesApiCompatibleProvider::new(name, root, "fixture", AuthStyle::Bearer);
+        // Leave defaults untouched in the control rows, including OpenAI.
+        let provider = if provisional {
+            provider.with_provisional_messages(true)
+        } else {
+            provider
+        };
+        let chunks = crate::attachments::runtime::with_async_authority_scope(
+            "delivery-fixture".into(),
+            async {
+                let stream = provider
+                    .stream_chat_with_diagnostics(request())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    stream.message_delivery,
+                    if provisional {
+                        crate::ProviderMessageDelivery::Provisional
+                    } else {
+                        crate::ProviderMessageDelivery::Incremental
+                    }
+                );
+                stream.stream.collect::<Vec<_>>().await
+            },
+        )
+        .await;
+        let chunks = chunks.into_iter().collect::<Result<Vec<_>>>().unwrap();
+        let mut collector = ProviderMessageCollector::default();
+        let mut unresolved = false;
+        let mut provisional_text = String::new();
+        for chunk in &chunks {
+            if let Some(event) = &chunk.message {
+                match event.boundary {
+                    crate::ProviderMessageBoundary::StartProvisional => unresolved = true,
+                    crate::ProviderMessageBoundary::Resolve => unresolved = false,
+                    _ => {}
+                }
+            }
+            if unresolved {
+                provisional_text.push_str(&chunk.delta);
+            }
+            collector.push(chunk).unwrap();
+        }
+        collector.finish().unwrap();
+        assert_eq!(provisional_text, if provisional { "visible" } else { "" });
+        assert_eq!(collector.text(), "visible");
+        assert_eq!(collector.messages().len(), 1);
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn compiled_prompt_tool_controls_and_responses_generation_policy() {
     crate::attachments::runtime::with_async_authority_scope(
         "responses-generation-fixture".into(),

@@ -3449,15 +3449,12 @@ async fn preload_agent_model(
     model: &str,
     thinking_item_id: &str,
 ) -> Result<(), ChatTurnError> {
-    if provider.name() == "vercel-ai-gateway" {
-        // A restored private selection has no process-global catalog entry.
-        await_context_request(context_session, async {
-            provider.model_limits(model).await.map_err(|error| {
-                provider::model_preparation_error(thinking_item_id, provider, model, &error)
-            })
+    await_context_request(context_session, async {
+        provider.prepare_model(model).await.map_err(|error| {
+            provider::model_preparation_error(thinking_item_id, provider, model, &error)
         })
-        .await?;
-    }
+    })
+    .await?;
     Ok(())
 }
 
@@ -7067,7 +7064,7 @@ mod tests {
     // Owns the context-gate lifecycle contract shared by model-fact preload
     // and provider rounds. No network or catalog fixture is required.
     #[tokio::test(start_paused = true)]
-    async fn context_gate_drops_model_limits_before_preparation_on_cancel_or_deadline() {
+    async fn context_gate_drops_model_preparation_on_cancel_or_deadline() {
         use crate::compaction::controller::{
             NativeContext, NativeContextController, NativeContextSession, NativePreparedRequest,
             NativeUsageMeasurement,
@@ -7084,19 +7081,16 @@ mod tests {
                 self.0.store(true, Ordering::SeqCst);
             }
         }
-        struct PendingLimits {
+        struct ModelPreparationFixture {
             entered: tokio::sync::Notify,
             dropped: Arc<AtomicBool>,
         }
         #[async_trait::async_trait]
-        impl Provider for PendingLimits {
+        impl Provider for ModelPreparationFixture {
             fn name(&self) -> &str {
-                "vercel-ai-gateway"
+                "connection-facts-provider"
             }
-            async fn model_limits(
-                &self,
-                _: &str,
-            ) -> anyhow::Result<pioneer_provider::catalog::CatalogLimits> {
+            async fn prepare_model(&self, _: &str) -> anyhow::Result<()> {
                 let _drop = DropSignal(self.dropped.clone());
                 self.entered.notify_one();
                 std::future::pending().await
@@ -7131,7 +7125,7 @@ mod tests {
 
         for cancellation in [true, false] {
             let dropped = Arc::new(AtomicBool::new(false));
-            let provider = Arc::new(PendingLimits {
+            let provider = Arc::new(ModelPreparationFixture {
                 entered: tokio::sync::Notify::new(),
                 dropped: dropped.clone(),
             });

@@ -602,6 +602,17 @@ pub(crate) fn merge_tool_support(discovery: Option<bool>, catalog: Option<bool>)
     }
 }
 
+/// Local catalog bootstrap has not supplied a validated snapshot yet.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelCatalogUnavailable;
+
+impl std::fmt::Display for ModelCatalogUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Model catalog is not loaded yet. Retry after the catalog has loaded.")
+    }
+}
+impl std::error::Error for ModelCatalogUnavailable {}
+
 #[derive(Default)]
 struct CatalogStore(RwLock<Option<Arc<ModelCatalog>>>);
 impl CatalogStore {
@@ -610,11 +621,7 @@ impl CatalogStore {
             .read()
             .expect("model catalog lock")
             .clone()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Model catalog is not loaded yet. Retry after the catalog has loaded."
-                )
-            })
+            .ok_or_else(|| ModelCatalogUnavailable.into())
     }
     fn publish(&self, catalog: ModelCatalog) {
         *self.0.write().expect("model catalog lock") = Some(Arc::new(catalog));

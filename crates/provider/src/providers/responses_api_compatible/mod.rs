@@ -27,6 +27,7 @@ pub struct ResponsesApiCompatibleProvider {
     policy: ProviderTimeoutPolicy,
     client: reqwest::Client,
     input_types: ProviderInputCapabilities,
+    provisional_messages: bool,
 }
 
 /// Contains only allowlisted classification facts, never native message/body.
@@ -166,7 +167,15 @@ impl ResponsesApiCompatibleProvider {
             policy,
             client: crate::http::build_client(policy),
             input_types: ProviderInputCapabilities::disabled_for_all_file_types(),
+            provisional_messages: false,
         }
+    }
+    /// Publish unresolved message text through StartProvisional/Resolve events.
+    /// Wrappers opt in when phase metadata can arrive after text; the default
+    /// buffers unresolved text until its phase is known.
+    pub fn with_provisional_messages(mut self, enabled: bool) -> Self {
+        self.provisional_messages = enabled;
+        self
     }
     pub fn with_input_capabilities(mut self, mut input_types: ProviderInputCapabilities) -> Self {
         input_types.audio = crate::InputTypeSupport::disabled();
@@ -199,6 +208,7 @@ impl ResponsesApiCompatibleProvider {
             policy,
             client,
             input_types,
+            provisional_messages: false,
         }
     }
     fn endpoint(&self) -> String {
@@ -343,15 +353,18 @@ impl ResponsesApiCompatibleProvider {
             prepared.request.parallel_tool_calls,
             id.as_deref(),
         )
-        // Opt in only for Vercel. OpenAI retains its accepted late-phase
-        // buffering; JSON and every completed message/replay contract are shared.
-        .with_provisional_messages(self.name == "vercel-ai-gateway");
+        .with_provisional_messages(self.provisional_messages);
         reducer.bind_request(&prepared.request);
         reducer.usage.api = Some("responses".into());
         reducer.usage.route = crate::usage::route(&self.root, "/responses");
         Ok(ProviderStream {
             stream: Self::decode(byte_stream, reducer),
             diagnostics,
+            message_delivery: if self.provisional_messages {
+                crate::ProviderMessageDelivery::Provisional
+            } else {
+                crate::ProviderMessageDelivery::default()
+            },
         })
     }
     fn decode(

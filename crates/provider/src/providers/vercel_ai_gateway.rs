@@ -115,7 +115,8 @@ impl VercelAiGatewayProvider {
             policy,
             client.clone(),
             inputs,
-        );
+        )
+        .with_provisional_messages(true);
         Self {
             adapter,
             client,
@@ -472,6 +473,9 @@ impl Provider for VercelAiGatewayProvider {
             embeddings: true,
             ..self.adapter.capabilities()
         }
+    }
+    async fn prepare_model(&self, id: &str) -> Result<()> {
+        self.ensure_model(id).await
     }
     async fn model_limits(&self, id: &str) -> Result<crate::catalog::CatalogLimits> {
         self.ensure_model(id).await?;
@@ -974,6 +978,8 @@ mod tests {
         ]).await;
         let provider = VercelAiGatewayProvider::with_base_url("fixture-key", root);
         // Persisted private ID after restart: no preceding model listing.
+        provider.prepare_model("private/agent").await.unwrap();
+        assert!(provider.model_tool_calling("private/agent"));
         let limits = provider.model_limits("private/agent").await.unwrap();
         assert_eq!(limits.context_window, 16000);
         assert_eq!(limits.context_origin, crate::catalog::OriginKind::Source);

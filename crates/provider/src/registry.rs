@@ -244,6 +244,10 @@ fn redacted_endpoint_error(
         // Keep only the controlled diagnostic, dropping any raw context chain.
         return rejection.clone().into();
     }
+    if error.is::<crate::catalog::ModelCatalogUnavailable>() {
+        // Preserve the local category, discarding any uncontrolled outer context.
+        return crate::catalog::ModelCatalogUnavailable.into();
+    }
     // Adapters can supply structured status even when their error does not
     // contain a reqwest source or the usual `API error (...)` prefix.
     let adapter_classification = inner.classify_failure(&error);
@@ -312,7 +316,10 @@ impl AuthorityBoundProvider {
         model: &str,
         catalog: Option<&crate::catalog::ModelCatalog>,
     ) -> bool {
-        if self.inner.name() == "vercel-ai-gateway" {
+        if self.inner.model_catalog_entry(model).is_some() {
+            // Connection-owned facts include the provider's model-specific
+            // tool decision. Public/discovery fallback below remains unchanged
+            // for providers that do not own a native model snapshot.
             return self.inner.model_tool_calling(model);
         }
         let discovery = self
@@ -584,6 +591,11 @@ impl Provider for AuthorityBoundProvider {
             })
         }));
         Ok(response)
+    }
+
+    async fn prepare_model(&self, model: &str) -> Result<()> {
+        self.ensure_not_revoked()?;
+        self.public_result(self.inner.prepare_model(model).await)
     }
 
     async fn model_limits(&self, model: &str) -> Result<crate::catalog::CatalogLimits> {
@@ -1436,6 +1448,19 @@ mod tests {
                 .to_string()
                 .contains("does not support listing models")
         );
+    }
+
+    #[test]
+    fn endpoint_redaction_preserves_local_catalog_category_without_raw_context() {
+        let error = anyhow::Error::new(crate::catalog::ModelCatalogUnavailable)
+            .context("sensitive endpoint and credential context");
+        let redacted = redacted_endpoint_error(
+            &NativeListFixture("connection-facts-provider"),
+            error,
+            ProviderFailureStage::Connect,
+        );
+        assert!(redacted.is::<crate::catalog::ModelCatalogUnavailable>());
+        assert!(!format!("{redacted:#}").contains("sensitive"));
     }
 
     struct NativeListFixture(&'static str);
