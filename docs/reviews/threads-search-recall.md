@@ -4,6 +4,83 @@
 
 **Тесты, cargo check, компиляция, сборки, приложение, CLI-агенты и генераторы не запускались. Компилируемость и прохождение тестов не подтверждены.**
 
+## Два оставшихся дефекта аудита — URI-prefilter и повторяющиеся предикаты
+
+Перед изменениями фактические HEAD и ветки совпали с заданием; оба worktree были чистыми. Прочитаны Pioneer `AGENTS.md`, Memvid `CLAUDE.md` / `CONTRIBUTING.md`; вложенных AGENTS в затронутых каталогах нет. Требования локальных инструкций запускать проверки уступают прямому запрету пользователя. Основные checkout и соседние worktree не изменялись.
+
+| Worktree / ветка | Исходный commit этого исправления | Итоговый commit кода |
+| --- | --- | --- |
+| `/Users/alexander/Code/pioneer/pioneer/.worktrees/threads-search`, `feat/threads-search` | `3995aae5bfe728efe6596cbf0e6526d6fecbbaec` | `a15214a5051bfc3ad827dd2273654717586d2f42` |
+| `/Users/alexander/Code/pioneer/memory-search-pagination`, `feat/search-pagination` | `3adcf08d6c383e0b0183f07ce6c6c6567234bcfe` | `d71c077a8c5144fb4eec99a86e7ca457443e8b68` |
+
+Этот отчёт фиксируется отдельным последующим documentation commit; точный итоговый HEAD Pioneer указан в финальной передаче, без самоссылки SHA в содержимом commit. `Cargo.toml` и `Cargo.lock` согласованно закрепляют `d71c077a8c5144fb4eec99a86e7ca457443e8b68`; другие зависимости не менялись. **Ревизия Memvid не опубликована.** Для внешнего получения зависимости потребуется отдельная разрешённая публикация; fetch/update/генерация lockfile не выполнялись.
+
+### 1. Lexical URI до postfilter
+
+Подтверждена полная цепочка: `try_tantivy_search` передавал `request.uri` в `TantivyEngine::search_documents`, а `QueryPlanner::build_root_query` превращал аргумент в точный `TermQuery`. Поэтому `MV2://WANTED/` отбрасывал `mv2://Wanted/parent#one` до авторитетного общего `uri_matches`.
+
+Изменён только аргумент этого вызова: передаётся `None`, чтобы URI проверял существующий postfilter. `uri_filter` по-прежнему сохраняется для проверки frame metadata и отключает отдельный scope. Сохраняются ASCII case-insensitive prefix без `#`, exact с `#`, фильтрация до выделения страницы и расширение `doc_limit` после отбрасывания кандидатов. Query parser, публичный engine API, query planner остальных callers и формат индекса не менялись; переиндексация не нужна.
+
+После этого исправления перечитан diff вызова и весь участок от расчёта `uri_filter/scope_filter` до завершения окна; подтверждено, что убран только несовместимый coarse filter и конец служебного окна не стал концом выдачи.
+
+### 2. Одна переменная для одинакового текстового условия
+
+Прежний `semantic_truth` независимо возвращал `(true,true)` каждому текстовому вхождению. Так обе стороны `needle AND NOT needle` могли считаться допустимыми одновременно.
+
+Существующий evaluator дополнен общей частичной оценкой текстовых предикатов на том же `Expr`. Ключ word/phrase соответствует их существующему lowercased substring matching; wildcard использует ключ существующего regex. Все одинаковые предикаты используют одно значение. Поля по-прежнему проверяются существующим `FieldTerm::matches`.
+
+Предикат, встречающийся только в одной полярности, сразу получает благоприятное значение; обычные положительные semantic-запросы не требуют перебора. Если предикат встречается и положительно, и под NOT, evaluator итеративно рассматривает false/true с отсечением заведомо ложных ветвей. Это проверка существования согласованного присваивания, а не требование буквального наличия слова в документе. У `(needle OR tag:allowed) AND NOT needle` без тега нет допустимого присваивания; с тегом допустимо needle=false. Итеративный перебор не добавляет глубину стека на каждый текстовый предикат.
+
+После второго исправления статически разобраны обе ветви приведённого выражения, простое и составное противоречия, NOT/двойная полярность, одинаковые word/phrase в разном регистре и wildcard. Проверены все callers `semantic_truth`, `permits_semantic_match`, прежний `evaluate` и место проверки vector-кандидатов до ACL/page slicing. Нового публичного API, языка запросов и зависимости нет.
+
+### Изменённые файлы и незапущенные регрессии
+
+- Memvid `src/memvid/search/tantivy.rs`: снят только точный prefilter аргумента request URI.
+- Memvid `src/search/mod.rs`: общие значения повторных текстовых предикатов и внутреннее итеративное разрешение смешанной полярности.
+- Memvid `tests/search_pagination.rs`: расширены **существующие** два теста, без отдельного дублирующего fixture.
+- Pioneer: только Git revision в `Cargo.toml` / `Cargo.lock` и этот отчёт. Gateway, recall, ANN и пагинация не переписывались.
+
+`hybrid_uri_uses_lexical_prefix_case_and_scope_precedence` теперь содержит 80 более высоких BM25/более близких vector-кандидатов с неподходящими URI перед двумя допустимыми. Сохранены обе ветки lexical/semantic, prefix/case, exact `#`, конфликтующий scope и продолжение страниц. Длиннее текст допустимых документов делает их BM25 ниже коротких неподходящих, поэтому lexical должен пройти первоначальное окно.
+
+`hybrid_query_fields_filter_semantic_candidates_before_paging` сохранён с прежней матрицей tag/date/AND/OR/NOT и страницами 2/2/1 после 80 неподходящих записей. Теперь он проверяет и прямой vector API, и hybrid. Добавлены исходное выражение из аудита, повтор в word/phrase с разным регистром, два взаимосвязанных текстовых предиката и wildcard. Пять допустимых дальних документов не содержат needle; прямой vector вызов проверяет semantic positive control без маскирования lexical-веткой. Самопротиворечия слова, фразы, wildcard и составного выражения возвращают пустой результат без продолжения.
+
+### Финальный статический аудит и ограничения
+
+Перечитан весь совокупный diff этого исправления от указанных исходных commits обоих репозиториев, включая расширенные тесты, связанные callers и revision/lockfile. В Memvid изменены три файла; в Pioneer — два файла зависимости и отчёт. Разбор/нормализация текста, поля и Boolean tree переиспользуются, формат `.mv2` не меняется. Сохранены zero-page error, recall full anchor с сокращением текста, ToolResultView/CLI byte budget и frozen catalog; их исходники не изменялись. Полный охват индексов, ACL, references, однократный embedding и lexical fallback не затронуты. Новых query/corpus caps нет; страницы остаются до 100 fragments и 2 MiB, ANN не фиксируется snapshot-сессией.
+
+Для произвольного Boolean-выражения точная проверка может потребовать в худшем случае экспоненциальный перебор числа различных текстовых предикатов со смешанной полярностью. Это работа над выражением запроса, не ограничение корпуса; искусственный предел/таймаут не добавлен. Однополярные предикаты не ветвятся. Новых backend/framework/dependencies/очередей/индексов нет.
+
+Работа выполнена родителем без новых attached или durable задач: при таком связанном объёме делегирование не требовалось. Предоставленные Tasks/Subagents инструкции не изменялись. Самоаудит не является внешней приёмкой.
+
+### Фактически выполненные команды этого этапа
+
+Read-only аудит использовал `git status --short`, `git rev-parse HEAD`, `git branch --show-current`, `git diff`, `git diff --stat`, `git diff --numstat`, `rg`, `rg --files`, `sed -n`, `cat`, `head`. Редактирование — apply_patch и Python-текстовые правки без импорта/исполнения кода проекта. Значимые команды форматирования и Git:
+
+```text
+# Memvid worktree:
+cargo +1.98.1 fmt
+cargo +1.98.1 fmt --check
+git diff --check
+git add src/memvid/search/tantivy.rs src/search/mod.rs tests/search_pagination.rs
+git diff --cached --check
+git -c core.hooksPath=/dev/null commit -m "fix(search): preserve URI postfilters and correlated text predicates"
+git diff 3adcf08d6c383e0b0183f07ce6c6c6567234bcfe HEAD --check
+
+# Pioneer worktree:
+git diff -- Cargo.toml Cargo.lock
+git diff --check
+git add Cargo.toml Cargo.lock
+git -c core.hooksPath=/dev/null commit -m "fix(memory): pin correlated search predicate and URI fixes"
+git add docs/reviews/threads-search-recall.md
+git diff --cached --check
+git -c core.hooksPath=/dev/null commit -m "docs: record URI and Boolean audit corrections"
+git diff 3995aae5bfe728efe6596cbf0e6526d6fecbbaec HEAD --check
+```
+
+Formatter/format check и whitespace-проверки завершились успешно. Оба worktree после commits чистые. Push, merge, release, deploy, fetch и CI не выполнялись.
+
+**Тесты, cargo check, компиляция, сборки, приложение, CLI-агенты и генераторы не запускались. Компилируемость и прохождение тестов не подтверждены.** Кандидат передаётся на повторное внешнее ревью; запрет проверок сохраняется до отдельного разрешения после внешней приёмки кода.
+
 ## Исправления пяти дефектов внешнего аудита — 2026-10-24
 
 Перед изменениями оба worktree были чистыми, фактические HEAD совпали с заданием. Ветки сохранены. Основные checkout и соседние worktree не изменялись.
@@ -13,7 +90,7 @@
 | Pioneer `/Users/alexander/Code/pioneer/pioneer/.worktrees/threads-search`, `feat/threads-search` | `596969d8ea5f252c49e8b81c8539b4ecde329501` | `048fec0d2ffdbab04909a8d7db2a683b881a6ee5` |
 | Memvid `/Users/alexander/Code/pioneer/memory-search-pagination`, `feat/search-pagination` | `aec587174243b95875c63a91876e3b62498ff234` | `3adcf08d6c383e0b0183f07ce6c6c6567234bcfe` |
 
-Отчёт обновлён отдельным последующим documentation commit; его HEAD указан в финальной передаче. **Новая ревизия Memvid `3adcf08d6c383e0b0183f07ce6c6c6567234bcfe` не опубликована.** `Cargo.toml` и `Cargo.lock` согласованно закрепляют её без path/vendor и без Cargo-генерации lockfile. Для внешнего получения зависимости потребуется отдельная разрешённая публикация.
+Отчёт обновлён отдельным последующим documentation commit; его HEAD указан в финальной передаче. **Новая ревизия Memvid `3adcf08d6c383e0b0183f07ce6c6c6567234bcfe` не опубликована.** На этом этапе `Cargo.toml` и `Cargo.lock` согласованно закрепляли её без path/vendor и без Cargo-генерации lockfile. Для внешнего получения зависимости потребуется отдельная разрешённая публикация.
 
 ### Подтверждение и исправление
 
