@@ -199,6 +199,7 @@ impl Default for CoordinatorState {
 #[derive(Default)]
 pub(crate) struct CliMcpCoordinator {
     state: Mutex<CoordinatorState>,
+    pub(crate) native_turn_changed: Notify,
 }
 
 impl CliMcpCoordinator {
@@ -522,6 +523,70 @@ impl CliMcpCoordinator {
         claim()
     }
 
+    /// Checks the same grant, projection and active Pioneer turn as facade
+    /// admission. Retarget and the exact item claim serialize on this lock.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn claim_codex_native_item(
+        &self,
+        bound: &CliMcpBoundGrant,
+        invocation: &crate::turn_mcp::invoker::TurnMcpInvocation,
+        key: &super::native_correlation::NativeMcpItemKey,
+        items: &super::native_correlation::NativeMcpCorrelationLedger,
+        fingerprint: &str,
+        cancellation: &CancellationToken,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, crate::turn_mcp::invoker::TurnMcpInvocationError> {
+        use crate::turn_mcp::invoker::{
+            TurnMcpInvocationError as Error, TurnMcpInvocationErrorCode as Code,
+        };
+        let state = self.state.lock().await;
+        if cancellation.is_cancelled() {
+            return Err(Error::new(Code::Cancelled, "Codex MCP admission cancelled"));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::new(Code::TimedOut, "Codex MCP admission timed out"));
+        }
+        let turn = state
+            .active_turns
+            .get(&bound.grant_id())
+            .ok_or_else(|| Error::new(Code::TurnNotActive, "Codex MCP turn is not active"))?;
+        let authorization = authorize_call_locked(&state, bound, turn.activation_generation)
+            .map_err(|error| {
+                Error::new(
+                    match error {
+                        CliMcpCoordinatorError::MissingTurn
+                        | CliMcpCoordinatorError::CallsNotActive => Code::TurnNotActive,
+                        _ => Code::SessionBindingUnavailable,
+                    },
+                    "Codex MCP binding is unavailable",
+                )
+            })?;
+        let instance = &bound.scope().process_instance;
+        if authorization.thread_id != invocation.thread_id
+            || authorization.turn_id != invocation.turn_id
+            || instance.key().workspace_id != invocation.workspace_id
+            || Some(instance.key().runtime_id.as_str()) != invocation.runtime_id.as_deref()
+            || Some(instance.generation()) != invocation.session_generation
+            || authorization.native_thread_id != key.native_thread_id
+        {
+            return Err(Error::new(
+                Code::ScopeMismatch,
+                "Codex MCP native scope does not match the active turn",
+            ));
+        }
+        if authorization.native_turn_id != key.native_turn_id {
+            return Ok(false);
+        }
+        items.claim_codex_exact(
+            key,
+            &invocation.canonical_callable_name,
+            fingerprint,
+            &invocation.provider_call_id,
+            cancellation,
+            deadline,
+        )
+    }
+
     pub(crate) async fn retarget_turn(
         &self,
         bound: &CliMcpBoundGrant,
@@ -559,6 +624,7 @@ impl CliMcpCoordinator {
                 return Err(CliMcpCoordinatorError::InvalidTransition);
             }
         }
+        self.native_turn_changed.notify_waiters();
         Ok(())
     }
 

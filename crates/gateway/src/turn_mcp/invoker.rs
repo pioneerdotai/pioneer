@@ -36,7 +36,7 @@ impl TurnMcpInvocationOrigin {
 }
 
 /// Native identity captured by the managed CLI adapter, never from model input.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct NativeMcpCallIdentity {
     pub(crate) native_thread_id: String,
     pub(crate) native_turn_id: String,

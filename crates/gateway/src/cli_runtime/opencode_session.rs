@@ -3222,6 +3222,7 @@ impl OpenCodeRequiredMcpBridge {
                         Arc::new(CorrelatingTurnMcpInvoker {
                             inner: self.invoker.clone(),
                             native_items: self.native_items.clone(),
+                            codex_binding: None,
                             opencode_binding: Some((
                                 self.supervisor.coordinator(),
                                 attachment.bound_grant.clone(),

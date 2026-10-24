@@ -542,10 +542,11 @@ struct ParsedRequest {
 }
 
 /// Selected at adapter construction; instance names and request data do not
-/// select the provider. Legacy keeps the existing Codex contract unchanged.
+/// select the provider. Legacy is reserved for uncorrelated protocol fixtures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CliMcpCallContract {
     Legacy,
+    Codex,
     Claude,
     OpenCode,
 }
@@ -1339,6 +1340,16 @@ fn parse_native_call(
     };
     let (arguments, item) = match contract {
         CliMcpCallContract::Legacy => return Ok((wire_arguments, None)),
+        CliMcpCallContract::Codex => {
+            let identity = parse_codex_native_call(meta)?;
+            if identity.native_thread_id != native_thread {
+                return Err(invocation_error(TurnMcpInvocationError::new(
+                    TurnMcpInvocationErrorCode::ScopeMismatch,
+                    "Codex MCP request belongs to a different native thread",
+                )));
+            }
+            return Ok((wire_arguments, Some(identity)));
+        }
         CliMcpCallContract::Claude => {
             let meta = meta.and_then(JsonValue::as_object).ok_or_else(invalid)?;
             (wire_arguments, required(meta, "claudecode/toolUseId")?)
@@ -1379,6 +1390,48 @@ fn parse_native_call(
             native_item_id: item,
         }),
     ))
+}
+
+// Codex rust-v0.164.0: mcp_tool_call.rs and turn_metadata.rs serialize
+// this as an object, with callId identical to the native McpToolCall item id.
+fn parse_codex_native_call(
+    meta: Option<&JsonValue>,
+) -> Result<NativeMcpCallIdentity, FacadeProtocolError> {
+    let invalid = || {
+        FacadeProtocolError::new(
+            INVALID_PARAMS,
+            "Codex MCP call requires consistent callId, threadId and turn metadata",
+            "invalid_native_metadata",
+        )
+    };
+    let meta = meta.and_then(JsonValue::as_object).ok_or_else(invalid)?;
+    let required = |object: &JsonMap<String, JsonValue>, field: &str| {
+        object
+            .get(field)
+            .and_then(JsonValue::as_str)
+            .filter(|value| {
+                !value.trim().is_empty()
+                    && value.trim() == *value
+                    && value.len() <= 512
+                    && !value.chars().any(char::is_control)
+            })
+            .map(str::to_owned)
+            .ok_or_else(invalid)
+    };
+    let native_item_id = required(meta, "callId")?;
+    let native_thread_id = required(meta, "threadId")?;
+    let turn_meta = meta
+        .get("x-codex-turn-metadata")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(invalid)?;
+    if required(turn_meta, "thread_id")? != native_thread_id {
+        return Err(invalid());
+    }
+    Ok(NativeMcpCallIdentity {
+        native_thread_id,
+        native_turn_id: required(turn_meta, "turn_id")?,
+        native_item_id,
+    })
 }
 
 fn invocation_error(error: TurnMcpInvocationError) -> FacadeProtocolError {
@@ -2464,6 +2517,7 @@ mod tests {
                         inner,
                         native_items: ledger.clone(),
                         opencode_binding: Some((coordinator, bound)),
+                        codex_binding: None,
                     },
                 ),
             }
@@ -2488,7 +2542,7 @@ mod tests {
                 }),
                 json!({"ai.opencode/sessionID": "native-thread-turn"}),
             ),
-            CliMcpCallContract::Legacy => unreachable!(),
+            CliMcpCallContract::Legacy | CliMcpCallContract::Codex => unreachable!(),
         };
         json!({"jsonrpc":"2.0", "id":rpc, "method":"tools/call", "params":{"name":"read", "arguments":arguments, "_meta":meta}})
     }
@@ -2525,7 +2579,7 @@ mod tests {
                 ledger.activate_scope("native-thread-turn", "native-turn-turn");
                 ExactItems::OpenCode(ledger)
             }
-            CliMcpCallContract::Legacy => unreachable!(),
+            CliMcpCallContract::Legacy | CliMcpCallContract::Codex => unreachable!(),
         };
         let facade_mut = Arc::get_mut(&mut facade).unwrap();
         facade_mut.call_contract = contract;
@@ -3056,6 +3110,588 @@ mod tests {
                     assert_eq!(
                         facade
                             .handle_message(&context, exact_call(contract, "late", "A", json!({})))
+                            .await
+                            .unwrap()["error"]["data"]["kind"],
+                        "turn_not_active"
+                    );
+                }
+            }
+        }
+    }
+
+    mod codex_regressions {
+        use super::*;
+        fn codex_meta(call: &str, thread: &str, turn: &str) -> JsonValue {
+            json!({
+                "callId": call, "threadId": thread,
+                "x-codex-turn-metadata": {"thread_id": thread, "turn_id": turn, "codex_version": "0.164.0"}
+            })
+        }
+
+        // These regressions cross the real facade ledger/admission and correlator.
+        // Only the final shared invoker is fake; request metadata matches Codex 0.164.
+        async fn codex_fixture(
+            limits: CliMcpFacadeLimits,
+        ) -> (
+            Arc<CliMcpToolFacade>,
+            Arc<RecordingInvoker>,
+            CliMcpFacadeRequestContext,
+            Arc<CliMcpCoordinator>,
+            Arc<super::super::super::native_correlation::NativeMcpCorrelationLedger>,
+        ) {
+            correlating_fixture("codex", true, limits).await
+        }
+
+        async fn correlating_fixture(
+            runtime_id: &str,
+            codex_adapter: bool,
+            limits: CliMcpFacadeLimits,
+        ) -> (
+            Arc<CliMcpToolFacade>,
+            Arc<RecordingInvoker>,
+            CliMcpFacadeRequestContext,
+            Arc<CliMcpCoordinator>,
+            Arc<super::super::super::native_correlation::NativeMcpCorrelationLedger>,
+        ) {
+            use super::super::super::native_correlation::{
+                CodexMcpCorrelationBinding, CorrelatingTurnMcpInvoker, NativeMcpCorrelationLedger,
+            };
+            assert!(codex_adapter);
+            let recording = Arc::new(RecordingInvoker {
+                calls: AtomicUsize::new(0),
+                invocations: StdMutex::new(Vec::new()),
+                result: basic_result(json!([])),
+            });
+            let (mut facade, mut context, coordinator) = fixture_with_runtime(
+                vec![fixture_tool("read"), fixture_tool("other")],
+                recording.clone(),
+                limits,
+                runtime_id,
+            )
+            .await;
+            let items = Arc::new(NativeMcpCorrelationLedger::default());
+            let facade_mut = Arc::get_mut(&mut facade).unwrap();
+            facade_mut.call_contract = CliMcpCallContract::Codex;
+            facade_mut.invoker = Arc::new(CorrelatingTurnMcpInvoker {
+                inner: recording.clone(),
+                native_items: items.clone(),
+                opencode_binding: None,
+                codex_binding: Some(CodexMcpCorrelationBinding {
+                    coordinator: coordinator.clone(),
+                    bound_grant: context.bound_grant.clone(),
+                }),
+            });
+            initialize(&facade, &context).await;
+            activate(&facade, &mut context, &coordinator, "turn").await;
+            (facade, recording, context, coordinator, items)
+        }
+
+        fn codex_call(rpc: &str, item: &str, turn: &str) -> JsonValue {
+            let mut request = call_message(json!(rpc), json!({}));
+            request["params"]["_meta"] = codex_meta(item, "native-thread-turn", turn);
+            request
+        }
+
+        fn codex_item(
+            item: &str,
+            turn: &str,
+        ) -> super::super::super::native_correlation::NativeMcpItemBinding {
+            super::super::super::native_correlation::NativeMcpItemBinding {
+                native_thread_id: "native-thread-turn".into(),
+                native_turn_id: turn.into(),
+                native_item_id: item.into(),
+                canonical_callable_name: "read".into(),
+                arguments_fingerprint: crate::cli_runtime::codex_mcp::canonical_value_fingerprint(
+                    &json!({}),
+                )
+                .unwrap(),
+            }
+        }
+
+        fn executed_ids(recording: &RecordingInvoker) -> Vec<String> {
+            recording
+                .invocations
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|call| call.provider_call_id.clone())
+                .collect()
+        }
+
+        async fn cancel_rpc(
+            facade: &CliMcpToolFacade,
+            context: &CliMcpFacadeRequestContext,
+            rpc: &str,
+        ) {
+            facade.handle_message(context, json!({
+            "jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": rpc}
+        })).await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn codex_facade_exact_items_survive_delay_reordering_and_identical_arguments() {
+            use futures_util::poll;
+            use tokio::time::advance;
+            for runtime_id in ["codex", "codex_work", "work"] {
+                let (facade, recording, context, _, items) =
+                    correlating_fixture(runtime_id, true, CliMcpFacadeLimits::default()).await;
+                let mut delayed = Box::pin(facade.handle_message(
+                    &context,
+                    codex_call("rpc-delayed", "delayed", "native-turn-turn"),
+                ));
+                assert!(poll!(delayed.as_mut()).is_pending());
+                advance(std::time::Duration::from_millis(300)).await;
+                // The old 250ms claim would already return session_binding_unavailable.
+                assert!(poll!(delayed.as_mut()).is_pending());
+                items
+                    .register(codex_item("delayed", "native-turn-turn"))
+                    .unwrap();
+                assert!(delayed.await.unwrap().get("result").is_some());
+                let mut absent = codex_call("missing-meta", "missing", "native-turn-turn");
+                absent["params"].as_object_mut().unwrap().remove("_meta");
+                assert_eq!(
+                    facade.handle_message(&context, absent).await.unwrap()["error"]["data"]["kind"],
+                    "invalid_native_metadata",
+                    "{runtime_id}"
+                );
+                assert_eq!(executed_ids(&recording), ["delayed"]);
+                // A is visible first but has not been requested. B/C must not steal it,
+                // and their completion must not imply that A has already executed.
+                items.register(codex_item("A", "native-turn-turn")).unwrap();
+                let mut c = Box::pin(
+                    facade.handle_message(&context, codex_call("rpc-C", "C", "native-turn-turn")),
+                );
+                let mut b = Box::pin(
+                    facade.handle_message(&context, codex_call("rpc-B", "B", "native-turn-turn")),
+                );
+                assert!(poll!(c.as_mut()).is_pending());
+                assert!(poll!(b.as_mut()).is_pending());
+                items.register(codex_item("B", "native-turn-turn")).unwrap();
+                assert!(poll!(c.as_mut()).is_pending());
+                assert!(b.await.unwrap().get("result").is_some());
+                items.register(codex_item("C", "native-turn-turn")).unwrap();
+                assert!(c.await.unwrap().get("result").is_some());
+                assert!(
+                    facade
+                        .handle_message(&context, codex_call("rpc-A", "A", "native-turn-turn"))
+                        .await
+                        .unwrap()
+                        .get("result")
+                        .is_some()
+                );
+                assert_eq!(executed_ids(&recording), ["delayed", "B", "C", "A"]);
+                assert!(
+                    recording
+                        .invocations
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|call| call.runtime_id.as_deref() == Some(runtime_id))
+                );
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn codex_facade_timeout_and_cancel_do_not_steal_later_calls_or_consume_items() {
+            use futures_util::poll;
+            use tokio::time::advance;
+            let mut limits = CliMcpFacadeLimits::default();
+            limits.max_queue_wait = std::time::Duration::from_secs(1);
+            let (facade, recording, context, _, items) = codex_fixture(limits).await;
+            let mut timed_out = Box::pin(
+                facade.handle_message(&context, codex_call("timeout", "A", "native-turn-turn")),
+            );
+            assert!(poll!(timed_out.as_mut()).is_pending());
+            advance(std::time::Duration::from_secs(1)).await;
+            let timeout = timed_out.await.unwrap();
+            assert_eq!(timeout["error"]["data"]["kind"], "timed_out");
+            assert_eq!(timeout["error"]["code"], FACADE_CALL_FAILED);
+            items.register(codex_item("A", "native-turn-turn")).unwrap();
+            let mut cancelled = Box::pin(
+                facade.handle_message(&context, codex_call("cancel", "C", "native-turn-turn")),
+            );
+            assert!(poll!(cancelled.as_mut()).is_pending());
+            cancel_rpc(&facade, &context, "cancel").await;
+            assert_eq!(
+                cancelled.await.unwrap()["error"]["data"]["kind"],
+                "cancelled"
+            );
+            items.register(codex_item("C", "native-turn-turn")).unwrap();
+            let mut b = Box::pin(
+                facade.handle_message(&context, codex_call("new-B", "B", "native-turn-turn")),
+            );
+            assert!(poll!(b.as_mut()).is_pending());
+            items.register(codex_item("B", "native-turn-turn")).unwrap();
+            assert!(b.await.unwrap().get("result").is_some());
+            // A timeout/cancel before claim is not evidence of execution. A fresh
+            // transport request may still use exactly that unconsumed native item.
+            for item in ["A", "C"] {
+                assert!(
+                    facade
+                        .handle_message(
+                            &context,
+                            codex_call(&format!("retry-{item}"), item, "native-turn-turn")
+                        )
+                        .await
+                        .unwrap()
+                        .get("result")
+                        .is_some()
+                );
+            }
+            assert_eq!(executed_ids(&recording), ["B", "A", "C"]);
+            assert_eq!(
+                facade.admission.available_permits(),
+                facade.limits.max_active_calls
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn codex_facade_replay_checks_identity_and_eviction_does_not_reexecute() {
+            use futures_util::poll;
+            let mut limits = CliMcpFacadeLimits::default();
+            limits.max_active_calls = 1;
+            limits.max_queued_calls = 1;
+            limits.max_ledger_entries = 2;
+            let (facade, recording, context, _, items) = codex_fixture(limits).await;
+            let request = codex_call("rpc-A", "A", "native-turn-turn");
+            let mut leader = Box::pin(facade.handle_message(&context, request.clone()));
+            let mut follower = Box::pin(facade.handle_message(&context, request.clone()));
+            assert!(poll!(leader.as_mut()).is_pending());
+            assert!(poll!(follower.as_mut()).is_pending());
+            let conflicting = facade
+                .handle_message(&context, codex_call("rpc-A", "B", "native-turn-turn"))
+                .await
+                .unwrap();
+            assert_eq!(
+                conflicting["error"]["data"]["kind"],
+                "conflicting_duplicate_request_id"
+            );
+            items.register(codex_item("A", "native-turn-turn")).unwrap();
+            let completed = leader.await.unwrap();
+            assert_eq!(follower.await.unwrap(), completed);
+            assert_eq!(
+                facade
+                    .handle_message(&context, request.clone())
+                    .await
+                    .unwrap(),
+                completed
+            );
+            assert_eq!(
+                facade
+                    .handle_message(&context, codex_call("rpc-A", "A", "other-native-turn"))
+                    .await
+                    .unwrap()["error"]["data"]["kind"],
+                "conflicting_duplicate_request_id"
+            );
+            for item in ["B", "C"] {
+                items
+                    .register(codex_item(item, "native-turn-turn"))
+                    .unwrap();
+                assert!(
+                    facade
+                        .handle_message(
+                            &context,
+                            codex_call(&format!("rpc-{item}"), item, "native-turn-turn")
+                        )
+                        .await
+                        .unwrap()
+                        .get("result")
+                        .is_some()
+                );
+            }
+            // Capacity evicted A's full result. Duplicate lifecycle registration
+            // must retain its independent used mark.
+            items.register(codex_item("A", "native-turn-turn")).unwrap();
+            assert_eq!(
+                facade.handle_message(&context, request).await.unwrap()["error"]["data"]["kind"],
+                "invalid_request"
+            );
+            // The cache uses std::time::Instant; expire the existing completed
+            // entry explicitly without sleeping or changing production clocks.
+            {
+                let mut ledger = lock_ledger_state(&facade.ledger.state);
+                for entry in ledger.entries.values_mut() {
+                    if let CliMcpLedgerEntryState::Completed { completed_at } = &mut entry.state {
+                        *completed_at = Instant::now() - facade.limits.completed_entry_ttl;
+                    }
+                }
+            }
+            assert_eq!(
+                facade
+                    .handle_message(&context, codex_call("rpc-C", "C", "native-turn-turn"))
+                    .await
+                    .unwrap()["error"]["data"]["kind"],
+                "invalid_request"
+            );
+            items.register(codex_item("D", "native-turn-turn")).unwrap();
+            assert!(
+                facade
+                    .handle_message(&context, codex_call("rpc-D", "D", "native-turn-turn"))
+                    .await
+                    .unwrap()
+                    .get("result")
+                    .is_some()
+            );
+            assert_eq!(executed_ids(&recording), ["A", "B", "C", "D"]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn codex_facade_rejects_invalid_metadata_scope_and_item_content() {
+            let (facade, recording, context, _, items) =
+                codex_fixture(CliMcpFacadeLimits::default()).await;
+            let mut absent = codex_call("absent", "A", "native-turn-turn");
+            absent["params"].as_object_mut().unwrap().remove("_meta");
+            assert_eq!(
+                facade.handle_message(&context, absent).await.unwrap()["error"]["data"]["kind"],
+                "invalid_native_metadata"
+            );
+            let valid = codex_meta("A", "native-thread-turn", "native-turn-turn");
+            let mut missing_call = valid.clone();
+            missing_call.as_object_mut().unwrap().remove("callId");
+            let mut bad_call = valid.clone();
+            bad_call["callId"] = json!(17);
+            let mut empty_turn = valid.clone();
+            empty_turn["x-codex-turn-metadata"]["turn_id"] = json!(" ");
+            let mut bad_thread = valid.clone();
+            bad_thread["x-codex-turn-metadata"]["thread_id"] = json!("different");
+            let mut serialized = valid.clone();
+            serialized["x-codex-turn-metadata"] = json!(valid["x-codex-turn-metadata"].to_string());
+            let mut missing_thread = valid.clone();
+            missing_thread.as_object_mut().unwrap().remove("threadId");
+            for meta in [
+                JsonValue::Null,
+                missing_call,
+                bad_call,
+                empty_turn,
+                bad_thread,
+                serialized,
+                missing_thread,
+            ] {
+                let mut request = codex_call("bad", "A", "native-turn-turn");
+                request["params"]["_meta"] = meta;
+                let response = facade.handle_message(&context, request).await.unwrap();
+                assert_eq!(response["error"]["data"]["kind"], "invalid_native_metadata");
+            }
+            let mut foreign = codex_call("foreign", "A", "native-turn-turn");
+            foreign["params"]["_meta"] = codex_meta("A", "foreign-thread", "native-turn-turn");
+            assert_eq!(
+                facade.handle_message(&context, foreign).await.unwrap()["error"]["data"]["kind"],
+                "scope_mismatch"
+            );
+            for (rpc, callable, args) in [
+                ("tool", "other", json!({})),
+                ("args", "read", json!({"different": true})),
+            ] {
+                items.register(codex_item(rpc, "native-turn-turn")).unwrap();
+                let mut request = codex_call(rpc, rpc, "native-turn-turn");
+                request["params"]["name"] = json!(callable);
+                request["params"]["arguments"] = args;
+                assert_eq!(
+                    facade.handle_message(&context, request).await.unwrap()["error"]["data"]["kind"],
+                    "invalid_request"
+                );
+            }
+            assert!(executed_ids(&recording).is_empty());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn codex_facade_queue_and_confirmation_share_one_deadline_and_release_capacity() {
+            use futures_util::poll;
+            use tokio::time::advance;
+            let mut limits = CliMcpFacadeLimits::default();
+            limits.max_active_calls = 1;
+            limits.max_queued_calls = 1;
+            limits.max_queue_wait = std::time::Duration::from_secs(1);
+            let (facade, recording, context, _, items) = codex_fixture(limits).await;
+            let mut a = Box::pin(
+                facade.handle_message(&context, codex_call("rpc-A", "A", "native-turn-turn")),
+            );
+            let mut b = Box::pin(
+                facade.handle_message(&context, codex_call("rpc-B", "B", "native-turn-turn")),
+            );
+            assert!(poll!(a.as_mut()).is_pending());
+            assert!(poll!(b.as_mut()).is_pending());
+            assert_eq!(facade.queued_calls.load(Ordering::Acquire), 1);
+            advance(std::time::Duration::from_millis(600)).await;
+            items.register(codex_item("A", "native-turn-turn")).unwrap();
+            assert!(a.await.unwrap().get("result").is_some());
+            assert!(poll!(b.as_mut()).is_pending());
+            assert_eq!(facade.queued_calls.load(Ordering::Acquire), 0);
+            advance(std::time::Duration::from_millis(399)).await;
+            assert!(poll!(b.as_mut()).is_pending());
+            advance(std::time::Duration::from_millis(1)).await;
+            assert_eq!(b.await.unwrap()["error"]["data"]["kind"], "timed_out");
+            assert_eq!(facade.admission.available_permits(), 1);
+            assert_eq!(executed_ids(&recording), ["A"]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn codex_facade_admitted_execution_outlives_admission_deadline() {
+            use super::super::super::native_correlation::{
+                CodexMcpCorrelationBinding, CorrelatingTurnMcpInvoker,
+            };
+            use futures_util::poll;
+            use tokio::time::advance;
+            let mut limits = CliMcpFacadeLimits::default();
+            limits.max_queue_wait = std::time::Duration::from_secs(1);
+            let (mut facade, _, context, coordinator, items) = codex_fixture(limits).await;
+            let execution = Arc::new(CancellationInvoker {
+                calls: AtomicUsize::new(0),
+            });
+            Arc::get_mut(&mut facade).unwrap().invoker = Arc::new(CorrelatingTurnMcpInvoker {
+                inner: execution.clone(),
+                native_items: items.clone(),
+                opencode_binding: None,
+                codex_binding: Some(CodexMcpCorrelationBinding {
+                    coordinator,
+                    bound_grant: context.bound_grant.clone(),
+                }),
+            });
+            items
+                .register(codex_item("long-call", "native-turn-turn"))
+                .unwrap();
+            let mut call = Box::pin(facade.handle_message(
+                &context,
+                codex_call("long-rpc", "long-call", "native-turn-turn"),
+            ));
+            assert!(poll!(call.as_mut()).is_pending());
+            assert_eq!(execution.calls.load(AtomicOrdering::SeqCst), 1);
+            advance(std::time::Duration::from_secs(2)).await;
+            assert!(poll!(call.as_mut()).is_pending());
+            cancel_rpc(&facade, &context, "long-rpc").await;
+            assert_eq!(call.await.unwrap()["error"]["data"]["kind"], "cancelled");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn codex_facade_waits_for_retarget_without_borrowing_old_turn_or_resetting_deadline()
+        {
+            use futures_util::poll;
+            use tokio::time::advance;
+            let mut limits = CliMcpFacadeLimits::default();
+            limits.max_queue_wait = std::time::Duration::from_secs(1);
+            let (facade, recording, context, coordinator, items) = codex_fixture(limits).await;
+            items
+                .register(codex_item("shared-id", "native-turn-turn"))
+                .unwrap();
+            let mut b = Box::pin(
+                facade.handle_message(&context, codex_call("rpc-B", "shared-id", "native-B")),
+            );
+            let mut missing = Box::pin(
+                facade.handle_message(&context, codex_call("rpc-missing", "missing", "native-B")),
+            );
+            assert!(poll!(b.as_mut()).is_pending());
+            assert!(poll!(missing.as_mut()).is_pending());
+            advance(std::time::Duration::from_millis(600)).await;
+            // Even an exact B item must wait until the normal coordinator retarget.
+            items.register(codex_item("shared-id", "native-B")).unwrap();
+            assert!(poll!(b.as_mut()).is_pending());
+            coordinator
+                .retarget_turn(
+                    &context.bound_grant,
+                    context.activation_generation.unwrap(),
+                    "native-thread-turn",
+                    "native-B",
+                )
+                .await
+                .unwrap();
+            assert!(b.await.unwrap().get("result").is_some());
+            assert!(poll!(missing.as_mut()).is_pending());
+            coordinator
+                .retarget_turn(
+                    &context.bound_grant,
+                    context.activation_generation.unwrap(),
+                    "native-thread-turn",
+                    "native-B",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                facade
+                    .handle_message(&context, codex_call("duplicate-B", "shared-id", "native-B"))
+                    .await
+                    .unwrap()["error"]["data"]["kind"],
+                "invalid_request"
+            );
+            advance(std::time::Duration::from_millis(400)).await;
+            assert_eq!(missing.await.unwrap()["error"]["data"]["kind"], "timed_out");
+            assert_eq!(executed_ids(&recording), ["shared-id"]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn codex_facade_lifecycle_cancels_native_and_queue_waits() {
+            use futures_util::poll;
+            for stop in ["cancel", "terminal", "revoke", "replacement", "shutdown"] {
+                let mut limits = CliMcpFacadeLimits::default();
+                limits.max_active_calls = 1;
+                limits.max_queued_calls = 1;
+                let (facade, recording, context, coordinator, items) = codex_fixture(limits).await;
+                let mut a = Box::pin(
+                    facade.handle_message(&context, codex_call("rpc-A", "A", "native-turn-turn")),
+                );
+                let mut b = Box::pin(
+                    facade.handle_message(&context, codex_call("rpc-B", "B", "native-turn-turn")),
+                );
+                assert!(poll!(a.as_mut()).is_pending());
+                assert!(poll!(b.as_mut()).is_pending());
+                match stop {
+                    "cancel" => {
+                        cancel_rpc(&facade, &context, "rpc-A").await;
+                        cancel_rpc(&facade, &context, "rpc-B").await;
+                    }
+                    "terminal" => coordinator
+                        .terminal_turn(&context.bound_grant, context.activation_generation.unwrap())
+                        .await
+                        .unwrap(),
+                    "revoke" => {
+                        coordinator
+                            .revoke_connection(&context.bound_grant)
+                            .await
+                            .unwrap();
+                    }
+                    "replacement" => {
+                        coordinator
+                            .revoke_process(&context.bound_grant.scope().process_instance)
+                            .await;
+                    }
+                    "shutdown" => {
+                        let mut shutdown = Box::pin(facade.shutdown());
+                        assert!(poll!(shutdown.as_mut()).is_pending());
+                        assert_eq!(
+                            a.as_mut().await.unwrap()["error"]["data"]["kind"],
+                            "cancelled"
+                        );
+                        assert_eq!(
+                            b.as_mut().await.unwrap()["error"]["data"]["kind"],
+                            "cancelled"
+                        );
+                        assert!(shutdown.await.drained);
+                    }
+                    _ => unreachable!(),
+                }
+                if stop != "shutdown" {
+                    assert_eq!(a.await.unwrap()["error"]["data"]["kind"], "cancelled");
+                    assert_eq!(b.await.unwrap()["error"]["data"]["kind"], "cancelled");
+                }
+                assert_eq!(facade.admission.available_permits(), 1, "{stop}");
+                assert_eq!(facade.queued_calls.load(Ordering::Acquire), 0, "{stop}");
+                assert!(executed_ids(&recording).is_empty(), "{stop}");
+                if stop == "cancel" {
+                    items.register(codex_item("A", "native-turn-turn")).unwrap();
+                    assert!(
+                        facade
+                            .handle_message(
+                                &context,
+                                codex_call("fresh-A", "A", "native-turn-turn")
+                            )
+                            .await
+                            .unwrap()
+                            .get("result")
+                            .is_some()
+                    );
+                } else if stop == "terminal" {
+                    assert_eq!(
+                        facade
+                            .handle_message(&context, codex_call("late", "A", "native-turn-turn"))
                             .await
                             .unwrap()["error"]["data"]["kind"],
                         "turn_not_active"

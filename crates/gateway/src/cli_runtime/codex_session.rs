@@ -23,7 +23,9 @@ use crate::cli_runtime::manager::{
 use crate::cli_runtime::mcp::coordinator::{
     CliMcpProjectionFingerprint, CliMcpProjectionGeneration,
 };
-use crate::cli_runtime::mcp::facade::{CliMcpFacadeProjection, CliMcpFacadeTool};
+use crate::cli_runtime::mcp::facade::{
+    CliMcpCallContract, CliMcpFacadeProjection, CliMcpFacadeTool,
+};
 use crate::cli_runtime::mcp::grants::{CliMcpGrantScope, CliMcpManifestHash};
 use crate::cli_runtime::mcp::limits::{
     CliMcpFacadeLimits, CliMcpFacadeProjectionLimits, CliMcpRuntimeLimits,
@@ -330,7 +332,7 @@ pub(crate) async fn run_codex_mcp_local_provider_probe(
             reservation.generation,
             projection_for_server.clone(),
             CliMcpFacadeLimits::default(),
-            crate::cli_runtime::mcp::facade::CliMcpCallContract::Legacy,
+            CliMcpCallContract::Codex,
         )?;
         let server = tokio::spawn(server.run());
         tokio_timeout(
@@ -571,7 +573,7 @@ struct CodexRequiredMcpBridge {
 }
 
 use crate::cli_runtime::mcp::native_correlation::{
-    CorrelatingTurnMcpInvoker as CodexCorrelatingTurnMcpInvoker,
+    CodexMcpCorrelationBinding, CorrelatingTurnMcpInvoker as CodexCorrelatingTurnMcpInvoker,
     NativeMcpCorrelationLedger as CodexNativeMcpCorrelationLedger,
     NativeMcpItemKey as CodexNativeMcpItemKey,
 };
@@ -650,11 +652,15 @@ impl CodexRequiredMcpBridge {
                             inner: self.invoker.clone(),
                             native_items: self.native_items.clone(),
                             opencode_binding: None,
+                            codex_binding: Some(CodexMcpCorrelationBinding {
+                                coordinator: self.supervisor.coordinator(),
+                                bound_grant: attachment.bound_grant.clone(),
+                            }),
                         }),
                         self.projection_generation,
                         self.projection.clone(),
                         self.facade_limits.clone(),
-                        crate::cli_runtime::mcp::facade::CliMcpCallContract::Legacy,
+                        CliMcpCallContract::Codex,
                     )
                     .map_err(|error| anyhow!("Codex MCP facade build failed: {error}"))?;
                     let server = tokio::spawn(server.run());
@@ -866,10 +872,14 @@ impl CodexRequiredMcpBridge {
             )
             .await
             .map_err(|error| anyhow!("failed to retarget Codex MCP turn: {error:?}"))?;
-        self.native_items.clear_turn(
-            turn.native_thread_id.as_deref(),
-            turn.native_turn_id.as_deref(),
-        );
+        if turn.native_thread_id.as_deref() != Some(native_thread_id)
+            || turn.native_turn_id.as_deref() != Some(native_turn_id)
+        {
+            self.native_items.clear_turn(
+                turn.native_thread_id.as_deref(),
+                turn.native_turn_id.as_deref(),
+            );
+        }
         turn.native_thread_id = Some(native_thread_id.to_owned());
         turn.native_turn_id = Some(native_turn_id.to_owned());
         Ok(())
@@ -3021,6 +3031,62 @@ mod tests {
         );
     }
 
+    async fn active_correlation_binding() -> (
+        Arc<crate::cli_runtime::mcp::coordinator::CliMcpCoordinator>,
+        crate::cli_runtime::mcp::grants::CliMcpBoundGrant,
+    ) {
+        use crate::cli_runtime::mcp::grants::CliMcpConnectionId;
+        use pioneer_cli_mcp_bridge::{AttachRequest, BridgeGeneration};
+        let coordinator =
+            Arc::new(crate::cli_runtime::mcp::coordinator::CliMcpCoordinator::default());
+        let instance = CliSessionGenerationAllocator::default()
+            .allocate(CLIAgentRuntimeSessionKey::new("workspace", "codex", "thread").unwrap())
+            .unwrap();
+        let scope =
+            CliMcpGrantScope::new(instance, CliMcpManifestHash::new("a".repeat(64)).unwrap());
+        let issued = coordinator
+            .issue_grant(scope.clone(), codex_mcp_bootstrap_expiry(60_000).unwrap())
+            .await
+            .unwrap();
+        let projection = coordinator
+            .stage_projection(
+                &issued.grant_ref(),
+                CliMcpProjectionFingerprint::new("b".repeat(64)).unwrap(),
+            )
+            .await
+            .unwrap();
+        let bound = coordinator
+            .attach(
+                &AttachRequest {
+                    session_id: issued.bridge_session_id.clone(),
+                    generation: BridgeGeneration::new(1).unwrap(),
+                    nonce: issued.nonce.clone(),
+                },
+                &scope,
+                CliMcpConnectionId::for_test(1),
+            )
+            .await
+            .unwrap();
+        coordinator
+            .mark_projection_ready(&bound, projection.generation, &projection.fingerprint)
+            .await
+            .unwrap();
+        let turn = coordinator
+            .reserve_turn(&issued.grant_ref(), projection.generation, "thread", "turn")
+            .await
+            .unwrap();
+        coordinator
+            .activate_turn(
+                &bound,
+                turn.activation_generation,
+                "native-thread",
+                "native-turn",
+            )
+            .await
+            .unwrap();
+        (coordinator, bound)
+    }
+
     #[tokio::test]
     async fn codex_mcp_timeline_correlation_uses_native_item_identity_in_invoker_audit() {
         let ledger = Arc::new(CodexNativeMcpCorrelationLedger::default());
@@ -3038,10 +3104,15 @@ mod tests {
             })
             .expect("native lifecycle registration");
         let inner = Arc::new(RecordingProviderCallInvoker::default());
+        let (coordinator, bound_grant) = active_correlation_binding().await;
         let invoker = CodexCorrelatingTurnMcpInvoker {
             inner: inner.clone(),
             native_items: ledger,
             opencode_binding: None,
+            codex_binding: Some(CodexMcpCorrelationBinding {
+                coordinator,
+                bound_grant,
+            }),
         };
         let error = invoker
             .invoke(
@@ -3052,8 +3123,12 @@ mod tests {
                     runtime_id: Some("codex".to_owned()),
                     session_generation: Some(1),
                     provider_call_id: "jsonrpc:7".to_owned(),
-                    native_call: None,
-                    admission_deadline: None,
+                    native_call: Some(crate::turn_mcp::invoker::NativeMcpCallIdentity {
+                        native_thread_id: "native-thread".into(),
+                        native_turn_id: "native-turn".into(),
+                        native_item_id: "native-item".into(),
+                    }),
+                    admission_deadline: Some(tokio::time::Instant::now() + Duration::from_secs(30)),
                     canonical_callable_name: "mcp__server__tool".to_owned(),
                     arguments,
                     origin: crate::turn_mcp::invoker::TurnMcpInvocationOrigin::CliFacade,
@@ -3249,6 +3324,57 @@ mod tests {
                 .expect("arguments fingerprint"),
             })
             .expect("register exact native item");
+        let used_key = CodexNativeMcpItemKey {
+            native_thread_id: "native-thread".into(),
+            native_turn_id: "native-turn".into(),
+            native_item_id: "native-item".into(),
+        };
+        let fingerprint =
+            crate::cli_runtime::codex_mcp::canonical_value_fingerprint(&json!({"value": 7}))
+                .unwrap();
+        assert!(
+            required_bridge
+                .native_items
+                .claim_codex_exact(
+                    &used_key,
+                    "mcp__server__tool",
+                    &fingerprint,
+                    "first-rpc",
+                    &CancellationToken::new(),
+                    tokio::time::Instant::now() + CliMcpFacadeLimits::default().max_queue_wait
+                )
+                .unwrap()
+        );
+        required_bridge
+            .retarget_turn("pioneer-turn", "native-thread", "native-turn")
+            .await
+            .unwrap();
+        // A repeated native turn notification must preserve the used mark,
+        // including when that same native item is registered again.
+        required_bridge
+            .register_native_item(crate::cli_runtime::codex_mcp::CodexNativeMcpItemBinding {
+                native_thread_id: used_key.native_thread_id.clone(),
+                native_turn_id: used_key.native_turn_id.clone(),
+                native_item_id: used_key.native_item_id.clone(),
+                canonical_callable_name: "mcp__server__tool".into(),
+                arguments_fingerprint: fingerprint.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            required_bridge
+                .native_items
+                .claim_codex_exact(
+                    &used_key,
+                    "mcp__server__tool",
+                    &fingerprint,
+                    "second-rpc",
+                    &CancellationToken::new(),
+                    tokio::time::Instant::now() + CliMcpFacadeLimits::default().max_queue_wait
+                )
+                .unwrap_err()
+                .code,
+            TurnMcpInvocationErrorCode::InvalidRequest
+        );
         let requested_permissions = json!({"network": ["example.com"]});
         let exact = required_bridge
             .native_approval_response(CLIAgentRuntimeNativeMcpApprovalRequest {

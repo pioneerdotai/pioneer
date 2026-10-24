@@ -508,7 +508,7 @@ mod tests {
             reservation.generation,
             projection,
             CliMcpFacadeLimits::default(),
-            super::super::facade::CliMcpCallContract::Legacy,
+            super::super::facade::CliMcpCallContract::Codex,
         )
         .expect("server");
         let server = tokio::spawn(server.run());
@@ -568,7 +568,8 @@ mod tests {
                 "jsonrpc": "2.0", "id": 3, "method": "tools/call",
                 "params": {
                     "name": "echo", "arguments": {"value": 7},
-                    "_meta": {"progressToken": "progress-3"}
+                    "_meta": {"progressToken": "progress-3", "callId": "echo-3", "threadId": "native-thread",
+                        "x-codex-turn-metadata": {"thread_id": "native-thread", "turn_id": "native-turn"}}
                 }
             }))
             .await;
@@ -583,7 +584,10 @@ mod tests {
         provider
             .send(json!({
                 "jsonrpc": "2.0", "id": 4, "method": "tools/call",
-                "params": {"name": "wait", "arguments": {}}
+                "params": {"name": "wait", "arguments": {}, "_meta": {
+                    "callId": "wait-4", "threadId": "native-thread",
+                    "x-codex-turn-metadata": {"thread_id": "native-thread", "turn_id": "native-turn"}
+                }}
             }))
             .await;
         wait_for_count(&invoker.wait_calls, 1).await;
