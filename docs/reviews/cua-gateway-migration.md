@@ -946,3 +946,28 @@ resolver, project scripts or runtime/platform probes ran. Existing monitor
 `1EuSrEXDwGwWI6UvduAfp` was paused before merging (no run active), and will resume
 on the same fifteen-minute schedule after the authorized merge commit/push.
 Fresh GitHub CI and platform/runtime qualification remain pending.
+
+## 2026-10-24 — CI cancellation fixture database lifetime
+
+Monitor run 25 inspected current head `57a960d90480ae1eba9b77f0ac639e82ea79204d`
+and CI run `40093388808`. Windows, macOS, Linux build and shard 1 passed;
+shard 3 failed in `turn_mcp_cancel_reaches_upstream_and_late_release_cannot_succeed`
+when its post-cancellation audit read found no `mcp_audit_event` table.
+Shards 2 and 4 were still running. Future monitor firings were paused and verified
+before editing.
+
+The invoker fixture used `sqlite::memory:`, whose schema can disappear when
+cancellation retires its pooled connection. The test-only fixture now retains a
+TempDir and uses a migrated SQLite file for its lifetime; the existing service
+setup accepts the database URL, retaining memory setup for unrelated tests.
+Cancellation, late release, upstream call-count and exact audit reason assertions
+are unchanged. No production code changed: its full prefix was compared with the
+entry bytes. This is a narrow test-fixture exception outside CUA code, needed for
+the existing merged-main cancellation regression; no product contract changed.
+
+Applied test-audit to the test-only edit. `cargo fmt --all --check`,
+`git diff --check` and unchanged Cargo.lock comparison passed. No local tests,
+builds, compilers, resolvers or platform probes ran; fresh CI must validate this
+repair. Fetched main `12fb677bc996957b64471a4b88acb08e1efc3eb4` merges without
+conflicts (`git merge-tree --write-tree`); GitHub reports MERGEABLE. CUA pin,
+server/CU variants, update/recovery and release assets remain unchanged.

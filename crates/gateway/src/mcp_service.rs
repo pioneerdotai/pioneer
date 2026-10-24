@@ -4673,6 +4673,7 @@ mod tests {
         manifest_hash: String,
         execution: Arc<TestValidatedMcpExecution>,
         invoker: GatewayTurnMcpInvoker,
+        _database_dir: tempfile::TempDir,
     }
 
     struct TestMcpRuntimeConnector {
@@ -4877,9 +4878,16 @@ mod tests {
     async fn test_mcp_service_with_store(
         store: Arc<dyn pioneer_keystore::SecretStore>,
     ) -> (McpService, Arc<CrudStore>, String, Arc<GatewaySecrets>) {
-        let connection = Database::connect("sqlite::memory:")
+        test_mcp_service_with_database(store, "sqlite::memory:").await
+    }
+
+    async fn test_mcp_service_with_database(
+        store: Arc<dyn pioneer_keystore::SecretStore>,
+        database_url: &str,
+    ) -> (McpService, Arc<CrudStore>, String, Arc<GatewaySecrets>) {
+        let connection = Database::connect(database_url)
             .await
-            .expect("must connect to sqlite memory");
+            .expect("must connect to test sqlite database");
         Migrator::up(&connection, None)
             .await
             .expect("migrations must succeed");
@@ -5546,7 +5554,15 @@ mod tests {
     async fn turn_mcp_invoker_fixture_with_connector(
         connector: Arc<dyn McpRuntimeConnector>,
     ) -> TestTurnMcpInvokerFixture {
-        let (service, crud_store, workspace_id) = test_mcp_service().await;
+        // Cancellation can retire a pooled connection. Keep the migrated database
+        // alive independently of that connection so audit assertions see its schema.
+        let database_dir = tempfile::tempdir().expect("test database directory should exist");
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            database_dir.path().join("mcp.db").display()
+        );
+        let (service, crud_store, workspace_id, _) =
+            test_mcp_service_with_database(Arc::new(MemorySecretStore::new()), &database_url).await;
         let thread_id = "T00000000000000000001".to_owned();
         let turn_id = "U00000000000000000001".to_owned();
         seed_started_turn(
@@ -5627,6 +5643,7 @@ mod tests {
             manifest_hash,
             execution,
             invoker,
+            _database_dir: database_dir,
         }
     }
 
