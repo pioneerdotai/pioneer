@@ -581,6 +581,7 @@ async fn saved_search_over_256_kib_reconstructs_exact_payload_and_revalidates_di
     p.crud_store.database_connection().execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
         "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('saved-search-context',?,'saved-search',1,'tool_result_v2',?,'{}',CURRENT_TIMESTAMP)",
         [source.turn_id.clone().into(),serialized.into()])).await.unwrap();
+    let tool = serde_json::to_value(&tool).unwrap();
     let params = pioneer_protocol::ThreadToolResultReadParams {
         workspace_id: WORKSPACE_RED_ID.into(),
         thread_id: THREAD_RED_PRIVATE_A_ID.into(),
