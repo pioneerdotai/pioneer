@@ -102,7 +102,8 @@ pub use output_policy::{
     web_search_output_policy,
 };
 pub use output_projection::{
-    ToolProjectionInput, bounded_summary_for_chars, builtin_json_llm_payload_size, project_tool_result,
+    ToolProjectionInput, bounded_summary_for_chars, builtin_json_llm_payload_size,
+    project_tool_result,
 };
 pub use permissions::{
     PermissionActionKind, PermissionApprovalBroker, PermissionApprovalResolution,
