@@ -1,5 +1,15 @@
 # Thread search and episodic recall: review and publication record
 
+## Memvid 4.0.0 release (2026-10-24)
+
+The user authorized merging the Memvid PR and publishing the next major version of the fork. PR https://github.com/pioneerdotai/memory/pull/1 is merged into main at `85eed6a081413a047f219813f37ee4bc550b0379`. Release https://github.com/pioneerdotai/memory/releases/tag/v4.0.0 and its tag both point to that merge commit. The package version and its lockfile entry are `4.0.0`.
+
+Pioneer uses `tag = "v4.0.0"` in Cargo.toml, restoring the project's version-tag convention. Cargo.lock names version `4.0.0` and resolves that tag to the merge commit; the manifest's `rev` selector is removed. No other dependency changed.
+
+The existing monitor `G2dk4ksihOwuhHcY6NR6s` is retained for Pioneer PR #174. Its instructions preserve release tags and prohibit replacing the version with an unreleased revision. The Memvid Windows job on the earlier `e0f971d` head failed in file-lock scenarios; Linux and macOS jobs were cancelled by the matrix. Publishing the release does not establish GREEN. The main-branch CI and current Pioneer PR checks remain observable through GitHub.
+
+Commands for this stage: Git status and diff reads, `git fetch origin main`, ancestry checks, `git ls-remote`, GitHub PR/release/tag/job-log queries, a static version and lockfile edit, commits and pushes with hooks disabled, `gh pr merge --merge --match-head-commit`, `gh release create --target`, and `git diff --check`. Local tests, compilation, builds, applications, CLI agents, and generators were not run. Earlier sections are historical records.
+
 ## Publication and CI follow-up (2026-10-24)
 
 The user accepted the result and authorized publication. Both existing feature branches are now published:
