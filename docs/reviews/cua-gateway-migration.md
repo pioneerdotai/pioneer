@@ -1,5 +1,7 @@
 # CUA Gateway migration — handoff
 
+Publication update: the user accepted this implementation and authorized commit/push, PR creation and CI repairs. PR: https://github.com/pioneerdotai/pioneer/pull/172. The review-round statuses and repository snapshots below are preserved historical records from before publication. The accepted implementation was committed as `7e208b9912d3615392d83aeb25e7f92137711f2b`. Current CI follow-up is recorded at the end.
+
 **Готово к повторному внешнему статическому ревью; компиляция и тесты не запускались.** Round 2 residual G02 and G12 fixes are unstaged over the unchanged 114-path reviewed index and preserved round-1 fixes. G01 and G03–G11 were closed by the external round-2 static audit; they were not rewritten. The existing untracked build-support file is preserved and listed below. Daemon, inventory, UI, signing, packaging and installation were not executed. Round-1 task history and round-2 task resolution are recorded below; internal integration is not external acceptance or permission to execute.
 
 ## Immutable product contract and product review
@@ -365,3 +367,13 @@ Final round-2 source state: branch `feature/cua-gateway-migration`, base=HEAD `6
 Final allowed observations: `cargo fmt -p pioneer-agent -p pioneer-cli --check`, `git diff --check`, `git diff --cached --check`; all returned exit 0 in the final separate observations. Final task_wait also returned both tasks completed/succeeded, 0 pending/reviewRequired/failed/blocked/cancelled. Full current-tree review patch, including the unchanged untracked helper, is `.cua-source/round2-current-tree.patch`; original index and entry round-1 snapshots remain separate. Source/JSON/hash comparison is scope accounting, not a regression test. Compilation, all tests, SDK/platform/runtime checks and native Intel dyld load smoke remain deferred.
 
 **Готово к повторному внешнему статическому ревью; компиляция и тесты не запускались.**
+
+## Publication and initial CI follow-up
+
+The user accepted the implementation and authorized publication and concrete CI repairs, with local builds/tests still prohibited. PR: https://github.com/pioneerdotai/pioneer/pull/172. The English PR description went through humanizer and contains no testing-status section. Accepted implementation commit: `7e208b9912d3615392d83aeb25e7f92137711f2b`; original base: `6c1e6b2c49359c76e49624c0545bbafc4a3d310a`.
+
+CI run `40059382645` failed dependency selection on macOS and Windows: the old lockfile held `zune-core 0.5.3`, conflicting with the pinned CUA core's exact `=0.5.1` compatibility constraint. The narrow non-build command `cargo update -p zune-core@0.5.3 --precise 0.5.1` resolved the graph, added the SDK/platform crates at the unchanged immutable revision and removed unused xa11y/xcap dependencies. No manifest pin, checksum, version entry or `--locked` consumer was manually weakened. This resolves the lockfile deferral in the historical static-review snapshots above; build/link/runtime qualification remains CI's job.
+
+The repair changes only Cargo.lock and this handoff. Static inspection covered the exact CUA Git source/version entries, legacy-package removal and Pioneer workspace versions; `git diff --check` was run. Current origin/main was fetched and remained an ancestor of this branch; GitHub reported MERGEABLE. No local build, test, compiler, SDK/daemon or platform probe was run.
+
+One recurring monitor, `1EuSrEXDwGwWI6UvduAfp`, owns PR CI follow-up every 15 minutes and sends results to the original thread. Its stored instructions include this worktree, immutable Gateway ownership, bounded scope, no local builds/tests, English conventional commit/title format, no CI-skip markers, pause during repair, main conflict checks and permanent stop after verified current-head GREEN or PR closure. Its schedule was paused before this repair and will be resumed only after push, with the next firing explicitly verified at +15 minutes.
