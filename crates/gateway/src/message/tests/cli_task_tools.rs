@@ -3803,12 +3803,27 @@ fn admitted_cli_search_preserves_structured_pages_at_projection_byte_boundary() 
                 ),
             )
             .await;
+        // Cursors are bound to the original authority. A narrower identity
+        // must restart the search rather than reuse the previous page token.
+        let stale_cursor = invoke_task(
+            &processor,
+            &context.turn_id,
+            "search-revoked-cursor",
+            "threads_search",
+            next_params,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            stale_cursor.code,
+            crate::turn_mcp::invoker::TurnMcpInvocationErrorCode::InvalidRequest
+        );
         let after_revocation = invoke_task(
             &processor,
             &context.turn_id,
             "search-revoked",
             "threads_search",
-            next_params,
+            params,
         )
         .await
         .unwrap();
