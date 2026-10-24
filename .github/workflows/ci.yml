@@ -24,13 +24,18 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
 
     steps:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
+
+      # apple-metal (through the pinned CUA SDK) uses macOS 26.2 SDK APIs.
+      - name: select-cua-xcode
+        if: runner.os == 'macOS'
+        run: sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
 
       - name: setup-rust
         uses: dtolnay/rust-toolchain@stable
