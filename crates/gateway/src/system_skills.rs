@@ -287,6 +287,65 @@ mod tests {
     };
 
     #[test]
+    fn html_is_required_without_explicit_attachments_and_exposes_exact_asset_root() {
+        let runtime_home = tempfile::tempdir().unwrap();
+        let roots = materialize_bundled_system_skill_roots(runtime_home.path()).unwrap();
+        let root = std::path::Path::new(&roots[0]);
+        let catalog = load_catalog(&SkillCatalogLoadParams {
+            installations: Vec::new(),
+            bundled: bundled_system_skill_catalog_entries(root).unwrap(),
+            max_file_bytes: 1024 * 1024,
+        })
+        .unwrap();
+        let html = catalog
+            .skills
+            .iter()
+            .find(|skill| skill.identity.slug == "html")
+            .unwrap();
+        assert_eq!(
+            html.policy_hints.implicit_invocation,
+            pioneer_skills::SkillImplicitInvocationPolicy::Required
+        );
+        assert!(html.policy_hints.catalog_hidden);
+        assert!(!html.runtime.disable_model_invocation);
+        let resolution = pioneer_skills::resolve_skills(pioneer_skills::SkillResolutionInput {
+            explicit_refs: &[],
+            touched_paths: &[],
+            catalog: &catalog,
+            policy_set: &pioneer_skills::SkillPolicySet::default(),
+            validation_policy: pioneer_skills::SkillValidationPolicy::default(),
+            dependency_input: &pioneer_skills::DependencyCheckInput::baseline(),
+        });
+        let active = resolution
+            .active
+            .into_iter()
+            .filter(|skill| skill.definition.identity.slug == "html")
+            .collect::<Vec<_>>();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].reason, SkillResolvedReason::Implicit);
+        let prompt = build_skill_prompt(
+            &active,
+            SkillPromptBudget {
+                max_chars: 24000,
+                compact_mode_threshold: 6,
+                include_read_skill_hint: true,
+            },
+        );
+        assert!(
+            prompt
+                .text
+                .contains(&format!("skill:{}", html.identity.skill_id))
+        );
+        assert!(prompt.text.contains("pioneer/html"));
+        assert!(
+            std::path::Path::new(&html.identity.skill_dir)
+                .join("references/theme-and-layout.md")
+                .is_file()
+        );
+        assert!(crate::cli_runtime::skills::ensure_cli_runtime_skills_exportable(&active).is_ok());
+    }
+
+    #[test]
     fn materializes_bundled_browser_subagents_tasks_and_memory_skills() {
         let runtime_home = tempfile::tempdir().expect("runtime home");
         let roots = materialize_bundled_system_skill_roots(runtime_home.path())
@@ -586,7 +645,7 @@ mod tests {
             if skill.policy_hints.implicit_invocation == SkillImplicitInvocationPolicy::Required
                 && !matches!(
                     skill.identity.slug.as_str(),
-                    "tasks" | "subagents" | "memory"
+                    "tasks" | "subagents" | "html" | "memory"
                 )
             {
                 let unsupported = [ResolvedSkill {
@@ -682,6 +741,7 @@ mod tests {
                 "browser",
                 "pioneer/browser",
             ),
+            ("HtmL6PrEvIeWsPiOnEeR1", "pioneer", "html", "pioneer/html"),
             (
                 "TYotuYDUMUbxl37lej8cv",
                 "pioneer",

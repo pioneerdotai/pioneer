@@ -1,6 +1,7 @@
 //! First-party HTML execution. Context and canonical call identity are supplied
 //! by the Gateway, while both provider paths use the same implementation.
 mod browser;
+mod theme;
 use super::MessageProcessor;
 use async_trait::async_trait;
 use pioneer_agent::TurnToolContext;
@@ -9,9 +10,7 @@ use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind, ArtifactKind,
     ArtifactRole, ArtifactSummary,
 };
-use pioneer_tools::html::{
-    self, Appearance, HTML_PREVIEW, HTML_RENDER, PreviewParams, RenderParams,
-};
+use pioneer_tools::html::{self, HTML_PREVIEW, HTML_RENDER, PreviewParams, RenderParams};
 use pioneer_tools::{
     FunctionToolOutput, ToolError, ToolExtensionBundle, ToolHandler, ToolInvocation, ToolOutput,
     ToolPayload,
@@ -81,6 +80,7 @@ impl MessageProcessor {
                             ArtifactKind::File,
                             "text/html",
                             true,
+                            1,
                             Value::Null,
                             cancel,
                         )
@@ -119,10 +119,54 @@ impl MessageProcessor {
                         .map_err(|e| ToolError::invalid_arguments(e.to_string()))?;
                     html::validate_html(&params.html)?;
                     self.html_preview_vision(context).await?;
-                    let input = self.html_ingest(context, call, "input", params.html.as_bytes().to_vec(), "HTML preview source", ArtifactKind::File, "text/html", false, json!({"appearance":if matches!(params.appearance,Appearance::Dark) {"dark"} else {"light"}}), cancel).await?;
+                    // A recorded v1 call can recover its exact stored source and frames;
+                    // metadata is never upgraded in place or used to synthesize images.
+                    let source_id = html_identity(context, call, "input");
+                    let legacy = match self
+                        .artifact_service
+                        .get_artifact(&context.workspace_id, &source_id, None)
+                        .await
+                    {
+                        Ok(source) => source.metadata["htmlTool"]["version"] == 1,
+                        Err(pioneer_artifacts::ArtifactError::NotFound { .. }) => false,
+                        Err(error) => return Err(ToolError::execution_failed(error.to_string())),
+                    };
+                    let details = if legacy {
+                        json!({"appearance":if matches!(params.appearance, html::Appearance::Dark) {"dark"} else {"light"}})
+                    } else {
+                        json!({"formatVersion":2})
+                    };
+                    let input = self
+                        .html_ingest(
+                            context,
+                            call,
+                            "input",
+                            params.html.as_bytes().to_vec(),
+                            "HTML preview source",
+                            ArtifactKind::File,
+                            "text/html",
+                            false,
+                            if legacy { 1 } else { 2 },
+                            details,
+                            cancel,
+                        )
+                        .await?;
+                    let frames: Vec<(Option<&str>, u32, String)> = if legacy {
+                        html::PREVIEW_WIDTHS
+                            .iter()
+                            .map(|&width| (None, width, width.to_string()))
+                            .collect()
+                    } else {
+                        html::PREVIEW_FRAMES
+                            .iter()
+                            .map(|&(appearance, width)| {
+                                (Some(appearance), width, format!("{appearance}-{width}"))
+                            })
+                            .collect()
+                    };
                     let mut stored = std::collections::HashMap::new();
-                    for width in html::PREVIEW_WIDTHS {
-                        let id = html_identity(context, call, &width.to_string());
+                    for (_, _, index) in &frames {
+                        let id = html_identity(context, call, index);
                         match self
                             .artifact_service
                             .get_artifact(&context.workspace_id, &id, None)
@@ -132,9 +176,27 @@ impl MessageProcessor {
                                 if summary.artifact.status
                                     == pioneer_protocol::ArtifactStatus::Ready
                                     && summary.created_by_actor_id.as_deref()
-                                        == Some(HTML_PREVIEW) =>
+                                        == Some(HTML_PREVIEW)
+                                    && summary.metadata["htmlTool"]["version"]
+                                        == (if legacy { 1 } else { 2 })
+                                    && summary.metadata["htmlTool"]["index"] == index.as_str()
+                                    && summary.metadata["htmlTool"]["turnId"]
+                                        == context.turn_id
+                                    && summary.metadata["htmlTool"]["callId"] == call
+                                    && summary.bindings.iter().any(|binding| {
+                                        binding.thread_id.as_deref()
+                                            == Some(context.thread_id.as_str())
+                                            && binding.turn_id.as_deref()
+                                                == Some(context.turn_id.as_str())
+                                            && binding.tool_call_id.as_deref() == Some(call)
+                                            && binding.version_id == summary.artifact.version_id
+                                            && binding.binding_kind
+                                                == ArtifactBindingKind::ToolOutput
+                                            && binding.direction == ArtifactBindingDirection::Output
+                                            && binding.role == Some(ArtifactRole::Tool)
+                                    }) =>
                             {
-                                stored.insert(width, summary);
+                                stored.insert(index.clone(), summary);
                             }
                             Ok(_) => {
                                 return Err(ToolError::execution_failed(
@@ -147,12 +209,15 @@ impl MessageProcessor {
                     }
                     // Recover committed screenshots after a crash without changing
                     // their bytes or diagnostics. Missing presets use fresh contexts.
-                    let captures = if stored.len() == 3 {
+                    let captures = if stored.len() == frames.len() {
                         Vec::new()
+                    } else if legacy {
+                        return Err(ToolError::execution_failed(
+                            "legacy preview is incomplete; saved screenshots cannot be regenerated",
+                        ));
                     } else {
                         browser::capture(
                             &params.html,
-                            matches!(params.appearance, Appearance::Dark),
                             &self.artifact_runtime_home.join("html-preview"),
                             cancel,
                         )
@@ -169,39 +234,43 @@ impl MessageProcessor {
                         if cancel.is_cancelled() {
                             return Err(ToolError::cancelled("HTML preview cancelled"));
                         }
-                        if stored.contains_key(&capture.width) {
+                        let index = format!("{}-{}", capture.appearance, capture.width);
+                        if stored.contains_key(&index) {
                             continue;
                         }
-                        let details = json!({"width":capture.width,"contentHeight":capture.content_height,"capturedHeight":capture.captured_height,"diagnostics":capture.diagnostics});
+                        let details = json!({"appearance":capture.appearance,"width":capture.width,"contentHeight":capture.content_height,"capturedHeight":capture.captured_height,"diagnostics":capture.diagnostics});
                         let summary = self
                             .html_ingest(
                                 context,
                                 call,
-                                &capture.width.to_string(),
+                                &index,
                                 capture.png,
-                                &format!("HTML preview {}px", capture.width),
+                                &format!("HTML preview {} {}px", capture.appearance, capture.width),
                                 ArtifactKind::Screenshot,
                                 "image/png",
                                 false,
+                                2,
                                 details,
                                 cancel,
                             )
                             .await?;
-                        stored.insert(capture.width, summary);
+                        stored.insert(index, summary);
                     }
-                    let mut previews = Vec::with_capacity(3);
-                    let mut images = Vec::with_capacity(3);
-                    let mut media = Vec::with_capacity(6);
+                    let mut previews = Vec::with_capacity(frames.len());
+                    let mut images = Vec::with_capacity(frames.len());
+                    let mut media = Vec::with_capacity(frames.len() * 2);
                     let mut bytes = 0u64;
-                    for width in html::PREVIEW_WIDTHS {
-                        let summary = stored.remove(&width).ok_or_else(|| {
-                            ToolError::execution_failed("preview must contain all three presets")
+                    for (appearance, width, index) in frames {
+                        let summary = stored.remove(&index).ok_or_else(|| {
+                            ToolError::execution_failed(
+                                "preview must contain the complete ordered preset set",
+                            )
                         })?;
                         bytes =
                             bytes.saturating_add(summary.artifact.size_bytes.unwrap_or(u64::MAX));
                         if bytes > browser::SCREENSHOT_BUDGET as u64 {
                             return Err(ToolError::execution_failed(
-                                "three preview images exceed the shared transport budget",
+                                "preview images exceed the shared transport budget",
                             ));
                         }
                         let resolved = self
@@ -216,7 +285,10 @@ impl MessageProcessor {
                                 ToolError::execution_failed("exact preview screenshot unavailable")
                             })?;
                         let details = summary.metadata["htmlTool"]["details"].clone();
-                        if details["width"] != width {
+                        if details["width"] != width
+                            || appearance
+                                .is_some_and(|appearance| details["appearance"] != appearance)
+                        {
                             return Err(ToolError::execution_failed(
                                 "preview screenshot diagnostics are missing",
                             ));
@@ -224,15 +296,26 @@ impl MessageProcessor {
                         let mut preview = details;
                         preview["artifact"] = json!(summary.artifact);
                         previews.push(preview);
-                        media.push(pioneer_provider::MessageContentPart::text(format!(
-                            "HTML preview — {width} CSS px"
-                        )));
+                        let caption = match appearance {
+                            Some(appearance) => {
+                                format!("HTML preview — {appearance} {width} CSS px")
+                            }
+                            None => format!("HTML preview — {width} CSS px"),
+                        };
+                        media.push(pioneer_provider::MessageContentPart::text(caption));
                         media.push(pioneer_provider::MessageContentPart::image(
                             resolved.attachment.clone(),
                         ));
-                        images.push(json!({"width":width,"attachment":resolved.attachment}));
+                        let mut image = json!({"width":width,"attachment":resolved.attachment});
+                        if let Some(appearance) = appearance {
+                            image["appearance"] = appearance.into();
+                        }
+                        images.push(image);
                     }
-                    let value = json!({"source":input.artifact,"previews":previews,"llm_context":{"images":images}});
+                    let mut value = json!({"source":input.artifact,"previews":previews,"llm_context":{"images":images}});
+                    if !legacy {
+                        value["formatVersion"] = 2.into();
+                    }
                     let pioneer_tools::LlmOutputPolicy::Structured { max_bytes } =
                         pioneer_tools::ToolOutputPolicySnapshot::for_tool_name(HTML_PREVIEW).llm
                     else {
@@ -547,13 +630,14 @@ impl MessageProcessor {
         kind: ArtifactKind,
         mime: &str,
         publication: bool,
+        format_version: u32,
         details: Value,
         cancel: &CancellationToken,
     ) -> Result<ArtifactSummary, ToolError> {
         let generation = self.html_authorize(context).await?;
         let identity = html_identity(context, call, index);
         let mut metadata = BTreeMap::new();
-        metadata.insert("htmlTool".into(), json!({"version":1,"publication":publication,"turnId":context.turn_id,"callId":call,"index":index,"title":title,"details":details}));
+        metadata.insert("htmlTool".into(), json!({"version":format_version,"publication":publication,"turnId":context.turn_id,"callId":call,"index":index,"title":title,"details":details}));
         self.artifact_service
             .ingest_tool_bytes(
                 IngestArtifactBytesRequest {
@@ -667,14 +751,9 @@ impl ToolOutput for HtmlOutput {
 /// Theme appears before authored scripts and content. No credentials, source URL,
 /// filesystem access or Gateway/native RPC is injected into the document.
 fn prepared_document(html: &str, dark: bool) -> String {
-    let (background, foreground, muted, border, accent) = if dark {
-        ("#18181b", "#fafafa", "#a1a1aa", "#3f3f46", "#60a5fa")
-    } else {
-        ("#ffffff", "#18181b", "#71717a", "#d4d4d8", "#2563eb")
-    };
+    let theme = theme::standard_theme_css(dark);
     format!(
-        "<!doctype html><meta name=viewport content=\"width=device-width,initial-scale=1\"><style>:root{{color-scheme:{};--pioneer-background:{background};--pioneer-foreground:{foreground};--pioneer-muted:{muted};--pioneer-border:{border};--pioneer-accent:{accent}}}html,body{{margin:0;background:var(--pioneer-background);color:var(--pioneer-foreground)}}</style>{html}",
-        if dark { "dark" } else { "light" }
+        "<!doctype html><meta name=viewport content=\"width=device-width,initial-scale=1\"><style>{theme}html,body{{margin:0;background:var(--pioneer-background);color:var(--pioneer-foreground)}}</style>{html}"
     )
 }
 

@@ -1881,9 +1881,9 @@ fn cli_automatic_orchestration_skills_coexist_with_selected_user_names() {
                         label: Some(format!("tests/{user_name}")),
                     }]
                 );
-                assert_eq!(bindings.len(), 3);
+                assert_eq!(bindings.len(), 4);
                 assert!(bindings.iter().any(|binding| binding.skill_id == user_id && binding.source_kind == "user"));
-                for slug in ["tasks", "subagents"] {
+                for slug in ["tasks", "subagents", "html"] {
                     assert!(
                         bindings
                             .iter()
@@ -1926,12 +1926,13 @@ fn cli_automatic_orchestration_skills_coexist_with_selected_user_names() {
                 let start = &starts[0];
                 let instructions = start.elevated_instructions.text();
                 if kind == CLIAgentRuntimeKind::Claude {
-                    assert!(instructions.contains(&format!("Selected skills:\n- {user_name}\n- pioneer-system-tasks\n- pioneer-system-subagents")),
-                        "application order must retain the user's selected skill before automatic tasks/subagents");
+                    assert!(instructions.contains(&format!("Selected skills:\n- {user_name}\n- pioneer-system-tasks\n- pioneer-system-subagents\n- pioneer-system-html")),
+                        "application order must retain the user's selected skill before automatic system skills");
                 }
                 for name in [
                     "pioneer-system-tasks",
                     "pioneer-system-subagents",
+                    "pioneer-system-html",
                     user_name,
                 ] {
                     assert!(instructions.contains(name), "{kind:?}: {name}");
@@ -2181,10 +2182,10 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
                 .unwrap();
             assert_eq!(
                 skills.len(),
-                2,
-                "orchestration skills are automatic even without user attachments"
+                3,
+                "orchestration and HTML skills are automatic even without user attachments"
             );
-            for slug in ["tasks", "subagents"] {
+            for slug in ["tasks", "subagents", "html"] {
                 assert!(
                     skills
                         .iter()

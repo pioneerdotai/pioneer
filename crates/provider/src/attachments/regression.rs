@@ -1763,10 +1763,19 @@ pub(crate) fn html_preview_fixture(
     let catalog =
         crate::catalog::ModelCatalog::parse(&models.to_string(), &provenance.to_string()).unwrap();
     let state = Arc::new(AdmissionState::for_test(Arc::new(catalog)));
+    let frames = [
+        ("light", 360),
+        ("light", 768),
+        ("light", 1024),
+        ("dark", 360),
+        ("dark", 768),
+        ("dark", 1024),
+    ];
     let mut preview = ChatMessage::tool_result("preview-call", "html_preview", json!({
-        "previews":([360,768,1024].map(|width|json!({"width":width,"diagnostics":["resource load error"],"artifact":{"artifact_id":format!("capture-{width}"),"version_id":format!("version-{width}")}})))
+        "formatVersion":2,
+        "previews":(frames.map(|(appearance,width)|json!({"appearance":appearance,"width":width,"diagnostics":["resource load error"],"artifact":{"artifact_id":format!("capture-{appearance}-{width}"),"version_id":format!("version-{appearance}-{width}")}})))
     }).to_string());
-    for width in [360, 768, 1024] {
+    for (appearance, width) in frames {
         let png = image(image::ImageFormat::Png, width, 8);
         let mut image = match part(InputContentType::Image, "image/png", &png) {
             MessageContentPart::Image { image } => image,
@@ -1774,11 +1783,11 @@ pub(crate) fn html_preview_fixture(
         };
         image.artifact = Some(AttachmentArtifactContext {
             workspace_id: "workspace".into(),
-            artifact_id: format!("capture-{width}"),
-            artifact_version_id: Some(format!("version-{width}")),
+            artifact_id: format!("capture-{appearance}-{width}"),
+            artifact_version_id: Some(format!("version-{appearance}-{width}")),
         });
         preview.content_parts.push(MessageContentPart::text(format!(
-            "HTML preview — {width} CSS px"
+            "HTML preview — {appearance}, {width} CSS px"
         )));
         preview.content_parts.push(MessageContentPart::image(image));
     }

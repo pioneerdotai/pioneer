@@ -114,7 +114,7 @@ impl ToolResultEnvelope {
             return ModelInputItem::tool_result(
                 call_id,
                 tool_name,
-                "HTML preview delivery failed: three exact image parts are required",
+                "HTML preview delivery failed: a complete ordered set of exact image parts are required",
                 Some(
                     serde_json::json!({"error":"preview_image_delivery_failed","tool_outcome":{"status":"failed"}}),
                 ),
@@ -314,12 +314,13 @@ fn attachment_parts_from_llm_context(payload: &JsonValue) -> Vec<MessageContentP
     {
         // A preview is atomic: never turn malformed or truncated references into a
         // successful partial image set. Other attachment tools retain their format.
-        if images.len() != 3 {
+        let Some(layout) = crate::html::preview_image_layout(payload) else {
             return Vec::new();
-        }
-        let mut parts = Vec::with_capacity(6);
-        for (entry, width) in images.iter().zip([360, 768, 1024]) {
-            if entry.get("width").and_then(JsonValue::as_u64) != Some(width) {
+        };
+        let mut parts = Vec::with_capacity(images.len() * 2);
+        let mut identities = std::collections::HashSet::new();
+        for (entry, (appearance, width)) in images.iter().zip(layout) {
+            if entry.get("width").and_then(JsonValue::as_u64) != Some(u64::from(width)) {
                 return Vec::new();
             }
             let Ok(attachment) =
@@ -336,9 +337,21 @@ fn attachment_parts_from_llm_context(payload: &JsonValue) -> Vec<MessageContentP
             {
                 return Vec::new();
             }
-            parts.push(MessageContentPart::text(format!(
-                "HTML preview: {width} CSS px"
-            )));
+            let artifact = attachment
+                .artifact
+                .as_ref()
+                .expect("validated exact artifact");
+            if !identities.insert((
+                artifact.artifact_id.clone(),
+                artifact.artifact_version_id.clone(),
+            )) {
+                return Vec::new();
+            }
+            let caption = match appearance {
+                Some(appearance) => format!("HTML preview: {appearance} {width} CSS px"),
+                None => format!("HTML preview: {width} CSS px"),
+            };
+            parts.push(MessageContentPart::text(caption));
             parts.push(MessageContentPart::image(attachment));
         }
         return parts;
@@ -466,13 +479,89 @@ mod tests {
         serde_json::json!({"llm_context":{"images":images}})
     }
 
+    fn six_preview_payload() -> JsonValue {
+        let images = crate::html::PREVIEW_FRAMES.map(|(appearance, width)| {
+            let mut attachment = MessageAttachment::from_path(
+                format!("/fixture/{appearance}-{width}.png"),
+                "image/png",
+            );
+            attachment.artifact = Some(pioneer_provider::AttachmentArtifactContext {
+                workspace_id: "workspace".into(),
+                artifact_id: format!("{appearance}-{width}"),
+                artifact_version_id: Some(format!("version-{appearance}-{width}")),
+            });
+            serde_json::json!({"appearance":appearance,"width":width,"attachment":attachment})
+        });
+        serde_json::json!({"formatVersion":2,"llm_context":{"images":images}})
+    }
+
+    #[test]
+    fn preview_delivers_six_distinct_ordered_exact_images_and_labels() {
+        let parts = attachment_parts_from_llm_context(&six_preview_payload());
+        assert_eq!(parts.len(), 12);
+        for (pair, (appearance, width)) in parts.chunks_exact(2).zip([
+            ("light", 360),
+            ("light", 768),
+            ("light", 1024),
+            ("dark", 360),
+            ("dark", 768),
+            ("dark", 1024),
+        ]) {
+            assert!(
+                matches!(&pair[0], MessageContentPart::Text { text } if text.contains(appearance) && text.contains(&width.to_string()))
+            );
+            assert!(
+                matches!(&pair[1], MessageContentPart::Image { image } if image.artifact.as_ref().unwrap().artifact_version_id.as_deref() == Some(format!("version-{appearance}-{width}").as_str()))
+            );
+        }
+    }
+
+    #[test]
+    fn versioned_preview_rejects_partial_reordered_repeated_or_unversioned_images() {
+        for fault in 0..5 {
+            let mut payload = six_preview_payload();
+            match fault {
+                0 => {
+                    payload["llm_context"]["images"]
+                        .as_array_mut()
+                        .unwrap()
+                        .pop();
+                }
+                1 => payload["llm_context"]["images"]
+                    .as_array_mut()
+                    .unwrap()
+                    .swap(0, 3),
+                2 => {
+                    payload["llm_context"]["images"][3]["attachment"] =
+                        payload["llm_context"]["images"][0]["attachment"].clone()
+                }
+                3 => {
+                    payload.as_object_mut().unwrap().remove("formatVersion");
+                }
+                _ => {
+                    payload["llm_context"]["images"][0]["attachment"]["artifact"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("artifact_version_id");
+                }
+            }
+            assert!(
+                attachment_parts_from_llm_context(&payload).is_empty(),
+                "fault {fault}"
+            );
+        }
+        let mut old = preview_payload();
+        old["formatVersion"] = 2.into();
+        assert!(attachment_parts_from_llm_context(&old).is_empty());
+    }
+
     #[test]
     fn preview_is_three_ordered_images_with_exact_replay_versions() {
         let parts = attachment_parts_from_llm_context(&preview_payload());
         assert_eq!(parts.len(), 6);
         for (pair, width) in parts.chunks_exact(2).zip([360, 768, 1024]) {
             assert!(
-                matches!(&pair[0],MessageContentPart::Text {text} if text.contains(&width.to_string()))
+                matches!(&pair[0],MessageContentPart::Text {text} if text == &format!("HTML preview: {width} CSS px"))
             );
             assert!(
                 matches!(&pair[1],MessageContentPart::Image {image} if image.artifact.as_ref().unwrap().artifact_version_id.as_deref() == Some(format!("version-{width}").as_str()))

@@ -623,6 +623,21 @@ pub fn compile_prompt(input: PromptCompileInput) -> anyhow::Result<CompiledPromp
         sections.push(build_tool_recovery_policy_section());
     }
 
+    if input.include_html_policy {
+        sections.push(PromptSection {
+            id: PromptSectionId::HtmlPolicy,
+            stability: PromptStability::Dynamic,
+            title: content::SECTION_TITLE_HTML_POLICY.to_owned(),
+            content: if profile == PromptProfile::CliRuntime {
+                content::CLI_HTML_POLICY_PROMPT
+            } else {
+                content::HTML_POLICY_PROMPT
+            }
+            .to_owned(),
+            sources: Vec::new(),
+        });
+    }
+
     if input.include_task_orchestration_policy {
         sections.push(build_subagents_policy_section(
             profile == PromptProfile::CliRuntime,
@@ -761,6 +776,7 @@ mod tests {
             retry_instruction: Some("retry with corrected arguments".to_owned()),
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: true,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -787,6 +803,7 @@ mod tests {
             retry_instruction: Some("retry".to_owned()),
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: true,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -814,6 +831,7 @@ mod tests {
             retry_instruction: Some("retry".to_owned()),
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: true,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -884,6 +902,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: false,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections,
             dynamic_sections: Vec::new(),
@@ -928,6 +947,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: true,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -999,6 +1019,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -1065,6 +1086,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: vec![memory_recall_runtime_section(
                 "Available memory tools: memory_search",
@@ -1106,6 +1128,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: vec![agents_md_runtime_section(
                 "Follow project-specific instructions.",
@@ -1154,6 +1177,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: vec![agents_md_runtime_section("   ", Some(20_000))],
             dynamic_sections: Vec::new(),
@@ -1182,6 +1206,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: vec![agents_md_runtime_section(content.as_str(), Some(25_000))],
             dynamic_sections: Vec::new(),
@@ -1223,6 +1248,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: vec![
                 runtime_dynamic,
@@ -1287,6 +1313,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: vec![dynamic_section(
@@ -1331,6 +1358,7 @@ mod tests {
             retry_instruction: Some("retry".to_owned()),
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: true,
             runtime_sections: vec![memory_recall_runtime_section("memory recall content")],
             dynamic_sections: vec![
@@ -1384,6 +1412,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -1400,6 +1429,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: vec![dynamic_section(
@@ -1435,6 +1465,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: vec![section],
@@ -1464,6 +1495,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: vec![dynamic_section("test.phase10.empty", Some("Empty"), "   ")],
@@ -1490,6 +1522,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: vec![dynamic_section(
@@ -1534,6 +1567,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -1578,6 +1612,7 @@ mod tests {
                 retry_instruction: None,
                 include_tool_recovery_policy: true,
                 include_task_orchestration_policy: false,
+                include_html_policy: false,
                 continue_generation_hint: false,
                 runtime_sections: Vec::new(),
                 dynamic_sections: Vec::new(),
@@ -1625,6 +1660,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -1641,6 +1677,7 @@ mod tests {
             retry_instruction: Some("retry with corrected args".to_owned()),
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: true,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -1672,6 +1709,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -1730,6 +1768,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -1765,6 +1804,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -1802,6 +1842,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -1829,6 +1870,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -1870,6 +1912,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
@@ -1909,6 +1952,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
             dynamic_sections: Vec::new(),
