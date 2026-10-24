@@ -738,12 +738,15 @@ mod tests {
             wait_calls: AtomicUsize::new(0),
             gateway_only_secret: SECRET_CANARY.to_owned(),
         });
-        let facade = CliMcpToolFacade::new(
+        let facade = CliMcpToolFacade::try_new(
             coordinator.clone(),
             invoker.clone(),
             facade_projection,
             Arc::new(super::super::facade::CliMcpNoopProgressSink),
-        );
+            CliMcpFacadeLimits::default(),
+            super::super::facade::CliMcpCallContract::Codex,
+        )
+        .expect("facade");
         let context = CliMcpFacadeRequestContext {
             bound_grant: bound,
             projection_generation: projection_reservation.generation,

@@ -3365,8 +3365,7 @@ impl OpenCodeRequiredMcpBridge {
             )
             .await
             .map_err(|error| anyhow!("failed to activate OpenCode MCP turn: {error:?}"))?;
-        self.native_items
-            .activate_scope(native_thread_id, native_turn_id);
+        self.native_items.clear();
         handle
             .set_activation(Some(turn.activation_generation))
             .await;
@@ -3397,7 +3396,6 @@ impl OpenCodeRequiredMcpBridge {
             .await
             .map_err(|error| anyhow!("failed to terminalize OpenCode MCP turn: {error:?}"))?;
         handle.set_activation(None).await;
-        self.native_items.deactivate_scope();
         Ok(())
     }
 }
@@ -3602,7 +3600,7 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
                     provider_contract_fingerprint: prepared.provider_contract_fingerprint,
                     isolation_contract_fingerprint: prepared.isolation_contract_fingerprint,
                     invoker: self.turn_mcp_invoker.clone(),
-                    native_items: Arc::new(NativeMcpCorrelationLedger::scoped()),
+                    native_items: Arc::new(NativeMcpCorrelationLedger::default()),
                     facade_limits: self.mcp_limits.facade_limits(),
                     state: Mutex::new(OpenCodeRequiredMcpBridgeState::Pending),
                 });

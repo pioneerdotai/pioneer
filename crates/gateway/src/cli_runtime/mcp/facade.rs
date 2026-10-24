@@ -303,7 +303,7 @@ struct CliMcpLedgerKey {
 struct CliMcpLedgerIdentity {
     callable: String,
     arguments_hash: String,
-    native_call: Option<NativeMcpCallIdentity>,
+    native_call: NativeMcpCallIdentity,
 }
 
 type CliMcpCachedOutcome = Result<JsonValue, FacadeProtocolError>;
@@ -542,10 +542,9 @@ struct ParsedRequest {
 }
 
 /// Selected at adapter construction; instance names and request data do not
-/// select the provider. Legacy is reserved for uncorrelated protocol fixtures.
+/// select the provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CliMcpCallContract {
-    Legacy,
     Codex,
     Claude,
     OpenCode,
@@ -566,24 +565,6 @@ pub(crate) struct CliMcpToolFacade {
 }
 
 impl CliMcpToolFacade {
-    #[cfg(test)]
-    pub(crate) fn new(
-        coordinator: Arc<CliMcpCoordinator>,
-        invoker: Arc<dyn TurnMcpInvoker>,
-        projection: CliMcpFacadeProjection,
-        progress_sink: Arc<dyn CliMcpProgressSink>,
-    ) -> Arc<Self> {
-        Self::try_new(
-            coordinator,
-            invoker,
-            projection,
-            progress_sink,
-            CliMcpFacadeLimits::default(),
-            CliMcpCallContract::Legacy,
-        )
-        .expect("default CLI MCP facade limits must be valid")
-    }
-
     pub(crate) fn try_new(
         coordinator: Arc<CliMcpCoordinator>,
         invoker: Arc<dyn TurnMcpInvoker>,
@@ -895,9 +876,7 @@ impl CliMcpToolFacade {
         if !arguments.is_object() {
             return Err(invalid_params());
         }
-        let admission_deadline = native_call
-            .as_ref()
-            .map(|_| tokio::time::Instant::now() + self.limits.max_queue_wait);
+        let admission_deadline = tokio::time::Instant::now() + self.limits.max_queue_wait;
         let progress_token = parse_progress_token(params.get("_meta"))?;
         let cancellation = authorization.cancellation.child_token();
         let process_instance = &context.bound_grant.scope().process_instance;
@@ -958,8 +937,8 @@ impl CliMcpToolFacade {
         name: &str,
         arguments: JsonValue,
         progress_token: Option<JsonValue>,
-        native_call: Option<NativeMcpCallIdentity>,
-        admission_deadline: Option<tokio::time::Instant>,
+        native_call: NativeMcpCallIdentity,
+        admission_deadline: tokio::time::Instant,
         thread_id: String,
         turn_id: String,
         cancellation: CancellationToken,
@@ -980,17 +959,13 @@ impl CliMcpToolFacade {
                     total: 1.0,
                     message: "MCP tool call started",
                 });
-            let sent = if let Some(deadline) = admission_deadline {
-                tokio::select! {
-                    biased;
-                    () = cancellation.cancelled() => return Err(cancelled_error()),
-                    result = tokio::time::timeout_at(deadline, send) => match result {
-                        Ok(result) => result.is_ok(),
-                        Err(_) => return Err(admission_timeout_error()),
-                    }
+            let sent = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(cancelled_error()),
+                result = tokio::time::timeout_at(admission_deadline, send) => match result {
+                    Ok(result) => result.is_ok(),
+                    Err(_) => return Err(admission_timeout_error()),
                 }
-            } else {
-                matches!(timeout(self.limits.max_queue_wait, send).await, Ok(Ok(())))
             };
             if !sent {
                 cancellation.cancel();
@@ -1010,8 +985,8 @@ impl CliMcpToolFacade {
             runtime_id: Some(process_instance.key().runtime_id.clone()),
             session_generation: Some(process_instance.generation()),
             provider_call_id: request_id.provider_call_id(),
-            native_call,
-            admission_deadline,
+            native_call: Some(native_call),
+            admission_deadline: Some(admission_deadline),
             canonical_callable_name: name.to_owned(),
             arguments,
             origin: TurnMcpInvocationOrigin::CliFacade,
@@ -1046,7 +1021,7 @@ impl CliMcpToolFacade {
     async fn acquire_call_permit(
         &self,
         cancellation: &CancellationToken,
-        admission_deadline: Option<tokio::time::Instant>,
+        admission_deadline: tokio::time::Instant,
     ) -> Result<OwnedSemaphorePermit, FacadeProtocolError> {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(shutting_down_error());
@@ -1064,15 +1039,10 @@ impl CliMcpToolFacade {
         tokio::select! {
             biased;
             () = cancellation.cancelled() => Err(cancelled_error()),
-            outcome = tokio::time::timeout_at(admission_deadline.unwrap_or_else(|| tokio::time::Instant::now() + self.limits.max_queue_wait), acquire) => match outcome {
+            outcome = tokio::time::timeout_at(admission_deadline, acquire) => match outcome {
                 Ok(Ok(permit)) => Ok(permit),
                 Ok(Err(_)) => Err(shutting_down_error()),
-                Err(_) if admission_deadline.is_some() => Err(admission_timeout_error()),
-                Err(_) => Err(FacadeProtocolError::new(
-                    FACADE_BUSY,
-                    "MCP tool call queue wait limit was exceeded",
-                    "queue_wait_timed_out",
-                )),
+                Err(_) => Err(admission_timeout_error()),
             }
         }
     }
@@ -1317,7 +1287,7 @@ fn parse_native_call(
     wire_arguments: JsonValue,
     native_thread: &str,
     native_turn: &str,
-) -> Result<(JsonValue, Option<NativeMcpCallIdentity>), FacadeProtocolError> {
+) -> Result<(JsonValue, NativeMcpCallIdentity), FacadeProtocolError> {
     let invalid = || {
         FacadeProtocolError::new(
             INVALID_PARAMS,
@@ -1339,7 +1309,6 @@ fn parse_native_call(
             .ok_or_else(invalid)
     };
     let (arguments, item) = match contract {
-        CliMcpCallContract::Legacy => return Ok((wire_arguments, None)),
         CliMcpCallContract::Codex => {
             let identity = parse_codex_native_call(meta)?;
             if identity.native_thread_id != native_thread {
@@ -1348,7 +1317,7 @@ fn parse_native_call(
                     "Codex MCP request belongs to a different native thread",
                 )));
             }
-            return Ok((wire_arguments, Some(identity)));
+            return Ok((wire_arguments, identity));
         }
         CliMcpCallContract::Claude => {
             let meta = meta.and_then(JsonValue::as_object).ok_or_else(invalid)?;
@@ -1384,11 +1353,11 @@ fn parse_native_call(
     };
     Ok((
         arguments,
-        Some(NativeMcpCallIdentity {
+        NativeMcpCallIdentity {
             native_thread_id: native_thread.into(),
             native_turn_id: native_turn.into(),
             native_item_id: item,
-        }),
+        },
     ))
 }
 
@@ -1741,7 +1710,8 @@ mod tests {
         CliMcpFacadeRequestContext,
         Arc<CliMcpCoordinator>,
     ) {
-        fixture_with_runtime(tools, invoker, limits, "codex").await
+        // Shared facade cases use Claude metadata independently of the instance name.
+        fixture_with_runtime(tools, invoker, limits, "codex", CliMcpCallContract::Claude).await
     }
 
     async fn fixture_with_runtime(
@@ -1749,6 +1719,7 @@ mod tests {
         invoker: Arc<dyn TurnMcpInvoker>,
         limits: CliMcpFacadeLimits,
         runtime_id: &str,
+        contract: CliMcpCallContract,
     ) -> (
         Arc<CliMcpToolFacade>,
         CliMcpFacadeRequestContext,
@@ -1785,7 +1756,7 @@ mod tests {
             projection,
             Arc::new(CliMcpNoopProgressSink),
             limits,
-            CliMcpCallContract::Legacy,
+            contract,
         )
         .expect("facade");
         (
@@ -1852,7 +1823,10 @@ mod tests {
             "jsonrpc": "2.0",
             "id": id,
             "method": "tools/call",
-            "params": {"name": "read", "arguments": arguments}
+            "params": {
+                "name": "read", "arguments": arguments,
+                "_meta": {"claudecode/toolUseId": format!("toolu_{id}")}
+            }
         })
     }
 
@@ -1946,7 +1920,9 @@ mod tests {
                 &context,
                 json!({
                     "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                    "params": {"name": "read", "arguments": {}}
+                    "params": {"name": "read", "arguments": {},
+                        "_meta": {"claudecode/toolUseId": "toolu_inactive"}
+                    }
                 }),
             )
             .await
@@ -2001,7 +1977,9 @@ mod tests {
                 &context,
                 json!({
                     "jsonrpc": "2.0", "id": "call-1", "method": "tools/call",
-                    "params": {"name": "read", "arguments": {"key": "value"}}
+                    "params": {"name": "read", "arguments": {"key": "value"},
+                        "_meta": {"claudecode/toolUseId": "toolu_call-1"}
+                    }
                 }),
             )
             .await
@@ -2060,7 +2038,9 @@ mod tests {
                 &context,
                 json!({
                     "jsonrpc": "2.0", "id": "child-call", "method": "tools/call",
-                    "params": {"name": "read", "arguments": {}}
+                    "params": {"name": "read", "arguments": {},
+                        "_meta": {"claudecode/toolUseId": "toolu_child-call"}
+                    }
                 }),
             )
             .await
@@ -2542,7 +2522,7 @@ mod tests {
                 }),
                 json!({"ai.opencode/sessionID": "native-thread-turn"}),
             ),
-            CliMcpCallContract::Legacy | CliMcpCallContract::Codex => unreachable!(),
+            CliMcpCallContract::Codex => unreachable!(),
         };
         json!({"jsonrpc":"2.0", "id":rpc, "method":"tools/call", "params":{"name":"read", "arguments":arguments, "_meta":meta}})
     }
@@ -2568,21 +2548,15 @@ mod tests {
             recording.clone(),
             limits,
             runtime_id,
+            contract,
         )
         .await;
         let items = match contract {
             CliMcpCallContract::Claude => ExactItems::Claude(Arc::default()),
-            CliMcpCallContract::OpenCode => {
-                let ledger = Arc::new(
-                    super::super::native_correlation::NativeMcpCorrelationLedger::scoped(),
-                );
-                ledger.activate_scope("native-thread-turn", "native-turn-turn");
-                ExactItems::OpenCode(ledger)
-            }
-            CliMcpCallContract::Legacy | CliMcpCallContract::Codex => unreachable!(),
+            CliMcpCallContract::OpenCode => ExactItems::OpenCode(Arc::default()),
+            CliMcpCallContract::Codex => unreachable!(),
         };
         let facade_mut = Arc::get_mut(&mut facade).unwrap();
-        facade_mut.call_contract = contract;
         facade_mut.invoker = items.invoker(
             recording.clone(),
             coordinator.clone(),
@@ -3167,11 +3141,11 @@ mod tests {
                 recording.clone(),
                 limits,
                 runtime_id,
+                CliMcpCallContract::Codex,
             )
             .await;
             let items = Arc::new(NativeMcpCorrelationLedger::default());
             let facade_mut = Arc::get_mut(&mut facade).unwrap();
-            facade_mut.call_contract = CliMcpCallContract::Codex;
             facade_mut.invoker = Arc::new(CorrelatingTurnMcpInvoker {
                 inner: recording.clone(),
                 native_items: items.clone(),

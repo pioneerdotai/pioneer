@@ -15,6 +15,7 @@ use crate::cli_runtime::continuation::{
 };
 use crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions;
 use crate::cli_runtime::mcp::conformance::run_cli_mcp_bridge_conformance;
+use crate::cli_runtime::mcp::facade::CliMcpCallContract;
 use crate::cli_runtime::permissions::{
     ClaudeMcpPermissionFallbackDecision, claude_mcp_permission_fallback_response,
 };
@@ -394,7 +395,7 @@ pub async fn run_claude_mcp_deterministic_conformance() -> Result<ClaudeMcpDeter
         native_timeline_deduplicated,
         "Claude replay fixture no longer proves canonical item deduplication"
     );
-    let bridge = run_cli_mcp_bridge_conformance("claude").await?;
+    let bridge = run_cli_mcp_bridge_conformance("claude", CliMcpCallContract::Claude).await?;
     let bridge_cleanup_complete = bridge.grant_revoked_on_eof && bridge.artifacts_removed;
 
     Ok(ClaudeMcpDeterministicEvidence {
