@@ -145,3 +145,15 @@ Production resolver, converter, storage formats, installer/restore/reconcile и 
 Фактически выполнены чтение через `cat`/`sed`, поиск через `rg`, `git status --short`, `git branch --show-current`, `git rev-parse HEAD`, `git worktree list`, просмотр `git diff` (включая `--stat`/`--numstat`), сравнение production-региона с исходным commit через `cmp`, SHA-256 через `shasum -a 256`, `cargo fmt --all --check` и `git diff --check`. Проверки форматирования и whitespace завершились с кодом 0; production-регион побайтно совпал с исходным commit. Форматирование выполнялось только в check-режиме. Commit создаётся с `core.hooksPath=/dev/null` и `commit.gpgsign=false`.
 
 Тесты, cargo check, компиляция, сборки, приложение, Gateway, CLI-агенты и генераторы не запускались, в том числе через scripts/hooks. Компиляция и прохождение тестов не подтверждены. Merge, push и deploy не выполнялись. Это передача на повторное внешнее ревью; выполнение кода требует отдельного разрешения пользователя после внешней приёмки.
+
+## Коррекция P3: workflow чтения сохранённого результата
+
+Продолжение с проверенного HEAD `8ad7d41ce8d001105e5534d50bf4109bd2b60952`, ветка и worktree прежние. Начальное дерево чистое, применимые AGENTS.md прочитаны. Изменены только один абзац Read A Saved Search Page Or Tool Result в `resources/skills/pioneer/threads/references/workflows.md` и этот отчёт.
+
+Сборка одного JSON до EOF теперь явно относится к `output_log:false` или отсутствующему `output_log`. Для `output_log:true` описаны отдельные JSON-записи и сборка фрагментов одной записи перед её разбором; EOF текущего журнала не подтверждает завершение команды. Добавлена ссылка на уже исправленный Saved Tool Result Reader в `tool-schemas.md`. Различие reader.next и search.nextCursor и исходные параметры поиска сохранены.
+
+Статический самоаудит: workflow сверен с `tool-schemas.md`, `ThreadToolResultReadParams`/`ThreadToolResultCursor`, `read_thread_tool_result_with_cursor` и `read_thread_tool_output_log` в `gateway/src/message/thread_tool_results.rs`. Проверены default false, сборка обычного результата, постраничное чтение отдельной записи журнала и переход к следующей записи. Весь собственный diff перечитан; production-код, тесты, schemas, зависимости, права и Tasks/Subagents не изменены.
+
+Фактически выполнены чтение/поиск через `cat`, `sed`, `tail`, `rg`; проверка `git status --short`, `git branch --show-current`, `git rev-parse HEAD`, `git worktree list`; просмотр `git diff` и `git diff --stat`; `git diff --check` и `git diff --cached --check` без ошибок. Commit создаётся с `core.hooksPath=/dev/null` и `commit.gpgsign=false`. Cargo-команды для этой документационной коррекции не запускались.
+
+Тесты, cargo check/build/test/nextest/clippy/run, компиляция, сборки, приложение, Gateway, CLI-агенты и генераторы не запускались, в том числе косвенно через scripts/hooks. Компиляция и прохождение тестов не подтверждены. Основной checkout и соседние worktree не изменялись; merge, push и deploy не выполнялись. Коррекция передаётся на повторное внешнее ревью.

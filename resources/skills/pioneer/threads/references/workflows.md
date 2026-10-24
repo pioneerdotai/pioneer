@@ -50,7 +50,7 @@ Follow pagination as needed and open only relevant histories. Descendant discove
 
 ## Read A Saved Search Page Or Tool Result
 
-Use the response's actual full-result reference as `threads_tools_result_read` input. Preserve snake_case fields and optional output_log. Append exact response `text` and pass response `next` as the next reader `cursor` until eof. Decode the assembled saved result, respecting its actual wrapper. If it contains a search page with nextCursor, call threads_search with that cursor and original query/limit for the next search page. Do not confuse reading the rest of one saved page with requesting more search results.
+Use the response's actual full-result reference as `threads_tools_result_read` input. Preserve snake_case fields and optional `output_log`; pass the reader's `next` as the next reader `cursor`. With `output_log:false` or omitted, append exact response `text` until `eof:true`, then decode the assembled saved JSON, respecting its actual wrapper. With `output_log:true`, read separate JSON log records: assemble any fragments of one record before parsing it, and parse each record separately rather than the whole log as one JSON document. EOF refers to the currently saved log and does not itself confirm command completion. See [Saved Tool Result Reader](tool-schemas.md#saved-tool-result-reader). If the decoded saved result contains a search page with `nextCursor`, call `threads_search` with that cursor and the original query/limit for the next search page. The reader's `next` continues saved text; the search page's `nextCursor` continues search results. Do not confuse reading the rest of one saved page with requesting more search results.
 
 ## Create A Conversation
 
