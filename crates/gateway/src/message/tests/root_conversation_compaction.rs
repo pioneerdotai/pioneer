@@ -1518,6 +1518,19 @@ async fn real_composer_native_start_preempts_background_owned_by_the_visible_roo
         crud_store: store,
         workspace_id: workspace,
     };
+    // review_enabled_processor defaults to echo, while this registry exposes
+    // summary-capture. Admit the actual root summarizer before testing preemption.
+    harness
+        .processor
+        .apply_compaction_settings(pioneer_compaction::CompactionSettings {
+            selection: Some(pioneer_compaction::ModelSelection {
+                transport: pioneer_compaction::Transport::Api,
+                instance: "summary-capture".into(),
+                model: "test-model".into(),
+                effort: None,
+            }),
+        })
+        .unwrap();
     enable_worker(&harness).await;
     harness.processor.bind_task_bridge().await;
     let started = harness

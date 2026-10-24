@@ -2,7 +2,7 @@
 use sea_orm::ConnectionTrait;
 use sea_orm_migration::{
     prelude::*,
-    sea_query::{ExprTrait, IndexOrder, PostgresQueryBuilder},
+    sea_query::{ExprTrait, IndexOrder},
 };
 
 // Frozen migration identifiers: never import runtime entities or policy helpers.
@@ -43,34 +43,6 @@ enum Schema {
     Present,
     ProjectionRevision,
     Revision,
-}
-
-// Keep exactly the expression used by the publication trigger's millis().
-fn millis_expr() -> Expr {
-    let seconds = Func::cust(Alias::new("strftime"))
-        .args([Expr::val("%s"), Expr::col(Schema::CreatedAt)])
-        .cast_as(Alias::new("INTEGER"));
-    let fraction =
-        Func::cust(Alias::new("strftime")).args([Expr::val("%f"), Expr::col(Schema::CreatedAt)]);
-    let milliseconds = Func::cust(Alias::new("substr"))
-        .args([fraction.into(), Expr::val(4), Expr::val(3)])
-        .cast_as(Alias::new("INTEGER"));
-    seconds.mul(1000).add(milliseconds)
-}
-
-async fn create_expression_index(
-    manager: &SchemaManager<'_>,
-    index: IndexCreateStatement,
-) -> Result<(), DbErr> {
-    // SeaQuery 1.0.2 SQLite's inherited IndexBuilder panics on IndexColumn::Expr.
-    // As in the inbox migration, PostgreSQL renders this restricted AST with
-    // SQLite-compatible quoting, CAST, functions, ordering and partial predicate.
-    // The whole statement stays builder-owned; no SQL templates or rewriting.
-    manager
-        .get_connection()
-        .execute_unprepared(&index.to_string(PostgresQueryBuilder))
-        .await?;
-    Ok(())
 }
 
 #[derive(DeriveMigrationName)]
@@ -278,8 +250,11 @@ impl MigrationTrait for Migration {
         } else {
             "task_delivery"
         };
-        // Current publication looks up its exact completion event, never old
-        // conversation activity. Keep the ordered per-turn event index.
+        // Current publication seeks only this turn's completion events. Keep
+        // index keys as columns: sqlite-zstd cannot introspect expression keys
+        // when subsequently enabling payload compression. The trigger still
+        // orders this exact subset by original epoch milliseconds, so timezone
+        // offsets never make lexical created_at order authoritative.
         let event_storage = if manager.has_table("_turn_event_zstd").await? {
             "_turn_event_zstd"
         } else {
@@ -300,19 +275,19 @@ impl MigrationTrait for Migration {
         } else {
             Schema::TurnItem
         };
-        create_expression_index(
-            manager,
-            Index::create()
-                .if_not_exists()
-                .name("compaction_root_completion_event")
-                .table(event_table)
-                .col(Schema::TurnId)
-                .col(Schema::EventType)
-                .col((millis_expr(), IndexOrder::Desc))
-                .col((Schema::Id, IndexOrder::Desc))
-                .to_owned(),
-        )
-        .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("compaction_root_completion_event")
+                    .table(event_table)
+                    .col(Schema::TurnId)
+                    .col(Schema::EventType)
+                    .col((Schema::CreatedAt, IndexOrder::Desc))
+                    .col((Schema::Id, IndexOrder::Desc))
+                    .to_owned(),
+            )
+            .await?;
         manager
             .create_index(
                 Index::create()

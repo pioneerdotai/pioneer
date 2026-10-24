@@ -80681,24 +80681,19 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
         let thread_id = "creation-order";
         let historical_turn = "creation-history";
         let current_turn = "creation-current";
-        for (turn_id, input) in [
-            (historical_turn, "initial input"),
-            (current_turn, "current input marker"),
-        ] {
-            store
-                .materialize_turn_start(
-                    &phase_13_test_thread(workspace, thread_id, phase_13_now_secs()),
-                    SandboxMode::FullAccess,
-                    &phase_13_turn(turn_id, TurnStatus::InProgress),
-                    &[UserInput::Text {
-                        text: input.into(),
-                        text_elements: vec![],
-                    }],
-                    pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
-                )
-                .await
-                .unwrap();
-        }
+        store
+            .materialize_turn_start(
+                &phase_13_test_thread(workspace, thread_id, phase_13_now_secs()),
+                SandboxMode::FullAccess,
+                &phase_13_turn(historical_turn, TurnStatus::InProgress),
+                &[UserInput::Text {
+                    text: "initial input".into(),
+                    text_elements: vec![],
+                }],
+                pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
+            )
+            .await
+            .unwrap();
         let call = ChatMessage::assistant_tool_calls(
             Some("call order marker"),
             vec![ProviderToolCall {
@@ -80815,6 +80810,22 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
                 &phase_13_turn("creation-middle", TurnStatus::InProgress),
                 &[UserInput::Text {
                     text: format!("middle order marker {}", "middle detail ".repeat(12_000)),
+                    text_elements: vec![],
+                }],
+                pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
+            )
+            .await
+            .unwrap();
+        // Accept the current request last: a later principal input would
+        // correctly Stop it. Saved source times below still interleave its
+        // input with the historical round and middle turn.
+        store
+            .materialize_turn_start(
+                &phase_13_test_thread(workspace, thread_id, phase_13_now_secs()),
+                SandboxMode::FullAccess,
+                &phase_13_turn(current_turn, TurnStatus::InProgress),
+                &[UserInput::Text {
+                    text: "current input marker".into(),
                     text_elements: vec![],
                 }],
                 pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),

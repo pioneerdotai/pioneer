@@ -181,6 +181,9 @@ async fn lifecycle_claim_and_deferral_failure_keeps_batch_progress_history_poll_
             .unwrap(),
         poison
     );
+    // The independent root job may still own the same coordinator key. Join
+    // its cancellation before checking lifecycle progress on that key.
+    processor.suspend_completed_history_checks().await;
     // Move only this existing scheduling deadline to its expiry, without sleep.
     *processor.compaction_lifecycle_not_before.write().unwrap() = Some(tokio::time::Instant::now());
     processor.poll_completed_history_checks().await.unwrap();

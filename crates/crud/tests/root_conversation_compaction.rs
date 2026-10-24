@@ -178,6 +178,14 @@ async fn policy_upgrade_preserves_execution_intents_and_root_publication_survive
     db.execute_unprepared("DROP TRIGGER reject_root_debt")
         .await
         .unwrap();
+    // The canonical append survived the failed projection. Retry its saved
+    // projection through the durable replay owner, preserving original time.
+    let replayed = store
+        .replay_due_turn_event_projections(READY + 30, 10)
+        .await
+        .unwrap();
+    assert_eq!(replayed.projected, 1);
+    assert_eq!(replayed.failed, 0);
     complete(&store, "root", "human", READY).await;
     let due = store.compaction_pending_history_checks().await.unwrap();
     assert_eq!(due.len(), 1);
