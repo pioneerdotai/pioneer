@@ -91,6 +91,7 @@ impl CliMcpBridgeFacadeServer {
         projection_generation: CliMcpProjectionGeneration,
         projection: CliMcpFacadeProjection,
         limits: CliMcpFacadeLimits,
+        call_contract: super::facade::CliMcpCallContract,
     ) -> Result<(CliMcpBridgeFacadeHandle, Self), CliMcpFacadeConfigurationError> {
         let channel_capacity = limits
             .max_ledger_entries
@@ -104,6 +105,7 @@ impl CliMcpBridgeFacadeServer {
                 outbound: outbound_sender.clone(),
             }),
             limits.clone(),
+            call_contract,
         )?;
         let context = Arc::new(CliMcpBridgeFacadeContext {
             bound_grant: transport.bound_grant().clone(),
@@ -506,6 +508,7 @@ mod tests {
             reservation.generation,
             projection,
             CliMcpFacadeLimits::default(),
+            super::super::facade::CliMcpCallContract::Legacy,
         )
         .expect("server");
         let server = tokio::spawn(server.run());

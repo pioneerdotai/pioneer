@@ -35,6 +35,14 @@ impl TurnMcpInvocationOrigin {
     }
 }
 
+/// Native identity captured by the managed CLI adapter, never from model input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeMcpCallIdentity {
+    pub(crate) native_thread_id: String,
+    pub(crate) native_turn_id: String,
+    pub(crate) native_item_id: String,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TurnMcpInvocation {
     pub(crate) workspace_id: String,
@@ -43,6 +51,9 @@ pub(crate) struct TurnMcpInvocation {
     pub(crate) runtime_id: Option<String>,
     pub(crate) session_generation: Option<u64>,
     pub(crate) provider_call_id: String,
+    pub(crate) native_call: Option<NativeMcpCallIdentity>,
+    /// Admission only, not the lifetime of an admitted tool execution.
+    pub(crate) admission_deadline: Option<tokio::time::Instant>,
     pub(crate) canonical_callable_name: String,
     pub(crate) arguments: JsonValue,
     pub(crate) origin: TurnMcpInvocationOrigin,

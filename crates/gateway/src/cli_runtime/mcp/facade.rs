@@ -8,8 +8,8 @@ use super::limits::{
     RESPONSE_ENVELOPE_RESERVE_BYTES,
 };
 use crate::turn_mcp::invoker::{
-    TurnMcpInvocation, TurnMcpInvocationError, TurnMcpInvocationErrorCode, TurnMcpInvocationOrigin,
-    TurnMcpInvoker,
+    NativeMcpCallIdentity, TurnMcpInvocation, TurnMcpInvocationError, TurnMcpInvocationErrorCode,
+    TurnMcpInvocationOrigin, TurnMcpInvoker,
 };
 use crate::turn_mcp::result::CanonicalMcpToolResult;
 use async_trait::async_trait;
@@ -303,6 +303,7 @@ struct CliMcpLedgerKey {
 struct CliMcpLedgerIdentity {
     callable: String,
     arguments_hash: String,
+    native_call: Option<NativeMcpCallIdentity>,
 }
 
 type CliMcpCachedOutcome = Result<JsonValue, FacadeProtocolError>;
@@ -540,9 +541,19 @@ struct ParsedRequest {
     params: Option<JsonValue>,
 }
 
+/// Selected at adapter construction; instance names and request data do not
+/// select the provider. Legacy keeps the existing Codex contract unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CliMcpCallContract {
+    Legacy,
+    Claude,
+    OpenCode,
+}
+
 pub(crate) struct CliMcpToolFacade {
     coordinator: Arc<CliMcpCoordinator>,
     invoker: Arc<dyn TurnMcpInvoker>,
+    call_contract: CliMcpCallContract,
     projection: CliMcpFacadeProjection,
     progress_sink: Arc<dyn CliMcpProgressSink>,
     limits: CliMcpFacadeLimits,
@@ -567,6 +578,7 @@ impl CliMcpToolFacade {
             projection,
             progress_sink,
             CliMcpFacadeLimits::default(),
+            CliMcpCallContract::Legacy,
         )
         .expect("default CLI MCP facade limits must be valid")
     }
@@ -577,6 +589,7 @@ impl CliMcpToolFacade {
         projection: CliMcpFacadeProjection,
         progress_sink: Arc<dyn CliMcpProgressSink>,
         limits: CliMcpFacadeLimits,
+        call_contract: CliMcpCallContract,
     ) -> Result<Arc<Self>, CliMcpFacadeConfigurationError> {
         limits
             .validate()
@@ -593,6 +606,7 @@ impl CliMcpToolFacade {
         Ok(Arc::new(Self {
             coordinator,
             invoker,
+            call_contract,
             projection,
             progress_sink,
             ledger: Arc::new(CliMcpInvocationLedger::new(&limits)),
@@ -866,13 +880,23 @@ impl CliMcpToolFacade {
                 "tasks_not_supported",
             ));
         }
-        let arguments = params
+        let wire_arguments = params
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
+        let (arguments, native_call) = parse_native_call(
+            self.call_contract,
+            params.get("_meta"),
+            wire_arguments,
+            &authorization.native_thread_id,
+            &authorization.native_turn_id,
+        )?;
         if !arguments.is_object() {
             return Err(invalid_params());
         }
+        let admission_deadline = native_call
+            .as_ref()
+            .map(|_| tokio::time::Instant::now() + self.limits.max_queue_wait);
         let progress_token = parse_progress_token(params.get("_meta"))?;
         let cancellation = authorization.cancellation.child_token();
         let process_instance = &context.bound_grant.scope().process_instance;
@@ -884,6 +908,7 @@ impl CliMcpToolFacade {
         let identity = CliMcpLedgerIdentity {
             callable: name.to_owned(),
             arguments_hash: json_fingerprint(&arguments)?,
+            native_call: native_call.clone(),
         };
         let leader = match self.ledger.begin(key, identity, cancellation.clone()) {
             Ok(CliMcpLedgerBegin::Follower(receiver)) => {
@@ -913,6 +938,8 @@ impl CliMcpToolFacade {
                 name,
                 arguments,
                 progress_token,
+                native_call,
+                admission_deadline,
                 authorization.thread_id,
                 authorization.turn_id,
                 cancellation,
@@ -930,37 +957,48 @@ impl CliMcpToolFacade {
         name: &str,
         arguments: JsonValue,
         progress_token: Option<JsonValue>,
+        native_call: Option<NativeMcpCallIdentity>,
+        admission_deadline: Option<tokio::time::Instant>,
         thread_id: String,
         turn_id: String,
         cancellation: CancellationToken,
     ) -> Result<JsonValue, FacadeProtocolError> {
-        let _permit = self.acquire_call_permit(&cancellation).await?;
+        let _permit = self
+            .acquire_call_permit(&cancellation, admission_deadline)
+            .await?;
         if cancellation.is_cancelled() {
             return Err(cancelled_error());
         }
 
-        if let Some(progress_token) = progress_token.clone()
-            && !matches!(
-                timeout(
-                    self.limits.max_queue_wait,
-                    self.progress_sink
-                        .send_progress(CliMcpProgressNotification {
-                            progress_token,
-                            progress: 0.0,
-                            total: 1.0,
-                            message: "MCP tool call started",
-                        })
-                )
-                .await,
-                Ok(Ok(()))
-            )
-        {
-            cancellation.cancel();
-            return Err(FacadeProtocolError::new(
-                INTERNAL_ERROR,
-                "failed to send MCP progress",
-                "progress_transport_failed",
-            ));
+        if let Some(progress_token) = progress_token.clone() {
+            let send = self
+                .progress_sink
+                .send_progress(CliMcpProgressNotification {
+                    progress_token,
+                    progress: 0.0,
+                    total: 1.0,
+                    message: "MCP tool call started",
+                });
+            let sent = if let Some(deadline) = admission_deadline {
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => return Err(cancelled_error()),
+                    result = tokio::time::timeout_at(deadline, send) => match result {
+                        Ok(result) => result.is_ok(),
+                        Err(_) => return Err(admission_timeout_error()),
+                    }
+                }
+            } else {
+                matches!(timeout(self.limits.max_queue_wait, send).await, Ok(Ok(())))
+            };
+            if !sent {
+                cancellation.cancel();
+                return Err(FacadeProtocolError::new(
+                    INTERNAL_ERROR,
+                    "failed to send MCP progress",
+                    "progress_transport_failed",
+                ));
+            }
         }
 
         let process_instance = &context.bound_grant.scope().process_instance;
@@ -971,6 +1009,8 @@ impl CliMcpToolFacade {
             runtime_id: Some(process_instance.key().runtime_id.clone()),
             session_generation: Some(process_instance.generation()),
             provider_call_id: request_id.provider_call_id(),
+            native_call,
+            admission_deadline,
             canonical_callable_name: name.to_owned(),
             arguments,
             origin: TurnMcpInvocationOrigin::CliFacade,
@@ -1005,6 +1045,7 @@ impl CliMcpToolFacade {
     async fn acquire_call_permit(
         &self,
         cancellation: &CancellationToken,
+        admission_deadline: Option<tokio::time::Instant>,
     ) -> Result<OwnedSemaphorePermit, FacadeProtocolError> {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(shutting_down_error());
@@ -1022,9 +1063,10 @@ impl CliMcpToolFacade {
         tokio::select! {
             biased;
             () = cancellation.cancelled() => Err(cancelled_error()),
-            outcome = timeout(self.limits.max_queue_wait, acquire) => match outcome {
+            outcome = tokio::time::timeout_at(admission_deadline.unwrap_or_else(|| tokio::time::Instant::now() + self.limits.max_queue_wait), acquire) => match outcome {
                 Ok(Ok(permit)) => Ok(permit),
                 Ok(Err(_)) => Err(shutting_down_error()),
+                Err(_) if admission_deadline.is_some() => Err(admission_timeout_error()),
                 Err(_) => Err(FacadeProtocolError::new(
                     FACADE_BUSY,
                     "MCP tool call queue wait limit was exceeded",
@@ -1145,6 +1187,13 @@ fn json_fingerprint(value: &JsonValue) -> Result<String, FacadeProtocolError> {
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
+fn admission_timeout_error() -> FacadeProtocolError {
+    invocation_error(TurnMcpInvocationError::new(
+        TurnMcpInvocationErrorCode::TimedOut,
+        "MCP native admission timed out",
+    ))
+}
+
 fn cancelled_error() -> FacadeProtocolError {
     FacadeProtocolError::new(
         FACADE_CALL_FAILED,
@@ -1259,6 +1308,77 @@ fn coordinator_error(error: CliMcpCoordinatorError) -> FacadeProtocolError {
             "coordinator_failed",
         ),
     }
+}
+
+fn parse_native_call(
+    contract: CliMcpCallContract,
+    meta: Option<&JsonValue>,
+    wire_arguments: JsonValue,
+    native_thread: &str,
+    native_turn: &str,
+) -> Result<(JsonValue, Option<NativeMcpCallIdentity>), FacadeProtocolError> {
+    let invalid = || {
+        FacadeProtocolError::new(
+            INVALID_PARAMS,
+            "managed MCP native identity is missing or invalid",
+            "invalid_native_identity",
+        )
+    };
+    let required = |object: &JsonMap<String, JsonValue>, name: &str| {
+        object
+            .get(name)
+            .and_then(JsonValue::as_str)
+            .filter(|s| {
+                !s.is_empty()
+                    && s.trim() == *s
+                    && s.len() <= 512
+                    && !s.chars().any(char::is_control)
+            })
+            .map(str::to_owned)
+            .ok_or_else(invalid)
+    };
+    let (arguments, item) = match contract {
+        CliMcpCallContract::Legacy => return Ok((wire_arguments, None)),
+        CliMcpCallContract::Claude => {
+            let meta = meta.and_then(JsonValue::as_object).ok_or_else(invalid)?;
+            (wire_arguments, required(meta, "claudecode/toolUseId")?)
+        }
+        CliMcpCallContract::OpenCode => {
+            // Created only by the owned executor after native input decoding.
+            // Original arguments stay nested, including any names like these.
+            let envelope = wire_arguments.as_object().ok_or_else(invalid)?;
+            if envelope.len() != 2 {
+                return Err(invalid());
+            }
+            let identity = envelope
+                .get("__pioneer_mcp")
+                .and_then(JsonValue::as_object)
+                .ok_or_else(invalid)?;
+            if identity.len() != 3 {
+                return Err(invalid());
+            }
+            let session = required(identity, "sessionID")?;
+            let meta = meta.and_then(JsonValue::as_object).ok_or_else(invalid)?;
+            if session != native_thread || required(meta, "ai.opencode/sessionID")? != session {
+                return Err(invocation_error(TurnMcpInvocationError::new(
+                    TurnMcpInvocationErrorCode::ScopeMismatch,
+                    "OpenCode MCP session does not match its native binding",
+                )));
+            }
+            let message = required(identity, "messageID")?;
+            let call = required(identity, "id")?;
+            let arguments = envelope.get("arguments").cloned().ok_or_else(invalid)?;
+            (arguments, format!("{message}:tool:{call}"))
+        }
+    };
+    Ok((
+        arguments,
+        Some(NativeMcpCallIdentity {
+            native_thread_id: native_thread.into(),
+            native_turn_id: native_turn.into(),
+            native_item_id: item,
+        }),
+    ))
 }
 
 fn invocation_error(error: TurnMcpInvocationError) -> FacadeProtocolError {
@@ -1532,9 +1652,9 @@ mod tests {
         })
     }
 
-    fn process_instance() -> CliSessionInstanceId {
+    fn process_instance(runtime_id: &str) -> CliSessionInstanceId {
         CliSessionInstanceId::unmanaged_for_test(
-            CLIAgentRuntimeSessionKey::new("workspace", "codex", "thread").expect("key"),
+            CLIAgentRuntimeSessionKey::new("workspace", runtime_id, "thread").expect("key"),
             1,
         )
         .expect("instance")
@@ -1568,12 +1688,25 @@ mod tests {
         CliMcpFacadeRequestContext,
         Arc<CliMcpCoordinator>,
     ) {
+        fixture_with_runtime(tools, invoker, limits, "codex").await
+    }
+
+    async fn fixture_with_runtime(
+        tools: Vec<CliMcpFacadeTool>,
+        invoker: Arc<dyn TurnMcpInvoker>,
+        limits: CliMcpFacadeLimits,
+        runtime_id: &str,
+    ) -> (
+        Arc<CliMcpToolFacade>,
+        CliMcpFacadeRequestContext,
+        Arc<CliMcpCoordinator>,
+    ) {
         let coordinator = Arc::new(CliMcpCoordinator::default());
         let projection =
             CliMcpFacadeProjection::new(tools, CliMcpFacadeProjectionLimits::default())
                 .expect("projection");
         let scope = CliMcpGrantScope::new(
-            process_instance(),
+            process_instance(runtime_id),
             CliMcpManifestHash::new("a".repeat(64)).expect("manifest"),
         );
         let issued = coordinator
@@ -1599,6 +1732,7 @@ mod tests {
             projection,
             Arc::new(CliMcpNoopProgressSink),
             limits,
+            CliMcpCallContract::Legacy,
         )
         .expect("facade");
         (
@@ -2247,6 +2381,688 @@ mod tests {
         })
         .await
         .expect("atomic state");
+    }
+
+    // One facade-level owner for the shared admission/replay properties. Each
+    // case uses its production correlator and ledger; only final execution is fake.
+    enum ExactItems {
+        Claude(Arc<crate::cli_runtime::claude_session::ClaudeNativeMcpCorrelationLedger>),
+        OpenCode(Arc<super::super::native_correlation::NativeMcpCorrelationLedger>),
+    }
+
+    impl ExactItems {
+        fn item_id(&self, call: &str) -> String {
+            match self {
+                Self::Claude(_) => format!("toolu_{call}"),
+                Self::OpenCode(_) => format!("msg_assistant:tool:{call}"),
+            }
+        }
+
+        fn register_in(
+            &self,
+            call: &str,
+            arguments: JsonValue,
+            callable: &str,
+            thread: &str,
+            turn: &str,
+        ) {
+            let item = self.item_id(call);
+            let fingerprint =
+                crate::cli_runtime::codex_mcp::canonical_value_fingerprint(&arguments).unwrap();
+            match self {
+                Self::Claude(ledger) => ledger
+                    .register(
+                        &crate::cli_runtime::claude_mcp::ClaudeNativeMcpItemBinding {
+                            native_thread_id: thread.into(),
+                            native_turn_id: turn.into(),
+                            native_item_id: item,
+                            canonical_callable_name: callable.into(),
+                            arguments_fingerprint: fingerprint,
+                            metadata: pioneer_protocol::ToolMetadata::empty(),
+                        },
+                    )
+                    .unwrap(),
+                Self::OpenCode(ledger) => ledger
+                    .register(super::super::native_correlation::NativeMcpItemBinding {
+                        native_thread_id: thread.into(),
+                        native_turn_id: turn.into(),
+                        native_item_id: item,
+                        canonical_callable_name: callable.into(),
+                        arguments_fingerprint: fingerprint,
+                    })
+                    .unwrap(),
+            }
+        }
+
+        fn register(&self, call: &str, arguments: JsonValue) {
+            self.register_in(
+                call,
+                arguments,
+                "read",
+                "native-thread-turn",
+                "native-turn-turn",
+            );
+        }
+
+        fn invoker(
+            &self,
+            inner: Arc<dyn TurnMcpInvoker>,
+            coordinator: Arc<CliMcpCoordinator>,
+            bound: CliMcpBoundGrant,
+        ) -> Arc<dyn TurnMcpInvoker> {
+            match self {
+                Self::Claude(ledger) => Arc::new(
+                    crate::cli_runtime::claude_session::ClaudeCorrelatingTurnMcpInvoker {
+                        inner,
+                        native_items: ledger.clone(),
+                        coordinator,
+                        bound_grant: bound,
+                    },
+                ),
+                Self::OpenCode(ledger) => Arc::new(
+                    super::super::native_correlation::CorrelatingTurnMcpInvoker {
+                        inner,
+                        native_items: ledger.clone(),
+                        opencode_binding: Some((coordinator, bound)),
+                    },
+                ),
+            }
+        }
+    }
+
+    fn exact_call(
+        contract: CliMcpCallContract,
+        rpc: &str,
+        call: &str,
+        arguments: JsonValue,
+    ) -> JsonValue {
+        let (arguments, meta) = match contract {
+            CliMcpCallContract::Claude => (
+                arguments,
+                json!({"claudecode/toolUseId": format!("toolu_{call}")}),
+            ),
+            CliMcpCallContract::OpenCode => (
+                json!({
+                    "__pioneer_mcp": {"sessionID": "native-thread-turn", "messageID": "msg_assistant", "id": call},
+                    "arguments": arguments,
+                }),
+                json!({"ai.opencode/sessionID": "native-thread-turn"}),
+            ),
+            CliMcpCallContract::Legacy => unreachable!(),
+        };
+        json!({"jsonrpc":"2.0", "id":rpc, "method":"tools/call", "params":{"name":"read", "arguments":arguments, "_meta":meta}})
+    }
+
+    async fn exact_fixture(
+        contract: CliMcpCallContract,
+        runtime_id: &str,
+        limits: CliMcpFacadeLimits,
+    ) -> (
+        Arc<CliMcpToolFacade>,
+        Arc<RecordingInvoker>,
+        CliMcpFacadeRequestContext,
+        Arc<CliMcpCoordinator>,
+        ExactItems,
+    ) {
+        let recording = Arc::new(RecordingInvoker {
+            calls: AtomicUsize::new(0),
+            invocations: StdMutex::new(Vec::new()),
+            result: basic_result(json!([])),
+        });
+        let (mut facade, mut context, coordinator) = fixture_with_runtime(
+            vec![fixture_tool("read"), fixture_tool("other")],
+            recording.clone(),
+            limits,
+            runtime_id,
+        )
+        .await;
+        let items = match contract {
+            CliMcpCallContract::Claude => ExactItems::Claude(Arc::default()),
+            CliMcpCallContract::OpenCode => {
+                let ledger = Arc::new(
+                    super::super::native_correlation::NativeMcpCorrelationLedger::scoped(),
+                );
+                ledger.activate_scope("native-thread-turn", "native-turn-turn");
+                ExactItems::OpenCode(ledger)
+            }
+            CliMcpCallContract::Legacy => unreachable!(),
+        };
+        let facade_mut = Arc::get_mut(&mut facade).unwrap();
+        facade_mut.call_contract = contract;
+        facade_mut.invoker = items.invoker(
+            recording.clone(),
+            coordinator.clone(),
+            context.bound_grant.clone(),
+        );
+        initialize(&facade, &context).await;
+        activate(&facade, &mut context, &coordinator, "turn").await;
+        (facade, recording, context, coordinator, items)
+    }
+
+    fn recorded_ids(invoker: &RecordingInvoker) -> Vec<String> {
+        invoker
+            .invocations
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| call.provider_call_id.clone())
+            .collect()
+    }
+
+    async fn cancel_exact(
+        facade: &CliMcpToolFacade,
+        context: &CliMcpFacadeRequestContext,
+        rpc: &str,
+    ) {
+        facade.handle_message(context, json!({"jsonrpc":"2.0", "method":"notifications/cancelled", "params":{"requestId":rpc}})).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exact_adapters_wait_for_own_identity_despite_delay_foreign_notifications_and_reordered_calls()
+     {
+        use futures_util::poll;
+        use tokio::time::advance;
+        for contract in [CliMcpCallContract::Claude, CliMcpCallContract::OpenCode] {
+            // Names deliberately disagree with provider kinds, including Codex's
+            // usual name; neither metadata nor the name selects the adapter.
+            for runtime_id in ["work", "codex"] {
+                let (facade, invoker, context, _, items) =
+                    exact_fixture(contract, runtime_id, CliMcpFacadeLimits::default()).await;
+                let mut b = Box::pin(
+                    facade.handle_message(&context, exact_call(contract, "rpc-B", "B", json!({}))),
+                );
+                assert!(poll!(b.as_mut()).is_pending());
+                advance(std::time::Duration::from_millis(300)).await;
+                assert!(poll!(b.as_mut()).is_pending()); // OpenCode's old 250ms window.
+                items.register("foreign", json!({"different":true}));
+                assert!(poll!(b.as_mut()).is_pending()); // Claude's old single wakeup failed here.
+                advance(std::time::Duration::from_secs(2)).await;
+                assert!(poll!(b.as_mut()).is_pending()); // No independent two-second Claude window.
+                let mut a = Box::pin(
+                    facade.handle_message(&context, exact_call(contract, "rpc-A", "A", json!({}))),
+                );
+                assert!(poll!(a.as_mut()).is_pending());
+                items.register("A", json!({}));
+                assert!(poll!(b.as_mut()).is_pending());
+                assert!(a.await.unwrap().get("result").is_some());
+                items.register("B", json!({}));
+                assert!(b.await.unwrap().get("result").is_some());
+
+                assert_eq!(
+                    recorded_ids(&invoker),
+                    [items.item_id("A"), items.item_id("B")]
+                );
+                // An earlier native item whose RPC has not arrived remains
+                // unused even after the later identical call completes.
+                items.register("first", json!({}));
+                items.register("later", json!({}));
+                for call in ["later", "first"] {
+                    assert!(
+                        facade
+                            .handle_message(&context, exact_call(contract, call, call, json!({})))
+                            .await
+                            .unwrap()
+                            .get("result")
+                            .is_some()
+                    );
+                }
+                assert!(
+                    invoker
+                        .invocations
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|call| call.runtime_id.as_deref() == Some(runtime_id))
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exact_adapters_timeout_and_cancel_do_not_consume_or_steal_late_items() {
+        use futures_util::poll;
+        use tokio::time::advance;
+        for contract in [CliMcpCallContract::Claude, CliMcpCallContract::OpenCode] {
+            let mut limits = CliMcpFacadeLimits::default();
+            limits.max_queue_wait = std::time::Duration::from_secs(1);
+            let (facade, invoker, context, _, items) =
+                exact_fixture(contract, "work", limits).await;
+            let mut a = Box::pin(
+                facade.handle_message(&context, exact_call(contract, "timeout-A", "A", json!({}))),
+            );
+            assert!(poll!(a.as_mut()).is_pending());
+            advance(std::time::Duration::from_secs(1)).await;
+            let timed_out = a.await.unwrap();
+            assert_eq!(timed_out["error"]["data"]["kind"], "timed_out");
+            assert_eq!(timed_out["error"]["code"], FACADE_CALL_FAILED);
+            items.register("A", json!({}));
+            let mut b = Box::pin(
+                facade.handle_message(&context, exact_call(contract, "cancel-B", "B", json!({}))),
+            );
+            assert!(poll!(b.as_mut()).is_pending());
+            cancel_exact(&facade, &context, "cancel-B").await;
+            assert_eq!(b.await.unwrap()["error"]["data"]["kind"], "cancelled");
+            items.register("B", json!({}));
+            let mut c = Box::pin(
+                facade.handle_message(&context, exact_call(contract, "new-C", "C", json!({}))),
+            );
+            assert!(poll!(c.as_mut()).is_pending());
+            items.register("C", json!({}));
+            assert!(c.await.unwrap().get("result").is_some());
+            // Neither a timeout nor cancellation before claim consumes A/B.
+            for call in ["A", "B"] {
+                assert!(
+                    facade
+                        .handle_message(
+                            &context,
+                            exact_call(contract, &format!("fresh-{call}"), call, json!({}))
+                        )
+                        .await
+                        .unwrap()
+                        .get("result")
+                        .is_some()
+                );
+            }
+            assert_eq!(
+                recorded_ids(&invoker),
+                [items.item_id("C"), items.item_id("A"), items.item_id("B")]
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exact_adapters_replay_and_cache_eviction_never_reexecute_used_native_items() {
+        use futures_util::poll;
+        for contract in [CliMcpCallContract::Claude, CliMcpCallContract::OpenCode] {
+            let mut limits = CliMcpFacadeLimits::default();
+            limits.max_active_calls = 1;
+            limits.max_queued_calls = 1;
+            limits.max_ledger_entries = 2;
+            let (facade, invoker, context, _, items) =
+                exact_fixture(contract, "work", limits).await;
+            let request = exact_call(contract, "rpc-A", "A", json!({}));
+            let mut leader = Box::pin(facade.handle_message(&context, request.clone()));
+            let mut follower = Box::pin(facade.handle_message(&context, request.clone()));
+            assert!(poll!(leader.as_mut()).is_pending());
+            assert!(poll!(follower.as_mut()).is_pending());
+            assert_eq!(
+                facade
+                    .handle_message(
+                        &context,
+                        exact_call(contract, "rpc-A", "foreign", json!({}))
+                    )
+                    .await
+                    .unwrap()["error"]["data"]["kind"],
+                "conflicting_duplicate_request_id"
+            );
+            items.register("A", json!({}));
+            let result = leader.await.unwrap();
+            assert_eq!(follower.await.unwrap(), result);
+            assert_eq!(
+                facade
+                    .handle_message(&context, request.clone())
+                    .await
+                    .unwrap(),
+                result
+            );
+            assert_eq!(
+                facade
+                    .handle_message(
+                        &context,
+                        exact_call(contract, "rpc-A", "foreign", json!({}))
+                    )
+                    .await
+                    .unwrap()["error"]["data"]["kind"],
+                "conflicting_duplicate_request_id"
+            );
+            for call in ["B", "C"] {
+                items.register(call, json!({}));
+                assert!(
+                    facade
+                        .handle_message(&context, exact_call(contract, call, call, json!({})))
+                        .await
+                        .unwrap()
+                        .get("result")
+                        .is_some()
+                );
+            }
+            items.register("A", json!({})); // Re-registration preserves its used mark.
+            assert_eq!(
+                facade.handle_message(&context, request).await.unwrap()["error"]["data"]["kind"],
+                "invalid_request"
+            );
+            {
+                // Result TTL uses std time; expire completed entries directly.
+                let mut state = lock_ledger_state(&facade.ledger.state);
+                for entry in state.entries.values_mut() {
+                    if let CliMcpLedgerEntryState::Completed { completed_at } = &mut entry.state {
+                        *completed_at = Instant::now() - facade.limits.completed_entry_ttl;
+                    }
+                }
+            }
+            assert_eq!(
+                facade
+                    .handle_message(&context, exact_call(contract, "C", "C", json!({})))
+                    .await
+                    .unwrap()["error"]["data"]["kind"],
+                "invalid_request"
+            );
+            items.register("D", json!({}));
+            assert!(
+                facade
+                    .handle_message(&context, exact_call(contract, "D", "D", json!({})))
+                    .await
+                    .unwrap()
+                    .get("result")
+                    .is_some()
+            );
+            assert_eq!(
+                recorded_ids(&invoker),
+                [
+                    items.item_id("A"),
+                    items.item_id("B"),
+                    items.item_id("C"),
+                    items.item_id("D")
+                ]
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exact_adapters_reject_invalid_identity_content_and_scope_before_execution() {
+        use futures_util::poll;
+        use tokio::time::advance;
+        for contract in [CliMcpCallContract::Claude, CliMcpCallContract::OpenCode] {
+            let mut limits = CliMcpFacadeLimits::default();
+            limits.max_queue_wait = std::time::Duration::from_secs(1);
+            let (facade, invoker, context, _, items) =
+                exact_fixture(contract, "work", limits).await;
+            let mut missing = exact_call(contract, "missing", "A", json!({}));
+            missing["params"].as_object_mut().unwrap().remove("_meta");
+            assert_eq!(
+                facade.handle_message(&context, missing).await.unwrap()["error"]["data"]["kind"],
+                "invalid_native_identity"
+            );
+            let mut malformed = exact_call(contract, "malformed", "A", json!({}));
+            match contract {
+                CliMcpCallContract::Claude => {
+                    malformed["params"]["_meta"]["claudecode/toolUseId"] = json!(17)
+                }
+                CliMcpCallContract::OpenCode => {
+                    malformed["params"]["arguments"]["__pioneer_mcp"]["id"] = json!(17)
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                facade.handle_message(&context, malformed).await.unwrap()["error"]["data"]["kind"],
+                "invalid_native_identity"
+            );
+            for (call, callable, args) in [
+                ("tool", "other", json!({})),
+                ("args", "read", json!({"different":true})),
+            ] {
+                items.register(call, json!({}));
+                let mut request = exact_call(contract, call, call, args);
+                request["params"]["name"] = json!(callable);
+                assert_eq!(
+                    facade.handle_message(&context, request).await.unwrap()["error"]["data"]["kind"],
+                    "invalid_request"
+                );
+            }
+            items.register_in(
+                "foreign",
+                json!({}),
+                "read",
+                "foreign-thread",
+                "foreign-turn",
+            );
+            let mut foreign = Box::pin(facade.handle_message(
+                &context,
+                exact_call(contract, "foreign", "foreign", json!({})),
+            ));
+            assert!(poll!(foreign.as_mut()).is_pending());
+            advance(std::time::Duration::from_secs(1)).await;
+            assert_eq!(foreign.await.unwrap()["error"]["data"]["kind"], "timed_out");
+            if contract == CliMcpCallContract::OpenCode {
+                let mut forged = exact_call(contract, "forged", "A", json!({}));
+                forged["params"]["arguments"]["__pioneer_mcp"]["sessionID"] = json!("foreign");
+                assert_eq!(
+                    facade.handle_message(&context, forged).await.unwrap()["error"]["data"]["kind"],
+                    "scope_mismatch"
+                );
+                let raw = call_message(json!("raw"), json!({"id":"A","sessionID":"model"}));
+                assert_eq!(
+                    facade.handle_message(&context, raw).await.unwrap()["error"]["data"]["kind"],
+                    "invalid_native_identity"
+                );
+            }
+            assert!(recorded_ids(&invoker).is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn opencode_envelope_is_removed_before_replay_and_execution_without_argument_collisions()
+    {
+        let contract = CliMcpCallContract::OpenCode;
+        let (facade, invoker, context, _, items) =
+            exact_fixture(contract, "work", CliMcpFacadeLimits::default()).await;
+        let arguments =
+            json!({"__pioneer_mcp":{"sessionID":"legal-model-field"},"arguments":{"id":"legal"}});
+        items.register("A", arguments.clone());
+        let request = exact_call(contract, "rpc-A", "A", arguments.clone());
+        let result = facade
+            .handle_message(&context, request.clone())
+            .await
+            .unwrap();
+        assert!(result.get("result").is_some());
+        assert_eq!(
+            facade.handle_message(&context, request).await.unwrap(),
+            result
+        );
+        assert_eq!(invoker.invocations.lock().unwrap()[0].arguments, arguments);
+        assert_eq!(recorded_ids(&invoker), [items.item_id("A")]);
+    }
+
+    struct StalledProgress;
+    #[async_trait]
+    impl CliMcpProgressSink for StalledProgress {
+        async fn send_progress(
+            &self,
+            _: CliMcpProgressNotification,
+        ) -> Result<(), CliMcpProgressSendError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exact_adapters_queue_progress_and_confirmation_share_one_deadline() {
+        use futures_util::poll;
+        use tokio::time::advance;
+        for contract in [CliMcpCallContract::Claude, CliMcpCallContract::OpenCode] {
+            for progress in [false, true] {
+                let mut limits = CliMcpFacadeLimits::default();
+                limits.max_active_calls = 1;
+                limits.max_queued_calls = 1;
+                limits.max_queue_wait = std::time::Duration::from_secs(1);
+                let (mut facade, invoker, context, _, items) =
+                    exact_fixture(contract, "work", limits).await;
+                if progress {
+                    Arc::get_mut(&mut facade).unwrap().progress_sink = Arc::new(StalledProgress);
+                }
+                let mut a = Box::pin(
+                    facade.handle_message(&context, exact_call(contract, "A", "A", json!({}))),
+                );
+                let mut request_b = exact_call(contract, "B", "B", json!({}));
+                if progress {
+                    request_b["params"]["_meta"]["progressToken"] = json!("B");
+                }
+                let mut b = Box::pin(facade.handle_message(&context, request_b));
+                assert!(poll!(a.as_mut()).is_pending());
+                assert!(poll!(b.as_mut()).is_pending());
+                assert_eq!(facade.queued_calls.load(Ordering::Acquire), 1);
+                advance(std::time::Duration::from_millis(600)).await;
+                items.register("A", json!({}));
+                assert!(a.await.unwrap().get("result").is_some());
+                assert!(poll!(b.as_mut()).is_pending());
+                advance(std::time::Duration::from_millis(399)).await;
+                assert!(poll!(b.as_mut()).is_pending());
+                advance(std::time::Duration::from_millis(1)).await;
+                assert_eq!(b.await.unwrap()["error"]["data"]["kind"], "timed_out");
+                assert_eq!(facade.admission.available_permits(), 1);
+                assert_eq!(facade.queued_calls.load(Ordering::Acquire), 0);
+                assert_eq!(recorded_ids(&invoker), [items.item_id("A")]);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exact_adapters_admitted_execution_outlives_admission_deadline() {
+        use futures_util::poll;
+        use tokio::time::advance;
+        for contract in [CliMcpCallContract::Claude, CliMcpCallContract::OpenCode] {
+            let mut limits = CliMcpFacadeLimits::default();
+            limits.max_queue_wait = std::time::Duration::from_secs(1);
+            let (mut facade, _, context, coordinator, items) =
+                exact_fixture(contract, "work", limits).await;
+            let execution = Arc::new(CancellationInvoker {
+                calls: AtomicUsize::new(0),
+            });
+            Arc::get_mut(&mut facade).unwrap().invoker =
+                items.invoker(execution.clone(), coordinator, context.bound_grant.clone());
+            items.register("long", json!({}));
+            let mut call = Box::pin(
+                facade.handle_message(&context, exact_call(contract, "long", "long", json!({}))),
+            );
+            assert!(poll!(call.as_mut()).is_pending());
+            assert_eq!(execution.calls.load(AtomicOrdering::SeqCst), 1);
+            advance(std::time::Duration::from_secs(2)).await;
+            assert!(poll!(call.as_mut()).is_pending());
+            cancel_exact(&facade, &context, "long").await;
+            assert_eq!(call.await.unwrap()["error"]["data"]["kind"], "cancelled");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exact_adapters_revalidate_native_turn_after_wait_without_transferring_invocation() {
+        use futures_util::poll;
+        for contract in [CliMcpCallContract::Claude, CliMcpCallContract::OpenCode] {
+            let (facade, invoker, context, coordinator, items) =
+                exact_fixture(contract, "work", CliMcpFacadeLimits::default()).await;
+            let mut old = Box::pin(
+                facade.handle_message(&context, exact_call(contract, "old", "A", json!({}))),
+            );
+            assert!(poll!(old.as_mut()).is_pending());
+            coordinator
+                .retarget_turn(
+                    &context.bound_grant,
+                    context.activation_generation.unwrap(),
+                    "native-thread-turn",
+                    "new-native-turn",
+                )
+                .await
+                .unwrap();
+            items.register("A", json!({}));
+            assert_eq!(
+                old.await.unwrap()["error"]["data"]["kind"],
+                "scope_mismatch"
+            );
+            let mut new = Box::pin(
+                facade.handle_message(&context, exact_call(contract, "new", "B", json!({}))),
+            );
+            assert!(poll!(new.as_mut()).is_pending());
+            items.register_in(
+                "B",
+                json!({}),
+                "read",
+                "native-thread-turn",
+                "new-native-turn",
+            );
+            assert!(new.await.unwrap().get("result").is_some());
+            assert_eq!(recorded_ids(&invoker), [items.item_id("B")]);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exact_adapters_lifecycle_cancels_waiters_and_releases_capacity() {
+        use futures_util::poll;
+        for contract in [CliMcpCallContract::Claude, CliMcpCallContract::OpenCode] {
+            for stop in [
+                "cancel",
+                "terminal",
+                "revoke",
+                "replacement",
+                "shutdown",
+                "drop",
+            ] {
+                let mut limits = CliMcpFacadeLimits::default();
+                limits.max_active_calls = 1;
+                limits.max_queued_calls = 1;
+                let (facade, invoker, context, coordinator, _) =
+                    exact_fixture(contract, "work", limits).await;
+                let mut a = Box::pin(
+                    facade.handle_message(&context, exact_call(contract, "A", "A", json!({}))),
+                );
+                let mut b = Box::pin(
+                    facade.handle_message(&context, exact_call(contract, "B", "B", json!({}))),
+                );
+                assert!(poll!(a.as_mut()).is_pending());
+                assert!(poll!(b.as_mut()).is_pending());
+                if stop == "drop" {
+                    drop(a);
+                    drop(b);
+                } else if stop == "shutdown" {
+                    let mut shutdown = Box::pin(facade.shutdown());
+                    assert!(poll!(shutdown.as_mut()).is_pending());
+                    assert_eq!(a.await.unwrap()["error"]["data"]["kind"], "cancelled");
+                    assert_eq!(b.await.unwrap()["error"]["data"]["kind"], "cancelled");
+                    assert!(shutdown.await.drained);
+                } else {
+                    match stop {
+                        "cancel" => {
+                            cancel_exact(&facade, &context, "A").await;
+                            cancel_exact(&facade, &context, "B").await;
+                        }
+                        "terminal" => coordinator
+                            .terminal_turn(
+                                &context.bound_grant,
+                                context.activation_generation.unwrap(),
+                            )
+                            .await
+                            .unwrap(),
+                        "revoke" => {
+                            coordinator
+                                .revoke_connection(&context.bound_grant)
+                                .await
+                                .unwrap();
+                        }
+                        "replacement" => {
+                            coordinator
+                                .revoke_process(&context.bound_grant.scope().process_instance)
+                                .await;
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert_eq!(a.await.unwrap()["error"]["data"]["kind"], "cancelled");
+                    assert_eq!(b.await.unwrap()["error"]["data"]["kind"], "cancelled");
+                }
+                assert_eq!(
+                    facade.admission.available_permits(),
+                    1,
+                    "{contract:?} {stop}"
+                );
+                assert_eq!(facade.queued_calls.load(Ordering::Acquire), 0);
+                assert!(recorded_ids(&invoker).is_empty());
+                if stop == "terminal" {
+                    assert_eq!(
+                        facade
+                            .handle_message(&context, exact_call(contract, "late", "A", json!({})))
+                            .await
+                            .unwrap()["error"]["data"]["kind"],
+                        "turn_not_active"
+                    );
+                }
+            }
+        }
     }
 
     fn now_ms() -> u64 {

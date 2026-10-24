@@ -241,6 +241,7 @@ async fn run_single_bridge_conformance(
         reservation.generation,
         projection,
         CliMcpFacadeLimits::default(),
+        super::facade::CliMcpCallContract::Legacy,
     )?;
     let server = tokio::spawn(server.run());
     let mut provider = ProviderClient {

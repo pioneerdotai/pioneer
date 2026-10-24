@@ -1,6 +1,10 @@
 //! Native item correlation shared by the Codex and OpenCode MCP adapters.
 //! The facade execution ledger remains the sole execution/replay journal.
-use crate::turn_mcp::invoker::TurnMcpInvoker;
+use super::coordinator::CliMcpCoordinator;
+use super::grants::CliMcpBoundGrant;
+use crate::turn_mcp::invoker::{
+    TurnMcpInvocation, TurnMcpInvocationError, TurnMcpInvocationErrorCode, TurnMcpInvoker,
+};
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -107,6 +111,60 @@ impl NativeMcpCorrelationLedger {
             .contains_key(key)
     }
 
+    /// OpenCode uses its exact existing item identity. The legacy Codex claim
+    /// below intentionally keeps its current contract in this worktree.
+    pub(crate) fn claim_exact(
+        &self,
+        invocation: &TurnMcpInvocation,
+        fingerprint: &str,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<bool, TurnMcpInvocationError> {
+        let identity = invocation.native_call.as_ref().ok_or_else(|| {
+            TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::InvalidRequest,
+                "OpenCode native identity is missing",
+            )
+        })?;
+        let key = NativeMcpItemKey {
+            native_thread_id: identity.native_thread_id.clone(),
+            native_turn_id: identity.native_turn_id.clone(),
+            native_item_id: identity.native_item_id.clone(),
+        };
+        let mut items = self
+            .items
+            .lock()
+            .expect("native MCP ledger should not be poisoned");
+        if cancellation.is_cancelled() {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::Cancelled,
+                "OpenCode MCP admission cancelled",
+            ));
+        }
+        if invocation
+            .admission_deadline
+            .is_none_or(|deadline| Instant::now() >= deadline)
+        {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::TimedOut,
+                "OpenCode MCP admission timed out",
+            ));
+        }
+        let Some(item) = items.get_mut(&key) else {
+            return Ok(false);
+        };
+        if item.canonical_callable_name != invocation.canonical_callable_name
+            || item.arguments_fingerprint != fingerprint
+            || item.facade_request_id.is_some()
+        {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::InvalidRequest,
+                "OpenCode native item mismatches this invocation or is already used",
+            ));
+        }
+        item.facade_request_id = Some(invocation.provider_call_id.clone());
+        Ok(true)
+    }
+
     pub(crate) async fn claim(
         &self,
         canonical_callable_name: &str,
@@ -189,6 +247,50 @@ impl NativeMcpCorrelationLedger {
 pub(crate) struct CorrelatingTurnMcpInvoker {
     pub(crate) inner: Arc<dyn TurnMcpInvoker>,
     pub(crate) native_items: Arc<NativeMcpCorrelationLedger>,
+    // Factory-owned binding references, independent of the instance's name.
+    pub(crate) opencode_binding: Option<(Arc<CliMcpCoordinator>, CliMcpBoundGrant)>,
+}
+
+impl CorrelatingTurnMcpInvoker {
+    async fn claim_opencode(
+        &self,
+        invocation: &TurnMcpInvocation,
+        fingerprint: &str,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<(), TurnMcpInvocationError> {
+        let (coordinator, bound) = self
+            .opencode_binding
+            .as_ref()
+            .expect("OpenCode factory binding");
+        let deadline = invocation.admission_deadline.ok_or_else(|| {
+            TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::InvalidRequest,
+                "OpenCode admission deadline is missing",
+            )
+        })?;
+        loop {
+            let notified = self.native_items.changed.notified();
+            let claim = coordinator.claim_correlated_call(bound, invocation, cancellation, || {
+                self.native_items
+                    .claim_exact(invocation, fingerprint, cancellation)
+            });
+            let claimed = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::Cancelled, "OpenCode MCP admission cancelled")),
+                () = tokio::time::sleep_until(deadline) => return Err(TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::TimedOut, "OpenCode MCP confirmation timed out")),
+                claimed = claim => claimed?,
+            };
+            if claimed {
+                return Ok(());
+            }
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::Cancelled, "OpenCode MCP admission cancelled")),
+                () = tokio::time::sleep_until(deadline) => return Err(TurnMcpInvocationError::new(TurnMcpInvocationErrorCode::TimedOut, "OpenCode MCP confirmation timed out")),
+                () = notified => {},
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -209,6 +311,17 @@ impl TurnMcpInvoker for CorrelatingTurnMcpInvoker {
                         "CLI MCP invocation arguments are not canonicalizable",
                     )
                 })?;
+        if self.opencode_binding.is_some() {
+            self.claim_opencode(&invocation, &arguments_fingerprint, &cancellation)
+                .await?;
+            invocation.provider_call_id = invocation
+                .native_call
+                .as_ref()
+                .expect("claimed OpenCode identity")
+                .native_item_id
+                .clone();
+            return self.inner.invoke(invocation, cancellation).await;
+        }
         let facade_request_id = invocation.provider_call_id.clone();
         let native_item = tokio::select! {
             biased;
@@ -475,6 +588,7 @@ mod tests {
         let invoker = CorrelatingTurnMcpInvoker {
             inner: Arc::new(UnexpectedInvoker),
             native_items: native_items.clone(),
+            opencode_binding: None,
         };
         let cancellation = CancellationToken::new();
         let invocation = TurnMcpInvocation {
@@ -484,6 +598,8 @@ mod tests {
             runtime_id: Some("opencode".into()),
             session_generation: Some(1),
             provider_call_id: "cancelled-request".into(),
+            native_call: None,
+            admission_deadline: None,
             canonical_callable_name: CALLABLE.into(),
             arguments: json!({ "value": "own" }),
             origin: TurnMcpInvocationOrigin::CliFacade,

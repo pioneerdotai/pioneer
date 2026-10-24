@@ -5466,6 +5466,8 @@ mod tests {
             runtime_id: None,
             session_generation: None,
             provider_call_id: "provider-call-test".to_owned(),
+            native_call: None,
+            admission_deadline: None,
             canonical_callable_name: fixture.callable_name.clone(),
             arguments: json!({"secret": "argument-canary-must-not-enter-errors"}),
             origin: TurnMcpInvocationOrigin::NativeApi,

@@ -330,6 +330,7 @@ pub(crate) async fn run_codex_mcp_local_provider_probe(
             reservation.generation,
             projection_for_server.clone(),
             CliMcpFacadeLimits::default(),
+            crate::cli_runtime::mcp::facade::CliMcpCallContract::Legacy,
         )?;
         let server = tokio::spawn(server.run());
         tokio_timeout(
@@ -648,10 +649,12 @@ impl CodexRequiredMcpBridge {
                         Arc::new(CodexCorrelatingTurnMcpInvoker {
                             inner: self.invoker.clone(),
                             native_items: self.native_items.clone(),
+                            opencode_binding: None,
                         }),
                         self.projection_generation,
                         self.projection.clone(),
                         self.facade_limits.clone(),
+                        crate::cli_runtime::mcp::facade::CliMcpCallContract::Legacy,
                     )
                     .map_err(|error| anyhow!("Codex MCP facade build failed: {error}"))?;
                     let server = tokio::spawn(server.run());
@@ -3038,6 +3041,7 @@ mod tests {
         let invoker = CodexCorrelatingTurnMcpInvoker {
             inner: inner.clone(),
             native_items: ledger,
+            opencode_binding: None,
         };
         let error = invoker
             .invoke(
@@ -3048,6 +3052,8 @@ mod tests {
                     runtime_id: Some("codex".to_owned()),
                     session_generation: Some(1),
                     provider_call_id: "jsonrpc:7".to_owned(),
+                    native_call: None,
+                    admission_deadline: None,
                     canonical_callable_name: "mcp__server__tool".to_owned(),
                     arguments,
                     origin: crate::turn_mcp::invoker::TurnMcpInvocationOrigin::CliFacade,

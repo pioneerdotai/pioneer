@@ -3222,10 +3222,15 @@ impl OpenCodeRequiredMcpBridge {
                         Arc::new(CorrelatingTurnMcpInvoker {
                             inner: self.invoker.clone(),
                             native_items: self.native_items.clone(),
+                            opencode_binding: Some((
+                                self.supervisor.coordinator(),
+                                attachment.bound_grant.clone(),
+                            )),
                         }),
                         self.projection_generation,
                         self.projection.clone(),
                         self.facade_limits.clone(),
+                        crate::cli_runtime::mcp::facade::CliMcpCallContract::OpenCode,
                     )
                     .map_err(|error| anyhow!("OpenCode MCP facade build failed: {error}"))?;
                     let server = tokio::spawn(server.run());

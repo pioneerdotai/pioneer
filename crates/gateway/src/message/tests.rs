@@ -26839,6 +26839,8 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
                     runtime_id: Some(runtime_id.to_owned()),
                     session_generation: Some(session_generation),
                     provider_call_id: format!("provider-call-{runtime_id}"),
+                    native_call: None,
+                    admission_deadline: None,
                     canonical_callable_name: projected_tool.canonical_callable_name,
                     arguments: json!({"message": format!("{runtime_id} MCP authorization")}),
                     origin: crate::turn_mcp::invoker::TurnMcpInvocationOrigin::CliFacade,
