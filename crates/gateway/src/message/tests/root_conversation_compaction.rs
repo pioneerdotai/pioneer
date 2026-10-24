@@ -236,6 +236,23 @@ async fn published_human_answer_prepares_root_once_and_next_cli_and_native_reuse
         "uncovered-next-input",
     )
     .await;
+    assert!(
+        harness
+            .crud_store
+            .compaction_root_history_activity(&harness.workspace_id, "warm-root", "warm-root-next")
+            .await
+            .unwrap()
+            .is_some(),
+        "a new input participates in the permanent live policy"
+    );
+    // Model an upgraded cold conversation with a compatible checkpoint and a
+    // question already present before the activity policy was installed.
+    harness
+        .crud_store
+        .database_connection()
+        .execute_unprepared("DELETE FROM compaction_root_activity WHERE thread_id='warm-root'")
+        .await
+        .unwrap();
     let deadline = u64::try_from(chrono::Utc::now().timestamp_millis())
         .unwrap()
         .saturating_add(pioneer_compaction::OPERATION_MILLIS);
@@ -319,6 +336,31 @@ async fn published_human_answer_prepares_root_once_and_next_cli_and_native_reuse
         provider.call_count(),
         calls,
         "next request must not summarize covered history again"
+    );
+    assert_eq!(
+        harness
+            .crud_store
+            .compaction_root_history_activity(&harness.workspace_id, "warm-root", "warm-root-next")
+            .await
+            .unwrap(),
+        None,
+        "mandatory CLI and Native preparation must not backfill cold activity"
+    );
+    answer(
+        &harness,
+        "warm-root",
+        "warm-root-next",
+        at + 2,
+        "new published answer",
+    )
+    .await;
+    assert_eq!(
+        harness
+            .crud_store
+            .compaction_root_history_activity(&harness.workspace_id, "warm-root", "warm-root-next")
+            .await
+            .unwrap(),
+        Some((at + 2) * 1000)
     );
     events.shutdown_progress().await;
 }
@@ -706,7 +748,7 @@ async fn accepted_deliveries_coalesce_keep_frozen_outputs_and_preserve_work_arri
             .await
             .unwrap(),
         Some(original_activity * 1000),
-        "ordinary results recover context but do not renew a conversation's activity"
+        "ordinary results enter context but do not renew a conversation's activity"
     );
     let revision_before = pending[0].revision;
     let prepared = harness
@@ -1151,14 +1193,8 @@ async fn hidden_composer_defers_root_warmup_until_its_answer_is_delivered() {
         "visible message completion is not readiness of its hidden response"
     );
 
-    // Simulate the upgraded root's absent activity index. Publication must
-    // atomically seed debt, and the real worker must restore activity before
-    // its busy decision; the test does not invoke a recovery helper directly.
-    db.execute_unprepared(
-        "DELETE FROM compaction_root_activity WHERE thread_id='composer-warm-root'",
-    )
-    .await
-    .unwrap();
+    // First retain the live-input case: ordinary work cannot bypass the
+    // actual foreground Composer or extend the eight-hour window.
     let (ordinary, candidate) = reviewed_task_in(
         &harness,
         "composer-warm-root",
@@ -1181,22 +1217,15 @@ async fn hidden_composer_defers_root_warmup_until_its_answer_is_delivered() {
         .process_due_task_deliveries(phase_13_now_secs() + 1, 16)
         .await
         .unwrap();
-    assert!(
+    assert_eq!(
         harness
             .crud_store
             .compaction_pending_history_checks()
             .await
             .unwrap()
-            .is_empty(),
-        "seeded root debt waits for activity reconstruction in the real poll"
+            .len(),
+        1
     );
-    let seeded = check::Entity::find_by_id("composer-human-question")
-        .one(&db)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(seeded.purpose, "root_conversation");
-    assert_eq!(seeded.state, "pending");
     drain_worker(&harness.processor).await;
     let deferred = check::Entity::find_by_id("composer-human-question")
         .one(&harness.crud_store.database_connection())
@@ -1234,6 +1263,112 @@ async fn hidden_composer_defers_root_warmup_until_its_answer_is_delivered() {
         Some("cancelled"),
         "ordinary delivery during a long Composer run does not extend the window"
     );
+    // Now represent an old conversation whose question preceded the policy:
+    // ordinary publication must not reconstruct activity or create work.
+    db.execute_unprepared(
+        "DELETE FROM compaction_root_activity WHERE thread_id='composer-warm-root'",
+    )
+    .await
+    .unwrap();
+    let (cold_report, cold_candidate) = reviewed_task_in(
+        &harness,
+        "composer-warm-root",
+        "composer-human-question",
+        "cold-monitor-result",
+        Some("composer-warm-root"),
+    )
+    .await;
+    accept_candidate(
+        &harness,
+        connection,
+        &mut rx,
+        &cold_report.task.id,
+        &cold_report.run.as_ref().unwrap().id,
+        &cold_candidate,
+    )
+    .await;
+    harness
+        .processor
+        .process_due_task_deliveries(phase_13_now_secs() + 1, 16)
+        .await
+        .unwrap();
+    drain_worker(&harness.processor).await;
+    assert_eq!(
+        harness
+            .crud_store
+            .compaction_root_history_activity(
+                &harness.workspace_id,
+                "composer-warm-root",
+                "composer-human-question"
+            )
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(
+        harness
+            .crud_store
+            .compaction_pending_history_checks()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // The CLI monitor requires a live request. Model this same pre-policy
+    // question as still in progress while its detached Composer is running;
+    // changing its status neither accepts new input nor publishes an answer.
+    db.execute_unprepared(
+        "UPDATE turn SET status='in_progress' WHERE id='composer-human-question'",
+    )
+    .await
+    .unwrap();
+    let cold_deadline = u64::try_from(chrono::Utc::now().timestamp_millis())
+        .unwrap()
+        .saturating_add(pioneer_compaction::OPERATION_MILLIS);
+    let cold_basis = harness
+        .processor
+        .capture_cli_transfer_projection(
+            &harness.workspace_id,
+            "composer-warm-root",
+            "composer-human-question",
+            cold_deadline,
+        )
+        .await
+        .unwrap();
+    let cold_output = harness
+        .crud_store
+        .compaction_task_output(&harness.workspace_id, &cold_candidate.task_run_turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        cold_basis.messages.iter().any(|message| message
+            .content
+            .contains("composer and ordinary work")
+            && message
+                .provenance
+                .as_ref()
+                .is_some_and(|origin| origin.thread_id == cold_output.source_thread)),
+        "a cold root retains this exact delivered output in its authorized request basis"
+    );
+    drop(cold_basis);
+    assert_eq!(
+        harness
+            .crud_store
+            .compaction_root_history_activity(
+                &harness.workspace_id,
+                "composer-warm-root",
+                "composer-human-question"
+            )
+            .await
+            .unwrap(),
+        None,
+        "mandatory CLI preparation must not invent activity for the old request"
+    );
+    // Restore the actual RPC's visible status. Its detached work owner means
+    // this fixture status change cannot publish a direct ready answer.
+    db.execute_unprepared("UPDATE turn SET status='completed' WHERE id='composer-human-question'")
+        .await
+        .unwrap();
     provider.release_first.notify_one();
     assert_eq!(
         wait_for_task_status(
@@ -1254,7 +1389,7 @@ async fn hidden_composer_defers_root_warmup_until_its_answer_is_delivered() {
             )
             .await
             .unwrap(),
-        Some(activity),
+        None,
         "child computation completion must not masquerade as response publication"
     );
     harness
@@ -1303,6 +1438,40 @@ async fn hidden_composer_defers_root_warmup_until_its_answer_is_delivered() {
     assert!(
         delivered_activity >= activity + 28_800_000,
         "this actual Composer response became ready later than eight hours after input"
+    );
+    let publication_revision = check::Entity::find_by_id("composer-human-question")
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    clock.set(delivered_activity as u64 + 1000);
+    harness
+        .processor
+        .process_due_task_deliveries(phase_13_now_secs() + 100, 16)
+        .await
+        .unwrap();
+    assert_eq!(
+        harness
+            .crud_store
+            .compaction_root_history_activity(
+                &harness.workspace_id,
+                "composer-warm-root",
+                "composer-human-question"
+            )
+            .await
+            .unwrap(),
+        Some(delivered_activity)
+    );
+    assert_eq!(
+        check::Entity::find_by_id("composer-human-question")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision,
+        publication_revision,
+        "delivery replay cannot create another preparation request"
     );
     clock.set(delivered_activity as u64);
     drain_worker(&harness.processor).await;

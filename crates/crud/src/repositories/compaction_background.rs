@@ -1,7 +1,13 @@
 //! Durable locators for optional root conversation preparation. No history copy.
 use anyhow::{Result, ensure};
-use pioneer_entity::{compaction_history_check, thread, turn};
-use sea_orm::sea_query::{Expr, ExprTrait, Func, JoinType, OnConflict, Query};
+use pioneer_entity::{
+    compaction_context, compaction_execution_stop, compaction_history_check,
+    compaction_root_activity, task, task_run_turn, thread, thread_lineage, turn,
+    turn_cli_runtime_binding,
+};
+use sea_orm::sea_query::{
+    Alias, Condition, Expr, ExprTrait, Func, JoinType, OnConflict, Order, Query, SelectStatement,
+};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QuerySelect,
 };
@@ -119,43 +125,213 @@ pub(crate) async fn compaction_enqueue_native_history_check<C: ConnectionTrait>(
     }
     Ok(())
 }
-/// A newer execution invalidates an optional older check. Inspect one
-/// locator at a time rather than bulk-updating a thread's retained history.
+// Query-local names only: physical tables/columns always use generated entities.
+#[derive(Clone, Copy, sea_orm::DeriveIden)]
+enum HistoryAlias {
+    Root,
+    Human,
+    Composer,
+    Execution,
+}
+
+// Constants that define an expression/partial index are literal AST nodes.
+// Binding these as parameters would prevent SQLite from matching that index.
+fn literal(value: impl Into<sea_orm::Value>) -> Expr {
+    Expr::Constant(value.into())
+}
+
+fn no_child_lineage(root: Expr) -> Expr {
+    Expr::exists(
+        Query::select()
+            .expr(literal(1_i64))
+            .from(thread_lineage::Entity)
+            .and_where(
+                Expr::col((
+                    thread_lineage::Entity,
+                    thread_lineage::Column::ChildThreadId,
+                ))
+                .eq(root),
+            )
+            .to_owned(),
+    )
+    .not()
+}
+
+fn human_conversation(alias: HistoryAlias) -> Condition {
+    Condition::all()
+        .add(Expr::col((alias, turn::Column::Origin)).eq(literal("user")))
+        .add(Expr::col((alias, turn::Column::TurnKind)).eq(literal("conversation")))
+        .add(Expr::col((alias, turn::Column::InitiatedByActorKind)).eq(literal("principal")))
+}
+
+// A single SQL scope for busy detection and foreground binding.
+// JSON functions are ordinary function-call ASTs; CASE guards malformed legacy
+// metadata. The snake_case launch keys are the TurnStartParams wire contract.
+fn composer_task_scope() -> SelectStatement {
+    use HistoryAlias::{Composer as K, Human as U, Root as H};
+    let metadata = Expr::col((K, task::Column::MetadataJson));
+    let valid: Expr = Func::cust(Alias::new("json_valid"))
+        .arg(metadata.clone())
+        .into();
+    let safe: Expr = Expr::case(valid, metadata).finally(literal("{}")).into();
+    let field = |path: &str| -> Expr {
+        Func::cust(Alias::new("json_extract"))
+            .args([safe.clone(), Expr::val(path)])
+            .into()
+    };
+    Query::select()
+        .from_as(task::Entity, K)
+        .join_as(
+            JoinType::InnerJoin,
+            thread::Entity,
+            H,
+            Expr::col((H, thread::Column::Id))
+                .eq(Expr::col((K, task::Column::CreatedByThreadId)))
+                .and(
+                    Expr::col((H, thread::Column::WorkspaceId))
+                        .eq(Expr::col((K, task::Column::WorkspaceId))),
+                ),
+        )
+        .join_as(
+            JoinType::InnerJoin,
+            turn::Entity,
+            U,
+            Condition::all()
+                .add(
+                    Expr::col((U, turn::Column::Id))
+                        .eq(Expr::col((K, task::Column::CreatedByTurnId))),
+                )
+                .add(Expr::col((U, turn::Column::ThreadId)).eq(Expr::col((H, thread::Column::Id))))
+                .add(human_conversation(U))
+                .add(Expr::col((U, turn::Column::WorkOwner)).eq(literal("detached_task"))),
+        )
+        .and_where(field("$.composerWork.version").eq(pioneer_protocol::TASK_COMPOSER_WORK_VERSION))
+        .and_where(field("$.composerWork.launch.thread_id").eq(Expr::col((H, thread::Column::Id))))
+        .and_where(field("$.composerWork.launch.turn_id").eq(Expr::col((U, turn::Column::Id))))
+        .to_owned()
+}
+
+// Shared currency/discovery predicate; optional warming never discovers old
+// execution-purpose debt. The activity join ties it to the latest human input.
+fn root_history_checks() -> SelectStatement {
+    use compaction_history_check as h;
+    use compaction_root_activity as a;
+    Query::select()
+        .from(h::Entity)
+        .join(
+            JoinType::InnerJoin,
+            turn::Entity,
+            Expr::col((turn::Entity, turn::Column::Id))
+                .eq(Expr::col((h::Entity, h::Column::TurnId))),
+        )
+        .join(
+            JoinType::InnerJoin,
+            a::Entity,
+            Expr::col((a::Entity, a::Column::ThreadId))
+                .eq(Expr::col((turn::Entity, turn::Column::ThreadId)))
+                .and(
+                    Expr::col((a::Entity, a::Column::UserTurnId))
+                        .eq(Expr::col((turn::Entity, turn::Column::Id))),
+                ),
+        )
+        .and_where(Expr::col((h::Entity, h::Column::State)).eq(literal("pending")))
+        .and_where(Expr::col((h::Entity, h::Column::Managed)).eq(literal(1_i64)))
+        .and_where(Expr::col((h::Entity, h::Column::Purpose)).eq(literal("root_conversation")))
+        .and_where(Expr::col((turn::Entity, turn::Column::Status)).is_in([
+            "completed",
+            "failed",
+            "blocked",
+        ]))
+        .and_where(no_child_lineage(Expr::col((
+            turn::Entity,
+            turn::Column::ThreadId,
+        ))))
+        .to_owned()
+}
+
+/// A newer execution invalidates an optional older check. Inspect one locator.
 pub(crate) async fn compaction_history_check_is_current<C: ConnectionTrait>(
     db: &C,
     turn: &str,
     revision: Option<i64>,
 ) -> Result<bool> {
-    // Only publication-triggered level-zero work is eligible. Native execution
-    // intents remain durable lifecycle metadata, including those of children.
-    Ok(db.query_one_raw(sea_orm::Statement::from_sql_and_values(
-        sea_orm::DbBackend::Sqlite,
-        r#"SELECT 1 FROM compaction_history_check h
-           JOIN turn t ON t.id=h.turn_id
-           JOIN compaction_root_activity a ON a.thread_id=t.thread_id AND a.user_turn_id=t.id
-           WHERE h.turn_id=? AND (? IS NULL OR h.revision=?) AND h.state='pending' AND h.managed=1 AND h.purpose='root_conversation' AND a.recovery_pending=0 AND t.status IN ('completed','failed','blocked')
-             AND NOT EXISTS (SELECT 1 FROM thread_lineage l WHERE l.child_thread_id=t.thread_id)
-             AND NOT EXISTS (SELECT 1 FROM compaction_execution_stop s
-                 JOIN compaction_context c ON c.owner=s.owner
-                 WHERE s.turn_id=t.id AND c.thread_id=t.thread_id)"#,
-        [turn.into(), revision.into(), revision.into()],
-    )).await?.is_some())
+    let stopped = Query::select()
+        .expr(literal(1_i64))
+        .from(compaction_execution_stop::Entity)
+        .join(
+            JoinType::InnerJoin,
+            compaction_context::Entity,
+            Expr::col((
+                compaction_context::Entity,
+                compaction_context::Column::Owner,
+            ))
+            .eq(Expr::col((
+                compaction_execution_stop::Entity,
+                compaction_execution_stop::Column::Owner,
+            ))),
+        )
+        .and_where(
+            Expr::col((
+                compaction_execution_stop::Entity,
+                compaction_execution_stop::Column::TurnId,
+            ))
+            .eq(Expr::col((turn::Entity, turn::Column::Id))),
+        )
+        .and_where(
+            Expr::col((
+                compaction_context::Entity,
+                compaction_context::Column::ThreadId,
+            ))
+            .eq(Expr::col((turn::Entity, turn::Column::ThreadId))),
+        )
+        .to_owned();
+    let mut query = root_history_checks();
+    query
+        .expr(literal(1_i64))
+        .and_where(
+            Expr::col((
+                compaction_history_check::Entity,
+                compaction_history_check::Column::TurnId,
+            ))
+            .eq(turn),
+        )
+        .and_where(Expr::exists(stopped).not());
+    if let Some(revision) = revision {
+        query.and_where(
+            Expr::col((
+                compaction_history_check::Entity,
+                compaction_history_check::Column::Revision,
+            ))
+            .eq(revision),
+        );
+    }
+    Ok(db.query_one(&query).await?.is_some())
 }
 
-/// Indexed control metadata only; callers release the reader before capture,
-/// provider preparation or waiting for foreground ownership.
+/// Indexed control metadata only; no reader held across capture or admission.
 pub(crate) async fn root_history_activity<C: ConnectionTrait>(
     db: &C,
     workspace: &str,
     thread: &str,
     turn: &str,
 ) -> Result<Option<i64>> {
-    let row = db.query_one_raw(sea_orm::Statement::from_sql_and_values(
-        sea_orm::DbBackend::Sqlite,
-        "SELECT a.last_user_activity_ms FROM compaction_root_activity a JOIN thread h ON h.id=a.thread_id WHERE h.workspace_id=? AND a.thread_id=? AND a.user_turn_id=? AND a.recovery_pending=0",
-        [workspace.into(), thread.into(), turn.into()],
-    )).await?;
-    row.map(|r| r.try_get("", "last_user_activity_ms"))
+    use compaction_root_activity as a;
+    let query = Query::select()
+        .column((a::Entity, a::Column::LastUserActivityMs))
+        .from(a::Entity)
+        .join(
+            JoinType::InnerJoin,
+            thread::Entity,
+            Expr::col((thread::Entity, thread::Column::Id))
+                .eq(Expr::col((a::Entity, a::Column::ThreadId))),
+        )
+        .and_where(Expr::col((thread::Entity, thread::Column::WorkspaceId)).eq(workspace))
+        .and_where(Expr::col((a::Entity, a::Column::ThreadId)).eq(thread))
+        .and_where(Expr::col((a::Entity, a::Column::UserTurnId)).eq(turn))
+        .to_owned();
+    db.query_one(&query)
+        .await?
+        .map(|r| r.try_get("", "last_user_activity_ms"))
         .transpose()
         .map_err(Into::into)
 }
@@ -165,146 +341,93 @@ pub(crate) async fn root_history_busy<C: ConnectionTrait>(
     workspace: &str,
     root: &str,
 ) -> Result<bool> {
-    Ok(db.query_one_raw(sea_orm::Statement::from_sql_and_values(
-        sea_orm::DbBackend::Sqlite,
-        r#"SELECT 1 FROM thread h WHERE h.id=? AND h.workspace_id=? AND (
-            EXISTS (SELECT 1 FROM turn t WHERE t.thread_id=h.id AND t.status='in_progress'
-                    AND t.origin='user' AND t.work_owner='turn')
-            OR EXISTS (SELECT 1 FROM task k WHERE k.created_by_thread_id=h.id AND k.workspace_id=h.workspace_id
-                AND json_extract(CASE WHEN json_valid(k.metadata_json) THEN k.metadata_json ELSE '{}' END,'$.composerWork.version')=1
-                AND json_extract(CASE WHEN json_valid(k.metadata_json) THEN k.metadata_json ELSE '{}' END,'$.composerWork.launch.thread_id')=h.id
-                AND json_extract(CASE WHEN json_valid(k.metadata_json) THEN k.metadata_json ELSE '{}' END,'$.composerWork.launch.turn_id')=k.created_by_turn_id
-                AND k.metadata_json IS NOT NULL AND k.status NOT IN ('completed','failed','blocked','cancelled')
-                AND EXISTS (SELECT 1 FROM turn human WHERE human.id=k.created_by_turn_id
-                    AND human.thread_id=h.id AND human.origin='user' AND human.turn_kind='conversation'
-                    AND human.initiated_by_actor_kind='principal' AND human.work_owner='detached_task'))
-        )"#,
-        [root.into(), workspace.into()],
-    )).await?.is_some())
+    use HistoryAlias::{Composer as K, Root as H};
+    let direct = Query::select()
+        .expr(literal(1_i64))
+        .from(turn::Entity)
+        .and_where(
+            Expr::col((turn::Entity, turn::Column::ThreadId))
+                .eq(Expr::col((thread::Entity, thread::Column::Id))),
+        )
+        .and_where(Expr::col((turn::Entity, turn::Column::Status)).eq(literal("in_progress")))
+        .and_where(Expr::col((turn::Entity, turn::Column::Origin)).eq(literal("user")))
+        .and_where(Expr::col((turn::Entity, turn::Column::WorkOwner)).eq(literal("turn")))
+        .to_owned();
+    let composer = composer_task_scope()
+        .expr(literal(1_i64))
+        .and_where(
+            Expr::col((H, thread::Column::Id)).eq(Expr::col((thread::Entity, thread::Column::Id))),
+        )
+        // Match the partial live-work index literally.
+        .and_where(Expr::col((K, task::Column::Status)).is_not_in([
+            literal("completed"),
+            literal("failed"),
+            literal("blocked"),
+            literal("cancelled"),
+        ]))
+        .and_where(Expr::col((K, task::Column::MetadataJson)).is_not_null())
+        .to_owned();
+    let query = Query::select()
+        .expr(literal(1_i64))
+        .from(thread::Entity)
+        .and_where(Expr::col((thread::Entity, thread::Column::Id)).eq(root))
+        .and_where(Expr::col((thread::Entity, thread::Column::WorkspaceId)).eq(workspace))
+        .cond_where(
+            Condition::any()
+                .add(Expr::exists(direct))
+                .add(Expr::exists(composer)),
+        )
+        .to_owned();
+    Ok(db.query_one(&query).await?.is_some())
 }
 
-/// A technical Composer execution shares foreground priority with the visible
-/// conversation. Ordinary nested tasks do not acquire that conversation key.
+/// A technical Composer execution shares the visible conversation's priority.
 pub(crate) async fn root_for_history_execution<C: ConnectionTrait>(
     db: &C,
     workspace: &str,
     thread: &str,
     turn: &str,
 ) -> Result<Option<String>> {
-    let row = db.query_one_raw(sea_orm::Statement::from_sql_and_values(
-        sea_orm::DbBackend::Sqlite,
-        r#"SELECT k.created_by_thread_id AS root FROM task_run_turn x
-            JOIN task k ON k.id=x.task_id
-            JOIN thread h ON h.id=k.created_by_thread_id AND h.workspace_id=k.workspace_id
-            JOIN turn u ON u.id=k.created_by_turn_id AND u.thread_id=h.id AND u.origin='user'
-                AND u.turn_kind='conversation' AND u.initiated_by_actor_kind='principal' AND u.work_owner='detached_task'
-            WHERE x.turn_id=? AND x.thread_id=? AND k.workspace_id=?
-              AND h.origin_kind IN ('user','collaborative','direct_message')
-              AND json_extract(CASE WHEN json_valid(k.metadata_json) THEN k.metadata_json ELSE '{}' END,'$.composerWork.version')=1
-              AND json_extract(CASE WHEN json_valid(k.metadata_json) THEN k.metadata_json ELSE '{}' END,'$.composerWork.launch.thread_id')=h.id
-              AND json_extract(CASE WHEN json_valid(k.metadata_json) THEN k.metadata_json ELSE '{}' END,'$.composerWork.launch.turn_id')=u.id
-              AND NOT EXISTS (SELECT 1 FROM thread_lineage l WHERE l.child_thread_id=h.id)
-            LIMIT 1"#,
-        [turn.into(), thread.into(), workspace.into()],
-    )).await?;
-    row.map(|r| r.try_get("", "root"))
-        .transpose()
-        .map_err(Into::into)
-}
-
-/// Recover only roots first touched after upgrade. Publication already saved
-/// the latest input, its own original ready time, and durable queue debt. Read
-/// at most 16 roots / two 64-row index seeks per root; never hold a reader while
-/// processing rows or committing progress. New publication/input uses MAX and
-/// does not reset this cursor. No clock, payload, LLM or service is involved.
-pub(crate) async fn recover_root_activity_quantum(store: &crate::CrudStore) -> Result<()> {
-    use sea_orm::{DbBackend, Statement};
-    const EVENT_MS: &str = "(CAST(strftime('%s',created_at) AS INTEGER)*1000 + CAST(substr(strftime('%f',created_at),4,3) AS INTEGER))";
-    let roots = store.connection.query_all_raw(Statement::from_string(DbBackend::Sqlite,
-        "SELECT thread_id,last_user_activity_ms,recovery_before_ms,recovery_before_id FROM compaction_root_activity WHERE recovery_pending=1 ORDER BY thread_id LIMIT 16".to_owned()
-    )).await?;
-    for root in roots {
-        let thread: String = root.try_get("", "thread_id")?;
-        let activity: i64 = root.try_get("", "last_user_activity_ms")?;
-        let before_ms: i64 = root.try_get("", "recovery_before_ms")?;
-        let before_id: String = root.try_get("", "recovery_before_id")?;
-        // Separate equality/earlier seeks give each cursor component an
-        // explicit index range, including arbitrarily many equal timestamps.
-        // MATERIALIZED bounds authority work to the newest 64 of <=128 keys.
-        // No OFFSET, residual tuple filter or unbounded historical sort.
-        let rows = if activity >= before_ms {
-            // A publication/input already covers every remaining timestamp.
-            Vec::new()
-        } else {
-            store.connection.query_all_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            format!(r#"WITH same_time AS MATERIALIZED (
-              SELECT id,turn_id,event_type,{EVENT_MS} AS event_ms FROM turn_event
-              WHERE thread_id=? AND event_type IN ('turn/completed','item/completed')
-                AND {EVENT_MS}=? AND id<?
-              ORDER BY id DESC LIMIT 64
-            ), earlier_time AS MATERIALIZED (
-              SELECT id,turn_id,event_type,{EVENT_MS} AS event_ms FROM turn_event
-              WHERE thread_id=? AND event_type IN ('turn/completed','item/completed')
-                AND {EVENT_MS}<? AND {EVENT_MS}>?
-              ORDER BY {EVENT_MS} DESC,id DESC LIMIT 64
-            ), quantum AS MATERIALIZED (
-              SELECT * FROM same_time UNION ALL SELECT * FROM earlier_time
-              ORDER BY event_ms DESC,id DESC LIMIT 64
-            )
-            SELECT q.id,q.event_ms,CASE WHEN
-              (q.event_type='turn/completed' AND EXISTS (
-                SELECT 1 FROM turn t WHERE t.id=q.turn_id AND t.thread_id=?
-                  AND t.origin='user' AND t.turn_kind='conversation'
-                  AND t.initiated_by_actor_kind='principal' AND t.work_owner='turn' AND t.status='completed'
-                  AND EXISTS(SELECT 1 FROM turn_item i WHERE i.turn_id=t.id AND i.item_type='agent_message' AND i.status='completed')))
-              OR (q.event_type='item/completed' AND EXISTS (
-                SELECT 1 FROM compaction_event_revision r
-                JOIN task_delivery d ON d.id=substr(r.item_id,length('task_delivery_result_')+1)
-                  AND r.item_id='task_delivery_result_'||d.id
-                JOIN thread h ON h.id=d.target_thread_id AND h.workspace_id=d.workspace_id
-                JOIN compaction_delivery_output b ON b.delivery_id=d.id
-                JOIN compaction_task_output s ON s.task_run_turn_id=b.task_run_turn_id
-                  AND s.task_id=d.task_id AND s.run_id=d.run_id AND s.workspace_id=d.workspace_id
-                JOIN task_result_candidate c ON c.id=b.candidate_id AND c.status='accepted'
-                  AND c.task_run_turn_id=s.task_run_turn_id AND c.task_id=s.task_id AND c.run_id=s.run_id
-                  AND c.thread_id=s.source_thread AND c.turn_id=s.source_turn
-                JOIN task k ON k.id=d.task_id AND k.workspace_id=d.workspace_id
-                JOIN turn human ON human.id=k.created_by_turn_id AND human.thread_id=h.id
-                  AND human.origin='user' AND human.turn_kind='conversation'
-                  AND human.initiated_by_actor_kind='principal' AND human.work_owner='detached_task'
-                WHERE r.source_id=q.id AND r.turn_id=q.turn_id AND r.present=1 AND r.projection_revision=r.revision
-                  AND d.delivered_turn_id=q.turn_id AND h.id=?
-                  AND d.mode='thread' AND d.status='delivered' AND d.delivered_at IS NOT NULL AND d.error_snapshot_json IS NULL
-                  AND k.created_by_thread_id=h.id
-                  AND json_extract(CASE WHEN json_valid(k.metadata_json) THEN k.metadata_json ELSE '{{}}' END,'$.composerWork.version')=1
-                  AND json_extract(CASE WHEN json_valid(k.metadata_json) THEN k.metadata_json ELSE '{{}}' END,'$.composerWork.launch.thread_id')=h.id
-                  AND json_extract(CASE WHEN json_valid(k.metadata_json) THEN k.metadata_json ELSE '{{}}' END,'$.composerWork.launch.turn_id')=human.id
-                  AND EXISTS(SELECT 1 FROM turn_item i WHERE i.turn_id=q.turn_id AND i.item_id=r.item_id AND i.status='completed')))
-              THEN q.event_ms ELSE 0 END AS confirmed_ms
-            FROM quantum q ORDER BY q.event_ms DESC,q.id DESC"#),
-            [thread.clone().into(),before_ms.into(),before_id.clone().into(),thread.clone().into(),before_ms.into(),activity.into(),thread.clone().into(),thread.clone().into()]
-        )).await?
-        };
-        let mut confirmed = 0_i64;
-        let mut next_ms = before_ms;
-        let mut next_id = before_id.clone();
-        for row in &rows {
-            confirmed = std::cmp::max(confirmed, row.try_get("", "confirmed_ms")?);
-            next_ms = row.try_get("", "event_ms")?;
-            next_id = row.try_get("", "id")?;
-        }
-        // Once the newest confirmed event is found, older pages cannot raise
-        // the watermark. Current publications have independently raised MAX.
-        let pending = i64::from(rows.len() == 64 && confirmed == 0);
-        store.run_serialized_write(|| async {
-            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "UPDATE compaction_root_activity SET last_user_activity_ms=MAX(last_user_activity_ms,?),recovery_pending=?,recovery_before_ms=?,recovery_before_id=? WHERE thread_id=? AND recovery_pending=1 AND recovery_before_ms=? AND recovery_before_id=?",
-                [confirmed.into(),pending.into(),next_ms.into(),next_id.clone().into(),thread.clone().into(),before_ms.into(),before_id.clone().into()]
-            )).await?;
-            Ok(())
-        }).await?;
-    }
-    Ok(())
+    use HistoryAlias::{Composer as K, Execution as X, Human as U, Root as H};
+    let query = composer_task_scope()
+        .expr_as(Expr::col((H, thread::Column::Id)), Alias::new("root"))
+        .expr_as(Expr::col((U, turn::Column::Id)), Alias::new("human_turn"))
+        .column((K, task::Column::MetadataJson))
+        .join_as(
+            JoinType::InnerJoin,
+            task_run_turn::Entity,
+            X,
+            Expr::col((X, task_run_turn::Column::TaskId)).eq(Expr::col((K, task::Column::Id))),
+        )
+        .and_where(Expr::col((X, task_run_turn::Column::TurnId)).eq(turn))
+        .and_where(Expr::col((X, task_run_turn::Column::ThreadId)).eq(thread))
+        .and_where(Expr::col((K, task::Column::WorkspaceId)).eq(workspace))
+        .and_where(Expr::col((H, thread::Column::OriginKind)).is_in([
+            "user",
+            "collaborative",
+            "direct_message",
+        ]))
+        .and_where(no_child_lineage(Expr::col((H, thread::Column::Id))))
+        .limit(1)
+        .to_owned();
+    let Some(row) = db.query_one(&query).await? else {
+        return Ok(None);
+    };
+    let root: String = row.try_get("", "root")?;
+    let human: String = row.try_get("", "human_turn")?;
+    let metadata: Option<String> = row.try_get("", "metadata_json")?;
+    // Match the existing protocol decoder after releasing reader capacity.
+    let composer = metadata
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<pioneer_protocol::TaskMetadata>(json).ok())
+        .and_then(|metadata| metadata.composer_work);
+    Ok(composer
+        .filter(|work| {
+            work.version == pioneer_protocol::TASK_COMPOSER_WORK_VERSION
+                && work.launch.thread_id == root
+                && work.launch.turn_id == human
+        })
+        .map(|_| root))
 }
 
 /// One bounded metadata page; caller releases reader capacity before decoding.
@@ -321,25 +444,77 @@ pub(crate) async fn compaction_due_history_checks<C: ConnectionTrait>(
     db: &C,
     now: i64,
 ) -> Result<Vec<CompletedHistoryCheck>> {
-    // The root watermark is also the policy discriminator for pre-upgrade
-    // pending checks. Never discover the old child-completion queue policy.
-    CompletedHistoryCheck::find_by_statement(sea_orm::Statement::from_sql_and_values(
-        sea_orm::DbBackend::Sqlite,
-        r#"SELECT h.turn_id,t.thread_id,th.workspace_id,
-            COALESCE(b.runtime_id,th.model_provider) AS runtime_id,
-            COALESCE(b.runtime_kind,'') AS runtime_kind,
-            COALESCE(b.model,th.model) AS model,t.reasoning_effort,
-            h.descriptor,h.revision,h.failures,h.attempt_deadline_ms,h.diagnostic,h.config_hash,h.outcome,h.managed
-           FROM compaction_history_check h
-           JOIN turn t ON t.id=h.turn_id
-           JOIN compaction_root_activity a ON a.thread_id=t.thread_id AND a.user_turn_id=t.id
-           JOIN thread th ON th.id=t.thread_id
-           LEFT JOIN turn_cli_runtime_binding b ON b.turn_id=t.id AND b.thread_id=t.thread_id AND b.workspace_id=th.workspace_id
-           WHERE h.next_attempt_ms<=? AND h.state='pending' AND h.managed=1 AND h.purpose='root_conversation' AND a.recovery_pending=0 AND t.status IN ('completed','failed','blocked')
-             AND NOT EXISTS (SELECT 1 FROM thread_lineage l WHERE l.child_thread_id=t.thread_id)
-           ORDER BY h.next_attempt_ms,h.turn_id LIMIT 16"#,
-        [now.into()],
-    )).all(db).await.map_err(Into::into)
+    use compaction_history_check as h;
+    use turn_cli_runtime_binding as b;
+    let mut query = root_history_checks();
+    query
+        .columns(
+            [
+                h::Column::TurnId,
+                h::Column::Descriptor,
+                h::Column::Revision,
+                h::Column::Failures,
+                h::Column::AttemptDeadlineMs,
+                h::Column::Diagnostic,
+                h::Column::ConfigHash,
+                h::Column::Outcome,
+                h::Column::Managed,
+            ]
+            .map(|col| (h::Entity, col)),
+        )
+        .columns(
+            [turn::Column::ThreadId, turn::Column::ReasoningEffort].map(|col| (turn::Entity, col)),
+        )
+        .column((thread::Entity, thread::Column::WorkspaceId))
+        .join(
+            JoinType::InnerJoin,
+            thread::Entity,
+            Expr::col((thread::Entity, thread::Column::Id))
+                .eq(Expr::col((turn::Entity, turn::Column::ThreadId))),
+        )
+        .join(
+            JoinType::LeftJoin,
+            b::Entity,
+            Condition::all()
+                .add(
+                    Expr::col((b::Entity, b::Column::TurnId))
+                        .eq(Expr::col((turn::Entity, turn::Column::Id))),
+                )
+                .add(
+                    Expr::col((b::Entity, b::Column::ThreadId))
+                        .eq(Expr::col((turn::Entity, turn::Column::ThreadId))),
+                )
+                .add(
+                    Expr::col((b::Entity, b::Column::WorkspaceId))
+                        .eq(Expr::col((thread::Entity, thread::Column::WorkspaceId))),
+                ),
+        )
+        .expr_as(
+            Func::coalesce([
+                Expr::col((b::Entity, b::Column::RuntimeId)),
+                Expr::col((thread::Entity, thread::Column::ModelProvider)),
+            ]),
+            b::Column::RuntimeId,
+        )
+        .expr_as(
+            Func::coalesce([Expr::col((b::Entity, b::Column::RuntimeKind)), literal("")]),
+            b::Column::RuntimeKind,
+        )
+        .expr_as(
+            Func::coalesce([
+                Expr::col((b::Entity, b::Column::Model)),
+                Expr::col((thread::Entity, thread::Column::Model)),
+            ]),
+            b::Column::Model,
+        )
+        .and_where(Expr::col((h::Entity, h::Column::NextAttemptMs)).lte(now))
+        .order_by((h::Entity, h::Column::NextAttemptMs), Order::Asc)
+        .order_by((h::Entity, h::Column::TurnId), Order::Asc)
+        .limit(16);
+    CompletedHistoryCheck::find_by_statement(db.get_database_backend().build(&query))
+        .all(db)
+        .await
+        .map_err(Into::into)
 }
 
 /// Persist the captured settings/deadline before service admission; restart

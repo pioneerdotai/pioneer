@@ -1,6 +1,77 @@
 //! Durable user activity and publication-triggered optional root preparation.
 use sea_orm::ConnectionTrait;
-use sea_orm_migration::prelude::*;
+use sea_orm_migration::{
+    prelude::*,
+    sea_query::{ExprTrait, IndexOrder, PostgresQueryBuilder},
+};
+
+// Frozen migration identifiers: never import runtime entities or policy helpers.
+#[derive(Clone, Copy, DeriveIden)]
+enum Schema {
+    CompactionHistoryCheck,
+    CompactionRootActivity,
+    CompactionEventRevision,
+    Thread,
+    Turn,
+    Task,
+    TurnEvent,
+    TurnItem,
+    #[iden = "_task_zstd"]
+    TaskZstd,
+    #[iden = "_turn_event_zstd"]
+    TurnEventZstd,
+    #[iden = "_turn_item_zstd"]
+    TurnItemZstd,
+    Id,
+    ThreadId,
+    UserTurnId,
+    LastUserActivityMs,
+    Purpose,
+    NextAttemptMs,
+    TurnId,
+    State,
+    Managed,
+    WorkspaceId,
+    CreatedByThreadId,
+    Status,
+    MetadataJson,
+    CreatedAt,
+    EventType,
+    ItemType,
+    ItemId,
+    SourceId,
+    Present,
+    ProjectionRevision,
+    Revision,
+}
+
+// Keep exactly the expression used by the publication trigger's millis().
+fn millis_expr() -> Expr {
+    let seconds = Func::cust(Alias::new("strftime"))
+        .args([Expr::val("%s"), Expr::col(Schema::CreatedAt)])
+        .cast_as(Alias::new("INTEGER"));
+    let fraction =
+        Func::cust(Alias::new("strftime")).args([Expr::val("%f"), Expr::col(Schema::CreatedAt)]);
+    let milliseconds = Func::cust(Alias::new("substr"))
+        .args([fraction.into(), Expr::val(4), Expr::val(3)])
+        .cast_as(Alias::new("INTEGER"));
+    seconds.mul(1000).add(milliseconds)
+}
+
+async fn create_expression_index(
+    manager: &SchemaManager<'_>,
+    index: IndexCreateStatement,
+) -> Result<(), DbErr> {
+    // SeaQuery 1.0.2 SQLite's inherited IndexBuilder panics on IndexColumn::Expr.
+    // As in the inbox migration, PostgreSQL renders this restricted AST with
+    // SQLite-compatible quoting, CAST, functions, ordering and partial predicate.
+    // The whole statement stays builder-owned; no SQL templates or rewriting.
+    manager
+        .get_connection()
+        .execute_unprepared(&index.to_string(PostgresQueryBuilder))
+        .await?;
+    Ok(())
+}
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
@@ -22,6 +93,11 @@ fn enqueue(selection: &str) -> String {
     )
 }
 
+// These historical trigger predicates intentionally freeze the publication
+// invariant. The receipt/status transition and debt must commit together, and
+// only an exact accepted immutable output may enter this root's future context.
+// Runtime independently validates current authorization when consuming debt;
+// it cannot replace these checks with a fallible post-commit callback.
 // A delivery locator is not authority: require the exact immutable binding,
 // accepted candidate and the result's already materialized acknowledgement.
 const DELIVERIES: &str = r#"
@@ -50,6 +126,9 @@ const DELIVERIES: &str = r#"
        AND i.item_id='task_delivery_result_'||d.id AND i.status='completed')
 "#;
 
+// Only a response bound to an original human request extends activity. This
+// short exact-delivery check stays atomic with receipt publication; frozen JSON
+// paths describe the released wire format, not a runtime policy import.
 const COMPOSER: &str = r#"
  json_valid(k.metadata_json)
  AND json_extract(CASE WHEN json_valid(k.metadata_json) THEN k.metadata_json ELSE '{}' END,'$.composerWork.version')=1
@@ -61,29 +140,6 @@ const COMPOSER: &str = r#"
      AND human.work_owner='detached_task'
      AND k.created_by_turn_id=human.id AND k.created_by_thread_id=h.id)
 "#;
-
-// Publication performs one ordered index seek, never historical aggregates.
-// Older ready responses (if any) are recovered by the existing Maintenance poll
-// in bounded pages. Its cursor and the queue debt commit with publication.
-fn seed_activity(destination: &str, publication: &str) -> String {
-    let input_ms = millis("human.created_at");
-    let candidate_ms = millis("candidate.created_at");
-    format!(
-        r#"INSERT INTO compaction_root_activity(thread_id,user_turn_id,last_user_activity_ms,recovery_pending)
-      SELECT root.id,human.id,{input_ms},1
-      FROM thread root CROSS JOIN turn human
-      WHERE root.id={destination}
-        AND root.origin_kind IN ('user','collaborative','direct_message')
-        AND NOT EXISTS(SELECT 1 FROM thread_lineage WHERE child_thread_id=root.id)
-        AND NOT EXISTS(SELECT 1 FROM compaction_root_activity a WHERE a.thread_id=root.id)
-        AND ({publication})
-        AND human.id=(SELECT candidate.id FROM turn candidate
-          WHERE candidate.thread_id=root.id AND candidate.origin='user'
-            AND candidate.turn_kind='conversation' AND candidate.initiated_by_actor_kind='principal'
-          ORDER BY {candidate_ms} DESC,candidate.id DESC LIMIT 1)
-      ON CONFLICT(thread_id) DO NOTHING;"#
-    )
-}
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
@@ -99,9 +155,34 @@ impl MigrationTrait for Migration {
             .has_column("compaction_history_check", "purpose")
             .await?
         {
-            db.execute_unprepared("ALTER TABLE compaction_history_check ADD COLUMN purpose TEXT NOT NULL DEFAULT 'execution'").await?;
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(Schema::CompactionHistoryCheck)
+                        .add_column(
+                            ColumnDef::new(Schema::Purpose)
+                                .text()
+                                .not_null()
+                                .default("execution"),
+                        )
+                        .to_owned(),
+                )
+                .await?;
         }
-        db.execute_unprepared("CREATE INDEX IF NOT EXISTS compaction_root_history_due ON compaction_history_check(next_attempt_ms,turn_id) WHERE purpose='root_conversation' AND state='pending' AND managed=1").await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("compaction_root_history_due")
+                    .table(Schema::CompactionHistoryCheck)
+                    .col(Schema::NextAttemptMs)
+                    .col(Schema::TurnId)
+                    .and_where(Expr::col(Schema::Purpose).eq("root_conversation"))
+                    .and_where(Expr::col(Schema::State).eq("pending"))
+                    .and_where(Expr::col(Schema::Managed).eq(1))
+                    .to_owned(),
+            )
+            .await?;
         let task_storage = if manager.has_table("_task_zstd").await? {
             "_task_zstd"
         } else {
@@ -109,7 +190,30 @@ impl MigrationTrait for Migration {
         };
         // The metadata guard is a cheap superset of Composer work. The worker
         // verifies composerWork after reading only live rows in this root.
-        db.execute_unprepared(&format!("CREATE INDEX IF NOT EXISTS compaction_root_live_composer ON {task_storage}(workspace_id,created_by_thread_id,status) WHERE status NOT IN ('completed','failed','blocked','cancelled') AND metadata_json IS NOT NULL")).await?;
+        let task_table = if task_storage == "_task_zstd" {
+            Schema::TaskZstd
+        } else {
+            Schema::Task
+        };
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("compaction_root_live_composer")
+                    .table(task_table)
+                    .col(Schema::WorkspaceId)
+                    .col(Schema::CreatedByThreadId)
+                    .col(Schema::Status)
+                    .and_where(Expr::col(Schema::Status).is_not_in([
+                        "completed",
+                        "failed",
+                        "blocked",
+                        "cancelled",
+                    ]))
+                    .and_where(Expr::col(Schema::MetadataJson).is_not_null())
+                    .to_owned(),
+            )
+            .await?;
         for name in [
             "compaction_root_human_input",
             "compaction_root_answer_completed",
@@ -118,17 +222,50 @@ impl MigrationTrait for Migration {
             db.execute_unprepared(&format!("DROP TRIGGER IF EXISTS {name}"))
                 .await?;
         }
-        db.execute_unprepared(
-            r#"CREATE TABLE IF NOT EXISTS compaction_root_activity(
-          thread_id TEXT PRIMARY KEY NOT NULL REFERENCES thread(id) ON DELETE CASCADE,
-          user_turn_id TEXT NOT NULL REFERENCES turn(id) ON DELETE CASCADE,
-          last_user_activity_ms INTEGER NOT NULL CHECK(last_user_activity_ms>=0),
-          recovery_pending INTEGER NOT NULL DEFAULT 0 CHECK(recovery_pending IN (0,1)),
-          recovery_before_ms INTEGER NOT NULL DEFAULT 9223372036854775807,
-          recovery_before_id TEXT NOT NULL DEFAULT '~~~~~~~~~~~~~~~~~~~~~')"#,
-        )
-        .await?;
-        db.execute_unprepared("CREATE UNIQUE INDEX IF NOT EXISTS compaction_root_activity_turn ON compaction_root_activity(user_turn_id)").await?;
+        manager
+            .create_table(
+                Table::create()
+                    .if_not_exists()
+                    .table(Schema::CompactionRootActivity)
+                    .col(
+                        ColumnDef::new(Schema::ThreadId)
+                            .text()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(Schema::UserTurnId).text().not_null())
+                    .col(
+                        ColumnDef::new(Schema::LastUserActivityMs)
+                            .integer()
+                            .not_null(),
+                    )
+                    .check(Expr::col(Schema::LastUserActivityMs).gte(0))
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(Schema::CompactionRootActivity, Schema::ThreadId)
+                            .to(Schema::Thread, Schema::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(Schema::CompactionRootActivity, Schema::UserTurnId)
+                            .to(Schema::Turn, Schema::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .unique()
+                    .name("compaction_root_activity_turn")
+                    .table(Schema::CompactionRootActivity)
+                    .col(Schema::UserTurnId)
+                    .to_owned(),
+            )
+            .await?;
         db.execute_unprepared("DROP TRIGGER IF EXISTS compaction_history_cli_completed")
             .await?;
         let turn_storage = if manager.has_table("_turn_zstd").await? {
@@ -141,8 +278,8 @@ impl MigrationTrait for Migration {
         } else {
             "task_delivery"
         };
-        // Each range/order below uses the identical deterministic expression in
-        // its index. No computed ORDER BY over an unindexed historical set.
+        // Current publication looks up its exact completion event, never old
+        // conversation activity. Keep the ordered per-turn event index.
         let event_storage = if manager.has_table("_turn_event_zstd").await? {
             "_turn_event_zstd"
         } else {
@@ -153,15 +290,56 @@ impl MigrationTrait for Migration {
         } else {
             "turn_item"
         };
-        let human_ms = millis("created_at");
-        db.execute_unprepared(&format!("CREATE INDEX IF NOT EXISTS compaction_root_human_turn ON {turn_storage}(thread_id,{human_ms} DESC,id DESC) WHERE origin='user' AND turn_kind='conversation' AND initiated_by_actor_kind='principal'")).await?;
-        db.execute_unprepared(&format!("CREATE INDEX IF NOT EXISTS compaction_root_ready_event ON {event_storage}(thread_id,{human_ms} DESC,id DESC) WHERE event_type IN ('turn/completed','item/completed')")).await?;
-        db.execute_unprepared(&format!("CREATE INDEX IF NOT EXISTS compaction_root_completion_event ON {event_storage}(turn_id,event_type,{human_ms} DESC,id DESC)")).await?;
-        db.execute_unprepared(&format!("CREATE INDEX IF NOT EXISTS compaction_root_ready_item ON {item_storage}(turn_id,item_type,status)")).await?;
-        db.execute_unprepared("CREATE INDEX IF NOT EXISTS compaction_root_activity_recovery ON compaction_root_activity(thread_id) WHERE recovery_pending=1").await?;
-        // The current delivery joins its exact materialized receipt, rather
-        // than searching completed items across the destination's history.
-        db.execute_unprepared("CREATE INDEX IF NOT EXISTS compaction_root_delivery_receipt ON compaction_event_revision(turn_id,item_id,source_id) WHERE present=1 AND projection_revision=revision").await?;
+        let event_table = if event_storage == "_turn_event_zstd" {
+            Schema::TurnEventZstd
+        } else {
+            Schema::TurnEvent
+        };
+        let item_table = if item_storage == "_turn_item_zstd" {
+            Schema::TurnItemZstd
+        } else {
+            Schema::TurnItem
+        };
+        create_expression_index(
+            manager,
+            Index::create()
+                .if_not_exists()
+                .name("compaction_root_completion_event")
+                .table(event_table)
+                .col(Schema::TurnId)
+                .col(Schema::EventType)
+                .col((millis_expr(), IndexOrder::Desc))
+                .col((Schema::Id, IndexOrder::Desc))
+                .to_owned(),
+        )
+        .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("compaction_root_ready_item")
+                    .table(item_table)
+                    .col(Schema::TurnId)
+                    .col(Schema::ItemType)
+                    .col(Schema::Status)
+                    .to_owned(),
+            )
+            .await?;
+        // The current delivery joins only its exact materialized receipt.
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("compaction_root_delivery_receipt")
+                    .table(Schema::CompactionEventRevision)
+                    .col(Schema::TurnId)
+                    .col(Schema::ItemId)
+                    .col(Schema::SourceId)
+                    .and_where(Expr::col(Schema::Present).eq(1))
+                    .and_where(Expr::col(Schema::ProjectionRevision).equals(Schema::Revision))
+                    .to_owned(),
+            )
+            .await?;
         let input_ms = millis("NEW.created_at");
         db.execute_unprepared(&format!(r#"CREATE TRIGGER IF NOT EXISTS compaction_root_human_input
           AFTER INSERT ON {turn_storage}
@@ -196,7 +374,6 @@ impl MigrationTrait for Migration {
                 last_user_activity_ms=MAX(compaction_root_activity.last_user_activity_ms,{input_ms});
           END"#)).await?;
         let completion_ms = millis("e.created_at");
-        let direct_seed = seed_activity("NEW.thread_id", "1");
         let direct_enqueue = enqueue(
             "SELECT a.user_turn_id,'pending',1,'root_conversation' FROM compaction_root_activity a WHERE a.thread_id=NEW.thread_id",
         );
@@ -209,17 +386,21 @@ impl MigrationTrait for Migration {
                 AND i.item_type='agent_message' AND i.status='completed')
             AND EXISTS(SELECT 1 FROM turn_event e WHERE e.turn_id=NEW.id AND e.event_type='turn/completed')
           BEGIN
-            {direct_seed}
-            UPDATE compaction_root_activity SET last_user_activity_ms=MAX(last_user_activity_ms,
-              (SELECT {completion_ms} FROM turn_event e WHERE e.turn_id=NEW.id AND e.event_type='turn/completed' ORDER BY {completion_ms} DESC,e.id DESC LIMIT 1))
-              WHERE thread_id=NEW.thread_id;
+            -- A newly published reply can belong to an input from before
+            -- upgrade. Initialize from this exact reply, not old history.
+            INSERT INTO compaction_root_activity(thread_id,user_turn_id,last_user_activity_ms)
+              SELECT h.id,NEW.id,{completion_ms}
+              FROM thread h JOIN turn_event e ON e.turn_id=NEW.id
+                AND e.thread_id=h.id AND e.event_type='turn/completed'
+              WHERE h.id=NEW.thread_id
+                AND h.origin_kind IN ('user','collaborative','direct_message')
+                AND NOT EXISTS(SELECT 1 FROM thread_lineage l WHERE l.child_thread_id=h.id)
+              ORDER BY {completion_ms} DESC,e.id DESC LIMIT 1
+              ON CONFLICT(thread_id) DO UPDATE SET last_user_activity_ms=
+                MAX(compaction_root_activity.last_user_activity_ms,excluded.last_user_activity_ms);
             {direct_enqueue}
           END"#)).await?;
         let delivery_ms = millis("acknowledgement.created_at");
-        let delivery_seed = seed_activity(
-            "NEW.target_thread_id",
-            &format!("EXISTS(SELECT 1 {DELIVERIES} AND d.id=NEW.id)"),
-        );
         let delivery_enqueue = enqueue(&format!(
             "SELECT a.user_turn_id,'pending',1,'root_conversation' FROM compaction_root_activity a WHERE a.thread_id=NEW.target_thread_id AND EXISTS(SELECT 1 {DELIVERIES} AND d.id=NEW.id)"
         ));
@@ -228,11 +409,14 @@ impl MigrationTrait for Migration {
           AFTER UPDATE OF status ON {delivery_storage}
           WHEN NEW.status='delivered' AND OLD.status<>'delivered'
           BEGIN
-            {delivery_seed}
-            UPDATE compaction_root_activity SET last_user_activity_ms=MAX(last_user_activity_ms,
-              (SELECT MAX({delivery_ms}) {DELIVERIES} AND d.id=NEW.id AND {COMPOSER}))
-              WHERE thread_id=NEW.target_thread_id
-                AND EXISTS(SELECT 1 {DELIVERIES} AND d.id=NEW.id AND {COMPOSER});
+            -- Only an actual Composer reply may initialize absent activity.
+            -- Existing live input owns the anchor, including a newer question.
+            INSERT INTO compaction_root_activity(thread_id,user_turn_id,last_user_activity_ms)
+              SELECT h.id,k.created_by_turn_id,MAX({delivery_ms})
+              {DELIVERIES} AND d.id=NEW.id AND {COMPOSER}
+              GROUP BY h.id,k.created_by_turn_id
+              ON CONFLICT(thread_id) DO UPDATE SET last_user_activity_ms=
+                MAX(compaction_root_activity.last_user_activity_ms,excluded.last_user_activity_ms);
             {delivery_enqueue}
           END"#
         ))
@@ -250,22 +434,38 @@ impl MigrationTrait for Migration {
             db.execute_unprepared(&format!("DROP TRIGGER IF EXISTS {name}"))
                 .await?;
         }
-        db.execute_unprepared("DROP TABLE IF EXISTS compaction_root_activity")
+        manager
+            .drop_table(
+                Table::drop()
+                    .if_exists()
+                    .table(Schema::CompactionRootActivity)
+                    .to_owned(),
+            )
             .await?;
         for name in [
-            "compaction_root_ready_event",
             "compaction_root_completion_event",
             "compaction_root_ready_item",
             "compaction_root_delivery_receipt",
         ] {
-            db.execute_unprepared(&format!("DROP INDEX IF EXISTS {name}"))
+            manager
+                .drop_index(Index::drop().if_exists().name(name).to_owned())
                 .await?;
         }
-        db.execute_unprepared("DROP INDEX IF EXISTS compaction_root_human_turn")
+        manager
+            .drop_index(
+                Index::drop()
+                    .if_exists()
+                    .name("compaction_root_history_due")
+                    .to_owned(),
+            )
             .await?;
-        db.execute_unprepared("DROP INDEX IF EXISTS compaction_root_history_due")
-            .await?;
-        db.execute_unprepared("DROP INDEX IF EXISTS compaction_root_live_composer")
+        manager
+            .drop_index(
+                Index::drop()
+                    .if_exists()
+                    .name("compaction_root_live_composer")
+                    .to_owned(),
+            )
             .await?;
         if manager
             .has_column("compaction_history_check", "purpose")
@@ -274,8 +474,8 @@ impl MigrationTrait for Migration {
             manager
                 .alter_table(
                     Table::alter()
-                        .table(Alias::new("compaction_history_check"))
-                        .drop_column(Alias::new("purpose"))
+                        .table(Schema::CompactionHistoryCheck)
+                        .drop_column(Schema::Purpose)
                         .to_owned(),
                 )
                 .await?;

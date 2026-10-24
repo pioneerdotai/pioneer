@@ -210,10 +210,6 @@ impl MessageProcessor {
             warn!("compaction lifecycle maintenance deferred after storage failure");
         }
         let store = self.crud_store.with_maintenance_access();
-        // Schema-upgraded roots retain publication debt atomically, but cannot
-        // start optional service work until original activity is reconstructed.
-        // A quantum yields between polls; lifecycle reconciliation stays above.
-        store.compaction_recover_root_activity_quantum().await?;
         let finished = {
             let mut jobs = self.completed_history_checks.lock().await;
             let keys: Vec<_> = jobs

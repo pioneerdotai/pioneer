@@ -40,20 +40,13 @@ async fn policy_upgrade_preserves_execution_intents_and_root_publication_survive
         "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('executor','child','in_progress','conversation','user','2026-10-24T00:00:00Z','2026-10-24T00:00:00Z')",
         "INSERT INTO turn(id,thread_id,status,turn_kind,origin,initiated_by_actor_kind,initiated_by_actor_id,created_at,updated_at) VALUES('old-human','root','in_progress','conversation','user','principal','P00000000000000000001','2026-10-23T00:00:00Z','2026-10-23T00:00:00Z')",
         "INSERT INTO turn(id,thread_id,status,turn_kind,origin,initiated_by_actor_kind,initiated_by_actor_id,created_at,updated_at) VALUES('late-human','root','in_progress','conversation','user','principal','P00000000000000000001','2026-10-23T01:00:00Z','2026-10-23T01:00:00Z')",
-        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('monitor','root','completed','conversation','user','2026-10-24T00:00:00Z','2026-10-24T00:00:00Z')",
         "INSERT INTO compaction_history_check(turn_id,descriptor,managed,revision,failures) VALUES('executor','retained-legacy-descriptor',1,9,2)",
     ] {
         db.execute_unprepared(sql).await.unwrap();
     }
-    // Original ready response predates upgrade. A newer stream of ordinary
-    // monitor items must neither renew activity nor force publication to scan
-    // the stream. More than one recovery quantum makes cursor progress and a
-    // fresh owner (without in-memory state) observable, including equal times.
+    // Historical input and ready response must never populate the new table.
     answer_item(&store, "old-human", "old-ready", READY + 10).await;
     complete(&store, "root", "old-human", READY + 10).await;
-    for n in 0..65 {
-        answer_item(&store, "monitor", &format!("report-{n}"), READY + 20).await;
-    }
     writer
         .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
         .await
@@ -70,6 +63,26 @@ async fn policy_upgrade_preserves_execution_intents_and_root_publication_survive
             .await
             .unwrap()
             .is_empty()
+    );
+    assert!(
+        db.query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT thread_id FROM compaction_root_activity".to_owned()
+        ))
+        .await
+        .unwrap()
+        .is_none(),
+        "migration and repeated startup must leave historical activity unindexed"
+    );
+    complete(&store, "root", "old-human", READY + 100_000).await;
+    assert!(
+        store
+            .with_maintenance_access()
+            .compaction_root_history_activity("ws", "root", "old-human")
+            .await
+            .unwrap()
+            .is_none(),
+        "replaying an old ready event cannot activate a cold root"
     );
     let legacy = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
         "SELECT descriptor,revision,failures,purpose FROM compaction_history_check WHERE turn_id='executor'".to_owned())).await.unwrap().unwrap();
@@ -154,68 +167,18 @@ async fn policy_upgrade_preserves_execution_intents_and_root_publication_survive
             .unwrap()
             .is_empty()
     );
+    assert!(
+        store
+            .compaction_root_history_activity("ws", "root", "human")
+            .await
+            .unwrap()
+            .is_none(),
+        "failed publication must roll back activity as well as debt"
+    );
     db.execute_unprepared("DROP TRIGGER reject_root_debt")
         .await
         .unwrap();
     complete(&store, "root", "human", READY).await;
-    assert!(
-        store
-            .compaction_pending_history_checks()
-            .await
-            .unwrap()
-            .is_empty(),
-        "upgrade debt must wait for bounded activity restoration"
-    );
-    let cursor = || {
-        Statement::from_string(DbBackend::Sqlite,
-        "SELECT recovery_pending,recovery_before_ms FROM compaction_root_activity WHERE thread_id='root'".to_owned())
-    };
-    let seeded = db.query_one_raw(cursor()).await.unwrap().unwrap();
-    assert_eq!(seeded.try_get::<i64>("", "recovery_pending").unwrap(), 1);
-    assert_eq!(
-        seeded.try_get::<i64>("", "recovery_before_ms").unwrap(),
-        i64::MAX
-    );
-    store
-        .compaction_recover_root_activity_quantum()
-        .await
-        .unwrap();
-    assert!(
-        store
-            .compaction_pending_history_checks()
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    let progress = db.query_one_raw(cursor()).await.unwrap().unwrap();
-    assert_eq!(progress.try_get::<i64>("", "recovery_pending").unwrap(), 1);
-    assert!(progress.try_get::<i64>("", "recovery_before_ms").unwrap() < i64::MAX);
-    // An independent publication arrives behind the cursor. Its original time
-    // is recorded atomically, without resetting progress; the older, later-ready
-    // historical answer still wins MAX when another owner resumes recovery.
-    answer_item(&store, "late-human", "late-ready", READY + 5).await;
-    complete(&store, "root", "late-human", READY + 5).await;
-    let interrupted = db.query_one_raw(cursor()).await.unwrap().unwrap();
-    assert_eq!(
-        interrupted
-            .try_get::<i64>("", "recovery_before_ms")
-            .unwrap(),
-        progress.try_get::<i64>("", "recovery_before_ms").unwrap()
-    );
-    let recovery_owner = store.with_maintenance_access();
-    recovery_owner
-        .compaction_recover_root_activity_quantum()
-        .await
-        .unwrap();
-    assert_eq!(
-        db.query_one_raw(cursor())
-            .await
-            .unwrap()
-            .unwrap()
-            .try_get::<i64>("", "recovery_pending")
-            .unwrap(),
-        0
-    );
     let due = store.compaction_pending_history_checks().await.unwrap();
     assert_eq!(due.len(), 1);
     assert_eq!((&*due[0].thread_id, &*due[0].turn_id), ("root", "human"));
@@ -224,7 +187,7 @@ async fn policy_upgrade_preserves_execution_intents_and_root_publication_survive
             .compaction_root_history_activity("ws", "root", "human")
             .await
             .unwrap(),
-        Some((READY + 10) * 1000)
+        Some(READY * 1000)
     );
     // Reprocessing completion at a later wall clock must not rejuvenate root
     // activity or manufacture a new publication request.
@@ -234,7 +197,7 @@ async fn policy_upgrade_preserves_execution_intents_and_root_publication_survive
             .compaction_root_history_activity("ws", "root", "human")
             .await
             .unwrap(),
-        Some((READY + 10) * 1000)
+        Some(READY * 1000)
     );
     let replay = store.compaction_pending_history_checks().await.unwrap();
     assert_eq!(replay[0].revision, due[0].revision);
@@ -270,6 +233,18 @@ async fn policy_upgrade_preserves_execution_intents_and_root_publication_survive
             .unwrap(),
         Some(deadline)
     );
+    writer
+        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted
+            .compaction_root_history_activity("ws", "root", "human")
+            .await
+            .unwrap(),
+        Some(READY * 1000),
+        "new publication activity survives a fresh owner"
+    );
     let diagnostic = HistoryCheckDiagnostic::default();
     assert!(
         !store
@@ -303,7 +278,8 @@ async fn policy_upgrade_preserves_execution_intents_and_root_publication_survive
         .unwrap()
         .unwrap();
     assert_eq!(contexts.try_get::<i64>("", "n").unwrap(), 0);
-    let thread = store.get_thread_model("root").await.unwrap().unwrap();
+    let mut thread = store.get_thread_model("root").await.unwrap().unwrap();
+    thread.updated_at = READY + 1;
     let (_, mut next) = store.get_turn("root", "human").await.unwrap().unwrap();
     next.id = "next-human".into();
     next.status = TurnStatus::InProgress;
@@ -319,6 +295,24 @@ async fn policy_upgrade_preserves_execution_intents_and_root_publication_survive
         )
         .await
         .unwrap();
+    // A newly accepted input owns the anchor; a late answer to the older
+    // pre-upgrade question can extend activity but must not reclaim ownership.
+    answer_item(&store, "late-human", "late-ready", READY + 5).await;
+    complete(&store, "root", "late-human", READY + 5).await;
+    assert_eq!(
+        restarted
+            .compaction_root_history_activity("ws", "root", "human")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        restarted
+            .compaction_root_history_activity("ws", "root", "next-human")
+            .await
+            .unwrap(),
+        Some((READY + 5) * 1000)
+    );
     let fence = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
         "SELECT s.turn_id FROM compaction_execution_stop s JOIN compaction_context c ON c.owner=s.owner WHERE c.thread_id='root' AND s.turn_id='human'".to_owned())).await.unwrap();
     assert!(

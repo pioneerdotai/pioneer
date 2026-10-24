@@ -728,10 +728,6 @@ impl CrudStore {
         )
         .await
     }
-    /// One bounded recovery quantum for publication-triggered legacy roots.
-    pub async fn compaction_recover_root_activity_quantum(&self) -> Result<()> {
-        repositories::compaction::background::recover_root_activity_quantum(self).await
-    }
     /// One bounded metadata page; caller releases reader capacity before decoding.
     pub async fn compaction_pending_history_checks(&self) -> Result<Vec<CompletedHistoryCheck>> {
         repositories::compaction::background::compaction_pending_history_checks(&self.connection)

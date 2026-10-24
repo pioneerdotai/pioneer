@@ -25074,7 +25074,8 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
             r#"<task_result>{{"summary":"immediate background result","data":{{"rawText":"{}"}}}}</task_result>"#,
             "🧪".repeat(60_000)
         ))
-        .with_first_delay(Duration::from_millis(250)),
+        .with_first_delay(Duration::from_millis(250))
+        .with_valid_summary_completion(),
     );
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
@@ -25378,15 +25379,48 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
     processor
         .set_thread_episodic_ingestor_for_test(delivery_ingestor.clone())
         .await;
+    // Occupy optional preparation with a published user root, independently
+    // of the detached occurrence whose delivery/order/provenance we observe.
+    let history = Phase13CompactionHarness {
+        processor: processor.clone(),
+        crud_store: crud_store.clone(),
+        workspace_id: workspace_id.clone(),
+    };
+    let history_thread = "thr_delivery_background_root";
+    let history_turn = "turn_delivery_background_root";
+    let history_at = super::now_timestamp_secs();
+    crate::compaction::load_test_catalog();
+    root_conversation_compaction::human_input(
+        &history,
+        history_thread,
+        history_turn,
+        history_at,
+        "background root question",
+    )
+    .await;
+    root_conversation_compaction::answer(
+        &history,
+        history_thread,
+        history_turn,
+        history_at,
+        &"published background root work ".repeat(80_000),
+    )
+    .await;
     let pending = crud_store
         .compaction_pending_history_checks()
         .await
-        .expect("Native completion intent should be queryable before worker admission");
+        .expect("published root work should be discoverable before worker admission");
     assert!(
         pending
             .iter()
-            .any(|check| check.turn_id == lineage.child_turn_id),
-        "Native child completion must expose its intent before delivery"
+            .any(|check| { check.thread_id == history_thread && check.turn_id == history_turn }),
+        "the actual ready root answer must enqueue background preparation"
+    );
+    assert!(
+        pending.iter().all(|check| {
+            check.thread_id != lineage.child_thread_id && check.turn_id != lineage.child_turn_id
+        }),
+        "retained child results must not become optional conversation warming"
     );
     let before_delivery = processor
         .task_runtime
@@ -25411,7 +25445,7 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
     let summary_calls = provider.call_count();
     match barrier {
         CompletedHistoryDeliveryBarrier::Preparation => {
-            processor.arm_completed_history_preparation_barrier(&lineage.child_turn_id)
+            processor.arm_completed_history_preparation_barrier(history_turn)
         }
         CompletedHistoryDeliveryBarrier::Summarizer => {
             provider.pause_first.store(true, Ordering::SeqCst)
@@ -25420,21 +25454,50 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
     processor
         .poll_completed_history_checks()
         .await
-        .expect("Native history worker should start");
+        .expect("published root history worker should start");
     match barrier {
         CompletedHistoryDeliveryBarrier::Preparation => timeout(
             Duration::from_secs(10),
             processor.wait_for_completed_history_preparation_barrier(),
         )
         .await
-        .expect("Native worker must reach the preparation barrier"),
+        .expect("root worker must reach the preparation barrier"),
         CompletedHistoryDeliveryBarrier::Summarizer => timeout(Duration::from_secs(10), async {
-            while provider.call_count() == summary_calls {
+            // The first whole-unit portion may contain only the short question.
+            while provider.call_count() == summary_calls
+                || !provider
+                    .snapshot_requests()
+                    .iter()
+                    .skip(summary_calls)
+                    .any(|request| {
+                        request.messages.first().is_some_and(|message| {
+                            message.content == pioneer_compaction::summary::INSTRUCTIONS
+                        }) && request
+                            .messages
+                            .iter()
+                            .skip(1)
+                            .any(|message| message.content.contains("background root question"))
+                    })
+            {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("Native summarizer must reach the provider barrier"),
+        .expect("root summarizer must reach the provider barrier"),
+    }
+
+    {
+        let jobs = processor.completed_history_checks.lock().await;
+        let root_job = jobs
+            .get(&(workspace_id.clone(), history_thread.to_owned()))
+            .expect("the published root must own the blocked preparation");
+        assert!(
+            root_job
+                .handle
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished()),
+            "delivery must overlap occupied background preparation"
+        );
     }
 
     processor
@@ -79226,43 +79289,6 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
             .is_empty(),
         "an unfinished turn intent must not be executable"
     );
-    let completion = harness
-        .crud_store
-        .database_connection()
-        .begin()
-        .await
-        .unwrap();
-    turn::Entity::update_many()
-        .col_expr(turn::Column::Status, Expr::value("completed"))
-        .filter(turn::Column::Id.eq(turn))
-        .exec(&completion)
-        .await
-        .unwrap();
-    let visible_inside_completion = completion
-        .query_one_raw(sea_orm::Statement::from_string(
-            sea_orm::DbBackend::Sqlite,
-            format!(
-                "SELECT count(*) AS n FROM compaction_history_check h JOIN turn t ON t.id=h.turn_id WHERE h.turn_id='{turn}' AND t.status='completed' AND h.state='pending'"
-            ),
-        ))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        visible_inside_completion.try_get::<i64>("", "n").unwrap(),
-        1,
-        "the pre-registered intent becomes eligible in the completion transaction"
-    );
-    completion.rollback().await.unwrap();
-    assert!(
-        harness
-            .crud_store
-            .compaction_pending_history_checks()
-            .await
-            .unwrap()
-            .is_empty(),
-        "rolling completion back must keep the intent unavailable to the worker"
-    );
     let mut foreign = context.clone();
     foreign.workspace_id = "foreign-workspace".into();
     assert!(
@@ -79321,7 +79347,7 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
     assert_eq!(
         due.len(),
         1,
-        "durable completion must activate the pre-registered intent"
+        "canonical ready publication must expose the pre-registered root work"
     );
     let descriptor: serde_json::Value =
         serde_json::from_str(due[0].descriptor.as_deref().unwrap()).unwrap();
