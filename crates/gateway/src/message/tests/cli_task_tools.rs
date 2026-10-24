@@ -3481,6 +3481,9 @@ fn admitted_cli_production_recall_hook_searches_another_accessible_conversation(
             tool["threads"][0]["threadId"], other,
             "positive control: admitted execution can read the other source"
         );
+        let mut memory_config = processor.memory_loop_config();
+        memory_config.active_recall.mode = pioneer_memory::hooks::MemoryActiveRecallMode::Hybrid;
+        processor.apply_memory_loop_config(memory_config);
         processor.bind_memory_bridge().await;
         let runtime = processor.hook_runtime.read().await.clone().unwrap();
         let mut policy = std::collections::BTreeMap::new();
