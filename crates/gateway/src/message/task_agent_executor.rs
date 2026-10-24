@@ -7083,6 +7083,19 @@ async fn load_task_execution_conversation_scope(
         // preparation may register legacy metadata, so give that entire operation
         // the normal class of its caller rather than inheriting Critical writes.
         let history_store = ordinary_history_store(processor.crud_store.as_ref());
+        // A Composer snapshot is the next user's root history consumer. Share
+        // priority with root preparation before accepting that immutable input.
+        let history_cancellation = tokio_util::sync::CancellationToken::new();
+        let _conversation_lease = processor
+            .acquire_composer_history_priority(
+                &history_store,
+                &task.workspace_id,
+                execution_thread_id,
+                execution_turn_id,
+                &history_cancellation,
+            )
+            .await?;
+
         if let Some(snapshot) = processor
             .crud_store
             .get_turn_runtime_snapshot(execution_turn_id)

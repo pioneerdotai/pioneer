@@ -650,6 +650,7 @@ mod tests {
                 hooks: Default::default(),
                 artifacts: GatewayArtifactsConfig::default(),
                 resilience: Default::default(),
+                context_compaction: Default::default(),
                 auth: GatewayAuthConfig {
                     jwt_issuer: "pioneer".to_owned(),
                     jwt_audience: "pioneer-clients".to_owned(),

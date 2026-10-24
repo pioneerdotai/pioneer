@@ -930,6 +930,11 @@ impl pioneer_agent::compaction::controller::NativeContextController
             &context.turn_id,
             pioneer_observability::turn_startup::Stage::CompactionWait,
         );
+        let _conversation_lease = tokio::select! { biased;
+            _ = context.cancellation.cancelled() => anyhow::bail!("native context preparation cancelled"),
+            _ = clock.sleep_until(deadline) => anyhow::bail!("native context preparation deadline exceeded"),
+            result = processor.acquire_composer_history_priority(&history_store, &context.workspace_id, &context.thread_id, &context.turn_id, &context.cancellation) => result?,
+        };
         let lease = tokio::select! { biased;
             _ = context.cancellation.cancelled() => anyhow::bail!("native context preparation cancelled"),
             _ = clock.sleep_until(deadline) => anyhow::bail!("native context preparation deadline exceeded"),

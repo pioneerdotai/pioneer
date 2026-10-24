@@ -58,6 +58,8 @@ pub struct Model {
     pub agent_turn_response_execution: HasOne<super::agent_turn_response_execution::Entity>,
     #[sea_orm(has_one)]
     pub compaction_history_check: HasOne<super::compaction_history_check::Entity>,
+    #[sea_orm(has_one)]
+    pub compaction_root_activity: HasOne<super::compaction_root_activity::Entity>,
     #[sea_orm(has_many)]
     pub compaction_task_outputs: HasMany<super::compaction_task_output::Entity>,
     #[sea_orm(has_one)]
