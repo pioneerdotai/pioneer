@@ -1207,7 +1207,6 @@ mod tests {
             .map(|slug| {
                 let mut skill = resolved_skill(slug, SkillSourceKind::System);
                 skill.definition.identity.owner = Some("pioneer".to_owned());
-                skill.slug = format!("pioneer/{slug}");
                 skill.definition.identity.skill_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("../../resources/skills/pioneer")
                     .join(slug)
@@ -1326,22 +1325,24 @@ mod tests {
             if kind == pioneer_protocol::CLIAgentRuntimeKind::Claude {
                 assert_claude_skill_projection_reuses_process(initial.clone(), restored.clone());
             }
-            let mut legacy =
-                serde_json::to_value(read_external_runtime_receipt(&receipt_path).unwrap())
-                    .unwrap();
-            legacy["version"] = serde_json::json!(1);
+            // Only the legacy receipt uses owner/slug labels. Resolved skills
+            // and their frozen bindings retain the resolver's short slugs.
+            let mut legacy = read_external_runtime_receipt(&receipt_path).unwrap();
+            legacy.version = 1;
+            for entry in &mut legacy.entries {
+                entry.skill_slug = match entry.owner.as_deref() {
+                    Some(owner) => format!("{owner}/{}", entry.slug),
+                    None => entry.slug.clone(),
+                };
+            }
             fs::write(&receipt_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
-            let threads_plan = plans.iter().find(|plan| plan.slug == "threads").unwrap();
-            let converted =
-                install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, threads_plan)
-                    .await
-                    .unwrap();
-            assert_eq!(converted.status, CliRuntimeSkillInstallStatus::Current);
+            // Conversion preserves legacy labels; restore must still accept
+            // the unchanged modern bindings, independently of install plans.
+            let converted = ensure_external_runtime_receipt_v2(&receipt_path, &candidates).unwrap();
+            assert_eq!(converted.version, 2);
             assert_eq!(
-                read_external_runtime_receipt(&receipt_path)
-                    .unwrap()
-                    .version,
-                2
+                read_external_runtime_receipt(&receipt_path).unwrap(),
+                converted
             );
             assert_eq!(
                 restore_cli_runtime_selected_skills(

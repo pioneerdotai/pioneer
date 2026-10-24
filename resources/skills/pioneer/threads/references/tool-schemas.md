@@ -53,7 +53,12 @@ Optional fields: `cursor`, `max_tokens`, `max_bytes`. Normal full reading can om
 {"text":"EXACT_SAVED_TEXT_FRAGMENT","next":{"version":"OPAQUE_AUTHENTICATED_TOKEN","offset":123},"eof":false}
 ```
 
-Pass the whole returned `next` as `cursor` with the same source fields and `output_log`. `offset` is a Unicode scalar offset, not bytes. Keep `version` untouched. Concatenate `text` until `eof:true`, then interpret the complete saved JSON. `output_log:true` selects the saved output/progress log. Source deletion, modification, or lost access can stop a previously valid read.
+Pass the whole returned `next` as `cursor` with the same source fields and `output_log`; keep any supplied `max_tokens` and `max_bytes` unchanged as well. `offset` is a Unicode scalar offset, not bytes. Keep `version` untouched.
+
+- `output_log:false`: concatenate exact `text` fragments until `eof:true`, then parse the complete saved JSON.
+- `output_log:true`: read the saved output/progress log as a sequence of separate JSON records. A single record can span pages; assemble its fragments before parsing that record. Parse each complete record separately, not the whole log as one JSON document. `eof:true` refers to the currently saved log and does not itself confirm that the command has finished.
+
+Source deletion, modification, or lost access can stop a previously valid read.
 
 Native full-result references can point to a saved complete search page while the working context shows an excerpt. The reader's `next` continues that saved page's text. Once decoded, the search response's `nextCursor` continues search with the original query/limit. Do not pass a search/history string cursor to the result reader. A `kind:"saved_item"` fallback with `fullResultSaved:false` represents only the retained item; upstream truncation markers remain truthful.
 

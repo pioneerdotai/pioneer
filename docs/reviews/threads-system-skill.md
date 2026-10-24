@@ -94,7 +94,7 @@ Threads alias добавлен к protected destinations legacy conversion. До
 ## Самоаудит
 
 1. Skill/manifest: сверены все десять canonical names, payloads, result casing, варианты создания, launch inheritance, reasoning и три независимых вида продолжения. Поиск описан как поиск доступного корпуса с пагинацией результатов.
-2. Lifecycle: проверены пути планирования, install/update/restore, fingerprint/ownership и legacy conversion. Найдена и закрыта mapped foreign alias claim до записи receipt. Legacy fixture приведён к реальному qualified skill label.
+2. Lifecycle: проверены пути планирования, install/update/restore, fingerprint/ownership и legacy conversion. Найдена и закрыта mapped foreign alias claim до записи receipt. Коррекция resolved slug и отдельной legacy fixture после внешнего ревью описана ниже.
 3. Projection/dispatch: сохранены transport families, единственный shared options binding, canonical definitions и существующая replay-цепочка. Добавлено исключение явно запрещённых Threads readers и общего options tool из CLI-каталога (исполнение уже подчинялось этим запретам); native регистрация readers учитывает реальную read authority. Дополнительная зависимость mutation schemas от read authority исключена при повторной сверке handlers; их действующие gates сохранены.
 4. Prompt: проверены отдельный section/manifest id, trust, delivered reference и все места компиляции. Исправлен пропущенный аргумент тестового caller; статически сверена арность всех native compilation callers.
 5. Итоговый diff: повторно просмотрены production изменения, тестовые фикстуры, пакеты и связанные неизменённые callers. Отдельно сверена побайтная неизменность Tasks/Subagents skills и четырёх policy constants. Проверены отсутствие изменений dependencies/lockfiles/backend, новых search limits и новых mutation API.
@@ -108,3 +108,40 @@ Threads alias добавлен к protected destinations legacy conversion. До
 Тесты, cargo check, компиляция, сборки, приложение, Gateway, CLI-агенты и генераторы не запускались. Компиляция и прохождение тестов не подтверждены. Форматирование не заменяет эти проверки. Старые восстановленные execution сохраняют свой frozen catalog и attachments; новый skill не добавляет им инструменты задним числом. Доступность моделей, approximate retrieval и ограничения фактически сохранённых результатов следуют существующим контрактам main.
 
 Merge, push, release и deploy не выполнялись. Это передача на внешнее ревью; окончательная приёмка и разрешение выполнять код проекта остаются отдельным шагом пользователя.
+
+## Исправления после внешнего ревью
+
+Работа продолжена с проверенного HEAD `cb9c10fbebc830a6deb9f914393ce119b2b0193a` в той же ветке `feat/threads-system-skill` и worktree `/Users/alexander/Code/pioneer/pioneer/.worktrees/threads-system-skill`. Исходная база остаётся `43b32ae8cfe69ff1a54f2035a59f23eb213eabdf`. При начале исправлений дерево было чистым; посторонних изменений не обнаружено.
+
+Изменены только тестовый регион `#[cfg(test)]` в `crates/gateway/src/cli_runtime/skills.rs`, раздел Saved Tool Result Reader в `resources/skills/pioneer/threads/references/tool-schemas.md` и этот отчёт.
+
+### Resolved skills и legacy fixture
+
+Из `canonical_orchestration_skills` удалена подмена slug на `pioneer/{slug}`. Helper сохраняет короткие `tasks`, `subagents`, `threads`, как настоящий resolver (`ResolvedSkill.slug = definition.identity.slug`). Install plans, обычные v2 receipts и frozen bindings снова согласованы; implicit Threads binding распознаётся при окончательной проекции.
+
+Только внутри legacy-v1 receipt fixture поле `skill_slug` получает историческую метку owner/slug. Миграция вызывается через существующий `ensure_external_runtime_receipt_v2`; проверяются версия 2, сохранение полученного receipt и точное восстановление прежних attachments с неизменёнными короткими frozen bindings. Converter сохраняет исторический `skill_slug`: поэтому legacy-сценарий отделён от повторной установки по современному plan, а не маскирует различие изменением resolved skills или production ownership guards. Проверки `Current` и неизменности receipt при повторной обычной установке остаются в предшествующем цикле этого же теста. Успешная повторная managed-установка непосредственно поверх legacy-qualified receipt этим сценарием не утверждается.
+
+Статически перечитаны все шесть потребителей helper:
+
+- `automatic_orchestration_exports_preserve_foreign_names_and_restore_exact_bindings`: Codex/Claude/OpenCode, install/current/restore, точные aliases, references, session reuse, отдельная legacy conversion и сохранность чужих файлов.
+- `claude_explicit_and_automatic_skill_projection_restores_exactly`: короткие binding slug согласованы с receipt; сохранены точное восстановление, application order и session identity.
+- `orchestration_export_update_recovers_after_copy_without_receipt_commit`: все три пакета, обычный update и восстановление после копирования до записи receipt; hash, references и точный restore сохранены.
+- `final_threads_catalog_reconciles_implicit_attachments_without_changing_task_selection`: отсутствие операций, только shared options, реальная Threads operation и explicit skill; сохранены проверки bindings/install plans и неизменности Tasks/Subagents selection.
+- `orchestration_exports_refuse_foreign_destinations_receipts_and_local_edits`: отрицательные варианты ownership, legacy, локальных изменений и unhashed файлов сохраняют предназначенные причины отказа и проверки отсутствия записи receipt/чужих файлов.
+- `orchestration_exports_never_replace_or_follow_foreign_symlinks`: destination/receipt/root/nested symlinks и сохранность receipt/чужих файлов; корректные короткие slug не подменяют эти отказы ошибкой frozen projection.
+
+Production resolver, converter, storage formats, installer/restore/reconcile и их проверки не изменены. Новых тестов и проверок строк исходника не добавлено; тесты не запускались.
+
+### Чтение output log
+
+Для `output_log:false` описана сборка сохранённого JSON до EOF. Для `output_log:true` описана последовательность отдельных JSON-записей, сборка фрагментов одной записи перед разбором и отдельный разбор каждой записи. EOF относится к текущему сохранённому журналу и сам по себе не означает завершения команды.
+
+Уточнение сверено с `read_thread_tool_output_log` и `ThreadToolResultReadParams`/`ThreadToolResultCursor`: сохранены snake_case, передача полного `next` в `cursor`, opaque `version`, Unicode scalar offset и исходные параметры, включая неизменные заданные `max_tokens`/`max_bytes`. Новых полей и API нет.
+
+### Самоаудит и проверки этой коррекции
+
+После исправления тестовых данных сверены resolver → install plan → v2 receipt → frozen binding → restore, независимая legacy conversion → restore и окончательная Threads projection. После уточнения документации сверены terminal-result reader и отдельный log reader. Итоговый diff перечитан целиком вместе со всеми потребителями helper. Production-регион смешанного Rust-файла (строки 1–912 до `#[cfg(test)]`) сохраняет исходный SHA-256 `175656141d02fb57c983cbcd1c6c8a57fdbacc938b6882b3eebcf7206254aa31`. Других source-файлов, зависимостей, Tasks/Subagents skills/references/policy-текстов или прав в этой коррекции не менялось.
+
+Фактически выполнены чтение через `cat`/`sed`, поиск через `rg`, `git status --short`, `git branch --show-current`, `git rev-parse HEAD`, `git worktree list`, просмотр `git diff` (включая `--stat`/`--numstat`), сравнение production-региона с исходным commit через `cmp`, SHA-256 через `shasum -a 256`, `cargo fmt --all --check` и `git diff --check`. Проверки форматирования и whitespace завершились с кодом 0; production-регион побайтно совпал с исходным commit. Форматирование выполнялось только в check-режиме. Commit создаётся с `core.hooksPath=/dev/null` и `commit.gpgsign=false`.
+
+Тесты, cargo check, компиляция, сборки, приложение, Gateway, CLI-агенты и генераторы не запускались, в том числе через scripts/hooks. Компиляция и прохождение тестов не подтверждены. Merge, push и deploy не выполнялись. Это передача на повторное внешнее ревью; выполнение кода требует отдельного разрешения пользователя после внешней приёмки.
