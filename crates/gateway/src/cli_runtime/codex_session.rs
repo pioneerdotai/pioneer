@@ -66,6 +66,7 @@ use serde_json::Value as JsonValue;
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::BufReader;
@@ -569,6 +570,8 @@ struct CodexRequiredMcpBridge {
     invoker: Arc<dyn TurnMcpInvoker>,
     facade_limits: CliMcpFacadeLimits,
     native_items: Arc<CodexNativeMcpCorrelationLedger>,
+    // Monotonic, generation-local mirror of fail_closed for synchronous session reuse checks.
+    failed: AtomicBool,
     state: tokio::sync::Mutex<CodexRequiredMcpBridgeState>,
 }
 
@@ -714,6 +717,7 @@ impl CodexRequiredMcpBridge {
     async fn fail_closed(&self) {
         let mut state = self.state.lock().await;
         let previous = std::mem::replace(&mut *state, CodexRequiredMcpBridgeState::Failed);
+        self.failed.store(true, Ordering::Release);
         match previous {
             CodexRequiredMcpBridgeState::Serving { server, .. }
             | CodexRequiredMcpBridgeState::Ready { server, .. } => server.abort(),
@@ -1191,6 +1195,7 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
                 invoker: self.turn_mcp_invoker.clone(),
                 facade_limits: self.mcp_limits.facade_limits(),
                 native_items: Arc::new(CodexNativeMcpCorrelationLedger::default()),
+                failed: AtomicBool::new(false),
                 state: tokio::sync::Mutex::new(CodexRequiredMcpBridgeState::Pending),
             }))
         } else {
@@ -1843,6 +1848,12 @@ fn codex_turn_observation_from_snapshot(
 
 #[async_trait]
 impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
+    fn is_usable(&self) -> bool {
+        self.required_mcp_bridge
+            .as_ref()
+            .is_none_or(|bridge| !bridge.failed.load(Ordering::Acquire))
+    }
+
     async fn close(&self) -> Result<()> {
         if let Some(bridge) = self.required_mcp_bridge.as_ref() {
             bridge.fail_closed().await;
@@ -2484,6 +2495,384 @@ mod tests {
                 .write_all(format!("{payload}\n").as_bytes())
                 .await
                 .expect("fake Codex server should write response");
+        }
+    }
+
+    #[cfg(unix)]
+    mod recovery {
+        use super::*;
+        use crate::cli_runtime::codex_mcp::build_codex_mcp_session_launch_projection;
+        use crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions;
+        use crate::turn_mcp::projection::{
+            McpProjectionLimits, McpSelectionReason, ResolvedMcpTurnProjection, ResolvedMcpTurnTool,
+        };
+
+        // Only the process and provider RPC boundary are fake. The manager,
+        // Codex session, bridge, supervisor and generation revocation are real.
+        struct RecoveryFactory {
+            root: PathBuf,
+            supervisor: Arc<CliMcpBridgeSupervisor>,
+            starts: AtomicUsize,
+            fail_start: AtomicBool,
+            sessions: StdMutex<Vec<(Arc<CodexCLIAgentRuntimeSession>, FakeCodexIsolationServer)>>,
+        }
+
+        impl RecoveryFactory {
+            fn new(root: &std::path::Path) -> Arc<Self> {
+                Arc::new(Self {
+                    root: root.to_path_buf(),
+                    supervisor: CliMcpBridgeSupervisor::new(root.join("bridge")),
+                    starts: AtomicUsize::new(0),
+                    fail_start: AtomicBool::new(false),
+                    sessions: StdMutex::new(Vec::new()),
+                })
+            }
+        }
+
+        #[async_trait]
+        impl CLIAgentRuntimeSessionFactory for RecoveryFactory {
+            async fn start_session_with_launch_spec(
+                &self,
+                instance: &CliSessionInstanceId,
+                spec: &CliSessionLaunchSpec,
+            ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
+                self.starts.fetch_add(1, Ordering::SeqCst);
+                if self.fail_start.load(Ordering::SeqCst) {
+                    bail!("injected replacement startup failure");
+                }
+                let CliProviderContinuation::CodexRpcThread { native_thread_id } =
+                    &spec.continuation
+                else {
+                    bail!("expected Codex continuation");
+                };
+                let config = CodexAccountProbeConfig {
+                    executable: "/bin/cat".to_owned(),
+                    home_path: self.root.join("shared-home").to_string_lossy().into_owned(),
+                    shadow_home_path: None,
+                    cwd: Some(self.root.clone()),
+                    home_dir: None,
+                    env: SensitiveEnvironment::new(),
+                    initialize_timeout: Duration::from_secs(2),
+                    request_timeout: Duration::from_secs(2),
+                    shutdown_grace: Duration::from_secs(2),
+                    stderr_ring_lines: 0,
+                };
+                std::fs::create_dir_all(&config.home_path)?;
+                let (mut process_config, overlay) = codex_generation_app_server_process_config(
+                    &config,
+                    &self.root.join("overlays"),
+                    codex_generation_overlay_identity(instance)?,
+                )?;
+                process_config.args.clear();
+                process_config = process_config.with_process_generation(instance.generation())?;
+                let process = spawn_cli_agent_process(&process_config)?;
+                let fake = FakeCodexIsolationServer::new();
+                let launch_projection = match &spec.mcp {
+                    CliMcpSessionLaunch::Codex(projection) => Some(projection.clone()),
+                    CliMcpSessionLaunch::Disabled => None,
+                    _ => bail!("unexpected MCP launch"),
+                };
+                let required_mcp_bridge = if let Some(projection) = &launch_projection {
+                    let facade =
+                        projection.facade_projection(CliMcpFacadeProjectionLimits::default())?;
+                    let launch = self
+                        .supervisor
+                        .prepare(
+                            CliMcpGrantScope::new(
+                                instance.clone(),
+                                CliMcpManifestHash::new(
+                                    projection.preflight.canonical_manifest_hash.clone(),
+                                )
+                                .expect("manifest"),
+                            ),
+                            codex_mcp_bootstrap_expiry(2_000)?,
+                        )
+                        .await?;
+                    let reservation = self
+                        .supervisor
+                        .coordinator()
+                        .stage_projection(launch.grant_ref(), facade.fingerprint().clone())
+                        .await
+                        .map_err(|error| anyhow!("stage projection: {error:?}"))?;
+                    self.supervisor
+                        .associate_provider_process(
+                            instance,
+                            process.id().expect("process id"),
+                            None,
+                        )
+                        .await?;
+                    Some(Arc::new(CodexRequiredMcpBridge {
+                        supervisor: self.supervisor.clone(),
+                        process_instance: instance.clone(),
+                        launch,
+                        projection_fingerprint: facade.fingerprint().clone(),
+                        projection: facade,
+                        projection_generation: reservation.generation,
+                        canonical_manifest_hash: projection
+                            .preflight
+                            .canonical_manifest_hash
+                            .clone(),
+                        provider_contract_fingerprint: projection
+                            .preflight
+                            .provider_contract_fingerprint
+                            .clone(),
+                        isolation_contract_fingerprint: "c".repeat(64),
+                        invoker: Arc::new(NeverCalledInvoker),
+                        facade_limits: CliMcpFacadeLimits::default(),
+                        native_items: Arc::new(CodexNativeMcpCorrelationLedger::default()),
+                        failed: AtomicBool::new(false),
+                        state: tokio::sync::Mutex::new(CodexRequiredMcpBridgeState::Pending),
+                    }))
+                } else {
+                    None
+                };
+                let session = Arc::new(CodexCLIAgentRuntimeSession {
+                    client: fake.client.clone(),
+                    _stderr: process.stderr(),
+                    process: tokio::sync::Mutex::new(process),
+                    request_timeout: Duration::from_secs(2),
+                    shutdown_grace: Duration::from_secs(2),
+                    event_receivers: StdMutex::new(None),
+                    generation_overlay: StdMutex::new(Some(overlay)),
+                    required_mcp_bridge,
+                    mcp_attestation: empty_attestation(),
+                    mcp_launch_projection: launch_projection,
+                    continuation: tokio::sync::Mutex::new(CodexThreadContinuationState {
+                        expected_native_thread_id: native_thread_id.clone(),
+                        bound_native_thread_id: None,
+                    }),
+                });
+                self.sessions.lock().unwrap().push((session.clone(), fake));
+                Ok(session)
+            }
+        }
+
+        fn launch_spec() -> CliSessionLaunchSpec {
+            let mut projection = ResolvedMcpTurnProjection::empty("workspace", "requested-turn");
+            projection.tools.push(ResolvedMcpTurnTool {
+                canonical_callable_name: String::new(),
+                workspace_id: "workspace".into(),
+                server_installation_id: "installation".into(),
+                server_name: "server".into(),
+                raw_tool_name: "tool".into(),
+                description: None,
+                input_schema: json!({"type": "object"}),
+                annotations: None,
+                timeout_ms: 20_000,
+                catalog_version: "catalog".into(),
+                installation_fingerprint: "installation-fingerprint".into(),
+                schema_fingerprint: String::new(),
+                runtime_generation: 1,
+                selection_reason: McpSelectionReason::ExplicitTool,
+                capability_id: Some("capability".into()),
+            });
+            projection
+                .finalize_identity(McpProjectionLimits::default())
+                .unwrap();
+            CliSessionLaunchSpec::codex(
+                CLIAgentRuntimeSessionStartOptions::default(),
+                CliMcpSessionLaunch::Codex(
+                    build_codex_mcp_session_launch_projection(projection, "b".repeat(64)).unwrap(),
+                ),
+                Some("native-thread".into()),
+            )
+        }
+
+        #[tokio::test]
+        async fn codex_failed_bridge_is_replaced_only_on_next_acquisition() {
+            for fail_replacement in [false, true] {
+                let root = tempfile::tempdir_in("/tmp").unwrap();
+                let factory = RecoveryFactory::new(root.path());
+                let manager =
+                    CLIAgentRuntimeManager::new(factory.clone(), Duration::from_secs(60)).unwrap();
+                let key = CLIAgentRuntimeSessionKey::new("workspace", "codex", "failed").unwrap();
+                let other_key =
+                    CLIAgentRuntimeSessionKey::new("workspace", "codex", "other").unwrap();
+                let spec = launch_spec();
+                let first = manager
+                    .get_or_start_with_launch_spec(key.clone(), spec.clone())
+                    .await
+                    .unwrap();
+                let other = manager
+                    .get_or_start_with_launch_spec(other_key.clone(), spec.clone())
+                    .await
+                    .unwrap();
+                let reused = manager
+                    .get_or_start_with_launch_spec(key.clone(), spec.clone())
+                    .await
+                    .unwrap();
+                assert!(Arc::ptr_eq(&first.session(), &reused.session()));
+                let (session, mut fake) = factory.sessions.lock().unwrap().remove(0);
+                let bridge = session.required_mcp_bridge.as_ref().unwrap();
+                let bootstrap = bridge.launch.bootstrap_path().to_path_buf();
+                {
+                    let _busy = bridge.state.lock().await;
+                    assert!(session.is_usable(), "a busy Pending bridge is reusable");
+                }
+                // Cancel an individual resume while waiting for metadata. It
+                // must not mark the entire generation as failed.
+                let mut resume = Box::pin(session.resume_thread(
+                    "native-thread",
+                    thread_open_params("/workspace"),
+                    Duration::from_secs(2),
+                ));
+                assert!(futures_util::poll!(&mut resume).is_pending());
+                let cancelled_read = fake.read_request().await;
+                assert_eq!(cancelled_read["method"], "thread/read");
+                drop(resume);
+                fake.write_result(
+                    cancelled_read["id"].clone(),
+                    json!({"thread": {"id": "native-thread", "cwd": "/workspace"}}),
+                )
+                .await;
+                assert!(session.is_usable());
+
+                // Exercise a real production fail_closed caller. Invalid
+                // persisted metadata fails the current operation before dispatch.
+                let mut resume = Box::pin(session.resume_thread(
+                    "native-thread",
+                    thread_open_params("/workspace"),
+                    Duration::from_secs(2),
+                ));
+                assert!(futures_util::poll!(&mut resume).is_pending());
+                let read = fake.read_request().await;
+                assert_eq!(read["method"], "thread/read");
+                assert_eq!(read["params"]["threadId"], "native-thread");
+                fake.write_result(
+                    read["id"].clone(),
+                    json!({"thread": {"id": "native-thread", "cwd": "relative"}}),
+                )
+                .await;
+                assert!(resume.await.is_err());
+                assert!(!session.is_usable());
+                assert!(matches!(
+                    *bridge.state.lock().await,
+                    CodexRequiredMcpBridgeState::Failed
+                ));
+                assert!(!bootstrap.exists());
+                assert_eq!(
+                    factory.starts.load(Ordering::SeqCst),
+                    2,
+                    "failure must not start a replacement automatically"
+                );
+                assert!(
+                    futures_util::poll!(Box::pin(fake.read_request())).is_pending(),
+                    "no automatic RPC replay"
+                );
+
+                factory.fail_start.store(fail_replacement, Ordering::SeqCst);
+                let next = manager
+                    .get_or_start_with_launch_spec(key.clone(), spec.clone())
+                    .await;
+                assert_eq!(
+                    factory.starts.load(Ordering::SeqCst),
+                    3,
+                    "one replacement attempt"
+                );
+                let reused_other = manager
+                    .get_or_start_with_launch_spec(other_key, spec.clone())
+                    .await
+                    .unwrap();
+                assert!(Arc::ptr_eq(&other.session(), &reused_other.session()));
+                assert!(
+                    session.generation_overlay.lock().unwrap().is_none(),
+                    "old resources were closed"
+                );
+                if fail_replacement {
+                    assert!(
+                        format!("{:#}", next.err().expect("startup failure"))
+                            .contains("injected replacement startup failure")
+                    );
+                    assert!(manager.existing_session(&key).await.is_none());
+                } else {
+                    let next = next.unwrap();
+                    assert_ne!(first.instance(), next.instance());
+                    assert!(next.instance().generation() > first.instance().generation());
+                    let (replacement, mut replacement_rpc) =
+                        factory.sessions.lock().unwrap().pop().unwrap();
+                    assert_eq!(
+                        replacement
+                            .continuation
+                            .lock()
+                            .await
+                            .expected_native_thread_id
+                            .as_deref(),
+                        Some("native-thread")
+                    );
+                    assert!(
+                        replacement
+                            .start_thread(thread_open_params("/workspace"), Duration::from_secs(2))
+                            .await
+                            .is_err(),
+                        "replacement cannot create a new native thread"
+                    );
+                    let reused = manager
+                        .get_or_start_with_launch_spec(key.clone(), spec)
+                        .await
+                        .unwrap();
+                    assert!(Arc::ptr_eq(&next.session(), &reused.session()));
+                    session.close().await.unwrap();
+                    assert!(!manager.remove_if_generation(first.instance()).await);
+                    assert!(manager.is_current_instance(next.instance()).await);
+                    assert!(replacement.is_usable());
+                    assert!(
+                        replacement
+                            .generation_overlay
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .unwrap()
+                            .effective_home_path
+                            .exists()
+                    );
+                    assert!(
+                        replacement
+                            .required_mcp_bridge
+                            .as_ref()
+                            .unwrap()
+                            .launch
+                            .bootstrap_path()
+                            .exists()
+                    );
+                    assert!(
+                        futures_util::poll!(Box::pin(replacement_rpc.read_request())).is_pending(),
+                        "acquisition must not replay a user operation"
+                    );
+                }
+                manager.close_all().await.unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn codex_without_required_mcp_remains_reusable() {
+            let root = tempfile::tempdir_in("/tmp").unwrap();
+            let factory = RecoveryFactory::new(root.path());
+            let manager =
+                CLIAgentRuntimeManager::new(factory.clone(), Duration::from_secs(60)).unwrap();
+            let key = CLIAgentRuntimeSessionKey::new("workspace", "codex", "unmanaged").unwrap();
+            let spec = CliSessionLaunchSpec::codex(
+                CLIAgentRuntimeSessionStartOptions::default(),
+                CliMcpSessionLaunch::Disabled,
+                Some("native-thread".into()),
+            );
+            let first = manager
+                .get_or_start_with_launch_spec(key.clone(), spec.clone())
+                .await
+                .unwrap();
+            assert!(first.session().is_usable());
+            assert!(
+                factory.sessions.lock().unwrap()[0]
+                    .0
+                    .required_mcp_bridge
+                    .is_none()
+            );
+            let reused = manager
+                .get_or_start_with_launch_spec(key, spec)
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(&first.session(), &reused.session()));
+            assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
+            manager.close_all().await.unwrap();
         }
     }
 
@@ -3206,6 +3595,7 @@ mod tests {
             invoker: Arc::new(NeverCalledInvoker),
             facade_limits: CliMcpFacadeLimits::default(),
             native_items: Arc::new(CodexNativeMcpCorrelationLedger::default()),
+            failed: AtomicBool::new(false),
             state: tokio::sync::Mutex::new(CodexRequiredMcpBridgeState::Pending),
         });
         let mcp_servers = json!({
@@ -3272,6 +3662,10 @@ mod tests {
             .read_line(&mut line)
             .await
             .expect("read initialize response");
+        assert!(
+            !required_bridge.failed.load(Ordering::Acquire),
+            "Serving is not a terminal failure"
+        );
         assert_eq!(
             serde_json::from_str::<JsonValue>(&line).expect("initialize JSON")["id"],
             json!(1)
@@ -3303,6 +3697,10 @@ mod tests {
             .await
             .expect("start task should join")
             .expect("exact list and native thread must complete barrier");
+        assert!(
+            !required_bridge.failed.load(Ordering::Acquire),
+            "Ready remains usable"
+        );
 
         required_bridge
             .prepare_turn("pioneer-thread", "pioneer-turn")
@@ -3409,6 +3807,10 @@ mod tests {
             .terminal_turn("pioneer-turn")
             .await
             .expect("terminalize exact MCP turn");
+        assert!(
+            !required_bridge.failed.load(Ordering::Acquire),
+            "a terminal operation does not fail its generation"
+        );
         let terminal = required_bridge
             .native_approval_response(CLIAgentRuntimeNativeMcpApprovalRequest {
                 native_thread_id: "native-thread".to_owned(),
@@ -3483,6 +3885,7 @@ mod tests {
             invoker: Arc::new(NeverCalledInvoker),
             facade_limits: CliMcpFacadeLimits::default(),
             native_items: Arc::new(CodexNativeMcpCorrelationLedger::default()),
+            failed: AtomicBool::new(false),
             state: tokio::sync::Mutex::new(CodexRequiredMcpBridgeState::Pending),
         };
 
@@ -3491,6 +3894,7 @@ mod tests {
             .await
             .expect_err("missing helper must fail the bounded attach barrier");
         bridge.fail_closed().await;
+        assert!(bridge.failed.load(Ordering::Acquire));
         assert!(!bootstrap_path.exists());
         assert!(!supervisor.revoke_session(&process_instance).await);
         assert!(matches!(
