@@ -3075,6 +3075,35 @@ pub(crate) async fn compaction_tool_result_id<C: ConnectionTrait>(
     Ok(rows.into_iter().next())
 }
 
+/// Resolve ownership using canonical columns. Never deserialize full provider
+/// output/storage merely to authorize a result. Only observer parameters can
+/// introduce additional protected source references; other arguments are ignored.
+pub(crate) async fn tool_result_access_source(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    item: &str,
+) -> Result<Option<serde_json::Value>> {
+    let row = store.connection.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "SELECT ti.item_type AS item_type, json_extract(ti.payload,'$.toolName') AS tool_name, \
+         CASE WHEN json_extract(ti.payload,'$.toolName') IN ('threads_list','threads_history_read','threads_children_list','threads_tools_result_read') \
+         THEN json_extract(ti.payload,'$.arguments') ELSE NULL END AS arguments \
+         FROM turn_item ti JOIN turn t ON t.id=ti.turn_id JOIN thread th ON th.id=t.thread_id \
+         WHERE th.workspace_id=? AND t.thread_id=? AND t.id=? AND ti.item_id=? AND t.message_deleted_at IS NULL \
+         AND ti.item_type IN ('command_execution','file_change','web_search','web_fetch','download','dynamic_tool_call')",
+        vec![workspace.into(), thread.into(), turn.into(), item.into()])).await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let arguments: Option<String> = row.try_get("", "arguments")?;
+    Ok(Some(
+        serde_json::json!({"itemType":row.try_get::<String>("", "item_type")?,
+        "toolName":row.try_get::<Option<String>>("", "tool_name")?,
+        "arguments":arguments.map(|arguments| serde_json::from_str::<serde_json::Value>(&arguments)).transpose()?}),
+    ))
+}
+
 /// Prefer an already retained full shell source. Other tools use their canonical result.
 /// Both lookups and fragments retain the same workspace/thread/turn scope.
 pub(crate) async fn compaction_tool_result_fragment(

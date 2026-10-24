@@ -14,11 +14,50 @@ use std::sync::Arc;
 
 pub(super) const RESULT_READ_TOOL: &str = "threads_tools_result_read";
 
+#[derive(Clone, Copy)]
+struct ResultCursorProtection<'a> {
+    codec: &'a super::thread_read_cursor::ThreadReadCursorCodec,
+    scope: &'a str,
+}
+
+// Size the exact public representation, including the real random ciphertext
+// and the handler's Value serialization order. Return that same sealed cursor;
+// encrypting it again after checking would change its token count.
+fn result_delivery_encoding(
+    mut response: ThreadToolResultReadResponse,
+    protection: Option<ResultCursorProtection<'_>>,
+) -> Result<(ThreadToolResultReadResponse, String)> {
+    let encoded = if let Some(protection) = protection {
+        if let Some(next) = &mut response.next {
+            next.version = protection.codec.encode(next, protection.scope)?;
+        }
+        serde_json::to_string(&serde_json::to_value(&response)?)?
+    } else {
+        // Internal/direct consumers retain their raw source cursor contract.
+        serde_json::to_string(&response)?
+    };
+    Ok((response, encoded))
+}
+fn result_projection_excess(encoded: &str) -> Result<usize> {
+    Ok(
+        pioneer_tools::thread_read_page_bytes(&serde_json::from_str(encoded)?)
+            .saturating_sub(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES),
+    )
+}
+
 impl MessageProcessor {
     /// Caller supplies a centrally-authorized thread proof or revalidated tool authority.
     pub(super) async fn read_thread_tool_result(
         &self,
         params: ThreadToolResultReadParams,
+    ) -> Result<ThreadToolResultReadResponse> {
+        self.read_thread_tool_result_with_cursor(params, None).await
+    }
+
+    async fn read_thread_tool_result_with_cursor(
+        &self,
+        params: ThreadToolResultReadParams,
+        protection: Option<ResultCursorProtection<'_>>,
     ) -> Result<ThreadToolResultReadResponse> {
         let source = self
             .crud_store
@@ -37,7 +76,7 @@ impl MessageProcessor {
             "tool result source is unavailable"
         );
         if params.output_log {
-            return self.read_thread_tool_output_log(params).await;
+            return self.read_thread_tool_output_log(params, protection).await;
         }
         let offset = params.cursor.as_ref().map_or(0, |c| c.offset);
         let item_reference = self
@@ -80,55 +119,109 @@ impl MessageProcessor {
             )
             .await?;
         let Some(fragment) = fragment else {
-            return self.read_saved_tool_item_fallback(params).await;
+            return self.read_saved_tool_item_fallback(params, protection).await;
         };
-        let max_tokens = params.max_tokens.unwrap_or(4096).min(4096);
-        let max_bytes = params.max_bytes.unwrap_or(32768).min(32768) as usize;
+        // Source reads remain bounded quanta. Fill at most one public page,
+        // instead of exposing the internal 16K-character read as a hidden cap.
+        let mut text = fragment.text;
+        let version = fragment.reference.version;
+        let mut more = fragment.next_character;
+        let max_tokens = params.max_tokens.unwrap_or(u64::MAX);
+        let max_bytes = params
+            .max_bytes
+            .unwrap_or(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64)
+            .min(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64) as usize;
+        while let Some(next_offset) = more {
+            let probe = ThreadToolResultReadResponse {
+                text: text.clone(),
+                next: Some(ThreadToolResultCursor {
+                    version: version.clone(),
+                    offset: next_offset,
+                }),
+                eof: false,
+            };
+            let (_, encoded) = result_delivery_encoding(probe, protection)?;
+            if encoded.len() >= max_bytes
+                || result_projection_excess(&encoded)? > 0
+                || (max_tokens != u64::MAX
+                    && pioneer_compaction::text_tokens(&encoded) >= max_tokens)
+            {
+                break;
+            }
+            let next = self
+                .crud_store
+                .compaction_tool_result_fragment(
+                    &params.workspace_id,
+                    &params.thread_id,
+                    &params.turn_id,
+                    &params.item_id,
+                    Some(&version),
+                    next_offset,
+                )
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("tool result source changed"))?;
+            text.push_str(&next.text);
+            more = next.next_character;
+        }
+        let max_tokens = params.max_tokens.unwrap_or(u64::MAX);
+        let max_bytes = params
+            .max_bytes
+            .unwrap_or(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64)
+            .min(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64) as usize;
         let mut token_budget = max_tokens;
         let mut byte_budget = max_bytes;
         loop {
-            let page = pioneer_compaction::results::result_page(
-                &fragment.text,
-                &fragment.reference.version,
+            let page = pioneer_compaction::results::result_page_in_budget(
+                &text,
+                &version,
                 None,
                 token_budget,
                 byte_budget,
             )?;
-            let eof = page.eof && fragment.next_character.is_none();
+            let eof = page.eof && more.is_none();
             let next_offset = offset
                 .checked_add(page.text.chars().count() as u64)
                 .ok_or_else(|| anyhow::anyhow!("cursor overflow"))?;
             let result = ThreadToolResultReadResponse {
                 text: page.text,
                 next: (!eof).then(|| ThreadToolResultCursor {
-                    version: fragment.reference.version.clone(),
+                    version: version.clone(),
                     offset: next_offset,
                 }),
                 eof,
             };
-            let encoded = serde_json::to_string(&result)?;
-            let token_excess = pioneer_compaction::text_tokens(&encoded).saturating_sub(max_tokens);
+            let (result, encoded) = result_delivery_encoding(result, protection)?;
+            let token_excess = if max_tokens == u64::MAX {
+                0
+            } else {
+                pioneer_compaction::text_tokens(&encoded).saturating_sub(max_tokens)
+            };
             let byte_excess = encoded.len().saturating_sub(max_bytes);
-            if token_excess == 0 && byte_excess == 0 {
+            if token_excess == 0
+                && byte_excess == 0
+                && pioneer_tools::thread_read_page_fits(&serde_json::from_str(&encoded)?)
+            {
                 return Ok(result);
             }
             token_budget = token_budget.saturating_sub(token_excess);
-            byte_budget = byte_budget.saturating_sub(byte_excess);
+            byte_budget =
+                byte_budget.saturating_sub(byte_excess.max(result_projection_excess(&encoded)?));
         }
     }
 
     // Saved observation results carry ACL-protected metadata of OTHER sources.
     // Replaying their byte cursor must not bypass those sources' current ACLs.
-    // The three producers already bound the response to 32KiB; only their known
-    // public envelopes are decoded here, never arbitrary user text/receipts.
+    // Canonical ownership is resolved by exact workspace/thread/turn/item joins.
+    // Referenced sources are inspected incrementally, independently of result
+    // size and wrapper depth; arbitrary history message text is not traversed.
     pub(super) async fn saved_thread_read_result_disclosable(
         &self,
         authority: &super::thread_read_tools::ThreadReadAuthority,
         params: &ThreadToolResultReadParams,
-        item: &pioneer_protocol::TurnItem,
+        item: &serde_json::Value,
     ) -> Result<bool> {
         let mut target = params.clone();
-        let mut value = serde_json::to_value(item)?;
+        let mut value = item.clone();
         let mut seen = std::collections::HashSet::new();
         // A saved result-reader call may itself replay an earlier reader. Follow
         // exact stored parameter references, reauthorizing every source, so a
@@ -143,6 +236,13 @@ impl MessageProcessor {
             {
                 return Ok(false);
             }
+            // A saved reader page is authority only for the exact bytes it read.
+            // Compare its decoded text incrementally with the canonical source
+            // at the original offset. A changed source must not launder stale
+            // cached metadata through a currently accessible different result.
+            if !nested.output_log && !self.saved_reader_page_matches(&target, &nested).await? {
+                return Ok(false);
+            }
             if !seen.insert((
                 nested.thread_id.clone(),
                 nested.turn_id.clone(),
@@ -150,37 +250,23 @@ impl MessageProcessor {
             )) {
                 return Ok(false);
             }
-            let turns = self
-                .crud_store
-                .get_turns_by_thread_and_ids(
-                    &nested.thread_id,
-                    std::slice::from_ref(&nested.turn_id),
-                )
-                .await?;
-            if !turns
-                .get(&nested.turn_id)
-                .is_some_and(|turn| !turn.message_deleted)
-            {
-                return Ok(false);
-            }
             let Some(nested_item) = self
                 .crud_store
-                .get_turn_item(&nested.turn_id, &nested.item_id)
+                .tool_result_access_source(
+                    &nested.workspace_id,
+                    &nested.thread_id,
+                    &nested.turn_id,
+                    &nested.item_id,
+                )
                 .await?
             else {
                 return Ok(false);
             };
-            if !nested_item.is_tool_item()
-                || pioneer_crud::classify_turn_item_with_db_status(&nested_item, None).visibility
-                    != pioneer_crud::ProjectionVisibility::Visible
-            {
-                return Ok(false);
-            }
-            value = serde_json::to_value(nested_item)?;
+            value = nested_item;
             target = nested;
         }
         let params = &target;
-        let Some(name) = value["toolName"]
+        let Some(_) = value["toolName"]
             .as_str()
             .filter(|name| super::thread_read_tools::THREAD_READ_TOOL_NAMES.contains(name))
         else {
@@ -196,63 +282,183 @@ impl MessageProcessor {
         }
         let mut source = params.clone();
         source.cursor = None;
-        source.max_bytes = Some(32768);
-        source.max_tokens = Some(4096);
-        let mut encoded = String::new();
-        let mut complete = false;
-        for _ in 0..32 {
+        source.max_bytes = None;
+        source.max_tokens = None;
+        let mut references = super::thread_result_sources::SourceReferences::default();
+        loop {
             let page = self.read_thread_tool_result(source.clone()).await?;
-            encoded.push_str(&page.text);
-            if encoded.len() > 256 * 1024 {
-                return Ok(false);
+            references.feed(&page.text)?;
+            for reference in references.take_references() {
+                if !self.thread_source_readable(authority, &reference).await? {
+                    return Ok(false);
+                }
             }
             if page.eof {
-                complete = true;
                 break;
             }
+            ensure!(page.next.is_some(), "saved observer source cannot continue");
             source.cursor = page.next;
         }
-        if !complete {
+        if !references.finish()? {
             return Ok(false);
-        }
-        let root: serde_json::Value = serde_json::from_str(&encoded)?;
-        let Some(response) = saved_read_response(root, name) else {
-            return Ok(false);
-        };
-        let mut references = Vec::new();
-        if let Some(thread) = response["threadId"].as_str() {
-            references.push(thread.to_owned());
-        }
-        if let Some(rows) = response["threads"].as_array() {
-            for row in rows {
-                for field in ["threadId", "parentThreadId", "rootThreadId"] {
-                    if let Some(thread) = row[field].as_str() {
-                        references.push(thread.to_owned());
-                    }
-                }
-            }
-        }
-        if let Some(events) = response["events"].as_array() {
-            for event in events {
-                let reference = event
-                    .get("sourceThreadReference")
-                    .or_else(|| event["content"].get("sourceThreadReference"));
-                if let Some(thread) = reference.and_then(|r| r["threadId"].as_str()) {
-                    references.push(thread.to_owned());
-                }
-                if let Some(thread) = event["childReference"]["threadId"].as_str() {
-                    references.push(thread.to_owned());
-                }
-            }
-        }
-        references.sort();
-        references.dedup();
-        for reference in references {
-            if !self.thread_source_readable(authority, &reference).await? {
-                return Ok(false);
-            }
         }
         Ok(true)
+    }
+
+    async fn saved_reader_page_matches(
+        &self,
+        cached: &ThreadToolResultReadParams,
+        original: &ThreadToolResultReadParams,
+    ) -> Result<bool> {
+        let mut cached = cached.clone();
+        cached.cursor = None;
+        cached.max_tokens = None;
+        cached.max_bytes = None;
+        let mut expected = original.clone();
+        let mut skip = expected.cursor.as_ref().map_or(0, |cursor| cursor.offset);
+        expected.cursor = None;
+        expected.max_tokens = None;
+        expected.max_bytes = None;
+        let mut page = self.read_thread_tool_result(expected.clone()).await?;
+        let mut position = 0;
+        // Legacy/public cursors may have different envelopes. Only the saved,
+        // server-validated scalar offset is used; ownership and current ACLs
+        // are independently proved, and subsequent reads pin the live revision.
+        while skip > 0 {
+            if position == page.text.len() {
+                if page.eof {
+                    return Ok(false);
+                }
+                expected.cursor = page.next;
+                page = self.read_thread_tool_result(expected.clone()).await?;
+                position = 0;
+            }
+            let ch = page.text[position..]
+                .chars()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("source cannot advance"))?;
+            position += ch.len_utf8();
+            skip -= 1;
+        }
+        let mut scanner = super::thread_result_sources::SourceReferences::result_text();
+        loop {
+            let saved = self.read_thread_tool_result(cached.clone()).await?;
+            scanner.feed(&saved.text)?;
+            let text = scanner.take_result_text();
+            for actual in text.chars() {
+                if position == page.text.len() {
+                    if page.eof {
+                        return Ok(false);
+                    }
+                    expected.cursor = page.next;
+                    page = self.read_thread_tool_result(expected.clone()).await?;
+                    position = 0;
+                }
+                let expected = page.text[position..]
+                    .chars()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("source cannot advance"))?;
+                if actual != expected {
+                    return Ok(false);
+                }
+                position += expected.len_utf8();
+            }
+            if saved.eof {
+                return scanner.finish();
+            }
+            ensure!(saved.next.is_some(), "saved reader source cannot continue");
+            cached.cursor = saved.next;
+        }
+    }
+
+    // Bind disclosure validation and the public read to the same canonical
+    // revisions, including saved reader chains. No result ID alone is authority.
+    async fn saved_result_source_stamp(
+        &self,
+        params: &ThreadToolResultReadParams,
+    ) -> Result<String> {
+        let mut target = params.clone();
+        let mut digest = Sha256::new();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            ensure!(
+                seen.insert((
+                    target.thread_id.clone(),
+                    target.turn_id.clone(),
+                    target.item_id.clone()
+                )),
+                "cyclic saved reader source"
+            );
+            let value = self
+                .crud_store
+                .tool_result_access_source(
+                    &target.workspace_id,
+                    &target.thread_id,
+                    &target.turn_id,
+                    &target.item_id,
+                )
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("tool result source unavailable"))?;
+            digest.update(serde_json::to_vec(&value)?);
+            let references = [
+                self.crud_store
+                    .compaction_tool_item_reference(
+                        &target.workspace_id,
+                        &target.thread_id,
+                        &target.turn_id,
+                        &target.item_id,
+                    )
+                    .await?,
+                self.crud_store
+                    .compaction_context_reference_for_item(
+                        &target.workspace_id,
+                        &target.thread_id,
+                        &target.turn_id,
+                        &target.item_id,
+                        "tool_result_v2",
+                    )
+                    .await?,
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            if !references.is_empty() {
+                self.crud_store
+                    .compaction_prepare_references(
+                        &target.workspace_id,
+                        &target.thread_id,
+                        &references,
+                    )
+                    .await?;
+            }
+            if !target.output_log {
+                if let Some(fragment) = self
+                    .crud_store
+                    .compaction_tool_result_fragment(
+                        &target.workspace_id,
+                        &target.thread_id,
+                        &target.turn_id,
+                        &target.item_id,
+                        None,
+                        0,
+                    )
+                    .await?
+                {
+                    digest.update(serde_json::to_vec(&fragment.reference)?);
+                }
+            }
+            if value["toolName"].as_str() != Some(RESULT_READ_TOOL) {
+                break;
+            }
+            let nested: ThreadToolResultReadParams =
+                serde_json::from_value(value["arguments"].clone())?;
+            ensure!(
+                nested.workspace_id == params.workspace_id,
+                "tool result source unavailable"
+            );
+            target = nested;
+        }
+        Ok(hex::encode(digest.finalize()))
     }
 
     /// Legacy/native tools can retain a typed item without tool_result_v2 or
@@ -261,6 +467,7 @@ impl MessageProcessor {
     async fn read_saved_tool_item_fallback(
         &self,
         params: ThreadToolResultReadParams,
+        protection: Option<ResultCursorProtection<'_>>,
     ) -> Result<ThreadToolResultReadResponse> {
         let item = self
             .crud_store
@@ -291,12 +498,15 @@ impl MessageProcessor {
             .chars()
             .skip(usize::try_from(offset)?)
             .collect::<String>();
-        let max_tokens = params.max_tokens.unwrap_or(4096).min(4096);
-        let max_bytes = params.max_bytes.unwrap_or(32768).min(32768) as usize;
+        let max_tokens = params.max_tokens.unwrap_or(u64::MAX);
+        let max_bytes = params
+            .max_bytes
+            .unwrap_or(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64)
+            .min(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64) as usize;
         let mut tokens = max_tokens;
         let mut bytes = max_bytes;
         loop {
-            let page = pioneer_compaction::results::result_page(
+            let page = pioneer_compaction::results::result_page_in_budget(
                 &remaining, &version, None, tokens, bytes,
             )?;
             let end = offset + page.text.chars().count() as u64;
@@ -308,20 +518,28 @@ impl MessageProcessor {
                     offset: end,
                 }),
             };
-            let encoded = serde_json::to_string(&response)?;
-            let token_excess = pioneer_compaction::text_tokens(&encoded).saturating_sub(max_tokens);
+            let (response, encoded) = result_delivery_encoding(response, protection)?;
+            let token_excess = if max_tokens == u64::MAX {
+                0
+            } else {
+                pioneer_compaction::text_tokens(&encoded).saturating_sub(max_tokens)
+            };
             let byte_excess = encoded.len().saturating_sub(max_bytes);
-            if token_excess == 0 && byte_excess == 0 {
+            if token_excess == 0
+                && byte_excess == 0
+                && pioneer_tools::thread_read_page_fits(&serde_json::from_str(&encoded)?)
+            {
                 return Ok(response);
             }
             tokens = tokens.saturating_sub(token_excess);
-            bytes = bytes.saturating_sub(byte_excess);
+            bytes = bytes.saturating_sub(byte_excess.max(result_projection_excess(&encoded)?));
         }
     }
 
     async fn read_thread_tool_output_log(
         &self,
         params: ThreadToolResultReadParams,
+        protection: Option<ResultCursorProtection<'_>>,
     ) -> Result<ThreadToolResultReadResponse> {
         let ordinal = params
             .cursor
@@ -364,12 +582,15 @@ impl MessageProcessor {
             "output cursor is stale"
         );
         let remainder = text.chars().skip(offset as usize).collect::<String>();
-        let max_tokens = params.max_tokens.unwrap_or(4096).min(4096);
-        let max_bytes = params.max_bytes.unwrap_or(32768).min(32768) as usize;
+        let max_tokens = params.max_tokens.unwrap_or(u64::MAX);
+        let max_bytes = params
+            .max_bytes
+            .unwrap_or(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64)
+            .min(pioneer_protocol::TOOL_RESPONSE_MAX_BYTES as u64) as usize;
         let mut token_budget = max_tokens;
         let mut byte_budget = max_bytes;
         loop {
-            let page = pioneer_compaction::results::result_page(
+            let page = pioneer_compaction::results::result_page_in_budget(
                 &remainder,
                 &version,
                 None,
@@ -392,14 +613,22 @@ impl MessageProcessor {
                 eof: next.is_none(),
                 next,
             };
-            let encoded = serde_json::to_string(&response)?;
-            let token_excess = pioneer_compaction::text_tokens(&encoded).saturating_sub(max_tokens);
+            let (response, encoded) = result_delivery_encoding(response, protection)?;
+            let token_excess = if max_tokens == u64::MAX {
+                0
+            } else {
+                pioneer_compaction::text_tokens(&encoded).saturating_sub(max_tokens)
+            };
             let byte_excess = encoded.len().saturating_sub(max_bytes);
-            if token_excess == 0 && byte_excess == 0 {
+            if token_excess == 0
+                && byte_excess == 0
+                && pioneer_tools::thread_read_page_fits(&serde_json::from_str(&encoded)?)
+            {
                 return Ok(response);
             }
             token_budget = token_budget.saturating_sub(token_excess);
-            byte_budget = byte_budget.saturating_sub(byte_excess);
+            byte_budget =
+                byte_budget.saturating_sub(byte_excess.max(result_projection_excess(&encoded)?));
         }
     }
 
@@ -433,7 +662,7 @@ impl ToolHandler for ResultReadHandler {
         let ToolPayload::Function { arguments } = invocation.payload else {
             return Err(ToolError::invalid_arguments("expected function arguments"));
         };
-        let params: ThreadToolResultReadParams = serde_json::from_value(arguments)
+        let mut params: ThreadToolResultReadParams = serde_json::from_value(arguments)
             .map_err(|_| ToolError::invalid_arguments("invalid result/read parameters"))?;
         let denied = || ToolError::invalid_arguments("source unavailable or access denied");
         if params.workspace_id != self.context.workspace_id {
@@ -452,28 +681,51 @@ impl ToolHandler for ResultReadHandler {
         {
             return Err(denied());
         }
+        let codec = self
+            .processor
+            .thread_read_cursor_codec()
+            .map_err(|_| denied())?;
+        let scope = serde_json::json!([
+            authority.scope("result", &params.thread_id, false, 0),
+            params.turn_id,
+            params.item_id,
+            params.output_log,
+            params.max_tokens,
+            params.max_bytes
+        ])
+        .to_string();
+        if let Some(cursor) = &params.cursor {
+            if serde_json::to_vec(cursor).map_err(|_| denied())?.len() > 16384 {
+                return Err(ToolError::invalid_arguments(
+                    "result cursor exceeds 16 KiB; restart reading",
+                ));
+            }
+            let decoded: ThreadToolResultCursor =
+                codec.decode(&cursor.version, &scope).map_err(|_| {
+                    ToolError::invalid_arguments("invalid or old result cursor; restart reading")
+                })?;
+            if cursor.offset != decoded.offset {
+                return Err(ToolError::invalid_arguments("invalid result cursor"));
+            }
+            params.cursor = Some(decoded);
+        }
         let item = self
             .processor
             .crud_store
-            .get_turn_item(&params.turn_id, &params.item_id)
+            .tool_result_access_source(
+                &params.workspace_id,
+                &params.thread_id,
+                &params.turn_id,
+                &params.item_id,
+            )
             .await
             .map_err(|_| denied())?
             .ok_or_else(denied)?;
-        let turns = self
+        let stamp = self
             .processor
-            .crud_store
-            .get_turns_by_thread_and_ids(&params.thread_id, std::slice::from_ref(&params.turn_id))
+            .saved_result_source_stamp(&params)
             .await
             .map_err(|_| denied())?;
-        if !turns
-            .get(&params.turn_id)
-            .is_some_and(|turn| !turn.message_deleted)
-            || !item.is_tool_item()
-            || pioneer_crud::classify_turn_item_with_db_status(&item, None).visibility
-                != pioneer_crud::ProjectionVisibility::Visible
-        {
-            return Err(denied());
-        }
         if !self
             .processor
             .saved_thread_read_result_disclosable(&authority, &params, &item)
@@ -485,11 +737,17 @@ impl ToolHandler for ResultReadHandler {
         let source_thread_id = params.thread_id.clone();
         let result = self
             .processor
-            .read_thread_tool_result(params)
+            .read_thread_tool_result_with_cursor(
+                params.clone(),
+                Some(ResultCursorProtection {
+                    codec: &codec,
+                    scope: &scope,
+                }),
+            )
             .await
             .map_err(|_| {
                 ToolError::invalid_arguments(
-                    "result unavailable, cursor stale, or page budget too small",
+                    "result unavailable, cursor stale, or requested page budget cannot fit framing and source text",
                 )
             })?;
         let current = self
@@ -505,21 +763,57 @@ impl ToolHandler for ResultReadHandler {
         {
             return Err(denied());
         }
-        let text = serde_json::to_string(&result)
+        if !self
+            .processor
+            .saved_thread_read_result_disclosable(&current, &params, &item)
+            .await
+            .map_err(|_| denied())?
+        {
+            return Err(denied());
+        }
+        if self
+            .processor
+            .saved_result_source_stamp(&params)
+            .await
+            .map_err(|_| denied())?
+            != stamp
+        {
+            return Err(ToolError::invalid_arguments(
+                "result cursor is stale; restart reading",
+            ));
+        }
+        let payload = serde_json::to_value(result)
             .map_err(|_| ToolError::invalid_arguments("result encoding failed"))?;
-        Ok(Box::new(FunctionToolOutput::new(text, true)))
+        if !pioneer_tools::thread_read_page_fits(&payload) {
+            return Err(ToolError::execution_failed(
+                "result page exceeds projection limit",
+            ));
+        }
+        let text = serde_json::to_string(&payload)
+            .map_err(|_| ToolError::invalid_arguments("result encoding failed"))?;
+        if params
+            .max_tokens
+            .is_some_and(|budget| pioneer_compaction::text_tokens(&text) > budget)
+        {
+            return Err(ToolError::invalid_arguments(
+                "result page cannot fit the requested max_tokens budget",
+            ));
+        }
+        Ok(Box::new(FunctionToolOutput::with_payload(
+            text, true, payload,
+        )))
     }
 }
 
 pub(crate) fn thread_result_tool_specs() -> Vec<ConfiguredToolSpec> {
     let spec = ToolSpec::new(
         RESULT_READ_TOOL,
-        "Read a saved full tool result as bounded text pages of canonical JSON. Follow the version-bound cursor until eof. Attachment references remain references. Legacy saved-item views explicitly report fullResultSaved=false when a separate full provider result was never retained. Set output_log=true to read saved stdout/stderr/progress chunks (including interrupted commands); each chunk is a separate JSON object, and eof refers to the currently saved log.",
+        "Read a saved full tool result as bounded text pages of canonical JSON. Follow the opaque version-bound cursor until eof, keeping the exact source, output_log, max_tokens and max_bytes unchanged. Old cursors require restarting. Attachment references remain references. Legacy saved-item views explicitly report fullResultSaved=false when a separate full provider result was never retained. Set output_log=true to read saved stdout/stderr/progress chunks (including interrupted commands); each chunk is a separate JSON object, and eof refers to the currently saved log.",
         serde_json::json!({"type":"object","properties":{
                 "workspace_id":{"type":"string"},"thread_id":{"type":"string"},"turn_id":{"type":"string"},"item_id":{"type":"string"},
                 "output_log":{"type":"boolean","default":false},
                 "cursor":{"type":"object","properties":{"version":{"type":"string"},"offset":{"type":"integer","minimum":0}},"required":["version","offset"]},
-                "max_tokens":{"type":"integer","minimum":1,"maximum":4096},"max_bytes":{"type":"integer","minimum":1,"maximum":32768}},
+                "max_tokens":{"type":"integer","minimum":1,"description":"Optional token budget for the complete returned JSON, including the protected cursor; omitted means no token ceiling."},"max_bytes":{"type":"integer","minimum":1,"description":"Optional caller page budget; the complete page always fits Pioneer’s 2 MiB response projection."}},
                 "required":["workspace_id","thread_id","turn_id","item_id"],"additionalProperties":false}),
         PayloadKind::Function,
     );
@@ -528,56 +822,4 @@ pub(crate) fn thread_result_tool_specs() -> Vec<ConfiguredToolSpec> {
         ExecutionClass::Shared,
         pioneer_protocol::ToolOutputPolicySnapshot::for_tool_name(RESULT_READ_TOOL),
     )]
-}
-
-// Search only the canonical tool-result wrapper vocabulary. A matched public
-// response terminates traversal before its user-message contents are inspected.
-fn saved_read_response(root: serde_json::Value, name: &str) -> Option<serde_json::Value> {
-    use serde_json::Value;
-    let mut pending = vec![(root, 0_u8)];
-    while let Some((value, depth)) = pending.pop() {
-        if depth > 16 {
-            continue;
-        }
-        if (name == "threads_history_read" && value["events"].is_array())
-            || (name != "threads_history_read" && value["threads"].is_array())
-        {
-            return Some(value);
-        }
-        match value {
-            Value::Object(object) => {
-                for (key, value) in object {
-                    if [
-                        "value",
-                        "output",
-                        "result",
-                        "structuredContent",
-                        "content",
-                        "text",
-                        "item",
-                        "storage",
-                        "metadata",
-                        "stdout",
-                        "aggregated_output",
-                    ]
-                    .contains(&key.as_str())
-                    {
-                        pending.push((value, depth + 1));
-                    }
-                }
-            }
-            Value::Array(array) => {
-                for value in array {
-                    pending.push((value, depth + 1));
-                }
-            }
-            Value::String(text) => {
-                if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                    pending.push((value, depth + 1));
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }

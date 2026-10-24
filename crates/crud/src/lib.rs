@@ -80,40 +80,40 @@ pub use repositories::administrative_audit::{
     insert_administrative_audit_event,
 };
 pub use repositories::agent_domain::{
-    ACTIVE_AGENT_IDENTITY_CATALOG_LIMIT, AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS,
-    AGENT_ACTION_OUTBOX_MAX_ATTEMPTS, AgentActionInput, AgentActionLedgerCompactionSummary,
-    AgentActionOutboxClaimBatch, AgentActionTimelineProjection, AgentCommitInput,
-    AgentDelegationRouteInput, AgentExecutionAuthorProjection, AgentExecutionGrantInput,
-    AgentExecutionGraphCommitInput, AgentExecutionGraphCommitResult, AgentExecutionInput,
-    AgentIdentityInput, AgentQueueEntryInput, AgentResourceCommitInput, AgentResourceStateInput,
-    AgentThreadCreationCommitInput, AgentTurnResponseInput, AgentWorkGraphCancellationTarget,
-    AgentWorkGraphProjectionTarget, NativeAgentConfigInput, PresentationSnapshotInput,
-    PromotedAgentExecution, SOURCE_CLI_RUNTIME_INSTANCE, SOURCE_EPHEMERAL, SOURCE_NATIVE_AGENT,
-    TerminalTaskDeliveryCommitError, acquire_agent_running_permit,
-    agent_delegation_route_projection, agent_execution_grant_fingerprint,
-    agent_presentation_snapshot_from_rows, cancel_agent_work_graph, canonical_agent_id,
-    claim_actor_nickname, claim_agent_action_outbox, commit_agent_action,
-    commit_agent_delivery_action, commit_agent_execution_graph, commit_agent_thread_creation,
-    commit_native_agent_config_mutation, compact_terminal_agent_action_ledger,
-    defer_agent_action_outbox_for_permit, defer_agent_action_outbox_for_runtime,
-    enqueue_agent_execution, ensure_agent_identity, ensure_native_agent_config,
-    ensure_root_resource_scope, finalize_agent_execution, heartbeat_agent_execution,
-    insert_agent_action_idempotent, insert_agent_delegation_route, insert_agent_execution,
-    insert_agent_execution_grant, insert_agent_resource_state, insert_agent_turn_response,
-    insert_presentation_snapshot, list_active_agent_identities, list_agent_delegation_routes,
-    list_agent_delegation_routes_for_source, load_active_agent_identity,
-    load_active_agent_identity_by_source, load_agent_action, load_agent_action_outbox,
-    load_agent_action_receipt, load_agent_action_timeline_projections_for_targets,
-    load_agent_delegation_route, load_agent_execution, load_agent_execution_grant,
-    load_agent_execution_resource_state, load_agent_identity, load_agent_identity_by_source,
-    load_agent_presentation_snapshot, load_agent_turn_response,
-    load_agent_turn_responses_for_turns, load_agent_work_graph_projection_for_turn,
-    load_agent_work_graph_projection_target, load_current_agent_authors_for_executions,
-    load_current_agent_presentation_snapshot, load_native_agent_config,
-    load_native_agent_config_by_system_key, mark_agent_action_outbox_delivered,
-    mark_agent_action_outbox_failed, promote_queued_agent_executions,
-    record_agent_execution_progress, reopen_agent_execution_for_retry,
-    revoke_agent_delegation_route, upgrade_agent_execution_grant_model_to_current, utc_now,
+    AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS, AGENT_ACTION_OUTBOX_MAX_ATTEMPTS, AgentActionInput,
+    AgentActionLedgerCompactionSummary, AgentActionOutboxClaimBatch, AgentActionTimelineProjection,
+    AgentCommitInput, AgentDelegationRouteInput, AgentExecutionAuthorProjection,
+    AgentExecutionGrantInput, AgentExecutionGraphCommitInput, AgentExecutionGraphCommitResult,
+    AgentExecutionInput, AgentIdentityInput, AgentQueueEntryInput, AgentResourceCommitInput,
+    AgentResourceStateInput, AgentThreadCreationCommitInput, AgentTurnResponseInput,
+    AgentWorkGraphCancellationTarget, AgentWorkGraphProjectionTarget, NativeAgentConfigInput,
+    PresentationSnapshotInput, PromotedAgentExecution, SOURCE_CLI_RUNTIME_INSTANCE,
+    SOURCE_EPHEMERAL, SOURCE_NATIVE_AGENT, TerminalTaskDeliveryCommitError,
+    acquire_agent_running_permit, agent_delegation_route_projection,
+    agent_execution_grant_fingerprint, agent_presentation_snapshot_from_rows,
+    cancel_agent_work_graph, canonical_agent_id, claim_actor_nickname, claim_agent_action_outbox,
+    commit_agent_action, commit_agent_delivery_action, commit_agent_execution_graph,
+    commit_agent_thread_creation, commit_native_agent_config_mutation,
+    compact_terminal_agent_action_ledger, defer_agent_action_outbox_for_permit,
+    defer_agent_action_outbox_for_runtime, enqueue_agent_execution, ensure_agent_identity,
+    ensure_native_agent_config, ensure_root_resource_scope, finalize_agent_execution,
+    heartbeat_agent_execution, insert_agent_action_idempotent, insert_agent_delegation_route,
+    insert_agent_execution, insert_agent_execution_grant, insert_agent_resource_state,
+    insert_agent_turn_response, insert_presentation_snapshot, list_active_agent_identities_page,
+    list_agent_delegation_routes, list_agent_delegation_routes_for_source,
+    load_active_agent_identity, load_active_agent_identity_by_source, load_agent_action,
+    load_agent_action_outbox, load_agent_action_receipt,
+    load_agent_action_timeline_projections_for_targets, load_agent_delegation_route,
+    load_agent_execution, load_agent_execution_grant, load_agent_execution_resource_state,
+    load_agent_identity, load_agent_identity_by_source, load_agent_presentation_snapshot,
+    load_agent_turn_response, load_agent_turn_responses_for_turns,
+    load_agent_work_graph_projection_for_turn, load_agent_work_graph_projection_target,
+    load_current_agent_authors_for_executions, load_current_agent_presentation_snapshot,
+    load_native_agent_config, load_native_agent_config_by_system_key,
+    mark_agent_action_outbox_delivered, mark_agent_action_outbox_failed,
+    promote_queued_agent_executions, record_agent_execution_progress,
+    reopen_agent_execution_for_retry, revoke_agent_delegation_route,
+    upgrade_agent_execution_grant_model_to_current, utc_now,
     wake_agent_action_outbox_for_execution,
 };
 pub use repositories::agent_identity_catalog::{
@@ -18347,21 +18347,20 @@ impl CrudStore {
             .collect())
     }
 
-    pub async fn list_task_thread_lineage_by_root_thread_bounded(
+    pub async fn list_task_thread_lineage_by_root_thread_page(
         &self,
         root_thread_id: &str,
-        limit: u64,
+        after: Option<&str>,
     ) -> Result<Vec<TaskThreadLineage>> {
-        let rows = thread_lineage::list_lineage_by_root_thread_bounded(
+        Ok(thread_lineage::list_lineage_by_root_thread_page(
             &self.connection,
             root_thread_id,
-            limit,
+            after,
         )
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(task_thread_lineage_from_db_model)
-            .collect())
+        .await?
+        .into_iter()
+        .map(task_thread_lineage_from_db_model)
+        .collect())
     }
 
     pub async fn mark_thread_read(

@@ -1096,6 +1096,18 @@ pub(crate) fn bounded_tool_result_message_with_budget(
     reference: &str,
     available_tokens: u64,
 ) -> Result<ChatMessage, ChatTurnError> {
+    if source
+        .name
+        .as_deref()
+        .is_some_and(pioneer_tools::is_thread_paged_tool)
+    {
+        if source.content.len() <= pioneer_protocol::TOOL_RESPONSE_MAX_BYTES {
+            return Ok(source.clone());
+        }
+        return Err(ChatTurnError::Blocked(
+            "saved thread page exceeds projection limit".into(),
+        ));
+    }
     let token_limit = available_tokens.min(pioneer_compaction::RESULT_TOKENS);
     let mut message = source.clone();
     let mut text = message.content.clone();
@@ -6403,9 +6415,13 @@ async fn execute_agent_provider_response(
                     if !result.full_source_in_item {
                         persist_retained_tool_result(event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &result).await?;
                     }
-                    result.message = bounded_tool_result_message(
-                        result.full_message.as_ref().unwrap_or(&result.message), &reference,
-                    )?;
+                    // Thread readers already fit the complete page and its continuation
+                    // to the projection limit. A second excerpt would destroy that contract.
+                    if !pioneer_tools::is_thread_paged_tool(&result.tool_name) {
+                        result.message = bounded_tool_result_message(
+                            result.full_message.as_ref().unwrap_or(&result.message), &reference,
+                        )?;
+                    }
                     // The durable terminal item already owns full shell output. Retain only
                     // its bounded provider representation in canonical replay history.
                     if result.full_source_in_item {
@@ -10127,6 +10143,22 @@ mod tests {
 #[cfg(test)]
 mod compaction_result_budget_tests {
     use super::*;
+    #[test]
+    fn thread_pages_keep_their_content_and_cursor_in_native_replay() {
+        let text = serde_json::json!({"events":[{"text":"漢字 🌍 \"\\\n".repeat(30_000)}],"nextCursor":"sealed-continuation","eof":false}).to_string();
+        let mut source = ChatMessage::tool(text.clone());
+        source.name = Some("threads_history_read".into());
+        let page = bounded_tool_result_message(&source, "saved-source").unwrap();
+        assert_eq!(page.content, text);
+        let restored =
+            bounded_tool_result_message_with_budget(&source, "saved-source", 4096).unwrap();
+        assert_eq!(restored.content, text);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&restored.content).unwrap()["nextCursor"],
+            "sealed-continuation"
+        );
+    }
+
     #[test]
     fn inline_binary_result_uses_a_reference_to_the_retained_part() {
         let mut source = ChatMessage::tool("binary result");

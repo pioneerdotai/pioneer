@@ -566,6 +566,13 @@ impl MessageProcessor {
                 retry_dirty = true;
                 continue;
             }
+            #[cfg(test)]
+            if result.is_err() || changed {
+                eprintln!(
+                    "push recovery: snapshot={snapshot}, dirty={changed}, retried={retry_dirty}, error={:?}",
+                    result.as_ref().err()
+                );
+            }
             retry_dirty = false;
             let mut packet = match result {
                 Ok(packet) if !changed => packet,
@@ -643,6 +650,11 @@ impl MessageProcessor {
                 text = smaller;
             }
             if text.len() > MAX_PACKET_BYTES {
+                #[cfg(test)]
+                eprintln!(
+                    "push recovery: packet bytes {} exceed {MAX_PACKET_BYTES}",
+                    text.len()
+                );
                 packet.thread_summaries.clear();
                 packet.indicators.clear();
                 packet.inbox = None;
@@ -686,6 +698,10 @@ impl MessageProcessor {
                         }
                         let mut pending = scope.pending.lock().expect("push pending poisoned");
                         let recover = packet.resync_required || pending.generation != generation;
+                        #[cfg(test)]
+                        if !packet.resync_required && recover {
+                            eprintln!("push recovery: generation changed at final enqueue gate");
+                        }
                         let payload = if recover {
                             recovery_text.ok_or_else(|| anyhow!("cannot serialize recovery"))?
                         } else {

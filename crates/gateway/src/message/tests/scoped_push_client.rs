@@ -491,7 +491,7 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
         stage.set("initial negotiated snapshot");
         let snapshot = loop {
             let packet = packets_rx.recv().await.expect("negotiated snapshot");
-            assert!(!packet.resync_required);
+            assert!(!packet.resync_required, "initial push recovery: {packet:?}");
             if !hidden_cli_start || (packet.snapshot && packet.inbox.is_some() && !packet.indicators.is_empty()) {
                 break packet;
             }
