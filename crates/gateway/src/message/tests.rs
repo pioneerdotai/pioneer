@@ -2182,7 +2182,10 @@ async fn setup_cli_runtime_skill_preflight_harness(
     for entry in
         crate::system_skills::bundled_system_skill_catalog_entries(&harness.system_root).unwrap()
     {
-        if matches!(entry.slug.as_str(), "tasks" | "subagents" | "html") {
+        if matches!(
+            entry.slug.as_str(),
+            "tasks" | "subagents" | "html" | "threads"
+        ) {
             let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../resources/skills/pioneer")
                 .join(&entry.slug);
@@ -2557,9 +2560,10 @@ async fn capability_persistence_order_impl() {
                 turn_id: committed_turn_id,
                 bindings,
                 ..
-            } if committed_turn_id == turn_id && bindings.len() == 5
-                && bindings.iter().filter(|binding| binding.source_kind == "system").count() == 3
+            } if committed_turn_id == turn_id && bindings.len() == 6
+                && bindings.iter().filter(|binding| binding.source_kind == "system").count() == 4
                 && bindings.iter().any(|binding| binding.source_kind == "system" && binding.skill_slug == "html")
+                && bindings.iter().any(|binding| binding.source_kind == "system" && binding.skill_slug == "threads")
         ));
         if matches!(
             runtime_kind,
@@ -2576,6 +2580,7 @@ async fn capability_persistence_order_impl() {
                                 "pioneer-system-tasks"
                                     | "pioneer-system-subagents"
                                     | "pioneer-system-html"
+                                    | "pioneer-system-threads"
                             )
                         )
                 })
@@ -2726,7 +2731,7 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
 
         let first_receipt_bytes = first_receipt_snapshot.unwrap();
         let first_receipt = pioneer_skills::read_external_runtime_receipt(&receipt_path).unwrap();
-        assert_eq!(first_receipt.entries.len(), 4);
+        assert_eq!(first_receipt.entries.len(), 5);
         assert_eq!(first_receipt.entries[0].skill_id, lifecycle_id);
         assert_eq!(first_receipt.entries[0].owner.as_deref(), Some("tests"));
         assert_eq!(first_receipt.entries[0].slug, "lifecycle");
@@ -2823,8 +2828,8 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
             .find_turn_skill_bindings(&zero_turn)
             .await
             .expect("must read zero-skill CLI runtime turn bindings");
-        assert_eq!(zero_bindings.len(), 3);
-        for slug in ["tasks", "subagents", "html"] {
+        assert_eq!(zero_bindings.len(), 4);
+        for slug in ["tasks", "subagents", "html", "threads"] {
             assert!(
                 zero_bindings
                     .iter()
@@ -2852,6 +2857,7 @@ fn cli_html_skill_resolves_without_task_tools_or_explicit_attachments() {
                 &harness.workspace_id,
                 &[],
                 &pioneer_agent::AgentMcpAvailability::default(),
+                false,
                 false,
                 true,
             )
@@ -34009,7 +34015,8 @@ async fn cli_task_bootstrap_honors_empty_parent_context_policy_impl() {
         vec![
             "pioneer-system-tasks",
             "pioneer-system-subagents",
-            "pioneer-system-html"
+            "pioneer-system-html",
+            "pioneer-system-threads"
         ]
     );
     let adapter_messages = adapter_input

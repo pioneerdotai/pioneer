@@ -1881,9 +1881,9 @@ fn cli_automatic_orchestration_skills_coexist_with_selected_user_names() {
                         label: Some(format!("tests/{user_name}")),
                     }]
                 );
-                assert_eq!(bindings.len(), 4);
+                assert_eq!(bindings.len(), 5);
                 assert!(bindings.iter().any(|binding| binding.skill_id == user_id && binding.source_kind == "user"));
-                for slug in ["tasks", "subagents", "html"] {
+                for slug in ["tasks", "subagents", "html", "threads"] {
                     assert!(
                         bindings
                             .iter()
@@ -1926,13 +1926,14 @@ fn cli_automatic_orchestration_skills_coexist_with_selected_user_names() {
                 let start = &starts[0];
                 let instructions = start.elevated_instructions.text();
                 if kind == CLIAgentRuntimeKind::Claude {
-                    assert!(instructions.contains(&format!("Selected skills:\n- {user_name}\n- pioneer-system-tasks\n- pioneer-system-subagents\n- pioneer-system-html")),
+                    assert!(instructions.contains(&format!("Selected skills:\n- {user_name}\n- pioneer-system-tasks\n- pioneer-system-subagents\n- pioneer-system-html\n- pioneer-system-threads")),
                         "application order must retain the user's selected skill before automatic system skills");
                 }
                 for name in [
                     "pioneer-system-tasks",
                     "pioneer-system-subagents",
                     "pioneer-system-html",
+                    "pioneer-system-threads",
                     user_name,
                 ] {
                     assert!(instructions.contains(name), "{kind:?}: {name}");
@@ -2182,10 +2183,10 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
                 .unwrap();
             assert_eq!(
                 skills.len(),
-                3,
-                "orchestration and HTML skills are automatic even without user attachments"
+                4,
+                "system skills are automatic even without user attachments"
             );
-            for slug in ["tasks", "subagents", "html"] {
+            for slug in ["tasks", "subagents", "html", "threads"] {
                 assert!(
                     skills
                         .iter()
@@ -3838,5 +3839,625 @@ fn admitted_cli_search_preserves_structured_pages_at_projection_byte_boundary() 
         assert!(after_revocation["threads"].as_array().unwrap().is_empty());
         assert_eq!(after_revocation["eof"], true);
         assert!(!after_revocation.to_string().contains("byte-boundary-b"));
+    });
+}
+
+// Trusted admission fixture with an explicit Threads selection. The recording
+// runtime never starts an external provider process.
+async fn start_threads_cli_fixture(
+    kind: CLIAgentRuntimeKind,
+    denied: &[&str],
+) -> (
+    CliRuntimeSkillPreflightHarness,
+    Arc<MessageProcessor>,
+    String,
+) {
+    let harness = setup_cli_runtime_skill_preflight_harness(kind, false).await;
+    *harness.cli_session.projected_mcp_store.lock().await = Some(harness.crud_store.clone());
+    let thread = format!("cli_threads_{kind:?}").to_lowercase();
+    let turn = format!("cli_threads_turn_{kind:?}").to_lowercase();
+    seed_cli_runtime_skill_preflight_thread(&harness, &thread).await;
+    let processor = Arc::new(harness.processor.clone());
+    processor
+        .mark_cli_reasoning_model_ready_for_tests(
+            &harness.workspace_id,
+            &harness.runtime_id,
+            "threads-cli-choice",
+        )
+        .await
+        .unwrap();
+    processor.bind_agent_tool_bridges().await;
+    let request: JsonValue =
+        serde_json::from_str(&cli_runtime_turn_start_request_with_capabilities(
+            &generate_test_request_id("threads", &format!("{kind:?}")),
+            &thread,
+            &turn,
+            &harness.runtime_id,
+            kind,
+            vec![],
+        ))
+        .unwrap();
+    let params: pioneer_protocol::TurnStartParams =
+        serde_json::from_value(request["params"].clone()).unwrap();
+    let mut profile = default_test_permission_profile();
+    profile.effective_policy.allowed_tools = pioneer_tools::THREADS_DOMAIN_TOOL_NAMES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    // Explicit deny wins over allow and must remove the search schema and
+    // corresponding capability instruction from the frozen catalog.
+    profile.effective_policy.denied_tools = denied.iter().map(|name| (*name).to_owned()).collect();
+    let connection = processor
+        .session_manager
+        .connection_context(harness.connection_id)
+        .await
+        .unwrap();
+    use crate::authorization::{
+        ExecutionAdmissionEntryPoint, ExecutionAdmissionRequest, ExecutionAdmissionService,
+        ResourceAction,
+    };
+    let source = processor
+        .crud_store
+        .get_thread_model(&thread)
+        .await
+        .unwrap()
+        .unwrap();
+    let admission = ExecutionAdmissionRequest::for_turn(
+        ExecutionAdmissionEntryPoint::CliRuntime,
+        ResourceAction::AgentTurnStart,
+        vec![
+            ResourceAction::ThreadCreatePrivate,
+            ResourceAction::ThreadCreateWorkspace,
+            ResourceAction::ChildStart,
+            ResourceAction::ChildWrite,
+            ResourceAction::ChildObserve,
+        ],
+        &harness.workspace_id,
+        &thread,
+        &format!("cli_runtime:{}", harness.runtime_id),
+        &source.model,
+        &params,
+        &[],
+        None,
+    )
+    .unwrap();
+    let context = ExecutionAdmissionService::new(processor.crud_store.as_ref().clone())
+        .admit_context(
+            connection.principal(),
+            processor
+                .authorization_invalidation_hub
+                .current_revision()
+                .await
+                .unwrap(),
+            &admission,
+            Some(&pioneer_protocol::task_permission_cap_from_snapshot(
+                &profile,
+            )),
+        )
+        .await
+        .unwrap();
+    let revalidation = processor
+        .execution_leases
+        .revalidate_context(
+            processor.crud_store.as_ref(),
+            &context,
+            crate::authorization::ResourceAction::AgentTurnStart,
+            processor
+                .authorization_invalidation_hub
+                .current_revision()
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    processor
+        .turn_start_cli_runtime(
+            harness.connection_id,
+            serde_json::from_value(request["id"].clone()).unwrap(),
+            pioneer_protocol::PersistedActorRef::Principal(
+                connection.principal().principal_id.clone(),
+            ),
+            params,
+            harness.runtime_id.clone(),
+            kind,
+            crate::message::turn_handlers::TurnExecutionAuthority::Durable {
+                context,
+                revalidation: Arc::new(revalidation),
+            },
+            crate::message::turn_handlers::TurnStartSuccessResponse::TurnStart,
+        )
+        .await;
+    wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
+    wait_for_task_cli_activation(&processor, &turn).await;
+    (harness, processor, turn)
+}
+
+struct ThreadsFacade {
+    facade: Arc<crate::cli_runtime::mcp::facade::CliMcpToolFacade>,
+    context: crate::cli_runtime::mcp::facade::CliMcpFacadeRequestContext,
+    native_items: Arc<crate::cli_runtime::mcp::native_correlation::NativeMcpCorrelationLedger>,
+    claude_items: Arc<crate::cli_runtime::claude_session::ClaudeNativeMcpCorrelationLedger>,
+    kind: CLIAgentRuntimeKind,
+    native_thread: String,
+    native_turn: String,
+}
+
+impl ThreadsFacade {
+    async fn new(processor: &MessageProcessor, turn: &str, kind: CLIAgentRuntimeKind) -> Self {
+        use crate::cli_runtime::mcp::{
+            coordinator::CliMcpCoordinator, facade::*, grants::*, native_correlation::*,
+        };
+        let binding = processor
+            .crud_store
+            .get_cli_runtime_turn_binding(turn)
+            .await
+            .unwrap()
+            .unwrap();
+        let tools = processor
+            .crud_store
+            .list_turn_mcp_bindings(turn)
+            .await
+            .unwrap();
+        use crate::turn_mcp::native_tools::NativeToolFamily;
+        let definitions = [
+            NativeToolFamily::Html,
+            NativeToolFamily::Tasks,
+            NativeToolFamily::Threads,
+        ]
+        .into_iter()
+        .flat_map(|family| {
+            let selected = &tools;
+            family
+                .definitions()
+                .into_iter()
+                .filter(move |spec| {
+                    selected.iter().any(|binding| {
+                        binding.server_installation_id == family.server_id()
+                            && binding.raw_tool_name == spec.spec.name
+                    })
+                })
+                .map(move |spec| (family, spec))
+        })
+        .collect();
+        let canonical =
+            crate::turn_mcp::ResolvedMcpTurnProjection::empty(&binding.workspace_id, turn)
+                .with_native_tools(definitions, crate::turn_mcp::McpProjectionLimits::default())
+                .unwrap();
+        let metadata = binding.mcp.as_ref().unwrap();
+        assert_eq!(canonical.manifest_hash, metadata.manifest_hash);
+        let limits =
+            crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits::transport_bounded(128);
+        let projection = match kind {
+            CLIAgentRuntimeKind::Codex => {
+                crate::cli_runtime::codex_mcp::build_codex_mcp_session_launch_projection(
+                    canonical,
+                    metadata.provider_contract_fingerprint.clone(),
+                )
+                .unwrap()
+                .facade_projection(limits)
+                .unwrap()
+            }
+            CLIAgentRuntimeKind::Claude => {
+                crate::cli_runtime::claude_mcp::build_claude_mcp_session_launch_projection(
+                    canonical,
+                    metadata.provider_contract_fingerprint.clone(),
+                )
+                .unwrap()
+                .facade_projection(limits)
+                .unwrap()
+            }
+            CLIAgentRuntimeKind::OpenCode => {
+                crate::cli_runtime::opencode_mcp::build_opencode_mcp_session_launch_projection(
+                    canonical,
+                    metadata.provider_contract_fingerprint.clone(),
+                )
+                .unwrap()
+                .facade_projection(limits)
+                .unwrap()
+            }
+        };
+        let key = CLIAgentRuntimeSessionKey::new(
+            &binding.workspace_id,
+            &binding.runtime_id,
+            &binding.continuation_thread_id,
+        )
+        .unwrap();
+        let instance =
+            crate::cli_runtime::session_instance::CliSessionInstanceId::unmanaged_for_test(
+                key,
+                binding.mcp.as_ref().unwrap().session_generation as u64,
+            )
+            .unwrap();
+        let scope = CliMcpGrantScope::new(
+            instance,
+            CliMcpManifestHash::new(binding.mcp.as_ref().unwrap().manifest_hash.clone()).unwrap(),
+        );
+        let coordinator = Arc::new(CliMcpCoordinator::default());
+        let issued = coordinator
+            .issue_grant(
+                scope.clone(),
+                (pioneer_crud::utc_now().timestamp_millis() as u64) + 60_000,
+            )
+            .await
+            .unwrap();
+        let reservation = coordinator
+            .stage_projection(&issued.grant_ref(), projection.fingerprint().clone())
+            .await
+            .unwrap();
+        let bound = coordinator
+            .attach(
+                &pioneer_cli_mcp_bridge::AttachRequest {
+                    session_id: issued.bridge_session_id,
+                    generation: pioneer_cli_mcp_bridge::BridgeGeneration::new(
+                        scope.process_instance.generation(),
+                    )
+                    .unwrap(),
+                    nonce: issued.nonce,
+                },
+                &scope,
+                CliMcpConnectionId::for_test(1),
+            )
+            .await
+            .unwrap();
+        let native_items = Arc::new(NativeMcpCorrelationLedger::default());
+        let claude_items = Arc::new(
+            crate::cli_runtime::claude_session::ClaudeNativeMcpCorrelationLedger::default(),
+        );
+        let inner: Arc<dyn TurnMcpInvoker> = Arc::new(processor.mcp_service.turn_mcp_invoker());
+        let invoker: Arc<dyn TurnMcpInvoker> = match kind {
+            CLIAgentRuntimeKind::Claude => Arc::new(
+                crate::cli_runtime::claude_session::ClaudeCorrelatingTurnMcpInvoker {
+                    inner,
+                    native_items: claude_items.clone(),
+                    coordinator: coordinator.clone(),
+                    bound_grant: bound.clone(),
+                },
+            ),
+            _ => Arc::new(CorrelatingTurnMcpInvoker {
+                inner,
+                native_items: native_items.clone(),
+                opencode_binding: (kind == CLIAgentRuntimeKind::OpenCode)
+                    .then(|| (coordinator.clone(), bound.clone())),
+                codex_binding: (kind == CLIAgentRuntimeKind::Codex).then(|| {
+                    CodexMcpCorrelationBinding {
+                        coordinator: coordinator.clone(),
+                        bound_grant: bound.clone(),
+                    }
+                }),
+            }),
+        };
+        let facade = CliMcpToolFacade::try_new(
+            coordinator.clone(),
+            invoker,
+            projection,
+            Arc::new(CliMcpNoopProgressSink),
+            crate::cli_runtime::mcp::limits::CliMcpFacadeLimits::default(),
+            match kind {
+                CLIAgentRuntimeKind::Codex => CliMcpCallContract::Codex,
+                CLIAgentRuntimeKind::Claude => CliMcpCallContract::Claude,
+                CLIAgentRuntimeKind::OpenCode => CliMcpCallContract::OpenCode,
+            },
+        )
+        .unwrap();
+        let mut context = CliMcpFacadeRequestContext {
+            bound_grant: bound,
+            projection_generation: reservation.generation,
+            activation_generation: None,
+        };
+        let initialized = facade.handle_message(&context, json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}})).await.unwrap();
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        facade
+            .handle_message(
+                &context,
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            )
+            .await;
+        let listed = facade
+            .handle_message(
+                &context,
+                json!({"jsonrpc":"2.0","id":"list","method":"tools/list"}),
+            )
+            .await
+            .unwrap();
+        assert!(listed.get("error").is_none(), "{listed}");
+        let active = coordinator
+            .reserve_turn(
+                &context.bound_grant.grant_ref(),
+                context.projection_generation,
+                &binding.thread_id,
+                turn,
+            )
+            .await
+            .unwrap();
+        let native_thread = binding.native_thread_id;
+        let native_turn = binding.native_turn_id.unwrap();
+        coordinator
+            .activate_turn(
+                &context.bound_grant,
+                active.activation_generation,
+                native_thread.clone(),
+                native_turn.clone(),
+            )
+            .await
+            .unwrap();
+        context.activation_generation = Some(active.activation_generation);
+        Self {
+            facade,
+            context,
+            native_items,
+            claude_items,
+            kind,
+            native_thread,
+            native_turn,
+        }
+    }
+
+    async fn call(&self, rpc: &str, item: &str, name: &str, arguments: JsonValue) -> JsonValue {
+        let fingerprint =
+            crate::cli_runtime::codex_mcp::canonical_value_fingerprint(&arguments).unwrap();
+        let item_id = match self.kind {
+            CLIAgentRuntimeKind::Claude => format!("toolu_{item}"),
+            CLIAgentRuntimeKind::OpenCode => format!("assistant:tool:{item}"),
+            CLIAgentRuntimeKind::Codex => item.to_owned(),
+        };
+        if self.kind == CLIAgentRuntimeKind::Claude {
+            self.claude_items
+                .register(
+                    &crate::cli_runtime::claude_mcp::ClaudeNativeMcpItemBinding {
+                        native_thread_id: self.native_thread.clone(),
+                        native_turn_id: self.native_turn.clone(),
+                        native_item_id: item_id,
+                        canonical_callable_name: name.to_owned(),
+                        arguments_fingerprint: fingerprint,
+                        metadata: pioneer_protocol::ToolMetadata::empty(),
+                    },
+                )
+                .unwrap();
+        } else {
+            self.native_items
+                .register(
+                    crate::cli_runtime::mcp::native_correlation::NativeMcpItemBinding {
+                        native_thread_id: self.native_thread.clone(),
+                        native_turn_id: self.native_turn.clone(),
+                        native_item_id: item_id,
+                        canonical_callable_name: name.to_owned(),
+                        arguments_fingerprint: fingerprint,
+                    },
+                )
+                .unwrap();
+        }
+        let (wire, meta) = match self.kind {
+            CLIAgentRuntimeKind::Codex => (
+                arguments,
+                json!({"callId":item,"threadId":self.native_thread,"x-codex-turn-metadata":{"thread_id":self.native_thread,"turn_id":self.native_turn}}),
+            ),
+            CLIAgentRuntimeKind::Claude => (
+                arguments,
+                json!({"claudecode/toolUseId":format!("toolu_{item}")}),
+            ),
+            CLIAgentRuntimeKind::OpenCode => (
+                json!({"__pioneer_mcp":{"sessionID":self.native_thread,"messageID":"assistant","id":item},"arguments":arguments}),
+                json!({"ai.opencode/sessionID":self.native_thread}),
+            ),
+        };
+        let response = self.facade.handle_message(&self.context, json!({"jsonrpc":"2.0","id":rpc,"method":"tools/call","params":{"name":name,"arguments":wire,"_meta":meta}})).await.unwrap();
+        assert!(response.get("error").is_none(), "{name}: {response}");
+        assert_ne!(response["result"]["isError"], true, "{name}: {response}");
+        response["result"]["structuredContent"].clone()
+    }
+}
+
+#[test]
+fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_providers() {
+    run_standard_stack_message_test("Threads CLI integration", async {
+        for kind in [
+            CLIAgentRuntimeKind::Codex,
+            CLIAgentRuntimeKind::Claude,
+            CLIAgentRuntimeKind::OpenCode,
+        ] {
+            let (harness, processor, turn) =
+                start_threads_cli_fixture(kind, &["threads_search"]).await;
+            let bindings = processor
+                .crud_store
+                .list_turn_mcp_bindings(&turn)
+                .await
+                .unwrap();
+            assert_eq!(
+                bindings
+                    .iter()
+                    .filter(|tool| tool.raw_tool_name == "threads_start_options")
+                    .count(),
+                1
+            );
+            assert!(
+                !bindings
+                    .iter()
+                    .any(|tool| tool.raw_tool_name == "threads_search")
+            );
+            for tool in bindings.iter().filter(|tool| {
+                pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&tool.raw_tool_name.as_str())
+            }) {
+                let expected = if kind == CLIAgentRuntimeKind::OpenCode {
+                    format!("pioneer_{}", tool.raw_tool_name)
+                } else {
+                    format!("mcp__pioneer__{}", tool.raw_tool_name)
+                };
+                assert_eq!(tool.provider_callable_name, expected);
+                assert!(
+                    crate::turn_mcp::native_tools::current_identity(&harness.workspace_id, tool)
+                        .is_ok()
+                );
+            }
+            let facade = ThreadsFacade::new(&processor, &turn, kind).await;
+            let options = facade
+                .call("options", "options", "threads_start_options", json!({}))
+                .await;
+            let creation = options["threadCreationOptions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|option| option["label"] == "Current collaboration")
+                .unwrap()["id"]
+                .clone();
+            let create_args = json!({"optionId":creation});
+            let created = facade
+                .call("create", "create", "thread_create", create_args.clone())
+                .await;
+            assert_eq!(created["status"], "accepted");
+            let replay = ThreadsFacade::new(&processor, &turn, kind)
+                .await
+                .call("create-reconnected", "create", "thread_create", create_args)
+                .await;
+            assert_eq!(replay["receiptId"], created["receiptId"]);
+            let target = created["targetOptions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|option| {
+                    !options["targetOptions"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|old| old["id"] == option["id"])
+                })
+                .unwrap()["id"]
+                .clone();
+            let send_args = json!({"targetOptionId":target,"input":[{"type":"text","text":"Facade message without model execution"}]});
+            let sent = facade
+                .call("send", "send", "thread_message_send", send_args.clone())
+                .await;
+            let replay = ThreadsFacade::new(&processor, &turn, kind)
+                .await
+                .call("send-reconnected", "send", "thread_message_send", send_args)
+                .await;
+            assert_eq!(sent["receiptId"], replay["receiptId"]);
+            let listed = facade
+                .call("read", "read", "threads_list", json!({"limit":100}))
+                .await;
+            let children = listed["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|thread| {
+                    thread["parentThreadId"] == format!("cli_threads_{kind:?}").to_lowercase()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                children.len(),
+                1,
+                "replayed creation must not add another thread"
+            );
+            let child = children[0]["threadId"].clone();
+            let history = facade
+                .call(
+                    "history",
+                    "history",
+                    "threads_history_read",
+                    json!({"threadId":child,"limit":100}),
+                )
+                .await;
+            assert_eq!(
+                history
+                    .to_string()
+                    .matches("Facade message without model execution")
+                    .count(),
+                1
+            );
+            let identity = options["identities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|identity| identity["sourceKind"] == "cli_runtime_instance")
+                .unwrap()["id"]
+                .clone();
+            let models = facade
+                .call(
+                    "models",
+                    "models",
+                    "threads_identity_models_list",
+                    json!({"identityId":identity}),
+                )
+                .await;
+            let executor = models["executors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|executor| {
+                    executor["providerId"] == format!("cli_runtime:{}", harness.runtime_id)
+                })
+                .unwrap();
+            let model = executor["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["id"] == "threads-cli-choice")
+                .unwrap();
+            let effort = model["reasoning"]["effort_options"].as_array().unwrap()[0].clone();
+            let args = json!({"targetOptionId":target,"input":[{"type":"text","text":"Report findings in this conversation"}],"launch":{"identity":{"kind":"exact","id":identity},"profile":{"kind":"model","providerId":executor["providerId"],"modelId":model["id"]},"reasoning":{"effort":effort}}});
+            let started = facade
+                .call("start", "start", "threads_turn_start", args.clone())
+                .await;
+            let replay = ThreadsFacade::new(&processor, &turn, kind)
+                .await
+                .call("start-reconnected", "start", "threads_turn_start", args)
+                .await;
+            assert_eq!(started["receiptId"], replay["receiptId"]);
+            let native_start_item = match kind {
+                CLIAgentRuntimeKind::Codex => "start".to_owned(),
+                CLIAgentRuntimeKind::Claude => "toolu_start".to_owned(),
+                CLIAgentRuntimeKind::OpenCode => "assistant:tool:start".to_owned(),
+            };
+            let logical_call = crate::turn_mcp::native_tools::cli_task_call_id(
+                &turn,
+                "threads_turn_start",
+                &native_start_item,
+                &json!({}),
+            );
+            let action = crate::authorization::action_id_for_call(&logical_call);
+            let outbox = pioneer_crud::load_agent_action_outbox(
+                &processor.crud_store.database_connection(),
+                action.as_str(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let payload: JsonValue = serde_json::from_str(&outbox.payload_json).unwrap();
+            let params: pioneer_protocol::TurnStartParams =
+                serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+            assert_eq!(params.model.as_deref(), model["id"].as_str());
+            assert_eq!(
+                params.model_provider.as_deref(),
+                executor["providerId"].as_str()
+            );
+            assert_eq!(
+                params.reasoning.as_ref().unwrap().effort,
+                effort.as_str().unwrap()
+            );
+            assert_eq!(payload["dispatch"]["identity"]["id"], identity);
+            // One replayed start has one persisted child execution and payload.
+            assert_eq!(replay["outcome"], "agent_action_already_committed");
+            let denied = facade.facade.handle_message(&facade.context, json!({"jsonrpc":"2.0","id":"denied","method":"tools/call","params":{"name":"threads_search","arguments":{"query":"test","limit":1}}})).await.unwrap();
+            assert_eq!(denied["error"]["data"]["kind"], "tool_unbound");
+        }
+        let (_harness, processor, turn) =
+            start_threads_cli_fixture(CLIAgentRuntimeKind::Codex, &["threads_start_options"]).await;
+        let bindings = processor
+            .crud_store
+            .list_turn_mcp_bindings(&turn)
+            .await
+            .unwrap();
+        assert!(
+            !bindings
+                .iter()
+                .any(|tool| tool.raw_tool_name == "threads_start_options")
+        );
+        assert!(
+            bindings
+                .iter()
+                .any(|tool| tool.raw_tool_name == "threads_list")
+        );
+        let facade = ThreadsFacade::new(&processor, &turn, CLIAgentRuntimeKind::Codex).await;
+        let denied = facade.facade.handle_message(&facade.context, json!({"jsonrpc":"2.0","id":"denied-options","method":"tools/call","params":{"name":"threads_start_options","arguments":{}}})).await.unwrap();
+        assert_eq!(denied["error"]["data"]["kind"], "tool_unbound");
     });
 }

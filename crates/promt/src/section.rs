@@ -179,6 +179,7 @@ pub enum PromptSectionId {
     HtmlPolicy,
     SubagentsPolicy,
     TasksPolicy,
+    ThreadsPolicy,
     PioneerCliRuntimeInstructions,
     PioneerCliRuntimeContext,
     AgentsMd,
@@ -211,6 +212,7 @@ impl PromptSectionId {
             Self::TaskOrchestrationPolicy => "task_orchestration_policy",
             Self::SubagentsPolicy => "subagents_policy",
             Self::TasksPolicy => "tasks_policy",
+            Self::ThreadsPolicy => "threads_policy",
             Self::PioneerCliRuntimeInstructions => "pioneer_cli_runtime_instructions",
             Self::PioneerCliRuntimeContext => "pioneer_cli_runtime_context",
             Self::AgentsMd => "agents_md",
@@ -245,6 +247,7 @@ impl PromptSectionId {
                 | "task_orchestration_policy"
                 | "subagents_policy"
                 | "tasks_policy"
+                | "threads_policy"
                 | "pioneer_cli_runtime_instructions"
                 | "pioneer_cli_runtime_context"
                 | "agents_md"

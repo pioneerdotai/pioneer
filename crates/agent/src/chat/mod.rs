@@ -2299,6 +2299,60 @@ fn preflight_active_recall_prompt_context_input(
     )
 }
 
+fn native_threads_policy_available(
+    skills: &skills::TurnSkillResolution,
+    delivered_skills_prompt: Option<&str>,
+    tool_index: &PreflightToolIndex,
+    visible_tools: &[String],
+    permission_profile: &TurnPermissionProfileSnapshot,
+) -> bool {
+    let policy = &permission_profile.effective_policy;
+    let permitted = |name: &str| {
+        !policy
+            .denied_tools
+            .iter()
+            .any(|value| value.trim().eq_ignore_ascii_case(name))
+            && (!(policy.allowed_tools_restricted || !policy.allowed_tools.is_empty())
+                || policy
+                    .allowed_tools
+                    .iter()
+                    .any(|value| value.trim().eq_ignore_ascii_case(name)))
+    };
+    let visible = |name: &str| visible_tools.iter().any(|value| value == name) && permitted(name);
+    if !visible("read_skill") {
+        return false;
+    }
+    let has_operations = tool_index.candidate_tools.iter().any(|tool| {
+        tool.name != "threads_start_options"
+            && pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&tool.name.as_str())
+            && permitted(&tool.name)
+            && (visible(&tool.name) || visible("request_tools"))
+    });
+    has_operations
+        && skills.result.active.iter().any(|skill| {
+            matches!(
+                skill.definition.identity.source_kind,
+                pioneer_skills::SkillSourceKind::System
+            ) && skill.definition.identity.owner.as_deref() == Some("pioneer")
+                && skill.definition.identity.slug == "threads"
+                && skill.definition.is_available()
+                && skill.definition.policy_hints.catalog_hidden
+                && skills
+                    .runtime_plan
+                    .read_skill_index
+                    .contains_key(&format!("skill:{}", skill.skill_id))
+                && delivered_skills_prompt.is_some_and(|prompt| {
+                    prompt
+                        .split_once("[Internal Skill References]\n")
+                        .is_some_and(|(_, references)| {
+                            references.lines().any(|line| {
+                                line == format!("- pioneer/threads: `skill:{}`", skill.skill_id)
+                            })
+                        })
+                })
+        })
+}
+
 fn compile_agent_instruction_delivery_plan_with_prompt_root(
     prompt_root: &std::path::Path,
     skills_prompt: Option<String>,
@@ -2306,6 +2360,7 @@ fn compile_agent_instruction_delivery_plan_with_prompt_root(
     runtime_sections: &[PromptRuntimeSectionInput],
     permission_profile: &TurnPermissionProfileSnapshot,
     include_task_orchestration_policy: bool,
+    include_threads_policy: bool,
     include_html_policy: bool,
     include_request_tools_catalog: bool,
     continue_generation_hint: bool,
@@ -2336,6 +2391,7 @@ fn compile_agent_instruction_delivery_plan_with_prompt_root(
         retry_instruction,
         include_tool_recovery_policy: true,
         include_task_orchestration_policy,
+        include_threads_policy: include_threads_policy && include_request_tools_catalog,
         include_html_policy,
         skills_prompt,
         continue_generation_hint,
@@ -4014,6 +4070,7 @@ async fn execute_agent_provider_response(
             prompt_runtime_sections.as_slice(),
             &permission_profile,
             include_task_orchestration_policy,
+            false,
             include_html_policy,
             false,
             continue_generation_hint,
@@ -4357,6 +4414,14 @@ async fn execute_agent_provider_response(
         ));
     }
 
+    let include_threads_policy = native_threads_policy_available(
+        &skills_resolution,
+        skills_prompt.as_deref(),
+        &router.preflight_tool_index(),
+        &initial_visibility.visible_tools,
+        &permission_profile,
+    );
+
     emit_turn_skills_resolved_event(
         event_tx.as_ref(),
         thread_id,
@@ -4445,6 +4510,7 @@ async fn execute_agent_provider_response(
         prompt_runtime_sections.as_slice(),
         &permission_profile,
         include_task_orchestration_policy,
+        include_threads_policy,
         include_html_policy,
         true,
         continue_generation_hint,
@@ -4823,6 +4889,7 @@ async fn execute_agent_provider_response(
                         prompt_runtime_sections.as_slice(),
                         &permission_profile,
                         include_task_orchestration_policy,
+                        include_threads_policy,
                         include_html_policy,
                         round_plan.tools_enabled,
                         continue_generation_hint,
@@ -4918,6 +4985,7 @@ async fn execute_agent_provider_response(
                     no_tool_runtime_sections.as_slice(),
                     &permission_profile,
                     include_task_orchestration_policy,
+                    false,
                     include_html_policy,
                     false,
                     continue_generation_hint,
@@ -5273,6 +5341,7 @@ async fn execute_agent_provider_response(
                             prompt_runtime_sections.as_slice(),
                             &permission_profile,
                             include_task_orchestration_policy,
+                            include_threads_policy,
                             include_html_policy,
                             false,
                             continue_generation_hint,
@@ -6646,6 +6715,7 @@ async fn execute_agent_provider_response(
                     prompt_runtime_sections.as_slice(),
                     &permission_profile,
                     include_task_orchestration_policy,
+                    include_threads_policy,
                     include_html_policy,
                     next_round_tools_enabled,
                     continue_generation_hint,
@@ -9842,6 +9912,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             Some("thread_test"),
             "thread_test",
             "turn_test",
@@ -9890,6 +9961,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             Some("thread_agents_md"),
             "thread_agents_md",
             "turn_agents_md",
@@ -9921,6 +9993,7 @@ mod tests {
             None,
             &[],
             &profile,
+            false,
             false,
             false,
             true,
@@ -9971,6 +10044,7 @@ mod tests {
             None,
             &[],
             &pioneer_protocol::default_turn_permission_profile_snapshot(),
+            false,
             false,
             false,
             true,
@@ -10026,6 +10100,7 @@ mod tests {
             None,
             &[],
             &pioneer_protocol::default_turn_permission_profile_snapshot(),
+            false,
             false,
             false,
             false,

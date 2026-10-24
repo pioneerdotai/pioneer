@@ -31,6 +31,12 @@ slug = "runtime-diagnostics"
 resource_path = "pioneer/runtime-diagnostics"
 
 [[skills]]
+skill_id = "Th7kE4qP9mNs2vX6aR8cZ"
+owner = "pioneer"
+slug = "threads"
+resource_path = "pioneer/threads"
+
+[[skills]]
 skill_id = "HtmL6PrEvIeWsPiOnEeR1"
 owner = "pioneer"
 slug = "html"
