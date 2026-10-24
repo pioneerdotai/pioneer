@@ -8194,6 +8194,9 @@ mod tests {
 
     #[tokio::test]
     async fn large_search_page_is_retained_before_a_readable_reference_is_published() {
+        use super::{AgentDurableEvent, AgentEventHub, ToolResultView, retained_search_page_message};
+        use std::sync::Arc;
+
         let hub = Arc::new(AgentEventHub::new());
         let mut receiver = hub.take_durable_receiver().await.unwrap();
         let page = serde_json::json!({"threads":[{"threadId":"source-thread", "title":"full title",
