@@ -3519,12 +3519,19 @@ impl ToolHandler for AgentActionToolHandler {
                     .load_turn_execution_authorization_context(&self.context.turn_id)
                     .await
                     .map_err(|_| ToolError::execution_failed("agent_execution_stale"))?;
-                processor.execution_leases.revalidate_context(
-                    processor.crud_store.as_ref(), &authority,
-                    crate::authorization::ResourceAction::ThreadRead,
-                    processor.current_authorization_revision().await
-                        .map_err(|_| ToolError::execution_failed("agent_execution_stale"))?,
-                ).await.map_err(|_| ToolError::execution_failed("agent_action_not_allowed"))?;
+                processor
+                    .execution_leases
+                    .revalidate_context(
+                        processor.crud_store.as_ref(),
+                        &authority,
+                        crate::authorization::ResourceAction::ThreadRead,
+                        processor
+                            .current_authorization_revision()
+                            .await
+                            .map_err(|_| ToolError::execution_failed("agent_execution_stale"))?,
+                    )
+                    .await
+                    .map_err(|_| ToolError::execution_failed("agent_action_not_allowed"))?;
                 let mut catalog_identity = projection.clone();
                 catalog_identity.display_name = identity.display_name.clone();
                 let catalog_source_id = if projection.source_kind
@@ -3542,8 +3549,13 @@ impl ToolHandler for AgentActionToolHandler {
                             } => Some(runtime_instance_id.clone()),
                             _ => None,
                         })
-                } else { None };
-                if catalog_source_id.is_some() { catalog_identity.source_kind = pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance; }
+                } else {
+                    None
+                };
+                if catalog_source_id.is_some() {
+                    catalog_identity.source_kind =
+                        pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance;
+                }
                 let mut executors = identity_models_catalog(
                     &processor,
                     &self.context.workspace_id,
@@ -3753,7 +3765,13 @@ impl ToolHandler for AgentActionToolHandler {
                     receipt_id: Some(receipt.id),
                     outbox_id: Some(outbox.id),
                     public_message: None,
-                    target_options: if replay_kind == pioneer_protocol::AgentActionKind::CreateThread { options.target_options.clone() } else { Vec::new() },
+                    target_options: if replay_kind
+                        == pioneer_protocol::AgentActionKind::CreateThread
+                    {
+                        options.target_options.clone()
+                    } else {
+                        Vec::new()
+                    },
                 };
                 let payload = serde_json::to_value(&safe).map_err(|error| {
                     ToolError::internal(format!("failed to encode replay result: {error}"))
