@@ -3967,7 +3967,8 @@ async fn start_threads_cli_fixture(
             ),
         )
         .await
-        .expect("Threads fixture principal author should resolve"),
+        .expect("Threads fixture principal author should resolve")
+        .expect("Threads fixture principal should have an author snapshot"),
         completion: Arc::new(std::sync::Mutex::new(Some(sender))),
     };
     let (_, diagnostics) =
