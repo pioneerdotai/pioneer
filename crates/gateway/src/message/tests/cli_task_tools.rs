@@ -3960,16 +3960,14 @@ async fn start_threads_cli_fixture(
         execution_security_snapshot: security,
         continuation_thread_id: thread.clone(),
         context_thread_id: thread.clone(),
-        agent_author: pioneer_protocol::TurnAuthorSnapshot {
-            actor: pioneer_protocol::PersistedActorRef::Principal(
+        agent_author: super::super::message_turn::resolve_turn_author_snapshot(
+            processor.crud_store.as_ref(),
+            &pioneer_protocol::PersistedActorRef::Principal(
                 connection.principal().principal_id.clone(),
             ),
-            display_name: "Threads fixture".to_owned(),
-            nickname: "threads-fixture".to_owned(),
-            avatar_revision: None,
-            cli_runtime_kind: Some(kind),
-            agent: None,
-        },
+        )
+        .await
+        .expect("Threads fixture principal author should resolve"),
         completion: Arc::new(std::sync::Mutex::new(Some(sender))),
     };
     let (_, diagnostics) =
