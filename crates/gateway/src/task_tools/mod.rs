@@ -1797,17 +1797,18 @@ impl TaskToolHandler {
             requested_launch.profile,
             AgentToolProfileChoice::InheritParent
         );
-        let requested_launch = crate::message::agent_action_tools::resolve_tool_launch(
-            self.processor.as_ref(),
-            &pioneer_agent::TurnToolContext {
-                workspace_id: self.context.workspace_id.clone(),
-                thread_id: self.context.thread_id.clone(),
-                turn_id: self.context.turn_id.clone(),
-            },
-            requested_launch,
-            &invocation.call_id,
-        )
-        .await?;
+        let (requested_launch, selected_profile) =
+            crate::message::agent_action_tools::resolve_tool_launch(
+                self.processor.as_ref(),
+                &pioneer_agent::TurnToolContext {
+                    workspace_id: self.context.workspace_id.clone(),
+                    thread_id: self.context.thread_id.clone(),
+                    turn_id: self.context.turn_id.clone(),
+                },
+                requested_launch,
+                &invocation.call_id,
+            )
+            .await?;
         let server_launch = requested_launch.clone().into_server_selection();
         let mut params = self.create_params(input, authorization).await?;
         let agent_binding = self
@@ -1858,6 +1859,7 @@ impl TaskToolHandler {
             ))
         })?;
         let mut adapter = binding.adapter.lock().await;
+        let launch_options = adapter.install_selected_launch_profiles(vec![selected_profile]);
         let mut server_required_actions = Vec::new();
         if nested_task {
             server_required_actions.push(crate::authorization::ResourceAction::ChildTaskCreate);
@@ -1946,7 +1948,7 @@ impl TaskToolHandler {
                 invocation.call_id.as_str(),
                 tool,
                 arguments,
-                Some(&binding.options),
+                Some(&launch_options),
             )
             .map_err(crate::message::agent_action_tools::adapter_tool_error)?
             .ok_or_else(task_tool_authorization_error)?;

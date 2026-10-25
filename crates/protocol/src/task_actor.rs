@@ -158,22 +158,12 @@ impl TaskDerivedChildLaunchGrant {
         child_launch_grant
             .validate()
             .map_err(|_| TaskActorContractError::InvalidResolvedLaunchGrant)?;
-        if !child_launch_grant
-            .identities
-            .iter()
-            .any(|candidate| candidate == identity)
-            || !child_launch_grant
-                .profiles
-                .iter()
-                .any(|candidate| candidate == profile)
-            || (identity.source_kind != crate::AgentIdentitySourceKind::Ephemeral
-                && !profile
-                    .compatible_agent_identity_ids
-                    .iter()
-                    .any(|candidate| candidate == &identity.id))
-        {
-            return Err(TaskActorContractError::ResolvedLaunchGrantMismatch);
-        }
+        crate::validate_selected_agent_launch_profile(
+            identity,
+            profile,
+            &child_launch_grant.identities,
+        )
+        .map_err(|_| TaskActorContractError::ResolvedLaunchGrantMismatch)?;
         let mut unique_actions = allowed_actions.clone();
         unique_actions.sort();
         unique_actions.dedup();
@@ -252,11 +242,11 @@ impl TaskDerivedChildLaunchGrant {
                         crate::TurnPermissionProfileSource::TaskPermissionCap,
                     ) == selected
                 });
-        let reasoning_selection_allowed =
-            launch.execution.reasoning.as_ref().is_none_or(|selection| {
-                child_launch_grant.max_reasoning.allowed.contains(selection)
-                    && profile.allowed_reasoning.contains(selection)
-            });
+        let reasoning_selection_allowed = launch
+            .execution
+            .reasoning
+            .as_ref()
+            .is_none_or(|selection| profile.allowed_reasoning.contains(selection));
         if !identity_selection_allowed
             || !profile_selection_allowed
             || !permission_selection_allowed

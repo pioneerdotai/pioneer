@@ -223,6 +223,7 @@ impl SessionManager {
         Self::default()
     }
 
+    #[cfg(test)]
     pub async fn register_connection(
         &self,
         sender: mpsc::Sender<Message>,

@@ -80,9 +80,18 @@ fn cli_explicit_model_and_reasoning_reach_native_launch_and_survive_mcp_replay()
         let (harness, processor, parent) = start_task_cli_fixture_with_models(
             CLIAgentRuntimeKind::Codex,
             pioneer_tasks::TaskRuntimeConfig::default(),
-            &["catalog-cli-choice"],
+            &[],
         )
         .await;
+        // Readiness can expose another allowed model after parent admission.
+        processor
+            .mark_cli_reasoning_model_ready_for_tests(
+                &harness.workspace_id,
+                &harness.runtime_id,
+                "catalog-cli-choice",
+            )
+            .await
+            .unwrap();
         let options = invoke_task(
             &processor,
             &parent,
@@ -149,6 +158,11 @@ fn cli_explicit_model_and_reasoning_reach_native_launch_and_survive_mcp_replay()
             .await
             .unwrap()
             .unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(actor.derived_child_launch_grant_json.as_deref().unwrap())
+                .unwrap();
+        assert!(saved["child_launch_grant"].get("profiles").is_none());
+        assert_eq!(saved["profile"]["modelId"], "catalog-cli-choice");
         assert_eq!(
             actor.resolved_identity_id.as_deref(),
             Some(identity.id.as_str())

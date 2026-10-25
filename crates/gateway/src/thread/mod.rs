@@ -713,16 +713,6 @@ impl ThreadManager {
             .map(|entry| entry.thread.sidebar_visibility)
     }
 
-    /// Inspect loaded execution metadata without cloning its timeline/preview.
-    /// An unknown thread stays eligible for conservative tree invalidation.
-    pub(crate) async fn is_loaded_hidden_task_thread(&self, thread_id: &str) -> bool {
-        let state = self.state.read().await;
-        state.threads.get(thread_id).is_some_and(|entry| {
-            entry.thread.origin_kind == ThreadOriginKind::TaskRun
-                && entry.thread.sidebar_visibility == ThreadSidebarVisibility::Hidden
-        })
-    }
-
     pub async fn thread_get(&self, thread_id: &str) -> Option<Thread> {
         let state = self.state.read().await;
         state
@@ -2006,31 +1996,6 @@ mod tests {
             outcome.response.thread.workspace_id,
             "ws_000000000000000001"
         );
-    }
-
-    #[tokio::test]
-    async fn hidden_execution_hint_filter_requires_loaded_task_origin_and_hidden_visibility() {
-        let manager = ThreadManager::new("o4-mini", "openai");
-        let id = "hint-filter";
-        manager
-            .thread_start(10, "workspace".into(), start_params(id))
-            .await
-            .unwrap();
-        assert!(!manager.is_loaded_hidden_task_thread(id).await);
-        assert!(!manager.is_loaded_hidden_task_thread("unknown").await);
-        {
-            let mut state = manager.state.write().await;
-            let entry = state.threads.get_mut(id).unwrap();
-            entry.thread.origin_kind = ThreadOriginKind::TaskRun;
-            entry.thread.sidebar_visibility = ThreadSidebarVisibility::Hidden;
-        }
-        assert!(manager.is_loaded_hidden_task_thread(id).await);
-        {
-            let mut state = manager.state.write().await;
-            state.threads.get_mut(id).unwrap().thread.sidebar_visibility =
-                ThreadSidebarVisibility::Visible;
-        }
-        assert!(!manager.is_loaded_hidden_task_thread(id).await);
     }
 
     #[tokio::test]

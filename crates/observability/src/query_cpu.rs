@@ -755,8 +755,11 @@ where
 
 #[derive(Clone, Copy)]
 enum ClockError {
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     Api,
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     Invalid,
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     Unsupported,
 }
 fn read_clock(coverage: &mut Coverage) -> Option<u64> {
@@ -765,8 +768,11 @@ fn read_clock(coverage: &mut Coverage) -> Option<u64> {
         Ok(cpu) => Some(cpu),
         Err(error) => {
             match error {
+                #[cfg(any(target_os = "macos", target_os = "linux", windows))]
                 ClockError::Api => coverage.clock_api_errors += 1,
+                #[cfg(any(target_os = "macos", target_os = "linux", windows))]
                 ClockError::Invalid => coverage.clock_invalid_or_overflow += 1,
+                #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
                 ClockError::Unsupported => coverage.unsupported_platform += 1,
             }
             None
