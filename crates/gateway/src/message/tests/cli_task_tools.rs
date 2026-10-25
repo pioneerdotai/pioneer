@@ -3955,6 +3955,32 @@ async fn start_threads_cli_fixture(
     let (sender, receiver) = tokio::sync::oneshot::channel();
     // Durable authority must use the committed-agent response and activation
     // path; a fresh TurnStart response is rejected before native preparation.
+    // Threads-only catalogs do not include task_create, whose normal launch
+    // path persists this snapshot before binding the root Agent execution.
+    processor
+        .crud_store
+        .upsert_turn_runtime_snapshot(
+            crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
+                &thread,
+                &harness.workspace_id,
+                &turn,
+                pioneer_protocol::ThreadMode::Agent,
+                &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+                &source.model,
+                &source.model_provider,
+                None,
+                &HashMap::new(),
+                &params.input,
+                &params.capabilities,
+                &[],
+                &HashMap::new(),
+                &[],
+                &[],
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("Threads fixture runtime snapshot should persist");
     let response = crate::message::turn_handlers::TurnStartSuccessResponse::DurableAgent {
         permission_profile: profile,
         execution_security_snapshot: security,
