@@ -18,7 +18,6 @@ use pioneer_provider::{
 };
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::time::timeout;
 
 /// Request-local UI ownership. Only resolved commentary End creates a
 /// completed-copy relation. Text previews use the existing lossy progress lane:

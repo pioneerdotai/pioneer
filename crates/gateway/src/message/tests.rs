@@ -4026,6 +4026,27 @@ impl Provider for DelayedProvider {
         }
     }
 
+    async fn list_models(&self) -> anyhow::Result<Vec<pioneer_protocol::ProviderModelInfo>> {
+        Ok(vec![pioneer_protocol::ProviderModelInfo {
+            id: "test-model".to_owned(),
+            name: Some("Delayed fixture model".to_owned()),
+            description: None,
+            created: None,
+            provider: "openai".to_owned(),
+            owned_by: None,
+            limits: Default::default(),
+            capabilities: pioneer_protocol::ProviderModelCapabilities {
+                tool_calling: Some(false),
+                ..Default::default()
+            },
+            transcription: None,
+            pricing: None,
+            active: Some(true),
+            family: None,
+            lifecycle_status: None,
+        }])
+    }
+
     async fn chat(&self, _request: ChatRequest) -> anyhow::Result<ChatResponse> {
         sleep(self.delay).await;
         Ok(ChatResponse {
@@ -21508,6 +21529,10 @@ async fn review_enabled_child_completion_creates_pending_candidate_without_final
         workspace_manager,
         crud_store.clone(),
     );
+    processor
+        .gateway_secrets
+        .set_workspace_provider_api_key(workspace_id.as_str(), "openai", "fixture-key")
+        .expect("fixture provider should be configured");
     processor.bind_task_bridge().await;
 
     let mut params = test_task_create_params(
@@ -35902,11 +35927,11 @@ async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissio
         r#"<task_result>{"summary":"nested work completed"}</task_result>"#,
     ));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "nested",
+        "openai",
         provider.clone(),
     ));
     let session_manager = Arc::new(SessionManager::new());
-    let thread_manager = Arc::new(ThreadManager::new("test-model", "nested"));
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     // This scenario intentionally drives three concurrent Agent Turns. A
     // pooled `sqlite::memory:` URL can open isolated per-connection databases
     // under that load, so use one unique file-backed database for the exact
@@ -35937,6 +35962,10 @@ async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissio
             crate::compaction::GatewayNativeContextController::new(Arc::downgrade(&processor)),
         )))
         .await;
+    processor
+        .gateway_secrets
+        .set_workspace_provider_api_key(workspace_id.as_str(), "openai", "fixture-key")
+        .expect("fixture provider should be configured");
     processor.bind_task_bridge().await;
 
     let root_thread_id = "thread_nested_permission_root";
@@ -35952,7 +35981,7 @@ async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissio
         .agent_spec
         .as_mut()
         .expect("root agent spec should exist")
-        .model_provider = Some("nested".to_owned());
+        .model_provider = Some("openai".to_owned());
     let root = create_task_for_test(&processor, root_params)
         .await
         .expect("root task should start");
@@ -36698,13 +36727,13 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
         destination.display().to_string(),
     ));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "direct-agent-sandbox",
+        "openai",
         provider.clone(),
     ));
     let (tx, mut rx) = mpsc::channel(256);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("test-model", "direct-agent-sandbox"));
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     session_manager
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
@@ -36719,6 +36748,10 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
         test_summary_config(),
         test_tool_loop_config(),
     ));
+    processor
+        .gateway_secrets
+        .set_workspace_provider_api_key(workspace_id.as_str(), "openai", "fixture-key")
+        .expect("fixture provider should be configured");
     processor.bind_agent_tool_bridges().await;
 
     let thread_id = "thread_direct_agent_permission";
@@ -36731,7 +36764,7 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
         thread_id,
         root_turn_id,
         "Agent",
-        "direct-agent-sandbox",
+        "openai",
     )
     .await;
 
@@ -37307,6 +37340,11 @@ async fn task_create_inherits_exact_turn_capabilities_for_attached_and_backgroun
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     )
     .await;
+    harness
+        .processor
+        .gateway_secrets
+        .set_workspace_provider_api_key(harness.workspace_id.as_str(), "openai", "fixture-key")
+        .expect("fixture provider should be configured");
     harness.processor.bind_task_bridge().await;
     harness.processor.start_task_event_listener().await;
     let skill_id = seed_test_skill_installation(
@@ -37547,7 +37585,7 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
     let (tx, mut rx) = mpsc::channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("test-model", "parent"));
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let child_title = "Idempotent delegated task";
     let task_arguments = json!({
@@ -37574,7 +37612,7 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
         "parent observed child result",
     ));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "parent",
+        "openai",
         provider.clone(),
     ));
     provider_registry
@@ -37590,6 +37628,10 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
         test_summary_config(),
         test_tool_loop_config(),
     ));
+    processor
+        .gateway_secrets
+        .set_workspace_provider_api_key(workspace_id.as_str(), "openai", "fixture-key")
+        .expect("fixture provider should be configured");
     processor.bind_agent_tool_bridges().await;
     processor
         .start_resilience_workers()
@@ -37604,7 +37646,7 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
         "thr_task_tool_idempotency",
         "turn_task_tool_idempotency",
         "Agent",
-        "parent",
+        "openai",
     )
     .await;
     let _ = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
@@ -38751,11 +38793,11 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
         let session_manager = Arc::new(SessionManager::new());
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-        let thread_manager = Arc::new(ThreadManager::new("test-model", "parent"));
+        let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
         let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
         let provider = Arc::new(GuardAwareProvider::new());
         let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-            "parent",
+            "openai",
             provider.clone(),
         ));
         provider_registry
@@ -38777,6 +38819,10 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
             test_summary_config(),
             test_tool_loop_config(),
         ));
+        processor
+            .gateway_secrets
+            .set_workspace_provider_api_key(workspace_id.as_str(), "openai", "fixture-key")
+            .expect("fixture provider should be configured");
         processor.bind_task_bridge().await;
 
         start_thread_and_turn(
@@ -38787,7 +38833,7 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
             "thr_task_guard_parent",
             "turn_task_guard_parent",
             "Agent",
-            "parent",
+            "openai",
         )
         .await;
         let mut observed_notifications = Vec::new();
@@ -39021,11 +39067,11 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
     let (tx, mut rx) = mpsc::channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("test-model", "parent"));
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let provider = Arc::new(CreateThenHangProvider::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "parent",
+        "openai",
         provider.clone(),
     ));
     let processor = Arc::new(MessageProcessor::new(
@@ -39038,6 +39084,10 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
         test_summary_config(),
         test_tool_loop_config(),
     ));
+    processor
+        .gateway_secrets
+        .set_workspace_provider_api_key(workspace_id.as_str(), "openai", "fixture-key")
+        .expect("fixture provider should be configured");
     processor.bind_task_bridge().await;
 
     let thread_id = "thr_task_anchor_progress";
@@ -39050,7 +39100,7 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
         thread_id,
         turn_id,
         "Agent",
-        "parent",
+        "openai",
     )
     .await;
 
@@ -39109,11 +39159,11 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() 
     let (tx, mut rx) = mpsc::channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("test-model", "parent"));
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let provider = Arc::new(CreateThenHangProvider::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "parent",
+        "openai",
         provider.clone(),
     ));
     provider_registry
@@ -39135,6 +39185,10 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() 
         test_summary_config(),
         test_tool_loop_config(),
     ));
+    processor
+        .gateway_secrets
+        .set_workspace_provider_api_key(workspace_id.as_str(), "openai", "fixture-key")
+        .expect("fixture provider should be configured");
     processor.bind_task_bridge().await;
 
     start_thread_and_turn(
@@ -39145,7 +39199,7 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() 
         "thr_task_cancel_parent",
         "turn_task_cancel_parent",
         "Agent",
-        "parent",
+        "openai",
     )
     .await;
 

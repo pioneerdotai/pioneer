@@ -303,6 +303,7 @@ pub(super) struct CliRuntimeModelSnapshot {
 pub(super) struct CliRuntimeProbeSnapshot {
     pub(super) summary: RuntimeSummary,
     pub(super) models: Option<CliRuntimeModelSnapshot>,
+    #[cfg(test)]
     pub(super) mcp_readiness: Option<pioneer_protocol::CliMcpAdapterReadiness>,
 }
 
@@ -392,6 +393,7 @@ impl ProviderReadinessSupervisor {
         Some(CliRuntimeProbeSnapshot {
             summary,
             models: snapshot.models.get(runtime_id).cloned(),
+            #[cfg(test)]
             mcp_readiness: snapshot.mcp_readiness.get(runtime_id).cloned(),
         })
     }
@@ -1069,6 +1071,7 @@ impl MessageProcessor {
         Ok(Some(CliRuntimeProbeSnapshot {
             summary,
             models,
+            #[cfg(test)]
             mcp_readiness: snapshot.mcp_readiness.get(runtime_id).cloned(),
         }))
     }

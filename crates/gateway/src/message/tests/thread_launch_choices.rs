@@ -5,26 +5,47 @@ use pioneer_protocol::{AgentToolLaunchSelection, AgentToolProfileChoice, TurnSta
 use pioneer_tools::{ToolEventBus, ToolInvocation, ToolPayload};
 use std::path::PathBuf;
 
-struct ChoiceModelsProvider(PromptParityCaptureProvider);
+#[derive(Clone, Default)]
+enum ChoiceCatalogResponse {
+    #[default]
+    Default,
+    Models(Vec<pioneer_protocol::ProviderModelInfo>),
+    Unavailable,
+}
+
+struct ChoiceModelsProvider {
+    name: &'static str,
+    response: Arc<std::sync::RwLock<ChoiceCatalogResponse>>,
+    inner: PromptParityCaptureProvider,
+    extra_models: Arc<std::sync::atomic::AtomicUsize>,
+    catalog_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
 #[async_trait::async_trait]
 impl Provider for ChoiceModelsProvider {
     fn name(&self) -> &str {
-        "openai"
+        self.name
     }
     fn capabilities(&self) -> ProviderCapabilities {
-        self.0.capabilities()
+        self.inner.capabilities()
     }
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        self.0.chat(request).await
+        self.inner.chat(request).await
     }
     async fn stream_chat(
         &self,
         request: ChatRequest,
     ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
-        self.0.stream_chat(request).await
+        self.inner.stream_chat(request).await
     }
     async fn list_models(&self) -> anyhow::Result<Vec<pioneer_protocol::ProviderModelInfo>> {
-        let mut models = self.0.list_models().await?;
+        self.catalog_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match self.response.read().unwrap().clone() {
+            ChoiceCatalogResponse::Default => {}
+            ChoiceCatalogResponse::Models(models) => return Ok(models),
+            ChoiceCatalogResponse::Unavailable => anyhow::bail!("fixture catalog unavailable"),
+        }
+        let mut models = self.inner.list_models().await?;
         let mut no_effort = models[0].clone();
         no_effort.id = "catalog-no-effort".into();
         no_effort.name = Some("Model without effort controls".into());
@@ -45,6 +66,12 @@ impl Provider for ChoiceModelsProvider {
         other.id = "gpt-5.4-catalog-other".into();
         other.name = Some("Another selectable model".into());
         models.push(other);
+        for index in 0..self.extra_models.load(std::sync::atomic::Ordering::SeqCst) {
+            let mut model = models[0].clone();
+            model.id = format!("gpt-5.4-later-{index}");
+            model.name = Some(format!("Later model {index}"));
+            models.push(model);
+        }
         Ok(models)
     }
 }
@@ -54,18 +81,46 @@ async fn fixture() -> (
     TurnToolContext,
     pioneer_agent::TurnToolMaterialization,
 ) {
+    fixture_with_catalog(Default::default(), Default::default()).await
+}
+
+async fn fixture_with_catalog(
+    extra_models: Arc<std::sync::atomic::AtomicUsize>,
+    catalog_calls: Arc<std::sync::atomic::AtomicUsize>,
+) -> (
+    Arc<MessageProcessor>,
+    TurnToolContext,
+    pioneer_agent::TurnToolMaterialization,
+) {
+    fixture_with_parent(extra_models, catalog_calls, Default::default(), false).await
+}
+
+async fn fixture_with_parent(
+    extra_models: Arc<std::sync::atomic::AtomicUsize>,
+    catalog_calls: Arc<std::sync::atomic::AtomicUsize>,
+    response: Arc<std::sync::RwLock<ChoiceCatalogResponse>>,
+    cli_parent: bool,
+) -> (
+    Arc<MessageProcessor>,
+    TurnToolContext,
+    pioneer_agent::TurnToolMaterialization,
+) {
     let (workspaces, store, workspace) = setup_workspace_manager().await;
     let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
-        Arc::new(ChoiceModelsProvider(
-            PromptParityCaptureProvider::with_visible_tools(vec![]),
-        )),
+        Arc::new(ChoiceModelsProvider {
+            name: "openai",
+            response,
+            inner: PromptParityCaptureProvider::with_visible_tools(vec![]),
+            extra_models,
+            catalog_calls,
+        }),
     ));
     let secrets = test_gateway_secrets();
     secrets
         .set_workspace_provider_api_key(&workspace, "openai", "fixture-secret")
         .unwrap();
-    let processor = Arc::new(MessageProcessor::new(
+    let processor = MessageProcessor::new(
         Arc::new(ThreadManager::new("composer-model", "openai")),
         registry,
         Arc::new(SessionManager::new()),
@@ -74,7 +129,12 @@ async fn fixture() -> (
         secrets,
         test_summary_config(),
         test_tool_loop_config(),
-    ));
+    );
+    let processor = Arc::new(if cli_parent {
+        with_enabled_test_cli_runtime_catalog(processor)
+    } else {
+        processor
+    });
     let context = TurnToolContext {
         workspace_id: workspace.clone(),
         thread_id: "choices-root".into(),
@@ -87,27 +147,40 @@ async fn fixture() -> (
         &context.turn_id,
     )
     .await;
-    let mut authority = processor
-        .load_turn_execution_authorization_context(&context.turn_id)
-        .await
-        .unwrap();
-    authority.bind_test_provider_authority(
-        "openai",
-        "gpt-5.4",
-        processor
-            .provider_registry
-            .authority_fingerprint_for_workspace(&workspace, "openai")
-            .unwrap()
-            .as_str(),
-    );
-    processor
-        .crud_store
-        .set_turn_execution_authorization_context(
+    if cli_parent {
+        sync_test_cli_runtime_identities(&processor).await.unwrap();
+        persist_test_cli_execution_authorization_context(
+            processor.crud_store.as_ref(),
+            &workspace,
+            &context.thread_id,
             &context.turn_id,
-            &authority.to_persisted_json().unwrap(),
+            "codex",
+            "codex",
         )
-        .await
-        .unwrap();
+        .await;
+    } else {
+        let mut authority = processor
+            .load_turn_execution_authorization_context(&context.turn_id)
+            .await
+            .unwrap();
+        authority.bind_test_provider_authority(
+            "openai",
+            "gpt-5.4",
+            processor
+                .provider_registry
+                .authority_fingerprint_for_workspace(&workspace, "openai")
+                .unwrap()
+                .as_str(),
+        );
+        processor
+            .crud_store
+            .set_turn_execution_authorization_context(
+                &context.turn_id,
+                &authority.to_persisted_json().unwrap(),
+            )
+            .await
+            .unwrap();
+    }
     processor
         .crud_store
         .set_turn_execution_security_snapshot(
@@ -127,8 +200,13 @@ async fn fixture() -> (
             thread_id: context.thread_id.clone(),
             workspace_id: workspace,
             mode_json: serde_json::to_string(&ThreadMode::Agent).unwrap(),
-            model: "gpt-5.4".into(),
-            provider_name: "openai".into(),
+            model: if cli_parent { "test-model" } else { "gpt-5.4" }.into(),
+            provider_name: if cli_parent {
+                "cli_runtime:codex"
+            } else {
+                "openai"
+            }
+            .into(),
             reasoning_effort: Some("high".into()),
             agent_skill_versions_json: None,
             hook_runtime_context_json: serde_json::to_string(
@@ -146,6 +224,47 @@ async fn fixture() -> (
         })
         .await
         .unwrap();
+    if cli_parent {
+        let authority = processor
+            .load_turn_execution_authorization_context(&context.turn_id)
+            .await
+            .unwrap();
+        let mut thread = processor
+            .crud_store
+            .get_thread_model(&context.thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        thread.model = "test-model".into();
+        thread.model_provider = "cli_runtime:codex".into();
+        let backend = AgentExecutionBackend::CLIAgentRuntime {
+            runtime_id: "codex".into(),
+            runtime_kind: CLIAgentRuntimeKind::Codex,
+        };
+        let prepared = crate::message::agent_action_tools::prepare_root_agent_execution_admission(
+            &processor,
+            &context,
+            &thread,
+            &authority,
+            None,
+            None,
+            Some(&backend),
+            None,
+            Some("high"),
+        )
+        .await
+        .unwrap();
+        processor
+            .crud_store
+            .commit_agent_execution_graph(prepared.graph.clone())
+            .await
+            .unwrap();
+        crate::message::agent_action_tools::register_prepared_root_agent_action_binding(
+            &processor, &context, prepared,
+        )
+        .await
+        .unwrap();
+    }
     let tools = processor
         .materialize_agent_action_tools(context.clone())
         .await
@@ -212,7 +331,7 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
         .unwrap();
     let facts = binding.adapter.lock().await.persistence_facts();
     assert_eq!(facts.profile.model_id, "gpt-5.4");
-    let inherited = crate::message::agent_action_tools::resolve_tool_launch(
+    let (inherited, _) = crate::message::agent_action_tools::resolve_tool_launch(
         &processor,
         &context,
         AgentToolLaunchSelection::default(),
@@ -228,7 +347,7 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
     effort_only.reasoning = Some(pioneer_protocol::TurnReasoningSelection {
         effort: "low".into(),
     });
-    let effort_only = crate::message::agent_action_tools::resolve_tool_launch(
+    let (effort_only, _) = crate::message::agent_action_tools::resolve_tool_launch(
         &processor,
         &context,
         effort_only,
@@ -403,6 +522,648 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
     assert_eq!(explicit.reasoning.unwrap().effort, "high");
 }
 
+async fn api_choice_models(ids: &[&str]) -> Vec<pioneer_protocol::ProviderModelInfo> {
+    let template = PromptParityCaptureProvider::with_visible_tools(vec![])
+        .list_models()
+        .await
+        .unwrap()
+        .remove(0);
+    ids.iter()
+        .map(|id| {
+            let mut model = template.clone();
+            model.id = (*id).to_owned();
+            model
+        })
+        .collect()
+}
+
+async fn delegated_launch_target(
+    tools: &pioneer_agent::TurnToolMaterialization,
+    options: &pioneer_protocol::AgentToolOptionsProjection,
+) -> pioneer_protocol::AgentToolTargetOption {
+    let creation = options
+        .thread_creation_options
+        .iter()
+        .find(|option| option.label == "New delegated root")
+        .unwrap();
+    let created = call(
+        tools,
+        "thread_create",
+        "review-target",
+        json!({"optionId":creation.id}),
+    )
+    .await;
+    let targets: Vec<pioneer_protocol::AgentToolTargetOption> =
+        serde_json::from_value(created["targetOptions"].clone()).unwrap();
+    targets
+        .into_iter()
+        .find(|target| !options.target_options.iter().any(|old| old.id == target.id))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn cli_parent_selects_only_unambiguous_api_choices_for_threads_and_tasks() {
+    use pioneer_agent::TaskToolProvider;
+    for (model_selected, model_ids, second_provider, allowed) in [
+        (true, vec!["gpt-5.4", "gpt-5.4-other"], false, true),
+        (false, vec!["gpt-5.4"], false, true),
+        (true, vec!["gpt-5.4"], true, false),
+        (false, vec!["gpt-5.4", "gpt-5.4-other"], false, false),
+    ] {
+        let response = Arc::new(std::sync::RwLock::new(ChoiceCatalogResponse::Models(
+            api_choice_models(&model_ids).await,
+        )));
+        let (processor, context, tools) = fixture_with_parent(
+            Default::default(),
+            Default::default(),
+            response.clone(),
+            true,
+        )
+        .await;
+        if second_provider {
+            processor
+                .gateway_secrets
+                .set_workspace_provider_api_key(
+                    &context.workspace_id,
+                    "anthropic",
+                    "fixture-secret",
+                )
+                .unwrap();
+            processor
+                .provider_registry
+                .insert(
+                    "anthropic",
+                    Arc::new(ChoiceModelsProvider {
+                        name: "anthropic",
+                        response: response.clone(),
+                        inner: PromptParityCaptureProvider::with_visible_tools(vec![]),
+                        extra_models: Default::default(),
+                        catalog_calls: Default::default(),
+                    }),
+                )
+                .unwrap();
+        }
+        let binding = processor
+            .agent_action_binding(&context.turn_id)
+            .await
+            .unwrap();
+        assert!(matches!(
+            binding
+                .adapter
+                .lock()
+                .await
+                .persistence_facts()
+                .profile
+                .backend,
+            pioneer_protocol::AgentExecutionProfileBackend::CliRuntime { .. }
+        ));
+        let target = delegated_launch_target(&tools, &binding.options).await;
+        let mut launch = json!({"identity":{"kind":"default_pioneer"},"useDefaultReasoning":true});
+        if model_selected {
+            launch["profile"] = json!({"kind":"model","modelId":"gpt-5.4"});
+        }
+        let started = invoke_with_mutation(&tools, "threads_turn_start", "cli-to-api", json!({
+            "targetOptionId":target.id, "input":[{"type":"text","text":"Select an API executor"}], "launch":launch,
+        }), None).await;
+        let task_tools =
+            crate::task_tools::GatewayTaskToolProvider::new(Arc::downgrade(&processor))
+                .materialize_task_tools(pioneer_agent::TaskTurnContext {
+                    workspace_id: context.workspace_id.clone(),
+                    thread_id: context.thread_id.clone(),
+                    turn_id: context.turn_id.clone(),
+                })
+                .await
+                .unwrap();
+        let task_tools = pioneer_agent::TurnToolMaterialization {
+            bundles: task_tools.bundles,
+            ..Default::default()
+        };
+        let task = invoke_with_mutation(&task_tools, "task_create", "cli-to-api-task", json!({
+            "title":"API identity", "goal":"Keep the selected API configuration", "launch":launch,
+        }), None).await;
+        let database = processor.crud_store.database_connection();
+        if allowed {
+            started.unwrap();
+            let outbox = pioneer_crud::load_agent_action_outbox(
+                &database,
+                crate::authorization::action_id_for_call("cli-to-api").as_str(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&outbox.payload_json).unwrap();
+            let params: TurnStartParams =
+                serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+            assert_eq!(params.model_provider.as_deref(), Some("openai"));
+            assert_eq!(params.model.as_deref(), Some("gpt-5.4"));
+            assert!(matches!(
+                params.execution_backend,
+                Some(AgentExecutionBackend::ApiProvider { .. })
+            ));
+            let task = task.unwrap();
+            let actor = processor
+                .crud_store
+                .get_task_actor_contract(task["taskId"].as_str().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            actor.validate().unwrap();
+            let pioneer_protocol::TaskDerivedChildLaunchGrant::ResolvedTaskLaunch {
+                identity,
+                profile,
+                ..
+            } = serde_json::from_str(actor.derived_child_launch_grant_json.as_deref().unwrap())
+                .unwrap();
+            assert_eq!(
+                identity.source_kind,
+                pioneer_protocol::AgentIdentitySourceKind::NativeAgent
+            );
+            assert_eq!(profile.provider_id, "openai");
+            assert_eq!(profile.model_id, "gpt-5.4");
+            assert_eq!(
+                profile.backend,
+                pioneer_protocol::AgentExecutionProfileBackend::ApiProvider
+            );
+        } else {
+            assert!(matches!(
+                started,
+                Err(pioneer_tools::ToolError::InvalidArguments(_))
+            ));
+            assert!(matches!(
+                task,
+                Err(pioneer_tools::ToolError::InvalidArguments(_))
+            ));
+            for id in ["cli-to-api", "cli-to-api-task"] {
+                assert!(
+                    pioneer_crud::load_agent_action_outbox(
+                        &database,
+                        crate::authorization::action_id_for_call(id).as_str()
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn inherited_reasoning_replay_uses_committed_choice_when_catalog_changes() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for unavailable in [false, true] {
+        let response = Arc::new(std::sync::RwLock::new(ChoiceCatalogResponse::Default));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (processor, context, tools) =
+            fixture_with_parent(Default::default(), calls.clone(), response.clone(), false).await;
+        let binding = processor
+            .agent_action_binding(&context.turn_id)
+            .await
+            .unwrap();
+        let parent = binding.adapter.lock().await.persistence_facts();
+        assert_eq!(
+            parent.profile.allowed_reasoning,
+            vec![pioneer_protocol::TurnReasoningSelection {
+                effort: "high".into()
+            }]
+        );
+        let target = delegated_launch_target(&tools, &binding.options).await;
+        let request = json!({"targetOptionId":target.id,"input":[{"type":"text","text":"Inherited model, changed effort"}],
+            "launch":{"reasoning":{"effort":"low"},"permissionProfile":{"mode":"full_access"}}});
+        call(
+            &tools,
+            "threads_turn_start",
+            "inherit-reasoning",
+            request.clone(),
+        )
+        .await;
+        let database = processor.crud_store.database_connection();
+        let action_id = crate::authorization::action_id_for_call("inherit-reasoning");
+        let before = pioneer_crud::load_agent_action_outbox(&database, action_id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&before.payload_json).unwrap();
+        let params: TurnStartParams =
+            serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+        assert_eq!(params.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(params.reasoning.as_ref().unwrap().effort, "low");
+        let child_id = payload["spawned_execution_id"].as_str().unwrap();
+        let grant = pioneer_crud::load_agent_execution_grant(&database, child_id)
+            .await
+            .unwrap()
+            .unwrap();
+        // Remove the selected model. OpenAI's documented effort options are
+        // supplemented by the reasoning registry, so discovery cannot remove low.
+        let changed_models = api_choice_models(&["gpt-5.4-catalog-other"]).await;
+        *response.write().unwrap() = if unavailable {
+            ChoiceCatalogResponse::Unavailable
+        } else {
+            ChoiceCatalogResponse::Models(changed_models)
+        };
+        let before_replay = calls.load(Ordering::SeqCst);
+        let replay = call(
+            &tools,
+            "threads_turn_start",
+            "inherit-reasoning",
+            request.clone(),
+        )
+        .await;
+        assert_eq!(replay["outcome"], "agent_action_already_committed");
+        for change_reasoning in [false, true] {
+            let mut changed_request = request.clone();
+            if change_reasoning {
+                changed_request["launch"]["reasoning"]["effort"] = json!("high");
+            } else {
+                changed_request["input"][0]["text"] = json!("Different content");
+            }
+            assert!(
+                invoke_with_mutation(
+                    &tools,
+                    "threads_turn_start",
+                    "inherit-reasoning",
+                    changed_request,
+                    None
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            before_replay,
+            "replay must not rediscover model or reasoning"
+        );
+        assert_eq!(
+            pioneer_crud::load_agent_action_outbox(&database, action_id.as_str())
+                .await
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            pioneer_crud::load_agent_execution_grant(&database, child_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            grant
+        );
+        assert!(
+            invoke_with_mutation(
+                &tools,
+                "threads_turn_start",
+                "new-inherit-reasoning",
+                request,
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) > before_replay,
+            "a new launch still checks current metadata"
+        );
+    }
+}
+
+#[tokio::test]
+async fn inherited_other_cli_replay_does_not_reselect_a_model() {
+    let (processor, context, tools) = fixture_with_parent(
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        true,
+    )
+    .await;
+    processor
+        .mark_cli_runtimes_ready_for_tests(&context.workspace_id)
+        .await
+        .unwrap();
+    processor
+        .mark_cli_reasoning_model_ready_for_tests(
+            &context.workspace_id,
+            "claude",
+            "selected-cli-model",
+        )
+        .await
+        .unwrap();
+    let binding = processor
+        .agent_action_binding(&context.turn_id)
+        .await
+        .unwrap();
+    let target = delegated_launch_target(&tools, &binding.options).await;
+    let identity = binding
+        .options
+        .identities
+        .iter()
+        .find(|id| id.nickname == "claude")
+        .unwrap();
+    let request = json!({"targetOptionId":target.id,"input":[{"type":"text","text":"Another CLI identity"}],
+        "launch":{"identity":{"kind":"exact","id":identity.id},"useDefaultReasoning":true,"permissionProfile":{"mode":"full_access"}}});
+    call(
+        &tools,
+        "threads_turn_start",
+        "inherit-other-cli",
+        request.clone(),
+    )
+    .await;
+    let database = processor.crud_store.database_connection();
+    let action_id = crate::authorization::action_id_for_call("inherit-other-cli");
+    let before = pioneer_crud::load_agent_action_outbox(&database, action_id.as_str())
+        .await
+        .unwrap()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&before.payload_json).unwrap();
+    let params: TurnStartParams =
+        serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+    assert_eq!(params.model_provider.as_deref(), Some("cli_runtime:claude"));
+    assert_eq!(params.model.as_deref(), Some("selected-cli-model"));
+    processor
+        .mark_cli_reasoning_model_ready_for_tests(
+            &context.workspace_id,
+            "claude",
+            "another-cli-model",
+        )
+        .await
+        .unwrap();
+    let replay = call(
+        &tools,
+        "threads_turn_start",
+        "inherit-other-cli",
+        request.clone(),
+    )
+    .await;
+    assert_eq!(replay["outcome"], "agent_action_already_committed");
+    assert!(
+        invoke_with_mutation(
+            &tools,
+            "threads_turn_start",
+            "ambiguous-other-cli",
+            request.clone(),
+            None
+        )
+        .await
+        .is_err()
+    );
+    // Readiness now has no models. Existing replay still needs only the exact grant.
+    processor
+        .mark_cli_runtimes_ready_for_tests(&context.workspace_id)
+        .await
+        .unwrap();
+    let replay = call(&tools, "threads_turn_start", "inherit-other-cli", request).await;
+    assert_eq!(replay["outcome"], "agent_action_already_committed");
+    assert_eq!(
+        pioneer_crud::load_agent_action_outbox(&database, action_id.as_str())
+            .await
+            .unwrap()
+            .unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn large_later_catalog_stays_out_of_task_and_execution_grants_and_replay() {
+    use pioneer_agent::TaskToolProvider;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let extra_models = Arc::new(AtomicUsize::new(4096));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let response = Arc::new(std::sync::RwLock::new(ChoiceCatalogResponse::Default));
+    let (processor, context, tools) =
+        fixture_with_parent(extra_models.clone(), calls.clone(), response.clone(), false).await;
+    let binding = processor
+        .agent_action_binding(&context.turn_id)
+        .await
+        .unwrap();
+    let facts = binding.adapter.lock().await.persistence_facts();
+    assert_eq!(facts.profile.model_id, "gpt-5.4");
+    let database = processor.crud_store.database_connection();
+    let root_grant =
+        pioneer_crud::load_agent_execution_grant(&database, facts.execution_id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "root admission must not discover model catalogs"
+    );
+    assert!(root_grant.grant_json.len() < 131_072);
+    extra_models.store(4097, Ordering::SeqCst);
+    call(&tools, "threads_start_options", "large-options", json!({})).await;
+    crate::message::agent_action_tools::resolve_tool_launch(
+        &processor,
+        &context,
+        AgentToolLaunchSelection::default(),
+        "large-inherit",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "options and exact inheritance do not discover models"
+    );
+
+    let task_tools = crate::task_tools::GatewayTaskToolProvider::new(Arc::downgrade(&processor))
+        .materialize_task_tools(pioneer_agent::TaskTurnContext {
+            workspace_id: context.workspace_id.clone(),
+            thread_id: context.thread_id.clone(),
+            turn_id: context.turn_id.clone(),
+        })
+        .await
+        .unwrap();
+    let task_tools = pioneer_agent::TurnToolMaterialization {
+        bundles: task_tools.bundles,
+        ..Default::default()
+    };
+    let launch = json!({"profile":{"kind":"model","providerId":"openai","modelId":"gpt-5.4-later-4096"},"useDefaultReasoning":true});
+    let task = call(
+        &task_tools,
+        "task_create",
+        "large-task",
+        json!({
+            "title":"Later model", "goal":"Keep this exact selection", "launch":launch,
+        }),
+    )
+    .await;
+    let actor = processor
+        .crud_store
+        .get_task_actor_contract(task["taskId"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    actor.validate().unwrap();
+    let saved_task_grant = actor.derived_child_launch_grant_json.as_deref().unwrap();
+    assert!(saved_task_grant.len() < 131_072);
+    let saved_task: serde_json::Value = serde_json::from_str(saved_task_grant).unwrap();
+    assert_eq!(saved_task["profile"]["modelId"], "gpt-5.4-later-4096");
+    assert!(saved_task["child_launch_grant"].get("profiles").is_none());
+    assert!(
+        saved_task["child_launch_grant"]
+            .get("maxReasoning")
+            .is_none()
+    );
+
+    let creation = binding
+        .options
+        .thread_creation_options
+        .iter()
+        .find(|option| option.label == "New delegated root")
+        .unwrap();
+    let created = call(
+        &tools,
+        "thread_create",
+        "large-thread",
+        json!({"optionId":creation.id}),
+    )
+    .await;
+    let targets: Vec<pioneer_protocol::AgentToolTargetOption> =
+        serde_json::from_value(created["targetOptions"].clone()).unwrap();
+    let target = targets
+        .iter()
+        .find(|target| {
+            !binding
+                .options
+                .target_options
+                .iter()
+                .any(|old| old.id == target.id)
+        })
+        .unwrap();
+    let request = json!({"targetOptionId":target.id,"input":[{"type":"text","text":"Pinned child"}],"launch":launch});
+    call(&tools, "threads_turn_start", "large-child", request.clone()).await;
+    let action_id = crate::authorization::action_id_for_call("large-child");
+    let before = pioneer_crud::load_agent_action_outbox(&database, action_id.as_str())
+        .await
+        .unwrap()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&before.payload_json).unwrap();
+    let params: TurnStartParams =
+        serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+    assert_eq!(params.model.as_deref(), Some("gpt-5.4-later-4096"));
+    let child_grant = pioneer_crud::load_agent_execution_grant(
+        &database,
+        payload["spawned_execution_id"].as_str().unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(child_grant.grant_json.len() < 131_072);
+    let child: serde_json::Value = serde_json::from_str(&child_grant.grant_json).unwrap();
+    assert!(child["child_launch_grant"].get("profiles").is_none());
+    assert_eq!(child["profile"]["modelId"], "gpt-5.4-later-4096");
+
+    extra_models.store(0, Ordering::SeqCst);
+    let calls_before_replay = calls.load(Ordering::SeqCst);
+    for unavailable in [false, true] {
+        *response.write().unwrap() = if unavailable {
+            ChoiceCatalogResponse::Unavailable
+        } else {
+            ChoiceCatalogResponse::Default
+        };
+        let replay = call(&tools, "threads_turn_start", "large-child", request.clone()).await;
+        assert_eq!(replay["outcome"], "agent_action_already_committed");
+        // All other arguments stay identical, but inheritance now means the
+        // parent's gpt-5.4 instead of the explicitly selected later model.
+        let mut inherited_request = request.clone();
+        inherited_request["launch"]["profile"] = json!({"kind":"inherit_parent"});
+        assert!(matches!(
+            invoke_with_mutation(
+                &tools,
+                "threads_turn_start",
+                "large-child",
+                inherited_request,
+                None
+            )
+            .await,
+            Err(pioneer_tools::ToolError::InvalidArguments(_))
+        ));
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        calls_before_replay,
+        "replay uses its saved exact profile"
+    );
+    assert_eq!(
+        pioneer_crud::load_agent_action_outbox(&database, action_id.as_str())
+            .await
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        pioneer_crud::load_agent_execution_grant(
+            &database,
+            payload["spawned_execution_id"].as_str().unwrap()
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        child_grant
+    );
+    assert_eq!(
+        pioneer_crud::load_agent_execution_grant(&database, facts.execution_id.as_str())
+            .await
+            .unwrap()
+            .unwrap(),
+        root_grant
+    );
+    assert_eq!(
+        processor
+            .crud_store
+            .get_task_actor_contract(task["taskId"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap(),
+        actor
+    );
+    *response.write().unwrap() = ChoiceCatalogResponse::Default;
+    let unavailable: AgentToolLaunchSelection = serde_json::from_value(launch).unwrap();
+    assert!(
+        crate::message::agent_action_tools::resolve_tool_launch(
+            &processor,
+            &context,
+            unavailable,
+            "new-after-removal"
+        )
+        .await
+        .is_err()
+    );
+    let principal = crate::auth::AuthenticatedSessionPrincipal {
+        gateway_id: pioneer_protocol::GatewayId::new("G".repeat(21)).unwrap(),
+        principal_id: pioneer_protocol::PrincipalId::new("P".repeat(21)).unwrap(),
+        kind: pioneer_protocol::PrincipalKind::User,
+        role_key: Some(pioneer_protocol::RoleKey::new("synthetic_executor").unwrap()),
+        device_id: pioneer_protocol::DeviceId::new("D".repeat(21)).unwrap(),
+        session_id: pioneer_protocol::AuthSessionId::new("S".repeat(21)).unwrap(),
+        access_jti: "J".repeat(21),
+        access_expires_at_unix: u64::MAX,
+    };
+    let restricted = crate::authorization::ExecutionAuthorizationContext::for_test(
+        &principal,
+        &context.workspace_id,
+        &context.thread_id,
+        &pioneer_protocol::inherited_turn_permission_profile_snapshot(
+            pioneer_protocol::TurnPermissionMode::Supervised,
+        ),
+        None,
+    );
+    let before_denial = calls.load(Ordering::SeqCst);
+    let denied = crate::message::agent_action_tools::validate_new_launch_model(
+        &processor,
+        &context,
+        &facts.profile,
+        None,
+        &restricted,
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(denied, pioneer_tools::ToolError::InvalidArguments(code) if code == "agent_execution_selection_not_allowed")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), before_denial);
+}
+
 #[tokio::test]
 async fn identity_models_catalog_exposes_model_reasoning_without_secrets_and_rejects_unavailable_models()
  {
@@ -490,10 +1251,12 @@ async fn identity_models_catalog_exposes_model_reasoning_without_secrets_and_rej
     )
     .await
     .unwrap();
-    assert!(
-        ceiling.profiles.contains(&public_profile),
-        "Task actor profile must match its immutable grant exactly"
-    );
+    pioneer_protocol::validate_selected_agent_launch_profile(
+        &public_identity,
+        &public_profile,
+        &ceiling.identities,
+    )
+    .unwrap();
     let creation = binding
         .options
         .thread_creation_options

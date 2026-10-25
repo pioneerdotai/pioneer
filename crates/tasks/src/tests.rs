@@ -572,11 +572,9 @@ fn test_agent_launch_facts() -> (
             selected_capabilities: Vec::new(),
         },
     };
-    let child_launch_grant = pioneer_protocol::ChildAgentLaunchGrantSet::new(
-        vec![identity.clone()],
-        vec![profile.clone()],
-    )
-    .expect("valid test child launch grant");
+    let child_launch_grant =
+        pioneer_protocol::ChildAgentLaunchGrantSet::new(vec![identity.clone()])
+            .expect("valid test child launch grant");
     let authorization = crate::TaskAgentAuthorizationGrantSeed {
         role_key: "tasks_test_role".to_owned(),
         policy_generation: 1,

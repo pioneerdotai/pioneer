@@ -583,7 +583,7 @@ pub(crate) async fn claim_history_check(
         .run_serialized_write(|| async {
             let tx = store.connection.begin().await?;
             let row = E::find_by_id(id).one(&tx).await?;
-            let Some(row) = row.filter(|r| {
+            let Some(_) = row.filter(|r| {
                 r.revision == revision
                     && r.next_attempt_ms <= now
                     && r.state == "pending"

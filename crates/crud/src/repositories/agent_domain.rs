@@ -19,11 +19,11 @@ use pioneer_entity::{
 };
 use pioneer_protocol::{
     AgentDelegationRouteId, AgentDelegationRouteProjection, AgentExecutionId,
-    AgentExecutionProfileId, AgentExecutionProfileProjection, AgentIdentityId,
-    AgentIdentityProjection, AgentIdentitySourceKind, AgentPresentationSnapshot, AgentRouteAction,
-    AgentRouteDisclosurePolicy, AgentRouteKind, AgentRouteStatus, AgentWorkGraphProjection,
-    AgentWorkNodeProjection, AgentWorkNodeState, PersistedActorRef, SafeRouteProvenance,
-    TaskActorContract, TaskOccurrenceContract, TaskOccurrenceStatus, Thread,
+    AgentExecutionProfileId, AgentIdentityId, AgentIdentityProjection, AgentIdentitySourceKind,
+    AgentPresentationSnapshot, AgentRouteAction, AgentRouteDisclosurePolicy, AgentRouteKind,
+    AgentRouteStatus, AgentWorkGraphProjection, AgentWorkNodeProjection, AgentWorkNodeState,
+    PersistedActorRef, SafeRouteProvenance, TaskActorContract, TaskOccurrenceContract,
+    TaskOccurrenceStatus, Thread,
 };
 #[cfg(test)]
 use sea_orm::DatabaseConnection;
@@ -2444,19 +2444,12 @@ fn agent_execution_launch_grant_matches_child_identity(
     child_identity_id: &str,
 ) -> bool {
     identity.id.as_str() == child_identity_id
-        && child_launch_grant
-            .identities
-            .iter()
-            .any(|candidate| candidate == identity)
-        && child_launch_grant
-            .profiles
-            .iter()
-            .any(|candidate| candidate == profile)
-        && (identity.source_kind == pioneer_protocol::AgentIdentitySourceKind::Ephemeral
-            || profile
-                .compatible_agent_identity_ids
-                .iter()
-                .any(|candidate| candidate == &identity.id))
+        && pioneer_protocol::validate_selected_agent_launch_profile(
+            identity,
+            profile,
+            &child_launch_grant.identities,
+        )
+        .is_ok()
 }
 
 fn parse_agent_execution_launch_grant(
@@ -4986,6 +4979,11 @@ fn compacted_agent_action_outbox_payload(
             spawned_execution_id.clone(),
         );
     }
+    // Replay must distinguish the original launch choice from its resolved
+    // profile even after the dispatch envelope has been released.
+    if let Some(fingerprint) = original.get("launch_request_fingerprint") {
+        retained.insert("launch_request_fingerprint".to_owned(), fingerprint.clone());
+    }
     Ok(agent_action_compaction_marker(
         AGENT_ACTION_OUTBOX_COMPACTION_FORMAT,
         outbox.payload_json.as_str(),
@@ -5877,21 +5875,10 @@ pub async fn commit_agent_execution_graph(
             parse_agent_execution_launch_grant(parent_grant.grant_json.as_str())?;
         let ephemeral_child =
             grant_identity.source_kind == pioneer_protocol::AgentIdentitySourceKind::Ephemeral;
-        let ephemeral_profile_is_monotonic = ephemeral_child
-            && derived_ephemeral_profile_is_no_wider(
-                &grant_profile,
-                parent_launch_grant.profiles.as_slice(),
-                &grant_identity.id,
-            );
         let identity_ceiling_is_monotonic = child_launch_grant.identities.iter().all(|candidate| {
             parent_launch_grant.identities.iter().any(|parent| {
                 pioneer_protocol::agent_identity_has_same_launch_source(candidate, parent)
             }) || (ephemeral_child && candidate == &grant_identity)
-        });
-        let profile_ceiling_is_monotonic = child_launch_grant.profiles.iter().all(|candidate| {
-            parent_launch_grant.profiles.iter().any(|parent| {
-                pioneer_protocol::agent_execution_profile_is_no_wider(candidate, parent)
-            }) || (ephemeral_profile_is_monotonic && candidate == &grant_profile)
         });
         let capability_ceiling_is_monotonic = child_launch_grant
             .skill_ids
@@ -5913,7 +5900,6 @@ pub async fn commit_agent_execution_graph(
             pioneer_protocol::TurnPermissionProfileSource::TaskPermissionCap,
         ) == child_permission;
         if !identity_ceiling_is_monotonic
-            || !profile_ceiling_is_monotonic
             || !capability_ceiling_is_monotonic
             || !permission_ceiling_is_monotonic
             || (ephemeral_child && !parent_launch_grant.allow_server_derived_ephemeral)
@@ -6332,40 +6318,6 @@ pub async fn commit_agent_execution_graph(
         },
     )
     .await
-}
-
-fn derived_ephemeral_profile_is_no_wider(
-    derived: &AgentExecutionProfileProjection,
-    parent_profiles: &[AgentExecutionProfileProjection],
-    ephemeral_identity_id: &AgentIdentityId,
-) -> bool {
-    parent_profiles.iter().any(|parent| {
-        let mut compatible_agent_identity_ids = parent.compatible_agent_identity_ids.clone();
-        if !compatible_agent_identity_ids.contains(ephemeral_identity_id) {
-            compatible_agent_identity_ids.push(ephemeral_identity_id.clone());
-            compatible_agent_identity_ids.sort();
-        }
-        let expected_fingerprint = hex::encode(Sha256::digest(
-            format!(
-                "agent-derived-profile\0{}\0{}",
-                parent.fingerprint,
-                ephemeral_identity_id.as_str()
-            )
-            .as_bytes(),
-        ));
-        derived.id == parent.id
-            && derived.compatible_agent_identity_ids == compatible_agent_identity_ids
-            && derived.backend == parent.backend
-            && derived.provider_id == parent.provider_id
-            && derived.model_id == parent.model_id
-            && derived.provider_display_name == parent.provider_display_name
-            && derived.model_display_name == parent.model_display_name
-            && derived.allowed_reasoning == parent.allowed_reasoning
-            && derived.allowed_permission_profiles == parent.allowed_permission_profiles
-            && derived.catalog_generation == parent.catalog_generation
-            && derived.policy_generation == parent.policy_generation
-            && derived.fingerprint == expected_fingerprint
-    })
 }
 
 async fn validate_agent_graph_bounds(
@@ -7460,19 +7412,12 @@ mod tests {
                 identity
             })
             .collect::<Vec<_>>();
-        let profiles = (0..300)
-            .map(|n| {
-                let mut profile = seed.profiles[0].clone();
-                profile.id =
-                    pioneer_protocol::AgentExecutionProfileId::new(format!("P{n:020}")).unwrap();
-                profile.compatible_agent_identity_ids = vec![identities[n % 140].id.clone()];
-                profile
-            })
-            .collect::<Vec<_>>();
-        let ceiling =
-            pioneer_protocol::ChildAgentLaunchGrantSet::new(identities.clone(), profiles.clone())
+        let mut profile: pioneer_protocol::AgentExecutionProfileProjection =
+            serde_json::from_value(version_one_child_launch_grant()["profiles"][0].clone())
                 .unwrap();
-        let grant_json = serde_json::json!({"identity":identities[0],"profile":profiles[0],"child_launch_grant":ceiling}).to_string();
+        profile.compatible_agent_identity_ids = vec![identities[0].id.clone()];
+        let ceiling = pioneer_protocol::ChildAgentLaunchGrantSet::new(identities.clone()).unwrap();
+        let grant_json = serde_json::json!({"identity":identities[0],"profile":profile,"child_launch_grant":ceiling}).to_string();
         let model = agent_execution_grant::Model {
             id: "G00000000000000000001".into(),
             execution_id: "E00000000000000000001".into(),
@@ -8241,6 +8186,7 @@ mod tests {
             "execution_id": "execution-old",
             "kind": "start_agent",
             "spawned_execution_id": "spawned-old",
+            "launch_request_fingerprint": "a".repeat(64),
             "dispatch": {"opaque": "y".repeat(8192)},
         })
         .to_string();
@@ -8332,6 +8278,10 @@ mod tests {
                 .get("spawned_execution_id")
                 .and_then(serde_json::Value::as_str),
             Some("spawned-old")
+        );
+        assert_eq!(
+            compacted_payload["launch_request_fingerprint"],
+            "a".repeat(64)
         );
         assert_eq!(
             agent_action_outbox::Entity::find_by_id("outbox-recent")
@@ -8485,58 +8435,6 @@ mod tests {
             "send_message",
         );
         assert!(invalid_generation.is_err());
-    }
-
-    #[test]
-    fn derived_ephemeral_profile_cannot_widen_parent_runtime_or_reasoning() {
-        let parent_identity = AgentIdentityId::new("A12345678901234567890").unwrap();
-        let ephemeral_identity = AgentIdentityId::new("A02345678901234567890").unwrap();
-        let parent = AgentExecutionProfileProjection {
-            id: AgentExecutionProfileId::new("P12345678901234567890").unwrap(),
-            compatible_agent_identity_ids: vec![parent_identity],
-            backend: pioneer_protocol::AgentExecutionProfileBackend::ApiProvider,
-            provider_id: "provider".to_owned(),
-            model_id: "model".to_owned(),
-            provider_display_name: "Provider".to_owned(),
-            model_display_name: "Model".to_owned(),
-            allowed_reasoning: vec![pioneer_protocol::TurnReasoningSelection {
-                effort: "medium".to_owned(),
-            }],
-            allowed_permission_profiles: vec![pioneer_protocol::TurnPermissionMode::Supervised],
-            catalog_generation: 4,
-            policy_generation: 7,
-            fingerprint: "parent-profile-fingerprint".to_owned(),
-        };
-        let mut derived = parent.clone();
-        derived
-            .compatible_agent_identity_ids
-            .push(ephemeral_identity.clone());
-        derived.compatible_agent_identity_ids.sort();
-        derived.fingerprint = hex::encode(Sha256::digest(
-            format!(
-                "agent-derived-profile\0{}\0{}",
-                parent.fingerprint,
-                ephemeral_identity.as_str()
-            )
-            .as_bytes(),
-        ));
-        assert!(derived_ephemeral_profile_is_no_wider(
-            &derived,
-            std::slice::from_ref(&parent),
-            &ephemeral_identity,
-        ));
-
-        let mut widened = derived;
-        widened
-            .allowed_reasoning
-            .push(pioneer_protocol::TurnReasoningSelection {
-                effort: "high".to_owned(),
-            });
-        assert!(!derived_ephemeral_profile_is_no_wider(
-            &widened,
-            std::slice::from_ref(&parent),
-            &ephemeral_identity,
-        ));
     }
 }
 

@@ -85,6 +85,7 @@ pub(crate) struct VoiceSpeechSegment {
     pub(crate) samples: Vec<f32>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum VoiceVadSegmentationOutcome {
     NoSpeech {
@@ -97,6 +98,7 @@ pub(crate) enum VoiceVadSegmentationOutcome {
     },
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VoiceNoSpeechReason {
     TooShort,
@@ -127,6 +129,7 @@ where
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn segment_samples(
         &mut self,
         samples: &[f32],

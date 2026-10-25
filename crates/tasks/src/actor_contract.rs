@@ -341,23 +341,19 @@ mod tests {
                 policy_generation: 1,
                 allowed_actions: vec!["thread.read".to_owned()],
                 fingerprint: "a".repeat(64),
-                child_launch_grant: pioneer_protocol::ChildAgentLaunchGrantSet::new(
-                    vec![
-                        pioneer_protocol::AgentIdentityProjection::new(
-                            pioneer_protocol::AgentIdentityId::new("A12345678901234567890")
-                                .unwrap(),
-                            pioneer_protocol::AgentIdentitySourceKind::NativeAgent,
-                            "Agent",
-                            "agent",
-                            None,
-                            None,
-                            1,
-                            "source",
-                        )
-                        .unwrap(),
-                    ],
-                    Vec::new(),
-                )
+                child_launch_grant: pioneer_protocol::ChildAgentLaunchGrantSet::new(vec![
+                    pioneer_protocol::AgentIdentityProjection::new(
+                        pioneer_protocol::AgentIdentityId::new("A12345678901234567890").unwrap(),
+                        pioneer_protocol::AgentIdentitySourceKind::NativeAgent,
+                        "Agent",
+                        "agent",
+                        None,
+                        None,
+                        1,
+                        "source",
+                    )
+                    .unwrap(),
+                ])
                 .unwrap(),
             }),
             ..Default::default()

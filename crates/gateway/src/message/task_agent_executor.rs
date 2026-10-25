@@ -208,7 +208,6 @@ async fn task_child_launch_grant(
     // presentation/revision is captured with this execution; catalog additions
     // and current defaults never enter the grant.
     let mut identities = child_launch_grant.identities.clone();
-    let mut profiles = child_launch_grant.profiles.clone();
     if facts.identity.source_kind == AgentIdentitySourceKind::Ephemeral
         && matches!(
             facts.profile.backend,
@@ -243,15 +242,13 @@ async fn task_child_launch_grant(
         bail!("Task execution exceeds its saved child launch ceiling");
     }
     *selected = facts.identity.clone();
-    let selected_profile = profiles
-        .iter_mut()
-        .find(|profile| {
-            profile.id == facts.profile.id
-                && pioneer_protocol::agent_execution_profile_is_no_wider(&facts.profile, profile)
-        })
-        .context("Task execution profile is outside its saved child launch ceiling")?;
-    *selected_profile = facts.profile.clone();
-    pioneer_protocol::ChildAgentLaunchGrantSet::new(identities, profiles)
+    pioneer_protocol::validate_selected_agent_launch_profile(
+        &facts.identity,
+        &facts.profile,
+        &identities,
+    )
+    .map_err(|error| anyhow!("Task selected profile is invalid: {error:?}"))?;
+    pioneer_protocol::ChildAgentLaunchGrantSet::new(identities)
         .and_then(|grant| {
             grant.with_policy(
                 child_launch_grant.allow_inherit_parent_identity,
@@ -5486,6 +5483,14 @@ impl TaskAgentExecutor {
                     .await?
                     .context("reviewer Task has no saved actor contract")?;
                 let saved_ceiling = task_saved_child_launch_grant(&actor_contract)?;
+                super::agent_action_tools::prepare_named_reviewer_launch(
+                    &mut catalog_binding,
+                    processor,
+                    candidate.turn_id.as_str(),
+                    nickname,
+                    &saved_ceiling,
+                )
+                .await?;
                 let (identity, profile) = catalog_binding
                     .adapter
                     .lock()
