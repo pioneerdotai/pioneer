@@ -103,6 +103,21 @@ fn build_tasks_policy_section(cli: bool) -> PromptSection {
     }
 }
 
+fn build_threads_policy_section(cli: bool) -> PromptSection {
+    PromptSection {
+        id: PromptSectionId::ThreadsPolicy,
+        stability: PromptStability::Dynamic,
+        title: content::SECTION_TITLE_THREADS_POLICY.to_owned(),
+        content: if cli {
+            content::CLI_THREADS_POLICY_PROMPT
+        } else {
+            content::THREADS_POLICY_PROMPT
+        }
+        .to_owned(),
+        sources: Vec::new(),
+    }
+}
+
 fn format_file_block(file: &BudgetedBootstrapFile, include_evolution_note: bool) -> String {
     let mut block = content::IDENTITY_FILE_BLOCK_TEMPLATE
         .replace(content::IDENTITY_FILE_BLOCK_NAME_TOKEN, file.name.as_str())
@@ -647,6 +662,12 @@ pub fn compile_prompt(input: PromptCompileInput) -> anyhow::Result<CompiledPromp
         ));
     }
 
+    if input.include_threads_policy {
+        sections.push(build_threads_policy_section(
+            profile == PromptProfile::CliRuntime,
+        ));
+    }
+
     sections.extend(build_runtime_dynamic_sections(&input, &mut diagnostics));
 
     if profile == PromptProfile::AssistantNone {
@@ -776,6 +797,7 @@ mod tests {
             retry_instruction: Some("retry with corrected arguments".to_owned()),
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: true,
             runtime_sections: Vec::new(),
@@ -803,6 +825,7 @@ mod tests {
             retry_instruction: Some("retry".to_owned()),
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: true,
             runtime_sections: Vec::new(),
@@ -831,6 +854,7 @@ mod tests {
             retry_instruction: Some("retry".to_owned()),
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: true,
             runtime_sections: Vec::new(),
@@ -902,6 +926,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: false,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections,
@@ -947,6 +972,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: true,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
@@ -1019,6 +1045,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
@@ -1086,6 +1113,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: vec![memory_recall_runtime_section(
@@ -1128,6 +1156,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: vec![agents_md_runtime_section(
@@ -1177,6 +1206,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: vec![agents_md_runtime_section("   ", Some(20_000))],
@@ -1206,6 +1236,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: vec![agents_md_runtime_section(content.as_str(), Some(25_000))],
@@ -1248,6 +1279,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: vec![
@@ -1313,6 +1345,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
@@ -1358,6 +1391,7 @@ mod tests {
             retry_instruction: Some("retry".to_owned()),
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: true,
             runtime_sections: vec![memory_recall_runtime_section("memory recall content")],
@@ -1412,6 +1446,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
@@ -1429,6 +1464,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
@@ -1465,6 +1501,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
@@ -1495,6 +1532,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
@@ -1522,6 +1560,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
@@ -1567,6 +1606,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
@@ -1612,6 +1652,7 @@ mod tests {
                 retry_instruction: None,
                 include_tool_recovery_policy: true,
                 include_task_orchestration_policy: false,
+                include_threads_policy: false,
                 include_html_policy: false,
                 continue_generation_hint: false,
                 runtime_sections: Vec::new(),
@@ -1660,6 +1701,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
@@ -1677,6 +1719,7 @@ mod tests {
             retry_instruction: Some("retry with corrected args".to_owned()),
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: true,
             runtime_sections: Vec::new(),
@@ -1709,6 +1752,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
@@ -1768,6 +1812,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
@@ -1804,6 +1849,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
@@ -1842,6 +1888,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
@@ -1870,6 +1917,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
@@ -1912,6 +1960,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),
@@ -1952,6 +2001,7 @@ mod tests {
             retry_instruction: None,
             include_tool_recovery_policy: true,
             include_task_orchestration_policy: false,
+            include_threads_policy: false,
             include_html_policy: false,
             continue_generation_hint: false,
             runtime_sections: Vec::new(),

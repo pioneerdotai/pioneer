@@ -196,6 +196,14 @@ pub(crate) fn is_task_operation(tool: &ResolvedMcpTurnTool) -> bool {
         && tool.raw_tool_name != "threads_start_options"
 }
 
+/// Domain membership is independent of the frozen transport family. The shared
+/// options tool alone is not evidence of available Threads operations.
+pub(crate) fn is_threads_operation(tool: &ResolvedMcpTurnTool) -> bool {
+    exact_definition(tool).is_some()
+        && tool.raw_tool_name != "threads_start_options"
+        && pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&tool.raw_tool_name.as_str())
+}
+
 pub(crate) fn projection_allowance(
     tools: &[ResolvedMcpTurnTool],
     mut limits: McpProjectionLimits,

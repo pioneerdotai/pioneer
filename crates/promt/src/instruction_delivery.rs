@@ -211,6 +211,7 @@ fn cli_instruction_policy(id: &PromptSectionId) -> InstructionPolicy {
         | PromptSectionId::SubagentsPolicy
         | PromptSectionId::HtmlPolicy
         | PromptSectionId::TasksPolicy
+        | PromptSectionId::ThreadsPolicy
         | PromptSectionId::PioneerCliRuntimeInstructions => {
             provider_instructions(InstructionScope::Thread, InstructionTrust::Pioneer)
         }

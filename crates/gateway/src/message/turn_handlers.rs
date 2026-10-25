@@ -3927,6 +3927,22 @@ impl MessageProcessor {
             })
         {
             let thread_reader = family.is_thread_reader(&spec.spec.name);
+            if pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&spec.spec.name.as_str())
+                && (permission
+                    .effective_policy
+                    .denied_tools
+                    .iter()
+                    .any(|name| name.trim().eq_ignore_ascii_case(&spec.spec.name))
+                    || ((permission.effective_policy.allowed_tools_restricted
+                        || !permission.effective_policy.allowed_tools.is_empty())
+                        && !permission
+                            .effective_policy
+                            .allowed_tools
+                            .iter()
+                            .any(|name| name.trim().eq_ignore_ascii_case(&spec.spec.name))))
+            {
+                continue;
+            }
             // Thread actions and model options require explicit tool selection.
             // Readers use their separate ThreadRead grant. CLI catalogs freeze
             // at admission; request_tools cannot extend them afterwards.
@@ -4085,6 +4101,7 @@ impl MessageProcessor {
             plan.skill_install_plans
                 .retain(|plan| !omitted.contains(&plan.skill_id));
         }
+        crate::cli_runtime::skills::reconcile_implicit_threads_skill(plan);
         Ok(())
     }
 
@@ -4241,8 +4258,18 @@ impl MessageProcessor {
                         tool.server_installation_id == pioneer_tools::html::HTML_SERVER_ID
                     })
                 });
+            let include_threads = combined_preflight_input
+                .mcp_projection
+                .as_ref()
+                .is_some_and(|projection| {
+                    projection
+                        .tools
+                        .iter()
+                        .any(crate::turn_mcp::native_tools::is_threads_operation)
+                });
             let (skill_install_plans, resolved_skill_bindings) = if attachments.is_empty()
                 && !include_task_orchestration
+                && !include_threads
                 && !include_html
             {
                 (Vec::new(), Vec::new())
@@ -4255,6 +4282,7 @@ impl MessageProcessor {
                         attachments,
                         &projected_mcp_availability,
                         include_task_orchestration,
+                        include_threads,
                         include_html,
                     ),
                 )
