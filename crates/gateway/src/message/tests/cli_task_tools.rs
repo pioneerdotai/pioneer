@@ -3967,7 +3967,7 @@ async fn start_threads_cli_fixture(
                 pioneer_protocol::ThreadMode::Agent,
                 &pioneer_agent::AgentTurnHookRuntimeContext::default(),
                 &source.model,
-                &source.model_provider,
+                &cli_runtime_provider_key(&harness.runtime_id),
                 None,
                 &HashMap::new(),
                 &params.input,
