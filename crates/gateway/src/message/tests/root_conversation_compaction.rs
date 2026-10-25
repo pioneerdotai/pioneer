@@ -220,7 +220,10 @@ async fn published_human_answer_prepares_root_once_and_next_cli_and_native_reuse
         "warm-root",
         "warm-root-answer",
         at,
-        &"covered-root-raw-work ".repeat(80_000),
+        // Keep the history over budget without making checkpoint reuse depend
+        // on processing megabytes through incremental fragment tokenization.
+        // Spaces bound tokenizer pieces; the marker still detects raw replay.
+        &format!("covered-root-raw-work {}", "🧪 ".repeat(60_000)),
     )
     .await;
     let due = harness
