@@ -4297,8 +4297,14 @@ impl ThreadsFacade {
                 json!({"ai.opencode/sessionID":self.native_thread}),
             ),
         };
-        let response = self.facade.handle_message(&self.context, json!({"jsonrpc":"2.0","id":rpc,"method":"tools/call","params":{"name":name,"arguments":wire,"_meta":meta}})).await.unwrap();
-        assert!(response.get("error").is_none(), "{name}: {response}");
+        let (response, diagnostics) = crate::public_error::test_support::capture_events_async(
+            self.facade.handle_message(&self.context, json!({"jsonrpc":"2.0","id":rpc,"method":"tools/call","params":{"name":name,"arguments":wire,"_meta":meta}})),
+        ).await;
+        let response = response.unwrap();
+        assert!(
+            response.get("error").is_none(),
+            "{name}: {response}; diagnostics: {diagnostics:#?}"
+        );
         assert_ne!(response["result"]["isError"], true, "{name}: {response}");
         response["result"]["structuredContent"].clone()
     }
