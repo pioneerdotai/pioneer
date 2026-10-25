@@ -601,7 +601,10 @@ async fn identity_models_catalog(
                 return Ok(executors);
             }
             for definition in pioneer_provider::provider_definitions() {
-                if !authority.child_launch_executor_allowed(definition.name, false)
+                // The built-in local adapter only provides embeddings and
+                // transcription, so it cannot be a chat launch candidate.
+                if definition.name == "local"
+                    || !authority.child_launch_executor_allowed(definition.name, false)
                     || !processor.member_provider_is_configured(workspace_id, definition.name)
                 {
                     continue;
