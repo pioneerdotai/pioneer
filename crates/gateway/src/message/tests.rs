@@ -25403,7 +25403,10 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         history_thread,
         history_turn,
         history_at,
-        &"published background root work ".repeat(80_000),
+        // Exceed the context budget with dense tokens, rather than megabytes
+        // of low-density text that require many incremental fragment fits.
+        // The spaces keep tokenizer pieces bounded as well.
+        &"🧪 ".repeat(60_000),
     )
     .await;
     let pending = crud_store

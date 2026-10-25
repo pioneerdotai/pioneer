@@ -7077,7 +7077,7 @@ async fn load_task_execution_conversation_scope(
     AgentTurnHookRuntimeContext,
     Vec<pioneer_provider::ChatMessage>,
 )> {
-    scope_current_stage(Stage::TaskHistory, async {
+    let (hook_context, mut history) = scope_current_stage(Stage::TaskHistory, async {
         let expected_hook_context = task_hook_runtime_context(task, parent, task_run_turn_kind);
         // The Task transition itself retains its narrow Critical writes. History
         // preparation may register legacy metadata, so give that entire operation
@@ -7272,7 +7272,21 @@ async fn load_task_execution_conversation_scope(
         .await?;
         Ok((expected_hook_context, history))
     })
-    .await
+    .await?;
+    // Accepted history may have been captured in the parent context. Express
+    // its roles relative to this execution before freezing runtime history,
+    // across initial capture, accepted-snapshot restore and retries. Explicit
+    // OWN imports already name this execution as their context owner.
+    for message in &mut history {
+        if let Some(origin) = &mut message.provenance {
+            origin.inherited |= origin
+                .context_thread
+                .as_deref()
+                .unwrap_or(&origin.thread_id)
+                != execution_thread_id;
+        }
+    }
+    Ok((hook_context, history))
 }
 
 #[allow(clippy::too_many_arguments)]
