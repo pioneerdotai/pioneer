@@ -753,13 +753,9 @@ async fn inherited_reasoning_replay_uses_committed_choice_when_catalog_changes()
             .await
             .unwrap()
             .unwrap();
-        let mut changed_models = api_choice_models(&["gpt-5.4"]).await;
-        changed_models[0]
-            .capabilities
-            .reasoning
-            .as_mut()
-            .unwrap()
-            .effort_options = vec!["high".into()];
+        // Remove the selected model. OpenAI's documented effort options are
+        // supplemented by the reasoning registry, so discovery cannot remove low.
+        let changed_models = api_choice_models(&["gpt-5.4-catalog-other"]).await;
         *response.write().unwrap() = if unavailable {
             ChoiceCatalogResponse::Unavailable
         } else {
