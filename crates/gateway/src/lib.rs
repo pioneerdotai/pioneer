@@ -814,6 +814,7 @@ async fn run_gateway_until_shutdown_inner(
             command_execution_timeout: config.gateway.resilience.command_execution,
             provider_stream_item_timeout: config.gateway.resilience.provider_stream_items,
             context_compaction_timeout: context_compaction_timeout_config,
+            context_compaction: config.gateway.context_compaction,
             cli_runtime_command_heartbeat: config.gateway.cli_agent_runtime.command_heartbeat,
         },
     )

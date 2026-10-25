@@ -7077,12 +7077,25 @@ async fn load_task_execution_conversation_scope(
     AgentTurnHookRuntimeContext,
     Vec<pioneer_provider::ChatMessage>,
 )> {
-    scope_current_stage(Stage::TaskHistory, async {
+    let (hook_context, mut history) = scope_current_stage(Stage::TaskHistory, async {
         let expected_hook_context = task_hook_runtime_context(task, parent, task_run_turn_kind);
         // The Task transition itself retains its narrow Critical writes. History
         // preparation may register legacy metadata, so give that entire operation
         // the normal class of its caller rather than inheriting Critical writes.
         let history_store = ordinary_history_store(processor.crud_store.as_ref());
+        // A Composer snapshot is the next user's root history consumer. Share
+        // priority with root preparation before accepting that immutable input.
+        let history_cancellation = tokio_util::sync::CancellationToken::new();
+        let _conversation_lease = processor
+            .acquire_composer_history_priority(
+                &history_store,
+                &task.workspace_id,
+                execution_thread_id,
+                execution_turn_id,
+                &history_cancellation,
+            )
+            .await?;
+
         if let Some(snapshot) = processor
             .crud_store
             .get_turn_runtime_snapshot(execution_turn_id)
@@ -7259,7 +7272,21 @@ async fn load_task_execution_conversation_scope(
         .await?;
         Ok((expected_hook_context, history))
     })
-    .await
+    .await?;
+    // Accepted history may have been captured in the parent context. Express
+    // its roles relative to this execution before freezing runtime history,
+    // across initial capture, accepted-snapshot restore and retries. Explicit
+    // OWN imports already name this execution as their context owner.
+    for message in &mut history {
+        if let Some(origin) = &mut message.provenance {
+            origin.inherited |= origin
+                .context_thread
+                .as_deref()
+                .unwrap_or(&origin.thread_id)
+                != execution_thread_id;
+        }
+    }
+    Ok((hook_context, history))
 }
 
 #[allow(clippy::too_many_arguments)]

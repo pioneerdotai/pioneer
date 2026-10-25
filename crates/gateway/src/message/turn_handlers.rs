@@ -9720,6 +9720,9 @@ impl MessageProcessor {
                 result = &mut cancelled => Err(result.err().unwrap_or_else(|| anyhow::anyhow!("CLI history monitor ended unexpectedly"))),
                 _ = &mut deadline => anyhow::bail!("CLI history preparation exceeded the turn deadline"),
                 prepared = async {
+                    let _conversation_lease = self.acquire_composer_history_priority(
+                        &history_store, workspace_id, thread_id, active_turn_id, &self.cli_history_shutdown,
+                    ).await?;
                     let mut prepared = self.capture_running_context_basis_prepared(
                         &history_store, workspace_id, thread_id, active_turn_id, Some(active_turn_id),
                     ).await?;
@@ -9858,6 +9861,7 @@ impl MessageProcessor {
                     std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     Some(accepted),
                     cli_cwd,
+                    None,
                     &mut diagnostic,
                 );
                 tokio::pin!(work);

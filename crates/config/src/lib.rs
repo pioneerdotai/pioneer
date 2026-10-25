@@ -76,6 +76,8 @@ pub struct GatewayConfig {
     pub artifacts: GatewayArtifactsConfig,
     #[serde(default)]
     pub resilience: GatewayResilienceConfig,
+    #[serde(default)]
+    pub context_compaction: GatewayContextCompactionConfig,
     pub auth: GatewayAuthConfig,
 }
 
@@ -325,6 +327,53 @@ impl Default for GatewayArtifactsConfig {
             view_grants_per_session: default_gateway_artifacts_view_grants_per_session(),
             view_grant_streams: default_gateway_artifacts_view_grant_streams(),
         }
+    }
+}
+
+/// Activity window for optional preparation of the main conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct GatewayContextCompactionConfig {
+    pub hot_conversation_window_secs: u64,
+}
+
+impl Default for GatewayContextCompactionConfig {
+    fn default() -> Self {
+        Self {
+            hot_conversation_window_secs: 28_800,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for GatewayContextCompactionConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(default)]
+        struct Wire {
+            hot_conversation_window_secs: u64,
+        }
+        impl Default for Wire {
+            fn default() -> Self {
+                Self {
+                    hot_conversation_window_secs: GatewayContextCompactionConfig::default()
+                        .hot_conversation_window_secs,
+                }
+            }
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        // Keep conversion to the durable signed millisecond clock bounded.
+        if wire.hot_conversation_window_secs == 0
+            || wire.hot_conversation_window_secs > i64::MAX as u64 / 1_000
+        {
+            return Err(serde::de::Error::custom(
+                "hot_conversation_window_secs must be positive and fit signed milliseconds",
+            ));
+        }
+        Ok(Self {
+            hot_conversation_window_secs: wire.hot_conversation_window_secs,
+        })
     }
 }
 
@@ -4072,6 +4121,72 @@ hard_secs = 0
         assert_eq!(config.provider_stream_items.lease_secs, 960);
         assert_eq!(config.provider_stream_items.idle_secs, 900);
         assert_eq!(config.provider_stream_items.hard_secs, 1_800);
+    }
+
+    // Contract: older config files retain eight hours; user layers may override
+    // it, but invalid durations cannot accidentally admit unbounded warming.
+    // Existing resilience tests exercise operation deadlines, not this layer.
+    #[test]
+    fn conversation_compaction_window_defaults_and_user_override() {
+        let config = load_config_from_sources(DEFAULT_CONFIG_TOML, Vec::new()).unwrap();
+        assert_eq!(
+            config
+                .gateway
+                .context_compaction
+                .hot_conversation_window_secs,
+            28_800
+        );
+        let mut legacy: toml::Value = toml::from_str(DEFAULT_CONFIG_TOML).unwrap();
+        legacy["gateway"]
+            .as_table_mut()
+            .unwrap()
+            .remove("context_compaction");
+        let legacy = toml::to_string(&legacy).unwrap();
+        let config = load_config_from_sources(&legacy, Vec::new()).unwrap();
+        assert_eq!(
+            config
+                .gateway
+                .context_compaction
+                .hot_conversation_window_secs,
+            28_800
+        );
+
+        let user_override = unique_temp_file_path("conversation-compaction-window");
+        write_file(
+            &user_override,
+            "[gateway.context_compaction]\nhot_conversation_window_secs = 3600\n",
+        );
+        let config = load_config_from_sources(&legacy, vec![user_override.clone()]).unwrap();
+        assert_eq!(
+            config
+                .gateway
+                .context_compaction
+                .hot_conversation_window_secs,
+            3_600
+        );
+        // The empty section is also backward compatible when the field is absent.
+        write_file(&user_override, "[gateway.context_compaction]\n");
+        let config = load_config_from_sources(&legacy, vec![user_override.clone()]).unwrap();
+        assert_eq!(
+            config
+                .gateway
+                .context_compaction
+                .hot_conversation_window_secs,
+            28_800
+        );
+        for invalid in ["0", "-1", "9223372036854776", "18446744073709551616"] {
+            write_file(
+                &user_override,
+                &format!(
+                    "[gateway.context_compaction]\nhot_conversation_window_secs = {invalid}\n"
+                ),
+            );
+            assert!(
+                load_config_from_sources(&legacy, vec![user_override.clone()]).is_err(),
+                "accepted {invalid}"
+            );
+        }
+        let _ = fs::remove_file(user_override);
     }
 
     #[test]

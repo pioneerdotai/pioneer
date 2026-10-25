@@ -76,6 +76,7 @@ pub use super::compaction_operation_projection::Entity as CompactionOperationPro
 pub use super::compaction_projection_epoch::Entity as CompactionProjectionEpoch;
 pub use super::compaction_publication_fence::Entity as CompactionPublicationFence;
 pub use super::compaction_publication_source_fence::Entity as CompactionPublicationSourceFence;
+pub use super::compaction_root_activity::Entity as CompactionRootActivity;
 pub use super::compaction_runner_plan::Entity as CompactionRunnerPlan;
 pub use super::compaction_runner_state::Entity as CompactionRunnerState;
 pub use super::compaction_source_revision::Entity as CompactionSourceRevision;

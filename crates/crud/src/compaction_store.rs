@@ -676,6 +676,55 @@ impl CrudStore {
         repositories::compaction::background::compaction_history_check_is_current(
             &self.connection,
             turn,
+            None,
+        )
+        .await
+    }
+    pub async fn compaction_history_check_revision_is_current(
+        &self,
+        turn: &str,
+        revision: i64,
+    ) -> Result<bool> {
+        repositories::compaction::background::compaction_history_check_is_current(
+            &self.connection,
+            turn,
+            Some(revision),
+        )
+        .await
+    }
+    pub async fn compaction_root_history_activity(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+    ) -> Result<Option<i64>> {
+        repositories::compaction::background::root_history_activity(
+            &self.connection,
+            workspace,
+            thread,
+            turn,
+        )
+        .await
+    }
+    pub async fn compaction_root_history_busy(
+        &self,
+        workspace: &str,
+        thread: &str,
+    ) -> Result<bool> {
+        repositories::compaction::background::root_history_busy(&self.connection, workspace, thread)
+            .await
+    }
+    pub async fn compaction_root_for_execution(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+    ) -> Result<Option<String>> {
+        repositories::compaction::background::root_for_history_execution(
+            &self.connection,
+            workspace,
+            thread,
+            turn,
         )
         .await
     }
