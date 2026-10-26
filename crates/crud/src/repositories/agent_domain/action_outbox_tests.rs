@@ -662,6 +662,9 @@ async fn action_outbox_index_migration_and_marker_rollback_and_retry_are_atomic(
     assert_eq!(load(&db, "existing-immediate").await, immediate_before);
     assert_eq!(load(&db, "existing-final").await, final_before);
     assert_eq!(index_count(&db).await, 2);
+    // Historical rollback/retry is complete. Current discovery also requires
+    // the later exhausted expression index, installed by the normal Migrator.
+    Migrator::up(&db, None).await.unwrap();
     assert_eq!(
         ids(&db, now).await,
         vec!["existing-immediate", "existing-final"]

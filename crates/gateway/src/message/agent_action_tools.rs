@@ -3339,6 +3339,32 @@ enum AgentStartReconciliation {
     Unresolved,
 }
 
+// Parent identity alone cannot bind two sibling starts to their source actions.
+// Share the exact immutable grant check across ordinary dispatch and recovery.
+fn agent_start_grant_matches_source(
+    row: &pioneer_entity::agent_action_outbox::Model,
+    execution: &pioneer_entity::agent_execution::Model,
+    saved_grant: &pioneer_entity::agent_execution_grant::Model,
+    grant: &serde_json::Value,
+    turn_id: &str,
+) -> bool {
+    saved_grant.parent_execution_id == execution.parent_execution_id
+        && saved_grant.child_identity_id == execution.agent_identity_id
+        && grant
+            .get("source_action_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(row.action_id.as_str())
+        && grant
+            .get("source_execution_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(row.owner_execution_id.as_str())
+        && grant
+            .get("execution_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(execution.id.as_str())
+        && grant.get("turn_id").and_then(serde_json::Value::as_str) == Some(turn_id)
+}
+
 // A malformed envelope must never terminalize an unrelated Turn. Bind the
 // compensating terminal event to the exact saved response and current owner.
 async fn finalize_rejected_agent_start(
@@ -3395,21 +3421,7 @@ async fn finalize_rejected_agent_start(
             != execution.presentation_snapshot_id.as_deref()
         || execution.workspace_id != owner.workspace_id
         || execution.parent_thread_id.as_deref() != Some(owner.thread_id.as_str())
-        || saved_grant.parent_execution_id != execution.parent_execution_id
-        || saved_grant.child_identity_id != execution.agent_identity_id
-        || grant
-            .get("source_action_id")
-            .and_then(serde_json::Value::as_str)
-            != Some(row.action_id.as_str())
-        || grant
-            .get("source_execution_id")
-            .and_then(serde_json::Value::as_str)
-            != Some(row.owner_execution_id.as_str())
-        || grant
-            .get("execution_id")
-            .and_then(serde_json::Value::as_str)
-            != Some(execution_id)
-        || grant.get("turn_id").and_then(serde_json::Value::as_str) != Some(turn_id)
+        || !agent_start_grant_matches_source(row, &execution, &saved_grant, &grant, turn_id)
         || (!legacy_compacted
             && payload
                 .pointer("/dispatch/execution_generation")
@@ -3631,6 +3643,25 @@ async fn dispatch_agent_action_outbox_row_inner(
     else {
         return Err(Failure::InvalidStart.into());
     };
+    let saved_grant = pioneer_crud::load_agent_execution_grant(
+        &processor.crud_store.database_connection(),
+        &execution.id,
+    )
+    .await?
+    .ok_or(Failure::InvalidStart)?;
+    let grant: serde_json::Value =
+        serde_json::from_str(&saved_grant.grant_json).map_err(|_| Failure::InvalidStart)?;
+    if row.owner_execution_id != input_execution_id.as_str()
+        || !agent_start_grant_matches_source(
+            row,
+            &execution,
+            &saved_grant,
+            &grant,
+            &dispatch.turn_id,
+        )
+    {
+        return Err(Failure::InvalidStart.into());
+    }
     let independent_root = execution.parent_execution_id.is_none()
         && execution.id == execution.work_graph_root_execution_id
         && execution.home_root_thread_id == dispatch.thread_id;
@@ -3648,22 +3679,6 @@ async fn dispatch_agent_action_outbox_row_inner(
             )
             .await
             .map_err(|error| agent_start_proof_error(error, Failure::InvalidStart))?;
-        let grant = pioneer_crud::load_agent_execution_grant(
-            &processor.crud_store.database_connection(),
-            &execution.id,
-        )
-        .await?
-        .ok_or(Failure::InvalidStart)?;
-        let grant: serde_json::Value =
-            serde_json::from_str(&grant.grant_json).map_err(|_| Failure::InvalidStart)?;
-        if row.owner_execution_id != input_execution_id.as_str()
-            || grant
-                .get("source_action_id")
-                .and_then(serde_json::Value::as_str)
-                != Some(row.action_id.as_str())
-        {
-            return Err(Failure::InvalidStart.into());
-        }
     } else if execution.parent_execution_id.as_deref() != Some(input_execution_id.as_str()) {
         return Err(Failure::InvalidStart.into());
     }
