@@ -23,8 +23,17 @@ use tracing_subscriber::{Layer, layer::Context as LayerContext, registry::Lookup
 
 pub(crate) const TARGET: &str = "pioneer_sqlite::query_cpu";
 const MAX_SCOPES: usize = 128;
-const MAX_GROUPS: usize = 64;
 const MAX_SEGMENTS: u64 = 20_000;
+// Independent first-admission reservations: unmeasured sequential scopes cannot
+// consume the capacity for every measured segment to have its own full key.
+const MAX_MEASURED_GROUPS: usize = MAX_SEGMENTS as usize;
+const MAX_UNMEASURED_GROUPS: usize = 8192 + MAX_SCOPES;
+pub(crate) const MAX_GROUPS: usize = MAX_MEASURED_GROUPS + MAX_UNMEASURED_GROUPS;
+// Cumulative text allowance per admission class, not truncation of a key.
+// Current fixed labels need <=95 bytes/full key (including fingerprint).
+const MAX_MEASURED_KEY_BYTES: usize = MAX_MEASURED_GROUPS * 128;
+const MAX_UNMEASURED_KEY_BYTES: usize = MAX_UNMEASURED_GROUPS * 128;
+pub(crate) const MAX_GROUP_KEY_BYTES: usize = MAX_MEASURED_KEY_BYTES + MAX_UNMEASURED_KEY_BYTES;
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static LIVE_SPANS: AtomicUsize = AtomicUsize::new(0);
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -121,6 +130,27 @@ pub struct Coverage {
     pub missing_database_context: u64,
 }
 #[derive(Clone, Debug, Serialize)]
+pub struct Aggregation {
+    /// Completeness of retained groups only, not instrumentation/process coverage.
+    pub complete: bool,
+    pub incomplete_reason: Option<&'static str>,
+    pub retained_groups: usize,
+    pub retained_key_bytes: usize,
+    pub max_key_bytes: usize,
+    /// Charges stay in the class of the first admitted scope, even if a null
+    /// group is measured later. Updates to retained keys never need admission.
+    pub measured_admission_groups: usize,
+    pub unmeasured_admission_groups: usize,
+    pub measured_admission_key_bytes: usize,
+    pub unmeasured_admission_key_bytes: usize,
+    pub max_measured_admission_groups: usize,
+    pub max_unmeasured_admission_groups: usize,
+    pub max_measured_admission_key_bytes: usize,
+    pub max_unmeasured_admission_key_bytes: usize,
+    /// Each aggregated scope exactly once, including the disjoint residual.
+    pub accounted: Totals,
+}
+#[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
     pub schema_version: u32,
     pub generation: u64,
@@ -135,6 +165,7 @@ pub struct Snapshot {
     pub max_groups: usize,
     pub max_segments: u64,
     pub groups: Vec<Group>,
+    pub aggregation: Aggregation,
     pub measured_unknown: Totals,
     pub group_overflow: Totals,
     pub coverage: Coverage,
@@ -160,10 +191,18 @@ enum Outcome {
     Cancelled,
 }
 struct Data {
-    sealed: Option<Snapshot>,
+    sealed: Option<Arc<Snapshot>>,
     next_id: u64,
     queries: HashMap<u64, QueryData>,
     groups: Vec<Group>,
+    group_index: HashMap<GroupKey, usize>,
+    group_key_bytes: usize,
+    measured_admission_groups: usize,
+    unmeasured_admission_groups: usize,
+    measured_admission_key_bytes: usize,
+    unmeasured_admission_key_bytes: usize,
+    aggregation_limit: Option<&'static str>,
+    accounted: Totals,
     unknown: Totals,
     overflow: Totals,
     coverage: Coverage,
@@ -214,19 +253,53 @@ impl SessionState {
         if query.group.fingerprint.is_none() {
             data.unknown.add(&query.totals);
         }
-        if let Some(group) = data.groups.iter_mut().find(|g| g.key == query.group) {
-            group.totals.add(&query.totals);
-        } else if data.groups.len() < MAX_GROUPS {
+        data.accounted.add(&query.totals);
+        if let Some(&index) = data.group_index.get(&query.group) {
+            data.groups[index].totals.add(&query.totals);
+            return;
+        }
+        let key_bytes = query.group.fingerprint.as_ref().map_or(0, String::len)
+            + query.group.workload.len()
+            + query.group.site.len()
+            + query.group.control.map_or(0, str::len);
+        let measured = query.totals.cpu_ns.is_some(); // Some(0) is measured.
+        let reason = if measured {
+            if data.measured_admission_groups >= MAX_MEASURED_GROUPS {
+                Some("measured_group_count_budget")
+            } else if key_bytes > MAX_MEASURED_KEY_BYTES - data.measured_admission_key_bytes {
+                Some("measured_group_key_bytes_budget")
+            } else {
+                None
+            }
+        } else if data.unmeasured_admission_groups >= MAX_UNMEASURED_GROUPS {
+            Some("unmeasured_group_count_budget")
+        } else if key_bytes > MAX_UNMEASURED_KEY_BYTES - data.unmeasured_admission_key_bytes {
+            Some("unmeasured_group_key_bytes_budget")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            data.aggregation_limit.get_or_insert(reason);
+            data.coverage.group_overflow_scopes += 1;
+            data.overflow.add(&query.totals);
+        } else {
+            data.group_key_bytes += key_bytes;
+            if measured {
+                data.measured_admission_groups += 1;
+                data.measured_admission_key_bytes += key_bytes;
+            } else {
+                data.unmeasured_admission_groups += 1;
+                data.unmeasured_admission_key_bytes += key_bytes;
+            }
+            data.group_index
+                .insert(query.group.clone(), data.groups.len());
             data.groups.push(Group {
                 key: query.group,
                 totals: query.totals,
             });
-        } else {
-            data.coverage.group_overflow_scopes += 1;
-            data.overflow.add(&query.totals);
         }
     }
-    fn seal(&self) -> Snapshot {
+    fn seal(&self) -> Arc<Snapshot> {
         let mut data = lock(&self.data);
         if let Some(snapshot) = &data.sealed {
             return snapshot.clone();
@@ -241,15 +314,8 @@ impl SessionState {
         for (_, query) in queries {
             Self::aggregate(&mut data, query, true);
         }
-        data.groups.sort_by(|a, b| {
-            b.totals
-                .cpu_ns
-                .cmp(&a.totals.cpu_ns)
-                .then_with(|| a.key.site.cmp(b.key.site))
-                .then_with(|| a.key.fingerprint.cmp(&b.key.fingerprint))
-        });
         let snapshot = Snapshot {
-            schema_version: 1,
+            schema_version: 2,
             generation: self.generation,
             consent_generation: self.epoch,
             started_unix_ms: self.started_wall,
@@ -267,7 +333,23 @@ impl SessionState {
             max_scopes: MAX_SCOPES,
             max_groups: MAX_GROUPS,
             max_segments: MAX_SEGMENTS,
-            groups: data.groups.clone(),
+            aggregation: Aggregation {
+                complete: data.aggregation_limit.is_none(),
+                incomplete_reason: data.aggregation_limit,
+                retained_groups: data.groups.len(),
+                retained_key_bytes: data.group_key_bytes,
+                max_key_bytes: MAX_GROUP_KEY_BYTES,
+                measured_admission_groups: data.measured_admission_groups,
+                unmeasured_admission_groups: data.unmeasured_admission_groups,
+                measured_admission_key_bytes: data.measured_admission_key_bytes,
+                unmeasured_admission_key_bytes: data.unmeasured_admission_key_bytes,
+                max_measured_admission_groups: MAX_MEASURED_GROUPS,
+                max_unmeasured_admission_groups: MAX_UNMEASURED_GROUPS,
+                max_measured_admission_key_bytes: MAX_MEASURED_KEY_BYTES,
+                max_unmeasured_admission_key_bytes: MAX_UNMEASURED_KEY_BYTES,
+                accounted: data.accounted.clone(),
+            },
+            groups: std::mem::take(&mut data.groups),
             measured_unknown: data.unknown.clone(),
             group_overflow: data.overflow.clone(),
             coverage: data.coverage.clone(),
@@ -282,9 +364,13 @@ impl SessionState {
                 "Only instrumented workload/site causality is available; this is not a complete async stack or SQL registry.",
                 "SQL fingerprint/source mapping uses the exact build outside Gateway; ambiguity remains unresolved.",
                 "Native profile and sidecar have independent windows; no process CPU or sample-share allocation is performed.",
-                "measured_unknown overlaps groups with null fingerprint; group_overflow is excluded from groups.",
+                "aggregation.complete concerns retained observed groups only, not all SQL or process CPU.",
+                "Measured and unmeasured first-admission reservations are independent; later updates retain their original charge.",
+                "groups plus disjoint group_overflow equal aggregation.accounted; unmeasured CPU remains null/unknown.",
+                "measured_unknown overlaps null-fingerprint groups and possibly group_overflow; never add it to accounted.",
             ],
         };
+        let snapshot = Arc::new(snapshot);
         data.sealed = Some(snapshot.clone());
         snapshot
     }
@@ -319,7 +405,15 @@ impl Session {
                 sealed: None,
                 next_id: 0,
                 queries: HashMap::new(),
-                groups: Vec::new(),
+                groups: Vec::with_capacity(MAX_GROUPS),
+                group_index: HashMap::with_capacity(MAX_GROUPS),
+                group_key_bytes: 0,
+                measured_admission_groups: 0,
+                unmeasured_admission_groups: 0,
+                measured_admission_key_bytes: 0,
+                unmeasured_admission_key_bytes: 0,
+                aggregation_limit: None,
+                accounted: Totals::default(),
                 unknown: Totals::default(),
                 overflow: Totals::default(),
                 coverage: Coverage::default(),
@@ -330,7 +424,19 @@ impl Session {
         Some(Self { state })
     }
     pub fn finish(self) -> Snapshot {
-        self.state.seal()
+        // seal is also called by opt-out/Drop: it only freezes the table. Copy
+        // and rank here, on the existing diagnostic owner, outside its mutex.
+        let mut snapshot = (*self.state.seal()).clone();
+        snapshot.groups.sort_unstable_by(|a, b| {
+            b.totals
+                .cpu_ns
+                .cmp(&a.totals.cpu_ns)
+                .then_with(|| a.key.site.cmp(b.key.site))
+                .then_with(|| a.key.fingerprint.cmp(&b.key.fingerprint))
+                .then_with(|| a.key.workload.cmp(b.key.workload))
+                .then_with(|| a.key.control.cmp(&b.key.control))
+        });
+        snapshot
     }
 }
 impl Drop for Session {
@@ -830,6 +936,172 @@ fn thread_cpu_ns() -> Result<u64, ClockError> {
     Err(ClockError::Unsupported)
 }
 
+// Deterministic, test-only input at the collector's completed-scope boundary.
+// Does not replace the production CPU clock or export a production test hook.
+#[cfg(test)]
+pub(crate) mod aggregation_fixtures {
+    use super::*;
+    pub(super) fn session() -> Session {
+        let start = Instant::now();
+        Session {
+            state: Arc::new(SessionState {
+                generation: 0,
+                epoch: crate::telemetry_consent_snapshot().1,
+                start,
+                deadline: start + Duration::from_secs(60),
+                started_wall: 0,
+                started_mono: 0,
+                seconds: 60,
+                data: Mutex::new(Data {
+                    sealed: None,
+                    next_id: 0,
+                    queries: HashMap::new(),
+                    groups: Vec::with_capacity(MAX_GROUPS),
+                    group_index: HashMap::with_capacity(MAX_GROUPS),
+                    group_key_bytes: 0,
+                    measured_admission_groups: 0,
+                    unmeasured_admission_groups: 0,
+                    measured_admission_key_bytes: 0,
+                    unmeasured_admission_key_bytes: 0,
+                    aggregation_limit: None,
+                    accounted: Totals::default(),
+                    unknown: Totals::default(),
+                    overflow: Totals::default(),
+                    coverage: Coverage::default(),
+                }),
+            }),
+        }
+    }
+    pub(super) fn record(
+        session: &Session,
+        fingerprint: Option<u64>,
+        workload: &'static str,
+        site: &'static str,
+        control: Option<&'static str>,
+        cpu_ns: Option<u64>,
+        outcome: Outcome,
+        incomplete: bool,
+    ) {
+        let mut data = lock(&session.state.data);
+        data.coverage.registered_scopes += 1;
+        data.coverage.measured_segments += u64::from(cpu_ns.is_some());
+        data.coverage.reserved_segments += u64::from(cpu_ns.is_some());
+        SessionState::aggregate(
+            &mut data,
+            QueryData {
+                group: GroupKey {
+                    fingerprint: None,
+                    workload,
+                    site,
+                    control,
+                },
+                fingerprint,
+                callback: true,
+                fingerprint_conflict: false,
+                outcome,
+                totals: Totals {
+                    cpu_ns,
+                    measured_segments: u64::from(cpu_ns.is_some()),
+                    ..Totals::default()
+                },
+                open_segments: 0,
+                _work: None,
+            },
+            incomplete,
+        );
+    }
+    pub(crate) fn full_budget_snapshot() -> Snapshot {
+        let session = session();
+        const WORKLOAD: &str = "cli_runtime.native_event_cleanup";
+        const SITE: &str = "projection_receipt_cleanup_quantum";
+        // Generated fixed source labels only in this fixture. Each null-control
+        // full key is 32+34+46+16=128 UTF-8 bytes, including valid JSON escapes.
+        // No SQL, parameters, domain identity or decorative envelope padding.
+        for i in 0..8192 {
+            let control = Box::leak(format!("{}{:016x}", "\u{1}".repeat(46), i).into_boxed_str());
+            record(
+                &session,
+                None,
+                WORKLOAD,
+                SITE,
+                Some(control),
+                None,
+                Outcome::Ok,
+                false,
+            );
+        }
+        for i in 1..=20_000 {
+            record(
+                &session,
+                Some(i),
+                WORKLOAD,
+                SITE,
+                None,
+                Some(if i == 20_000 {
+                    1_000_000
+                } else if i == 1 {
+                    0
+                } else {
+                    1
+                }),
+                Outcome::Ok,
+                false,
+            );
+        }
+        {
+            let mut data = lock(&session.state.data);
+            for i in 8192..8320 {
+                let control =
+                    Box::leak(format!("{}{:016x}", "\u{1}".repeat(46), i).into_boxed_str());
+                // Leave all 128 active records for the real seal path after
+                // the completed measured/unmeasured tables have filled.
+                data.queries.insert(
+                    i,
+                    QueryData {
+                        group: GroupKey {
+                            fingerprint: None,
+                            workload: WORKLOAD,
+                            site: SITE,
+                            control: Some(control),
+                        },
+                        fingerprint: None,
+                        callback: true,
+                        fingerprint_conflict: false,
+                        outcome: Outcome::Pending,
+                        totals: Totals::default(),
+                        open_segments: 0,
+                        _work: None,
+                    },
+                );
+                data.coverage.registered_scopes += 1;
+            }
+        }
+        session.finish()
+    }
+    pub(crate) fn large_snapshot() -> Snapshot {
+        let session = session();
+        for i in 1..=1000 {
+            record(
+                &session,
+                Some(i),
+                "interactive",
+                "site_a",
+                None,
+                Some(if i == 1000 {
+                    20_000
+                } else if i == 999 {
+                    10_000
+                } else {
+                    1
+                }),
+                Outcome::Ok,
+                false,
+            );
+        }
+        session.finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -842,6 +1114,359 @@ mod tests {
         tracing::Dispatch::new(tracing_subscriber::registry().with(
             QueryCpuLayer.with_filter(filter_fn(|m| m.is_span() && target_enabled(m.target()))),
         ))
+    }
+
+    fn assert_balance(snapshot: &Snapshot) {
+        // Partition check only; fixed totals/ranks below are the independent
+        // oracle. Unknown is deliberately absent from this disjoint sum.
+        macro_rules! counter {
+            ($field:ident) => {
+                assert_eq!(
+                    snapshot.groups.iter().map(|g| g.totals.$field).sum::<u64>()
+                        + snapshot.group_overflow.$field,
+                    snapshot.aggregation.accounted.$field
+                );
+            };
+        }
+        counter!(completed_calls);
+        counter!(errors);
+        counter!(cancelled);
+        counter!(incomplete);
+        counter!(measured_segments);
+        let cpu: Vec<_> = snapshot
+            .groups
+            .iter()
+            .map(|g| g.totals.cpu_ns)
+            .chain(std::iter::once(snapshot.group_overflow.cpu_ns))
+            .flatten()
+            .collect();
+        assert_eq!(
+            if cpu.is_empty() {
+                None
+            } else {
+                Some(cpu.iter().sum::<u64>())
+            },
+            snapshot.aggregation.accounted.cpu_ns
+        );
+        assert_eq!(
+            snapshot.aggregation.accounted.measured_segments,
+            snapshot.coverage.measured_segments
+        );
+    }
+
+    #[test]
+    fn full_table_retains_late_expensive_groups_and_is_completion_order_independent() {
+        use aggregation_fixtures::{record, session};
+        let collect = |reverse: bool| {
+            let session = session();
+            let mut inputs: Vec<_> = (1..=1000)
+                .map(|i| {
+                    (
+                        Some(i),
+                        "interactive",
+                        "site_a",
+                        None,
+                        Some(if i == 1000 {
+                            20_000
+                        } else if i == 999 {
+                            10_000
+                        } else {
+                            1
+                        }),
+                    )
+                })
+                .collect();
+            inputs.extend([
+                (Some(1000), "interactive", "site_a", None, Some(7)),
+                (Some(1000), "interactive", "site_b", None, Some(5000)),
+                (Some(1000), "maintenance", "site_a", None, Some(20_007)),
+                (None, "interactive", "site_a", Some("begin"), Some(0)),
+                (None, "interactive", "site_a", Some("end"), Some(0)),
+                (None, "interactive", "site_a", Some("ping"), None),
+            ]);
+            if reverse {
+                inputs.reverse();
+            }
+            for (fp, workload, site, control, cpu) in inputs {
+                record(
+                    &session,
+                    fp,
+                    workload,
+                    site,
+                    control,
+                    cpu,
+                    Outcome::Ok,
+                    false,
+                );
+            }
+            // An idempotent seal must not recount scopes or perform ranking.
+            let first = session.state.seal();
+            assert!(Arc::ptr_eq(&first, &session.state.seal()));
+            session.finish()
+        };
+        let forward = collect(false);
+        let reverse = collect(true);
+        assert_eq!(forward.groups.len(), 1005);
+        assert!(forward.aggregation.complete);
+        assert_eq!(forward.coverage.group_overflow_scopes, 0);
+        assert_eq!(forward.aggregation.accounted.completed_calls, 1006);
+        assert_eq!(forward.aggregation.accounted.cpu_ns, Some(56_012));
+        assert_eq!(forward.aggregation.accounted.measured_segments, 1005);
+        assert_eq!(
+            forward.groups[0].key.fingerprint.as_deref(),
+            Some("00000000000003e8")
+        );
+        assert_eq!(forward.groups[0].totals.cpu_ns, Some(20_007));
+        assert_eq!(forward.groups[0].totals.completed_calls, 2);
+        assert_eq!(forward.groups[0].key.workload, "interactive");
+        assert_eq!(forward.groups[1].key.workload, "maintenance");
+        assert_eq!(forward.groups[1].totals.cpu_ns, Some(20_007));
+        assert_eq!(forward.groups[2].totals.cpu_ns, Some(10_000));
+        assert_eq!(forward.groups[3].key.site, "site_b");
+        assert_eq!(forward.groups[1002].key.control, Some("begin"));
+        assert_eq!(forward.groups[1003].key.control, Some("end"));
+        assert_eq!(forward.groups[1002].totals.cpu_ns, Some(0));
+        assert_eq!(forward.groups[1003].totals.cpu_ns, Some(0));
+        assert_eq!(forward.groups[1004].totals.cpu_ns, None);
+        assert_eq!(forward.measured_unknown.completed_calls, 3);
+        assert_eq!(forward.measured_unknown.cpu_ns, Some(0));
+        assert_eq!(
+            serde_json::to_value(&forward.groups).unwrap(),
+            serde_json::to_value(&reverse.groups).unwrap()
+        );
+        assert_balance(&forward);
+        assert_balance(&reverse);
+    }
+
+    #[test]
+    fn full_segment_capacity_and_extra_null_incomplete_allowance_retain_every_identity() {
+        let snapshot = aggregation_fixtures::full_budget_snapshot();
+        assert!(snapshot.aggregation.complete);
+        assert_eq!(snapshot.groups.len(), 28_320);
+        assert_eq!(snapshot.aggregation.measured_admission_groups, 20_000);
+        assert_eq!(snapshot.aggregation.unmeasured_admission_groups, 8320);
+        assert_eq!(snapshot.coverage.registered_scopes, 28_320);
+        assert_eq!(snapshot.coverage.measured_segments, 20_000);
+        assert_eq!(snapshot.coverage.reserved_segments, MAX_SEGMENTS);
+        assert_eq!(snapshot.aggregation.accounted.cpu_ns, Some(1_019_998));
+        assert_eq!(snapshot.aggregation.accounted.completed_calls, 28_192);
+        assert_eq!(snapshot.aggregation.accounted.incomplete, 128);
+        assert_eq!(
+            snapshot.groups[0].key.fingerprint.as_deref(),
+            Some("0000000000004e20")
+        );
+        assert_eq!(snapshot.groups[0].totals.cpu_ns, Some(1_000_000));
+        assert_eq!(snapshot.groups[19_999].totals.cpu_ns, Some(0));
+        // Check the entire identity set, not just count/sum/top.
+        let fingerprints: std::collections::BTreeSet<_> = snapshot
+            .groups
+            .iter()
+            .filter_map(|g| g.key.fingerprint.as_ref())
+            .map(|v| u64::from_str_radix(v, 16).unwrap())
+            .collect();
+        assert_eq!(
+            fingerprints,
+            (1..=20_000).collect::<std::collections::BTreeSet<_>>()
+        );
+        let controls: std::collections::BTreeSet<_> = snapshot
+            .groups
+            .iter()
+            .filter_map(|g| g.key.control)
+            .map(|control| {
+                assert_eq!(control.len(), 62);
+                assert!(control.as_bytes()[..46].iter().all(|b| *b == 1));
+                u64::from_str_radix(&control[46..], 16).unwrap()
+            })
+            .collect();
+        assert_eq!(
+            controls,
+            (0..8320).collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_eq!(snapshot.aggregation.measured_admission_key_bytes, 1_640_000);
+        assert_eq!(
+            snapshot.aggregation.unmeasured_admission_key_bytes,
+            1_064_960
+        );
+        assert_eq!(snapshot.aggregation.retained_key_bytes, 2_704_960);
+        assert_eq!(snapshot.measured_unknown.cpu_ns, None);
+        assert_eq!(snapshot.group_overflow.completed_calls, 0);
+        assert_eq!(snapshot.coverage.group_overflow_scopes, 0);
+        assert_balance(&snapshot);
+    }
+
+    #[test]
+    fn unmeasured_allowance_exhaustion_does_not_displace_measured_groups() {
+        use aggregation_fixtures::{record, session};
+        let session = session();
+        for i in 1..=MAX_UNMEASURED_GROUPS {
+            record(
+                &session,
+                Some(i as u64),
+                "interactive",
+                "a",
+                None,
+                None,
+                Outcome::Ok,
+                false,
+            );
+        }
+        // First overflow is truly unmeasured; measured reservation stays free.
+        record(
+            &session,
+            None,
+            "interactive",
+            "a",
+            None,
+            None,
+            Outcome::Error,
+            true,
+        );
+        record(
+            &session,
+            None,
+            "interactive",
+            "a",
+            Some("begin"),
+            None,
+            Outcome::Cancelled,
+            true,
+        );
+        // A retained null key can be measured later without another admission.
+        record(
+            &session,
+            Some(1),
+            "interactive",
+            "a",
+            None,
+            Some(0),
+            Outcome::Error,
+            false,
+        );
+        record(
+            &session,
+            Some(99_999),
+            "interactive",
+            "a",
+            None,
+            Some(100),
+            Outcome::Ok,
+            false,
+        );
+        let snapshot = session.finish();
+        assert!(!snapshot.aggregation.complete);
+        assert_eq!(
+            snapshot.aggregation.incomplete_reason,
+            Some("unmeasured_group_count_budget")
+        );
+        assert_eq!(snapshot.aggregation.unmeasured_admission_groups, 8320);
+        assert_eq!(snapshot.aggregation.measured_admission_groups, 1);
+        assert_eq!(snapshot.coverage.group_overflow_scopes, 2);
+        assert_eq!(snapshot.group_overflow.cpu_ns, None);
+        assert_eq!(snapshot.group_overflow.measured_segments, 0);
+        assert_eq!(snapshot.group_overflow.incomplete, 2);
+        assert_eq!(snapshot.group_overflow.errors, 1);
+        assert_eq!(snapshot.group_overflow.cancelled, 1);
+        assert_eq!(snapshot.measured_unknown.cpu_ns, None);
+        assert_eq!(
+            snapshot.groups[0].key.fingerprint.as_deref(),
+            Some("000000000001869f")
+        );
+        assert_eq!(snapshot.groups[0].totals.cpu_ns, Some(100));
+        assert_eq!(snapshot.groups[1].totals.cpu_ns, Some(0));
+        assert_eq!(snapshot.aggregation.accounted.cpu_ns, Some(100));
+        assert_eq!(
+            snapshot.aggregation.accounted.completed_calls,
+            MAX_UNMEASURED_GROUPS as u64 + 2
+        );
+        assert_eq!(snapshot.aggregation.accounted.errors, 2);
+        assert_balance(&snapshot);
+    }
+
+    #[test]
+    fn key_bytes_budgets_preserve_measured_residual_and_unknown_overlap() {
+        use aggregation_fixtures::{record, session};
+        // Long fixed labels exercise cumulative text bounds independently of
+        // group count. These are collector inputs, never domain/SQL text.
+        const LONG_SITE: &str = concat!(
+            "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz",
+            "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz"
+        );
+        for measured in [false, true] {
+            let session = session();
+            for i in 1..=16_000 {
+                record(
+                    &session,
+                    Some(i),
+                    "interactive",
+                    LONG_SITE,
+                    None,
+                    measured.then_some(1),
+                    Outcome::Ok,
+                    false,
+                );
+            }
+            record(
+                &session,
+                Some(1),
+                "interactive",
+                LONG_SITE,
+                None,
+                Some(0),
+                Outcome::Error,
+                false,
+            );
+            record(
+                &session,
+                Some(99_999),
+                "interactive",
+                LONG_SITE,
+                None,
+                measured.then_some(100),
+                Outcome::Ok,
+                false,
+            );
+            record(
+                &session,
+                None,
+                "interactive",
+                LONG_SITE,
+                None,
+                measured.then_some(25),
+                Outcome::Error,
+                true,
+            );
+            let snapshot = session.finish();
+            assert!(!snapshot.aggregation.complete);
+            assert_eq!(
+                snapshot.aggregation.incomplete_reason,
+                Some(if measured {
+                    "measured_group_key_bytes_budget"
+                } else {
+                    "unmeasured_group_key_bytes_budget"
+                })
+            );
+            assert!(
+                snapshot.groups.len()
+                    < if measured {
+                        MAX_MEASURED_GROUPS
+                    } else {
+                        MAX_UNMEASURED_GROUPS
+                    }
+            );
+            assert!(snapshot.aggregation.retained_key_bytes <= MAX_GROUP_KEY_BYTES);
+            assert!(snapshot.group_overflow.completed_calls > 0);
+            assert_eq!(snapshot.group_overflow.errors, 1);
+            assert_eq!(snapshot.group_overflow.incomplete, 1);
+            assert_eq!(
+                snapshot.aggregation.accounted.cpu_ns,
+                Some(if measured { 16_125 } else { 0 })
+            );
+            assert_eq!(snapshot.aggregation.accounted.completed_calls, 16_002);
+            assert_eq!(snapshot.measured_unknown.cpu_ns, measured.then_some(25));
+            assert_eq!(snapshot.group_overflow.cpu_ns.is_some(), measured);
+            // Unknown is a subset of residual here, never another partition.
+            assert_balance(&snapshot);
+        }
     }
 
     #[test]
@@ -1019,7 +1644,7 @@ mod tests {
     }
 
     #[test]
-    fn scope_group_and_segment_limits_report_loss_and_preserve_unknown() {
+    fn scope_and_segment_limits_report_loss_without_aggregation_loss() {
         let _serial = lock(&SERIAL);
         let dispatch = dispatch();
         tracing::dispatcher::with_default(&dispatch, || {
@@ -1057,9 +1682,10 @@ mod tests {
             // No callback: any measured CPU belongs to unknown, not hash zero.
             drop(measured);
             let snapshot = session.finish();
-            assert_eq!(snapshot.groups.len(), MAX_GROUPS);
+            assert_eq!(snapshot.groups.len(), MAX_SCOPES);
             assert_eq!(snapshot.coverage.scope_reservation_overflow, 1);
-            assert!(snapshot.coverage.group_overflow_scopes > 0);
+            assert_eq!(snapshot.coverage.group_overflow_scopes, 0);
+            assert!(snapshot.aggregation.complete);
             assert_eq!(snapshot.coverage.reserved_segments, MAX_SEGMENTS);
             assert_eq!(snapshot.coverage.segment_reservation_overflow, 1);
             assert!(snapshot.coverage.cpu_clock_reads <= 40_000);

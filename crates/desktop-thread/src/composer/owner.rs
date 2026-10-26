@@ -15,6 +15,24 @@ use pioneer_client::{
 };
 use std::sync::Arc;
 
+/// Thread reads used by Composer, plus existing draft/catalog revision fences
+/// for inputs read directly from ClientCore before their binding echo arrives.
+#[derive(PartialEq, Eq)]
+struct ComposerThreadInputs {
+    workspace_id: String,
+    is_draft: bool,
+    has_in_flight_turn: bool,
+    is_cancelling: bool,
+    conversation_can_submit: bool,
+    has_cli_binding: bool,
+    history_loading: bool,
+    model_selection_pending: bool,
+    message_mutation_pending: bool,
+    draft_id: DraftId,
+    composer_revision: u64,
+    catalog_revision: u64,
+}
+
 pub(crate) struct ComposerView {
     pub(super) client: Arc<ClientCore>,
     pub(super) thread_id: String,
@@ -46,6 +64,7 @@ pub(crate) struct ComposerView {
     pub(super) send_operation: Option<ComposerOperationIdentity>,
     pub(super) file_task: Option<Task<()>>,
     pub(super) send_task: Option<Task<()>>,
+    synchronized_thread_inputs: Option<ComposerThreadInputs>,
     _release: Subscription,
     _subscriptions: Vec<Subscription>,
     _binding_task: Task<()>,
@@ -172,11 +191,18 @@ impl ComposerView {
             let mut changes = binding.watch();
             let binding_task = cx.spawn_in(window, async move |view, cx| {
                 while changes.changed().await.is_ok() {
-                    if binding.drain().is_empty() {
+                    let publications = binding.drain();
+                    if publications.is_empty() {
                         continue;
                     }
                     if view
-                        .update_in(cx, |view, window, cx| view.synchronize_inputs(window, cx))
+                        .update_in(cx, |view, window, cx| {
+                            let thread_only = publications.iter().all(|publication| {
+                                matches!(publication.scope(), ClientScope::Thread { thread_id }
+                                    if thread_id == &view.thread_id)
+                            });
+                            view.synchronize_inputs(thread_only, window, cx);
+                        })
                         .is_err()
                     {
                         break;
@@ -229,15 +255,68 @@ impl ComposerView {
                 send_operation: None,
                 file_task: None,
                 send_task: None,
+                synchronized_thread_inputs: None,
                 _release: release,
                 _subscriptions: vec![input_subscription, mention_subscription, voice_events],
                 _binding_task: binding_task,
             };
-            view.synchronize_inputs(window, cx);
+            view.synchronize_inputs(false, window, cx);
             view
         })
     }
-    pub(super) fn synchronize_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn thread_inputs(&self) -> Option<ComposerThreadInputs> {
+        let thread = self.client.thread_snapshot(&self.thread_id)?;
+        let coordinator = thread.coordinator();
+        let input = self.composer_input.as_ref()?;
+        let catalog = self.client.composer_catalog_snapshot(&self.thread_id)?;
+        // Pending creation, missing authorization and stale draft/catalog owners
+        // do not provide a safe baseline for suppressing a notification.
+        coordinator.thread()?;
+        self.identity_input.as_ref()?.current_auth.as_ref()?;
+        input.authorization_fingerprint()?;
+        if coordinator.workspace_id.is_empty()
+            || input.thread_id() != self.thread_id
+            || catalog.thread_id != self.thread_id
+            || catalog.draft_id != input.draft_id()
+        {
+            return None;
+        }
+        let is_draft = self
+            .client
+            .thread_workspace_draft(&coordinator.workspace_id)
+            .as_deref()
+            == Some(self.thread_id.as_str());
+        let active = pioneer_client::state::snapshot::ActiveThreadSnapshot::from_coordinator(
+            Some(&self.thread_id),
+            Some(coordinator.as_ref()),
+            is_draft,
+        );
+        Some(ComposerThreadInputs {
+            workspace_id: coordinator.workspace_id.clone(),
+            is_draft,
+            has_in_flight_turn: active.has_in_flight_turn(),
+            is_cancelling: active.is_cancelling_turn(),
+            conversation_can_submit: thread.conversation().can_submit_message(),
+            has_cli_binding: thread.cli_binding().is_some(),
+            history_loading: active.history_loading,
+            model_selection_pending: self.composer_model_selection_pending(),
+            message_mutation_pending: self.message_mutation_pending(),
+            draft_id: input.draft_id(),
+            composer_revision: input.revision(),
+            catalog_revision: catalog.revision,
+        })
+    }
+    pub(super) fn synchronize_inputs(
+        &mut self,
+        thread_only: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let local_before = (
+            self.composer_upload_error.clone(),
+            self.composer_policy_notice.clone(),
+            self.send_operation.clone(),
+        );
         let payload = |scope: ClientScope| self.thread_bindings.publication(&scope);
         // Native input commits to the client synchronously, while binding
         // publications arrive asynchronously. An older echo must not replace
@@ -296,8 +375,14 @@ impl ComposerView {
         }
         self.present_composer_authorization_notice();
         self.present_composer_send_outcome();
-        self.controlled_text(window, cx);
-        self.synchronize_mention_items(window, cx);
+        let editor_changed = self.controlled_text(window, cx);
+        let mentions_changed = self.synchronize_mention_items(window, cx);
+        let local_changed = local_before
+            != (
+                self.composer_upload_error.clone(),
+                self.composer_policy_notice.clone(),
+                self.send_operation.clone(),
+            );
         if self
             .identity_input
             .as_ref()
@@ -313,10 +398,23 @@ impl ComposerView {
             }
             self.files.retire_mount(&self.thread_id, self.mount);
         }
-        cx.notify();
+        // Compare against the last completed synchronization, never a "before"
+        // snapshot taken from ClientCore after it has already been updated.
+        let next = self.thread_inputs();
+        let notify = !thread_only
+            || editor_changed
+            || mentions_changed
+            || local_changed
+            || next.is_none()
+            || next != self.synchronized_thread_inputs;
+        self.synchronized_thread_inputs = next;
+        if notify {
+            cx.notify();
+        }
     }
-    pub(super) fn controlled_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn controlled_text(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let draft_id = self.composer_input.as_ref().map(|input| input.draft_id());
+        let draft_changed = draft_id != self.composer_editor_draft;
         let draft_switched = draft_id.is_some()
             && self.composer_editor_draft.is_some()
             && draft_id != self.composer_editor_draft;
@@ -336,11 +434,13 @@ impl ComposerView {
                 // draft, so the rewrite becomes a no-op. A genuine draft swap
                 // (edit mode, epoch fence) must still land.
                 if !draft_switched && state.marked_text_range(window, cx).is_some() {
-                    return;
+                    return draft_changed;
                 }
                 state.set_value(text, window, cx);
+                return true;
             }
-        });
+            draft_changed
+        })
     }
     pub(crate) fn set_visible(
         &mut self,
@@ -1148,6 +1248,48 @@ mod tests {
                 self.cx.run_until_parked();
             }
 
+            // Deliver real committed publications in a chosen batch, leaving
+            // other scopes queued in the router to exercise delayed echoes.
+            fn deliver_composer_scopes(&mut self, scopes: &[ClientScope]) {
+                use pioneer_desktop_foundation::ClientPublicationSink;
+                for scope in scopes {
+                    let publication = self.client.snapshot(scope).unwrap();
+                    self.composer.read_with(self.cx, |view, _| {
+                        view.thread_bindings.publish(publication);
+                    });
+                }
+                self.cx.run_until_parked();
+            }
+
+            fn update_thread_metadata(&self) {
+                let previous_revision = self.client.thread_snapshot("a").unwrap().revision();
+                let mut thread = self
+                    .client
+                    .thread_snapshot("a")
+                    .unwrap()
+                    .coordinator()
+                    .thread()
+                    .unwrap()
+                    .clone();
+                thread.updated_at += 1;
+                thread.preview = format!("metadata revision {}", thread.updated_at);
+                self.client.upsert_thread(thread);
+                assert!(self.client.thread_snapshot("a").unwrap().revision() > previous_revision);
+            }
+
+            fn observe_composer(
+                &mut self,
+            ) -> (std::rc::Rc<std::cell::Cell<usize>>, gpui_kit::Subscription) {
+                let notifications = std::rc::Rc::new(std::cell::Cell::new(0));
+                let observed = notifications.clone();
+                let subscription = self.cx.update(|_, cx| {
+                    cx.observe(&self.composer, move |_, _| {
+                        observed.set(observed.get() + 1);
+                    })
+                });
+                (notifications, subscription)
+            }
+
             fn assert_editor(&self, text: &str, cursor: usize) {
                 self.input.read_with(self.cx, |input, _| {
                     assert_eq!(input.value().as_str(), text);
@@ -1233,6 +1375,298 @@ mod tests {
                     .outcome(),
                 ClientTransitionOutcome::Changed
             );
+        }
+
+        #[gpui_kit::test]
+        fn thread_metadata_is_quiet_and_mixed_batch_keeps_notification(cx: &mut TestAppContext) {
+            let mut fixture = Fixture::new(cx);
+            fixture.type_text("message");
+            fixture.synchronize();
+            let (notifications, _observer) = fixture.observe_composer();
+            let thread = ClientScope::Thread {
+                thread_id: "a".into(),
+            };
+            for _ in 0..2 {
+                fixture.update_thread_metadata();
+                fixture.deliver_composer_scopes(&[thread.clone()]);
+                assert_eq!(notifications.get(), 0);
+                fixture.assert_editor("message", 7);
+                fixture.composer.update(fixture.cx, |view, cx| {
+                    assert!(view.can_submit_message(cx));
+                });
+            }
+            fixture.update_thread_metadata();
+            let mut session = (*fixture.client.gateway_session()).clone();
+            // Status level is not a Composer input. Mixed batches must notify
+            // even when their effective Composer inputs are unchanged.
+            session.status.as_mut().unwrap().status_level = GatewayStatusLevel::Degraded;
+            publish_session(&fixture.client, session);
+            fixture.deliver_composer_scopes(&[thread.clone(), ClientScope::Session]);
+            assert!(notifications.get() > 0, "unchanged mixed batch must notify");
+            notifications.set(0);
+            fixture.update_thread_metadata();
+            publish_connection(&fixture.client, GatewayConnectionState::Reconnecting);
+            fixture.deliver_composer_scopes(&[thread.clone(), ClientScope::Session]);
+            assert!(notifications.get() > 0, "mixed batch must notify");
+            fixture.composer.update(fixture.cx, |view, cx| {
+                assert!(!view.can_submit_message(cx));
+            });
+            // A conservative synchronization must also advance the baseline.
+            notifications.set(0);
+            fixture.update_thread_metadata();
+            fixture.deliver_composer_scopes(&[thread]);
+            assert_eq!(notifications.get(), 0);
+        }
+
+        #[gpui_kit::test]
+        fn thread_only_turn_and_cli_target_changes_keep_composer_actions_current(
+            cx: &mut TestAppContext,
+        ) {
+            use pioneer_client::{
+                composer::state_machine::ComposerDomainAction, conversation::ConversationEvent,
+            };
+            let mut fixture = Fixture::new(cx);
+            let draft = fixture.client.composer_snapshot("a").unwrap();
+            for action in [
+                ComposerDomainAction::SetModeFromUser {
+                    mode: ThreadMode::Chat,
+                },
+                ComposerDomainAction::SetModelSelectionFromUser {
+                    provider: Some("synthetic-provider".into()),
+                    model: Some("synthetic-model".into()),
+                    capability_target: None,
+                },
+            ] {
+                fixture.client.composer_intent(ComposerIntent::Domain {
+                    thread_id: "a".into(),
+                    draft_id: draft.draft_id(),
+                    action,
+                });
+            }
+            let mut capabilities = fixture
+                .client
+                .thread_capability_snapshot("a")
+                .unwrap()
+                .snapshot
+                .clone()
+                .unwrap();
+            capabilities
+                .thread
+                .as_mut()
+                .unwrap()
+                .capabilities
+                .can_cancel_agent_execution = true;
+            ClientMutationAuthority::for_test()
+                .accept_thread_capabilities_for_test(&fixture.client, capabilities);
+            fixture.type_text("next message");
+            fixture.synchronize();
+            fixture
+                .composer
+                .update(fixture.cx, |view, cx| assert!(view.can_submit_message(cx)));
+            let (notifications, _observer) = fixture.observe_composer();
+            let thread = ClientScope::Thread {
+                thread_id: "a".into(),
+            };
+            for (turn_id, status) in [("completed", "Completed"), ("cancelled", "Interrupted")] {
+                notifications.set(0);
+                fixture.client.apply_thread_conversation_event(
+                    "workspace",
+                    ConversationEvent::LocalTurnStartRequested {
+                        thread_id: "a".into(),
+                        turn_id: turn_id.into(),
+                        pending_request_id: format!("request-{turn_id}"),
+                        mode: ThreadMode::Chat,
+                        user_text: "running".into(),
+                        attachments: vec![],
+                    },
+                    None,
+                );
+                fixture.deliver_composer_scopes(&[thread.clone()]);
+                assert!(notifications.get() > 0);
+                fixture.composer.update(fixture.cx, |view, cx| {
+                    assert!(!view.can_submit_message(cx));
+                    assert!(view.active_thread_snapshot().can_request_turn_cancel(true));
+                    assert!(view.can_cancel_active_thread_agent_presentation());
+                });
+                // A CLI binding can appear without changing the active turn ID.
+                notifications.set(0);
+                fixture.client.set_thread_cli_binding(
+                    "a",
+                    Some(
+                        serde_json::from_value(json!({
+                            "workspace_id": "workspace", "thread_id": "a", "runtime_id": "runtime",
+                            "runtime_kind": "codex", "status": "active"
+                        }))
+                        .unwrap(),
+                    ),
+                );
+                fixture.deliver_composer_scopes(&[thread.clone()]);
+                assert!(notifications.get() > 0);
+                notifications.set(0);
+                fixture.client.set_thread_cli_binding("a", None);
+                fixture.deliver_composer_scopes(&[thread.clone()]);
+                assert!(notifications.get() > 0);
+                notifications.set(0);
+                fixture.client.apply_thread_conversation_event(
+                    "workspace",
+                    ConversationEvent::LocalTurnCancelRequested {
+                        thread_id: "a".into(),
+                        turn_id: turn_id.into(),
+                    },
+                    None,
+                );
+                fixture.deliver_composer_scopes(&[thread.clone()]);
+                assert!(notifications.get() > 0);
+                fixture.composer.update(fixture.cx, |view, cx| {
+                    assert!(view.active_thread_snapshot().is_cancelling_turn());
+                    assert!(!view.active_thread_snapshot().can_request_turn_cancel(true));
+                    assert!(!view.can_submit_message(cx));
+                });
+                notifications.set(0);
+                // Accept a real terminal turn snapshot, including its permission profile.
+                let policy: serde_json::Map<String, serde_json::Value> = [
+                    "default_behavior",
+                    "file_read",
+                    "file_write",
+                    "shell_command",
+                    "network",
+                    "mcp_read",
+                    "mcp_write_or_unknown",
+                    "dynamic_skill_tool",
+                    "computer_use",
+                    "task_subagent",
+                    "memory_write",
+                    "agent_action",
+                ]
+                .into_iter()
+                .map(|key| (key.into(), json!("allow")))
+                .collect();
+                let turn = serde_json::from_value(json!({
+                    "id": turn_id, "status": status, "mode": "Chat",
+                    "permission_profile": {"mode": "full_access", "source": "defaulted", "effective_policy": policy}
+                })).unwrap();
+                let event = if status == "Completed" {
+                    ConversationEvent::TurnCompleted {
+                        thread_id: "a".into(),
+                        turn,
+                    }
+                } else {
+                    ConversationEvent::TurnFailed {
+                        thread_id: "a".into(),
+                        turn,
+                    }
+                };
+                fixture
+                    .client
+                    .apply_thread_conversation_event("workspace", event, None);
+                fixture.client.tick_thread_conversations();
+                fixture.deliver_composer_scopes(&[thread.clone()]);
+                assert!(notifications.get() > 0);
+                fixture.composer.update(fixture.cx, |view, cx| {
+                    assert!(!view.active_thread_snapshot().has_in_flight_turn());
+                    assert!(view.can_submit_message(cx));
+                });
+            }
+        }
+
+        #[gpui_kit::test]
+        fn thread_only_sync_preserves_ime_and_notifies_editor_repair(cx: &mut TestAppContext) {
+            let mut fixture = Fixture::new(cx);
+            fixture.type_text("hello ");
+            fixture.synchronize();
+            fixture.cx.update(|window, cx| {
+                fixture.input.update(cx, |state, cx| {
+                    state.replace_and_mark_text_in_range(None, "world", Some(5..5), window, cx);
+                });
+            });
+            let (notifications, _observer) = fixture.observe_composer();
+            let thread = ClientScope::Thread {
+                thread_id: "a".into(),
+            };
+            fixture.update_thread_metadata();
+            fixture.deliver_composer_scopes(&[thread.clone()]);
+            assert_eq!(notifications.get(), 0);
+            fixture.assert_editor("hello world", 11);
+            fixture.cx.update(|window, cx| {
+                fixture.input.update(cx, |state, cx| {
+                    assert!(state.marked_text_range(window, cx).is_some());
+                    // A controlled child value can differ without changing the
+                    // Client draft. Repair still needs a Composer notification.
+                    state.set_value("temporary child value", window, cx);
+                    assert!(state.marked_text_range(window, cx).is_none());
+                });
+            });
+            notifications.set(0);
+            fixture.update_thread_metadata();
+            fixture.deliver_composer_scopes(&[thread]);
+            assert!(notifications.get() > 0);
+            fixture.assert_editor("hello ", 0);
+            assert_eq!(
+                fixture.client.composer_snapshot("a").unwrap().draft().text,
+                "hello "
+            );
+        }
+
+        #[gpui_kit::test]
+        fn thread_only_sync_applies_a_new_draft_during_ime_and_terminal_send(
+            cx: &mut TestAppContext,
+        ) {
+            use pioneer_client::composer::store::ComposerOperationCompletion;
+            let mut fixture = Fixture::new(cx);
+            fixture.type_text("message");
+            fixture.synchronize();
+            let plan = fixture.composer.update(fixture.cx, |view, _| {
+                view.begin_operation(ComposerOperationKind::Send).unwrap()
+            });
+            fixture.client.complete_composer_operation(
+                plan.identity,
+                ComposerOperationCompletion::Failed {
+                    message: "technical error".into(),
+                },
+            );
+            let (notifications, _observer) = fixture.observe_composer();
+            let thread = ClientScope::Thread {
+                thread_id: "a".into(),
+            };
+            fixture.update_thread_metadata();
+            // The Composer echo is deliberately still queued, but lifecycle
+            // synchronization must consume the latest Client operation outcome.
+            fixture.deliver_composer_scopes(&[thread.clone()]);
+            assert!(notifications.get() > 0);
+            fixture.composer.read_with(fixture.cx, |view, _| {
+                assert!(view.send_operation.is_none());
+                assert_eq!(
+                    view.composer_upload_error.as_deref(),
+                    Some(t!("chat.composer.send_failed").as_ref())
+                );
+            });
+            fixture.cx.update(|window, cx| {
+                fixture.input.update(cx, |state, cx| {
+                    state.replace_and_mark_text_in_range(None, "ime", Some(3..3), window, cx);
+                });
+            });
+            let draft = fixture.client.composer_snapshot("a").unwrap();
+            assert_eq!(
+                fixture
+                    .client
+                    .composer_intent(ComposerIntent::StartMessageEdit {
+                        thread_id: "a".into(),
+                        draft_id: draft.draft_id(),
+                        turn_id: "turn".into(),
+                    })
+                    .outcome(),
+                ClientTransitionOutcome::Changed
+            );
+            notifications.set(0);
+            fixture.update_thread_metadata();
+            fixture.deliver_composer_scopes(&[thread]);
+            assert!(notifications.get() > 0);
+            fixture.assert_editor("original message", 0);
+            fixture.cx.update(|window, cx| {
+                fixture.input.update(cx, |state, cx| {
+                    assert!(state.marked_text_range(window, cx).is_none());
+                });
+            });
         }
 
         #[gpui_kit::test]

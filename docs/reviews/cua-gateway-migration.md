@@ -1190,3 +1190,30 @@ Cargo.lock, manifests and CI are unchanged. `git diff --check` and
 resolver or runtime/platform probe ran. Fresh remote CI must validate the repair.
 The monitor was paused before edits. Fetched main `e808bb31` merged cleanly in
 `git merge-tree --write-tree HEAD origin/main` before publication.
+
+
+## 2026-10-26 — refresh main after eight successful CI checks
+
+CI run `40340652927` completed all eight expected checks successfully for
+`334492128e3dfc31a7fce090a7c578b2194a5784`. Branch protection returned HTTP 404
+("Branch not protected") and the repository ruleset list was empty. This success
+is superseded by the following normal merge; fresh CI must validate its HEAD.
+
+Fetched main `a787f016f9ce1416ec87a2ce0fe402627e319881` conflicted only in
+`message/tests/scoped_push_client.rs`. Both sides repair the same volatile
+in-memory fixture. The resolution retains the feature branch's existing
+file-backed helper, separate read-only reader/serialized writer pools and held
+TempDir, which also fulfills main's file-backed database fix. No assertions or
+scenario behavior were removed. All 124 feature-only and 19 main-only paths
+match their respective parent bytes. The other two overlapping paths, Cargo.toml
+and Cargo.lock, combine main's three gpui-fast source patches with the feature
+branch's current-upstream CUA dependency; no resolver or dependency update ran.
+
+The isolated test-only resolution preserved all 3,927 other tracked file hashes
+before/after check-only formatting; its resulting test file equals the feature
+parent byte-for-byte. `cargo fmt -p pioneer-gateway --check`, `git diff --check`
+and `git diff --cached --check` passed. Main's inherited production changes were
+merged as authorized, without manual production edits. No local compilation,
+test, linter, runtime/platform probe or packaging command ran. The monitor was
+paused before the merge and must resume on its existing 900-second schedule
+after publication.
