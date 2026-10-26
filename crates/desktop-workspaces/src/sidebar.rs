@@ -46,6 +46,7 @@ pub(super) struct ThreadSidebarView {
     pub tree_structure: Vec<(String, usize, bool, bool)>,
     pub task_activity_indicators:
         Rc<HashMap<String, Entity<crate::tree_view::TaskActivityIndicator>>>,
+    pub retained_sidebar_rows: HashMap<String, crate::tree_view::SidebarRetainedRow>,
     pub prepared_sidebar: crate::tree_view::SidebarPreparation,
     pub visible_node_count: usize,
     owner: SidebarOwner,
@@ -67,6 +68,7 @@ pub(super) struct ThreadSidebarView {
     pub thread_scope_capabilities: pioneer_client::authorization::ThreadPresentationCapabilities,
     changes: Option<Task<()>>,
     tree_events: Option<Subscription>,
+    tree_changes: Option<Subscription>,
     pub context_locked: bool,
     last_workspace_unavailable: bool,
     presented_workspace: Option<String>,
@@ -126,6 +128,9 @@ impl ThreadSidebarView {
                 }
             },
         );
+        let tree_changes = cx.observe(&thread_tree_state, |view, _, cx| {
+            view.refresh_sidebar_row_tree_presentations(cx);
+        });
         let mut view = Self {
             load_expansion: config.load_expansion,
             save_expansion: config.save_expansion,
@@ -137,6 +142,7 @@ impl ThreadSidebarView {
             create_workspace_dialog: config.create_workspace_dialog,
             tree_structure: vec![],
             task_activity_indicators: Rc::default(),
+            retained_sidebar_rows: HashMap::new(),
             prepared_sidebar: Default::default(),
             visible_node_count: 0,
             owner: Default::default(),
@@ -158,6 +164,7 @@ impl ThreadSidebarView {
             thread_scope_capabilities: Default::default(),
             changes: Some(task),
             tree_events: Some(tree_events),
+            tree_changes: Some(tree_changes),
             context_locked: false,
             last_workspace_unavailable: true,
             presented_workspace: None,
@@ -243,6 +250,7 @@ impl ThreadSidebarView {
             }
             self.tree_registration.take();
             self.tree_structure.clear();
+            self.retained_sidebar_rows.clear();
             self.prepared_sidebar = Default::default();
             self.task_activity_indicators = Rc::default();
             self.thread_folder_expanded = navigation
@@ -352,6 +360,11 @@ impl ThreadSidebarView {
             navigation_changed,
             cx,
         );
+        // Permission-only changes need row inputs refreshed without resetting
+        // Tree items. Tree/navigation changes already reconciled the rows.
+        if capabilities_changed && !tree_changed && !navigation_changed {
+            self.refresh_sidebar_row_views(cx);
+        }
         if tree_changed
             || navigation_changed
             || catalog_changed
@@ -378,6 +391,13 @@ impl ThreadSidebarView {
                 thread_id: thread.map(str::to_owned),
             });
         }
+    }
+
+    pub(super) fn sidebar_row_owner_is_current(&self) -> bool {
+        self.owner.endpoint_id == self.client.gateway_session().startup.endpoint_id
+            && self.owner.authorization_connection
+                == self.client.authorization_connection_generation()
+            && self.active_workspace_id() == self.client.navigation_snapshot().workspace_id()
     }
 
     pub(super) fn workspace_unavailable(&self) -> bool {
@@ -408,11 +428,13 @@ impl ThreadSidebarView {
     fn release_bindings(&mut self) {
         self.changes.take();
         self.tree_events.take();
+        self.tree_changes.take();
         self.tree_registration.take();
         self.composer_registration.take();
         self.registrations.clear();
         self.binding.publications.borrow_mut().clear();
         self.input = None;
+        self.retained_sidebar_rows.clear();
         self.prepared_sidebar = Default::default();
         self.task_activity_indicators = Rc::default();
     }
