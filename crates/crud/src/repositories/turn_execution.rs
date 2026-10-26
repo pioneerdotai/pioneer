@@ -251,6 +251,28 @@ pub async fn mark_running_owned<C: ConnectionTrait>(
     Ok(result.rows_affected == 1)
 }
 
+pub async fn claim_unactivated<C: ConnectionTrait>(
+    db: &C,
+    expected: &TurnExecutionRecord,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let generation = i64::try_from(expected.owner_generation)?;
+    let result = turn_execution::Entity::update_many()
+        .filter(turn_execution::Column::TurnId.eq(&expected.turn_id))
+        .filter(turn_execution::Column::ThreadId.eq(&expected.thread_id))
+        .filter(turn_execution::Column::WorkspaceId.eq(&expected.workspace_id))
+        .filter(turn_execution::Column::OwnerId.eq(&expected.owner_id))
+        .filter(turn_execution::Column::OwnerGeneration.eq(generation))
+        .filter(turn_execution::Column::LeaseUntil.gt(now))
+        .filter(turn_execution::Column::Status.is_in(["queued", "starting"]))
+        .filter(turn_execution::Column::StartedAt.is_null())
+        .col_expr(turn_execution::Column::Status, Expr::value("running"))
+        .col_expr(turn_execution::Column::UpdatedAt, Expr::value(now))
+        .exec(db)
+        .await?;
+    Ok(result.rows_affected == 1)
+}
+
 pub async fn mark_terminal<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,

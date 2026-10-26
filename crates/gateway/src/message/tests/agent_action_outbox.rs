@@ -518,3 +518,79 @@ async fn agent_action_outbox_ack_panic_after_commit_does_not_compensate_or_stop_
     .unwrap();
     writer.rollback().await.unwrap();
 }
+
+#[test]
+fn agent_start_proof_preserves_typed_storage_faults_without_retrying_semantic_denials() {
+    use crate::message::agent_action_tools::agent_start_proof_error;
+    use pioneer_crud::AgentActionOutboxFailure as Failure;
+    use sea_orm::{DbErr, RuntimeErr, SqlxError};
+    use std::borrow::Cow;
+
+    // SQLx's typed DatabaseError boundary, as used by the SQLite driver. The
+    // text is deliberately unrelated to the numeric IOERR code: classification
+    // must preserve the driver failure without inspecting its Display payload.
+    #[derive(Debug)]
+    struct DriverIo;
+    impl std::fmt::Display for DriverIo {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("private provider payload must not become diagnostics")
+        }
+    }
+    impl std::error::Error for DriverIo {}
+    impl sea_orm::sqlx::error::DatabaseError for DriverIo {
+        fn message(&self) -> &str {
+            "private provider payload must not become diagnostics"
+        }
+        fn code(&self) -> Option<Cow<'_, str>> {
+            Some("10".into()) // SQLITE_IOERR
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sea_orm::sqlx::error::ErrorKind {
+            sea_orm::sqlx::error::ErrorKind::Other
+        }
+    }
+    let driver = RuntimeErr::SqlxError(Arc::new(SqlxError::Database(Box::new(DriverIo))));
+    for storage in [
+        DbErr::Conn(driver.clone()),
+        DbErr::Query(driver.clone()),
+        DbErr::Exec(driver),
+        DbErr::ConnectionAcquire(sea_orm::ConnAcquireErr::Timeout),
+    ] {
+        for semantic in [Failure::AuthorityDenied, Failure::InvalidStart] {
+            let proof_error = agent_start_proof_error(
+                anyhow::Error::new(storage.clone()).context("context proof unavailable"),
+                semantic,
+            );
+            assert_eq!(
+                proof_error.downcast_ref::<Failure>(),
+                Some(&Failure::StorageUnavailable)
+            );
+            assert!(proof_error.downcast_ref::<DbErr>().is_some());
+            assert_eq!(
+                proof_error.downcast_ref::<Failure>().unwrap().safe_name(),
+                "outbox_storage_unavailable"
+            );
+        }
+    }
+    for semantic in [Failure::AuthorityDenied, Failure::InvalidStart] {
+        let malformed = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        for error in [
+            anyhow::anyhow!("confirmed permission denial"),
+            anyhow::Error::new(DbErr::RecordNotFound("missing admission".into())),
+            anyhow::Error::new(DbErr::Type("invalid persisted field".into())),
+            anyhow::Error::new(malformed),
+            anyhow::anyhow!("SQLITE_IOERR is merely untrusted text here"),
+        ] {
+            let proof_error = agent_start_proof_error(error, semantic);
+            assert_eq!(proof_error.downcast_ref::<Failure>(), Some(&semantic));
+        }
+    }
+}

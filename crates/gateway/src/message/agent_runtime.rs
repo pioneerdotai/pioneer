@@ -495,7 +495,7 @@ fn terminal_durable_event_status(event: &AgentDurableEvent) -> Option<TurnStatus
 
 // Same SeaORM -> SQLx driver chain used by the existing memory write mapper.
 // SQLite extended codes preserve the primary BUSY/LOCKED code in the low byte.
-fn native_preparation_has_typed_sqlite_lock(error: &anyhow::Error) -> bool {
+pub(super) fn native_preparation_has_typed_sqlite_lock(error: &anyhow::Error) -> bool {
     use sea_orm::{DbErr, RuntimeErr, SqlxError};
     let Some(db_error) = error.downcast_ref::<DbErr>() else {
         return false;

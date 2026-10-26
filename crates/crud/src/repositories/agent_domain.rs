@@ -5362,6 +5362,41 @@ pub async fn mark_agent_action_outbox_delivered<C: ConnectionTrait>(
     Ok(result.rows_affected == 1)
 }
 
+/// Fixed diagnostics only: provider errors and user payloads never enter the ledger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentActionOutboxFailure {
+    DeliveryFailed,
+    StorageUnavailable,
+    InvalidStart,
+    AuthorityDenied,
+    RuntimeUnavailable,
+    PreparationUnavailable,
+    ControlUnavailable,
+    OutcomeUnknown,
+    ForegroundConflict,
+}
+impl AgentActionOutboxFailure {
+    pub const fn safe_name(self) -> &'static str {
+        match self {
+            Self::DeliveryFailed => "outbox_delivery_failed",
+            Self::StorageUnavailable => "outbox_storage_unavailable",
+            Self::InvalidStart => "outbox_start_integrity_rejected",
+            Self::AuthorityDenied => "outbox_start_authority_denied",
+            Self::RuntimeUnavailable => "outbox_start_runtime_unavailable",
+            Self::PreparationUnavailable => "outbox_start_preparation_unavailable",
+            Self::ControlUnavailable => "outbox_runtime_control_unavailable",
+            Self::OutcomeUnknown => "outbox_start_outcome_unknown",
+            Self::ForegroundConflict => "outbox_foreground_conflict",
+        }
+    }
+}
+impl std::fmt::Display for AgentActionOutboxFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.safe_name())
+    }
+}
+impl std::error::Error for AgentActionOutboxFailure {}
+
 pub async fn mark_agent_action_outbox_failed<C: ConnectionTrait>(
     db: &C,
     outbox_id: &str,
@@ -5857,14 +5892,27 @@ pub async fn commit_agent_execution_graph(
     {
         bail!("agent execution graph grant differs from its exact child execution");
     }
-    if let Some(parent_execution_id) = child.parent_execution_id.as_deref() {
+    // Independent roots retain the source's launch ceiling without inheriting
+    // its lifecycle. The canonical StartAgent action proves that source at commit.
+    #[derive(serde::Deserialize)]
+    struct LaunchSource {
+        #[serde(default)]
+        source_execution_id: Option<String>,
+    }
+    let source_grant: LaunchSource = serde_json::from_str(&input.grant.grant_json)?;
+    let launch_source = child
+        .parent_execution_id
+        .as_deref()
+        .or(source_grant.source_execution_id.as_deref());
+    if let Some(parent_execution_id) = launch_source {
         let parent = agent_execution::Entity::find_by_id(parent_execution_id.to_owned())
             .one(db)
             .await
             .context("failed to load exact parent execution")?
             .context("exact parent execution does not exist")?;
         if parent.workspace_id != child.workspace_id
-            || parent.work_graph_root_execution_id != input.root_execution_id
+            || (child.parent_execution_id.is_some()
+                && parent.work_graph_root_execution_id != input.root_execution_id)
         {
             bail!("exact parent execution is outside the child work graph");
         }

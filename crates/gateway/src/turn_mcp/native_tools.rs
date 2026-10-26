@@ -324,9 +324,35 @@ pub(crate) async fn materialize_task_tools(
     processor: std::sync::Arc<crate::message::MessageProcessor>,
     context: pioneer_agent::TurnToolContext,
 ) -> Result<Vec<pioneer_tools::ToolExtensionBundle>, String> {
+    materialize_task_tools_internal(processor, context, false)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) async fn materialize_task_tools_with_proof(
+    processor: std::sync::Arc<crate::message::MessageProcessor>,
+    context: pioneer_agent::TurnToolContext,
+) -> anyhow::Result<Vec<pioneer_tools::ToolExtensionBundle>> {
+    materialize_task_tools_internal(processor, context, true).await
+}
+
+async fn materialize_task_tools_internal(
+    processor: std::sync::Arc<crate::message::MessageProcessor>,
+    context: pioneer_agent::TurnToolContext,
+    retain_proof_errors: bool,
+) -> anyhow::Result<Vec<pioneer_tools::ToolExtensionBundle>> {
     use pioneer_agent::TaskToolProvider;
-    let mut actions =
-        crate::message::agent_action_tools::materialize(processor.clone(), context.clone()).await?;
+    let mut actions = if retain_proof_errors {
+        crate::message::agent_action_tools::materialize_with_proof(
+            processor.clone(),
+            context.clone(),
+        )
+        .await?
+    } else {
+        crate::message::agent_action_tools::materialize(processor.clone(), context.clone())
+            .await
+            .map_err(anyhow::Error::msg)?
+    };
     for bundle in &mut actions.bundles {
         bundle.specs.retain(|spec| {
             pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&spec.spec.name.as_str())
@@ -337,13 +363,19 @@ pub(crate) async fn materialize_task_tools(
     }
     let provider =
         crate::task_tools::GatewayTaskToolProvider::for_cli(std::sync::Arc::downgrade(&processor));
-    let tasks = provider
-        .materialize_task_tools(pioneer_agent::TaskTurnContext {
-            workspace_id: context.workspace_id,
-            thread_id: context.thread_id,
-            turn_id: context.turn_id,
-        })
-        .await?;
+    let task_context = pioneer_agent::TaskTurnContext {
+        workspace_id: context.workspace_id,
+        thread_id: context.thread_id,
+        turn_id: context.turn_id,
+    };
+    let tasks = if retain_proof_errors {
+        provider.materialize_cli_task_tools(task_context).await?
+    } else {
+        provider
+            .materialize_task_tools(task_context)
+            .await
+            .map_err(anyhow::Error::msg)?
+    };
     actions.bundles.extend(tasks.bundles);
     Ok(actions.bundles)
 }

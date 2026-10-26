@@ -142,27 +142,44 @@ impl GatewayTaskToolProvider {
     }
 }
 
-#[async_trait]
-impl TaskToolProvider for GatewayTaskToolProvider {
-    fn terminal_cleanup_runtime_contract(&self) -> &'static str {
-        "pioneer.gateway.attached-task-cleanup.v1"
-    }
-
-    async fn materialize_task_tools(
+impl GatewayTaskToolProvider {
+    // Only the internal CLI catalog keeps infrastructure failures typed. The
+    // public TaskToolProvider contract and handler diagnostics remain unchanged.
+    pub(crate) async fn materialize_cli_task_tools(
         &self,
         context: TaskTurnContext,
-    ) -> Result<TaskToolMaterialization, String> {
-        let processor = self.processor()?;
-        let authorization = resolve_task_tool_authorization_scope(processor.as_ref(), &context)
-            .await
-            .map_err(|error| error.to_string())?;
+    ) -> anyhow::Result<TaskToolMaterialization> {
+        let processor = self.processor().map_err(anyhow::Error::msg)?;
+        #[cfg(test)]
+        processor
+            .wait_at_completed_history_preparation_barrier(
+                "__cli_agent_catalog_before_task_proof__",
+            )
+            .await;
+        let authorization = resolve_task_tool_action_scope_proof(
+            processor.as_ref(),
+            &context,
+            crate::authorization::ResourceAction::AgentTurnStart,
+        )
+        .await?;
         let can_create = authorization
-            .authorize_root_action(
+            .authorize_root_action_proof(
                 processor.crud_store.as_ref(),
                 crate::authorization::ResourceAction::TaskCreate,
             )
+            .await?;
+        self.materialize_admitted_task_tools(processor, context, authorization, can_create)
             .await
-            .is_ok();
+            .map_err(anyhow::Error::msg)
+    }
+
+    async fn materialize_admitted_task_tools(
+        &self,
+        processor: Arc<MessageProcessor>,
+        context: TaskTurnContext,
+        authorization: TaskToolAuthorizationScope,
+        can_create: bool,
+    ) -> Result<TaskToolMaterialization, String> {
         let agent_capabilities = processor
             .agent_action_binding(context.turn_id.as_str())
             .await
@@ -202,6 +219,32 @@ impl TaskToolProvider for GatewayTaskToolProvider {
             bundles: vec![bundle],
             diagnostics: Vec::new(),
         })
+    }
+}
+
+#[async_trait]
+impl TaskToolProvider for GatewayTaskToolProvider {
+    fn terminal_cleanup_runtime_contract(&self) -> &'static str {
+        "pioneer.gateway.attached-task-cleanup.v1"
+    }
+
+    async fn materialize_task_tools(
+        &self,
+        context: TaskTurnContext,
+    ) -> Result<TaskToolMaterialization, String> {
+        let processor = self.processor()?;
+        let authorization = resolve_task_tool_authorization_scope(processor.as_ref(), &context)
+            .await
+            .map_err(|error| error.to_string())?;
+        let can_create = authorization
+            .authorize_root_action(
+                processor.crud_store.as_ref(),
+                crate::authorization::ResourceAction::TaskCreate,
+            )
+            .await
+            .is_ok();
+        self.materialize_admitted_task_tools(processor, context, authorization, can_create)
+            .await
     }
 
     async fn attached_task_finalization_snapshot(
@@ -781,8 +824,19 @@ impl TaskToolAuthorizationScope {
         store: &CrudStore,
         action: crate::authorization::ResourceAction,
     ) -> Result<(), ToolError> {
+        match self.authorize_root_action_proof(store, action).await {
+            Ok(true) => Ok(()),
+            Ok(false) | Err(_) => Err(task_tool_authorization_error()),
+        }
+    }
+
+    async fn authorize_root_action_proof(
+        &self,
+        store: &CrudStore,
+        action: crate::authorization::ResourceAction,
+    ) -> anyhow::Result<bool> {
         if !self.granted_actions.contains(&action) {
-            return Err(task_tool_authorization_error());
+            return Ok(false);
         }
         let principal = &self.principal;
         let workspace_id = &self.workspace_id;
@@ -804,19 +858,19 @@ impl TaskToolAuthorizationScope {
         {
             Ok(crate::authorization::ProofResolution::Authorized(proof)) => {
                 crate::authorization::record_task_tool_decision(action, proof.decision());
-                Ok(())
+                Ok(true)
             }
             Ok(crate::authorization::ProofResolution::Denied(decision)) => {
                 crate::authorization::record_task_tool_decision(action, &decision);
-                Err(task_tool_authorization_error())
+                Ok(false)
             }
-            Err(_) => {
+            Err(error) => {
                 crate::authorization::record_authorization_unavailable(
                     action.safe_name(),
                     "thread",
                     "tool",
                 );
-                Err(task_tool_authorization_error())
+                Err(error)
             }
         }
     }
@@ -1232,14 +1286,7 @@ async fn resolve_task_tool_action_scope(
     context: &TaskTurnContext,
     action: crate::authorization::ResourceAction,
 ) -> Result<TaskToolAuthorizationScope, ToolError> {
-    let current = processor
-        .revalidate_tool_execution_authorization(
-            context.workspace_id.as_str(),
-            context.thread_id.as_str(),
-            context.turn_id.as_str(),
-            None,
-            action,
-        )
+    resolve_task_tool_action_scope_proof(processor, context, action)
         .await
         .map_err(|_| {
             crate::authorization::record_authorization_unavailable(
@@ -1248,16 +1295,31 @@ async fn resolve_task_tool_action_scope(
                 "tool",
             );
             task_tool_authorization_error()
-        })?;
+        })
+}
+
+async fn resolve_task_tool_action_scope_proof(
+    processor: &MessageProcessor,
+    context: &TaskTurnContext,
+    action: crate::authorization::ResourceAction,
+) -> anyhow::Result<TaskToolAuthorizationScope> {
+    let current = processor
+        .revalidate_tool_execution_authorization(
+            context.workspace_id.as_str(),
+            context.thread_id.as_str(),
+            context.turn_id.as_str(),
+            None,
+            action,
+        )
+        .await?;
     if current.resource_boundary()
         != crate::authorization::ExecutionResourceBoundary::RootThreadCapsule
     {
-        return Err(task_tool_authorization_error());
+        anyhow::bail!("task tools require their admitted root capsule");
     }
     let admission = processor
         .load_turn_execution_authorization_context(&context.turn_id)
-        .await
-        .map_err(|_| task_tool_authorization_error())?;
+        .await?;
     Ok(TaskToolAuthorizationScope {
         granted_actions: admission
             .granted_action_names()

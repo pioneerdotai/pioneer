@@ -91,6 +91,13 @@ impl MessageProcessor {
     }
 
     #[cfg(test)]
+    pub(crate) async fn wait_at_completed_history_preparation_barrier(&self, phase: &str) {
+        self.completed_history_preparation_barrier
+            .wait_if_armed(phase, &CancellationToken::new())
+            .await;
+    }
+
+    #[cfg(test)]
     pub(crate) fn release_completed_history_preparation_barrier(&self) {
         self.completed_history_preparation_barrier.release();
     }
