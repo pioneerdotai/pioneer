@@ -79,10 +79,10 @@ pub use repositories::administrative_audit::{
     NewAdministrativeAuditEvent, audit_action_to_db, audit_domain_to_db, audit_target_kind_to_db,
     insert_administrative_audit_event,
 };
-pub use repositories::agent_domain::AgentActionOutboxFailure;
 pub use repositories::agent_domain::{
-    AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS, AGENT_ACTION_OUTBOX_MAX_ATTEMPTS, AgentActionInput,
-    AgentActionLedgerCompactionSummary, AgentActionOutboxClaimBatch, AgentActionTimelineProjection,
+    AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS, AGENT_ACTION_OUTBOX_MAX_ATTEMPTS,
+    AGENT_START_RECONCILIATION_REQUIRED, AgentActionInput, AgentActionLedgerCompactionSummary,
+    AgentActionOutboxClaimBatch, AgentActionOutboxFailure, AgentActionTimelineProjection,
     AgentCommitInput, AgentDelegationRouteInput, AgentExecutionAuthorProjection,
     AgentExecutionGrantInput, AgentExecutionGraphCommitInput, AgentExecutionGraphCommitResult,
     AgentExecutionInput, AgentIdentityInput, AgentQueueEntryInput, AgentResourceCommitInput,
@@ -112,9 +112,9 @@ pub use repositories::agent_domain::{
     load_current_agent_authors_for_executions, load_current_agent_presentation_snapshot,
     load_native_agent_config, load_native_agent_config_by_system_key,
     mark_agent_action_outbox_delivered, mark_agent_action_outbox_failed,
-    promote_queued_agent_executions, record_agent_execution_progress,
-    reopen_agent_execution_for_retry, revoke_agent_delegation_route,
-    upgrade_agent_execution_grant_model_to_current, utc_now,
+    mark_agent_action_outbox_failed_with_cause, promote_queued_agent_executions,
+    record_agent_execution_progress, reopen_agent_execution_for_retry,
+    revoke_agent_delegation_route, upgrade_agent_execution_grant_model_to_current, utc_now,
     wake_agent_action_outbox_for_execution,
 };
 pub use repositories::agent_identity_catalog::{

@@ -174,9 +174,46 @@ async fn action_outbox_ranges_bound_mixed_work_and_share_final_cleanup_budget() 
 }
 
 #[tokio::test]
-async fn action_outbox_plans_use_both_partial_ranges_without_history_sort() {
+async fn action_outbox_plans_exclude_closed_refusals_from_small_and_empty_backlogs() {
     let db = database().await;
     let now = utc_now();
+    for index in 0..2048 {
+        let id = format!("terminal-refusal-{index:04}");
+        seed(
+            &db,
+            &id,
+            "failed",
+            1 + index % 7,
+            now - Duration::days(100),
+            None,
+        )
+        .await;
+        let mut closed: agent_action_outbox::ActiveModel = load(&db, &id).await.into();
+        closed.last_error = Set(Some(
+            AGENT_START_TERMINAL_FAILURE_CLASSES[index as usize % 5].into(),
+        ));
+        closed.update(&db).await.unwrap();
+    }
+    seed(&db, "small-immediate", "pending", 0, now, None).await;
+    seed(&db, "small-timed", "failed", 1, now, Some(now)).await;
+    let selected = discover_agent_action_outbox(&db, now, 2).await.unwrap();
+    assert_eq!(
+        selected
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>(),
+        ["small-immediate", "small-timed"]
+    );
+    let claimed = claim_agent_action_outbox_with_clock(&db, 2, &|| now)
+        .await
+        .unwrap();
+    assert_eq!(claimed.rows.len(), 2);
+    assert!(
+        discover_agent_action_outbox(&db, now, 2)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     for (sql, values, index) in [
         (
             AGENT_ACTION_OUTBOX_IMMEDIATE_SQL,
@@ -220,6 +257,111 @@ async fn action_outbox_plans_use_both_partial_ranges_without_history_sort() {
             );
         }
     }
+    // Ask SQLite to plan a wider range that includes closed refusals using the
+    // working index. A correctly narrowed partial index cannot serve it; the
+    // old index could, despite also appearing in the positive query plan above.
+    assert!(db.query_all_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+        "EXPLAIN QUERY PLAN SELECT id FROM agent_action_outbox INDEXED BY idx_agent_action_outbox_immediate WHERE next_attempt_at IS NULL AND status IN ('pending','failed') AND attempts<8 ORDER BY created_at,id LIMIT ?",
+        [32_u64.into()],
+    )).await.is_err());
+}
+
+#[tokio::test]
+async fn exhausted_discovery_uses_indexed_null_and_timed_ranges_with_a_large_closed_ledger() {
+    let db = database().await;
+    let now = utc_now();
+    for n in 0..2048 {
+        seed(
+            &db,
+            &format!("closed-{n:04}"),
+            if n % 2 == 0 { "delivered" } else { "failed" },
+            8,
+            now - Duration::days(100),
+            None,
+        )
+        .await;
+        seed_action_for_discovery(&db, &format!("closed-{n:04}"), "send_message", now).await;
+    }
+    for (id, due) in [("exhausted-null", None), ("exhausted-timed", Some(now))] {
+        seed(&db, id, "failed", 8, now, due).await;
+        let mut outbox: agent_action_outbox::ActiveModel = load(&db, id).await.into();
+        outbox.payload_json = Set(serde_json::json!({"kind":"start_agent",
+            "action_id":format!("action-{id}"),"execution_id":"fixture-owner"})
+        .to_string());
+        outbox.update(&db).await.unwrap();
+        seed_action_for_discovery(&db, id, "start_agent", now).await;
+    }
+    let sql = agent_action_outbox_timed_discovery_sql();
+    let plan = db
+        .query_all_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            format!("EXPLAIN QUERY PLAN {sql}"),
+            [
+                now.into(),
+                1_u64.into(),
+                now.into(),
+                1_u64.into(),
+                1_u64.into(),
+            ],
+        ))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.try_get::<String>("", "detail").unwrap())
+        .collect::<Vec<_>>();
+    let exhausted = plan
+        .iter()
+        .filter(|line| line.contains("idx_agent_action_outbox_exhausted"))
+        .collect::<Vec<_>>();
+    assert_eq!(exhausted.len(), 1, "{plan:?}");
+    assert!(
+        exhausted
+            .iter()
+            .all(|line| line.contains("SEARCH") && line.contains("<expr>")),
+        "{plan:?}"
+    );
+    assert!(
+        !plan
+            .iter()
+            .any(|line| line.starts_with("SCAN o") || line.starts_with("SCAN agent_action_outbox")),
+        "{plan:?}"
+    );
+    let first = claim_agent_action_outbox_with_clock(&db, 2, &|| now)
+        .await
+        .unwrap()
+        .rows;
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].id, "exhausted-null");
+    assert_eq!(first[0].attempts, 8);
+    let second = claim_agent_action_outbox_with_clock(&db, 2, &|| now)
+        .await
+        .unwrap()
+        .rows;
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].id, "exhausted-timed");
+    assert_eq!(second[0].attempts, 8);
+}
+
+async fn seed_action_for_discovery(
+    db: &DatabaseConnection,
+    id: &str,
+    kind: &str,
+    now: DateTimeWithTimeZone,
+) {
+    agent_action::ActiveModel {
+        id: Set(format!("action-{id}")),
+        execution_id: Set("fixture-owner".into()),
+        action_kind: Set(kind.into()),
+        idempotency_key: Set(id.into()),
+        request_fingerprint: Set(id.into()),
+        status: Set("committed".into()),
+        created_at: Set(now),
+        committed_at: Set(Some(now)),
+        response_json: Set(None),
+    }
+    .insert(db)
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
