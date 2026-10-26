@@ -906,6 +906,21 @@ impl ExecutionAdmissionService {
             actions.insert(action.safe_name().to_owned());
         }
 
+        // Creation is optional and belongs to the workspace, not to the
+        // existing source thread. Never lend a later collaborator's broader
+        // create rights to an execution that did not admit them.
+        for action in [
+            ResourceAction::ThreadCreatePrivate,
+            ResourceAction::ThreadCreateWorkspace,
+        ] {
+            if self
+                .root_action_allowed(principal, request, action, runtime_draft)
+                .await?
+            {
+                actions.insert(action.safe_name().to_owned());
+            }
+        }
+
         // Cross-conversation observation is a separate, initiator-admitted grant.
         // It is deliberately absent from the shared capsule's unconditional
         // runtime actions: a later collaborator must not lend this authority.
@@ -1072,22 +1087,35 @@ impl ExecutionAdmissionService {
         action: ResourceAction,
         runtime_draft: Option<&RuntimeDraftAccess>,
     ) -> Result<bool> {
-        let gate =
-            self.policy
-                .authorize_action(principal.kind, principal.role_key.as_ref(), action);
+        let source_action = if action.is_thread_creation() {
+            ResourceAction::ThreadRead
+        } else {
+            action
+        };
+        let gate = self.policy.authorize_action(
+            principal.kind,
+            principal.role_key.as_ref(),
+            source_action,
+        );
         let resolved = match runtime_draft {
             Some(access)
                 if access.workspace_id() == workspace_id
                     && access.thread_id() == root_thread_id =>
             {
                 self.resolver
-                    .authorize_runtime_draft(principal, &gate, action, access)
+                    .authorize_runtime_draft(principal, &gate, source_action, access)
                     .await
             }
             Some(_) => bail!("runtime draft differs from the execution root"),
             None => {
                 self.resolver
-                    .authorize_thread(principal, &gate, action, root_thread_id, Some(workspace_id))
+                    .authorize_thread(
+                        principal,
+                        &gate,
+                        source_action,
+                        root_thread_id,
+                        Some(workspace_id),
+                    )
                     .await
             }
         }
@@ -1097,7 +1125,21 @@ impl ExecutionAdmissionService {
                 action.safe_name()
             )
         })?;
-        Ok(matches!(resolved, ProofResolution::Authorized(_)))
+        if !matches!(resolved, ProofResolution::Authorized(_)) {
+            return Ok(false);
+        }
+        if action.is_thread_creation() {
+            let gate =
+                self.policy
+                    .authorize_action(principal.kind, principal.role_key.as_ref(), action);
+            return Ok(matches!(
+                self.resolver
+                    .authorize_workspace(principal, &gate, action, workspace_id)
+                    .await?,
+                ProofResolution::Authorized(_)
+            ));
+        }
+        Ok(true)
     }
 }
 
@@ -1349,6 +1391,20 @@ impl ExecutionAuthorizationContext {
 
     pub(crate) fn grants_action(&self, action: ResourceAction) -> bool {
         self.grant_manifest.allows_action(action)
+    }
+
+    /// Optional creation permissions in a new agent-origin Task admission may
+    /// only narrow its creator's immutable grants, even if the user's current
+    /// role can create more kinds of conversations.
+    pub(crate) fn constrain_thread_creation_grants(
+        &mut self,
+        source_actions: &BTreeSet<ResourceAction>,
+    ) {
+        self.grant_manifest.actions.retain(|name| {
+            ResourceAction::from_safe_name(name).is_none_or(|action| {
+                !action.is_thread_creation() || source_actions.contains(&action)
+            })
+        });
     }
 
     pub(crate) fn child_launch_executor_allowed(&self, executor: &str, cli: bool) -> bool {
@@ -3173,11 +3229,35 @@ impl ExecutionAuthorizationContext {
             &current_cap,
             pioneer_protocol::TurnPermissionProfileSource::TaskPermissionCap,
         );
+        let resolver = AuthorizationResolver::new(store.clone());
+        if action.is_thread_creation() {
+            // Source access and workspace creation are separate proofs.
+            if !matches!(
+                resolver
+                    .authorize_workspace(
+                        principal,
+                        &action_gate,
+                        action,
+                        self.workspace_id.as_str()
+                    )
+                    .await?,
+                ProofResolution::Authorized(_)
+            ) {
+                bail!("current collaborator cannot create this kind of thread in the workspace");
+            }
+        }
+        let source_action = if action.is_thread_creation() {
+            ResourceAction::ThreadRead
+        } else {
+            action
+        };
+        let source_gate =
+            policy.authorize_action(principal.kind, principal.role_key.as_ref(), source_action);
         let authorization = AuthorizationResolver::new(store.clone())
             .authorize_thread(
                 principal,
-                &action_gate,
-                action,
+                &source_gate,
+                source_action,
                 self.root_thread_id.as_str(),
                 Some(self.workspace_id.as_str()),
             )

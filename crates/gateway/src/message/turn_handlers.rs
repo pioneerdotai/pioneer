@@ -3943,31 +3943,19 @@ impl MessageProcessor {
             {
                 continue;
             }
-            // Thread actions and model options require explicit tool selection.
-            // Readers use their separate ThreadRead grant. CLI catalogs freeze
-            // at admission; request_tools cannot extend them afterwards.
-            if family == NativeToolFamily::Threads
-                && !thread_reader
-                && (!permission
-                    .effective_policy
-                    .allowed_tools
-                    .contains(&spec.spec.name)
-                    || permission
-                        .effective_policy
-                        .denied_tools
-                        .contains(&spec.spec.name))
-            {
-                continue;
+            let mut allowed = false;
+            for action in family.actions(&spec.spec.name)? {
+                allowed |= match authority {
+                    TurnExecutionAuthority::Fresh(admission) => {
+                        admission
+                            .project_root_action(self.crud_store.as_ref(), action)
+                            .await?
+                    }
+                    TurnExecutionAuthority::Durable { context, .. } => {
+                        context.grants_action(action)
+                    }
+                };
             }
-            let action = family.action(&spec.spec.name)?;
-            let allowed = match authority {
-                TurnExecutionAuthority::Fresh(admission) => {
-                    admission
-                        .project_root_action(self.crud_store.as_ref(), action)
-                        .await?
-                }
-                TurnExecutionAuthority::Durable { context, .. } => context.grants_action(action),
-            };
             if !allowed {
                 continue;
             }

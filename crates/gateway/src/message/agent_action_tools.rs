@@ -307,6 +307,27 @@ impl AgentActionRuntimeBinding {
                     .map_err(|message| anyhow::anyhow!(message))?,
             );
         }
+        let revision = processor.current_authorization_revision().await?;
+        let private = processor
+            .execution_leases
+            .revalidate_context(
+                processor.crud_store.as_ref(),
+                &authority,
+                crate::authorization::ResourceAction::ThreadCreatePrivate,
+                revision,
+            )
+            .await
+            .is_ok();
+        let workspace = processor
+            .execution_leases
+            .revalidate_context(
+                processor.crud_store.as_ref(),
+                &authority,
+                crate::authorization::ResourceAction::ThreadCreateWorkspace,
+                revision,
+            )
+            .await
+            .is_ok();
         let mut adapter = self.adapter.lock().await;
         adapter
             .replace_same_capsule_targets(same_capsule_targets)
@@ -324,6 +345,7 @@ impl AgentActionRuntimeBinding {
             allowed_mcp_server_ids,
             effective_permission_cap,
         );
+        adapter.restrict_thread_creation_options(&mut self.options, private, workspace);
         Ok(())
     }
 }
@@ -4586,6 +4608,24 @@ impl AgentActionToolHandler {
         let processor = self.processor.upgrade().ok_or_else(|| {
             ToolError::execution_failed("message processor is no longer available")
         })?;
+        let create_action = match audience {
+            pioneer_protocol::AgentThreadAudienceTemplate::HomeCapsule => {
+                crate::authorization::ResourceAction::ThreadCreatePrivate
+            }
+            pioneer_protocol::AgentThreadAudienceTemplate::RootDelegation => {
+                crate::authorization::ResourceAction::ThreadCreateWorkspace
+            }
+        };
+        processor
+            .revalidate_tool_execution_authorization(
+                &self.context.workspace_id,
+                &self.context.thread_id,
+                &self.context.turn_id,
+                None,
+                create_action,
+            )
+            .await
+            .map_err(|_| ToolError::execution_failed("agent_action_not_allowed"))?;
         let source_thread = processor
             .crud_store
             .get_thread_model(self.context.thread_id.as_str())

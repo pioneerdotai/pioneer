@@ -13,8 +13,17 @@ enum ChoiceCatalogResponse {
     Unavailable,
 }
 
+#[derive(Default)]
+struct ChoiceRuntimeProbe {
+    main_calls: AtomicUsize,
+    main_started: Notify,
+    release_main: Notify,
+    hold_main: std::sync::atomic::AtomicBool,
+}
+
 struct ChoiceModelsProvider {
     name: &'static str,
+    probe: Arc<ChoiceRuntimeProbe>,
     response: Arc<std::sync::RwLock<ChoiceCatalogResponse>>,
     inner: PromptParityCaptureProvider,
     extra_models: Arc<std::sync::atomic::AtomicUsize>,
@@ -29,13 +38,30 @@ impl Provider for ChoiceModelsProvider {
         self.inner.capabilities()
     }
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        if matches!(
+            prompt_parity_request_kind(&request),
+            Some(PromptParityRequestKind::Main)
+        ) {
+            self.probe.main_calls.fetch_add(1, Ordering::SeqCst);
+            self.probe.main_started.notify_one();
+            if self.probe.hold_main.load(Ordering::SeqCst) {
+                self.probe.release_main.notified().await;
+            }
+        }
         self.inner.chat(request).await
     }
     async fn stream_chat(
         &self,
         request: ChatRequest,
     ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
-        self.inner.stream_chat(request).await
+        let response = self.chat(request).await?;
+        Ok(futures_util::stream::iter(vec![
+            Ok(StreamChunk::delta(response.text)),
+            Ok(StreamChunk::final_chunk_with(
+                pioneer_provider::ProviderTermination::Complete,
+            )),
+        ])
+        .boxed())
     }
     async fn list_models(&self) -> anyhow::Result<Vec<pioneer_protocol::ProviderModelInfo>> {
         self.catalog_calls
@@ -105,11 +131,56 @@ async fn fixture_with_parent(
     TurnToolContext,
     pioneer_agent::TurnToolMaterialization,
 ) {
+    fixture_with_probe(
+        extra_models,
+        catalog_calls,
+        response,
+        cli_parent,
+        Default::default(),
+    )
+    .await
+}
+
+async fn fixture_with_probe(
+    extra_models: Arc<std::sync::atomic::AtomicUsize>,
+    catalog_calls: Arc<std::sync::atomic::AtomicUsize>,
+    response: Arc<std::sync::RwLock<ChoiceCatalogResponse>>,
+    cli_parent: bool,
+    probe: Arc<ChoiceRuntimeProbe>,
+) -> (
+    Arc<MessageProcessor>,
+    TurnToolContext,
+    pioneer_agent::TurnToolMaterialization,
+) {
+    fixture_with_principal_probe(
+        extra_models,
+        catalog_calls,
+        response,
+        cli_parent,
+        probe,
+        false,
+    )
+    .await
+}
+
+async fn fixture_with_principal_probe(
+    extra_models: Arc<std::sync::atomic::AtomicUsize>,
+    catalog_calls: Arc<std::sync::atomic::AtomicUsize>,
+    response: Arc<std::sync::RwLock<ChoiceCatalogResponse>>,
+    cli_parent: bool,
+    probe: Arc<ChoiceRuntimeProbe>,
+    member: bool,
+) -> (
+    Arc<MessageProcessor>,
+    TurnToolContext,
+    pioneer_agent::TurnToolMaterialization,
+) {
     let (workspaces, store, workspace) = setup_workspace_manager().await;
     let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         Arc::new(ChoiceModelsProvider {
             name: "openai",
+            probe,
             response,
             inner: PromptParityCaptureProvider::with_visible_tools(vec![]),
             extra_models,
@@ -135,7 +206,7 @@ async fn fixture_with_parent(
     } else {
         processor
     });
-    let context = TurnToolContext {
+    let mut context = TurnToolContext {
         workspace_id: workspace.clone(),
         thread_id: "choices-root".into(),
         turn_id: "choices-parent".into(),
@@ -147,49 +218,153 @@ async fn fixture_with_parent(
         &context.turn_id,
     )
     .await;
-    if cli_parent {
-        sync_test_cli_runtime_identities(&processor).await.unwrap();
-        persist_test_cli_execution_authorization_context(
-            processor.crud_store.as_ref(),
-            &workspace,
-            &context.thread_id,
-            &context.turn_id,
-            "codex",
-            "codex",
-        )
-        .await;
-    } else {
-        let mut authority = processor
-            .load_turn_execution_authorization_context(&context.turn_id)
-            .await
-            .unwrap();
-        authority.bind_test_provider_authority(
-            "openai",
-            "gpt-5.4",
-            processor
-                .provider_registry
-                .authority_fingerprint_for_workspace(&workspace, "openai")
-                .unwrap()
-                .as_str(),
+    let mut principal = (*authenticated_test_superuser()).clone();
+    let mut permission = default_test_permission_profile();
+    if member {
+        const MEMBER: &str = "P0000000000000000000M";
+        principal.principal_id = pioneer_protocol::PrincipalId::new(MEMBER).unwrap();
+        principal.kind = pioneer_protocol::PrincipalKind::User;
+        principal.role_key = Some(pioneer_protocol::RoleKey::member());
+        permission = pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+            pioneer_protocol::TurnPermissionMode::Supervised,
+            pioneer_protocol::TurnPermissionProfileSource::Composer,
         );
+        processor.crud_store.database_connection().execute_unprepared(&format!(
+            "INSERT INTO gateway_principal(id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,created_at,updated_at) \
+             VALUES('{MEMBER}','{}','user','member','active','Threads Member','threads-member','threads-member',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP); \
+             INSERT INTO workspace_membership(principal_id,workspace_id,granted_by_actor_kind,created_at,updated_at) \
+             VALUES('{MEMBER}','{workspace}','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP); \
+             INSERT INTO thread_membership(thread_id,principal_id,added_by_actor_kind,created_at,updated_at) \
+             VALUES('{}','{MEMBER}','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            crate::session::test_support::TEST_GATEWAY_ID, context.thread_id)).await.unwrap();
+        let mut old_turn = processor
+            .crud_store
+            .get_turn(&context.thread_id, &context.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        old_turn.status = TurnStatus::Completed;
         processor
             .crud_store
-            .set_turn_execution_authorization_context(
-                &context.turn_id,
-                &authority.to_persisted_json().unwrap(),
+            .materialize_native_agent_turn_event(
+                pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(
+                    pioneer_protocol::TurnCompletedNotification {
+                        workspace_id: workspace.clone(),
+                        thread_id: context.thread_id.clone(),
+                        turn: old_turn.clone(),
+                    },
+                ),
+                now_timestamp_secs(),
+                None,
+            )
+            .await
+            .unwrap();
+        context.turn_id = "choices-member-parent".into();
+        let mut turn = old_turn;
+        turn.id = context.turn_id.clone();
+        turn.status = TurnStatus::InProgress;
+        turn.permission_profile = permission.clone();
+        turn.author = crate::message::message_turn::resolve_turn_author_snapshot(
+            processor.crud_store.as_ref(),
+            &pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
+        )
+        .await
+        .unwrap();
+        let thread = processor
+            .crud_store
+            .get_thread_model(&context.thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        processor
+            .crud_store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
             )
             .await
             .unwrap();
     }
+    if cli_parent {
+        sync_test_cli_runtime_identities(&processor).await.unwrap();
+    }
+    let provider = if cli_parent {
+        "cli_runtime:codex"
+    } else {
+        "openai"
+    };
+    let model = if cli_parent { "test-model" } else { "gpt-5.4" };
+    let backend = if cli_parent {
+        AgentExecutionBackend::CLIAgentRuntime {
+            runtime_id: "codex".into(),
+            runtime_kind: CLIAgentRuntimeKind::Codex,
+        }
+    } else {
+        AgentExecutionBackend::ApiProvider {
+            provider: "openai".into(),
+        }
+    };
+    let params: TurnStartParams = serde_json::from_value(json!({
+        "thread_id":context.thread_id, "turn_id":context.turn_id, "input":[],
+        "model":model, "model_provider":provider, "execution_backend":backend,
+    }))
+    .unwrap();
+    let request = crate::authorization::ExecutionAdmissionRequest::for_turn(
+        crate::authorization::ExecutionAdmissionEntryPoint::InteractiveTurn,
+        crate::authorization::ResourceAction::AgentTurnStart,
+        Vec::new(),
+        &workspace,
+        &context.thread_id,
+        provider,
+        model,
+        &params,
+        &[],
+        if cli_parent {
+            None
+        } else {
+            Some(
+                processor
+                    .provider_registry
+                    .authority_fingerprint_for_workspace(&workspace, "openai")
+                    .unwrap()
+                    .as_str()
+                    .to_owned(),
+            )
+        },
+    )
+    .unwrap();
+    let authority =
+        crate::authorization::ExecutionAdmissionService::new(processor.crud_store.as_ref().clone())
+            .admit_context(
+                &principal,
+                processor.current_authorization_revision().await.unwrap(),
+                &request,
+                Some(&pioneer_protocol::task_permission_cap_from_snapshot(
+                    &permission,
+                )),
+            )
+            .await
+            .unwrap();
     processor
         .crud_store
-        .set_turn_execution_security_snapshot(
+        .set_turn_execution_authorization_context(
             &context.turn_id,
-            &pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(
-                "/tmp/project",
-                pioneer_crud::utc_now().timestamp_millis(),
-            ),
+            &authority.to_persisted_json().unwrap(),
         )
+        .await
+        .unwrap();
+    let mut security = pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(
+        "/tmp/project",
+        pioneer_crud::utc_now().timestamp_millis(),
+    );
+    security.permission_profile = permission;
+    processor
+        .crud_store
+        .set_turn_execution_security_snapshot(&context.turn_id, &security)
         .await
         .unwrap();
     let now = pioneer_crud::utc_now();
@@ -311,7 +486,7 @@ async fn invoke_with_mutation(
     Ok(output.raw_json())
 }
 
-async fn call(
+pub(super) async fn call(
     tools: &pioneer_agent::TurnToolMaterialization,
     name: &str,
     id: &str,
@@ -595,6 +770,7 @@ async fn cli_parent_selects_only_unambiguous_api_choices_for_threads_and_tasks()
                     "anthropic",
                     Arc::new(ChoiceModelsProvider {
                         name: "anthropic",
+                        probe: Default::default(),
                         response: response.clone(),
                         inner: PromptParityCaptureProvider::with_visible_tools(vec![]),
                         extra_models: Default::default(),
@@ -1626,4 +1802,82 @@ async fn webhook_task_tools_create_get_and_replay_require_current_task_read() {
         .await;
         assert_eq!(restored["webhookUrl"], replay["webhookUrl"]);
     }
+}
+
+#[tokio::test]
+async fn member_creation_uses_both_workspace_variants_and_revocation_fences_the_shared_handler() {
+    let (processor, context, tools) = fixture_with_principal_probe(
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        false,
+        Default::default(),
+        true,
+    )
+    .await;
+    let binding = processor
+        .agent_action_binding(&context.turn_id)
+        .await
+        .unwrap();
+    let authority = processor
+        .load_turn_execution_authorization_context(&context.turn_id)
+        .await
+        .unwrap();
+    for (index, label) in ["Current collaboration", "New delegated root"]
+        .into_iter()
+        .enumerate()
+    {
+        let option = binding
+            .options
+            .thread_creation_options
+            .iter()
+            .find(|option| option.label == label)
+            .unwrap();
+        let result = call(
+            &tools,
+            "thread_create",
+            &format!("member-create-{index}"),
+            json!({"optionId":option.id}),
+        )
+        .await;
+        assert_eq!(result["status"], "accepted");
+    }
+    assert!(
+        invoke_with_mutation(
+            &tools,
+            "thread_create",
+            "member-invalid-option",
+            json!({"optionId":"O00000000000000000000"}),
+            None
+        )
+        .await
+        .is_err()
+    );
+    let option = binding.options.thread_creation_options[0].id.clone();
+    processor.crud_store.database_connection().execute_unprepared(&format!(
+        "DELETE FROM workspace_membership WHERE principal_id='P0000000000000000000M' AND workspace_id='{}'", context.workspace_id,
+    )).await.unwrap();
+    assert!(
+        invoke_with_mutation(
+            &tools,
+            "thread_create",
+            "member-revoked-create",
+            json!({"optionId":option}),
+            None
+        )
+        .await
+        .is_err()
+    );
+    let db = processor.crud_store.database_connection();
+    assert!(
+        pioneer_crud::load_agent_action_outbox(
+            &db,
+            crate::authorization::action_id_for_call("member-revoked-create").as_str()
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(authority.grants_action(crate::authorization::ResourceAction::ThreadCreatePrivate));
+    assert!(authority.grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace));
 }

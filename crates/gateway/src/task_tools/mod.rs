@@ -881,12 +881,13 @@ impl TaskToolAuthorizationScope {
             .agent_spec
             .as_ref()
             .and_then(|spec| spec.permission_cap.as_ref());
-        let context = crate::authorization::ExecutionAdmissionService::new(
+        let mut context = crate::authorization::ExecutionAdmissionService::new(
             processor.crud_store.as_ref().clone(),
         )
         .admit_context(principal, revision, &request, requested_permission_cap)
         .await
         .map_err(|_| task_tool_authorization_error())?;
+        context.constrain_thread_creation_grants(&self.granted_actions);
         Ok(Some(pioneer_tasks::TaskExecutionAdmissionSeed {
             workspace_id: context.workspace_id().to_owned(),
             root_thread_id: context.root_thread_id().to_owned(),
@@ -3006,6 +3007,7 @@ impl TaskToolHandler {
                 &authorization.principal,
                 Some(authorization.root_thread_id.as_str()),
                 params.task_id.as_str(),
+                Some(&authorization.granted_actions),
             )
             .await
             .map_err(|_| task_tool_authorization_error())?;

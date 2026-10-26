@@ -107,6 +107,22 @@ impl NativeToolFamily {
         }
     }
 
+    // Creation has two existing workspace-scoped variants. Catalog projection
+    // accepts either; the handler rechecks the exact server-issued option.
+    pub(crate) fn actions(
+        self,
+        name: &str,
+    ) -> Result<Vec<ResourceAction>, pioneer_tools::ToolError> {
+        if self == Self::Threads && name == "thread_create" {
+            Ok(vec![
+                ResourceAction::ThreadCreatePrivate,
+                ResourceAction::ThreadCreateWorkspace,
+            ])
+        } else {
+            self.action(name).map(|action| vec![action])
+        }
+    }
+
     pub(crate) fn action(self, name: &str) -> Result<ResourceAction, pioneer_tools::ToolError> {
         match self {
             Self::Html => Ok(ResourceAction::McpUse),
