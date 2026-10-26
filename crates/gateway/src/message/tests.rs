@@ -43011,6 +43011,7 @@ async fn terminal_turn_interruption_closes_running_execution_window() {
             turn_id: turn_id.to_owned(),
             reason: "user cancelled".to_owned(),
             recovery: None,
+            cancellation_owner: None,
         })
         .await;
 

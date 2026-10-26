@@ -4744,17 +4744,35 @@ impl AgentActionToolHandler {
         // durable commit. Every fallible identity, authority, presentation,
         // graph and outbox preparation step above therefore leaves no phantom
         // child Turn behind when it fails.
-        let outcome = processor
-            .thread_manager
-            .concurrent_agent_turn_start_with_permission_profile(
-                params.clone(),
-                permission_profile,
-                child.authored_turn.author.clone(),
-            )
-            .await
-            .map_err(|error| {
-                ToolError::execution_failed(format!("failed to prepare child Agent: {error:#}"))
-            })?;
+        let outcome = if user_root {
+            processor
+                .thread_manager
+                .agent_turn_start_with_permission_profile(
+                    params.clone(),
+                    permission_profile,
+                    child.authored_turn.author.clone(),
+                )
+                .await
+        } else {
+            processor
+                .thread_manager
+                .concurrent_agent_turn_start_with_permission_profile(
+                    params.clone(),
+                    permission_profile,
+                    child.authored_turn.author.clone(),
+                )
+                .await
+        }
+        .map_err(|error| {
+            if error
+                .downcast_ref::<crate::thread::ForegroundTurnConflict>()
+                .is_some()
+            {
+                ToolError::execution_failed(AgentPublicOutcome::AgentActionConflict.as_str())
+            } else {
+                ToolError::execution_failed(format!("failed to prepare Agent: {error:#}"))
+            }
+        })?;
         let graph_result = match processor
             .crud_store
             .materialize_agent_turn_start_with_graph_and_action(

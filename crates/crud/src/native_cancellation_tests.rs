@@ -2961,3 +2961,381 @@ async fn native_recovery_pre_start_and_refusal_share_attempt_owner_and_terminal_
         }
     }
 }
+
+async fn unactivated_fixture(
+    suffix: &str,
+) -> (
+    CrudStore,
+    Turn,
+    pioneer_protocol::NativeTerminalEffectPreparation,
+    crate::TurnExecutionRecord,
+) {
+    let workspace = format!("ws_early_{suffix}");
+    let thread = format!("thread_early_{suffix}");
+    let turn_id = format!("turn_early_{suffix}");
+    let store = test_store_with_workspace(&workspace).await;
+    let (store, _, turn) = start_test_turn(store, &workspace, &thread, &turn_id).await;
+    repositories::turn_execution::insert_immutable(
+        &store.connection,
+        crate::NewTurnExecution {
+            turn_id: turn_id.clone(),
+            thread_id: thread.clone(),
+            workspace_id: workspace.clone(),
+            executor_kind: crate::TurnExecutorKind::ApiProvider,
+            executor_key: Some("openai".into()),
+            status: crate::TurnExecutionStatus::Starting,
+            owner_id: OWNER.into(),
+            lease_until: unix_to_datetime(NOW + 100),
+            created_at: unix_to_datetime(NOW),
+        },
+    )
+    .await
+    .unwrap();
+    let expected = store.get_turn_execution(&turn_id).await.unwrap().unwrap();
+    let plan = cleanup_effect_preparation(&workspace, &thread, &turn_id, "original");
+    (store, turn, plan, expected)
+}
+
+#[tokio::test]
+async fn accepted_unactivated_stop_and_activation_share_a_durable_writer_fence() {
+    for claim_before_stop in [false, true] {
+        let suffix = if claim_before_stop {
+            "claimed"
+        } else {
+            "starting"
+        };
+        let (store, turn, plan, expected) = unactivated_fixture(suffix).await;
+        if claim_before_stop {
+            assert!(
+                store
+                    .claim_unactivated_agent_turn(&expected, unix_to_datetime(NOW))
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !store
+                    .claim_unactivated_agent_turn(&expected, unix_to_datetime(NOW))
+                    .await
+                    .unwrap()
+            );
+        }
+        let event = interrupted(&turn, &plan, "Stop before runtime");
+        store
+            .materialize_unactivated_turn_cancellation_owned_as(
+                event.clone(),
+                NOW + 1,
+                expected.clone(),
+                OWNER,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_turn(&plan.thread_id, &turn.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .status,
+            TurnStatus::Interrupted
+        );
+        assert_eq!(
+            store
+                .get_turn_execution(&turn.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::TurnExecutionStatus::Interrupted
+        );
+        assert!(
+            store
+                .native_cancellation_context(&turn.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .persist_native_cancellation_context(plan.clone(), OWNER, NOW + 2, true)
+                .await
+                .is_err()
+        );
+        assert!(
+            !store
+                .claim_unactivated_agent_turn(&expected, unix_to_datetime(NOW + 2))
+                .await
+                .unwrap()
+        );
+        store
+            .materialize_unactivated_turn_cancellation_owned_as(
+                event,
+                NOW + 2,
+                expected,
+                OWNER,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    // Both real writer contenders are legal; exactly one may accept its fence.
+    let (store, turn, plan, expected) = unactivated_fixture("race").await;
+    let stop_event = interrupted(&turn, &plan, "racing Stop");
+    let (stop, activation) = tokio::join!(
+        store.materialize_unactivated_turn_cancellation_owned_as(
+            stop_event,
+            NOW + 1,
+            expected,
+            OWNER,
+            None
+        ),
+        store.persist_native_cancellation_context(plan.clone(), OWNER, NOW + 1, true),
+    );
+    assert_ne!(stop.is_ok(), activation.is_ok());
+    if stop.is_ok() {
+        assert!(
+            store
+                .native_cancellation_context(&turn.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_turn_execution(&turn.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::TurnExecutionStatus::Interrupted
+        );
+    } else {
+        assert!(
+            store
+                .native_cancellation_context(&turn.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        cancel(&store, &turn, &plan, "ordinary activated Stop")
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn early_stop_never_bypasses_an_activated_owner_or_missing_immutable_context() {
+    let (store, turn, plan, expected) = unactivated_fixture("active_missing").await;
+    assert!(
+        store
+            .mark_turn_execution_running_owned(&turn.id, OWNER, NOW, NOW + 100)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .materialize_unactivated_turn_cancellation_owned_as(
+                interrupted(&turn, &plan, "invalid early Stop"),
+                NOW + 1,
+                expected,
+                OWNER,
+                None,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .get_turn(&plan.thread_id, &turn.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::InProgress
+    );
+    assert_eq!(
+        store
+            .get_turn_execution(&turn.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        crate::TurnExecutionStatus::Running
+    );
+    assert!(
+        store
+            .native_cancellation_context(&turn.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn unactivated_refusal_and_stop_preserve_activation_terminal_results_and_recovery_ownership()
+{
+    // Deterministically exercise activation winning the cancellation fence.
+    let (store, turn, plan, expected) = unactivated_fixture("activation_first").await;
+    store
+        .persist_native_cancellation_context(plan.clone(), OWNER, NOW, true)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .materialize_unactivated_turn_cancellation_owned_as(
+                interrupted(&turn, &plan, "late early Stop"),
+                NOW + 1,
+                expected.clone(),
+                OWNER,
+                None,
+            )
+            .await
+            .is_err()
+    );
+    let mut refused = turn.clone();
+    refused.status = TurnStatus::Failed;
+    refused.error = Some("outbox_start_integrity_rejected".into());
+    assert!(
+        store
+            .materialize_unactivated_turn_refusal_owned(
+                CanonicalTurnEventPayload::TurnFailed(TurnFailedNotification {
+                    workspace_id: plan.workspace_id.clone(),
+                    thread_id: plan.thread_id.clone(),
+                    turn: refused,
+                }),
+                NOW + 1,
+                expected,
+            )
+            .await
+            .is_err()
+    );
+    cancel(&store, &turn, &plan, "ordinary activated cancellation")
+        .await
+        .unwrap();
+
+    // A previously accepted completion cannot become an early interruption.
+    let (store, turn, plan, expected) = unactivated_fixture("terminal_first").await;
+    let mut completed = turn.clone();
+    completed.status = TurnStatus::Completed;
+    store
+        .materialize_native_agent_turn_event_owned(
+            CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
+                workspace_id: plan.workspace_id.clone(),
+                thread_id: plan.thread_id.clone(),
+                turn: completed,
+            }),
+            NOW,
+            None,
+            OWNER,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .materialize_unactivated_turn_cancellation_owned_as(
+                interrupted(&turn, &plan, "late Stop"),
+                NOW + 1,
+                expected,
+                OWNER,
+                None,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .get_turn(&plan.thread_id, &turn.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::Completed
+    );
+
+    // Late delivery refusal belongs to the old owner/generation, never to a
+    // recovery which has already claimed the durable execution.
+    let (store, turn, plan, expected) = unactivated_fixture("new_owner").await;
+    let replacement = store
+        .claim_expired_turn_execution(&expected, "replacement-owner", NOW + 101, NOW + 201)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(replacement.owner_generation > expected.owner_generation);
+    let mut refused = turn.clone();
+    refused.status = TurnStatus::Failed;
+    refused.error = Some("outbox_foreground_conflict".into());
+    assert!(
+        store
+            .materialize_unactivated_turn_refusal_owned(
+                CanonicalTurnEventPayload::TurnFailed(TurnFailedNotification {
+                    workspace_id: plan.workspace_id.clone(),
+                    thread_id: plan.thread_id.clone(),
+                    turn: refused,
+                }),
+                NOW + 102,
+                expected,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store.get_turn_execution(&turn.id).await.unwrap().unwrap(),
+        replacement
+    );
+    assert_eq!(
+        store
+            .get_turn(&plan.thread_id, &turn.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::InProgress
+    );
+
+    // The bounded phase fallback must fence generation even if recovery keeps
+    // the same process owner ID and a real immutable context already exists.
+    let (store, turn, plan, expected) = unactivated_fixture("same_owner_generation").await;
+    store
+        .persist_native_cancellation_context(plan.clone(), OWNER, NOW, true)
+        .await
+        .unwrap();
+    let context = store
+        .native_cancellation_context(&turn.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let replacement = store
+        .claim_expired_turn_execution(&expected, OWNER, NOW + 101, NOW + 201)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(replacement.owner_generation > expected.owner_generation);
+    assert!(
+        store
+            .materialize_native_cancellation_owned_at_generation(
+                interrupted(&turn, &plan, "old phase Stop"),
+                NOW + 102,
+                context,
+                plan.clone(),
+                OWNER,
+                None,
+                expected.owner_generation,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        !store
+            .native_turn_has_accepted_terminal(&turn.id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.get_turn_execution(&turn.id).await.unwrap().unwrap(),
+        replacement
+    );
+}

@@ -4373,8 +4373,12 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
             CLIAgentRuntimeKind::Claude,
             CLIAgentRuntimeKind::OpenCode,
         ] {
-            let (harness, processor, turn) =
-                start_threads_cli_fixture(kind, &["threads_search"]).await;
+            let (harness, processor, turn) = start_task_cli_fixture_with_models(
+                kind,
+                pioneer_tasks::TaskRuntimeConfig::default(),
+                &["threads-cli-choice"],
+            )
+            .await;
             let bindings = processor
                 .crud_store
                 .list_turn_mcp_bindings(&turn)
@@ -4387,10 +4391,17 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
                     .count(),
                 1
             );
+            let authority = processor
+                .load_turn_execution_authorization_context(&turn)
+                .await
+                .unwrap();
+            let permission =
+                pioneer_protocol::task_permission_cap_snapshot(authority.permission_profile_cap());
+            assert!(permission.effective_policy.allowed_tools.is_empty());
+            assert!(!permission.effective_policy.allowed_tools_restricted);
             assert!(
-                !bindings
-                    .iter()
-                    .any(|tool| tool.raw_tool_name == "threads_search")
+                authority
+                    .grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace)
             );
             for tool in bindings.iter().filter(|tool| {
                 pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&tool.raw_tool_name.as_str())
@@ -4457,7 +4468,7 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
                 .unwrap()
                 .iter()
                 .filter(|thread| {
-                    thread["parentThreadId"] == format!("cli_threads_{kind:?}").to_lowercase()
+                    thread["parentThreadId"] == format!("cli_tasks_{kind:?}").to_lowercase()
                 })
                 .collect::<Vec<_>>();
             assert_eq!(
@@ -4552,11 +4563,40 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
                 effort.as_str().unwrap()
             );
             assert_eq!(payload["dispatch"]["identity"]["id"], identity);
+            harness
+                .cli_session
+                .set_next_native_turn_id("threads-facade-explicit-child")
+                .await;
+            crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                .await
+                .unwrap();
+            let calls = wait_for_cli_runtime_turn_starts(&harness.cli_session, 2).await;
+            assert_eq!(calls[1].model.as_deref(), model["id"].as_str());
+            assert_eq!(calls[1].effort.as_deref(), effort.as_str());
             // One replayed start has one persisted child execution and payload.
             assert_eq!(replay["outcome"], "agent_action_already_committed");
-            let denied = facade.facade.handle_message(&facade.context, json!({"jsonrpc":"2.0","id":"denied","method":"tools/call","params":{"name":"threads_search","arguments":{"query":"test","limit":1}}})).await.unwrap();
-            assert_eq!(denied["error"]["data"]["kind"], "tool_unbound");
         }
+        let (_harness, processor, turn) =
+            start_threads_cli_fixture(CLIAgentRuntimeKind::Codex, &["threads_search"]).await;
+        assert!(
+            !processor
+                .crud_store
+                .list_turn_mcp_bindings(&turn)
+                .await
+                .unwrap()
+                .iter()
+                .any(|binding| binding.raw_tool_name == "threads_search")
+        );
+        let denied = ThreadsFacade::new(&processor, &turn, CLIAgentRuntimeKind::Codex)
+            .await
+            .call_response(
+                "denied-search",
+                "denied-search",
+                "threads_search",
+                json!({"query":"test","limit":1}),
+            )
+            .await;
+        assert_eq!(denied["error"]["data"]["kind"], "tool_unbound");
         let (_harness, processor, turn) =
             start_threads_cli_fixture(CLIAgentRuntimeKind::Codex, &["threads_start_options"]).await;
         let bindings = processor

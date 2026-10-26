@@ -1364,7 +1364,7 @@ pub use crate::repositories::execution_admission_lease::{
     ExecutionQuotaCeilings, NewExecutionAdmissionLease,
 };
 pub use crate::repositories::native_cancellation_context::{
-    NativeCancellationContext, NativeCancellationContextUnavailable,
+    NativeCancellationContext, NativeCancellationContextUnavailable, UnactivatedTurnPhaseChanged,
 };
 pub use crate::repositories::native_terminal_effect_outbox::{
     HandlerCheckpointInvalid, NativeTerminalEffectStats,
@@ -2084,6 +2084,8 @@ struct TurnEventProjectionContext {
     enqueue_optional_deliveries: bool,
     #[serde(skip)]
     native_cancellation: Option<PreparedNativeCancellation>,
+    #[serde(skip)]
+    unactivated_terminal: Option<TurnExecutionRecord>,
     #[serde(skip)]
     cancellation_actor_id: Option<String>,
 }
@@ -6217,6 +6219,14 @@ impl CrudStore {
                 .begin()
                 .await
                 .context("failed to begin CLI runtime initial attempt transaction")?;
+            anyhow::ensure!(
+                !turn_event_projection_stream_state::has_accepted_terminal(
+                    &transaction,
+                    &binding.turn_id
+                )
+                .await?,
+                "CLI initial attempt cannot activate an accepted terminal Turn"
+            );
             let existing_binding =
                 cli_runtime_binding::find_turn_binding(&transaction, binding.turn_id.as_str())
                     .await?;
@@ -16747,6 +16757,64 @@ impl CrudStore {
                     .context("failed to commit AgentExecution finalization transaction")?;
                 Ok(finalized)
             }
+        })
+        .await
+    }
+
+    /// Outbox replay may release only the exact terminal Turn generation it
+    /// observed. An explicit resume/recovery must not lose its new resources
+    /// to a delayed delivery ACK or failure-cleanup callback.
+    pub async fn finalize_terminal_agent_turn_owned(
+        &self,
+        expected: &TurnExecutionRecord,
+        execution_id: &str,
+        now: DateTimeWithTimeZone,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            let tx = self.connection.begin().await?;
+            let Some(current) = turn_execution::find(&tx, &expected.turn_id).await? else {
+                return Ok(false);
+            };
+            if current.owner_id != expected.owner_id
+                || current.owner_generation != expected.owner_generation
+                || current.thread_id != expected.thread_id
+                || current.workspace_id != expected.workspace_id
+                || !turn_event_projection_stream_state::has_accepted_terminal(
+                    &tx,
+                    &expected.turn_id,
+                )
+                .await?
+            {
+                return Ok(false);
+            }
+            let (turn_status, graph_status) = match current.status {
+                TurnExecutionStatus::Completed => (TurnStatus::Completed, "completed"),
+                TurnExecutionStatus::Failed => (TurnStatus::Failed, "failed"),
+                TurnExecutionStatus::Interrupted => (TurnStatus::Interrupted, "cancelled"),
+                TurnExecutionStatus::Blocked => (TurnStatus::Blocked, "blocked"),
+                _ => return Ok(false),
+            };
+            let saved = turn::find_turn_by_thread_and_id(&tx, &current.thread_id, &current.turn_id)
+                .await?
+                .context("terminal Agent Turn disappeared")?;
+            let response =
+                repositories::agent_domain::load_agent_turn_response(&tx, &current.turn_id)
+                    .await?
+                    .context("terminal Agent Turn response disappeared")?;
+            if turn_status_from_db(&saved.status) != Some(turn_status)
+                || response.execution_id != execution_id
+            {
+                return Ok(false);
+            }
+            repositories::agent_domain::finalize_agent_execution(
+                &tx,
+                execution_id,
+                graph_status,
+                now,
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(true)
         })
         .await
     }
@@ -27520,6 +27588,50 @@ impl CrudStore {
         owner_id: &str,
         cancellation_actor_id: Option<String>,
     ) -> Result<()> {
+        self.materialize_native_cancellation_with_generation(
+            event,
+            now_unix,
+            context,
+            preparation,
+            owner_id,
+            cancellation_actor_id,
+            None,
+        )
+        .await
+    }
+
+    pub async fn materialize_native_cancellation_owned_at_generation(
+        &self,
+        event: CanonicalTurnEventPayload,
+        now_unix: i64,
+        context: NativeCancellationContext,
+        preparation: pioneer_protocol::NativeTerminalEffectPreparation,
+        owner_id: &str,
+        cancellation_actor_id: Option<String>,
+        expected_generation: u64,
+    ) -> Result<()> {
+        self.materialize_native_cancellation_with_generation(
+            event,
+            now_unix,
+            context,
+            preparation,
+            owner_id,
+            cancellation_actor_id,
+            Some(expected_generation),
+        )
+        .await
+    }
+
+    async fn materialize_native_cancellation_with_generation(
+        &self,
+        event: CanonicalTurnEventPayload,
+        now_unix: i64,
+        context: NativeCancellationContext,
+        preparation: pioneer_protocol::NativeTerminalEffectPreparation,
+        owner_id: &str,
+        cancellation_actor_id: Option<String>,
+        expected_generation: Option<u64>,
+    ) -> Result<()> {
         anyhow::ensure!(
             matches!(&event, CanonicalTurnEventPayload::TurnFailed(n)
             if n.turn.status == pioneer_protocol::TurnStatus::Interrupted
@@ -27550,19 +27662,28 @@ impl CrudStore {
         let effects = native_terminal_effect_outbox::prepare_input(preparation)?;
         let revalidation =
             repositories::native_cancellation_context::prepare_revalidation(&context, owner_id);
-        self.materialize_turn_event_with_projection_context_and_owner(
+        let generation_guard = expected_generation.map(|generation| -> Result<_> {
+            Ok(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                "SELECT 1 FROM turn_execution WHERE turn_id = ? AND owner_id = ? AND owner_generation = ?",
+                [context.preparation.turn_id.clone().into(), owner_id.to_owned().into(), i64::try_from(generation)?.into()],
+            ))
+        }).transpose()?;
+        self.materialize_turn_event_with_projection_context_and_guard(
             event,
             now_unix,
             TurnEventProjectionContext {
                 item_started_deadlines: None,
                 enqueue_optional_deliveries: true,
                 cancellation_actor_id,
+                unactivated_terminal: None,
                 native_cancellation: Some(PreparedNativeCancellation {
                     revalidation,
                     effects,
                 }),
             },
             Some(owner_id),
+            generation_guard,
         )
         .await
     }
@@ -30271,6 +30392,7 @@ impl CrudStore {
             item_started_deadlines,
             enqueue_optional_deliveries: false,
             native_cancellation: None,
+            unactivated_terminal: None,
             cancellation_actor_id: None,
         };
         self.materialize_turn_event_with_projection_context(
@@ -30336,8 +30458,75 @@ impl CrudStore {
                 enqueue_optional_deliveries: true,
                 cancellation_actor_id,
                 native_cancellation: None,
+                unactivated_terminal: None,
             },
             Some(execution_owner_id),
+        )
+        .await
+    }
+
+    /// Accepted-but-unactivated cancellation uses the same canonical event
+    /// pipeline. The writer revalidates ownership/generation and activation
+    /// evidence atomically with acceptance; no synthetic native context exists.
+    pub async fn materialize_unactivated_turn_cancellation_owned_as(
+        &self,
+        event: CanonicalTurnEventPayload,
+        event_timestamp_secs: i64,
+        expected: TurnExecutionRecord,
+        execution_owner_id: &str,
+        cancellation_actor_id: Option<String>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            matches!(&event, CanonicalTurnEventPayload::TurnFailed(n)
+            if n.turn.status == TurnStatus::Interrupted && n.turn.id == expected.turn_id
+                && n.thread_id == expected.thread_id && n.workspace_id == expected.workspace_id)
+                && expected.owner_id == execution_owner_id,
+            "unactivated cancellation differs from its accepted execution"
+        );
+        self.materialize_turn_event_with_projection_context_and_owner(
+            event,
+            event_timestamp_secs,
+            TurnEventProjectionContext {
+                enqueue_optional_deliveries: true,
+                cancellation_actor_id,
+                unactivated_terminal: Some(expected),
+                ..Default::default()
+            },
+            Some(execution_owner_id),
+        )
+        .await
+    }
+
+    /// Definitive pre-activation refusals use the canonical terminal pipeline
+    /// and the same owner/generation/activation fence as early cancellation.
+    pub async fn materialize_unactivated_turn_refusal_owned(
+        &self,
+        event: CanonicalTurnEventPayload,
+        event_timestamp_secs: i64,
+        expected: TurnExecutionRecord,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            matches!(&event,
+            CanonicalTurnEventPayload::TurnFailed(n) if n.turn.status == TurnStatus::Failed)
+                || matches!(&event, CanonicalTurnEventPayload::TurnBlocked(n) if n.turn.status == TurnStatus::Blocked),
+            "unactivated refusal requires a Failed or Blocked event"
+        );
+        anyhow::ensure!(
+            event.turn_id() == expected.turn_id
+                && event.thread_id() == expected.thread_id
+                && event.workspace_id() == expected.workspace_id,
+            "unactivated refusal differs from its execution scope"
+        );
+        let owner_id = expected.owner_id.clone();
+        self.materialize_turn_event_with_projection_context_and_owner(
+            event,
+            event_timestamp_secs,
+            TurnEventProjectionContext {
+                enqueue_optional_deliveries: true,
+                unactivated_terminal: Some(expected),
+                ..Default::default()
+            },
+            Some(&owner_id),
         )
         .await
     }
@@ -30358,6 +30547,7 @@ impl CrudStore {
                 enqueue_optional_deliveries: true,
                 cancellation_actor_id: None,
                 native_cancellation: None,
+                unactivated_terminal: None,
             },
             generate_id(DB_ID_LEN),
             unix_to_datetime(timestamp + 60),
@@ -30385,6 +30575,7 @@ impl CrudStore {
                 item_started_deadlines: None,
                 enqueue_optional_deliveries: true,
                 native_cancellation: None,
+                unactivated_terminal: None,
                 cancellation_actor_id: None,
             },
             generate_id(DB_ID_LEN),
@@ -30408,6 +30599,7 @@ impl CrudStore {
             item_started_deadlines,
             enqueue_optional_deliveries: true,
             native_cancellation: None,
+            unactivated_terminal: None,
             cancellation_actor_id: None,
         };
         self.materialize_turn_event_with_projection_context_and_owner(
@@ -31203,6 +31395,41 @@ impl CrudStore {
             );
         }
 
+        if let Some(expected) = projection_context.unactivated_terminal.as_ref()
+            && !turn_event::prepared_event_already_exists(&transaction, &event).await?
+        {
+            let current = turn_execution::find(&transaction, &expected.turn_id)
+                .await?
+                .context("unactivated terminal execution disappeared")?;
+            anyhow::ensure!(
+                current.owner_id == expected.owner_id
+                    && current.owner_generation == expected.owner_generation
+                    && current.thread_id == expected.thread_id
+                    && current.workspace_id == expected.workspace_id
+                    && matches!(
+                        current.status,
+                        TurnExecutionStatus::Starting
+                            | TurnExecutionStatus::Queued
+                            | TurnExecutionStatus::Running
+                    )
+                    && current.started_at.is_none()
+                    && !repositories::native_cancellation_context::is_registered(
+                        &transaction,
+                        &expected.turn_id
+                    )
+                    .await?
+                    && cli_runtime_binding::latest_turn_attempt(&transaction, &expected.turn_id)
+                        .await?
+                        .is_none()
+                    && !turn_event_projection_stream_state::has_accepted_terminal(
+                        &transaction,
+                        &expected.turn_id
+                    )
+                    .await?,
+                UnactivatedTurnPhaseChanged
+            );
+        }
+
         let cancellation_turn_id = if let Some(cancellation) = native_cancellation {
             if !turn_event::prepared_event_already_exists(&transaction, &event).await? {
                 repositories::native_cancellation_context::revalidate(
@@ -31311,6 +31538,42 @@ impl CrudStore {
             return Err(error);
         }
         turn_event_projection_stream_state::accept_terminal(&transaction, &appended_event).await?;
+        if let Some(expected) = projection_context.unactivated_terminal.as_ref() {
+            let status = terminal_turn_execution_status_for_event(&appended_event.payload)
+                .context("unactivated terminal event has no terminal execution status")?;
+            let graph_status = match status {
+                TurnExecutionStatus::Interrupted => "cancelled",
+                TurnExecutionStatus::Blocked => "blocked",
+                TurnExecutionStatus::Failed => "failed",
+                _ => bail!("unsupported unactivated terminal event"),
+            };
+            turn_execution::mark_terminal(&transaction, &expected.turn_id, status, created_at)
+                .await?;
+            if let Some(response) = crate::repositories::agent_domain::load_agent_turn_response(
+                &transaction,
+                &expected.turn_id,
+            )
+            .await?
+            {
+                let execution = crate::repositories::agent_domain::load_agent_execution(
+                    &transaction,
+                    &response.execution_id,
+                )
+                .await?
+                .context("unactivated cancellation response execution disappeared")?;
+                // True Task occurrences retain their own candidate/run cleanup.
+                if execution.parent_task_id.is_none() {
+                    crate::repositories::agent_domain::finalize_agent_execution(
+                        &transaction,
+                        &response.execution_id,
+                        graph_status,
+                        created_at,
+                    )
+                    .await?;
+                }
+            }
+        }
+
         if let Err(error) = turn_event_delivery::insert_pending_for_event(
             &transaction,
             &appended_event,
@@ -49880,6 +50143,7 @@ mod tests {
             item_started_deadlines: None,
             enqueue_optional_deliveries: true,
             native_cancellation: None,
+            unactivated_terminal: None,
             cancellation_actor_id: Some("P00000000000000000001".into()),
         };
         // Stop the first producer at the real append/projection boundary.

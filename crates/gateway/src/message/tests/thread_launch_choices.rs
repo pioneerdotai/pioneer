@@ -672,6 +672,15 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
     .unwrap()
     .unwrap();
     assert_eq!(after.payload_json, before);
+    assert!(
+        processor
+            .mark_turn_interrupted(
+                start.thread_id.clone(),
+                start.turn_id.clone(),
+                "Finish the first accepted launch before the explicit launch".into()
+            )
+            .await
+    );
     call(
         &tools,
         "threads_turn_start",
@@ -1804,6 +1813,566 @@ async fn webhook_task_tools_create_get_and_replay_require_current_task_read() {
     }
 }
 
+// This crosses real action admission, canonical persistence, outbox dispatch,
+// native preparation and the recording provider. It never launches a process.
+#[tokio::test]
+async fn delegated_root_first_dispatch_replay_and_stop_have_an_independent_owner() {
+    use sea_orm::{ActiveModelTrait, Set};
+    for source_terminal in ["completed", "cancelled"] {
+        let probe = Arc::new(ChoiceRuntimeProbe::default());
+        probe.hold_main.store(true, Ordering::SeqCst);
+        let (processor, context, tools) = fixture_with_probe(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            false,
+            probe.clone(),
+        )
+        .await;
+        let binding = processor
+            .agent_action_binding(&context.turn_id)
+            .await
+            .unwrap();
+        let source = binding.adapter.lock().await.persistence_facts();
+        let target = delegated_launch_target(&tools, &binding.options).await;
+        call(
+            &tools,
+            "threads_turn_start",
+            "independent-first",
+            json!({
+                "targetOptionId":target.id, "input":[{"type":"text","text":"Run independently"}],
+            }),
+        )
+        .await;
+        let db = processor.crud_store.database_connection();
+        let action = crate::authorization::action_id_for_call("independent-first");
+        let outbox = pioneer_crud::load_agent_action_outbox(&db, action.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&outbox.payload_json).unwrap();
+        let params: TurnStartParams =
+            serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+        let execution_id = payload["spawned_execution_id"].as_str().unwrap();
+        let execution = pioneer_crud::load_agent_execution(&db, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(execution.parent_execution_id.is_none());
+        assert_eq!(execution.work_graph_root_execution_id, execution.id);
+        assert_ne!(
+            execution.work_graph_root_execution_id,
+            source.root_execution_id.as_str()
+        );
+        assert_eq!(execution.home_root_thread_id, params.thread_id);
+        assert!(
+            processor
+                .crud_store
+                .get_task_thread_lineage(&params.thread_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (_, accepted) = processor
+            .crud_store
+            .get_turn(&params.thread_id, &params.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            accepted.author.as_ref().unwrap().actor,
+            pioneer_protocol::PersistedActorRef::AgentExecution(source.execution_id.clone())
+        );
+        assert!(matches!(
+            processor
+                .agent_manager
+                .observe_turn(&params.thread_id, &params.turn_id)
+                .await,
+            Err(pioneer_agent::AgentControlError::ThreadNotFound)
+        ));
+        assert!(
+            processor
+                .crud_store
+                .get_turn_runtime_snapshot(&params.turn_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Terminating the source graph before delivery cannot cancel the new root.
+        let (_, parent) = processor
+            .crud_store
+            .get_turn(&context.thread_id, &context.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        if source_terminal == "completed" {
+            processor
+                .crud_store
+                .finalize_agent_execution(
+                    source.execution_id.as_str(),
+                    "completed",
+                    pioneer_crud::utc_now(),
+                )
+                .await
+                .unwrap();
+        } else {
+            assert!(
+                processor
+                    .cancel_root_agent_work_graph_for_turn(
+                        &context.thread_id,
+                        &parent,
+                        "source stopped"
+                    )
+                    .await
+                    .unwrap()
+            );
+        }
+        let result =
+            crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                .await
+                .unwrap();
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        timeout(Duration::from_secs(5), probe.main_started.notified())
+            .await
+            .unwrap();
+        assert_eq!(probe.main_calls.load(Ordering::SeqCst), 1);
+        let runtime = processor
+            .crud_store
+            .get_turn_runtime_snapshot(&params.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                runtime.provider_name.as_str(),
+                runtime.model.as_str(),
+                runtime.reasoning_effort.as_deref()
+            ),
+            ("openai", "gpt-5.4", Some("high"))
+        );
+
+        // Restore the pending ACK exactly as after a lost delivery acknowledgement.
+        let mut pending: pioneer_entity::agent_action_outbox::ActiveModel =
+            pioneer_crud::load_agent_action_outbox(&db, action.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .into();
+        pending.status = Set("pending".into());
+        pending.delivered_at = Set(None);
+        pending.next_attempt_at = Set(None);
+        pending.update(&db).await.unwrap();
+        crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+            .await
+            .unwrap();
+        assert_eq!(probe.main_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            processor
+                .cancel_root_agent_work_graph_for_turn(
+                    &params.thread_id,
+                    &accepted,
+                    "destination stopped"
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            processor
+                .mark_turn_interrupted(
+                    params.thread_id.clone(),
+                    params.turn_id.clone(),
+                    "destination stopped".into()
+                )
+                .await
+        );
+        assert!(
+            processor
+                .mark_turn_interrupted(
+                    params.thread_id.clone(),
+                    params.turn_id.clone(),
+                    "repeat Stop".into()
+                )
+                .await
+        );
+        assert_eq!(
+            pioneer_crud::load_agent_execution(&db, execution_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+        assert_eq!(
+            pioneer_crud::load_agent_execution(&db, source.execution_id.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            source_terminal
+        );
+        crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+            .await
+            .unwrap();
+        assert_eq!(probe.main_calls.load(Ordering::SeqCst), 1);
+        probe.release_main.notify_waiters();
+    }
+}
+
+// The fixture's source execution has no model actor. Complete its canonical
+// foreground Turn while retaining the source ledger for saved action delivery.
+async fn finish_choice_source_foreground(
+    processor: &Arc<MessageProcessor>,
+    context: &TurnToolContext,
+) {
+    let (_, mut turn) = processor
+        .crud_store
+        .get_turn(&context.thread_id, &context.turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    turn.status = TurnStatus::Completed;
+    processor
+        .crud_store
+        .materialize_native_agent_turn_event(
+            pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(
+                pioneer_protocol::TurnCompletedNotification {
+                    workspace_id: context.workspace_id.clone(),
+                    thread_id: context.thread_id.clone(),
+                    turn: turn.clone(),
+                },
+            ),
+            now_timestamp_secs(),
+            None,
+        )
+        .await
+        .unwrap();
+    processor
+        .thread_manager
+        .commit_terminal_turn(&context.thread_id, &turn)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn delegated_root_foreground_admission_rejects_competing_start_without_persisting_it() {
+    for target_label in [
+        "New delegated root",
+        "Current thread",
+        "Current collaboration",
+    ] {
+        let (processor, context, tools) = fixture().await;
+        let binding = processor
+            .agent_action_binding(&context.turn_id)
+            .await
+            .unwrap();
+        let target = if target_label == "New delegated root" {
+            delegated_launch_target(&tools, &binding.options).await
+        } else {
+            // Both own-root routes must refuse while the source owns foreground.
+            let target = binding
+                .options
+                .target_options
+                .iter()
+                .find(|target| target.label == target_label)
+                .unwrap()
+                .clone();
+            let busy = invoke_with_mutation(
+                &tools,
+                "threads_turn_start",
+                "own-root-busy",
+                json!({"targetOptionId":target.id,"input":[{"type":"text","text":"Busy root"}]}),
+                None,
+            )
+            .await;
+            assert!(
+                matches!(busy, Err(pioneer_tools::ToolError::ExecutionFailed(code)) if code == "agent_action_conflict")
+            );
+            assert!(
+                pioneer_crud::load_agent_action_outbox(
+                    &processor.crud_store.database_connection(),
+                    crate::authorization::action_id_for_call("own-root-busy").as_str()
+                )
+                .await
+                .unwrap()
+                .is_none()
+            );
+            finish_choice_source_foreground(&processor, &context).await;
+            target
+        };
+        let arguments = json!({"targetOptionId":target.id,"input":[{"type":"text","text":"One foreground owner"}]});
+        let (first, second) = tokio::join!(
+            invoke_with_mutation(
+                &tools,
+                "threads_turn_start",
+                "foreground-a",
+                arguments.clone(),
+                None
+            ),
+            invoke_with_mutation(
+                &tools,
+                "threads_turn_start",
+                "foreground-b",
+                arguments,
+                None
+            ),
+        );
+        assert_ne!(
+            first.is_ok(),
+            second.is_ok(),
+            "one foreground start must be refused"
+        );
+        let rejection = first
+            .as_ref()
+            .err()
+            .or_else(|| second.as_ref().err())
+            .unwrap();
+        assert!(
+            matches!(rejection, pioneer_tools::ToolError::ExecutionFailed(code) if code == "agent_action_conflict")
+        );
+        let db = processor.crud_store.database_connection();
+        let mut accepted = Vec::new();
+        for id in ["foreground-a", "foreground-b"] {
+            if let Some(row) = pioneer_crud::load_agent_action_outbox(
+                &db,
+                crate::authorization::action_id_for_call(id).as_str(),
+            )
+            .await
+            .unwrap()
+            {
+                accepted.push(row);
+            }
+        }
+        assert_eq!(
+            accepted.len(),
+            1,
+            "refusal cannot leave a second durable launch"
+        );
+        let payload: serde_json::Value = serde_json::from_str(&accepted[0].payload_json).unwrap();
+        let params: TurnStartParams =
+            serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+        let thread = processor
+            .crud_store
+            .get_thread_model(&params.thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            thread
+                .turns
+                .iter()
+                .filter(|turn| turn.status == TurnStatus::InProgress)
+                .count(),
+            1
+        );
+        let source = binding.adapter.lock().await.persistence_facts();
+        let (_, accepted_turn) = processor
+            .crud_store
+            .get_turn(&params.thread_id, &params.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        if target_label == "New delegated root" {
+            assert!(
+                processor
+                    .cancel_root_agent_work_graph_for_turn(
+                        &params.thread_id,
+                        &accepted_turn,
+                        "Stop new root"
+                    )
+                    .await
+                    .unwrap()
+            );
+        }
+        assert!(
+            processor
+                .mark_turn_interrupted(
+                    params.thread_id.clone(),
+                    params.turn_id.clone(),
+                    "Stop before activation".into()
+                )
+                .await
+        );
+        let stopped = processor
+            .crud_store
+            .get_turn(&params.thread_id, &params.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_eq!(stopped.status, TurnStatus::Interrupted);
+        assert!(
+            processor
+                .crud_store
+                .native_cancellation_context(&params.turn_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            pioneer_crud::load_agent_execution(
+                &db,
+                payload["spawned_execution_id"].as_str().unwrap()
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+            "cancelled"
+        );
+        assert_eq!(
+            pioneer_crud::load_agent_execution(&db, source.execution_id.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "running"
+        );
+        crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+            .await
+            .unwrap();
+        assert!(
+            processor
+                .crud_store
+                .get_turn_runtime_snapshot(&params.turn_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            processor
+                .agent_manager
+                .observe_turn(&params.thread_id, &params.turn_id)
+                .await,
+            Err(pioneer_agent::AgentControlError::ThreadNotFound)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn queued_internal_thread_stop_releases_only_its_child_resources_before_dispatch() {
+    use sea_orm::{ActiveModelTrait, Set};
+    let probe = Arc::new(ChoiceRuntimeProbe::default());
+    let (processor, context, tools) = fixture_with_probe(
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        false,
+        probe.clone(),
+    )
+    .await;
+    let binding = processor
+        .agent_action_binding(&context.turn_id)
+        .await
+        .unwrap();
+    let source = binding.adapter.lock().await.persistence_facts();
+    let db = processor.crud_store.database_connection();
+    let mut scope: pioneer_entity::agent_work_resource_scope::ActiveModel =
+        pioneer_entity::agent_work_resource_scope::Entity::find_by_id(
+            source.root_execution_id.as_str(),
+        )
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap()
+        .into();
+    scope.max_concurrency = Set(1);
+    scope.update(&db).await.unwrap();
+    let creation = binding
+        .options
+        .thread_creation_options
+        .iter()
+        .find(|option| option.label == "Current collaboration")
+        .unwrap();
+    let created = call(
+        &tools,
+        "thread_create",
+        "queued-thread",
+        json!({"optionId":creation.id}),
+    )
+    .await;
+    let target = created["targetOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|option| {
+            !binding
+                .options
+                .target_options
+                .iter()
+                .any(|old| old.id == option["id"].as_str().unwrap())
+        })
+        .unwrap()["id"]
+        .clone();
+    call(
+        &tools,
+        "threads_turn_start",
+        "queued-child",
+        json!({"targetOptionId":target,"input":[{"type":"text","text":"Wait for capacity"}]}),
+    )
+    .await;
+    let row = pioneer_crud::load_agent_action_outbox(
+        &db,
+        crate::authorization::action_id_for_call("queued-child").as_str(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
+    let params: TurnStartParams =
+        serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+    let child_id = payload["spawned_execution_id"].as_str().unwrap();
+    let child = pioneer_crud::load_agent_execution(&db, child_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        child.parent_execution_id.as_deref(),
+        Some(source.execution_id.as_str())
+    );
+    assert_eq!(
+        child.work_graph_root_execution_id,
+        source.root_execution_id.as_str()
+    );
+    assert_eq!(
+        pioneer_crud::load_agent_execution_resource_state(&db, child_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "queued"
+    );
+    assert!(
+        processor
+            .mark_turn_interrupted(
+                params.thread_id.clone(),
+                params.turn_id.clone(),
+                "Stop while queued".into()
+            )
+            .await
+    );
+    assert_eq!(
+        pioneer_crud::load_agent_execution_resource_state(&db, child_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "cancelled"
+    );
+    assert_eq!(
+        pioneer_crud::load_agent_execution(&db, source.execution_id.as_str())
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "running"
+    );
+    crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+        .await
+        .unwrap();
+    assert_eq!(probe.main_calls.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn member_creation_uses_both_workspace_variants_and_revocation_fences_the_shared_handler() {
     let (processor, context, tools) = fixture_with_principal_probe(
@@ -1880,4 +2449,187 @@ async fn member_creation_uses_both_workspace_variants_and_revocation_fences_the_
     );
     assert!(authority.grants_action(crate::authorization::ResourceAction::ThreadCreatePrivate));
     assert!(authority.grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace));
+}
+
+#[tokio::test]
+async fn recovery_terminalization_cannot_apply_blocked_over_a_resumed_generation() {
+    let probe = Arc::new(ChoiceRuntimeProbe::default());
+    let (processor, context, tools) = fixture_with_probe(
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        false,
+        probe.clone(),
+    )
+    .await;
+    processor.bind_agent_tool_bridges().await;
+    let binding = processor
+        .agent_action_binding(&context.turn_id)
+        .await
+        .unwrap();
+    let target = delegated_launch_target(&tools, &binding.options).await;
+    call(
+        &tools,
+        "threads_turn_start",
+        "recovery-sync-start",
+        json!({
+            "targetOptionId":target.id, "input":[{"type":"text","text":"Recover one admitted turn"}]
+        }),
+    )
+    .await;
+    let db = processor.crud_store.database_connection();
+    let row = pioneer_crud::load_agent_action_outbox(
+        &db,
+        crate::authorization::action_id_for_call("recovery-sync-start").as_str(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let payload: JsonValue = serde_json::from_str(&row.payload_json).unwrap();
+    let params: TurnStartParams =
+        serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+    // Keep the real prepared snapshot and activation fence, before actor/model
+    // admission. The recovery worker owns the ensuing terminal transition.
+    processor.arm_completed_history_preparation_barrier("__agent_start_after_activation_claim__");
+    let dispatch = tokio::spawn({
+        let processor = processor.clone();
+        async move {
+            crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                .await
+                .unwrap()
+        }
+    });
+    timeout(
+        Duration::from_secs(5),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    dispatch.abort();
+    let _ = dispatch.await;
+    processor.release_completed_history_preparation_barrier();
+    let before = processor
+        .crud_store
+        .get_turn_execution(&params.turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let now = now_timestamp_secs();
+    let job = processor
+        .crud_store
+        .enqueue_recovery_job(
+            params.turn_id.clone(),
+            "recovery-sync-reasoning".into(),
+            pioneer_protocol::TurnItemType::Reasoning,
+            None,
+            pioneer_protocol::RecoveryTrigger::Timeout,
+            pioneer_protocol::RecoveryAction::BlockResumable,
+            None,
+            None,
+            None,
+            None,
+            0,
+            0,
+            json!({}),
+            json!({"base_backoff_secs":0,"max_wall_clock_secs":60}),
+            now,
+        )
+        .await
+        .unwrap();
+    assert!(
+        processor
+            .crud_store
+            .mark_recovery_job_terminal(
+                &job.id,
+                pioneer_protocol::RecoveryJobStatus::Blocked,
+                None,
+                now,
+            )
+            .await
+            .unwrap()
+    );
+    processor.arm_completed_history_preparation_barrier("__agent_terminal_before_memory_sync__");
+    let recovery = tokio::spawn({
+        let processor = processor.clone();
+        async move {
+            processor
+                .process_due_recovery_terminalizations(now, 64)
+                .await
+                .unwrap()
+        }
+    });
+    timeout(
+        Duration::from_secs(5),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        processor
+            .crud_store
+            .get_turn(&params.thread_id, &params.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::Blocked
+    );
+    assert!(
+        processor
+            .resume_blocked_turn_control(
+                &context.workspace_id,
+                &params.thread_id,
+                &params.turn_id,
+                Some(&job.id),
+                now,
+            )
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let resumed = processor
+        .crud_store
+        .get_turn_execution(&params.turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resumed.owner_id, before.owner_id);
+    assert_eq!(resumed.owner_generation, before.owner_generation + 1);
+    processor.release_completed_history_preparation_barrier();
+    assert_eq!(recovery.await.unwrap(), 1);
+    let canonical = processor
+        .crud_store
+        .get_turn(&params.thread_id, &params.turn_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    assert_eq!(canonical.status, TurnStatus::InProgress);
+    assert_eq!(
+        processor
+            .thread_manager
+            .turn_get(&params.thread_id, &params.turn_id)
+            .await
+            .unwrap()
+            .1,
+        canonical
+    );
+    let mut competing = params.clone();
+    competing.turn_id = "competing-with-recovery-resume".into();
+    let conflict = processor
+        .thread_manager
+        .agent_turn_start_with_permission_profile(
+            competing,
+            canonical.permission_profile.clone(),
+            canonical.author.clone().unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        conflict
+            .downcast_ref::<crate::thread::ForegroundTurnConflict>()
+            .is_some()
+    );
+    assert_eq!(probe.main_calls.load(Ordering::SeqCst), 0);
 }

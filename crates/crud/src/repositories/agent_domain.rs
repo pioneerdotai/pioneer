@@ -6777,7 +6777,21 @@ pub async fn cancel_agent_work_graph(
         .iter()
         .map(|execution| execution.id.clone())
         .collect::<Vec<_>>();
-    let response_turns = if active_ids.is_empty() {
+    // Graph fencing and response Turn interruption are separate durable steps.
+    // Rediscover unfinished direct responses after a previous graph fence; real
+    // Tasks retain their own aggregate cancellation/reconciliation protocol.
+    let response_candidates = executions
+        .iter()
+        .filter(|execution| {
+            !terminal_statuses.contains(&execution.status.as_str())
+                || (execution.status == "cancelled" && execution.parent_task_id.is_none())
+        })
+        .collect::<Vec<_>>();
+    let response_ids = response_candidates
+        .iter()
+        .map(|execution| execution.id.clone())
+        .collect::<Vec<_>>();
+    let response_turns = if response_ids.is_empty() {
         Vec::new()
     } else {
         let active_turn_ids = Query::select()
@@ -6786,14 +6800,14 @@ pub async fn cancel_agent_work_graph(
             .and_where(turn::Column::Status.eq("in_progress"))
             .to_owned();
         agent_turn_response_execution::Entity::find()
-            .filter(agent_turn_response_execution::Column::ExecutionId.is_in(active_ids.clone()))
+            .filter(agent_turn_response_execution::Column::ExecutionId.is_in(response_ids.clone()))
             .filter(agent_turn_response_execution::Column::TurnId.in_subquery(active_turn_ids))
             .limit(graph_row_limit)
             .all(db)
             .await
             .context("failed to load active Agent work-graph Turn bindings")?
     };
-    if response_turns.len() > active_ids.len() {
+    if response_turns.len() > response_ids.len() {
         bail!("Agent work graph has too many active Turn bindings");
     }
     let mut response_turns_by_execution = BTreeMap::new();
@@ -6805,8 +6819,12 @@ pub async fn cancel_agent_work_graph(
             bail!("Agent execution has multiple active response Turns");
         }
     }
-    let targets = active
+    let targets = response_candidates
         .iter()
+        .filter(|execution| {
+            !terminal_statuses.contains(&execution.status.as_str())
+                || response_turns_by_execution.contains_key(execution.id.as_str())
+        })
         .map(|execution| AgentWorkGraphCancellationTarget {
             execution_id: execution.id.clone(),
             turn_id: response_turns_by_execution

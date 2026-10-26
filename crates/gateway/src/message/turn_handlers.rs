@@ -9501,6 +9501,36 @@ impl MessageProcessor {
         Ok(())
     }
 
+    pub(super) async fn resume_blocked_turn_control(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        recovery_job_id: Option<&str>,
+        now_unix: i64,
+    ) -> anyhow::Result<Option<pioneer_crud::RecoveryJobRecord>> {
+        self.thread_manager
+            .resume_blocked_turn_with_projection(workspace_id, thread_id, turn_id, async {
+                let job = self
+                    .recovery_coordinator
+                    .resume_blocked_turn(thread_id, turn_id, recovery_job_id, now_unix)
+                    .await?;
+                let turn = if job.is_some() {
+                    let (workspace, turn) = self
+                        .crud_store
+                        .get_turn(thread_id, turn_id)
+                        .await?
+                        .context("resumed Turn is missing")?;
+                    anyhow::ensure!(workspace == workspace_id, "resumed Turn workspace changed");
+                    Some(turn)
+                } else {
+                    None
+                };
+                Ok((job, turn))
+            })
+            .await
+    }
+
     pub(crate) async fn load_turn_execution_authorization_context(
         &self,
         turn_id: &str,
@@ -11358,8 +11388,8 @@ impl MessageProcessor {
                     }
                 };
                 let resumed_job = match self
-                    .recovery_coordinator
-                    .resume_blocked_turn(
+                    .resume_blocked_turn_control(
+                        &workspace_id,
                         thread_id.as_str(),
                         turn_id.as_str(),
                         recovery_job_id.as_deref(),
