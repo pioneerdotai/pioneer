@@ -3012,6 +3012,9 @@ async fn accepted_unactivated_stop_and_activation_share_a_durable_writer_fence()
                     .await
                     .unwrap()
             );
+            let claimed = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+            assert_eq!(claimed.status, crate::TurnExecutionStatus::Starting);
+            assert!(claimed.started_at.is_some());
             assert!(
                 !store
                     .claim_unactivated_agent_turn(&expected)

@@ -26,6 +26,57 @@
 Это повторный статический самоаудит части 3/4, а не приёмка. Интеграцию принятых
 исправлений в следующие части выполняет родительский ревьюер.
 
+## CI repair after the first complete Linux run
+
+CI run https://github.com/pioneerdotai/pioneer/actions/runs/40387902314
+checked head `b1be607e12ba3c00722ba5f9025e050f1651384d`. Windows, macOS
+and Linux build succeeded; all four Linux test shards failed. The monitor
+`yzK5AbQsY0y2kZwNKFvV2` paused future firings before this repair. Logs were
+read from the GitHub jobs API, including completed jobs while the run was
+still active. No local test or build was run.
+
+The activation claim attempted to store running with no started_at, violating
+ck_turn_execution_started_state. It now claims the existing starting receipt
+with a timestamp. The timestamp rejects duplicate claims; actual runtime
+registration still owns the transition to running. Cancellation recognizes
+that claimed starting phase before registration. Its serialized writer still
+requires the exact owner, generation and scope, no immutable native context,
+no CLI attempt and no accepted competing terminal. A running execution without
+its immutable context remains a refusal. The existing writer-fence regression
+also checks that a claimed execution remains starting with its timestamp.
+No schema, new state, queue, timeout or resource policy was introduced.
+
+The failed fixtures also contained incompatible setup assumptions:
+
+- The initial Stop matrix now persists its ordinary thread and restores its
+  durable lifecycle before requesting authoritative admission.
+- Cancellation and execution-window fixtures use the same resolved author and
+  permission profile in memory and storage. Strict terminal equality stays in
+  production; fixtures no longer depend on an actorless snapshot matching an
+  author hydrated from the durable initiator.
+- The restored Task manifest scenario subscribes its public client before
+  Stop, so ordinary terminal cleanup retains the loaded Turn whose hydration
+  the scenario asserts.
+- The CLI child fixture waits for the existing startup transition gate to be
+  released as well as for the binding, native turn and MCP metadata.
+- Launch fixtures restore the active source Turn and use a valid thread ID
+  for membership. The depth chain uses distinct hidden home-capsule threads,
+  preserving the foreground gate on the visible source. The pinned-launch
+  check updates its already durable thread through durable thread/start.
+- The internal DurableAgent completion check expects the typed, unreported
+  validation failure that the accepted base hands to its committed outbox.
+  External public-error coverage remains in its existing owner test.
+- The capability persistence-order assertion includes the four admitted
+  Threads actions/model tools and checks their names before skill/native start.
+
+Every failed scenario remains enabled. Tests were extended or repaired in
+place; no assertions were suppressed, timeouts increased or checks skipped.
+Static review followed claim to registration, preactivation cancellation,
+projection and guarded completion, plus fixture callers and shared signatures.
+Only cargo fmt and whitespace checks are used locally. The final formatting
+and Git conflict results are confirmed during handoff. The new CI run must
+confirm these repairs; this report does not assert GREEN.
+
 ## PR publication and base conflict resolution
 
 The user accepted the result and authorized publication, same-branch CI repairs,

@@ -2529,15 +2529,21 @@ async fn capability_persistence_order_impl() {
             .await
             .expect("committed MCP capability event should arrive")
             .expect("committed lane should stay open");
-        // Thread actions/model options require explicit selection; this turn
-        // admits only the readers alongside the default HTML and task tools.
+        // The admitted Threads catalog includes actions as well as readers.
+        let thread_actions = [
+            "threads_identity_models_list",
+            "thread_create",
+            "thread_message_send",
+            "threads_turn_start",
+        ];
         let expected_mcp_bindings = 2
             + crate::turn_mcp::native_tools::NativeToolFamily::Tasks
                 .definitions()
                 .len()
             + super::thread_read_tools::thread_read_tool_specs().len()
             + super::thread_search_tools::thread_search_tool_specs().len()
-            + super::thread_tool_results::thread_result_tool_specs().len();
+            + super::thread_tool_results::thread_result_tool_specs().len()
+            + thread_actions.len();
         assert!(matches!(
             committed_capabilities,
             AgentDurableEvent::TurnCapabilitiesResolved {
@@ -2552,6 +2558,7 @@ async fn capability_persistence_order_impl() {
                 && mcp_bindings.len() == expected_mcp_bindings
                 && mcp_bindings.iter().all(|binding| crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(&binding.server_installation_id).is_some())
                 && mcp_bindings.iter().any(|binding| binding.raw_tool_name == "task_wait")
+                && thread_actions.iter().all(|name| mcp_bindings.iter().any(|binding| binding.raw_tool_name == *name))
         ));
         let committed_skills = timeout(Duration::from_secs(1), committed_rx.recv())
             .await
@@ -24066,6 +24073,12 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         let connection =
             register_authenticated_test_connection(recovery_processor.session_manager.as_ref(), tx)
                 .await;
+        assert!(
+            recovery_processor
+                .thread_manager
+                .subscribe_connection(&lineage.child_thread_id, connection)
+                .await
+        );
         let mut terminal_events = None;
         for delivery in ["first", "repeat"] {
             let id = generate_test_request_id("taskstop", delivery);
@@ -42682,8 +42695,15 @@ async fn setup_execution_window_terminal_turn(
         )
         .await
         .expect("thread should start");
-    thread_manager
-        .system_turn_start_with_permission_profile(
+    let author = super::message_turn::resolve_turn_author_snapshot(
+        crud_store.as_ref(),
+        &pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let started = thread_manager
+        .agent_turn_start_with_permission_profile(
             pioneer_protocol::TurnStartParams {
                 agent_delegation_routes: Vec::new(),
                 thread_id: thread_id.to_owned(),
@@ -42702,9 +42722,8 @@ async fn setup_execution_window_terminal_turn(
                 permission_profile: None,
                 cli_runtime_options: None,
             },
-            pioneer_protocol::system_turn_permission_profile_snapshot(
-                pioneer_protocol::TurnPermissionMode::FullAccess,
-            ),
+            default_test_permission_profile(),
+            author,
         )
         .await
         .expect("turn should start in thread manager");
@@ -42712,21 +42731,7 @@ async fn setup_execution_window_terminal_turn(
         .materialize_turn_start(
             &thread_start.started_notification.thread,
             SandboxMode::FullAccess,
-            &Turn {
-                id: turn_id.to_owned(),
-                status: TurnStatus::InProgress,
-                turn_kind: Default::default(),
-                origin: Default::default(),
-                mode: Default::default(),
-                author: None,
-                reply_to_turn_id: None,
-                mentions: Vec::new(),
-                message_revision: 0,
-                message_deleted: false,
-                error: None,
-                prompt_manifest: None,
-                permission_profile: default_test_permission_profile(),
-            },
+            &started.materialization.turn,
             &[],
             pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
         )
@@ -59192,8 +59197,15 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
     // Cancellation is the control-plane operation under test. Seed an admitted,
     // durable in-progress Turn directly so the assertion does not depend on the
     // separate launch-admission surface (which has its own exhaustive tests).
+    let actor = pioneer_protocol::PersistedActorRef::Principal(
+        authenticated_test_superuser().principal_id.clone(),
+    );
+    let author =
+        super::message_turn::resolve_turn_author_snapshot(crud_store_for_assert.as_ref(), &actor)
+            .await
+            .unwrap();
     let turn_outcome = thread_manager_for_assert
-        .turn_start(
+        .turn_start_with_user_metadata(
             connection_id,
             pioneer_protocol::TurnStartParams {
                 agent_delegation_routes: Vec::new(),
@@ -59218,6 +59230,8 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                 permission_profile: None,
                 cli_runtime_options: None,
             },
+            author,
+            Vec::new(),
         )
         .await
         .expect("turn cancellation fixture should seed an in-progress Turn");
@@ -85126,8 +85140,17 @@ fn native_cancellation_race_fallback_preserves_materialization_error_and_require
             // Cancellation is the control-plane operation under test. Seed an admitted,
             // durable in-progress Turn directly so the assertion does not depend on the
             // separate launch-admission surface (which has its own exhaustive tests).
+            let actor = pioneer_protocol::PersistedActorRef::Principal(
+                authenticated_test_superuser().principal_id.clone(),
+            );
+            let author = super::message_turn::resolve_turn_author_snapshot(
+                crud_store_for_assert.as_ref(),
+                &actor,
+            )
+            .await
+            .unwrap();
             let turn_outcome = thread_manager_for_assert
-                .turn_start(
+                .turn_start_with_user_metadata(
                     connection_id,
                     pioneer_protocol::TurnStartParams {
                         agent_delegation_routes: Vec::new(),
@@ -85152,6 +85175,8 @@ fn native_cancellation_race_fallback_preserves_materialization_error_and_require
                         permission_profile: None,
                         cli_runtime_options: None,
                     },
+                    author,
+                    Vec::new(),
                 )
                 .await
                 .expect("turn cancellation fixture should seed an in-progress Turn");

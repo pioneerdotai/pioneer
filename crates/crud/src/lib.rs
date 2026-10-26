@@ -14442,8 +14442,8 @@ impl CrudStore {
         .await
     }
 
-    /// Fence duplicate outbox activations using the existing starting/running
-    /// receipt. This CAS precedes the native model request, while canonical
+    /// Fence duplicate outbox activations using the starting receipt's timestamp.
+    /// This CAS precedes runtime registration, while canonical
     /// terminal acceptance shares the same serialized writer.
     pub async fn claim_unactivated_agent_turn(
         &self,
@@ -31478,7 +31478,8 @@ impl CrudStore {
                             | TurnExecutionStatus::Queued
                             | TurnExecutionStatus::Running
                     )
-                    && current.started_at.is_none()
+                    && (current.started_at.is_none()
+                        || current.status == TurnExecutionStatus::Starting)
                     && !repositories::native_cancellation_context::is_registered(
                         &transaction,
                         &expected.turn_id

@@ -208,7 +208,7 @@ async fn fixture_with_principal_probe(
     });
     let mut context = TurnToolContext {
         workspace_id: workspace.clone(),
-        thread_id: "choices-root".into(),
+        thread_id: "C00000000000000000001".into(),
         turn_id: "choices-parent".into(),
     };
     ensure_test_superuser_execution_turn(
@@ -440,6 +440,19 @@ async fn fixture_with_principal_probe(
         .await
         .unwrap();
     }
+    // These scenarios start from an active foreground source, not only its
+    // persisted authorization/snapshot. Restore the actual source Turn too.
+    let source = processor
+        .crud_store
+        .get_thread_model(&context.thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    processor
+        .thread_manager
+        .system_thread_restore_persisted(source, Some(SandboxMode::FullAccess))
+        .await
+        .unwrap();
     let tools = processor
         .materialize_agent_action_tools(context.clone())
         .await
@@ -759,8 +772,7 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
     // only after that first Turn has finished.
     processor
         .thread_manager
-        .thread_start(
-            1,
+        .system_thread_start_seeded(
             context.workspace_id.clone(),
             serde_json::from_value(json!({
                 "workspace_id":context.workspace_id,
@@ -768,6 +780,8 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
                 "model":"gpt-5.4-catalog-other", "model_provider":"openai"
             }))
             .unwrap(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -972,11 +986,32 @@ async fn source_at_max_depth_can_start_only_an_independent_root() {
             .await
             .unwrap();
         let facts = binding.adapter.lock().await.persistence_facts();
-        let current = binding
+        // Keep each active ancestor in its own hidden destination. Starting
+        // another foreground Turn in the visible source is correctly refused.
+        let creation = binding
             .options
-            .target_options
+            .thread_creation_options
             .iter()
-            .find(|o| o.label == "Current thread")
+            .find(|option| option.label == "Current collaboration")
+            .unwrap();
+        let created = call(
+            &tools,
+            "thread_create",
+            &format!("depth-thread-{depth}"),
+            json!({"optionId":creation.id}),
+        )
+        .await;
+        let targets: Vec<pioneer_protocol::AgentToolTargetOption> =
+            serde_json::from_value(created["targetOptions"].clone()).unwrap();
+        let current = targets
+            .iter()
+            .find(|option| {
+                !binding
+                    .options
+                    .target_options
+                    .iter()
+                    .any(|old| old.id == option.id)
+            })
             .unwrap();
         let call_id = format!("depth-source-{depth}");
         call(
@@ -1033,6 +1068,10 @@ async fn source_at_max_depth_can_start_only_an_independent_root() {
             )
             .await
             .unwrap();
+        context.thread_id = payload["dispatch"]["thread_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         context.turn_id = payload["dispatch"]["turn_id"].as_str().unwrap().to_owned();
         tools = processor
             .materialize_agent_action_tools(context.clone())

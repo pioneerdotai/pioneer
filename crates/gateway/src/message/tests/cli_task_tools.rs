@@ -540,7 +540,14 @@ async fn wait_for_task_cli_child(
                 && binding.status == "running"
                 && binding.native_turn_id.is_some()
                 && binding.mcp.is_some()
+                && let Some(transition) = processor
+                    .try_cli_runtime_turn_transition(&binding)
+                    .await
+                    .unwrap()
             {
+                // Activation persists the binding before releasing its gate.
+                // Return an active child only after that startup handoff.
+                drop(transition);
                 return binding;
             }
             tokio::task::yield_now().await;

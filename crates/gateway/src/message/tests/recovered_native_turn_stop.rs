@@ -1658,7 +1658,21 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
         test_tool_loop_config(),
     ));
     let client = ClientCore::new();
-    open(&processor, connection, &mut rx, &client, &workspace, thread).await;
+    let opened = open(&processor, connection, &mut rx, &client, &workspace, thread).await;
+    store
+        .upsert_thread_model(
+            &opened,
+            pioneer_protocol::PersistedActorRef::Principal(
+                authenticated_test_superuser().principal_id.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    processor
+        .thread_manager
+        .system_thread_restore_persisted(opened, None)
+        .await
+        .unwrap();
     // Use ordinary admission/preparation, retaining the prepared runtime at its
     // actual pre-dispatch boundary rather than inventing a cancellation context.
     let admission =

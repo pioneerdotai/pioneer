@@ -266,7 +266,10 @@ pub async fn claim_unactivated<C: ConnectionTrait>(
         .filter(turn_execution::Column::LeaseUntil.gt(now))
         .filter(turn_execution::Column::Status.is_in(["queued", "starting"]))
         .filter(turn_execution::Column::StartedAt.is_null())
-        .col_expr(turn_execution::Column::Status, Expr::value("running"))
+        // Claim initial dispatch once while runtime registration is still pending.
+        // Running requires a registered runtime; started_at fences a second claim.
+        .col_expr(turn_execution::Column::Status, Expr::value("starting"))
+        .col_expr(turn_execution::Column::StartedAt, Expr::value(Some(now)))
         .col_expr(turn_execution::Column::UpdatedAt, Expr::value(now))
         .exec(db)
         .await?;

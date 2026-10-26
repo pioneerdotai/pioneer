@@ -3965,6 +3965,7 @@ impl MessageProcessor {
                         && e.thread_id == notification.thread_id
                         && e.workspace_id == notification.workspace_id
                         && (e.started_at.is_none()
+                            || e.status == pioneer_crud::TurnExecutionStatus::Starting
                             || (actor_generation.is_some()
                                 && registration_pending.map(|(generation, _)| generation)
                                     == actor_generation
