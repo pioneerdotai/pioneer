@@ -998,6 +998,22 @@ impl ThreadManager {
         if turn.status != TurnStatus::InProgress || turn.mode != ThreadMode::Agent {
             bail!("committed Agent Turn is not runnable");
         }
+        // The thread's composer settings may have changed since this Turn
+        // committed. Runtime preparation must use the launch pinned by its
+        // outbox without changing the current thread or rollback snapshot.
+        let mut materialization_thread = entry.thread.clone();
+        materialization_thread.model = params
+            .model
+            .clone()
+            .context("committed Agent Turn has no pinned model")?;
+        materialization_thread.model_provider = params
+            .model_provider
+            .clone()
+            .context("committed Agent Turn has no pinned provider")?;
+        materialization_thread.reasoning_effort = params
+            .reasoning
+            .as_ref()
+            .map(|reasoning| reasoning.effort.clone());
         let started_notification = TurnStartedNotification {
             workspace_id: entry.thread.workspace_id.clone(),
             thread_id: entry.thread.id.clone(),
@@ -1008,7 +1024,7 @@ impl ThreadManager {
             started_notification,
             started_notification_connection_ids: entry.subscribers.keys().copied().collect(),
             materialization: TurnStartMaterialization {
-                thread: entry.thread.clone(),
+                thread: materialization_thread,
                 turn,
                 input: persisted_input,
                 capabilities: params.capabilities.clone(),

@@ -661,6 +661,80 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
     assert_eq!(start.model.as_deref(), Some("gpt-5.4"));
     assert_eq!(start.model_provider.as_deref(), Some("openai"));
     assert_eq!(start.reasoning.as_ref().unwrap().effort, "high");
+    let response = pioneer_crud::load_agent_turn_response(&db, &start.turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let execution = pioneer_crud::load_agent_execution(&db, &response.execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted["spawned_execution_id"], execution.id);
+    assert_eq!(execution.work_graph_root_execution_id, execution.id);
+    assert_ne!(execution.id, facts.execution_id.as_str());
+    assert!(execution.parent_execution_id.is_none());
+    assert!(execution.parent_task_id.is_none());
+    assert_eq!(execution.home_root_thread_id, thread_id);
+    assert_eq!(execution.execution_generation, 1);
+    let (_, turn) = processor
+        .crud_store
+        .get_turn(thread_id, &start.turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        turn.author.unwrap().actor,
+        pioneer_protocol::PersistedActorRef::AgentExecution(facts.execution_id.clone())
+    );
+    let receipt = pioneer_crud::load_agent_action_receipt(&db, &outbox.action_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        receipt.actor_id.as_deref(),
+        Some(facts.execution_id.as_str())
+    );
+    assert_eq!(outbox.owner_execution_id, facts.execution_id.as_str());
+    let grant = pioneer_crud::load_agent_execution_grant(&db, &execution.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(grant.parent_execution_id.is_none());
+    let provenance: serde_json::Value = serde_json::from_str(&grant.grant_json).unwrap();
+    assert_eq!(
+        provenance["source_execution_id"],
+        facts.execution_id.as_str()
+    );
+    assert_eq!(provenance["source_action_id"], outbox.action_id);
+    assert_eq!(provenance["turn_id"], start.turn_id);
+    let parent_authority = processor
+        .load_turn_execution_authorization_context(&context.turn_id)
+        .await
+        .unwrap();
+    let authority = processor
+        .load_turn_execution_authorization_context(&start.turn_id)
+        .await
+        .unwrap();
+    assert_eq!(authority.root_thread_id(), thread_id);
+    assert_eq!(
+        authority.initiating_principal_id(),
+        parent_authority.initiating_principal_id()
+    );
+    assert!(
+        authority
+            .granted_action_names()
+            .iter()
+            .all(|action| { parent_authority.granted_action_names().contains(action) })
+    );
+    assert!(
+        processor
+            .crud_store
+            .get_turn_runtime_snapshot(&start.turn_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "canonical root provenance must validate before first runtime preparation"
+    );
     let before = outbox.payload_json;
     let replay = call(&tools, "threads_turn_start", "start-visible", arguments).await;
     assert_eq!(replay["outcome"], "agent_action_already_committed");
@@ -672,6 +746,14 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
     .unwrap()
     .unwrap();
     assert_eq!(after.payload_json, before);
+    assert_eq!(
+        pioneer_crud::load_agent_execution_grant(&db, &execution.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        grant,
+        "replay preserves the independent root's immutable provenance"
+    );
     call(
         &tools,
         "threads_turn_start",
@@ -679,7 +761,7 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
         json!({
             "targetOptionId": target.id, "input": [{"type":"text", "text":"Use another model"}],
             "launch": {"profile":{"kind":"model", "providerId":"openai", "modelId":"gpt-5.4-catalog-other"},
-                "reasoning":{"effort":"high"}, "permissionProfile":{"mode":"full_access"}}
+                "reasoning":{"effort":"low"}, "permissionProfile":{"mode":"full_access"}}
         }),
     )
     .await;
@@ -694,7 +776,111 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
     let explicit: TurnStartParams =
         serde_json::from_value(explicit["dispatch"]["params"].clone()).unwrap();
     assert_eq!(explicit.model.as_deref(), Some("gpt-5.4-catalog-other"));
-    assert_eq!(explicit.reasoning.unwrap().effort, "high");
+    assert_eq!(explicit.reasoning.unwrap().effort, "low");
+
+    // Dispatch of the earlier queued Turn must keep its pinned launch even
+    // after the same destination acquires different composer settings.
+    assert_eq!(
+        processor
+            .thread_manager
+            .thread_get(thread_id)
+            .await
+            .unwrap()
+            .model,
+        "gpt-5.4-catalog-other"
+    );
+    let input = processor
+        .crud_store
+        .get_turn_inputs(&start.turn_id)
+        .await
+        .unwrap();
+    let rehydrated = processor
+        .thread_manager
+        .rehydrate_committed_agent_turn(&start, input)
+        .await
+        .unwrap();
+    assert_eq!(rehydrated.materialization.thread.model, "gpt-5.4");
+    assert_eq!(rehydrated.materialization.thread.model_provider, "openai");
+    assert_eq!(
+        rehydrated
+            .materialization
+            .thread
+            .reasoning_effort
+            .as_deref(),
+        Some("high")
+    );
+    assert_eq!(
+        processor
+            .thread_manager
+            .thread_get(thread_id)
+            .await
+            .unwrap()
+            .model,
+        "gpt-5.4-catalog-other",
+        "rehydration must not overwrite current composer settings"
+    );
+
+    // A home-capsule destination still admits a real child of the source.
+    let home_creation = binding
+        .options
+        .thread_creation_options
+        .iter()
+        .find(|option| option.label == "Current collaboration")
+        .unwrap();
+    let home = call(
+        &tools,
+        "thread_create",
+        "create-home-child",
+        json!({"optionId": home_creation.id}),
+    )
+    .await;
+    let home_targets: Vec<pioneer_protocol::AgentToolTargetOption> =
+        serde_json::from_value(home["targetOptions"].clone()).unwrap();
+    let home_target = home_targets
+        .iter()
+        .find(|option| !targets.iter().any(|old| old.id == option.id))
+        .unwrap();
+    call(
+        &tools,
+        "threads_turn_start",
+        "start-home-child",
+        json!({
+            "targetOptionId": home_target.id,
+            "input": [{"type":"text", "text":"Internal child"}],
+            "launch":{"permissionProfile":{"mode":"full_access"}}
+        }),
+    )
+    .await;
+    let home_outbox = pioneer_crud::load_agent_action_outbox(
+        &db,
+        crate::authorization::action_id_for_call("start-home-child").as_str(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let home: serde_json::Value = serde_json::from_str(&home_outbox.payload_json).unwrap();
+    let home_execution =
+        pioneer_crud::load_agent_execution(&db, home["spawned_execution_id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        home_execution.parent_execution_id.as_deref(),
+        Some(facts.execution_id.as_str())
+    );
+    assert_eq!(
+        home_execution.work_graph_root_execution_id,
+        facts.root_execution_id.as_str()
+    );
+    assert_eq!(home_execution.home_root_thread_id, context.thread_id);
+    assert_eq!(
+        u64::try_from(home_execution.execution_generation).unwrap(),
+        facts.execution_generation + 1
+    );
+    processor
+        .load_turn_execution_authorization_context(home["dispatch"]["turn_id"].as_str().unwrap())
+        .await
+        .unwrap();
 }
 
 async fn api_choice_models(ids: &[&str]) -> Vec<pioneer_protocol::ProviderModelInfo> {
