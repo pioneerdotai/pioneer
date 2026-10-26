@@ -923,6 +923,264 @@ async fn delegated_launch_target(
 }
 
 #[tokio::test]
+async fn source_at_max_depth_can_start_only_an_independent_root() {
+    use sea_orm::PaginatorTrait;
+    let (processor, mut context, mut tools) = fixture().await;
+    let db = processor.crud_store.database_connection();
+    let graph_root = processor
+        .agent_action_binding(&context.turn_id)
+        .await
+        .unwrap()
+        .adapter
+        .lock()
+        .await
+        .persistence_facts()
+        .root_execution_id;
+    let max_depth = crate::authorization::AgentWorkResourcePolicy::default().max_depth;
+    // Build real, consistent ancestry through canonical tool admissions. Finish
+    // each previous owner after its child is committed so concurrency capacity
+    // cannot become the reason the final depth check rejects a launch.
+    for depth in 1..=max_depth {
+        let binding = processor
+            .agent_action_binding(&context.turn_id)
+            .await
+            .unwrap();
+        let facts = binding.adapter.lock().await.persistence_facts();
+        let current = binding
+            .options
+            .target_options
+            .iter()
+            .find(|o| o.label == "Current thread")
+            .unwrap();
+        let call_id = format!("depth-source-{depth}");
+        call(
+            &tools,
+            "threads_turn_start",
+            &call_id,
+            json!({
+                "targetOptionId":current.id,
+                "input":[{"type":"text", "text":"Continue in the same work graph"}],
+                "launch":{"useDefaultReasoning":true,"permissionProfile":{"mode":"full_access"}}
+            }),
+        )
+        .await;
+        let outbox = pioneer_crud::load_agent_action_outbox(
+            &db,
+            crate::authorization::action_id_for_call(&call_id).as_str(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&outbox.payload_json).unwrap();
+        assert_eq!(payload["dispatch"]["depth"], depth);
+        let mut previous = processor
+            .crud_store
+            .get_turn(&context.thread_id, &context.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        previous.status = TurnStatus::Completed;
+        processor
+            .crud_store
+            .materialize_turn_completed(
+                pioneer_protocol::TurnCompletedNotification {
+                    workspace_id: context.workspace_id.clone(),
+                    thread_id: context.thread_id.clone(),
+                    turn: previous.clone(),
+                },
+                now_timestamp_secs(),
+            )
+            .await
+            .unwrap();
+        processor
+            .thread_manager
+            .commit_terminal_turn(&context.thread_id, &previous)
+            .await
+            .unwrap();
+        processor
+            .crud_store
+            .finalize_agent_execution(
+                facts.execution_id.as_str(),
+                "completed",
+                pioneer_crud::utc_now(),
+            )
+            .await
+            .unwrap();
+        context.turn_id = payload["dispatch"]["turn_id"].as_str().unwrap().to_owned();
+        tools = processor
+            .materialize_agent_action_tools(context.clone())
+            .await
+            .unwrap();
+    }
+    let binding = processor
+        .agent_action_binding(&context.turn_id)
+        .await
+        .unwrap();
+    let source = binding.adapter.lock().await.persistence_facts();
+    assert_eq!(source.root_execution_id, graph_root);
+    assert_eq!(source.execution_generation, u64::from(max_depth) + 1);
+    let target = delegated_launch_target(&tools, &binding.options).await;
+    call(
+        &tools,
+        "threads_turn_start",
+        "depth-independent-root",
+        json!({
+            "targetOptionId":target.id,
+            "input":[{"type":"text","text":"Start a new independent graph"}],
+            "launch":{"useDefaultReasoning":true,"permissionProfile":{"mode":"full_access"}}
+        }),
+    )
+    .await;
+    let outbox = pioneer_crud::load_agent_action_outbox(
+        &db,
+        crate::authorization::action_id_for_call("depth-independent-root").as_str(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&outbox.payload_json).unwrap();
+    let execution =
+        pioneer_crud::load_agent_execution(&db, payload["spawned_execution_id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(payload["dispatch"]["depth"], 0);
+    assert!(execution.parent_execution_id.is_none());
+    assert_eq!(execution.work_graph_root_execution_id, execution.id);
+    assert_ne!(
+        execution.work_graph_root_execution_id,
+        source.root_execution_id.as_str()
+    );
+    assert_eq!(execution.execution_generation, 1);
+    assert!(
+        pioneer_entity::agent_work_resource_scope::Entity::find_by_id(execution.id.clone())
+            .one(&db)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let grant = pioneer_crud::load_agent_execution_grant(&db, &execution.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let grant: serde_json::Value = serde_json::from_str(&grant.grant_json).unwrap();
+    assert_eq!(grant["source_execution_id"], source.execution_id.as_str());
+    assert_eq!(grant["source_action_id"], outbox.action_id);
+    let (_, root_turn) = processor
+        .crud_store
+        .get_turn(
+            execution.parent_thread_id.as_ref().unwrap(),
+            payload["dispatch"]["turn_id"].as_str().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        root_turn.author.unwrap().actor,
+        pioneer_protocol::PersistedActorRef::AgentExecution(source.execution_id.clone())
+    );
+
+    let home_creation = binding
+        .options
+        .thread_creation_options
+        .iter()
+        .find(|option| option.label == "Current collaboration")
+        .unwrap();
+    let home = call(
+        &tools,
+        "thread_create",
+        "depth-home-thread",
+        json!({"optionId":home_creation.id}),
+    )
+    .await;
+    let home_targets: Vec<pioneer_protocol::AgentToolTargetOption> =
+        serde_json::from_value(home["targetOptions"].clone()).unwrap();
+    let refreshed = processor
+        .agent_action_binding(&context.turn_id)
+        .await
+        .unwrap();
+    let home_target = home_targets
+        .iter()
+        .find(|option| {
+            !binding
+                .options
+                .target_options
+                .iter()
+                .any(|old| old.id == option.id)
+                && option.id != target.id
+        })
+        .unwrap();
+    // The new home target is resolved by its opaque option and durable lineage,
+    // and still consumes the source graph's next depth.
+    assert!(
+        refreshed
+            .options
+            .target_options
+            .iter()
+            .any(|option| option.id == home_target.id)
+    );
+    let nodes = pioneer_entity::agent_execution::Entity::find()
+        .count(&db)
+        .await
+        .unwrap();
+    let turns = pioneer_entity::turn::Entity::find()
+        .count(&db)
+        .await
+        .unwrap();
+    let denied = invoke_with_mutation(
+        &tools,
+        "threads_turn_start",
+        "depth-home-denied",
+        json!({
+            "targetOptionId":home_target.id,
+            "input":[{"type":"text","text":"This child exceeds the source depth"}],
+            "launch":{"useDefaultReasoning":true,"permissionProfile":{"mode":"full_access"}}
+        }),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(&denied, Err(pioneer_tools::ToolError::ExecutionFailed(message))
+        if message == pioneer_protocol::AgentPublicOutcome::AgentWorkGraphLimitExceeded.as_str()),
+        "home child must fail at its depth limit: {denied:?}"
+    );
+    let denied_action = crate::authorization::action_id_for_call("depth-home-denied");
+    assert!(
+        pioneer_crud::load_agent_action(&db, denied_action.as_str())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        pioneer_crud::load_agent_action_receipt(&db, denied_action.as_str())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        pioneer_crud::load_agent_action_outbox(&db, denied_action.as_str())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        pioneer_entity::agent_execution::Entity::find()
+            .count(&db)
+            .await
+            .unwrap(),
+        nodes
+    );
+    assert_eq!(
+        pioneer_entity::turn::Entity::find()
+            .count(&db)
+            .await
+            .unwrap(),
+        turns
+    );
+}
+
+#[tokio::test]
 async fn cli_parent_selects_only_unambiguous_api_choices_for_threads_and_tasks() {
     use pioneer_agent::TaskToolProvider;
     for (model_selected, model_ids, second_provider, allowed) in [
