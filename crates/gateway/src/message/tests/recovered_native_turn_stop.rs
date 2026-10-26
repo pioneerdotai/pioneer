@@ -3,6 +3,7 @@ use pioneer_client::{core::ClientCore, state::snapshot::ActiveThreadSnapshot};
 use pioneer_crud::{TurnExecutionStatus, TurnExecutorKind};
 use pioneer_protocol::{
     GatewayNotification, NativeTerminalEffectPreparation, ThreadUpdatedNotification,
+    TurnStartParams,
 };
 use pioneer_sqlite::SqliteWriteClass;
 use sea_orm::ActiveModelTrait;
