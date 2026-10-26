@@ -919,10 +919,17 @@ pub(super) fn row_dependency_revision(
     }
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     match row.item().map(|item| &item.item) {
-        Some(TurnItem::UserMessage { .. }) => {
+        Some(TurnItem::UserMessage { attachments, .. }) => {
             ptr(&screen.identity_input).hash(&mut hash);
             ptr(&screen.thread_member_input).hash(&mut hash);
-            ptr(&screen.artifact_input).hash(&mut hash);
+            if attachments.iter().any(|attachment| {
+                matches!(
+                    attachment,
+                    pioneer_client::timeline::types::UserMessageAttachment::Artifact { .. }
+                )
+            }) {
+                ptr(&screen.artifact_input).hash(&mut hash);
+            }
             ptr(&screen.thread_capability_input).hash(&mut hash);
             screen
                 .active_artifact_presentation_policy()
@@ -1012,6 +1019,170 @@ mod tests {
         core::{ClientCore, ClientScope},
         timeline::semantic::{TopLevelPageMergeMode, WorkPageMergeMode},
     };
+
+    #[gpui_kit::test]
+    fn artifact_publication_invalidates_only_artifact_consumers(cx: &mut TestAppContext) {
+        use pioneer_client::{
+            artifacts::{ArtifactRef, HtmlPublication, store::ArtifactPublication},
+            timeline::types::UserMessageAttachment,
+        };
+        cx.update(gpui_kit::init);
+        let client = Arc::new(ClientCore::new());
+        install_thread_timeline(&client, "a", "initial");
+        let artifact: ArtifactRef = serde_json::from_value(serde_json::json!({
+            "artifact_id":"document","version_id":"version","display_name":"Document",
+            "kind":"file","mime_type":"text/html","size_bytes":10,
+            "sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "status":"ready"
+        }))
+        .unwrap();
+        let non_artifacts: Vec<UserMessageAttachment> = serde_json::from_value(serde_json::json!([
+            {"type":"localFile","path":""},
+            {"type":"skill","capability":{"skillId":"SSSSSSSSSSSSSSSSSSSSS","label":"Skill",
+                "slug":"skill","sourceKind":"user"}},
+            {"type":"mcpTool","capability":{"id":"tool","label":"Tool","serverName":"server",
+                "rawToolName":"tool","scopeKind":"workspace"}}
+        ]))
+        .unwrap();
+        let mut blocks = [
+            ("plain", Vec::new()),
+            ("non-artifact", non_artifacts),
+            ("artifact", vec![UserMessageAttachment::Artifact { artifact: artifact.clone() }]),
+        ].into_iter().enumerate().map(|(index, (id, attachments))| {
+            serde_json::json!({"workspaceId":"workspace","threadId":"a","blockId":id,
+                "turnId":id,"sortKey":index.to_string(),
+                "kind":{"kind":"user_message","text":id,"mode":"Message","attachments":attachments}})
+        }).collect::<Vec<_>>();
+        blocks.push(
+            serde_json::json!({"workspaceId":"workspace","threadId":"a","blockId":"html",
+            "turnId":"html","sortKey":"3","kind":{"kind":"assistant_message","itemId":"html",
+                "text":"Document","htmlPublications":[HtmlPublication {
+                    workspace_id: "workspace".into(), thread_id: "a".into(), turn_id: "html".into(),
+                    call_id: "html-call".into(), title: "Document".into(), artifact,
+                }]}}),
+        );
+        client.apply_thread_timeline_page(
+            serde_json::from_value(serde_json::json!({
+                "workspaceId":"workspace","threadId":"a","projectionVersion":1,"blocks":blocks,
+                "page":{"hasMoreBefore":false,"hasMoreAfter":false}
+            }))
+            .unwrap(),
+            TopLevelPageMergeMode::Reset,
+        );
+        let (registrar, deliver) = binding_router(client.clone());
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::new(
+                ThreadView::new(
+                    ThreadViewConfig::new(
+                        client.clone(),
+                        "a".into(),
+                        registrar,
+                        Arc::new(ThreadPorts),
+                        Arc::new(ThreadPorts),
+                        Arc::new(ThreadPorts),
+                    ),
+                    window,
+                    cx,
+                ),
+                window,
+                cx,
+            )
+        });
+        deliver();
+        cx.run_until_parked();
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.run_until_parked();
+        }
+        let thread = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<ThreadView>().unwrap()
+        });
+        let timeline = thread.read_with(cx, |view, _| view.timeline_for_test());
+        timeline.update(cx, |view, cx| {
+            let prepared = view.thread_timeline_view_state.prepared.clone().unwrap();
+            assert_eq!(prepared.slots.len(), 4);
+            assert!(view.artifact_input.is_none());
+            for (slot, (key, _)) in prepared.slots.iter().zip(&prepared.row_inputs) {
+                assert_eq!(
+                    key.dependencies_revision,
+                    row_dependency_revision(view, slot.snapshot(), cx)
+                );
+                assert!(view.layout_store.height(key).is_some());
+                assert!(slot.view.as_ref().unwrap().read(cx).matches_input(key));
+            }
+            let publication = Arc::new(ArtifactPublication {
+                thread_id: "a".into(),
+                workspace_id: "workspace".into(),
+                revision: 1,
+                generation: 1,
+                items: Vec::new(),
+                request: Default::default(),
+                downloads: Vec::new(),
+                actions: Vec::new(),
+                previews: Vec::new(),
+            });
+            // Keep both allocations alive, including across the no-op and removal.
+            let replacement = Arc::new((*publication).clone());
+            let mut previous = prepared
+                .row_inputs
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            for (input, changed, present) in [
+                (Some(publication.clone()), true, true),
+                (Some(publication.clone()), false, true),
+                (Some(replacement.clone()), true, true),
+                (None, true, false),
+            ] {
+                view.artifact_input = input;
+                for (index, (slot, (key, _))) in
+                    prepared.slots.iter().zip(&prepared.row_inputs).enumerate()
+                {
+                    let depends = matches!(key.id.as_str(), "artifact" | "html");
+                    let next = RowMeasurementKey {
+                        dependencies_revision: row_dependency_revision(view, slot.snapshot(), cx),
+                        ..key.clone()
+                    };
+                    assert_eq!(
+                        next != previous[index],
+                        depends && changed,
+                        "{}",
+                        key.id.as_str()
+                    );
+                    assert_eq!(next == *key, !depends || !present, "{}", key.id.as_str());
+                    // These are the actual shared-key consumers: a cache hit skips
+                    // measurement, and matches_input skips rebuilding RowPresentation.
+                    assert_eq!(
+                        view.layout_store.height(&next).is_some(),
+                        !depends || !present
+                    );
+                    assert_eq!(
+                        slot.view.as_ref().unwrap().read(cx).matches_input(&next),
+                        !depends || !present
+                    );
+                    previous[index] = next;
+                }
+            }
+            // Change the real authorization generation while holding all screen
+            // publications fixed, isolating the independent HTML fence.
+            let generation = client.authorization_connection_generation();
+            client.begin_authorization_epoch(Some(("replacement".into(), 1)));
+            assert_ne!(generation, client.authorization_connection_generation());
+            for (slot, (key, _)) in prepared.slots.iter().zip(&prepared.row_inputs) {
+                let next = RowMeasurementKey {
+                    dependencies_revision: row_dependency_revision(view, slot.snapshot(), cx),
+                    ..key.clone()
+                };
+                let is_html = key.id.as_str() == "html";
+                assert_eq!(next != *key, is_html);
+                assert_eq!(view.layout_store.height(&next).is_none(), is_html);
+                assert_eq!(
+                    !slot.view.as_ref().unwrap().read(cx).matches_input(&next),
+                    is_html
+                );
+            }
+        });
+    }
 
     fn publish_work(client: &Arc<ClientCore>, revision: i64, extra: bool) {
         let work = serde_json::json!({"turnId":"turn","presentation":"expanded_terminal_no_final","state":"completed",
