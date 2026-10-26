@@ -2707,8 +2707,22 @@ async fn member_creation_uses_both_workspace_variants_and_revocation_fences_the_
 #[tokio::test]
 async fn exhausted_child_start_cannot_reconcile_a_sibling_from_another_action() {
     use sea_orm::{ActiveModelTrait, Set};
-    for attempts in [0, pioneer_crud::AGENT_ACTION_OUTBOX_MAX_ATTEMPTS] {
-        let (processor, context, tools) = fixture().await;
+    for (attempts, historical_grant) in [
+        (0, false),
+        (0, true),
+        (pioneer_crud::AGENT_ACTION_OUTBOX_MAX_ATTEMPTS, false),
+        (pioneer_crud::AGENT_ACTION_OUTBOX_MAX_ATTEMPTS, true),
+    ] {
+        let probe = Arc::new(ChoiceRuntimeProbe::default());
+        probe.hold_main.store(true, Ordering::SeqCst);
+        let (processor, context, tools) = fixture_with_probe(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            false,
+            probe.clone(),
+        )
+        .await;
         let binding = processor
             .agent_action_binding(&context.turn_id)
             .await
@@ -2766,6 +2780,29 @@ async fn exhausted_child_start_cannot_reconcile_a_sibling_from_another_action() 
         let params: TurnStartParams =
             serde_json::from_value(sibling["dispatch"]["params"].clone()).unwrap();
         let execution_id = sibling["spawned_execution_id"].as_str().unwrap();
+        if historical_grant {
+            // Reproduce the actual bb85dcdf child producer, including its valid
+            // fingerprint. Only disposable fixture rows are changed here.
+            for payload in [&original, &sibling] {
+                let id = payload["spawned_execution_id"].as_str().unwrap();
+                let saved = pioneer_crud::load_agent_execution_grant(&db, id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut json: serde_json::Value = serde_json::from_str(&saved.grant_json).unwrap();
+                assert_eq!(json["kind"], "agent_child");
+                for field in ["source_action_id", "source_execution_id", "turn_id"] {
+                    json.as_object_mut().unwrap().remove(field);
+                }
+                let json = json.to_string();
+                let mut historical: pioneer_entity::agent_execution_grant::ActiveModel =
+                    saved.into();
+                historical.grant_fingerprint =
+                    Set(pioneer_crud::agent_execution_grant_fingerprint(&json).unwrap());
+                historical.grant_json = Set(json);
+                historical.update(&db).await.unwrap();
+            }
+        }
         let execution = pioneer_crud::load_agent_execution(&db, execution_id)
             .await
             .unwrap()
@@ -2817,6 +2854,10 @@ async fn exhausted_child_start_cannot_reconcile_a_sibling_from_another_action() 
         let own_params: TurnStartParams =
             serde_json::from_value(original["dispatch"]["params"].clone()).unwrap();
         let own_execution_id = original["spawned_execution_id"].as_str().unwrap();
+        let own_grant = pioneer_crud::load_agent_execution_grant(&db, own_execution_id)
+            .await
+            .unwrap()
+            .unwrap();
         let own_turn = processor
             .crud_store
             .get_turn(&own_params.thread_id, &own_params.turn_id)
@@ -2950,10 +2991,76 @@ async fn exhausted_child_start_cannot_reconcile_a_sibling_from_another_action() 
         assert_eq!(unresolved.status, "failed");
         assert!(unresolved.delivered_at.is_none());
         assert!(unresolved.next_attempt_at.is_some());
-        if attempts == 0 {
+        assert_eq!(probe.main_calls.load(Ordering::SeqCst), 0);
+        if attempts == 0 && !historical_grant {
+            // A correct own payload must still fail when any source field of
+            // the new grant contradicts it, including a partially present set.
+            let mut retry = unresolved;
+            for field in [
+                "source_action_id",
+                "source_execution_id",
+                "turn_id",
+                "partial",
+            ] {
+                let mut json: serde_json::Value =
+                    serde_json::from_str(&own_grant.grant_json).unwrap();
+                if field == "partial" {
+                    json.as_object_mut().unwrap().remove("source_execution_id");
+                    json.as_object_mut().unwrap().remove("turn_id");
+                    json["source_action_id"] = json!("contradicting-source");
+                } else {
+                    json[field] = json!("contradicting-source");
+                }
+                let json = json.to_string();
+                let mut bad: pioneer_entity::agent_execution_grant::ActiveModel =
+                    own_grant.clone().into();
+                bad.grant_fingerprint =
+                    Set(pioneer_crud::agent_execution_grant_fingerprint(&json).unwrap());
+                bad.grant_json = Set(json.clone());
+                let bad = bad.update(&db).await.unwrap();
+                let mut due: pioneer_entity::agent_action_outbox::ActiveModel = retry.into();
+                due.payload_json = Set(original.to_string());
+                due.next_attempt_at =
+                    Set(Some(pioneer_crud::utc_now() - chrono::Duration::seconds(1)));
+                due.update(&db).await.unwrap();
+                crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                    .await
+                    .unwrap();
+                retry = pioneer_crud::load_agent_action_outbox(&db, &rows[0].action_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(retry.status, "failed", "{field}");
+                assert!(retry.delivered_at.is_none());
+                assert_eq!(
+                    processor
+                        .crud_store
+                        .get_turn(&own_params.thread_id, &own_params.turn_id)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    own_turn
+                );
+                assert_eq!(
+                    pioneer_crud::load_agent_execution_resource_state(&db, own_execution_id)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    own_resource
+                );
+                assert_eq!(
+                    pioneer_entity::agent_execution_grant::Entity::find_by_id(&bad.id)
+                        .one(&db)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    bad
+                );
+                assert_eq!(probe.main_calls.load(Ordering::SeqCst), 0);
+            }
             continue;
         }
-        // The original exact grant remains reconcilable; the sibling remains live.
+        // Restore the own payload: only the intended child may dispatch/reconcile.
         let mut restored: pioneer_entity::agent_action_outbox::ActiveModel = unresolved.into();
         restored.payload_json = Set(original.to_string());
         restored.next_attempt_at =
@@ -2962,6 +3069,53 @@ async fn exhausted_child_start_cannot_reconcile_a_sibling_from_another_action() 
         crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
             .await
             .unwrap();
+        if attempts == 0 {
+            timeout(Duration::from_secs(5), probe.main_started.notified())
+                .await
+                .unwrap();
+            assert_eq!(probe.main_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                pioneer_crud::load_agent_action_outbox(&db, &rows[0].action_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "delivered"
+            );
+            assert!(
+                processor
+                    .mark_turn_interrupted(
+                        own_params.thread_id.clone(),
+                        own_params.turn_id.clone(),
+                        "legacy child stopped".into(),
+                    )
+                    .await
+            );
+            let _ = processor
+                .agent_manager
+                .cancel_turn(
+                    &own_params.thread_id,
+                    &own_params.turn_id,
+                    "fixture cleanup",
+                )
+                .await;
+            probe.release_main.notify_waiters();
+            // Lost ordinary delivery ACK after a real canonical terminal.
+            let mut replay: pioneer_entity::agent_action_outbox::ActiveModel =
+                pioneer_crud::load_agent_action_outbox(&db, &rows[0].action_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into();
+            replay.status = Set("pending".into());
+            replay.delivered_at = Set(None);
+            replay.next_attempt_at = Set(None);
+            replay.update(&db).await.unwrap();
+            crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                .await
+                .unwrap();
+            assert_eq!(probe.main_calls.load(Ordering::SeqCst), 1);
+        }
         assert_eq!(
             pioneer_crud::load_agent_action_outbox(&db, &rows[0].action_id)
                 .await
@@ -2979,7 +3133,11 @@ async fn exhausted_child_start_cannot_reconcile_a_sibling_from_another_action() 
                 .unwrap()
                 .1
                 .status,
-            TurnStatus::InProgress
+            if attempts == 0 {
+                TurnStatus::Interrupted
+            } else {
+                TurnStatus::InProgress
+            }
         );
         assert_eq!(
             pioneer_crud::load_agent_execution_resource_state(&db, execution_id)
@@ -2987,6 +3145,89 @@ async fn exhausted_child_start_cannot_reconcile_a_sibling_from_another_action() 
                 .unwrap()
                 .unwrap(),
             resource
+        );
+        if historical_grant {
+            pioneer_crud::compact_terminal_agent_action_ledger(
+                &db,
+                pioneer_crud::utc_now() + chrono::Duration::days(32),
+                100,
+            )
+            .await
+            .unwrap();
+            let compacted = pioneer_crud::load_agent_action_outbox(&db, &rows[0].action_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut payload: serde_json::Value =
+                serde_json::from_str(&compacted.payload_json).unwrap();
+            assert!(payload.get("_pioneer_compacted").is_some());
+            // The old compactor dropped dispatch entirely; the old grant has
+            // no Turn/source fields either. Canonical links must suffice.
+            payload.as_object_mut().unwrap().remove("dispatch");
+            let mut legacy: pioneer_entity::agent_action_outbox::ActiveModel = compacted.into();
+            legacy.payload_json = Set(payload.to_string());
+            legacy.status = Set("failed".into());
+            legacy.attempts = Set(pioneer_crud::AGENT_ACTION_OUTBOX_MAX_ATTEMPTS);
+            legacy.delivered_at = Set(None);
+            legacy.next_attempt_at = Set(None);
+            legacy.update(&db).await.unwrap();
+            crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                .await
+                .unwrap();
+            let reconciled = pioneer_crud::load_agent_action_outbox(&db, &rows[0].action_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (reconciled.status.as_str(), reconciled.attempts),
+                ("delivered", 8)
+            );
+            assert!(reconciled.next_attempt_at.is_none());
+            assert_eq!(reconciled.payload_json, payload.to_string());
+            assert_eq!(
+                probe.main_calls.load(Ordering::SeqCst),
+                usize::from(attempts == 0)
+            );
+            let canonical = processor
+                .crud_store
+                .get_turn(&own_params.thread_id, &own_params.turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1;
+            assert_eq!(
+                canonical.status,
+                if attempts == 0 {
+                    TurnStatus::Interrupted
+                } else {
+                    TurnStatus::Blocked
+                }
+            );
+            assert_eq!(
+                processor
+                    .thread_manager
+                    .turn_get(&own_params.thread_id, &own_params.turn_id)
+                    .await
+                    .unwrap()
+                    .1,
+                canonical
+            );
+        }
+        assert_eq!(
+            pioneer_entity::agent_execution_grant::Entity::find_by_id(&own_grant.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap(),
+            own_grant
+        );
+        assert_eq!(
+            pioneer_entity::agent_execution_grant::Entity::find_by_id(&grant.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap(),
+            grant
         );
     }
 }

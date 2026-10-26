@@ -3339,30 +3339,73 @@ enum AgentStartReconciliation {
     Unresolved,
 }
 
+fn is_legacy_agent_child_grant(grant: &serde_json::Value) -> bool {
+    grant.get("kind").and_then(serde_json::Value::as_str) == Some("agent_child")
+        && ["source_action_id", "source_execution_id", "turn_id"]
+            .iter()
+            .all(|field| grant.get(*field).is_none())
+}
+
 // Parent identity alone cannot bind two sibling starts to their source actions.
-// Share the exact immutable grant check across ordinary dispatch and recovery.
-fn agent_start_grant_matches_source(
+// Both producers bind the input Turn ID to its action; callers also validate
+// the saved Turn author, response execution/presentation and owner/generation.
+async fn agent_start_grant_matches_source(
+    processor: &MessageProcessor,
     row: &pioneer_entity::agent_action_outbox::Model,
     execution: &pioneer_entity::agent_execution::Model,
     saved_grant: &pioneer_entity::agent_execution_grant::Model,
     grant: &serde_json::Value,
     turn_id: &str,
-) -> bool {
-    saved_grant.parent_execution_id == execution.parent_execution_id
-        && saved_grant.child_identity_id == execution.agent_identity_id
-        && grant
+) -> anyhow::Result<bool> {
+    if saved_grant.parent_execution_id != execution.parent_execution_id
+        || saved_grant.child_identity_id != execution.agent_identity_id
+        || grant
+            .get("execution_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(execution.id.as_str())
+    {
+        return Ok(false);
+    }
+    if !is_legacy_agent_child_grant(grant) {
+        // Present but invalid/contradictory source fields never enable fallback.
+        return Ok(grant
             .get("source_action_id")
             .and_then(serde_json::Value::as_str)
             == Some(row.action_id.as_str())
-        && grant
-            .get("source_execution_id")
+            && grant
+                .get("source_execution_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(row.owner_execution_id.as_str())
+            && grant.get("turn_id").and_then(serde_json::Value::as_str) == Some(turn_id));
+    }
+    // The historical producer used this exact action-derived input Turn ID.
+    // Its saved allowed receipt and the caller's exact response link prove the
+    // source without rewriting the old grant or restoring user payload.
+    if execution.parent_execution_id.as_deref() != Some(row.owner_execution_id.as_str())
+        || grant
+            .get("parent_execution_id")
             .and_then(serde_json::Value::as_str)
-            == Some(row.owner_execution_id.as_str())
-        && grant
-            .get("execution_id")
-            .and_then(serde_json::Value::as_str)
-            == Some(execution.id.as_str())
-        && grant.get("turn_id").and_then(serde_json::Value::as_str) == Some(turn_id)
+            != Some(row.owner_execution_id.as_str())
+        || turn_id
+            != pioneer_crud::canonical_agent_id(
+                'T',
+                &format!("agent-start-turn\0{}", row.action_id),
+            )
+    {
+        return Ok(false);
+    }
+    let database = processor.crud_store.database_connection();
+    let action = pioneer_crud::load_agent_action(&database, &row.action_id).await?;
+    let receipt = pioneer_crud::load_agent_action_receipt(&database, &row.action_id).await?;
+    Ok(action.is_some_and(|action| {
+        action.status == "committed"
+            && action.action_kind == "start_agent"
+            && action.execution_id == row.owner_execution_id
+    }) && receipt.is_some_and(|receipt| {
+        receipt.decision == "allowed"
+            && receipt.actor_kind == "agent_execution"
+            && receipt.actor_id.as_deref() == Some(row.owner_execution_id.as_str())
+    }))
 }
 
 // A malformed envelope must never terminalize an unrelated Turn. Bind the
@@ -3390,6 +3433,8 @@ async fn finalize_rejected_agent_start(
         return Ok(AgentStartReconciliation::Unresolved);
     };
     let grant: serde_json::Value = serde_json::from_str(&saved_grant.grant_json)?;
+    let canonical_turn_id =
+        pioneer_crud::canonical_agent_id('T', &format!("agent-start-turn\0{}", row.action_id));
     let Some(turn_id) = payload
         .pointer("/dispatch/turn_id")
         .and_then(serde_json::Value::as_str)
@@ -3398,6 +3443,10 @@ async fn finalize_rejected_agent_start(
                 .then(|| grant.get("turn_id"))
                 .flatten()
                 .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    (legacy_compacted && is_legacy_agent_child_grant(&grant))
+                        .then_some(canonical_turn_id.as_str())
+                })
         })
     else {
         return Ok(AgentStartReconciliation::Unresolved);
@@ -3421,7 +3470,15 @@ async fn finalize_rejected_agent_start(
             != execution.presentation_snapshot_id.as_deref()
         || execution.workspace_id != owner.workspace_id
         || execution.parent_thread_id.as_deref() != Some(owner.thread_id.as_str())
-        || !agent_start_grant_matches_source(row, &execution, &saved_grant, &grant, turn_id)
+        || !agent_start_grant_matches_source(
+            processor,
+            row,
+            &execution,
+            &saved_grant,
+            &grant,
+            turn_id,
+        )
+        .await?
         || (!legacy_compacted
             && payload
                 .pointer("/dispatch/execution_generation")
@@ -3653,12 +3710,14 @@ async fn dispatch_agent_action_outbox_row_inner(
         serde_json::from_str(&saved_grant.grant_json).map_err(|_| Failure::InvalidStart)?;
     if row.owner_execution_id != input_execution_id.as_str()
         || !agent_start_grant_matches_source(
+            processor,
             row,
             &execution,
             &saved_grant,
             &grant,
             &dispatch.turn_id,
         )
+        .await?
     {
         return Err(Failure::InvalidStart.into());
     }
