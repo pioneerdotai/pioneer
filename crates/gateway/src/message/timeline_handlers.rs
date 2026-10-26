@@ -2267,7 +2267,9 @@ impl MessageProcessor {
             AuthorizationResolver, AuthorizationService, ProofResolution, ResourceAction,
         };
         let principal = request_context.principal();
-        let action = ResourceAction::ChildObserve;
+        // The resolver authorizes this read through the root and separately
+        // requires ChildObserve for the internal execution child.
+        let action = ResourceAction::ThreadRead;
         let gate = AuthorizationService::new().authorize_action(
             principal.kind,
             principal.role_key.as_ref(),
