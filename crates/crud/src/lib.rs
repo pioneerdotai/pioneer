@@ -30497,6 +30497,70 @@ impl CrudStore {
         .await
     }
 
+    /// Continue an early Stop after the initial CLI attempt won admission.
+    /// The caller holds the existing CLI transition gate through cleanup.
+    pub async fn materialize_cli_runtime_cancellation_owned_as(
+        &self,
+        notification: pioneer_protocol::TurnFailedNotification,
+        expected: &TurnExecutionRecord,
+        source: &CliRuntimeTurnTerminalGuard,
+        cancellation_actor_id: Option<String>,
+        now_unix: i64,
+    ) -> Result<()> {
+        let attempt = source
+            .attempt
+            .as_ref()
+            .context("CLI cancellation attempt is missing")?;
+        anyhow::ensure!(
+            expected.executor_kind == TurnExecutorKind::CliRuntime
+                && source.turn_status == TurnStatus::InProgress
+                && attempt.status.is_active()
+                && attempt.turn_id == expected.turn_id
+                && attempt.runtime_id == source.binding.runtime_id
+                && attempt.runtime_kind == source.binding.runtime_kind
+                && notification.turn.status == TurnStatus::Interrupted
+                && notification.turn.id == expected.turn_id
+                && notification.thread_id == expected.thread_id
+                && notification.workspace_id == expected.workspace_id
+                && source.binding.turn_id == expected.turn_id
+                && source.binding.thread_id == expected.thread_id
+                && source.binding.workspace_id == expected.workspace_id
+                && source.execution_owner.as_ref()
+                    == Some(&(expected.owner_id.clone(), expected.owner_generation)),
+            UnactivatedTurnPhaseChanged
+        );
+        // The canonical append pipeline accepts a Statement guard, evaluated
+        // inside its writer transaction. A prior repository read cannot fence
+        // an ownership transfer between gate acquisition and canonical append.
+        let guard = sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT 1 FROM turn_execution e JOIN turn_cli_runtime_binding b ON b.turn_id = e.turn_id JOIN turn_cli_runtime_attempt a ON a.turn_id = e.turn_id WHERE e.turn_id = ? AND e.owner_id = ? AND e.owner_generation = ? AND e.thread_id = ? AND e.workspace_id = ? AND b.runtime_id = ? AND b.continuation_thread_id = ? AND a.id = ? AND a.status = ?",
+            [
+                expected.turn_id.clone().into(),
+                expected.owner_id.clone().into(),
+                i64::try_from(expected.owner_generation)?.into(),
+                expected.thread_id.clone().into(),
+                expected.workspace_id.clone().into(),
+                source.binding.runtime_id.clone().into(),
+                source.binding.continuation_thread_id.clone().into(),
+                attempt.id.clone().into(),
+                attempt.status.as_str().into(),
+            ],
+        );
+        self.materialize_turn_event_with_projection_context_and_guard(
+            CanonicalTurnEventPayload::TurnFailed(notification),
+            now_unix,
+            TurnEventProjectionContext {
+                enqueue_optional_deliveries: true,
+                cancellation_actor_id,
+                ..Default::default()
+            },
+            Some(&expected.owner_id),
+            Some(guard),
+        )
+        .await
+    }
+
     /// Definitive pre-activation refusals use the canonical terminal pipeline
     /// and the same owner/generation/activation fence as early cancellation.
     pub async fn materialize_unactivated_turn_refusal_owned(

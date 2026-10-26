@@ -4077,6 +4077,242 @@ async fn start_threads_cli_fixture_with_policy(
     (harness, processor, turn)
 }
 
+#[tokio::test]
+async fn early_public_stop_and_cli_initial_attempt_share_the_exact_writer_fence() {
+    for phase in [
+        "stop_first",
+        "cli_first",
+        "replacement_generation",
+        "same_owner_generation",
+    ] {
+        let kind = CLIAgentRuntimeKind::Codex;
+        let mut harness = setup_cli_runtime_skill_preflight_harness(kind, false).await;
+        *harness.cli_session.projected_mcp_store.lock().await = Some(harness.crud_store.clone());
+        let thread = "cli_early_stop_race";
+        let turn = "cli_early_stop_race_turn";
+        seed_cli_runtime_skill_preflight_thread(&harness, thread).await;
+        let processor = Arc::new(harness.processor.clone());
+        processor.bind_agent_tool_bridges().await;
+        processor.arm_completed_history_preparation_barrier("__cli_before_initial_binding__");
+        let request = cli_runtime_turn_start_request_with_capabilities(
+            &generate_test_request_id("early-cli", "start"),
+            thread,
+            turn,
+            &harness.runtime_id,
+            kind,
+            vec![],
+        );
+        let start = tokio::spawn({
+            let processor = processor.clone();
+            let connection = harness.connection_id;
+            async move {
+                processor
+                    .process_request_for_connection(connection, &request)
+                    .await
+            }
+        });
+        timeout(
+            Duration::from_secs(10),
+            processor.wait_for_completed_history_preparation_barrier(),
+        )
+        .await
+        .unwrap();
+        let store = &harness.crud_store;
+        let owner = store.get_turn_execution(turn).await.unwrap().unwrap();
+        assert!(
+            store
+                .latest_cli_runtime_turn_attempt(turn)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .native_cancellation_context(turn)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let cancel_id = generate_test_request_id("early-cli", "cancel");
+        let cancel_request = json!({"jsonrpc":"2.0", "id":cancel_id, "method":"turn/cancel",
+            "params":{"thread_id":thread,"turn_id":turn}})
+        .to_string();
+        if phase == "stop_first" {
+            processor
+                .process_request_for_connection(harness.connection_id, &cancel_request)
+                .await;
+            let reply = recv_response_by_id(&mut harness.rx, &cancel_id).await;
+            let reply: TurnCancelResponse = serde_json::from_value(reply.result).unwrap();
+            assert_eq!(reply.turn.status, TurnStatus::Interrupted);
+            processor.release_completed_history_preparation_barrier();
+            timeout(Duration::from_secs(10), start)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                store
+                    .latest_cli_runtime_turn_attempt(turn)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            // Stop has observed no CLI attempt, but has not entered its writer.
+            let reached = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            *processor
+                .native_cancellation_materialization_barrier
+                .lock()
+                .await = Some((reached.clone(), release.clone()));
+            let stop = tokio::spawn({
+                let processor = processor.clone();
+                let connection = harness.connection_id;
+                async move {
+                    processor
+                        .process_request_for_connection(connection, &cancel_request)
+                        .await
+                }
+            });
+            timeout(Duration::from_secs(10), reached.notified())
+                .await
+                .unwrap();
+            processor.arm_completed_history_preparation_barrier("__cli_after_initial_binding__");
+            processor.release_completed_history_preparation_barrier();
+            timeout(
+                Duration::from_secs(10),
+                processor.wait_for_completed_history_preparation_barrier(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                store
+                    .latest_cli_runtime_turn_attempt(turn)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            if matches!(phase, "replacement_generation" | "same_owner_generation") {
+                let replacement = store
+                    .claim_expired_turn_execution(
+                        &owner,
+                        if phase == "same_owner_generation" {
+                            &owner.owner_id
+                        } else {
+                            "replacement-cli-owner"
+                        },
+                        owner.lease_until.timestamp() + 1,
+                        owner.lease_until.timestamp() + 100,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let before = store.get_turn(thread, turn).await.unwrap().unwrap();
+                release.notify_one();
+                timeout(Duration::from_secs(10), stop)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                recv_error_by_id(&mut harness.rx, &cancel_id).await;
+                assert!(!store.native_turn_has_accepted_terminal(turn).await.unwrap());
+                assert_eq!(store.get_turn(thread, turn).await.unwrap().unwrap(), before);
+                assert_eq!(
+                    store.get_turn_execution(turn).await.unwrap().unwrap(),
+                    replacement
+                );
+                // The stale launch is held at the real preparation boundary.
+                start.abort();
+                let _ = start.await;
+                processor.release_completed_history_preparation_barrier();
+                assert!(harness.cli_session.turn_starts.lock().await.is_empty());
+                continue;
+            }
+            // Keep activation's gate owned until Stop loses its early writer.
+            processor
+                .arm_completed_history_preparation_barrier("__early_stop_cli_after_phase_change__");
+            release.notify_one();
+            timeout(
+                Duration::from_secs(10),
+                processor.wait_for_completed_history_preparation_barrier(),
+            )
+            .await
+            .unwrap();
+            processor.release_completed_history_preparation_barrier();
+            processor.release_completed_history_preparation_barrier();
+            timeout(Duration::from_secs(10), start)
+                .await
+                .unwrap()
+                .unwrap();
+            timeout(Duration::from_secs(10), stop)
+                .await
+                .unwrap()
+                .unwrap();
+            let reply = recv_response_by_id(&mut harness.rx, &cancel_id).await;
+            let reply: TurnCancelResponse = serde_json::from_value(reply.result).unwrap();
+            assert_eq!(reply.turn.status, TurnStatus::Interrupted);
+            let binding = store
+                .get_cli_runtime_turn_binding(turn)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(binding.status, "interrupted");
+            assert_eq!(
+                store
+                    .latest_cli_runtime_turn_attempt(turn)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                pioneer_crud::CliRuntimeTurnAttemptStatus::Interrupted
+            );
+            assert!(!harness.cli_session.interrupts.lock().await.is_empty());
+        }
+        assert!(
+            store
+                .native_cancellation_context(turn)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let saved = store.get_turn(thread, turn).await.unwrap().unwrap().1;
+        assert_eq!(saved.status, TurnStatus::Interrupted);
+        assert_eq!(
+            processor
+                .thread_manager
+                .turn_get(thread, turn)
+                .await
+                .unwrap()
+                .1,
+            saved
+        );
+        let stopped = store.get_turn_execution(turn).await.unwrap().unwrap();
+        assert_eq!(stopped.owner_id, owner.owner_id);
+        assert_eq!(stopped.owner_generation, owner.owner_generation);
+        assert_eq!(
+            stopped.status,
+            pioneer_crud::TurnExecutionStatus::Interrupted
+        );
+        let db = store.database_connection();
+        let response = pioneer_crud::load_agent_turn_response(&db, turn)
+            .await
+            .unwrap()
+            .unwrap();
+        let resource =
+            pioneer_crud::load_agent_execution_resource_state(&db, &response.execution_id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(resource.status, "cancelled");
+        let permit =
+            pioneer_entity::agent_running_permit::Entity::find_by_id(resource.permit_id.unwrap())
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(permit.status, "released");
+        assert!(harness.cli_session.turn_starts.lock().await.is_empty());
+    }
+}
+
 struct ThreadsFacade {
     facade: Arc<crate::cli_runtime::mcp::facade::CliMcpToolFacade>,
     context: crate::cli_runtime::mcp::facade::CliMcpFacadeRequestContext,

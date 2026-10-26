@@ -1527,6 +1527,9 @@ enum InitialStopPhase {
     NativeTaskBeforeRegistration,
     GraphFenceStorageUnavailable,
     AcceptedProjectionPending,
+    ProjectionStorageUnavailable,
+    BeforeActorProjectionStorageUnavailable,
+    GraphFenceProjectionUnavailable,
 }
 
 // These phase tests use one executor thread: observing the control registry's
@@ -1585,6 +1588,21 @@ async fn public_root_stop_rediscovers_unfinished_children_after_a_graph_fence() 
 #[tokio::test]
 async fn public_initial_stop_waits_for_accepted_cancellation_projection() {
     exercise_initial_native_stop(InitialStopPhase::AcceptedProjectionPending).await;
+}
+
+#[tokio::test]
+async fn public_initial_stop_retains_actor_after_a_real_projection_failure() {
+    exercise_initial_native_stop(InitialStopPhase::ProjectionStorageUnavailable).await;
+}
+
+#[tokio::test]
+async fn public_early_stop_and_repeat_wait_for_real_projection_without_an_actor() {
+    exercise_initial_native_stop(InitialStopPhase::BeforeActorProjectionStorageUnavailable).await;
+}
+
+#[tokio::test]
+async fn public_root_stop_retries_a_direct_child_after_real_projection_failure() {
+    exercise_initial_native_stop(InitialStopPhase::GraphFenceProjectionUnavailable).await;
 }
 
 async fn exercise_initial_native_stop(phase: InitialStopPhase) {
@@ -1666,6 +1684,54 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
         "params":{"thread_id":thread,"turn_id":turn}})
     .to_string();
     match phase {
+        InitialStopPhase::BeforeActorProjectionStorageUnavailable => {
+            drop(prepared);
+            db.execute_unprepared("CREATE TRIGGER reject_early_projection BEFORE UPDATE OF status ON turn WHEN NEW.status = 'interrupted' BEGIN SELECT RAISE(ABORT, 'fixture projection unavailable'); END").await.unwrap();
+            for suffix in ["first-pending", "repeat-pending"] {
+                let id = generate_test_request_id("initialstop", suffix);
+                let mut pending: JsonValue = serde_json::from_str(&request).unwrap();
+                pending["id"] = json!(id);
+                processor
+                    .process_request_for_connection(connection, &pending.to_string())
+                    .await;
+                recv_error_by_id(&mut rx, &id).await;
+                assert!(store.native_turn_has_accepted_terminal(turn).await.unwrap());
+                assert_eq!(
+                    store
+                        .get_turn(thread, turn)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .1
+                        .status,
+                    TurnStatus::InProgress
+                );
+                assert_eq!(
+                    processor
+                        .thread_manager
+                        .turn_get(thread, turn)
+                        .await
+                        .unwrap()
+                        .1
+                        .status,
+                    TurnStatus::Interrupted
+                );
+                assert!(!processor.agent_manager.has_thread(thread).await);
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            }
+            db.execute_unprepared("DROP TRIGGER reject_early_projection")
+                .await
+                .unwrap();
+            let replay = store
+                .with_maintenance_access()
+                .replay_due_turn_event_projections(now_timestamp_secs() + 120, 64)
+                .await
+                .unwrap();
+            assert!(replay.projected > 0);
+            processor
+                .process_request_for_connection(connection, &request)
+                .await;
+        }
         InitialStopPhase::NativeTaskBeforeRegistration => {
             processor.bind_task_bridge().await;
             processor.arm_completed_history_preparation_barrier(
@@ -1795,7 +1861,8 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                 .await;
         }
         InitialStopPhase::DirectChildBeforeRegistration
-        | InitialStopPhase::GraphFenceStorageUnavailable => {
+        | InitialStopPhase::GraphFenceStorageUnavailable
+        | InitialStopPhase::GraphFenceProjectionUnavailable => {
             let tools = processor
                 .materialize_agent_action_tools(pioneer_agent::TurnToolContext {
                     workspace_id: workspace.clone(),
@@ -1806,7 +1873,11 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                 .unwrap();
             let mut children = Vec::new();
             let mut child_owners = std::collections::BTreeMap::new();
-            for index in 0..if matches!(phase, InitialStopPhase::GraphFenceStorageUnavailable) {
+            for index in 0..if matches!(
+                phase,
+                InitialStopPhase::GraphFenceStorageUnavailable
+                    | InitialStopPhase::GraphFenceProjectionUnavailable
+            ) {
                 2
             } else {
                 1
@@ -1857,7 +1928,11 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                 );
                 children.push(payload);
             }
-            if matches!(phase, InitialStopPhase::GraphFenceStorageUnavailable) {
+            if matches!(
+                phase,
+                InitialStopPhase::GraphFenceStorageUnavailable
+                    | InitialStopPhase::GraphFenceProjectionUnavailable
+            ) {
                 let read = Arc::new(Notify::new());
                 let continue_commit = Arc::new(Notify::new());
                 *processor
@@ -1898,7 +1973,17 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                     .expect("the first child holds provisional interruption before its writer");
                 // The graph fence has committed; fail the actual first child's
                 // terminal append, irrespective of repository traversal order.
-                db.execute_unprepared(&format!("CREATE TRIGGER fail_graph_child BEFORE INSERT ON turn_event WHEN NEW.turn_id='{first_turn}' BEGIN SELECT RAISE(ABORT,'fixture storage unavailable'); END")).await.unwrap();
+                let trigger = if matches!(phase, InitialStopPhase::GraphFenceProjectionUnavailable)
+                {
+                    format!(
+                        "CREATE TRIGGER fail_graph_child BEFORE UPDATE OF status ON turn WHEN NEW.id='{first_turn}' AND NEW.status='interrupted' BEGIN SELECT RAISE(ABORT,'fixture projection unavailable'); END"
+                    )
+                } else {
+                    format!(
+                        "CREATE TRIGGER fail_graph_child BEFORE INSERT ON turn_event WHEN NEW.turn_id='{first_turn}' BEGIN SELECT RAISE(ABORT,'fixture storage unavailable'); END"
+                    )
+                };
+                db.execute_unprepared(&trigger).await.unwrap();
                 continue_commit.notify_one();
                 timeout(Duration::from_secs(10), first_stop)
                     .await
@@ -1942,9 +2027,31 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                         }
                     );
                 }
+                if matches!(phase, InitialStopPhase::GraphFenceProjectionUnavailable) {
+                    assert!(
+                        store
+                            .native_turn_has_accepted_terminal(&first_turn)
+                            .await
+                            .unwrap()
+                    );
+                    let id = generate_test_request_id("initialstop", "graph-repeat-pending");
+                    let mut pending: JsonValue = serde_json::from_str(&request).unwrap();
+                    pending["id"] = json!(id);
+                    processor
+                        .process_request_for_connection(connection, &pending.to_string())
+                        .await;
+                    recv_error_by_id(&mut rx, &id).await;
+                }
                 db.execute_unprepared("DROP TRIGGER fail_graph_child")
                     .await
                     .unwrap();
+                if matches!(phase, InitialStopPhase::GraphFenceProjectionUnavailable) {
+                    store
+                        .with_maintenance_access()
+                        .replay_due_turn_event_projections(now_timestamp_secs() + 120, 64)
+                        .await
+                        .unwrap();
+                }
                 processor
                     .process_request_for_connection(connection, &request)
                     .await;
@@ -2110,7 +2217,8 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
         | InitialStopPhase::CanonicalStorageUnavailable
         | InitialStopPhase::RegistrationStorageUnavailable
         | InitialStopPhase::RegistrationWriteStorageUnavailable
-        | InitialStopPhase::AcceptedProjectionPending => {
+        | InitialStopPhase::AcceptedProjectionPending
+        | InitialStopPhase::ProjectionStorageUnavailable => {
             processor.arm_completed_history_preparation_barrier(
                 "__native_initial_control_before_registration__",
             );
@@ -2299,7 +2407,14 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                     .await
                     .unwrap();
             }
-            if matches!(phase, InitialStopPhase::AcceptedProjectionPending) {
+            if matches!(
+                phase,
+                InitialStopPhase::AcceptedProjectionPending
+                    | InitialStopPhase::ProjectionStorageUnavailable
+            ) {
+                if matches!(phase, InitialStopPhase::ProjectionStorageUnavailable) {
+                    db.execute_unprepared("CREATE TRIGGER reject_owned_projection BEFORE UPDATE OF status ON turn WHEN NEW.status = 'interrupted' BEGIN SELECT RAISE(ABORT, 'fixture projection unavailable'); END").await.unwrap();
+                }
                 processor.arm_completed_history_preparation_barrier(
                     "__initial_stop_terminal_commit_failed__",
                 );
@@ -2324,6 +2439,35 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                 assert!(!stop.is_finished());
                 assert!(processor.agent_manager.has_thread(thread).await);
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
+                if matches!(phase, InitialStopPhase::ProjectionStorageUnavailable) {
+                    // Let the first real projector failure reach classification.
+                    // A permanent refusal loses the actor before this next retry.
+                    processor.arm_completed_history_preparation_barrier(
+                        "__initial_stop_terminal_completion_pending__",
+                    );
+                    processor.release_completed_history_preparation_barrier();
+                    timeout(
+                        Duration::from_secs(10),
+                        processor.wait_for_completed_history_preparation_barrier(),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(!stop.is_finished());
+                    assert!(processor.agent_manager.has_thread(thread).await);
+                    assert_eq!(
+                        store
+                            .get_turn(thread, turn)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .1
+                            .status,
+                        TurnStatus::InProgress
+                    );
+                    db.execute_unprepared("DROP TRIGGER reject_owned_projection")
+                        .await
+                        .unwrap();
+                }
                 let replay = store
                     .with_maintenance_access()
                     .replay_due_turn_event_projections(now_timestamp_secs() + 120, 64)
@@ -2445,6 +2589,15 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
     assert_eq!(reply.turn.status, TurnStatus::Interrupted);
     let terminal = store.get_turn(thread, turn).await.unwrap().unwrap().1;
     assert_eq!(terminal, reply.turn);
+    assert_eq!(
+        processor
+            .thread_manager
+            .turn_get(thread, turn)
+            .await
+            .unwrap()
+            .1,
+        terminal
+    );
     let stopped = store.get_turn_execution(turn).await.unwrap().unwrap();
     assert_eq!(stopped.owner_id, owner.owner_id);
     assert_eq!(stopped.owner_generation, owner.owner_generation);
@@ -2454,6 +2607,8 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
         InitialStopPhase::DirectChildBeforeRegistration
             | InitialStopPhase::GraphFenceStorageUnavailable
             | InitialStopPhase::NativeTaskBeforeRegistration
+            | InitialStopPhase::BeforeActorProjectionStorageUnavailable
+            | InitialStopPhase::GraphFenceProjectionUnavailable
     ) {
         assert!(
             store

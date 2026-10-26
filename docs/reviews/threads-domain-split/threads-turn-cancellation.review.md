@@ -1,10 +1,13 @@
-# Threads turn cancellation: передача на внешнее ревью
+# Threads turn cancellation: повторная передача на внешнее ревью
 
 ## Ревизии и рабочая область
 
 - Ветка: `fix/threads-turn-cancellation`.
 - Worktree: `/Users/alexander/Code/pioneer/pioneer/.worktrees/threads-turn-cancellation`.
-- Фактический начальный commit: `4ea81a4c67a9d24876e4333989dae1955b00b943`
+- Фактический начальный commit текущей доработки:
+  `a30fc0bba9922916cc93df5ddac38b0658167387` — совпал с проверенным HEAD.
+- Начальный commit предыдущего самоаудита:
+  `4ea81a4c67a9d24876e4333989dae1955b00b943`
   (`Split Threads Stop, foreground control and terminal synchronization`).
 - При входе дерево было чистым, staged/unstaged/untracked работы не было.
 - База собственной части: `13b22123b19026b1ab4701e72c884f3efe4a15b3`.
@@ -18,8 +21,131 @@
   самоотчёт не использовались как эталон корректности. Совокупная база
   разделения: `bb85dcdf7080164c4dc6480d12410e5e38edade8`.
 
-Это статический самоаудит части 3/4, а не приёмка. Интеграцию принятых
+Это повторный статический самоаудит части 3/4, а не приёмка. Интеграцию принятых
 исправлений в следующие части выполняет родительский ревьюер.
+
+## Доработка по трём подтверждённым замечаниям внешнего аудита
+
+Предыдущий самоаудит не обнаружил три дефекта ниже. Его выводы о projection
+и полном раннем completion были недостаточны; актуальные изменения и
+ограничения этой передачи приведены здесь. Дерево на входе снова было чистым.
+
+1. **Owned Stop после настоящего сбоя проектора.**
+   Обе формы `TurnEventProjectionAfterAppendError` означают подтверждённый
+   append, включая `pending=false` с сохранённой текстом DB-причиной.
+   Обработка owned TurnInterrupted теперь использует существующий typed
+   `turn_event_was_appended_before_error`, не текст ошибки и не только
+   `is_pending()`. Актор сохраняет свою публикацию и completion receipt до
+   projection replay, exact cleanup и guarded memory sync. Отказы до append
+   сохраняют прежнюю классификацию; owner/generation mismatch остаётся
+   permanent denial.
+
+2. **Ранний Stop и повторный Interrupted.**
+   Только для Interrupted общий post-append fallback больше не превращает
+   незавершённую projection в `Ok(())`. Семантика ACK остальных событий
+   сохранена. Уже принятое событие не откатывается. Из существующего owned
+   completion выделен общий `finish_turn_cancellation`: он проверяет точный
+   owner/generation и scope, projected Interrupted, существующий точный
+   finalizer и guarded sync, затем повторно сверяет owner/generation.
+   Ранняя ветка вызывает его после своего writer, а обычная interruption
+   публикация также использует его при повторной доставке. Поэтому
+   `current_turn.status == Interrupted` не пропускает ни projection, ни
+   освобождение прежних ресурсов. Настоящие Tasks по-прежнему пропускают
+   прямой graph finalizer и остаются у aggregate protocol.
+
+   Ошибка проверки completion после успешного append сохраняет typed context
+   `NativeTurnControlTransitionPending`; она не разрешает rollback принятого
+   результата. Semantic owner/generation denial внутри context проверяется
+   раньше retry-классификации. Public fallback теперь читает canonical Turn
+   и проверяет сохранённый owner/generation и guarded sync. После неудачного
+   mark он допускает только другой projected terminal outcome; provisional
+   или ещё не завершённый Interrupted не подтверждает Stop.
+
+3. **CLI initial attempt выиграл ранний writer.**
+   После `UnactivatedTurnPhaseChanged` сначала повторно проверяются точные
+   owner/generation/workspace/thread, затем различаются CLI attempt и native
+   registration. CLI продолжение захватывает существующий session transition
+   gate, перечитывает binding, проверяет неизменяемую session identity,
+   attempt ID и durable owner/generation. Оно не требует native context.
+   Если activation уже завершила эту отмену, повторного terminal append нет.
+   Иначе небольшой внутренний CRUD adapter использует существующий canonical
+   append/projection pipeline с writer guard по owner/generation/scope и
+   binding/attempt. Штатные terminalization и cleanup выполняются под тем же
+   gate; completion включает exact finalizer и guarded sync. Новых внешних
+   tool/API операций, очередей, таймаутов и альтернативного CLI lifecycle нет.
+
+Новый guard — дополнительная проверка в существующей append-транзакции,
+а не новая транзакционная граница. Подготовленный snapshot используется
+только под CLI gate; mutable owner/generation, scope, binding route и
+attempt ID/status перепроверяются самим writer. Все DB-ресурсы освобождаются
+до runtime cleanup, notification и gate ожидания. Scheduling class не менялся.
+
+### Написанные регрессии этой доработки (не запускались)
+
+- `public_initial_stop_retains_actor_after_a_real_projection_failure`:
+  настоящая ошибка UPDATE `turn.status` после canonical append. Проверяется
+  accepted terminal + сохранённый InProgress + незавершённый Stop + живой
+  актор. Первая ошибка действительно проходит классификацию, после чего тест
+  ждёт следующую попытку completion при всё ещё сломанной projection;
+  остановка актора на permanent rejection не может пройти этот барьер.
+  Затем существующий replay завершает тот же Stop без нового model call.
+- `public_early_stop_and_repeat_wait_for_real_projection_without_an_actor`:
+  та же ошибка UPDATE без dispatch актора; первый и повторный public Stop
+  возвращают persistence error, пока DB Turn InProgress, хотя память содержит
+  provisional Interrupted. После восстановления и projection replay
+  подтверждается прежняя отмена, совпадают memory/DB/resources/permit.
+- `public_root_stop_retries_a_direct_child_after_real_projection_failure`:
+  расширена существующая graph/siblings fixture. Проекция одного ребёнка
+  не завершается, другой ребёнок обрабатывается; повторный public Stop до
+  replay также не успешен. После replay завершается оставшаяся отмена.
+- `early_public_stop_and_cli_initial_attempt_share_the_exact_writer_fence`:
+  существующий recording CLI harness и реальные публичные start/cancel,
+  без подготовленного результата вместо writer. Порядок Stop-first
+  запрещает настоящий initial attempt; порядок CLI-first продолжает тот же
+  Stop через CLI cleanup без второго нажатия. Отдельные отрицательные
+  варианты меняют owner+generation и только generation при прежнем owner.
+  В них canonical Turn/новый owner не меняются этой отменой. В положительных
+  вариантах проверяются Interrupted, terminal binding/attempt, память,
+  resource state и released permit; native model calls отсутствуют.
+
+Для детерминированного порядка переиспользован существующий test-only barrier
+на границах initial binding и перехода раннего Stop. Нового production control
+механизма нет. Все SQL triggers и fake/recording runtimes остаются только
+текстом не запущенных тестов.
+
+### Повторный самоаудит и реальные проверки
+
+Просмотрен итоговый diff от `13b22123…`, включая ранее перенесённую часть и
+текущие исправления; повторно прочитаны непосредственные callers и shared
+signatures: actor ACK/publication, canonical append/error/replay,
+unactivated writer, terminal finalizer, public turn/cancel, CLI initial
+binding, transition gate, guarded terminalization и runtime effects.
+Проверены оба порядка гонок, повторная отмена, отсутствие rollback после
+append, отсутствие успешного completion из provisional memory, точные fences,
+сохранение Task aggregate protocol и отделение process ACK от completion.
+Другие части не переносились, recovery/outbox matrix части 4 не реализовывалась.
+
+В этой доработке выполнены только чтение (`cat`, `rg`, `sed`), Git inspection
+(`pwd`, `git rev-parse HEAD`, `git branch --show-current`, `git status --short`,
+`git diff`, в том числе diff от `13b22123`), статические текстовые правки
+через `apply_patch`/`python3`, несколько проходов
+`cargo fmt -p pioneer-gateway -p pioneer-crud`, затем
+`cargo fmt --all --check`, `git diff --check` и
+`git diff --check 13b22123b19026b1ab4701e72c884f3efe4a15b3`.
+Итоговые formatting/whitespace checks — код 0. Перед commit также проверяется
+`git diff --cached --check`; commit выполняется с
+`git -c core.hooksPath=/dev/null commit ...`.
+
+Это статические результаты. Тесты, cargo check, компиляция, сборки,
+приложение, Gateway, тестовые CLI-агенты, миграции, EXPLAIN, benchmarks и
+генераторы не запускались. Компилируемость, фактическое прохождение новых
+и существующих регрессий и pre-fix/post-fix результаты не подтверждены.
+Требуется повторное внешнее ревью; разрешения на запуск оно не даёт.
+
+## Материалы предыдущего самоаудита
+
+Ниже сохранены scope, предшествующие исправления и проверки первой передачи;
+выводы по трём новым замечаниям уточнены разделом выше.
 
 ## Прочитанные инструкции и scope
 
