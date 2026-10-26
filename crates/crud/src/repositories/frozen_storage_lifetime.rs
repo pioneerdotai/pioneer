@@ -2193,12 +2193,6 @@ impl FrozenStorageLifetimeProgress {
                 &Query::select()
                     .from(checkpoint::Entity)
                     .column((checkpoint::Entity, checkpoint::Column::Id))
-                    .column((operation::Entity, operation::Column::Status))
-                    .columns(
-                        [runner::Column::Generation, runner::Column::State]
-                            .map(|c| (runner::Entity, c)),
-                    )
-                    .column((projection::Entity, projection::Column::ManifestId))
                     .join(
                         JoinType::InnerJoin,
                         operation::Entity,
@@ -2226,12 +2220,6 @@ impl FrozenStorageLifetimeProgress {
                             projection::Column::ManifestId,
                         ))),
                     )
-                    .join(
-                        JoinType::InnerJoin,
-                        runner::Entity,
-                        Expr::col((runner::Entity, runner::Column::OperationId))
-                            .eq(Expr::col((operation::Entity, operation::Column::Id))),
-                    )
                     .and_where(
                         Expr::col((checkpoint::Entity, checkpoint::Column::Id))
                             .gt(&self.discard_after),
@@ -2247,10 +2235,6 @@ impl FrozenStorageLifetimeProgress {
                     .and_where(
                         Expr::col((checkpoint::Entity, checkpoint::Column::Status)).ne("applied"),
                     )
-                    .and_where(
-                        Expr::cust("length(CAST(compaction_runner_state.state AS BLOB))")
-                            .lte(256_i64 * 1024),
-                    )
                     .order_by((checkpoint::Entity, checkpoint::Column::Id), Order::Asc)
                     .limit(1)
                     .to_owned(),
@@ -2261,10 +2245,6 @@ impl FrozenStorageLifetimeProgress {
             return Ok(false);
         };
         let id: String = row.try_get("", "id")?;
-        let manifest: String = row.try_get("", "manifest_id")?;
-        let status: String = row.try_get("", "status")?;
-        let generation: Option<i64> = row.try_get("", "generation")?;
-        let state: String = row.try_get("", "state")?;
         // One exact-key metadata read, after LIMIT has selected this candidate.
         // A failed read acknowledges nothing; a successful refusal advances the
         // keyset without allocating a reverse traversal or decoding runner JSON.
@@ -2273,20 +2253,12 @@ impl FrozenStorageLifetimeProgress {
             self.discard_after = id;
             return Ok(true);
         }
-        let scope = compaction::checkpoint_row(&store.connection, &id).await?;
-        self.discard_after = id.clone();
-        ensure!(
-            terminal(&status, generation, Some(&state))?,
-            "staging discard state unproved"
-        );
-        let scope = scope.ok_or_else(|| anyhow::anyhow!("discard checkpoint scope missing"))?;
-        self.discard = Some(DiscardPreparation {
-            reverse: Reachability::new(&id, &scope.workspace_id),
-            id,
-            manifest,
-            status,
-            generation,
-        });
+        // Discovery/preflight may already be stale. Fetch all current binding
+        // facts together, only now touching runner payload/size. Any DB error
+        // leaves this visit unacknowledged; a successful refusal is not EOF.
+        let discard = prepare_discard_candidate(store, &id).await?;
+        self.discard_after = id;
+        self.discard = discard;
         Ok(true)
     }
 }
@@ -2310,6 +2282,69 @@ async fn discard_preflight(store: &CrudStore, id: &str) -> Result<bool> {
         ))
         .await?;
     Ok(row.is_some())
+}
+
+// Both reads are advisory: cleanup still owns final authorization in its
+// serialized writer. No reader/permit survives query_one_raw/checkpoint_row.
+async fn prepare_discard_candidate(
+    store: &CrudStore,
+    id: &str,
+) -> Result<Option<DiscardPreparation>> {
+    let row = store.connection.query_one_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT c.operation_id,c.owner,c.status AS checkpoint_status,p.manifest_id,o.status,r.generation,CAST(r.state AS BLOB) AS state \
+         FROM compaction_checkpoint c \
+         JOIN compaction_operation o ON o.id=c.operation_id AND o.owner=c.owner \
+         JOIN compaction_operation_projection p ON p.operation_id=o.id \
+         JOIN compaction_frozen_history h ON h.id=p.manifest_id \
+         JOIN compaction_runner_state r ON r.operation_id=o.id \
+         WHERE c.id=?1 AND c.status<>'applied' AND h.expired=1 \
+         AND o.status IN ('failed','cancelled','stale') \
+         AND typeof(r.state)='text' AND typeof(r.generation)='integer' \
+         AND length(CAST(r.state AS BLOB))<=262144 LIMIT 1",
+        [id.into()],
+    )).await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let operation: String = row.try_get("", "operation_id")?;
+    let owner: String = row.try_get("", "owner")?;
+    let checkpoint_status: String = row.try_get("", "checkpoint_status")?;
+    let manifest: String = row.try_get("", "manifest_id")?;
+    let status: String = row.try_get("", "status")?;
+    let generation: Option<i64> = row.try_get("", "generation")?;
+    let state: Vec<u8> = row.try_get("", "state")?;
+    // Corrupt legacy TEXT may contain invalid UTF-8. Read bytes so this is a
+    // successful data refusal, rather than a driver decode error stuck on ID.
+    let Ok(state) = std::str::from_utf8(&state) else {
+        return Ok(None);
+    };
+    // Parse only after reader release. Invalid JSON/generation/phase is a
+    // conservative refusal, never a fabricated terminal proof or a stuck key.
+    if !terminal(&status, generation, Some(state)).unwrap_or(false) {
+        return Ok(None);
+    }
+    let Some(scope) = compaction::checkpoint_row(&store.connection, id).await? else {
+        return Ok(None);
+    };
+    // Do not combine a changed checkpoint/projection scope with the runner
+    // observation above. The writer later rechecks generation/status/binding,
+    // incoming edges, expiry and holds even after reverse traversal succeeds.
+    if scope.operation_id != operation
+        || scope.owner != owner
+        || scope.status != checkpoint_status
+        || scope.manifest_id.as_deref() != Some(manifest.as_str())
+        || scope.format_version != 1
+    {
+        return Ok(None);
+    }
+    Ok(Some(DiscardPreparation {
+        reverse: Reachability::new(id, &scope.workspace_id),
+        id: id.into(),
+        manifest,
+        status,
+        generation,
+    }))
 }
 
 struct DiscardPreparation {
@@ -2766,6 +2801,9 @@ mod tests {
     mod expiry_preflight {
         include!("frozen_storage_lifetime_expiry_tests.rs");
     }
+    mod discard_admission {
+        include!("frozen_storage_lifetime_discard_tests.rs");
+    }
     use migration::{Migrator, MigratorTrait};
     use pioneer_compaction::{
         Checkpoint, ModelSelection, SourceRef, Transport,
@@ -3169,6 +3207,14 @@ mod tests {
             .unwrap();
         assert_eq!(pragma, 0, "production single writer uses FK OFF");
         Migrator::up(&db, None).await.unwrap();
+        fixture_in_store(CrudStore::new(db), published, ids).await
+    }
+    async fn fixture_in_store(
+        store: CrudStore,
+        published: bool,
+        ids: [&str; 2],
+    ) -> (CrudStore, FrozenHistoryRef) {
+        let db = store.database_connection();
         for sql in [
             "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',1,1)",
             "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
@@ -3176,8 +3222,6 @@ mod tests {
         ] {
             db.execute_unprepared(sql).await.unwrap();
         }
-        let store = CrudStore::new(db);
-        let db = store.database_connection();
         let sources: Vec<_> = (0..2)
             .map(|i| SourceRef {
                 scope: "event:turn".into(),
@@ -5943,6 +5987,17 @@ mod tests {
             .await
             .unwrap();
 
+        // A missing column makes *any* payload or length access fail in SQLite,
+        // even if JSON decoding were still deferred. No SQL-text assertion or
+        // production instrumentation is needed for this negative control.
+        store
+            .connection
+            .execute_unprepared(
+                "ALTER TABLE compaction_runner_state RENAME COLUMN state TO unavailable_state",
+            )
+            .await
+            .unwrap();
+        store.connection.execute_unprepared("ALTER TABLE compaction_runner_state RENAME COLUMN generation TO unavailable_generation").await.unwrap();
         for id in ["cp-0", "cp-05-empty"] {
             assert!(progress.discard_quantum(&store).await.unwrap());
             assert_eq!(progress.discard_after, id);
@@ -5956,11 +6011,36 @@ mod tests {
         // retention predicate; preflight must not reinterpret it as safe.
         store.connection.execute_unprepared("INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES('cp-05-empty','checkpoint:unknown','cp-1','unknown')").await.unwrap();
         assert!(!discard_preflight(&store, "cp-1").await.unwrap());
+        assert!(progress.discard_quantum(&store).await.unwrap());
+        assert_eq!(progress.discard_after, "cp-1");
+        assert!(
+            progress.discard.is_none(),
+            "foreign refusal must not read runner"
+        );
+        assert!(!progress.discard_quantum(&store).await.unwrap());
         store
             .connection
             .execute_unprepared("DELETE FROM compaction_coverage WHERE checkpoint_id='cp-05-empty'")
             .await
             .unwrap();
+        // Next pass retries previously held keys. Positive preflight now reaches
+        // the point read and fails without acknowledging cp-1.
+        for id in ["cp-0", "cp-05-empty"] {
+            assert!(progress.discard_quantum(&store).await.unwrap());
+            assert_eq!(progress.discard_after, id);
+        }
+        let error = progress.discard_quantum(&store).await.unwrap_err();
+        assert!(error.downcast_ref::<sea_orm::DbErr>().is_some());
+        assert_eq!(progress.discard_after, "cp-05-empty");
+        assert!(progress.discard.is_none());
+        store
+            .connection
+            .execute_unprepared(
+                "ALTER TABLE compaction_runner_state RENAME COLUMN unavailable_state TO state",
+            )
+            .await
+            .unwrap();
+        store.connection.execute_unprepared("ALTER TABLE compaction_runner_state RENAME COLUMN unavailable_generation TO generation").await.unwrap();
         assert!(progress.discard_quantum(&store).await.unwrap());
         assert_eq!(progress.discard.as_ref().unwrap().id, "cp-1");
         for _ in 0..64 {
