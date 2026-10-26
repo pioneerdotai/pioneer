@@ -2704,6 +2704,333 @@ async fn member_creation_uses_both_workspace_variants_and_revocation_fences_the_
     assert!(authority.grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace));
 }
 
+#[tokio::test]
+async fn exhausted_child_start_cannot_reconcile_a_sibling_from_another_action() {
+    use sea_orm::{ActiveModelTrait, Set};
+    let (processor, context, tools) = fixture().await;
+    let binding = processor
+        .agent_action_binding(&context.turn_id)
+        .await
+        .unwrap();
+    let creation = binding
+        .options
+        .thread_creation_options
+        .iter()
+        .find(|option| option.label == "Current collaboration")
+        .unwrap();
+    let created = call(
+        &tools,
+        "thread_create",
+        "reconcile-thread",
+        json!({"optionId":creation.id}),
+    )
+    .await;
+    let target = created["targetOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|option| {
+            !binding
+                .options
+                .target_options
+                .iter()
+                .any(|old| old.id == option["id"].as_str().unwrap())
+        })
+        .unwrap()["id"]
+        .clone();
+    let db = processor.crud_store.database_connection();
+    let mut rows = Vec::new();
+    for call_id in ["reconcile-first", "reconcile-sibling"] {
+        call(
+            &tools,
+            "threads_turn_start",
+            call_id,
+            json!({
+                "targetOptionId":target, "input":[{"type":"text","text":"Child command"}]
+            }),
+        )
+        .await;
+        rows.push(
+            pioneer_crud::load_agent_action_outbox(
+                &db,
+                crate::authorization::action_id_for_call(call_id).as_str(),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        );
+    }
+    let original: serde_json::Value = serde_json::from_str(&rows[0].payload_json).unwrap();
+    let sibling: serde_json::Value = serde_json::from_str(&rows[1].payload_json).unwrap();
+    let params: TurnStartParams =
+        serde_json::from_value(sibling["dispatch"]["params"].clone()).unwrap();
+    let execution_id = sibling["spawned_execution_id"].as_str().unwrap();
+    let execution = pioneer_crud::load_agent_execution(&db, execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        execution.parent_execution_id.as_deref(),
+        Some(rows[0].owner_execution_id.as_str())
+    );
+    let resource = pioneer_crud::load_agent_execution_resource_state(&db, execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let grant = pioneer_crud::load_agent_execution_grant(&db, execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut held: pioneer_entity::agent_action_outbox::ActiveModel = rows[1].clone().into();
+    held.next_attempt_at = Set(Some(pioneer_crud::utc_now() + chrono::Duration::hours(1)));
+    held.update(&db).await.unwrap();
+    let mut redirected = original.clone();
+    redirected["spawned_execution_id"] = sibling["spawned_execution_id"].clone();
+    redirected["dispatch"] = sibling["dispatch"].clone();
+    let mut exhausted: pioneer_entity::agent_action_outbox::ActiveModel = rows[0].clone().into();
+    exhausted.payload_json = Set(redirected.to_string());
+    exhausted.status = Set("failed".into());
+    exhausted.attempts = Set(8);
+    exhausted.next_attempt_at = Set(None);
+    exhausted.update(&db).await.unwrap();
+    crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+        .await
+        .unwrap();
+    assert!(
+        !processor
+            .crud_store
+            .native_turn_has_accepted_terminal(&params.turn_id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        processor
+            .crud_store
+            .get_turn(&params.thread_id, &params.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::InProgress
+    );
+    assert_eq!(
+        pioneer_crud::load_agent_execution_resource_state(&db, execution_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        resource
+    );
+    assert_eq!(
+        pioneer_crud::load_agent_execution_grant(&db, execution_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        grant
+    );
+    let unresolved = pioneer_crud::load_agent_action_outbox(&db, &rows[0].action_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unresolved.attempts, 8);
+    assert_eq!(unresolved.status, "failed");
+    assert!(unresolved.delivered_at.is_none());
+    assert!(unresolved.next_attempt_at.is_some());
+    // The original exact grant remains reconcilable; the sibling remains live.
+    let mut restored: pioneer_entity::agent_action_outbox::ActiveModel = unresolved.into();
+    restored.payload_json = Set(original.to_string());
+    restored.next_attempt_at = Set(Some(pioneer_crud::utc_now() - chrono::Duration::seconds(1)));
+    restored.update(&db).await.unwrap();
+    crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+        .await
+        .unwrap();
+    assert_eq!(
+        pioneer_crud::load_agent_action_outbox(&db, &rows[0].action_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "delivered"
+    );
+    assert_eq!(
+        processor
+            .crud_store
+            .get_turn(&params.thread_id, &params.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        TurnStatus::InProgress
+    );
+    assert_eq!(
+        pioneer_crud::load_agent_execution_resource_state(&db, execution_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        resource
+    );
+}
+
+#[tokio::test]
+async fn start_outbox_waits_for_accepted_terminal_projection_before_acknowledging_runtime() {
+    use sea_orm::{ActiveModelTrait, Set};
+    for attempts in [1, pioneer_crud::AGENT_ACTION_OUTBOX_MAX_ATTEMPTS] {
+        let probe = Arc::new(ChoiceRuntimeProbe::default());
+        probe.hold_main.store(true, Ordering::SeqCst);
+        let (processor, context, tools) = fixture_with_probe(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            false,
+            probe.clone(),
+        )
+        .await;
+        let binding = processor
+            .agent_action_binding(&context.turn_id)
+            .await
+            .unwrap();
+        let target = delegated_launch_target(&tools, &binding.options).await;
+        call(
+            &tools,
+            "threads_turn_start",
+            "pending-terminal-start",
+            json!({
+                "targetOptionId":target.id, "input":[{"type":"text","text":"Start once"}]
+            }),
+        )
+        .await;
+        let db = processor.crud_store.database_connection();
+        let action = crate::authorization::action_id_for_call("pending-terminal-start");
+        let row = pioneer_crud::load_agent_action_outbox(&db, action.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
+        let params: TurnStartParams =
+            serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+        let execution_id = payload["spawned_execution_id"].as_str().unwrap();
+        crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), probe.main_started.notified())
+            .await
+            .unwrap();
+        let owner = processor
+            .crud_store
+            .get_turn_execution(&params.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(owner.started_at.is_some());
+        let (_, mut terminal) = processor
+            .crud_store
+            .get_turn(&params.thread_id, &params.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        terminal.status = TurnStatus::Failed;
+        terminal.error = Some("fixture terminal outcome".into());
+        // Reproduce process loss between the real canonical append and projector.
+        // Dispatch still runs normally and must inspect the pending acceptance.
+        processor
+            .crud_store
+            .accept_native_turn_event_without_projection_for_test(
+                pioneer_crud::CanonicalTurnEventPayload::TurnFailed(
+                    pioneer_protocol::TurnFailedNotification {
+                        workspace_id: context.workspace_id.clone(),
+                        thread_id: params.thread_id.clone(),
+                        turn: terminal.clone(),
+                    },
+                ),
+                now_timestamp_secs(),
+                &owner.owner_id,
+            )
+            .await
+            .unwrap();
+        let mut lost: pioneer_entity::agent_action_outbox::ActiveModel =
+            pioneer_crud::load_agent_action_outbox(&db, action.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .into();
+        lost.status = Set("pending".into());
+        lost.attempts = Set(attempts);
+        lost.delivered_at = Set(None);
+        lost.next_attempt_at = Set(None);
+        lost.update(&db).await.unwrap();
+        let pending =
+            crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                .await
+                .unwrap();
+        assert_eq!(pending.delivered, 0);
+        let row = pioneer_crud::load_agent_action_outbox(&db, action.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "failed");
+        assert!(row.delivered_at.is_none());
+        assert!(row.next_attempt_at.is_some());
+        assert_eq!(
+            processor
+                .crud_store
+                .get_turn(&params.thread_id, &params.turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .status,
+            TurnStatus::InProgress
+        );
+        assert_eq!(probe.main_calls.load(Ordering::SeqCst), 1);
+        let replay = processor
+            .crud_store
+            .with_maintenance_access()
+            .replay_due_turn_event_projections(now_timestamp_secs(), 64)
+            .await
+            .unwrap();
+        assert_eq!(replay.projected, 1);
+        assert_eq!(replay.failed, 0);
+        let mut due: pioneer_entity::agent_action_outbox::ActiveModel = row.into();
+        due.next_attempt_at = Set(Some(pioneer_crud::utc_now() - chrono::Duration::seconds(1)));
+        due.update(&db).await.unwrap();
+        crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+            .await
+            .unwrap();
+        assert_eq!(
+            pioneer_crud::load_agent_action_outbox(&db, action.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "delivered"
+        );
+        assert_eq!(
+            processor
+                .thread_manager
+                .turn_get(&params.thread_id, &params.turn_id)
+                .await
+                .unwrap()
+                .1,
+            terminal
+        );
+        assert_eq!(
+            pioneer_crud::load_agent_execution_resource_state(&db, execution_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "failed"
+        );
+        assert_eq!(probe.main_calls.load(Ordering::SeqCst), 1);
+        let _ = processor
+            .agent_manager
+            .cancel_turn(&params.thread_id, &params.turn_id, "fixture cleanup")
+            .await;
+        probe.release_main.notify_waiters();
+    }
+}
+
 // These faults occur at the real storage/activation boundaries. The fixture
 // database is disposable; no result is supplied in place of production dispatch.
 #[tokio::test]

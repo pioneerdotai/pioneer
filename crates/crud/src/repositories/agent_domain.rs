@@ -4820,8 +4820,32 @@ where
                 .add(
                     Condition::any()
                         .add(
-                            agent_action_outbox::Column::Attempts
-                                .gte(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS),
+                            Condition::all()
+                                .add(
+                                    agent_action_outbox::Column::Attempts
+                                        .gte(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS),
+                                )
+                                // Exclude unresolved starts before LIMIT using
+                                // a point lookup of the canonical action.
+                                .add(sea_orm::sea_query::Expr::exists(
+                                    Query::select()
+                                        .column(agent_action::Column::Id)
+                                        .from(agent_action::Entity)
+                                        .and_where(
+                                            sea_orm::sea_query::Expr::col((
+                                                agent_action::Entity,
+                                                agent_action::Column::Id,
+                                            ))
+                                            .equals((
+                                                agent_action_outbox::Entity,
+                                                agent_action_outbox::Column::ActionId,
+                                            )),
+                                        )
+                                        .and_where(
+                                            agent_action::Column::ActionKind.ne("start_agent"),
+                                        )
+                                        .to_owned(),
+                                )),
                         )
                         .add(
                             agent_action_outbox::Column::LastError
@@ -5150,6 +5174,8 @@ struct AgentActionOutboxId {
 
 // Predicates and ordering match the existing due indexes and the exhausted
 // expression index added by m20261026_000001_agent_start_reconciliation_index.
+// SeaORM/SeaQuery do not expose SQLite INDEXED BY on the bounded UNION arm;
+// keep that discovery statement here, with only clocks and limits as binds.
 fn agent_action_outbox_timed_discovery_sql() -> String {
     // Empty text sorts before every stored timestamp. This makes NULL and timed
     // exhausted deadlines one searchable range with the unchanged input quota.
@@ -8453,6 +8479,26 @@ mod tests {
             old_payload.clone(),
         )
         .await;
+        // An older exhausted StartAgent still owes reconciliation. It must not
+        // consume the compaction quantum forever ahead of closed action tuples.
+        insert_compaction_test_tuple(
+            &db,
+            "unresolved",
+            "failed",
+            AGENT_ACTION_OUTBOX_MAX_ATTEMPTS,
+            old - Duration::days(1),
+            None,
+            "unresolved-response".to_owned(),
+            serde_json::json!({
+                "action_id": "action-unresolved",
+                "execution_id": "execution-unresolved",
+                "kind": "start_agent",
+                "spawned_execution_id": "spawned-unresolved",
+                "dispatch": {"turn_id":"turn-unresolved", "execution_generation":1},
+            })
+            .to_string(),
+        )
+        .await;
         insert_compaction_test_tuple(
             &db,
             "recent",
@@ -8486,12 +8532,18 @@ mod tests {
         )
         .await;
 
-        let summary = compact_terminal_agent_action_ledger(&db, now, 100)
+        let summary = compact_terminal_agent_action_ledger(&db, now, 1)
             .await
             .unwrap();
         assert_eq!(summary.candidate_rows, 1);
         assert_eq!(summary.compacted_rows, 1);
         assert!(summary.payload_bytes_released > 0);
+        let unresolved = agent_action_outbox::Entity::find_by_id("outbox-unresolved")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!unresolved.payload_json.contains("_pioneer_compacted"));
 
         let action = agent_action::Entity::find_by_id("action-old")
             .one(&db)

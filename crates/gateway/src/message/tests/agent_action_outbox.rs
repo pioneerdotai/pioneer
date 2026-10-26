@@ -533,6 +533,7 @@ async fn start_outbox_refusal_stops_delivery_without_inflating_attempts_and_unkn
         ("refused", r#"{"kind":"start_agent"}"#, 0),
         ("temporary", r#"{"kind":"start_agent"}"#, 0),
         ("unknown", r#"{"kind":"start_agent"}"#, 0),
+        ("stale-refusal", r#"{"kind":"start_agent"}"#, 7),
     ])
     .await;
     let db = processor
@@ -542,19 +543,38 @@ async fn start_outbox_refusal_stops_delivery_without_inflating_attempts_and_unkn
     let batch = pioneer_crud::claim_agent_action_outbox(&db, 64)
         .await
         .unwrap();
-    let result = process_claimed_agent_action_outbox(&db, batch, |row| async move {
-        match row.id.as_str() {
-            "refused" => Ok(AgentActionOutboxDispatch::Rejected(
-                Failure::ForegroundConflict,
-            )),
-            "temporary" => Err(Failure::ControlUnavailable.into()),
-            _ => Err(anyhow::anyhow!(
-                "provider secret and private input must not be persisted"
-            )),
+    let result = process_claimed_agent_action_outbox(&db, batch, |row| {
+        let db = db.clone();
+        async move {
+            match row.id.as_str() {
+                "stale-refusal" => {
+                    // Another delivery already acknowledged this exact claim. The
+                    // losing CAS must not count a second successful acknowledgement.
+                    assert!(
+                        pioneer_crud::mark_agent_action_outbox_delivered(
+                            &db,
+                            &row.id,
+                            row.attempts,
+                            pioneer_crud::utc_now(),
+                        )
+                        .await
+                        .unwrap()
+                    );
+                    Ok(AgentActionOutboxDispatch::Rejected(Failure::OutcomeUnknown))
+                }
+                "refused" => Ok(AgentActionOutboxDispatch::Rejected(
+                    Failure::ForegroundConflict,
+                )),
+                "temporary" => Err(Failure::ControlUnavailable.into()),
+                _ => Err(anyhow::anyhow!(
+                    "provider secret and private input must not be persisted"
+                )),
+            }
         }
     })
     .await;
     assert!(result.errors.is_empty());
+    assert_eq!(result.delivered, 0);
     let refused = agent_action_outbox::Entity::find_by_id("refused")
         .one(&db)
         .await

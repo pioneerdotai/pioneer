@@ -291,6 +291,19 @@ async fn exhausted_discovery_uses_indexed_null_and_timed_ranges_with_a_large_clo
         outbox.update(&db).await.unwrap();
         seed_action_for_discovery(&db, id, "start_agent", now).await;
     }
+    // Upgrade existing ledger data after rolling back both draft indexes.
+    // The old immediate range must be restored while the exhausted index is
+    // absent; reapplying must restore the production selectors and their plans.
+    Migrator::down(&db, Some(2)).await.unwrap();
+    assert!(db.query_all_raw(Statement::from_string(DatabaseBackend::Sqlite,
+        "EXPLAIN QUERY PLAN SELECT id FROM agent_action_outbox INDEXED BY idx_agent_action_outbox_immediate WHERE next_attempt_at IS NULL AND status IN ('pending','failed') AND attempts<8 ORDER BY created_at,id LIMIT 1"
+    )).await.is_ok());
+    let exhausted_index = db.query_one_raw(Statement::from_string(DatabaseBackend::Sqlite,
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_agent_action_outbox_exhausted'"
+    )).await.unwrap();
+    assert!(exhausted_index.is_none());
+    Migrator::up(&db, None).await.unwrap();
+    Migrator::up(&db, None).await.unwrap();
     let sql = agent_action_outbox_timed_discovery_sql();
     let plan = db
         .query_all_raw(Statement::from_sql_and_values(
