@@ -615,7 +615,7 @@ fn gateway_reported_admission_does_not_hide_child_persistence_error() {
 #[test]
 fn real_internal_completion_keeps_type_ownership_and_durable_agent_contract() {
     use super::super::turn_handlers::{TurnStartFailure, TurnStartSuccessResponse};
-    let ((task_saved, durable_public), events) = capture_task_start(async {
+    let ((task_saved, durable_error), events) = capture_task_start(async {
         let harness =
             setup_cli_runtime_skill_preflight_harness(CLIAgentRuntimeKind::Codex, false).await;
         let security =
@@ -706,7 +706,8 @@ fn real_internal_completion_keeps_type_ownership_and_durable_agent_contract() {
             admitted_outcome: None,
             completion: Arc::new(std::sync::Mutex::new(Some(sender))),
         };
-        // Expected failure avoids a raw diagnostic in the unchanged DurableAgent reporter.
+        // Committed outbox completion retains the typed validation cause for
+        // its caller, which owns classification and reporting.
         harness
             .processor
             .send_turn_start_failure_for_test(
@@ -719,12 +720,12 @@ fn real_internal_completion_keeps_type_ownership_and_durable_agent_contract() {
             )
             .await;
         let error = receiver.await.unwrap().err().unwrap();
-        assert!(error.downcast_ref::<TaskStartFailure>().is_none());
-        let public: pioneer_protocol::PublicError =
-            serde_json::from_str(&error.to_string()).unwrap();
-        assert_eq!(public.code, pioneer_protocol::PublicErrorCode::InvalidInput);
-        assert_eq!(public.stage, pioneer_protocol::PublicErrorStage::Admission);
-        (task_saved, public)
+        let failure = error.downcast_ref::<TaskStartFailure>().unwrap();
+        assert_eq!(failure.descriptor().stage, TaskStartStage::CliAdmission);
+        assert_eq!(failure.descriptor().cause, TaskStartCause::Validation);
+        assert_eq!(failure.reporting(), TaskStartReporting::Unreported);
+        assert!(failure.public_error().is_none());
+        (task_saved, failure.descriptor().task_error(None))
     });
     assert_eq!(events.len(), 1);
     assert_safe_events(&events);
@@ -733,7 +734,8 @@ fn real_internal_completion_keeps_type_ownership_and_durable_agent_contract() {
             .unwrap()
             .contains("PIONEER9_")
     );
-    assert!(!durable_public.retryable);
+    assert_eq!(durable_error.class, TaskErrorClass::Validation);
+    assert_eq!(durable_error.code, "task_cli_admission_validation_failed");
 }
 
 #[test]

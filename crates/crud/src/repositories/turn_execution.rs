@@ -267,6 +267,7 @@ pub async fn claim_unactivated<C: ConnectionTrait>(
         .filter(turn_execution::Column::Status.is_in(["queued", "starting"]))
         .filter(turn_execution::Column::StartedAt.is_null())
         .col_expr(turn_execution::Column::Status, Expr::value("running"))
+        .col_expr(turn_execution::Column::StartedAt, Expr::value(Some(now)))
         .col_expr(turn_execution::Column::UpdatedAt, Expr::value(now))
         .exec(db)
         .await?;

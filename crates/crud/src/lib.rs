@@ -58336,6 +58336,10 @@ mod tests {
             .unwrap();
         let renewed = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
         assert!(store.claim_unactivated_agent_turn(&renewed).await.unwrap());
+        let activated = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+        assert_eq!(activated.status, TurnExecutionStatus::Running);
+        assert!(activated.started_at.is_some());
+        assert_eq!(activated.owner_generation, renewed.owner_generation);
         assert!(!store.claim_unactivated_agent_turn(&renewed).await.unwrap());
     }
 

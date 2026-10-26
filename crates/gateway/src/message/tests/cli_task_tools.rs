@@ -388,7 +388,7 @@ fn threads_first_cli_outbox_dispatch_uses_committed_turn_once() {
             .load_turn_execution_authorization_context(child)
             .await
             .unwrap()
-            .to_persisted_json()
+            .authorization_fingerprint()
             .unwrap();
         let security = processor
             .crud_store
@@ -445,12 +445,14 @@ fn threads_first_cli_outbox_dispatch_uses_committed_turn_once() {
                 .unwrap(),
             grant
         );
+        // Preparation binds MCP and Skill projections after admission. The
+        // immutable authority ceiling and provenance must stay the same.
         assert_eq!(
             processor
                 .load_turn_execution_authorization_context(child)
                 .await
                 .unwrap()
-                .to_persisted_json()
+                .authorization_fingerprint()
                 .unwrap(),
             authority
         );
