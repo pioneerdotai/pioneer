@@ -645,6 +645,10 @@ pub struct MessageProcessor {
     agent_listener_tasks: Arc<Mutex<HashMap<String, AgentListenerTask>>>,
     agent_listener_generation: Arc<AtomicU64>,
     agent_message_buffers: Arc<Mutex<HashMap<String, AgentMarkdownBuffer>>>,
+    #[cfg(test)]
+    markdown_delta_parse_count: Arc<AtomicU64>,
+    #[cfg(test)]
+    progress_item_type_lookup_count: Arc<AtomicU64>,
     progress_items: Arc<Mutex<ProgressItemRegistry>>,
     agent_action_bindings:
         Arc<Mutex<HashMap<String, agent_action_tools::AgentActionRuntimeBinding>>>,
@@ -745,13 +749,15 @@ struct AgentListenerTask {
 
 #[derive(Default)]
 struct AgentMarkdownBuffer {
+    turn_id: String,
     text: String,
     stats: Arc<AgentMarkdownBufferStats>,
 }
 
 impl AgentMarkdownBuffer {
-    fn new(text: String) -> Self {
+    fn new(turn_id: String, text: String) -> Self {
         Self {
+            turn_id,
             text,
             stats: Arc::new(AgentMarkdownBufferStats::default()),
         }
@@ -1314,6 +1320,10 @@ impl MessageProcessor {
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
             agent_listener_generation: Arc::new(AtomicU64::new(1)),
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            markdown_delta_parse_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            progress_item_type_lookup_count: Arc::new(AtomicU64::new(0)),
             progress_items: Arc::new(Mutex::new(ProgressItemRegistry::default())),
             agent_action_bindings: Arc::new(Mutex::new(HashMap::new())),
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
@@ -2189,6 +2199,26 @@ impl MessageProcessor {
         // a barrier: no in-flight progress can reinsert state behind it.
         self.execution_leases.finish(turn_id).await;
         self.progress_items.lock().await.forget_turn(turn_id);
+        let removed = {
+            let mut buffers = self.agent_message_buffers.lock().await;
+            let mut removed = Vec::new();
+            buffers.retain(|_, buffer| {
+                if buffer.turn_id == turn_id {
+                    removed.push(std::mem::take(buffer));
+                    false
+                } else {
+                    true
+                }
+            });
+            removed
+        };
+        for buffer in removed {
+            Self::record_agent_markdown_buffer(
+                &buffer,
+                buffer.text.len(),
+                pioneer_observability::GatewayMarkdownMessageOutcome::Abandoned,
+            );
+        }
     }
 
     pub(crate) async fn validate_task_execution_admission_seed(
@@ -4982,6 +5012,10 @@ impl MessageProcessor {
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
             agent_listener_generation: Arc::new(AtomicU64::new(1)),
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            markdown_delta_parse_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            progress_item_type_lookup_count: Arc::new(AtomicU64::new(0)),
             progress_items: Arc::new(Mutex::new(ProgressItemRegistry::default())),
             agent_action_bindings: Arc::new(Mutex::new(HashMap::new())),
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
