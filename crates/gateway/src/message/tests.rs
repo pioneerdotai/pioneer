@@ -62867,7 +62867,7 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
                 .unwrap()
                 .top_level
                 .stale_block_ids()
-                .contains(&block_id)
+                .contains(&block_id.as_str())
         );
         assert!(
             core.thread_semantic_snapshot(&child.child_thread_id)
@@ -63121,7 +63121,7 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
                     turn_id: child.child_turn_id.clone(),
                     item: TurnItem::SystemEvent {
                         id: history_id.clone(),
-                        level: SystemEventLevel::Warning,
+                        level: pioneer_protocol::SystemEventLevel::Warning,
                         message: "Codex reported a request retry after a temporary failure.".into(),
                         code: Some("codex_request_retried".into()),
                         details: None,
