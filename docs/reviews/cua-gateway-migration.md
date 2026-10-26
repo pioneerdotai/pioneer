@@ -1163,3 +1163,30 @@ AST/TOML/JSON parsing, YAML syntax parsing, shell syntax, cargo fmt --all --chec
 and git diff --check. No local build/compiler/test/daemon/install/package run
 occurred. Fresh remote CI validates this head; source refresh is now intentionally
 part of each build entry point rather than a separately published update.
+
+## 2026-10-26 — preserve the socket fixture database across cancellation
+
+Current-head CI run `40316426675` on `0442c8a0a090d4b740a224b3a4d25355bc5e6f9b`
+failed only in Linux shard 2: the hidden-task CLI/sidebar socket regression
+received an initial recovery packet because workspace authorization SQL reported
+`no such table: workspace`. The log identifies merge-ref `d0f8eea4` as merging
+this exact PR head. The other six platform/build/shard checks passed; the Linux
+aggregate failed as a consequence. This is not GREEN.
+
+The existing socket fixture used a single-connection in-memory database. SQLx's
+pool acquisition contract explicitly permits dropping a connection on
+cancellation, including loss of a single-connection in-memory SQLite database.
+The push worker selects database work against cancellation/scope changes. The
+fixture now uses the existing isolated file-backed Gateway helper with separate
+reader and writer pools and retains its TempDir for the full scenario. Both
+socket scenarios retain every assertion, including no client recovery, hidden
+sidebar scope, authorization, unread delivery and same-session renewal.
+
+Applied test-audit as an isolated test-only batch: the changed module is included
+only through `message::tests` under `cfg(test)`. All other 3,923 tracked file hashes
+matched before and after `cargo fmt -p pioneer-gateway --check`; production,
+Cargo.lock, manifests and CI are unchanged. `git diff --check` and
+`git diff --cached --check` passed. No local build, test, compiler, dependency
+resolver or runtime/platform probe ran. Fresh remote CI must validate the repair.
+The monitor was paused before edits. Fetched main `e808bb31` merged cleanly in
+`git merge-tree --write-tree HEAD origin/main` before publication.
