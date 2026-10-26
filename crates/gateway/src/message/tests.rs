@@ -1,3 +1,7 @@
+#[cfg(unix)]
+#[path = "tests/title_recovery.rs"]
+mod title_recovery;
+
 #[path = "tests/root_conversation_compaction.rs"]
 mod root_conversation_compaction;
 
@@ -11068,7 +11072,7 @@ async fn title_generation_retries_after_transient_failure() {
         preview_author: None,
         mode: pioneer_protocol::ThreadMode::Agent,
         model: "test-model".to_owned(),
-        model_provider: "openai".to_owned(),
+        model_provider: "cli_runtime:codex".to_owned(),
         reasoning_effort: None,
         created_at: 1,
         updated_at: 1,
@@ -42489,6 +42493,14 @@ async fn setup_execution_window_terminal_turn(
     thread_id: &str,
     turn_id: &str,
 ) -> (MessageProcessor, Arc<CrudStore>, String) {
+    setup_execution_window_terminal_turn_with_input(thread_id, turn_id, &[]).await
+}
+
+async fn setup_execution_window_terminal_turn_with_input(
+    thread_id: &str,
+    turn_id: &str,
+    input: &[UserInput],
+) -> (MessageProcessor, Arc<CrudStore>, String) {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let agent_manager = Arc::new(AgentManager::new(test_provider(), test_tool_loop_config()));
@@ -42531,7 +42543,7 @@ async fn setup_execution_window_terminal_turn(
                 agent_delegation_routes: Vec::new(),
                 thread_id: thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),
-                input: Vec::new(),
+                input: input.to_vec(),
                 capabilities: Vec::new(),
                 model: None,
                 model_provider: None,
@@ -42570,7 +42582,7 @@ async fn setup_execution_window_terminal_turn(
                 prompt_manifest: None,
                 permission_profile: default_test_permission_profile(),
             },
-            &[],
+            input,
             pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
         )
         .await

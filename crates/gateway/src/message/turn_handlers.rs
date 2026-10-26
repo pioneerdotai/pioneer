@@ -2552,8 +2552,15 @@ impl MessageProcessor {
                 .await;
                 return;
             }
+            // This only acknowledges Composer admission. Recovery belongs to
+            // successful delivery from its hidden execution thread.
             if !self
-                .complete_turn(thread.id.clone(), launch.turn_id.clone(), None)
+                .complete_turn_with_title_recovery(
+                    thread.id.clone(),
+                    launch.turn_id.clone(),
+                    None,
+                    false,
+                )
                 .await
             {
                 self.mark_turn_blocked(

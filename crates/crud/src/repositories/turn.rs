@@ -1960,6 +1960,23 @@ pub async fn find_latest_conversation_turn_for_thread<C: ConnectionTrait>(
         .context("failed to query latest conversation turn for thread")
 }
 
+/// A Composer TaskRun occurrence can sort before its source in the same
+/// timestamp bucket. It is not the first user message used for an automatic name.
+pub async fn find_oldest_user_conversation_turn<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+) -> Result<Option<turn::Model>> {
+    turn::Entity::find()
+        .filter(turn::Column::ThreadId.eq(thread_id.to_owned()))
+        .filter(turn::Column::TurnKind.eq("conversation"))
+        .filter(turn::Column::Origin.eq("user"))
+        .order_by_asc(turn::Column::CreatedAt)
+        .order_by_asc(turn::Column::Id)
+        .one(db)
+        .await
+        .context("failed to query first user conversation turn")
+}
+
 pub async fn find_oldest_turn_for_thread<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,
