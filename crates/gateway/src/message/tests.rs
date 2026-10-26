@@ -59649,10 +59649,11 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
         .expect("interrupted turn should be persisted");
     assert_eq!(persisted_turn.status, TurnStatus::Interrupted);
     assert_eq!(persisted_turn.error.as_deref(), Some("user clicked stop"));
-    // Aggregate reads synthesize the legacy author from the persisted initiator.
-    // The accepted canonical notification must still deliver its exact Turn.
-    assert!(persisted_turn.author.is_some());
-    assert!(failed.turn.author.is_none());
+    // Admission stored an explicit author. Cancellation must retain that exact
+    // author in both its canonical notification and the persisted projection.
+    assert_eq!(failed.turn.author, turn_outcome.materialization.turn.author);
+    assert!(failed.turn.author.is_some());
+    assert_eq!(persisted_turn, failed.turn);
     assert_eq!(
         thread_manager_for_assert
             .turn_get("thr_000000000000000022", "turn_000000000000000022")

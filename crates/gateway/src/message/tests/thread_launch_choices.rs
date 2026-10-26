@@ -767,29 +767,24 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
         grant,
         "replay preserves the independent root's immutable provenance"
     );
-    // Change the composer through the normal thread settings path while the
-    // first Turn is still runnable. Foreground admission permits its successor
-    // only after that first Turn has finished.
-    processor
+    // Restore the still-runnable Turn with newer composer settings, as after
+    // reconnecting before the committed outbox prepares its pinned launch.
+    let rehydration_manager = ThreadManager::new("composer-model", "openai");
+    let mut restored_thread = processor
         .thread_manager
-        .system_thread_start_seeded(
-            context.workspace_id.clone(),
-            serde_json::from_value(json!({
-                "workspace_id":context.workspace_id,
-                "thread_id":thread_id,
-                "model":"gpt-5.4-catalog-other", "model_provider":"openai"
-            }))
-            .unwrap(),
-            None,
-            None,
-        )
+        .thread_get(thread_id)
+        .await
+        .unwrap();
+    restored_thread.model = "gpt-5.4-catalog-other".into();
+    restored_thread.reasoning_effort = Some("low".into());
+    rehydration_manager
+        .system_thread_restore_persisted(restored_thread, Some(SandboxMode::FullAccess))
         .await
         .unwrap();
     // Dispatch of the earlier queued Turn must keep its pinned launch even
     // after the same destination acquires different composer settings.
     assert_eq!(
-        processor
-            .thread_manager
+        rehydration_manager
             .thread_get(thread_id)
             .await
             .unwrap()
@@ -801,8 +796,7 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
         .get_turn_inputs(&start.turn_id)
         .await
         .unwrap();
-    let rehydrated = processor
-        .thread_manager
+    let rehydrated = rehydration_manager
         .rehydrate_committed_agent_turn(&start, input)
         .await
         .unwrap();
@@ -817,8 +811,7 @@ async fn inherited_configuration_survives_visible_thread_creation_message_and_st
         Some("high")
     );
     assert_eq!(
-        processor
-            .thread_manager
+        rehydration_manager
             .thread_get(thread_id)
             .await
             .unwrap()
@@ -1086,6 +1079,41 @@ async fn source_at_max_depth_can_start_only_an_independent_root() {
             .unwrap()
             .to_owned();
         context.turn_id = payload["dispatch"]["turn_id"].as_str().unwrap().to_owned();
+        // This admission-depth fixture has no provider dispatch. Seed the
+        // child's runtime input just as fixture() seeds the first source;
+        // thread_create requires a source snapshot matching its pinned profile.
+        let child_params: TurnStartParams =
+            serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+        let now = pioneer_crud::utc_now();
+        processor
+            .crud_store
+            .upsert_turn_runtime_snapshot(pioneer_crud::NewTurnRuntimeSnapshot {
+                turn_id: context.turn_id.clone(),
+                thread_id: context.thread_id.clone(),
+                workspace_id: context.workspace_id.clone(),
+                mode_json: serde_json::to_string(&ThreadMode::Agent).unwrap(),
+                model: child_params.model.clone().unwrap(),
+                provider_name: child_params.model_provider.clone().unwrap(),
+                reasoning_effort: child_params
+                    .reasoning
+                    .as_ref()
+                    .map(|value| value.effort.clone()),
+                agent_skill_versions_json: None,
+                hook_runtime_context_json: serde_json::to_string(
+                    &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+                )
+                .unwrap(),
+                workspace_skill_policies_json: "[]".into(),
+                input_json: serde_json::to_string(&child_params.input).unwrap(),
+                capabilities_json: serde_json::to_string(&child_params.capabilities).unwrap(),
+                resolved_artifacts_json: "[]".into(),
+                runtime_environment_json: "{}".into(),
+                history_json: "[]".into(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
         tools = processor
             .materialize_agent_action_tools(context.clone())
             .await
@@ -2569,6 +2597,7 @@ async fn finish_choice_source_foreground(
 
 #[tokio::test]
 async fn delegated_root_foreground_admission_rejects_competing_start_without_persisting_it() {
+    use sea_orm::PaginatorTrait;
     for target_label in [
         "New delegated root",
         "Current thread",
@@ -2664,19 +2693,15 @@ async fn delegated_root_foreground_admission_rejects_competing_start_without_per
         let payload: serde_json::Value = serde_json::from_str(&accepted[0].payload_json).unwrap();
         let params: TurnStartParams =
             serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
-        let thread = processor
-            .crud_store
-            .get_thread_model(&params.thread_id)
-            .await
-            .unwrap()
-            .unwrap();
         assert_eq!(
-            thread
-                .turns
-                .iter()
-                .filter(|turn| turn.status == TurnStatus::InProgress)
-                .count(),
-            1
+            pioneer_entity::turn::Entity::find()
+                .filter(pioneer_entity::turn::Column::ThreadId.eq(params.thread_id.clone()))
+                .filter(pioneer_entity::turn::Column::Status.eq("in_progress"))
+                .count(&db)
+                .await
+                .unwrap(),
+            1,
+            "the full saved timeline must have exactly one foreground owner"
         );
         let source = binding.adapter.lock().await.persistence_facts();
         let (_, accepted_turn) = processor

@@ -1679,7 +1679,7 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
         test_execution_authorization_admission(&processor, connection, &workspace, thread).await;
     let params: TurnStartParams = serde_json::from_value(json!({
         "thread_id":thread, "turn_id":turn,
-        "model":"test-model", "model_provider":"openai", "mode":"agent",
+        "model":"test-model", "model_provider":"openai", "mode":ThreadMode::Agent,
         "execution_backend":{"type":"apiProvider","provider":"openai"},
         "permission_profile":pioneer_protocol::TurnPermissionProfileSelection::full_access(),
         "input":[{"type":"text","text":"stop before the first model call"}]
