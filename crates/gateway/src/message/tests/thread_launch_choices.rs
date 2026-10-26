@@ -208,7 +208,11 @@ async fn fixture_with_principal_probe(
     });
     let mut context = TurnToolContext {
         workspace_id: workspace.clone(),
-        thread_id: "choices-root".into(),
+        thread_id: if member {
+            "T0000000000000000000C".into()
+        } else {
+            "choices-root".into()
+        },
         turn_id: "choices-parent".into(),
     };
     ensure_test_superuser_execution_turn(

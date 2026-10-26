@@ -260,3 +260,53 @@ fingerprint guards, сохранённые fingerprints и Tasks/Subagents polic
 выполнения теста; проверки до/после запрещены пользователем. Для запуска после
 приёмки требуется отдельное разрешение. Merge, push, deploy и изменения
 соседних веток/worktree не выполнялись.
+
+## CI follow-up for PR #196
+
+The monitor inspected GitHub Actions run
+[`40370662809`](https://github.com/pioneerdotai/pioneer/actions/runs/40370662809)
+for head `ccf3f4becef402d3f633b3abc5c2ddb6efe77876`. Windows, macOS,
+Linux build (including formatting and doctests), and Linux shard 2 passed.
+Shards 1, 3, and 4 each reported one failing Gateway test; the Linux aggregate
+failed as a consequence. The monitor paused its future trigger before repair.
+
+The fixes stay in existing test code:
+
+- The Member launch fixture used `choices-root` as the thread ID in
+  `thread_membership`. The database rejected it with
+  `CHECK constraint failed: ck_thread_membership_ids`, before the creation
+  checks ran. That constraint requires 21 alphanumeric characters. The Member
+  fixture now uses `T0000000000000000000C`; the non-Member fixture keeps its
+  original ID. Both callers of `fixture_with_principal_probe` were reviewed.
+- The capability persistence ordering test still expected only Threads
+  readers. The unrestricted CLI catalog now also admits permitted mutations
+  and model options. Its expected count includes the full Threads family,
+  alongside the existing HTML and Tasks tools. The event ordering, native
+  family, skill materialization, and `task_wait` assertions remain intact.
+- The readmission test observed the child's running binding and immediately
+  called `mark_turn_blocked`. CLI startup can still hold the session transition
+  gate after persisting that binding; the nonblocking gate acquisition returns
+  false in that window. The test now waits for the existing transition guard
+  within the fixture's existing ten-second readiness budget and passes the
+  guard to `mark_turn_blocked_with_transition`. It holds the gate through the
+  terminal operation. Both persisted/legacy admission branches and the MCP
+  resume path remain unchanged. The existing native Task cancellation test
+  demonstrates the same startup handoff boundary.
+
+Static review followed the membership constraint, fixed catalog projection,
+CLI transition acquisition, guarded blocked commit/cleanup, and both resume
+branches. No shared helper signatures, production files, fingerprints,
+authorization checks, policy, timeouts, CI workflow, or dependencies changed.
+The three Rust files are test modules under `message::tests` (`#[cfg(test)]`).
+The whole repair diff was reviewed; production integrity is checked against
+the clean starting head, excluding only these test files and this report.
+
+Local validation is limited to `cargo fmt --all --check`, `git diff --check`,
+staged whitespace review, and Git state/diff inspection. Current `main` is
+fetched and checked with `git merge-tree --write-tree` before publication.
+Commit and push disable hooks. Fresh GitHub CI must confirm the repair;
+the earlier run proves the failures, not the success of these changes.
+No local tests, cargo check, compilation, builds, application, Gateway,
+test CLI agents, migrations, benchmarks, or generators were run. No PR merge
+or deployment is authorized. The monitor resumes with its next check set to
+15 minutes after this repair run, and verifies that schedule separately.

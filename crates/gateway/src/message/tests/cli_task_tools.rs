@@ -4819,12 +4819,29 @@ fn task_resume_preserves_persisted_admission_but_constrains_a_new_legacy_seed() 
             assert!(
                 original.grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace)
             );
+            // The running binding is persisted before startup releases its
+            // session gate. Wait for that handoff and hold the gate while blocking.
+            let transition = timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(transition) = processor
+                        .try_cli_runtime_turn_transition(&child)
+                        .await
+                        .unwrap()
+                    {
+                        break transition;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("Task child must release its startup transition");
             assert!(
                 processor
-                    .mark_turn_blocked(
+                    .mark_turn_blocked_with_transition(
                         child.thread_id.clone(),
                         child.turn_id.clone(),
-                        "resumable Task".into()
+                        "resumable Task".into(),
+                        Some(transition),
                     )
                     .await
             );
