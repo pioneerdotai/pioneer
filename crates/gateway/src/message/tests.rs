@@ -62591,8 +62591,12 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
         ("opencode", CLIAgentRuntimeKind::OpenCode),
     ] {
         // The harness thread is the visible parent. Never subscribe it to the child.
-        let mut harness =
-            setup_live_semantic_timeline_harness(&format!("retry_{runtime_id}")).await;
+        // Membership rows require a 21-character alphanumeric thread ID.
+        let mut harness = setup_live_semantic_timeline_harness_with_thread_id(
+            &format!("retry_{runtime_id}"),
+            generate_test_request_id("retrythread", runtime_id),
+        )
+        .await;
         let cli = Arc::new(RecordingCliRuntimeSession::default());
         cli.set_next_native_turn_id("retry_native_turn").await;
         cli.enable_projected_mcp_metadata(harness.processor.crud_store.clone())
@@ -64336,6 +64340,17 @@ async fn setup_semantic_timeline_query_harness_inner(
 }
 
 async fn setup_live_semantic_timeline_harness(case_id: &str) -> LiveSemanticTimelineHarness {
+    setup_live_semantic_timeline_harness_with_thread_id(
+        case_id,
+        format!("thr_semantic_live_{case_id}"),
+    )
+    .await
+}
+
+async fn setup_live_semantic_timeline_harness_with_thread_id(
+    case_id: &str,
+    thread_id: String,
+) -> LiveSemanticTimelineHarness {
     let (tx, rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -64344,7 +64359,6 @@ async fn setup_live_semantic_timeline_harness(case_id: &str) -> LiveSemanticTime
     session_manager
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
-    let thread_id = format!("thr_semantic_live_{case_id}");
     let turn_id = format!("turn_semantic_live_{case_id}");
 
     let thread_start = thread_manager
