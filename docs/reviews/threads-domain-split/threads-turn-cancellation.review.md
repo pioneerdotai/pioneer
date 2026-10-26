@@ -26,6 +26,35 @@
 Это повторный статический самоаудит части 3/4, а не приёмка. Интеграцию принятых
 исправлений в следующие части выполняет родительский ревьюер.
 
+## Monitor run 8: reconcile the advanced stacked base
+
+The run started at head `7d27df67e795bd4a16ea025ab69dda51c8a355eb`
+with a clean worktree. CI run 40399211376 had passed Windows, macOS and
+Linux build; all four Linux test shards were still running. No GREEN was
+claimed. Future monitor firings were paused before the repair.
+
+The actual PR base advanced to
+`4c172b33a79141cdc5d51d255bf6e18b28f7f03c`, creating conflicts in
+`turn_execution.rs` and `task_start_failure.rs`. The base independently added
+an activation timestamp and corrected the typed DurableAgent failure fixture.
+The merge retains this branch's claimed `starting` phase with `started_at`:
+runtime registration owns `running`, while the timestamp fences duplicate
+claims. The production repository file is byte-for-byte identical to the
+pre-merge head. The typed failure fixture also remains byte-for-byte identical,
+including its assertion that the saved error excludes the raw diagnostic.
+
+Other base fixture changes merge normally. Its lease regression now checks
+`Starting`, a present `started_at` and the unchanged generation after claim,
+consistent with the registration boundary above. The duplicate-claim and
+expired-lease assertions remain intact. New fixture imports, distinct native
+CLI ID, authorization fingerprint comparison and source restoration are kept.
+No production behavior, timeout, CI workflow or dependency changes were needed.
+
+Only static inspection, conflict resolution, formatting checks and Git checks
+were used locally. Local builds, tests and project execution remain prohibited.
+The current main and actual PR base are checked again before push; the next
+monitor schedule and resulting commit are reported with the run result.
+
 ## CI repair after the first complete Linux run
 
 CI run https://github.com/pioneerdotai/pioneer/actions/runs/40387902314

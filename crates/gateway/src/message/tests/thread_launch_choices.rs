@@ -966,6 +966,19 @@ async fn delegated_launch_target(
 async fn source_at_max_depth_can_start_only_an_independent_root() {
     use sea_orm::PaginatorTrait;
     let (processor, mut context, mut tools) = fixture().await;
+    // This fixture seeds the parent directly in CRUD. Restore its Turn before
+    // exercising the same in-memory terminal lifecycle as subsequent children.
+    let parent_thread = processor
+        .crud_store
+        .get_thread_model(&context.thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    processor
+        .thread_manager
+        .system_thread_restore_persisted(parent_thread, Some(SandboxMode::FullAccess))
+        .await
+        .unwrap();
     let db = processor.crud_store.database_connection();
     let graph_root = processor
         .agent_action_binding(&context.turn_id)

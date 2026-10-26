@@ -36956,6 +36956,34 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
         sleep(Duration::from_millis(25)).await;
     }
     if !child_dispatched {
+        let db = crud_store.database_connection();
+        let outbox_rows = pioneer_entity::agent_action_outbox::Entity::find()
+            .all(&db)
+            .await
+            .expect("direct Agent outbox diagnostics should load");
+        for row in &outbox_rows {
+            let payload: JsonValue = serde_json::from_str(&row.payload_json).unwrap();
+            if let Some(child_turn_id) = payload["dispatch"]["turn_id"].as_str() {
+                let owner = crud_store.get_turn_execution(child_turn_id).await;
+                let snapshot = crud_store.get_turn_runtime_snapshot(child_turn_id).await;
+                let authority = processor
+                    .load_turn_execution_authorization_context(child_turn_id)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:#}"));
+                let execution_id = payload["spawned_execution_id"].as_str().unwrap();
+                let resource =
+                    pioneer_crud::load_agent_execution_resource_state(&db, execution_id).await;
+                eprintln!(
+                    "direct Agent dispatch diagnostics: status={}, attempts={}, last_error={:?}, next_attempt_at={:?}, child_turn_id={child_turn_id}, owner={owner:?}, snapshot_present={:?}, authority={authority:?}, resource={resource:?}",
+                    row.status,
+                    row.attempts,
+                    row.last_error,
+                    row.next_attempt_at,
+                    snapshot.as_ref().map(|snapshot| snapshot.is_some()),
+                );
+            }
+        }
         let root_turn = crud_store
             .get_turn(thread_id, root_turn_id)
             .await

@@ -58605,6 +58605,11 @@ mod tests {
 
     #[tokio::test]
     async fn agent_activation_claim_rechecks_lease_after_waiting_for_writer() {
+        use crate::{
+            NewTurnExecution, TurnExecutionStatus, TurnExecutorKind, repositories::turn_execution,
+            utc_now,
+        };
+
         let (store, thread, turn) = test_store_with_started_turn(
             "ws_activation_lease",
             "thr_activation_lease",
@@ -58660,6 +58665,10 @@ mod tests {
             .unwrap();
         let renewed = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
         assert!(store.claim_unactivated_agent_turn(&renewed).await.unwrap());
+        let activated = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+        assert_eq!(activated.status, TurnExecutionStatus::Starting);
+        assert!(activated.started_at.is_some());
+        assert_eq!(activated.owner_generation, renewed.owner_generation);
         assert!(!store.claim_unactivated_agent_turn(&renewed).await.unwrap());
     }
 
