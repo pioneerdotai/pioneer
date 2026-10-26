@@ -5241,8 +5241,7 @@ dependencies = [
 [[package]]
 name = "gpui-fast-macos"
 version = "0.1.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c9656cc924a624ebbc44bb9f8149f5206fe6e94b262349f662efe692e03d900"
+source = "git+https://github.com/pioneerdotai/gpui-fast?rev=97b387f958fb3caf8defc8290b85e53251a899e9#97b387f958fb3caf8defc8290b85e53251a899e9"
 dependencies = [
  "accesskit",
  "accesskit_macos",
