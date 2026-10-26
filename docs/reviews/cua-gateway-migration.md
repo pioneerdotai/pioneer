@@ -1079,3 +1079,18 @@ upstream dependency pin, not a driver fork; changing its update policy is outsid
 this main-integration change. All conflicts are resolved for a normal merge
 commit and push to the existing feature branch. Fresh remote CI must validate
 this new HEAD independently of the previous GREEN result.
+
+
+## 2026-10-26 — repair merged lockfile before driver-update automation
+
+CI run `40299476268` failed on HEAD `e7bbcaa743f7d73274f40b5fb7b1f26c0e6ab996`
+on Linux, Windows and macOS before compilation: Cargo required a lockfile update.
+The manual merge had copied main's clipboard-win 5.4.3 dependency list without
+accounting for the feature union enabled by the CUA graph. Cargo's offline
+workspace resolver restores its windows-win dependency; the complete repair is
+one lockfile line, with no package/version/checksum change. This corrects the
+previous handoff's incomplete static dependency-list reasoning.
+
+The user authorized driver update automation, CI repair and publication to the
+existing PR. `cargo update --workspace --offline` resolves dependencies only;
+no local compilation or tests were run. Fresh CI validates the repaired graph.
