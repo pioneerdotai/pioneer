@@ -218,4 +218,6 @@ rmcp = { version = "3.5", default-features = false, features = ["auth", "client"
 process-wrap = { version = "10", features = ["tokio1"] }
 
 [patch.crates-io]
-gpui-fast-macos = { git = "https://github.com/pioneerdotai/gpui-fast", rev = "97b387f958fb3caf8defc8290b85e53251a899e9" }
+gpui-fast-macos = { git = "https://github.com/pioneerdotai/gpui-fast", rev = "80d0b8d6aaf23b0011eb1a1edc068dc6f2a3d974" }
+gpui-fast-windows = { git = "https://github.com/pioneerdotai/gpui-fast", rev = "80d0b8d6aaf23b0011eb1a1edc068dc6f2a3d974" }
+gpui-fast-linux = { git = "https://github.com/pioneerdotai/gpui-fast", rev = "80d0b8d6aaf23b0011eb1a1edc068dc6f2a3d974" }

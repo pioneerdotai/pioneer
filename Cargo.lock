@@ -5196,8 +5196,7 @@ dependencies = [
 [[package]]
 name = "gpui-fast-linux"
 version = "0.1.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f41024ac6447667ddb55d23dd897acc714f1d4ed74214b34144f320458de879f"
+source = "git+https://github.com/pioneerdotai/gpui-fast?rev=80d0b8d6aaf23b0011eb1a1edc068dc6f2a3d974#80d0b8d6aaf23b0011eb1a1edc068dc6f2a3d974"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -5241,7 +5240,7 @@ dependencies = [
 [[package]]
 name = "gpui-fast-macos"
 version = "0.1.10"
-source = "git+https://github.com/pioneerdotai/gpui-fast?rev=97b387f958fb3caf8defc8290b85e53251a899e9#97b387f958fb3caf8defc8290b85e53251a899e9"
+source = "git+https://github.com/pioneerdotai/gpui-fast?rev=80d0b8d6aaf23b0011eb1a1edc068dc6f2a3d974#80d0b8d6aaf23b0011eb1a1edc068dc6f2a3d974"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -5367,8 +5366,7 @@ dependencies = [
 [[package]]
 name = "gpui-fast-windows"
 version = "0.1.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f034e131f83ff84b67f009cde41e0cbecb3be09d7ebba7c548ea78fe0fdee5b0"
+source = "git+https://github.com/pioneerdotai/gpui-fast?rev=80d0b8d6aaf23b0011eb1a1edc068dc6f2a3d974#80d0b8d6aaf23b0011eb1a1edc068dc6f2a3d974"
 dependencies = [
  "accesskit",
  "accesskit_windows",
