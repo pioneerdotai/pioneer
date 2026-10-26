@@ -1111,3 +1111,15 @@ clipboard-win feature-union lockfile fix is retained.
 
 Local validation is limited to source inspection, parsing, formatting and diff
 checks. No local builds or tests were run; fresh remote CI validates publication.
+
+
+## 2026-10-26 — merged threads-policy test argument
+
+Remote CI `40304151869` passed lockfile admission and platform workspace checks,
+then Linux test compilation exposed E0061 in agent/chat/skills.rs: main's threads
+policy test caller supplied thirteen arguments to the fourteen-argument merged
+prompt compiler. The test now explicitly supplies false for CUA availability,
+preserving the threads-policy and continuation matrix. The isolated test-only
+batch preserved its full production prefix and every other tracked file hash;
+cargo fmt --all --check and git diff --check passed. No local build/test ran.
+Fresh remote CI must validate this fixture repair.
