@@ -400,6 +400,12 @@ fn threads_first_cli_outbox_dispatch_uses_committed_turn_once() {
         db.execute_unprepared(&format!(
             "CREATE TRIGGER reject_repeat_thread_admission BEFORE INSERT ON turn_admission WHEN NEW.turn_id='{child}' BEGIN SELECT RAISE(ABORT,'repeated committed admission'); END"
         )).await.unwrap();
+        // The recording session otherwise reuses the parent's native ID,
+        // which the durable attempt ledger correctly rejects for a new Turn.
+        harness
+            .cli_session
+            .set_next_native_turn_id("first-delegated-cli-child")
+            .await;
         let batch =
             crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
                 .await
