@@ -1461,9 +1461,8 @@ impl MessageProcessor {
                     // A handed-off initial Stop still owns this registration
                     // publication. Typed storage unavailability cannot become a
                     // permanent refusal before its terminal completion receipt.
-                    let handed_off = self.initial_stop_handoff_is_current(&preparation).await?;
-                    if handed_off
-                        && super::agent_action_tools::agent_start_has_storage_failure(&error)
+                    if super::agent_action_tools::agent_start_has_storage_failure(&error)
+                        && self.initial_stop_handoff_is_current(&preparation).await?
                     {
                         #[cfg(test)]
                         self.completed_history_preparation_barrier
@@ -1919,16 +1918,22 @@ impl MessageProcessor {
                     match self.guard_execution_commit(turn_id).await {
                         Ok(_) => false,
                         Err(error) => {
-                            let handed_off =
-                                if let AgentDurableEvent::NativeCancellationContextPrepared {
+                            // A failed handoff lookup cannot replace an already
+                            // established semantic denial with a storage retry.
+                            let handoff_relevant =
+                                super::agent_action_tools::agent_start_has_storage_failure(&error)
+                                    || error.downcast_ref::<crate::authorization::ExecutionTurnNotInProgress>()
+                                        .is_some_and(|e| e.status() == TurnStatus::Interrupted);
+                            let handed_off = if handoff_relevant
+                                && let AgentDurableEvent::NativeCancellationContextPrepared {
                                     preparation,
                                     initial_turn: true,
                                 } = &event
-                                {
-                                    self.initial_stop_handoff_is_current(preparation).await?
-                                } else {
-                                    false
-                                };
+                            {
+                                self.initial_stop_handoff_is_current(preparation).await?
+                            } else {
+                                false
+                            };
                             if handed_off
                                 && super::agent_action_tools::agent_start_has_storage_failure(
                                     &error,

@@ -1157,7 +1157,7 @@ pub(super) async fn run_agent_loop(
             AgentCommand::CancelTurn {
                 turn_id,
                 reason,
-                expected_run_id,
+                expected_run_id: _,
                 completion_ack,
                 cancellation_owner,
                 ack,

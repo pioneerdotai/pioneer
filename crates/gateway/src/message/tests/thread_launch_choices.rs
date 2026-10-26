@@ -2453,22 +2453,23 @@ async fn member_creation_uses_both_workspace_variants_and_revocation_fences_the_
 
 #[tokio::test]
 async fn recovery_terminalization_cannot_apply_blocked_over_a_resumed_generation() {
-    let probe = Arc::new(ChoiceRuntimeProbe::default());
-    let (processor, context, tools) = fixture_with_probe(
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        false,
-        probe.clone(),
-    )
-    .await;
-    processor.bind_agent_tool_bridges().await;
-    let binding = processor
-        .agent_action_binding(&context.turn_id)
-        .await
-        .unwrap();
-    let target = delegated_launch_target(&tools, &binding.options).await;
-    call(
+    for resume_first in [true, false] {
+        let probe = Arc::new(ChoiceRuntimeProbe::default());
+        let (processor, context, tools) = fixture_with_probe(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            false,
+            probe.clone(),
+        )
+        .await;
+        processor.bind_agent_tool_bridges().await;
+        let binding = processor
+            .agent_action_binding(&context.turn_id)
+            .await
+            .unwrap();
+        let target = delegated_launch_target(&tools, &binding.options).await;
+        call(
         &tools,
         "threads_turn_start",
         "recovery-sync-start",
@@ -2477,159 +2478,181 @@ async fn recovery_terminalization_cannot_apply_blocked_over_a_resumed_generation
         }),
     )
     .await;
-    let db = processor.crud_store.database_connection();
-    let row = pioneer_crud::load_agent_action_outbox(
-        &db,
-        crate::authorization::action_id_for_call("recovery-sync-start").as_str(),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    let payload: JsonValue = serde_json::from_str(&row.payload_json).unwrap();
-    let params: TurnStartParams =
-        serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
-    // Keep the real prepared snapshot and activation fence, before actor/model
-    // admission. The recovery worker owns the ensuing terminal transition.
-    processor.arm_completed_history_preparation_barrier("__agent_start_after_activation_claim__");
-    let dispatch = tokio::spawn({
-        let processor = processor.clone();
-        async move {
-            crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
-                .await
-                .unwrap()
-        }
-    });
-    timeout(
-        Duration::from_secs(5),
-        processor.wait_for_completed_history_preparation_barrier(),
-    )
-    .await
-    .unwrap();
-    dispatch.abort();
-    let _ = dispatch.await;
-    processor.release_completed_history_preparation_barrier();
-    let before = processor
-        .crud_store
-        .get_turn_execution(&params.turn_id)
+        let db = processor.crud_store.database_connection();
+        let row = pioneer_crud::load_agent_action_outbox(
+            &db,
+            crate::authorization::action_id_for_call("recovery-sync-start").as_str(),
+        )
         .await
         .unwrap()
         .unwrap();
-    let now = now_timestamp_secs();
-    let job = processor
-        .crud_store
-        .enqueue_recovery_job(
-            params.turn_id.clone(),
-            "recovery-sync-reasoning".into(),
-            pioneer_protocol::TurnItemType::Reasoning,
-            None,
-            pioneer_protocol::RecoveryTrigger::Timeout,
-            pioneer_protocol::RecoveryAction::BlockResumable,
-            None,
-            None,
-            None,
-            None,
-            0,
-            0,
-            json!({}),
-            json!({"base_backoff_secs":0,"max_wall_clock_secs":60}),
-            now,
+        let payload: JsonValue = serde_json::from_str(&row.payload_json).unwrap();
+        let params: TurnStartParams =
+            serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+        // Keep the real prepared snapshot and activation fence, before actor/model
+        // admission. The recovery worker owns the ensuing terminal transition.
+        processor
+            .arm_completed_history_preparation_barrier("__agent_start_after_activation_claim__");
+        let dispatch = tokio::spawn({
+            let processor = processor.clone();
+            async move {
+                crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                    .await
+                    .unwrap()
+            }
+        });
+        timeout(
+            Duration::from_secs(5),
+            processor.wait_for_completed_history_preparation_barrier(),
         )
         .await
         .unwrap();
-    assert!(
-        processor
+        dispatch.abort();
+        let _ = dispatch.await;
+        processor.release_completed_history_preparation_barrier();
+        let before = processor
             .crud_store
-            .mark_recovery_job_terminal(
-                &job.id,
-                pioneer_protocol::RecoveryJobStatus::Blocked,
+            .get_turn_execution(&params.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let now = now_timestamp_secs();
+        let job = processor
+            .crud_store
+            .enqueue_recovery_job(
+                params.turn_id.clone(),
+                "recovery-sync-reasoning".into(),
+                pioneer_protocol::TurnItemType::Reasoning,
                 None,
+                pioneer_protocol::RecoveryTrigger::Timeout,
+                pioneer_protocol::RecoveryAction::BlockResumable,
+                None,
+                None,
+                None,
+                None,
+                0,
+                0,
+                json!({}),
+                json!({"base_backoff_secs":0,"max_wall_clock_secs":60}),
                 now,
             )
             .await
-            .unwrap()
-    );
-    processor.arm_completed_history_preparation_barrier("__agent_terminal_before_memory_sync__");
-    let recovery = tokio::spawn({
-        let processor = processor.clone();
-        async move {
+            .unwrap();
+        assert!(
             processor
-                .process_due_recovery_terminalizations(now, 64)
+                .crud_store
+                .mark_recovery_job_terminal(
+                    &job.id,
+                    pioneer_protocol::RecoveryJobStatus::Blocked,
+                    None,
+                    now,
+                )
                 .await
                 .unwrap()
-        }
-    });
-    timeout(
-        Duration::from_secs(5),
-        processor.wait_for_completed_history_preparation_barrier(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
+        );
         processor
+            .arm_completed_history_preparation_barrier("__agent_terminal_before_memory_sync__");
+        let recovery = tokio::spawn({
+            let processor = processor.clone();
+            async move {
+                processor
+                    .process_due_recovery_terminalizations(now, 64)
+                    .await
+                    .unwrap()
+            }
+        });
+        timeout(
+            Duration::from_secs(5),
+            processor.wait_for_completed_history_preparation_barrier(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            processor
+                .crud_store
+                .get_turn(&params.thread_id, &params.turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .status,
+            TurnStatus::Blocked
+        );
+        let recovery = if resume_first {
+            Some(recovery)
+        } else {
+            processor.release_completed_history_preparation_barrier();
+            assert_eq!(recovery.await.unwrap(), 1);
+            assert_eq!(
+                processor
+                    .thread_manager
+                    .turn_get(&params.thread_id, &params.turn_id)
+                    .await
+                    .unwrap()
+                    .1
+                    .status,
+                TurnStatus::Blocked
+            );
+            None
+        };
+        assert!(
+            processor
+                .resume_blocked_turn_control(
+                    &context.workspace_id,
+                    &params.thread_id,
+                    &params.turn_id,
+                    Some(&job.id),
+                    now,
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let resumed = processor
+            .crud_store
+            .get_turn_execution(&params.turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.owner_id, before.owner_id);
+        assert_eq!(resumed.owner_generation, before.owner_generation + 1);
+        if let Some(recovery) = recovery {
+            processor.release_completed_history_preparation_barrier();
+            assert_eq!(recovery.await.unwrap(), 1);
+        }
+        let canonical = processor
             .crud_store
             .get_turn(&params.thread_id, &params.turn_id)
             .await
             .unwrap()
             .unwrap()
-            .1
-            .status,
-        TurnStatus::Blocked
-    );
-    assert!(
-        processor
-            .resume_blocked_turn_control(
-                &context.workspace_id,
-                &params.thread_id,
-                &params.turn_id,
-                Some(&job.id),
-                now,
+            .1;
+        assert_eq!(canonical.status, TurnStatus::InProgress);
+        assert_eq!(
+            processor
+                .thread_manager
+                .turn_get(&params.thread_id, &params.turn_id)
+                .await
+                .unwrap()
+                .1,
+            canonical
+        );
+        let mut competing = params.clone();
+        competing.turn_id = "competing-with-recovery-resume".into();
+        let conflict = processor
+            .thread_manager
+            .agent_turn_start_with_permission_profile(
+                competing,
+                canonical.permission_profile.clone(),
+                canonical.author.clone().unwrap(),
             )
             .await
-            .unwrap()
-            .is_some()
-    );
-    let resumed = processor
-        .crud_store
-        .get_turn_execution(&params.turn_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(resumed.owner_id, before.owner_id);
-    assert_eq!(resumed.owner_generation, before.owner_generation + 1);
-    processor.release_completed_history_preparation_barrier();
-    assert_eq!(recovery.await.unwrap(), 1);
-    let canonical = processor
-        .crud_store
-        .get_turn(&params.thread_id, &params.turn_id)
-        .await
-        .unwrap()
-        .unwrap()
-        .1;
-    assert_eq!(canonical.status, TurnStatus::InProgress);
-    assert_eq!(
-        processor
-            .thread_manager
-            .turn_get(&params.thread_id, &params.turn_id)
-            .await
-            .unwrap()
-            .1,
-        canonical
-    );
-    let mut competing = params.clone();
-    competing.turn_id = "competing-with-recovery-resume".into();
-    let conflict = processor
-        .thread_manager
-        .agent_turn_start_with_permission_profile(
-            competing,
-            canonical.permission_profile.clone(),
-            canonical.author.clone().unwrap(),
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        conflict
-            .downcast_ref::<crate::thread::ForegroundTurnConflict>()
-            .is_some()
-    );
-    assert_eq!(probe.main_calls.load(Ordering::SeqCst), 0);
+            .unwrap_err();
+        assert!(
+            conflict
+                .downcast_ref::<crate::thread::ForegroundTurnConflict>()
+                .is_some()
+        );
+        assert_eq!(probe.main_calls.load(Ordering::SeqCst), 0);
+    }
 }

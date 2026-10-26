@@ -1522,6 +1522,7 @@ enum InitialStopPhase {
     RegistrationAfterControlAckWindow,
     CanonicalStorageUnavailable,
     RegistrationStorageUnavailable,
+    RegistrationWriteStorageUnavailable,
     DirectChildBeforeRegistration,
     NativeTaskBeforeRegistration,
     GraphFenceStorageUnavailable,
@@ -1559,6 +1560,11 @@ async fn public_initial_stop_retains_completion_across_a_real_terminal_storage_f
 #[tokio::test]
 async fn public_initial_stop_retains_completion_across_registration_storage_failure() {
     exercise_initial_native_stop(InitialStopPhase::RegistrationStorageUnavailable).await;
+}
+
+#[tokio::test]
+async fn public_initial_stop_retains_completion_across_registration_write_failure() {
+    exercise_initial_native_stop(InitialStopPhase::RegistrationWriteStorageUnavailable).await;
 }
 
 #[tokio::test]
@@ -2103,6 +2109,7 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
         | InitialStopPhase::RegistrationAfterControlAckWindow
         | InitialStopPhase::CanonicalStorageUnavailable
         | InitialStopPhase::RegistrationStorageUnavailable
+        | InitialStopPhase::RegistrationWriteStorageUnavailable
         | InitialStopPhase::AcceptedProjectionPending => {
             processor.arm_completed_history_preparation_barrier(
                 "__native_initial_control_before_registration__",
@@ -2194,6 +2201,36 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                 assert!(!stop.is_finished());
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
                 tokio::time::resume();
+            }
+            if matches!(phase, InitialStopPhase::RegistrationWriteStorageUnavailable) {
+                // The guard can read storage; only the real immutable context
+                // INSERT fails after the Stop has been handed to the actor.
+                db.execute_unprepared(&format!("CREATE TRIGGER fail_initial_registration BEFORE INSERT ON native_cancellation_context WHEN NEW.turn_id='{turn}' BEGIN SELECT RAISE(ABORT,'fixture registration storage unavailable'); END"))
+                    .await.unwrap();
+                processor.arm_completed_history_preparation_barrier(
+                    "__initial_stop_registration_failed__",
+                );
+                processor.release_completed_history_preparation_barrier();
+                timeout(
+                    Duration::from_secs(10),
+                    processor.wait_for_completed_history_preparation_barrier(),
+                )
+                .await
+                .unwrap();
+                assert!(processor.agent_manager.has_thread(thread).await);
+                assert!(!stop.is_finished());
+                assert!(
+                    store
+                        .native_cancellation_context(turn)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(!store.native_turn_has_accepted_terminal(turn).await.unwrap());
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                db.execute_unprepared("DROP TRIGGER fail_initial_registration")
+                    .await
+                    .unwrap();
             }
             if matches!(phase, InitialStopPhase::RegistrationStorageUnavailable) {
                 processor.arm_completed_history_preparation_barrier(
