@@ -17,9 +17,8 @@ import sys
 import tempfile
 import zipfile
 
-RELEASE = json.loads((Path(__file__).resolve().parents[2] / "config/cua-driver.json").read_text())
-REVISION = RELEASE["revision"]
-VERSION = RELEASE["version"]
+REVISION = "6df77f678d17bb42e97f496e1f0b137e83fd2c9d"
+VERSION = "0.38.0"
 BUNDLE_ID = "ai.pioneer.gateway"
 TARGETS = {
     "x86_64-apple-darwin", "aarch64-apple-darwin",

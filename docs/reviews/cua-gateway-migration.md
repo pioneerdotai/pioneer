@@ -1081,7 +1081,7 @@ commit and push to the existing feature branch. Fresh remote CI must validate
 this new HEAD independently of the previous GREEN result.
 
 
-## 2026-10-26 — repair merged lockfile before driver-update automation
+## 2026-10-26 — repair merged lockfile
 
 CI run `40299476268` failed on HEAD `e7bbcaa743f7d73274f40b5fb7b1f26c0e6ab996`
 on Linux, Windows and macOS before compilation: Cargo required a lockfile update.
@@ -1091,75 +1091,23 @@ workspace resolver restores its windows-win dependency; the complete repair is
 one lockfile line, with no package/version/checksum change. This corrects the
 previous handoff's incomplete static dependency-list reasoning.
 
-The user authorized driver update automation, CI repair and publication to the
+The user authorized CI repair and publication to the
 existing PR. `cargo update --workspace --offline` resolves dependencies only;
 no local compilation or tests were run. Fresh CI validates the repaired graph.
 
 
-## 2026-10-26 — release-based CUA updates and CI repair
+## 2026-10-26 — current published CUA driver
 
-The user authorized replacing manual commit maintenance with automatic upstream
-release updates and publishing the result to PR #172. The prior ban on local
-builds/tests remains; dependency resolution and source generation were used,
-without executing upstream code, a daemon, packaging, installation or builds.
-
-The clipboard-win feature-union repair was committed/pushed as
-`75c5825940592f4e2e272850b0d1741004652a1d`. Its new remote CI run is
-`40302272297`. The preceding all-platform failure was lockfile admission, not
-a compiler/test result. The new release update starts a separate CI run.
-
-Current selection is published upstream tag
+The selected upstream release is
 `nightly-cua-driver-rs-v0.38.1-nightly.20261026.40269720879`, resolved to
-`6df77f678d17bb42e97f496e1f0b137e83fd2c9d`. This nightly's actual Rust workspace
-version is still 0.38.0; the contract remains 0.8.0. Do not infer the binary's
-version from its nightly tag. SDK embedded/session sources match the previously
-accepted revision; the browser implementation adds a longer Windows click
-baseline deadline. Native tool JSON is semantically unchanged apart from source
-revision; browser schema expressions are copied from this exact release.
+`6df77f678d17bb42e97f496e1f0b137e83fd2c9d`. Its Rust workspace version remains
+0.38.0 and the contract remains 0.8.0. The SDK manifest selects the release tag;
+packaging, runtime and installer identity checks use its matching source
+revision. Native schemas and supported browser schema expressions match the
+existing public contract; SDK embedded/session sources match the prior
+accepted implementation. Gateway ownership, operation allowlist, provenance,
+server variants and update/recovery contracts remain enforced. The prior
+clipboard-win feature-union lockfile fix is retained.
 
-`config/cua-driver.json` is the source for selected release metadata and input
-hashes. The SDK manifest uses the release tag. A standard-library Python updater
-selects the latest published driver-specific release (including nightlies),
-resolves its SHA, regenerates shared protocol release constants, the passive
-native/browser schema projections, the SDK tag and Cargo.lock together. It
-rejects moved current tags and missing supported tools and restores every output
-and the original lockfile if resolution fails. No new upstream tools are admitted:
-the existing operation allowlist remains the boundary. Runtime/installer package
-identity and digest checks use the generated constants. Package and smoke-fixture
-producers read the same metadata. Existing durable MCP server identifiers remain
-stable identities, not dependency pins. R01–R08 runtime/server/recovery contracts
-were not weakened; installed drivers still update with Pioneer packages.
-
-`.github/workflows/update-cua-driver.yml` prepares one update PR daily at
-06:17 UTC and allows manual dispatch. Normal CI validates updates; there is no
-automatic merge. For GITHUB_TOKEN, it explicitly dispatches CI to avoid dependence
-on approval of bot-created pull_request runs. An optional CUA_UPDATE_TOKEN bot
-secret uses normal PR-triggered CI. The schedule can only start after this new
-workflow reaches the default branch; PR #172 was not merged.
-
-GitHub repository workflow permissions are read-default and disallow bot PR
-creation. An attempt to enable creation at repository scope returned HTTP 409:
-"The organization does not allow GitHub Actions to create or approve pull requests".
-The setting was re-read and remains unchanged. Organization policy inspection
-returned HTTP 403 requiring admin:org, so no organization policy was changed.
-No existing bot token secret is configured. The user was asked to enable the
-organization permission or provide the separate repository bot-token secret;
-never put a personal token into chat or copy the local admin credential into CI.
-Thus code for scheduled updates is ready, but automatic PR creation additionally
-requires that external access setup.
-
-Applied test-audit as an isolated batch after production edits: the existing
-installer archive fixture now uses the selected release constants and retains
-its tamper/platform/recovery cases. New updater tests cover component-specific
-release selection, quoted/nested schema extraction, refusing missing schemas or
-moved tags, and restoration after a resolver failure. All protected production/
-configuration hashes and the installer production prefix matched actual batch
-entry before/after edits and check-only formatting. Tests were authored for CI,
-not run locally. No production seam was introduced for them.
-
-Actual validation: cargo update --workspace (resolution only), updater --check,
-Python AST and TOML/JSON inspection, Ruby Psych YAML parsing, cargo fmt --all
---check and git diff --check. The driver lockfile delta changes only nine CUA
-source identities; unrelated dependencies/versions/checksums remain unchanged.
-No local builds/tests/compiler/daemon/OS probes ran. Remote CI and real native
-release/runtime qualification remain separate from these static checks.
+Local validation is limited to source inspection, parsing, formatting and diff
+checks. No local builds or tests were run; fresh remote CI validates publication.

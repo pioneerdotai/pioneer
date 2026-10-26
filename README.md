@@ -124,26 +124,10 @@ for those CU builds. Desktop bundles the computer-use variant.
 
 The server assets retain their existing names and formats: gzip for Linux and
 macOS aarch64, ZIP for Windows and macOS x86_64. Computer-use assets are named
-`pioneer-gateway-{os}-{arch}-computer-use-package.zip` and contain the selected CUA driver
+`pioneer-gateway-{os}-{arch}-computer-use-package.zip` and contain the pinned CUA driver
 package. Install the complete CU archive; copying only `pioneer` cannot install
 the driver. The installer keeps the executable and `bin/cua` together and retains
 recovery files when schema compatibility is unknown.
-
-CUA release selection lives in `config/cua-driver.json`. The daily **Update CUA
-driver** workflow follows published `cua-driver-rs` releases, including nightlies,
-and opens or refreshes one update PR. It updates the SDK release tag, resolved
-source identity, native/browser schemas and Cargo.lock together, then dispatches
-the normal CI workflow. Updates require passing CI and merge; installed drivers
-update with Pioneer packages. The schedule starts after this workflow reaches
-the default branch. For an immediate update, run
-`python3 scripts/update-cua-driver.py`; `--release <tag>` selects a published
-release explicitly, and `--check` verifies committed consistency offline.
-
-Automatic PR creation requires the organization's permission for Actions to
-create PRs, or a repository secret `CUA_UPDATE_TOKEN` with a bot token that can
-write repository contents and pull requests. The default `GITHUB_TOKEN` path
-explicitly dispatches CI; a bot token uses the normal PR trigger. No automatic
-merge is configured.
 
 Existing computer-use installations use their normal `pioneer update` or
 `pioneer self-update` command. The old `-computer-use.gz` / `-computer-use.zip`

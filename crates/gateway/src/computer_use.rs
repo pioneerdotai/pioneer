@@ -7,7 +7,6 @@ use cua_driver_sdk::{
     SessionPermissionMode, TrustedSessionOptions,
 };
 use fs4::FileExt;
-use pioneer_protocol::{CUA_DRIVER_REVISION, CUA_DRIVER_VERSION};
 use pioneer_tools::{ComputerUseBackend, ToolError};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -21,6 +20,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+const DRIVER_VERSION: &str = "0.38.0";
 const HOST_BUNDLE_ID: &str = "ai.pioneer.gateway";
 const MAX_OWNERS: usize = 32;
 const QUEUE_CAPACITY: usize = 16;
@@ -538,9 +538,9 @@ impl Worker {
             }
         };
         record_daemon_pid(self.ownership.as_mut().unwrap(), Some(connection.pid))?;
-        if connection.driver_version != CUA_DRIVER_VERSION {
+        if connection.driver_version != DRIVER_VERSION {
             return Err(unavailable(
-                "bundled CUA daemon version does not match the selected release",
+                "bundled CUA daemon version does not match Pioneer pin 0.38.0",
             ));
         }
         self.generation.as_mut().unwrap().id = connection.generation;
@@ -679,8 +679,8 @@ fn verify_packaged_driver(executable_dir: &Path, binary: &Path) -> Result<(), To
     let relative = relative.to_string_lossy().replace('\\', "/");
     if manifest["schema_version"] != 1
         || manifest["repository"] != "https://github.com/trycua/cua"
-        || manifest["revision"] != CUA_DRIVER_REVISION
-        || manifest["version"] != CUA_DRIVER_VERSION
+        || manifest["revision"] != "6df77f678d17bb42e97f496e1f0b137e83fd2c9d"
+        || manifest["version"] != DRIVER_VERSION
         || manifest["permission_owner"] != "gateway"
         || manifest["target"].as_str() != Some(packaged_target()?)
         || manifest["daemon"].as_str() != Some(relative.as_str())
