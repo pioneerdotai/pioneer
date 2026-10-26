@@ -2,7 +2,7 @@
 
 Результат подготовлен к внешнему ревью. Это не приёмка части или совместной интеграции четырёх частей. Исторический `docs/reviews/threads-domain-execution.md` не использовался как доказательство корректности или внешней приёмки и не изменён.
 
-Актуальная передача после трёх подтверждённых замечаний внешнего аудита описана в последнем разделе. Предыдущие разделы сохраняют историю первого самоаудита; уточнения ниже имеют приоритет.
+Актуальная передача после P2 о совместимости исторического child grant описана в последнем разделе. Предыдущие разделы сохраняют историю самоаудита и трёх исправлений внешнего аудита; уточнения ниже имеют приоритет.
 
 ## Ревизии и изоляция
 
@@ -177,3 +177,65 @@ git rev-parse HEAD
 Основной checkout, соседние worktree, dev/prod-базы, службы, конфиги и установленные skills не изменялись. Merge, push, deploy, создание PR и интеграция частей 1–3 не выполнялись.
 
 Тесты, cargo check, компиляция, сборки, приложение, Gateway, тестовые CLI-агенты, миграции, EXPLAIN, benchmarks и генераторы не запускались; компилируемость и прохождение тестов не подтверждены. Это передача на повторное внешнее ревью части 4 без окончательной приёмки. После полного ревью и приёмки для запуска проверок всё равно требуется отдельное разрешение пользователя.
+
+## Повторное внешнее ревью: P2, исторический child grant
+
+Начальный HEAD этого прохода — `ca8847597f62fadb839d01cd7b8e24bd4d49362d`; фактические ветка `fix/threads-dispatch-recovery` и worktree `/Users/alexander/Code/pioneer/pioneer/.worktrees/threads-dispatch-recovery` совпали с заданными. Начальное дерево было чистым, включая untracked. База собственной части остаётся `4ea81a4c67a9d24876e4333989dae1955b00b943`; обновления базы и интеграции частей не было.
+
+Commit исправления и регрессии: `8bdd43bde7b8045b2bffc0b1371b1fb0b4d394a4` (`Support historical child grants in Threads dispatch recovery`). Следующий commit содержит только обновление этого отчёта; его SHA передаётся отдельно, поскольку отчёт не может ссылаться на собственный commit.
+
+### Причина и минимальное исправление
+
+Через `git show bb85dcdf7080164c4dc6480d12410e5e38edade8:crates/gateway/src/message/agent_action_tools.rs` проверен реальный исторический producer: `child_grant_json` не содержал `source_action_id`, `source_execution_id`, `turn_id`, но input Turn уже получал `canonical_agent_id('T', "agent-start-turn\0" + action_id)`. Текущий producer сохраняет ту же формулу ID. Прочитаны `load_agent_execution_grant` и `upgrade_agent_execution_grant_model_to_current`: fingerprint проверяется в сохранённом представлении, upcast касается вложенного child-launch ceiling и не добавляет source-полей. Поэтому обязательная проверка всех трёх полей ошибочно блокировала корректный старый dispatch и terminal reconciliation.
+
+Изменены только `crates/gateway/src/message/agent_action_tools.rs`, существующая регрессия в `crates/gateway/src/message/tests/thread_launch_choices.rs` и этот отчёт.
+
+- Общий приватный `agent_start_grant_matches_source` сохраняет строгую проверку нового формата. Историческая ветвь разрешена только для `kind=agent_child`, когда все три source-поля отсутствуют. Наличие null, неверного типа, частичного набора или противоречащего значения не включает fallback. Независимые roots продолжают использовать строгие source-поля и прежнюю provenance-проверку.
+- Для исторического child проверяются сохранённые grant parent/identity/execution, parent execution и JSON parent против row owner, точный action-derived input Turn ID, committed StartAgent action того же owner и allowed receipt с тем же agent actor. Оба callers дополнительно проверяют сохранённого автора Turn и точный response execution/presentation; прежние workspace, parent thread, identity/profile, owner/generation checks остаются на месте. Совпадение одного parent не является доказательством: Turn sibling не соответствует action-derived ID, а сочетание собственного Turn с чужим execution отсекается response binding.
+- Обычный dispatch и finalizer используют один async helper до terminal cleanup/ACK. Дополнительные reads идут через существующие scoped CRUD handles и repositories; типизированные ошибки хранения сохраняются. Helper только читает факты и не удерживает DB capacity во время runtime/control работы.
+- Для исторического compacted receipt без dispatch и без source-полей grant используется тот же canonical Turn ID. После общей проверки сохраняется существующее ограничение: этот путь подтверждает только projected canonical terminal через fenced cleanup и guarded memory sync, не активирует и не завершает живую или resumed generation. Payload пользователя не восстанавливается. Exhausted claim по-прежнему идёт только в reconciliation, без повторного model call и без увеличения attempts.
+
+Immutable grants и fingerprints в production не переписываются. Права initiating user, explicit allow/deny, scope, routes, ceilings и общие primitives частей 2–3 не менялись. Три предыдущих исправления сохранены: raw expression-index DDL и историческая migration fixture в этом проходе не изменены; exact source-action guard остаётся перед ordinary terminal cleanup.
+
+### Написанная, но не запущенная регрессия
+
+Расширен существующий `exhausted_child_start_cannot_reconcile_a_sibling_from_another_action`, без нового теста или production seam. Реальные tools допускают двух HomeCapsule children; disposable fixture воспроизводит старый grant удалением ровно трёх полей и пересчётом корректного fingerprint. Production grant loader проверяет этот fingerprint обычным образом.
+
+- Матрица теперь включает ordinary attempts=0 и exhausted attempts=8 для нового и исторического grant. Redirect A на B остаётся unresolved: A не ACK-ается, его Turn/execution/resources сохранены; canonical Turn, memory, owner, execution, resources и grant B не изменены. В ordinary случае B заранее завершается настоящим pre-activation Stop; exhausted случай сохраняет живого B. Model calls остаются равны нулю.
+- После восстановления собственного payload исторический ordinary child проходит production outbox dispatch до recording provider ровно один раз. Настоящий Stop создаёт canonical terminal; потерянный ACK проигрывается через production outbox без второго model call. Exhausted child с корректной исторической связью проходит production отказ/terminalization и ACK без запуска модели.
+- Production compaction удаляет bulky материал; fixture дополнительно убирает dispatch, как старый compactor. Exhausted replay такого receipt подтверждает canonical Interrupted/Blocked, очищает retry obligation, синхронизирует loaded memory и не вызывает модель повторно. Проверяется неизменность compacted payload и сырых grant models с fingerprints после обработки.
+- Для нового grant правильный собственный payload по-прежнему отклоняется при противоречии каждого из трёх source-полей и при частично сохранённом наборе. Проверяются отсутствие ACK/model call и сохранность собственного Turn/resources и самого grant. Эти строки проходят настоящий dispatcher и его finalizer; готовый результат finalizer не подставляется.
+
+### Статический самоаудит и выполненные команды
+
+Перечитаны весь diff этого исправления, собственный продуктовый diff от базы `4ea81a4c…` и затронутые callers: исторический/текущий producer, grant loader/upcast, ordinary root/child proof, response/author checks, rejected-start finalizer, exhausted claim/bookkeeping, compaction, terminal writer и guarded memory sync. Проверены существующие signatures и типы моделей. Положительный старый путь прослежен до runtime admission либо canonical terminal; отрицательные пути останавливаются до cleanup/sync другого исполнения. Pending terminal projection по-прежнему не ACK-ается, foreign live owner не активируется, resumed N+1 защищён прежними writer и memory fences. Limits, deadlines, quotas, scheduling priority и число попыток не увеличены.
+
+Статический authoring gate: на начальном HEAD валидный старый grant не проходит strict source check; ordinary dispatch не достиг бы provider, а terminal/exhausted replay остался бы Unresolved. Это ожидаемая причина падения положительных расширений до исправления. Baseline и исправленная версия не исполнялись; прохождение не заявляется.
+
+Прочитаны применимые AGENTS.md, prompt и review. Для чтения использовались `pwd`, `rg`, `rg --files`, `cat`, `sed -n`, `git show`, `git diff` (включая diff от базы и полный diff текущей правки). Навигационные поиски без совпадений уточнялись чтением существующих путей. Выполнены `git branch --show-current`, `git rev-parse HEAD`, `git status --short --untracked-files=all`, `git diff --stat`, `git diff --numstat`, `git diff --name-only` и `git diff --cached --stat`.
+
+Фактически выполнены только разрешённые formatting/whitespace проверки; завершились с exit 0:
+
+```sh
+cargo fmt --all
+cargo fmt --all -- --check
+git diff --check
+git diff 4ea81a4c67a9d24876e4333989dae1955b00b943 --check
+git diff --cached --check
+```
+
+Исправление зафиксировано с отключёнными hooks; staging содержал ровно два Rust-пути выше. Для отчёта используется отдельный commit с тем же отключением hooks:
+
+```sh
+git -c core.hooksPath=/dev/null add crates/gateway/src/message/agent_action_tools.rs crates/gateway/src/message/tests/thread_launch_choices.rs
+git -c core.hooksPath=/dev/null -c commit.gpgsign=false commit -m "Support historical child grants in Threads dispatch recovery"
+git -c core.hooksPath=/dev/null add docs/reviews/threads-domain-split/threads-dispatch-recovery.review.md
+git diff --cached --check
+git -c core.hooksPath=/dev/null -c commit.gpgsign=false commit -m "Document historical child grant compatibility review"
+git status --short --untracked-files=all
+git rev-parse HEAD
+```
+
+Основной checkout, соседние worktree/ветки, dev/prod-базы, службы, конфиги и установленные skills не менялись. Merge, push, deploy, PR и интеграция частей не выполнялись.
+
+Тесты, cargo check, компиляция, сборки, приложение, Gateway, тестовые CLI-агенты, миграции, EXPLAIN, benchmarks и генераторы не запускались. Компилируемость и прохождение тестов не подтверждены. Это передача на повторное внешнее ревью части 4 без окончательной приёмки; запрет запуска проверок сохраняется до отдельного разрешения пользователя после внешней приёмки.
