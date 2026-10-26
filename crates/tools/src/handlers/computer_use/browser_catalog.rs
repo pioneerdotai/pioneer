@@ -1,5 +1,5 @@
-// Browser schema expressions copied from trycua/cua at 688c5fd62a9f13dddc309970c948df494e7de33f.
-// Source: libs/cua-driver/rust/crates/cua-driver-core/src/browser/tools.rs (MIT).
+// Generated from trycua/cua release nightly-cua-driver-rs-v0.38.1-nightly.20261026.40269720879 (MIT).
+// Only passive schema expressions; Gateway retains its explicit operation allowlist.
 use serde_json::{Value, json};
 fn schema_delivery_mode() -> Value {
     json!({
@@ -35,7 +35,13 @@ fn schema_ref() -> Value {
 }
 
 fn schema_session() -> Value {
-    json!({"type":"string", "description":"For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session. Browser targets, tabs, and refs belong to the resolved lifecycle session."})
+    serde_json::json!({
+        "type": "string",
+        "description": format!(
+            "{} Browser targets, tabs, and refs belong to the resolved lifecycle session.",
+            "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session."
+        )
+    })
 }
 pub(super) fn schemas() -> Vec<(&'static str, Value)> {
     vec![

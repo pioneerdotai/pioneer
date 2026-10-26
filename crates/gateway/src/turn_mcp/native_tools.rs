@@ -20,6 +20,7 @@ pub(crate) enum NativeToolFamily {
     Threads,
 }
 
+// The existing CUA server id is a durable binding identity, not a dependency pin.
 impl NativeToolFamily {
     pub(crate) fn from_server_id(id: &str) -> Option<Self> {
         match id {

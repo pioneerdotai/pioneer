@@ -11,6 +11,9 @@ import plistlib
 import zipfile
 
 
+RELEASE = json.loads((Path(__file__).resolve().parents[2] / "config/cua-driver.json").read_text())
+
+
 def fixture(binary, archive, target):
     windows = "windows" in target
     macos = "apple-darwin" in target
@@ -34,8 +37,8 @@ def fixture(binary, archive, target):
             CFBundleIdentifier="ai.pioneer.gateway", CFBundleExecutable="pioneer",
             CFBundleName="Pioneer Gateway", CFBundlePackageType="APPL")), 0o644)
     manifest = dict(schema_version=1, repository="https://github.com/trycua/cua",
-                    revision="688c5fd62a9f13dddc309970c948df494e7de33f",
-                    version="0.38.0", target=target, permission_owner="gateway",
+                    revision=RELEASE["revision"],
+                    version=RELEASE["version"], target=target, permission_owner="gateway",
                     daemon=daemon, sha256=hashlib.sha256(driver).hexdigest())
     members["cua/manifest.json"] = ((json.dumps(manifest) + "\n").encode(), 0o644)
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:

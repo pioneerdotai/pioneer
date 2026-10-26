@@ -3105,7 +3105,7 @@ dependencies = [
 [[package]]
 name = "cua-cursor-motion"
 version = "0.38.0"
-source = "git+https://github.com/trycua/cua?rev=688c5fd62a9f13dddc309970c948df494e7de33f#688c5fd62a9f13dddc309970c948df494e7de33f"
+source = "git+https://github.com/trycua/cua?tag=nightly-cua-driver-rs-v0.38.1-nightly.20261026.40269720879#6df77f678d17bb42e97f496e1f0b137e83fd2c9d"
 dependencies = [
  "serde",
 ]
@@ -3113,7 +3113,7 @@ dependencies = [
 [[package]]
 name = "cua-driver-contract"
 version = "0.38.0"
-source = "git+https://github.com/trycua/cua?rev=688c5fd62a9f13dddc309970c948df494e7de33f#688c5fd62a9f13dddc309970c948df494e7de33f"
+source = "git+https://github.com/trycua/cua?tag=nightly-cua-driver-rs-v0.38.1-nightly.20261026.40269720879#6df77f678d17bb42e97f496e1f0b137e83fd2c9d"
 dependencies = [
  "schemars 1.2.3",
  "serde",
@@ -3124,7 +3124,7 @@ dependencies = [
 [[package]]
 name = "cua-driver-core"
 version = "0.38.0"
-source = "git+https://github.com/trycua/cua?rev=688c5fd62a9f13dddc309970c948df494e7de33f#688c5fd62a9f13dddc309970c948df494e7de33f"
+source = "git+https://github.com/trycua/cua?tag=nightly-cua-driver-rs-v0.38.1-nightly.20261026.40269720879#6df77f678d17bb42e97f496e1f0b137e83fd2c9d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3164,7 +3164,7 @@ dependencies = [
 [[package]]
 name = "cua-driver-sdk"
 version = "0.38.0"
-source = "git+https://github.com/trycua/cua?rev=688c5fd62a9f13dddc309970c948df494e7de33f#688c5fd62a9f13dddc309970c948df494e7de33f"
+source = "git+https://github.com/trycua/cua?tag=nightly-cua-driver-rs-v0.38.1-nightly.20261026.40269720879#6df77f678d17bb42e97f496e1f0b137e83fd2c9d"
 dependencies = [
  "async-trait",
  "core-foundation 0.10.1",
@@ -3193,7 +3193,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 [[package]]
 name = "cursor-overlay"
 version = "0.38.0"
-source = "git+https://github.com/trycua/cua?rev=688c5fd62a9f13dddc309970c948df494e7de33f#688c5fd62a9f13dddc309970c948df494e7de33f"
+source = "git+https://github.com/trycua/cua?tag=nightly-cua-driver-rs-v0.38.1-nightly.20261026.40269720879#6df77f678d17bb42e97f496e1f0b137e83fd2c9d"
 dependencies = [
  "anyhow",
  "cua-cursor-motion",
@@ -11495,7 +11495,7 @@ dependencies = [
 [[package]]
 name = "pip-preview"
 version = "0.38.0"
-source = "git+https://github.com/trycua/cua?rev=688c5fd62a9f13dddc309970c948df494e7de33f#688c5fd62a9f13dddc309970c948df494e7de33f"
+source = "git+https://github.com/trycua/cua?tag=nightly-cua-driver-rs-v0.38.1-nightly.20261026.40269720879#6df77f678d17bb42e97f496e1f0b137e83fd2c9d"
 dependencies = [
  "serde_json",
 ]
@@ -11547,7 +11547,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 [[package]]
 name = "platform-linux"
 version = "0.38.0"
-source = "git+https://github.com/trycua/cua?rev=688c5fd62a9f13dddc309970c948df494e7de33f#688c5fd62a9f13dddc309970c948df494e7de33f"
+source = "git+https://github.com/trycua/cua?tag=nightly-cua-driver-rs-v0.38.1-nightly.20261026.40269720879#6df77f678d17bb42e97f496e1f0b137e83fd2c9d"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -11594,7 +11594,7 @@ dependencies = [
 [[package]]
 name = "platform-macos"
 version = "0.38.0"
-source = "git+https://github.com/trycua/cua?rev=688c5fd62a9f13dddc309970c948df494e7de33f#688c5fd62a9f13dddc309970c948df494e7de33f"
+source = "git+https://github.com/trycua/cua?tag=nightly-cua-driver-rs-v0.38.1-nightly.20261026.40269720879#6df77f678d17bb42e97f496e1f0b137e83fd2c9d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11633,7 +11633,7 @@ dependencies = [
 [[package]]
 name = "platform-windows"
 version = "0.38.0"
-source = "git+https://github.com/trycua/cua?rev=688c5fd62a9f13dddc309970c948df494e7de33f#688c5fd62a9f13dddc309970c948df494e7de33f"
+source = "git+https://github.com/trycua/cua?tag=nightly-cua-driver-rs-v0.38.1-nightly.20261026.40269720879#6df77f678d17bb42e97f496e1f0b137e83fd2c9d"
 dependencies = [
  "anyhow",
  "async-trait",

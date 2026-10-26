@@ -1,4 +1,4 @@
-// Canonical contract pin: trycua/cua 688c5fd62a9f13dddc309970c948df494e7de33f (MIT).
+// Canonical upstream schemas are maintained by scripts/update-cua-driver.py (MIT).
 use crate::output_policy::computer_use_output_policy;
 use crate::spec::{
     ConfiguredToolSpec, ExecutionClass, PayloadKind, ToolIdempotencyMode, ToolRecoveryMetadata,

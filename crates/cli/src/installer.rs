@@ -1864,8 +1864,8 @@ fn validate_cua_payload(payload: &Path) -> Result<()> {
     if manifest["schema_version"] != 1
         || manifest["repository"] != "https://github.com/trycua/cua"
         || manifest["target"].as_str() != Some(target.as_str())
-        || manifest["revision"] != "688c5fd62a9f13dddc309970c948df494e7de33f"
-        || manifest["version"] != "0.38.0"
+        || manifest["revision"] != pioneer_protocol::CUA_DRIVER_REVISION
+        || manifest["version"] != pioneer_protocol::CUA_DRIVER_VERSION
         || manifest["daemon"] != daemon
         || manifest["permission_owner"] != "gateway"
         || manifest["sha256"].as_str() != Some(sha256_file(&payload.join(daemon))?.as_str())
@@ -3047,8 +3047,8 @@ mod tests {
                         } else {
                             "unknown-linux-gnu"
                         }),
-                    "revision": "688c5fd62a9f13dddc309970c948df494e7de33f",
-                    "version": "0.38.0",
+                    "revision": pioneer_protocol::CUA_DRIVER_REVISION,
+                    "version": pioneer_protocol::CUA_DRIVER_VERSION,
                     "daemon": daemon,
                     "permission_owner": "gateway",
                     "sha256": super::sha256_file(&next.join(daemon)).unwrap(),

@@ -98,6 +98,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python3 scripts/update-cua-driver.py --check
+          python3 -m unittest discover -s scripts -p 'test_update_cua_driver.py'
           cargo fmt --all --check
 
       - &linux-dependencies

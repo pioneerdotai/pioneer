@@ -1,5 +1,5 @@
-// Final-binary Swift inputs for the pinned cua-driver SDK (0.38.0).
-// Adapted from trycua/cua 688c5fd62a9f13dddc309970c948df494e7de33f,
+// Final-binary Swift inputs for the selected cua-driver SDK.
+// Initially adapted from trycua/cua 688c5fd62a9f13dddc309970c948df494e7de33f,
 // libs/cua-driver/rust/crates/cua-driver/build.rs (MIT; notice in
 // crates/tools/src/handlers/computer_use/LICENSE.cua).
 // Transitive rustc-link-arg directives do not reach Pioneer executables.

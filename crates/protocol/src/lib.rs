@@ -13,6 +13,8 @@ pub use thread_tool_result::{
     ThreadToolResultCursor, ThreadToolResultReadParams, ThreadToolResultReadResponse,
 };
 pub mod constants;
+mod cua_driver_release;
+pub use cua_driver_release::{CUA_DRIVER_RELEASE, CUA_DRIVER_REVISION, CUA_DRIVER_VERSION};
 
 mod access;
 mod agent_action;
