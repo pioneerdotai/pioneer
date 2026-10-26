@@ -240,6 +240,13 @@ async fn codex_title_deadline_waits_for_fresh_completion_and_keeps_manual_names(
         };
         let (mut processor, store, workspace) =
             setup_execution_window_terminal_turn_with_input(thread, first, &input).await;
+        // Keep the conversation loaded across completion, replay, and the next turn.
+        assert!(
+            processor
+                .thread_manager
+                .subscribe_connection(thread, 1)
+                .await
+        );
         let fixture = tempfile::tempdir().unwrap();
         configure_title_process(&mut processor, fixture.path());
         let text_turn = if attachment_first {

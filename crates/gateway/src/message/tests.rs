@@ -42537,7 +42537,7 @@ async fn setup_execution_window_terminal_turn_with_input(
         )
         .await
         .expect("thread should start");
-    thread_manager
+    let turn_start = thread_manager
         .system_turn_start_with_permission_profile(
             pioneer_protocol::TurnStartParams {
                 agent_delegation_routes: Vec::new(),
@@ -42567,21 +42567,7 @@ async fn setup_execution_window_terminal_turn_with_input(
         .materialize_turn_start(
             &thread_start.started_notification.thread,
             SandboxMode::FullAccess,
-            &Turn {
-                id: turn_id.to_owned(),
-                status: TurnStatus::InProgress,
-                turn_kind: Default::default(),
-                origin: Default::default(),
-                mode: Default::default(),
-                author: None,
-                reply_to_turn_id: None,
-                mentions: Vec::new(),
-                message_revision: 0,
-                message_deleted: false,
-                error: None,
-                prompt_manifest: None,
-                permission_profile: default_test_permission_profile(),
-            },
+            &turn_start.materialization.turn,
             input,
             pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
         )
