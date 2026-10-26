@@ -1021,6 +1021,30 @@ async fn source_at_max_depth_can_start_only_an_independent_root() {
             .await
             .unwrap();
         context.turn_id = payload["dispatch"]["turn_id"].as_str().unwrap().to_owned();
+        if depth == max_depth {
+            // Canonical admission alone has no runtime snapshot. Prepare the
+            // source before it invokes thread_create, as a running agent would.
+            let params: TurnStartParams =
+                serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+            let input = processor
+                .crud_store
+                .get_turn_inputs(&context.turn_id)
+                .await
+                .unwrap();
+            let outcome = processor
+                .thread_manager
+                .rehydrate_committed_agent_turn(&params, input)
+                .await
+                .unwrap();
+            let authority = processor
+                .load_turn_execution_authorization_context(&context.turn_id)
+                .await
+                .unwrap();
+            processor
+                .prepare_committed_agent_api_turn(&params, outcome, &authority)
+                .await
+                .unwrap();
+        }
         tools = processor
             .materialize_agent_action_tools(context.clone())
             .await
