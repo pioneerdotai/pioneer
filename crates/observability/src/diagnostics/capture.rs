@@ -474,6 +474,7 @@ pub(super) fn capture(
             "target_identity_changed"
         );
     }
+    let reserve_sql_cpu = sql_cpu_eligible(&target.service, &config, pid);
     let capture_id = nanoid::nanoid!(24);
     let path = storage::capture_dir(root, &capture_id)?;
     let _capture_lease = storage::CaptureLease::new(&path);
@@ -501,88 +502,25 @@ pub(super) fn capture(
     }
     let mut manifest = match outcome {
         Ok(manifest) => manifest,
-        Err(error) => {
-            // capture_inner has already dropped/reaped its owned native tool.
-            // Record this upper bound BEFORE recovery filesystem work.
-            if let Some(attempt) = &mut attempt {
-                attempt
-                    .ended
-                    .get_or_insert_with(|| (unix_ms(), monotonic_ms()));
-            }
-            let mut files = storage::inventory(&path).ok();
-            if files.is_none() {
-                storage::remove_owned(&path);
-                let recreated = storage::capture_dir(root, &capture_id)?;
-                files = storage::inventory(&recreated).ok();
-            }
-            let mut manifest = failed_manifest(
-                &capture_id,
-                target,
-                &config,
-                pid,
-                &start_identity,
-                format!("{error}").chars().take(256).collect(),
-                files.unwrap_or_default(),
-            );
-            if let Some(attempt) = attempt {
-                attempt.preserve(&mut manifest);
-            }
-            manifest
-        }
+        Err(error) => recover_failed_capture(
+            root,
+            &path,
+            &capture_id,
+            target,
+            &config,
+            pid,
+            &start_identity,
+            error,
+            attempt,
+            reserve_sql_cpu,
+        )?,
     };
     if let Some(snapshot) = sql_cpu {
-        // This thread owns diagnostic storage and no database capacity. Keep
-        // provenance alongside the bounded table without exporting SQL text.
-        let sidecar = serde_json::json!({
-            "schema_version": 1,
-            "kind": "pioneer.gateway.sql_cpu",
-            "run": target.run,
-            "consent_generation": epoch,
-            "native_profile_status": manifest.status,
-            "native_profile_interval": {
-                "started_monotonic_ms": manifest.started_monotonic_ms,
-                "ended_monotonic_ms": manifest.ended_monotonic_ms,
-                "clock_scope": manifest.clock_scope,
-            },
-            "sql_cpu": snapshot,
-        });
         if !crate::telemetry_sample_allowed(Some(epoch)) || stop.load(Ordering::Acquire) {
             storage::remove_owned(&path);
             bail!("capture_shutdown_or_consent_revoked");
         }
-        let stored = (|| -> Result<Vec<ArtifactFile>> {
-            storage::write_new_json(&path.join("sql-cpu.json"), &sidecar)?;
-            storage::inventory(&path)
-        })();
-        match stored {
-            Ok(files) => {
-                manifest.files = files;
-                manifest.sql_cpu = Some(serde_json::json!({
-                    "filename": "sql-cpu.json",
-                    "status": "recorded",
-                    "coverage": sidecar["sql_cpu"]["coverage"],
-                    "measured_unknown": sidecar["sql_cpu"]["measured_unknown"],
-                    "group_overflow": sidecar["sql_cpu"]["group_overflow"],
-                    "started_monotonic_ms": sidecar["sql_cpu"]["started_monotonic_ms"],
-                    "ended_monotonic_ms": sidecar["sql_cpu"]["ended_monotonic_ms"],
-                    "scope": "SQLx command CPU in observed query scopes; independent window; inspect unknown, overflow, clock errors and incomplete before drawing conclusions",
-                }));
-            }
-            Err(_) => {
-                // A sidecar must never bypass the existing byte/file quota or
-                // turn a failed native profile into a successful capture.
-                let _ = fs::remove_file(path.join("sql-cpu.json"));
-                manifest.sql_cpu = Some(
-                    serde_json::json!({"status":"unavailable", "reason":"sql_cpu_storage_or_inventory_failed"}),
-                );
-                manifest
-                    .incomplete_reasons
-                    .push("sql_cpu_sidecar_unavailable".into());
-                if manifest.status == "completed" {
-                    manifest.status = "partial".into();
-                }
-            }
-        }
+        store_sql_cpu(&path, target, &mut manifest, &snapshot);
     }
     if manifest.sql_cpu.is_none() && sql_cpu_eligible(&target.service, &config, pid) {
         manifest.sql_cpu = Some(
@@ -596,6 +534,158 @@ pub(super) fn capture(
     }
     record_reference(&manifest);
     Ok(manifest)
+}
+// Native tool ownership has already been released/reaped at this boundary.
+// SQL recovery preserves both the sealed snapshot and the original admitted
+// directory/markers until commit, without taking another storage reservation.
+fn recover_failed_capture(
+    root: &Path,
+    path: &Path,
+    capture_id: &str,
+    target: &TargetSnapshot,
+    config: &CaptureRequest,
+    pid: u32,
+    start_identity: &str,
+    error: anyhow::Error,
+    mut attempt: Option<AttemptProvenance>,
+    reserve_sql_cpu: bool,
+) -> Result<CaptureManifest> {
+    if let Some(attempt) = &mut attempt {
+        attempt
+            .ended
+            .get_or_insert_with(|| (unix_ms(), monotonic_ms()));
+    }
+    let mut files = if reserve_sql_cpu {
+        native_size(path, true)
+            .ok()
+            .and_then(|_| capture_inventory(path, true).ok())
+    } else {
+        storage::inventory(path).ok()
+    };
+    if files.is_none() {
+        if reserve_sql_cpu {
+            storage::clear_owned_capture_output(path)?;
+            native_size(path, true)?;
+            files = Some(capture_inventory(path, true)?);
+        } else {
+            storage::remove_owned(path);
+            let recreated = storage::capture_dir(root, capture_id)?;
+            files = capture_inventory(&recreated, false).ok();
+        }
+    }
+    let mut manifest = failed_manifest(
+        capture_id,
+        target,
+        config,
+        pid,
+        start_identity,
+        format!("{error}").chars().take(256).collect(),
+        files.unwrap_or_default(),
+    );
+    if let Some(attempt) = attempt {
+        attempt.preserve(&mut manifest);
+    }
+    Ok(manifest)
+}
+fn capture_inventory(path: &Path, sql_cpu: bool) -> Result<Vec<ArtifactFile>> {
+    if sql_cpu {
+        // Leave one file/entry and eight MiB for manifest while active.json is
+        // still present. Lease release can only reduce the final footprint.
+        storage::inventory_with_limits(path, storage::SQL_INVENTORY_BYTES, storage::MAX_FILES - 1)
+    } else {
+        storage::inventory(path)
+    }
+}
+// The diagnostic owner performs serialization/checksums, never a SQLite worker.
+fn store_sql_cpu(
+    path: &Path,
+    target: &TargetSnapshot,
+    manifest: &mut CaptureManifest,
+    snapshot: &crate::query_cpu::Snapshot,
+) {
+    #[derive(Serialize)]
+    struct Sidecar<'a> {
+        schema_version: u32,
+        kind: &'static str,
+        run: &'a crate::identity::RunIdentity,
+        consent_generation: u64,
+        native_profile_status: &'a str,
+        native_profile_interval: serde_json::Value,
+        sql_cpu: &'a crate::query_cpu::Snapshot,
+    }
+    let mut created = false;
+    let stored = (|| -> Result<(Vec<ArtifactFile>, u64)> {
+        // The same reserve is enforced while the native child is running and
+        // after its final exit (including any final flush/overshoot).
+        let (limit, files) = native_storage_limits(true);
+        storage::size_with_file_limit(path, limit, files)?;
+        let sidecar = Sidecar {
+            schema_version: 2,
+            kind: "pioneer.gateway.sql_cpu",
+            run: &target.run,
+            consent_generation: target.consent_generation,
+            native_profile_status: &manifest.status,
+            native_profile_interval: serde_json::json!({
+                "started_monotonic_ms": manifest.started_monotonic_ms,
+                "ended_monotonic_ms": manifest.ended_monotonic_ms,
+                "clock_scope": manifest.clock_scope,
+            }),
+            sql_cpu: snapshot,
+        };
+        let bytes = storage::write_new_sql_cpu_json(&path.join("sql-cpu.json"), &sidecar)?;
+        created = true;
+        Ok((capture_inventory(path, true)?, bytes))
+    })();
+    let mut summary = serde_json::json!({
+        "schema_version": 2,
+        "aggregation": snapshot.aggregation,
+        "coverage": snapshot.coverage,
+        "measured_unknown": snapshot.measured_unknown,
+        "group_overflow": snapshot.group_overflow,
+        "started_monotonic_ms": snapshot.started_monotonic_ms,
+        "ended_monotonic_ms": snapshot.ended_monotonic_ms,
+        "scope": "Observed SQLx command CPU only; aggregation completeness is independent of unknown identities, measurement gaps and native profile status. measured_unknown overlaps groups/residual; never add it to accounted.",
+    });
+    match stored {
+        Ok((files, bytes)) => {
+            manifest.files = files;
+            summary["filename"] = "sql-cpu.json".into();
+            summary["bytes"] = bytes.into();
+            summary["status"] = "recorded".into();
+        }
+        Err(_) => {
+            // Remove only a successfully create_new-owned sidecar, never a
+            // pre-existing collision. The writer cleans its own partial writes.
+            if created {
+                let _ = fs::remove_file(path.join("sql-cpu.json"));
+            }
+            summary["status"] = "unavailable".into();
+            summary["reason"] = "sql_cpu_storage_or_inventory_failed".into();
+            manifest
+                .incomplete_reasons
+                .push("sql_cpu_sidecar_unavailable".into());
+            if manifest.status == "completed" {
+                manifest.status = "partial".into();
+            }
+        }
+    }
+    manifest.sql_cpu = Some(summary);
+}
+fn native_storage_limits(sql_cpu: bool) -> (u64, usize) {
+    if sql_cpu {
+        // Owner/active markers are already included in native size/count.
+        // Reserve both future SQL and manifest files/entries before spawning.
+        (
+            storage::SQL_INVENTORY_BYTES - storage::SQL_CPU_BYTES,
+            storage::MAX_FILES - 2,
+        )
+    } else {
+        (storage::INVENTORY_BYTES, storage::MAX_FILES)
+    }
+}
+fn native_size(path: &Path, sql_cpu: bool) -> Result<u64> {
+    let (bytes, files) = native_storage_limits(sql_cpu);
+    storage::size_with_file_limit(path, bytes, files)
 }
 #[derive(Default)]
 struct SqlCpuCapture {
@@ -628,6 +718,7 @@ fn capture_inner(
     sql_cpu: &mut SqlCpuCapture,
 ) -> Result<CaptureManifest> {
     let epoch = target.consent_generation;
+    let reserve_sql_cpu = sql_cpu_eligible(&target.service, &config, pid);
     let plan = plan(&config, pid, path, &target.stack_logging)?;
     let module = if config.child_generation.is_none() {
         Some(child_module(pid, epoch, stop, cancel)?)
@@ -642,6 +733,9 @@ fn capture_inner(
     );
     let output = fs::File::create(path.join("tool-output.txt"))?;
     let stderr = fs::File::create(path.join("tool-stderr.txt"))?;
+    if reserve_sql_cpu {
+        native_size(path, true)?;
+    }
     let started_unix_ms = unix_ms();
     let started_monotonic_ms = monotonic_ms();
     if sql_cpu_eligible(&target.service, &config, pid) {
@@ -722,12 +816,12 @@ fn capture_inner(
             stop_tool(&mut child, plan.graceful_stop, &mut registration);
             break;
         }
-        if storage::size(path, storage::CAPTURE_BYTES - 1024 * 1024).is_err() {
+        if native_size(path, reserve_sql_cpu).is_err() {
             reasons.push("output_overflow".into());
             status = "partial";
             sql_cpu.seal();
             stop_tool(&mut child, plan.graceful_stop, &mut registration);
-            trim_overflow(path)?;
+            trim_overflow(path, reserve_sql_cpu)?;
             break;
         }
         #[cfg(target_os = "linux")]
@@ -777,13 +871,43 @@ fn capture_inner(
             reasons.push("module_identity_changed_or_unavailable_after_capture".into());
         }
     }
-    let files = storage::inventory(path)?;
-    if !files.iter().any(|file| is_profile_file(config.mode, file)) {
-        status = "failed";
-        reasons.push("profile_artifact_missing".into());
-    }
+    let files = finalize_native_files(
+        path,
+        config.mode,
+        reserve_sql_cpu,
+        &mut status,
+        &mut reasons,
+    )?;
     let symbol_status = symbol_status(module.as_ref());
     Ok(CaptureManifest{schema_version:1,capture_id:capture_id.into(),run:target.run.clone(),consent_generation:epoch,target_pid:pid,target_start_identity:start_identity.into(),target_child_generation:config.child_generation,target_build_scope:if config.child_generation.is_none(){"target_executable"}else{"parent_build_only; child module identity separately reported"}.into(),mode:config.mode,tool:plan.program.file_name().unwrap_or_default().to_string_lossy().into_owned(),tool_version,configuration:plan.args,actual_format:plan.format.into(),started_unix_ms,ended_unix_ms,started_monotonic_ms,ended_monotonic_ms,clock_scope:"native tool spawn through observed exit/stop, target process monotonic_ms and unix_ms; tool artifact contains actual sample times; module hashing/version preparation excluded".into(),module_coverage:if module.is_some(){"main executable only; native tool artifact contains loaded-module evidence where available"}else{"main module ID unavailable; native artifact loaded-module evidence tool-defined"}.into(),module,symbol_status:symbol_status.into(),coverage:if cfg!(target_os="macos")&&matches!(config.mode,CaptureMode::Cpu|CaptureMode::Allocations){"template-controlled sampling; all target threads; frequency and lost samples unknown until tool analysis"}else{"tool-defined; see actual format; no CPU-to-async-operation attribution"}.into(),lost_samples:None,status:status.into(),incomplete_reasons:reasons,files,local_reference:format!("captures/pioneer-capture-{capture_id}/manifest.json"),correlation_scope:"service.instance.id + build + process/start + capture interval; SQL sidecar has its own observed query window, not arbitrary async stack attribution".into(),sql_cpu:None})
+}
+// Actual post-exit owner boundary: includes final flush/stop overshoot, trim,
+// final reserve validation and native status. Errors feed owned recovery above.
+fn finalize_native_files(
+    path: &Path,
+    mode: CaptureMode,
+    reserve_sql_cpu: bool,
+    status: &mut &str,
+    reasons: &mut Vec<String>,
+) -> Result<Vec<ArtifactFile>> {
+    if reserve_sql_cpu && native_size(path, true).is_err() {
+        if *status == "completed" {
+            *status = "partial";
+        }
+        if !reasons.iter().any(|r| r == "output_overflow") {
+            reasons.push("output_overflow".into());
+        }
+        // Preserve the reason even if trimming cannot restore the reserve and
+        // the SQL owner must clear native output in place, retaining its lease.
+        trim_overflow(path, true).context("output_overflow")?;
+        native_size(path, true).context("output_overflow")?;
+    }
+    let files = capture_inventory(path, reserve_sql_cpu)?;
+    if !files.iter().any(|file| is_profile_file(mode, file)) {
+        *status = "failed";
+        reasons.push("profile_artifact_missing".into());
+    }
+    Ok(files)
 }
 fn child_module(
     pid: u32,
@@ -844,9 +968,10 @@ fn classify_error(path: &Path) -> String {
     }
     .into()
 }
-fn trim_overflow(path: &Path) -> Result<()> {
-    // Preserve bounded partial files. Tools can overshoot between checks, so a
-    // directory that cannot be inventoried is removed rather than claimed bounded.
+fn trim_overflow(path: &Path, sql_cpu: bool) -> Result<()> {
+    let (limit, files) = native_storage_limits(sql_cpu);
+    // Preserve bounded partial files. Tools can overshoot between checks;
+    // output that still cannot be inventoried goes through owner recovery.
     for name in ["tool-output.txt", "tool-stderr.txt", "perf.data"] {
         let file = path.join(name);
         if let Ok(meta) = fs::metadata(&file) {
@@ -858,7 +983,7 @@ fn trim_overflow(path: &Path) -> Result<()> {
             }
         }
     }
-    if storage::size(path, storage::CAPTURE_BYTES - 1024 * 1024).is_err() {
+    if storage::size_with_file_limit(path, limit, files).is_err() {
         let trace = path.join("profile.trace");
         if trace.is_dir() {
             fs::remove_dir_all(trace)?;
@@ -979,6 +1104,385 @@ mod tests {
             assert!(!manifest.profile_data_present());
         }
     }
+    #[test]
+    fn full_sql_table_survives_reserved_native_bytes_inventory_and_manifest() {
+        use sha2::{Digest, Sha256};
+        let temp = tempfile::tempdir().unwrap();
+        let root = storage::private_root(&temp.path().join("diagnostics")).unwrap();
+        let path = storage::capture_dir(&root, "abcdefghijklmnopqrstuvwx").unwrap();
+        let lease = storage::CaptureLease::new(&path);
+        let target = crate::diagnostics::tests::target(7);
+        let snapshot = crate::query_cpu::aggregation_fixtures::full_budget_snapshot();
+        let mut manifest = failed_manifest(
+            "fixture",
+            &target,
+            &config(CaptureMode::Cpu),
+            42,
+            "start",
+            "native_failed".into(),
+            Vec::new(),
+        );
+        // Include owner/active markers in the exact native byte boundary.
+        let marker_bytes = storage::size(&path, storage::CAPTURE_BYTES).unwrap();
+        let native = fs::File::create(path.join("perf.data")).unwrap();
+        let (limit, _) = native_storage_limits(true);
+        assert_eq!(limit, 81_125_376);
+        assert_eq!(native_storage_limits(false).0, 127 * 1024 * 1024);
+        native.set_len(limit - marker_bytes).unwrap();
+        assert_eq!(native_size(&path, true).unwrap(), limit);
+        fs::write(path.join("excess"), b"x").unwrap();
+        assert!(native_size(&path, true).is_err());
+        fs::remove_file(path.join("excess")).unwrap();
+        store_sql_cpu(&path, &target, &mut manifest, &snapshot);
+        assert_eq!(manifest.status, "failed"); // SQL never promotes native
+        let summary = manifest.sql_cpu.as_ref().unwrap();
+        assert_eq!(summary["status"], "recorded");
+        assert_eq!(summary["aggregation"]["complete"], true);
+        assert_eq!(summary["aggregation"]["retained_groups"], 28_320);
+        assert!(summary.get("groups").is_none());
+        // Real local sidecar read with its own bound, independent of generic
+        // 8 MiB manifest/API JSON. The data itself, not padding, exceeds 8 MiB.
+        let bytes =
+            storage::read_bounded(&path.join("sql-cpu.json"), storage::SQL_CPU_BYTES).unwrap();
+        assert!(bytes.len() > 8 * 1024 * 1024);
+        assert_eq!(summary["bytes"], bytes.len() as u64);
+        let sidecar: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(sidecar["schema_version"], 2);
+        assert_eq!(
+            sidecar["sql_cpu"]["groups"].as_array().unwrap().len(),
+            28_320
+        );
+        assert_eq!(sidecar["sql_cpu"]["groups"][0]["cpu_ns"], 1_000_000);
+        assert_eq!(
+            sidecar["sql_cpu"]["aggregation"]["accounted"]["cpu_ns"],
+            1_019_998
+        );
+        let file = manifest
+            .files
+            .iter()
+            .find(|f| f.filename == "sql-cpu.json")
+            .unwrap();
+        assert_eq!(file.bytes, bytes.len() as u64);
+        assert_eq!(file.sha256, hex::encode(Sha256::digest(&bytes)));
+        storage::validate_private_file(&path.join("sql-cpu.json")).unwrap();
+        storage::write_new_json(&path.join("manifest.json"), &manifest).unwrap();
+        let saved: CaptureManifest = serde_json::from_slice(
+            &storage::read_bounded(&path.join("manifest.json"), 8 * 1024 * 1024).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved.sql_cpu.as_ref().unwrap()["status"], "recorded");
+        assert!(serde_json::to_vec(&saved).unwrap().len() <= 8 * 1024 * 1024);
+        assert!(!saved.profile_data_present());
+        assert!(storage::size(&path, storage::CAPTURE_BYTES).is_ok());
+        drop(lease);
+        assert!(!path.join("active.json").exists());
+    }
+
+    #[test]
+    fn post_exit_overshoot_recovers_owned_native_output_then_commits_full_sql_table() {
+        use sha2::{Digest, Sha256};
+        let temp = tempfile::tempdir().unwrap();
+        let root = storage::private_root(&temp.path().join("diagnostics")).unwrap();
+        let id = "abcdefghijklmnopqrstuvwx";
+        let path = storage::capture_dir(&root, id).unwrap();
+        let lease = storage::CaptureLease::new(&path);
+        let owner_marker = fs::read(path.join("owner.json")).unwrap();
+        let active_marker = fs::read(path.join("active.json")).unwrap();
+        #[cfg(unix)]
+        let original_inodes = {
+            use std::os::unix::fs::MetadataExt;
+            ["", "owner.json", "active.json"]
+                .map(|name| fs::metadata(path.join(name)).unwrap().ino())
+        };
+        // Fill the shared store before overshoot. These are separate active
+        // reservations even though no subprocess/profiler is needed here.
+        let other_captures: Vec<_> = (0..3)
+            .map(|i| {
+                let other = storage::capture_dir(&root, &format!("{i:024x}")).unwrap();
+                let lease = storage::CaptureLease::new(&other);
+                (other, lease)
+            })
+            .collect();
+        let fifth_id = "xwvutsrqponmlkjihgfedcba";
+        assert_eq!(
+            storage::capture_dir(&root, fifth_id)
+                .unwrap_err()
+                .to_string(),
+            "capture storage budget exhausted"
+        );
+        let foreign = root.join("captures/foreign");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("keep"), b"foreign-original").unwrap();
+        let target = crate::diagnostics::tests::target(7);
+        let snapshot = crate::query_cpu::aggregation_fixtures::full_budget_snapshot();
+        // SQL-native allowance is smaller than the existing reservation:
+        // 90 MiB fits whole-capture 128 MiB but cannot fit SQL-native output.
+        // Neither 45 MiB log is reduced by the existing 64 MiB per-file trim.
+        for name in ["tool-output.txt", "tool-stderr.txt"] {
+            fs::File::create(path.join(name))
+                .unwrap()
+                .set_len(45 * 1024 * 1024)
+                .unwrap();
+        }
+        assert!(storage::size(&path, storage::CAPTURE_BYTES).is_ok());
+        let admission_lock = storage::owned_lock(&root, storage::LockKind::Storage).unwrap();
+        assert_eq!(
+            storage::capture_dir(&root, fifth_id)
+                .unwrap_err()
+                .to_string(),
+            "capture_storage_busy"
+        );
+        let mut status = "completed";
+        let mut reasons = Vec::new();
+        let error = finalize_native_files(&path, CaptureMode::Cpu, true, &mut status, &mut reasons)
+            .unwrap_err();
+        assert_eq!(status, "partial");
+        assert_eq!(reasons, ["output_overflow"]);
+        assert_eq!(error.to_string(), "output_overflow");
+        // Native recovery must also unlink owned symlinks without traversing
+        // targets, both at the root and inside a native subtree.
+        fs::create_dir(path.join("native-subtree")).unwrap();
+        fs::write(path.join("native-subtree/owned"), b"native-output").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&foreign, path.join("native-link")).unwrap();
+            std::os::unix::fs::symlink(&foreign, path.join("native-subtree/link")).unwrap();
+        }
+        // Exercise the production recovery while re-admission is unavailable.
+        // The old remove/capture_dir path fails here with capture_storage_busy;
+        // an admitted capture must use its existing reservation, without a gap.
+        let mut manifest = recover_failed_capture(
+            &root,
+            &path,
+            id,
+            &target,
+            &config(CaptureMode::Cpu),
+            42,
+            "start",
+            error,
+            Some(AttemptProvenance {
+                tool: "fixture-native-tool".into(),
+                version: "fixture".into(),
+                configuration: Vec::new(),
+                format: "fixture-native".into(),
+                module: None,
+                started_wall: 1000,
+                started_mono: 10,
+                ended: Some((2000, 1010)),
+            }),
+            true,
+        )
+        .unwrap();
+        assert_eq!(manifest.status, "partial");
+        assert!(
+            manifest
+                .incomplete_reasons
+                .iter()
+                .any(|r| r == "output_overflow")
+        );
+        assert!(
+            manifest
+                .incomplete_reasons
+                .iter()
+                .any(|r| r == "native_attempt_started_then_failed")
+        );
+        assert!(!path.join("tool-output.txt").exists());
+        assert!(!path.join("native-subtree").exists());
+        assert!(fs::symlink_metadata(path.join("native-link")).is_err());
+        assert_eq!(fs::read(path.join("owner.json")).unwrap(), owner_marker);
+        assert_eq!(fs::read(path.join("active.json")).unwrap(), active_marker);
+        storage::validate_private(&path).unwrap();
+        storage::validate_private_file(&path.join("owner.json")).unwrap();
+        storage::validate_private_file(&path.join("active.json")).unwrap();
+        assert_eq!(fs::read(foreign.join("keep")).unwrap(), b"foreign-original");
+        store_sql_cpu(&path, &target, &mut manifest, &snapshot);
+        storage::write_new_json(&path.join("manifest.json"), &manifest).unwrap();
+        assert_eq!(manifest.status, "partial");
+        assert_eq!(manifest.sql_cpu.as_ref().unwrap()["status"], "recorded");
+        assert!(!manifest.profile_data_present());
+        let sidecar_bytes =
+            storage::read_bounded(&path.join("sql-cpu.json"), storage::SQL_CPU_BYTES).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&sidecar_bytes).unwrap();
+        assert_eq!(saved["sql_cpu"]["groups"].as_array().unwrap().len(), 28_320);
+        assert_eq!(saved["sql_cpu"]["aggregation"]["complete"], true);
+        assert_eq!(
+            saved["sql_cpu"]["groups"][0]["fingerprint"],
+            "0000000000004e20"
+        );
+        let saved_manifest: CaptureManifest = serde_json::from_slice(
+            &storage::read_bounded(&path.join("manifest.json"), 8 * 1024 * 1024).unwrap(),
+        )
+        .unwrap();
+        let sql_file = saved_manifest
+            .files
+            .iter()
+            .find(|f| f.filename == "sql-cpu.json")
+            .unwrap();
+        assert_eq!(sql_file.bytes, sidecar_bytes.len() as u64);
+        assert_eq!(sql_file.sha256, hex::encode(Sha256::digest(&sidecar_bytes)));
+        assert_eq!(
+            saved_manifest.sql_cpu.as_ref().unwrap()["bytes"],
+            sidecar_bytes.len() as u64
+        );
+        assert_eq!(
+            saved_manifest.sql_cpu.as_ref().unwrap()["status"],
+            "recorded"
+        );
+        assert_eq!(fs::read(path.join("owner.json")).unwrap(), owner_marker);
+        assert_eq!(fs::read(path.join("active.json")).unwrap(), active_marker);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                original_inodes,
+                ["", "owner.json", "active.json"]
+                    .map(|name| fs::metadata(path.join(name)).unwrap().ino())
+            );
+        }
+        assert!(storage::size(&path, storage::CAPTURE_BYTES).is_ok());
+        // Once the unrelated admission lock is released, the store is STILL
+        // full: recovery/SQL/manifest never surrendered A's live reservation.
+        drop(admission_lock);
+        assert_eq!(
+            storage::capture_dir(&root, fifth_id)
+                .unwrap_err()
+                .to_string(),
+            "capture storage budget exhausted"
+        );
+        assert!(path.join("active.json").exists());
+        drop(lease); // only ordinary lease release may surrender the reserve
+        let fifth = storage::capture_dir(&root, fifth_id).unwrap();
+        let _fifth_lease = storage::CaptureLease::new(&fifth);
+        assert!(fifth.join("active.json").is_file());
+        assert!(storage::is_owned(&fifth));
+        assert!(!path.exists()); // completed A may now be retired normally
+        for (other, _) in &other_captures {
+            assert!(other.join("active.json").is_file());
+        }
+        assert_eq!(fs::read(foreign.join("keep")).unwrap(), b"foreign-original");
+    }
+
+    #[test]
+    fn sql_finalization_reserves_file_and_entry_slots_including_live_markers() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = storage::private_root(&temp.path().join("diagnostics")).unwrap();
+        let path = storage::capture_dir(&root, "abcdefghijklmnopqrstuvwx").unwrap();
+        let lease = storage::CaptureLease::new(&path);
+        assert!(path.join("owner.json").is_file());
+        assert!(path.join("active.json").is_file());
+        // 1020 native files + two live markers. SQL and manifest must both
+        // still fit before active.json is released.
+        for i in 0..1020 {
+            fs::write(path.join(format!("native-{i}")), b"").unwrap();
+        }
+        assert!(native_size(&path, true).is_ok());
+        fs::write(path.join("excess-file"), b"").unwrap();
+        assert_eq!(
+            native_size(&path, true).unwrap_err().to_string(),
+            "artifact count overflow"
+        );
+        fs::remove_file(path.join("excess-file")).unwrap();
+        // 1022 files +1024 directories =2046 entries before finalization.
+        for i in 0..1024 {
+            fs::create_dir(path.join(format!("directory-{i}"))).unwrap();
+        }
+        assert!(native_size(&path, true).is_ok());
+        fs::create_dir(path.join("excess-directory")).unwrap();
+        assert_eq!(
+            native_size(&path, true).unwrap_err().to_string(),
+            "artifact directory entry overflow"
+        );
+        fs::remove_dir(path.join("excess-directory")).unwrap();
+        let target = crate::diagnostics::tests::target(7);
+        let snapshot = crate::query_cpu::aggregation_fixtures::large_snapshot();
+        let mut manifest = failed_manifest(
+            "fixture",
+            &target,
+            &config(CaptureMode::Cpu),
+            42,
+            "start",
+            "native_failed".into(),
+            Vec::new(),
+        );
+        store_sql_cpu(&path, &target, &mut manifest, &snapshot);
+        assert_eq!(manifest.sql_cpu.as_ref().unwrap()["status"], "recorded");
+        storage::write_new_json(&path.join("manifest.json"), &manifest).unwrap();
+        // All 1024 files /2048 entries exist while lease is still held.
+        assert!(storage::size(&path, storage::CAPTURE_BYTES).is_ok());
+        assert!(path.join("active.json").exists());
+        drop(lease);
+        assert!(!path.join("active.json").exists());
+        assert!(storage::size(&path, storage::CAPTURE_BYTES).is_ok());
+        let saved: CaptureManifest = serde_json::from_slice(
+            &storage::read_bounded(&path.join("manifest.json"), 8 * 1024 * 1024).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            saved
+                .files
+                .iter()
+                .filter(|f| f.filename == "sql-cpu.json")
+                .count(),
+            1
+        );
+        assert_eq!(saved.sql_cpu.unwrap()["status"], "recorded");
+    }
+
+    #[test]
+    fn sql_storage_failure_is_explicit_and_preserves_foreign_collision() {
+        let target = crate::diagnostics::tests::target(7);
+        let snapshot = crate::query_cpu::aggregation_fixtures::large_snapshot();
+        for (native_failed, collision) in [(false, true), (true, true), (false, false)] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut manifest = failed_manifest(
+                "fixture",
+                &target,
+                &config(CaptureMode::Cpu),
+                42,
+                "start",
+                "fixture".into(),
+                Vec::new(),
+            );
+            if !native_failed {
+                manifest.status = "completed".into();
+            }
+            if collision {
+                fs::write(temp.path().join("sql-cpu.json"), b"foreign-original").unwrap();
+            } else {
+                // Quota refusal must also be unavailable, even before writing.
+                fs::File::create(temp.path().join("perf.data"))
+                    .unwrap()
+                    .set_len(native_storage_limits(true).0 + 1)
+                    .unwrap();
+            }
+            store_sql_cpu(temp.path(), &target, &mut manifest, &snapshot);
+            assert_eq!(manifest.sql_cpu.as_ref().unwrap()["status"], "unavailable");
+            assert_eq!(
+                manifest.sql_cpu.as_ref().unwrap()["reason"],
+                "sql_cpu_storage_or_inventory_failed"
+            );
+            assert!(
+                manifest
+                    .incomplete_reasons
+                    .iter()
+                    .any(|r| r == "sql_cpu_sidecar_unavailable")
+            );
+            assert_eq!(
+                manifest.status,
+                if native_failed { "failed" } else { "partial" }
+            );
+            if collision {
+                assert_eq!(
+                    fs::read(temp.path().join("sql-cpu.json")).unwrap(),
+                    b"foreign-original"
+                );
+            } else {
+                assert!(!temp.path().join("sql-cpu.json").exists());
+            }
+            assert!(!manifest.files.iter().any(|f| f.filename == "sql-cpu.json"));
+        }
+    }
+
     #[test]
     fn profile_reference_requires_native_data_and_explicit_status() {
         let target = crate::diagnostics::tests::target(7);
@@ -1220,7 +1724,7 @@ mod fake_tool_tests {
         let f = fs::File::create(temp.path().join("perf.data")).unwrap();
         f.set_len(129 * 1024 * 1024).unwrap();
         assert!(storage::inventory(temp.path()).is_err());
-        trim_overflow(temp.path()).unwrap();
+        trim_overflow(temp.path(), false).unwrap();
         assert_eq!(
             storage::inventory(temp.path()).unwrap()[0].bytes,
             64 * 1024 * 1024
