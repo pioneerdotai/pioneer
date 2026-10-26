@@ -100,6 +100,9 @@ notify = { version = "=8.2.0", default-features = true }
 same-file = "=1.0.6"
 async-stream = "0.3"
 
+# Computer use
+cua-driver-sdk = { git = "https://github.com/trycua/cua" }
+
 # Error handling
 anyhow = "1"
 

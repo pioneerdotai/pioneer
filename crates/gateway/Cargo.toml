@@ -12,7 +12,7 @@ default = []
 computer-use = ["dep:cua-driver-sdk", "pioneer-tools/computer-use"]
 
 [dependencies]
-cua-driver-sdk = { git = "https://github.com/trycua/cua", optional = true }
+cua-driver-sdk = { workspace = true, optional = true }
 pioneer-compaction.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
