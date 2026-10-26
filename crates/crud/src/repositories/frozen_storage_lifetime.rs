@@ -1869,8 +1869,8 @@ impl FrozenStorageLifetimeProgress {
             }
             return Ok(true);
         }
-        // Page headers before choosing public roots; no full filtered scan
-        // when all old checkpoints have already been sealed.
+        // Seek unsealed headers through checkpoint_proof_discovery before
+        // choosing roots. The page is advisory; dequeue rechecks current state.
         if self.proof_pending.is_empty() {
             let query = Query::select()
                 .from(checkpoint::Entity)
@@ -1910,6 +1910,7 @@ impl FrozenStorageLifetimeProgress {
                         (checkpoint::Entity, checkpoint::Column::OperationId),
                     )),
                 )
+                .and_where(Expr::col((checkpoint::Entity, checkpoint::Column::ProofVersion)).eq(0))
                 .and_where(
                     Expr::col((checkpoint::Entity, checkpoint::Column::Id)).gt(&self.proof_after),
                 )
@@ -2801,6 +2802,9 @@ mod tests {
     include!("frozen_sweep_tests.rs");
     mod expiry_preflight {
         include!("frozen_storage_lifetime_expiry_tests.rs");
+    }
+    mod proof_discovery {
+        include!("frozen_storage_lifetime_proof_discovery_tests.rs");
     }
     mod discard_admission {
         include!("frozen_storage_lifetime_discard_tests.rs");
@@ -5169,6 +5173,7 @@ mod tests {
 
     #[tokio::test]
     async fn queued_proof_rechecks_seal_from_traversal_or_concurrent_preparation() {
+        proof_discovery::queued_raw_candidate_rechecks_concurrent_seal().await;
         for ancestor_first in [true, false] {
             let (store, _) = fixture_with_checkpoint_ids(true, ["b-parent", "a-root"]).await;
             store
@@ -5275,6 +5280,44 @@ mod tests {
             restart.proof_quantum(&store).await.unwrap();
             assert!(restart.proof_pending.is_empty() && restart.proof.is_none());
         }
+
+        // Discovery is advisory even when public status changes before dequeue.
+        // Use real preparation for the seal, then withdraw public status and
+        // availability. A private sealed candidate must take full validation.
+        let (store, _) = fixture(true).await;
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        assert!(progress.proof_quantum(&store).await.unwrap());
+        assert_eq!(progress.proof_pending, VecDeque::from(["cp-1".to_owned()]));
+        checkpoint_proofs::prepare_graph(&store, "cp-1")
+            .await
+            .unwrap();
+        for sql in [
+            "UPDATE compaction_checkpoint SET status='candidate' WHERE id='cp-1'",
+            "UPDATE compaction_frozen_history SET expired=1 WHERE id='origin'",
+        ] {
+            store.connection.execute_unprepared(sql).await.unwrap();
+        }
+        assert!(progress.proof_quantum(&store).await.unwrap());
+        assert!(
+            progress.proof.is_some(),
+            "private seal is not a dequeue shortcut"
+        );
+        let mut refused = false;
+        for _ in 0..500 {
+            if progress.proof_quantum(&store).await.is_err() {
+                refused = true;
+                break;
+            }
+            if progress.proof.is_none() {
+                break;
+            }
+        }
+        assert!(
+            refused,
+            "private candidate must still require its bound input"
+        );
+        drop(progress);
+        assert!(store.frozen_readers.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
