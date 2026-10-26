@@ -188,9 +188,18 @@ async fn start_title_user_turn(
         "thread_id":thread,"turn_id":turn,"mode":"Agent","input":input
     }))
     .unwrap();
+    let author = super::super::message_turn::resolve_turn_author_snapshot(
+        store,
+        &pioneer_protocol::PersistedActorRef::Principal(
+            authenticated_test_superuser().principal_id.clone(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let outcome = processor
         .thread_manager
-        .system_turn_start_with_permission_profile(params, default_test_permission_profile())
+        .agent_turn_start_with_permission_profile(params, default_test_permission_profile(), author)
         .await
         .unwrap();
     store

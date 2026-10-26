@@ -42537,8 +42537,15 @@ async fn setup_execution_window_terminal_turn_with_input(
         )
         .await
         .expect("thread should start");
+    let author = super::message_turn::resolve_turn_author_snapshot(
+        crud_store.as_ref(),
+        &pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let turn_start = thread_manager
-        .system_turn_start_with_permission_profile(
+        .agent_turn_start_with_permission_profile(
             pioneer_protocol::TurnStartParams {
                 agent_delegation_routes: Vec::new(),
                 thread_id: thread_id.to_owned(),
@@ -42560,6 +42567,7 @@ async fn setup_execution_window_terminal_turn_with_input(
             pioneer_protocol::system_turn_permission_profile_snapshot(
                 pioneer_protocol::TurnPermissionMode::FullAccess,
             ),
+            author,
         )
         .await
         .expect("turn should start in thread manager");
