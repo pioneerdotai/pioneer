@@ -2,6 +2,8 @@
 
 Результат подготовлен к внешнему ревью. Это не приёмка части или совместной интеграции четырёх частей. Исторический `docs/reviews/threads-domain-execution.md` не использовался как доказательство корректности или внешней приёмки и не изменён.
 
+Актуальная передача после трёх подтверждённых замечаний внешнего аудита описана в последнем разделе. Предыдущие разделы сохраняют историю первого самоаудита; уточнения ниже имеют приоритет.
+
 ## Ревизии и изоляция
 
 - Ветка: `fix/threads-dispatch-recovery`.
@@ -10,8 +12,8 @@
 - Начальное дерево: чистое, включая отсутствие staged/unstaged/untracked изменений.
 - База собственной части: `4ea81a4c67a9d24876e4333989dae1955b00b943`.
 - Родитель для будущего PR: `fix/threads-turn-cancellation`.
-- Итоговый commit исправлений: `e98bb3aeffb3ba9d353ea78052e237b78f211899`.
-- Следующий commit добавляет только этот отчёт. Его окончательный SHA передаётся отдельно в handoff, поскольку файл не может содержать hash собственного commit.
+- Commit исправлений первого самоаудита: `e98bb3aeffb3ba9d353ea78052e237b78f211899`.
+- Commit первого отчёта, проверенный внешним аудитом: `2a7ebe79daf8351e938f22b44ffb682ad0630689`.
 - Новая база от родительского ревьюера в этом запуске не передавалась. Аудит выполнен относительно указанной базы, включая перенесённый код и текущие исправления.
 - Исходный кандидат `9d86bc3eb65cc58f0e67bf3022a545dfec0b14b6` и совокупная база `bb85dcdf7080164c4dc6480d12410e5e38edade8` служат только контекстом разделения. Интеграция с ними или main не выполнялась.
 
@@ -40,7 +42,7 @@
 | Compaction выбирал старые failed/8/NULL StartAgent без terminal receipt, пропускал их после LIMIT и мог постоянно оставлять следующие closed tuples за quantum. | Unresolved exhausted StartAgent исключены до LIMIT через коррелированный lookup canonical action по PK. Не-StartAgent exhaustion и подтверждённые terminal refusals сохраняют eligibility; последующие safety checks и write fences сохранены. | Расширен `terminal_action_ledger_compaction_preserves_window_and_exact_replay_hashes`: более старый unresolved StartAgent перед closed tuple, limit=1; compacted только closed tuple, unresolved payload сохранён. |
 | Exhausted Rejected ACK преобразовывал даже `Ok(false)` от CAS в `true`, завышая delivered count. | Возвращается фактический результат ACK CAS. | Расширен `start_outbox_refusal_stops_delivery_without_inflating_attempts_and_unknown_error_is_safe`: другой ACK уже подтвердил claim; проигравший CAS не считается второй доставкой. |
 
-Дополнительно две новые draft-миграции приведены к применимым migration rules: вместо raw DDL используются SchemaManager/SeaQuery builders и локальные Alias. Их имена, очередность, индексируемые поля, NULL/CASE/COALESCE semantics, partial predicates и прежний down-контракт сохранены. У immediate replacement сохранена транзакция. Указана стоимость однократного построения индексов на существующем ledger. Historical migrations не менялись.
+В первом самоаудите обе новые draft-миграции были переведены на SchemaManager/SeaQuery builders и локальные Alias. Внешний аудит подтвердил ошибку этого решения для expression index: SQLite builder SeaQuery 1.0.2 не поддерживает IndexColumn::Expr. В актуальном исправлении только его создание возвращено к статическому raw DDL с документированным исключением; вторая миграция сохранена. Имена, очередность, поля, NULL/CASE/COALESCE semantics, partial predicates, down-контракт и транзакция immediate replacement не изменены. Стоимость однократного построения индексов описана в коде. Historical migrations не менялись.
 
 Существующая `exhausted_discovery_uses_indexed_null_and_timed_ranges_with_a_large_closed_ledger` дополнена rollback двух новых миграций на заполненном ledger, проверкой восстановления широкого immediate index, отсутствия exhausted index, повторным upgrade/reapply и прежними production discovery/plan/progress assertions. Fresh install продолжает покрываться существующими fixtures. Миграции и планы не исполнялись.
 
@@ -116,3 +118,62 @@ git rev-parse HEAD
 Повреждённый ledger без точной grant/response/owner связи остаётся unresolved с bounded reconciliation, а не выдаётся за завершённый. Старые frozen manifests и неизвестная активация не получают новых прав или повторного model start. Для уже принятого terminal с недоступной проекцией/cleanup/sync сохраняется прежнее outbox obligation.
 
 Следующий этап — внешнее ревью этой части. Перенос принятых исправлений и совместную интеграцию выполняет родительский ревьюер. Общая приёмка возможна после ревью и интеграции всех четырёх частей; даже приёмка не разрешает запуск проверок без отдельного согласия пользователя.
+
+## Повторное внешнее ревью: три подтверждённых замечания
+
+Начальный HEAD этого прохода — `2a7ebe79daf8351e938f22b44ffb682ad0630689`, дерево было чистым, ветка и абсолютный worktree совпали с заданными. База собственной части остаётся `4ea81a4c67a9d24876e4333989dae1955b00b943`; переносов соседних частей или обновления базы не было.
+
+Commit исправлений: `92f9445cc1158d35920ab5878db742ad29d20b02` (`Fix Threads expression index and terminal source binding`). Следующий commit обновляет только этот отчёт; его SHA передаётся отдельно в финальном handoff.
+
+### Исправления и регрессии
+
+1. **SQLite expression index.** Прочитана полная цепочка установленной SeaQuery 1.0.2: `src/index/common.rs` преобразует FunctionCall и Expr в IndexColumn::Expr, `src/backend/sqlite/index.rs` использует default prepare_index_columns из `src/backend/index_builder.rs`, где Expr вызывает panic. Создание индекса в `m20261026_000001_agent_start_reconciliation_index.rs` использует статический raw DDL через существующее SchemaManager connection. Это конкретное отсутствие операции в builder, разрешённое migration rules; замена Func на Expr::cust не применялась. Сохранены IF NOT EXISTS, имя, COALESCE(next_attempt_at,''), created_at/id, status/attempts predicate и CASE/json_valid/json_extract. Down продолжает удалять тот же индекс через поддерживаемый builder; регистрация в Migrator и вторая миграция не менялись. Установку по-прежнему покрывают существующие fresh-install fixtures и exhausted rollback/reapply regression; теста на текст SQL не добавлено.
+
+2. **Source action до ordinary terminal cleanup/ACK.** Из finalizer минимально выделена приватная `agent_start_grant_matches_source`. Оба callers проверяют сохранённый grant: source_action_id = row.action_id, source_execution_id = row.owner_execution_id, execution_id, Turn, parent и identity. Ordinary dispatcher также связывает row owner с input author до terminal/runtime shortcuts; у root прежняя независимая provenance/revalidation проверка сохранена. Ошибка чтения сохраняет typed DB cause, semantic mismatch возвращает InvalidStart. Wrapper повторно вызывает finalizer, где тот же mismatch даёт Unresolved до любых terminal writes, cleanup или memory sync. В exhausted ветви остаётся тот же guard без нового model start и без девятой попытки.
+
+   Расширен существующий `exhausted_child_start_cannot_reconcile_a_sibling_from_another_action`: общий fixture реально допускает HomeCapsule children A/B через tools. При attempts=0 B завершается production pre-activation Stop до projected canonical Interrupted; затем payload A перенаправляется на B и идёт через production outbox processing. Проверяются отсутствие ACK A, attempts=1 и назначенный retry, сохранность собственного Turn/execution/resources A, а также canonical Turn, loaded memory, owner, execution, resources и grant B. Прежний exhausted случай с живым B и attempts=8 сохранён, дополнен проверками A; после восстановления исходного payload сохранён положительный reconciliation-контроль. Dispatcher result не подставляется, новые production test hooks не создавались.
+
+3. **Историческая migration-fixture.** В `action_outbox_index_migration_and_marker_rollback_and_retry_are_atomic` сохранены исходный ограниченный upgrade, rollback индексов и marker, namespace-collision failure, повтор установки и проверки исходных строк. Только после них добавлен штатный `Migrator::up(&db, None)` перед заключительным `ids()`. Текущий discovery получает необходимый exhausted index. Production INDEXED BY, selectors и квоты не менялись; fallback со сканированием не добавлен.
+
+Затронуты ровно четыре Rust-файла: expression migration, `message/agent_action_tools.rs`, `message/tests/thread_launch_choices.rs`, `repositories/agent_domain/action_outbox_tests.rs`; дополнительно обновлён этот отчёт. Вторая миграция, зависимости, shared primitives частей 2–3, grants и Tasks/Subagents policies не менялись.
+
+### Статический самоаудит
+
+- Перечитаны собственный продуктовый diff от базы `4ea81a4c…` и непосредственно связанные grant producer/loader, independent-root proof, ordinary API/CLI preparation/activation, bookkeeping, discovery/compaction и terminal/recovery callers. Проверены существующие Model/TurnExecutionRecord signatures и PartialEq для расширенных assertions, без предположений о будущих definitions.
+- Прослежены обе ветви перенаправленного payload. Ordinary direct child теперь не доходит до terminal cleanup B и не подтверждает A; exhausted finalizer останавливается на том же immutable source mismatch. Helper не выдаёт права и не записывает данные. Подготовка/JSON parse и runtime/control остаются вне DB capacity.
+- Exact grant proof предшествует terminal shortcut, но не заменяет response/presentation, parent, workspace, execution generation и owner fences. Terminal ACK по-прежнему требует projected canonical Turn, существующий fenced cleanup и guarded memory sync. Pending projection остаётся unresolved; Rejected/Delivered не означают успех модели.
+- Сохранены restart и resumed N+1 ограничения: canonical terminal другого процесса может подтверждаться, активный foreign owner не активируется; old snapshot не применяется поверх resume. Shared writer и memory-lock primitives, а также recovery terminalization/resume race части 3 не изменялись.
+- Для миграции проверены up/down/reapply, точное соответствие raw partial predicate и expression ordering текущему discovery, а также независимость second migration от unsupported expression columns. Историческая fixture сначала завершает свой marker/rollback/retry контракт, затем доходит до актуальной схемы. NULL/timed ranges, poison progress, attempts, quotas и bounded quantum сохранены.
+- Authoring gate: новый ordinary вариант проверяет отдельный lifecycle gap, который прежний exhausted-only вариант не достигал. На исходном HEAD parent-only guard пропускал terminal B и ACK-ал A; это ожидаемая причина падения расширенной регрессии. Baseline и исправленная версия не запускались, прохождение не заявляется.
+
+### Команды и ограничения этого прохода
+
+До правок прочитаны применимые AGENTS.md, prompt и review. Для чтения использовались `pwd`, `rg`, `rg --files`, `cat`, `sed -n`, `head`, `tail`, `git diff` (включая полный продуктовый diff от базы и `git diff -w` изменённой регрессии). Прочитаны manifests, CI, test-audit references и три указанных source-файла установленной зависимости; код зависимости не исполнялся и не менялся. Один навигационный shell glob без совпадений и поиск отсутствующего `types.rs` были исправлены чтением существующих путей; это не проверки проекта.
+
+Фактически выполнены допустимые formatting/whitespace проверки, все завершились с exit 0:
+
+```sh
+cargo fmt --all
+cargo fmt --package pioneer-crud -- crates/crud/src/repositories/agent_domain/action_outbox_tests.rs
+cargo fmt --all -- --check
+cargo fmt --package pioneer-crud -- --check crates/crud/src/repositories/agent_domain/action_outbox_tests.rs
+git diff --check
+git diff 4ea81a4c67a9d24876e4333989dae1955b00b943 --check
+git diff --cached --check
+```
+
+Выполнены `git branch --show-current`, `git rev-parse HEAD`, `git status --short --untracked-files=all`, `git diff --stat`, `git diff --name-only`, `git diff --numstat`, `git diff --cached --stat`. Product staging содержал четыре явных пути выше. Фиксация исправлений и отчёта выполняется с отключёнными hooks:
+
+```sh
+git -c core.hooksPath=/dev/null add <четыре явных Rust-пути выше>
+git -c core.hooksPath=/dev/null -c commit.gpgsign=false commit -m "Fix Threads expression index and terminal source binding"
+git -c core.hooksPath=/dev/null add docs/reviews/threads-domain-split/threads-dispatch-recovery.review.md
+git diff --cached --check
+git -c core.hooksPath=/dev/null -c commit.gpgsign=false commit -m "Document Threads external audit corrections"
+git status --short --untracked-files=all
+git rev-parse HEAD
+```
+
+Основной checkout, соседние worktree, dev/prod-базы, службы, конфиги и установленные skills не изменялись. Merge, push, deploy, создание PR и интеграция частей 1–3 не выполнялись.
+
+Тесты, cargo check, компиляция, сборки, приложение, Gateway, тестовые CLI-агенты, миграции, EXPLAIN, benchmarks и генераторы не запускались; компилируемость и прохождение тестов не подтверждены. Это передача на повторное внешнее ревью части 4 без окончательной приёмки. После полного ревью и приёмки для запуска проверок всё равно требуется отдельное разрешение пользователя.
