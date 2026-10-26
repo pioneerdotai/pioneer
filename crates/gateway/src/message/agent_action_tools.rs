@@ -3587,7 +3587,7 @@ async fn dispatch_agent_action_outbox_row(
                 .await;
             if !processor
                 .crud_store
-                .claim_unactivated_agent_turn(&owner, pioneer_crud::utc_now())
+                .claim_unactivated_agent_turn(&owner)
                 .await?
             {
                 return Ok(AgentActionOutboxDispatch::AwaitingRuntime);
@@ -3618,18 +3618,12 @@ async fn dispatch_agent_action_outbox_row(
                     anyhow::anyhow!("committed StartAgent CLI Turn has no security snapshot")
                 })?
                 .snapshot;
-            // Main CLI execution receives the new command, never a Pioneer
-            // history projection or a summary prepared for native continuation.
-            // The outbox owns activation. Clear only the in-memory rehydrated
-            // draft before the shared CLI admission path recreates the same
-            // deterministic, already-durable Turn idempotently.
-            processor
-                .thread_manager
-                .rollback_turn_start(outcome.rollback_context)
-                .await;
+            // The shared dispatcher prepares the already-committed Turn. It
+            // must neither remove its input nor admit/persist it a second time.
             let prepared = processor
                 .prepare_committed_agent_cli_runtime_turn(
                     dispatch.params,
+                    outcome,
                     runtime_id,
                     runtime_kind,
                     permission_profile,
@@ -4103,11 +4097,42 @@ impl ToolHandler for AgentActionToolHandler {
                             "failed to load parent execution authority: {error:#}"
                         ))
                     })?;
+                // Resolve destination shape before either depth gate. Route
+                // authority and the other-capsule binding are still checked
+                // by the adapter/service, separately from this server fact.
+                let destination_is_visible_root = match &start.target {
+                    AgentStartTarget::RoutedThread { thread_id, .. } => {
+                        let target = processor
+                            .crud_store
+                            .get_thread_model(thread_id)
+                            .await
+                            .map_err(|_| {
+                                ToolError::execution_failed("agent_runtime_integrity_lost")
+                            })?
+                            .ok_or_else(|| {
+                                ToolError::execution_failed("Agent target is unavailable")
+                            })?;
+                        target.workspace_id == self.context.workspace_id
+                            && target.sidebar_visibility
+                                == pioneer_protocol::ThreadSidebarVisibility::Visible
+                            && processor
+                                .crud_store
+                                .get_task_thread_lineage(thread_id)
+                                .await
+                                .map_err(|_| {
+                                    ToolError::execution_failed("agent_runtime_integrity_lost")
+                                })?
+                                .is_none()
+                    }
+                    _ => false,
+                };
                 let mut adapter = self.adapter.lock().await;
                 if let Some(profile) = selected_profile {
                     options = adapter.install_selected_launch_profiles(vec![profile]);
                 }
-                let prepared = adapter.prepare(&intent).map_err(adapter_tool_error)?;
+                let prepared = adapter
+                    .prepare_start_agent(&intent, destination_is_visible_root)
+                    .map_err(adapter_tool_error)?;
                 let options = &options;
                 let child = adapter
                     .materialize_start_agent(
@@ -4159,7 +4184,7 @@ impl AgentActionToolHandler {
         start: pioneer_protocol::StartAgentIntent,
         parent_authority: crate::authorization::ExecutionAuthorizationContext,
         parent_facts: crate::authorization::AgentExecutionPersistenceFacts,
-        mut child: crate::authorization::MaterializedChildAgentStart,
+        child: crate::authorization::MaterializedChildAgentStart,
         mut plan: crate::authorization::AgentActionCommitPlan,
         requested_launch: pioneer_protocol::AgentToolLaunchSelection,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
@@ -4207,12 +4232,13 @@ impl AgentActionToolHandler {
                 .await
                 .map_err(|_| ToolError::execution_failed("agent_runtime_integrity_lost"))?
                 .is_none();
-        let independent_root =
+        let current_independent_root =
             user_root && child.grant.home_root_thread_id != parent_facts.home_root_thread_id;
-        if independent_root {
-            child.grant.root_execution_id = child.grant.execution_id.clone();
-            child.grant.depth = 0;
-            child.grant.branch_key = format!("root-start:{}", child.grant.execution_id);
+        let independent_root = child.grant.independent_root;
+        if independent_root != current_independent_root {
+            return Err(ToolError::execution_failed(
+                "Agent target placement changed before commit",
+            ));
         }
         processor
             .ensure_thread_loaded(thread_id.as_str(), self.context.workspace_id.as_str())
@@ -4559,8 +4585,7 @@ impl AgentActionToolHandler {
                 ToolError::internal("StartAgent action has no resource admission")
             })?;
         if resource.execution_id != child.grant.execution_id.as_str()
-            || (!independent_root
-                && resource.root_execution_id != child.grant.root_execution_id.as_str())
+            || resource.root_execution_id != child.grant.root_execution_id.as_str()
         {
             return Err(ToolError::internal(
                 "StartAgent resource admission differs from its child graph",

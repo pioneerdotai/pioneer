@@ -26,6 +26,43 @@
 Это повторный статический самоаудит части 3/4, а не приёмка. Интеграцию принятых
 исправлений в следующие части выполняет родительский ревьюер.
 
+## PR publication and base conflict resolution
+
+The user accepted the result and authorized publication, same-branch CI repairs,
+and conflict resolution. PR: https://github.com/pioneerdotai/pioneer/pull/199.
+The unpublished final commit was renamed to the conventional English title
+`fix(threads): preserve runtime cancellation through projection recovery`;
+its resulting commit is `77f968a026f5d96305b17253d68b8f8338058ff9`.
+
+The PR remains stacked on `fix/threads-independent-root-launch` (#198).
+That remote base advanced to `36f4a3fa59244154dd14c5d4577755a404e41a5e`.
+GitHub confirmed a content conflict in the shared launch fixture. The base was
+merged into this branch only; its branch/worktree were not changed or pushed.
+Both fixture guarantees are preserved: replay keeps immutable root provenance,
+and a foreground launch finishes before the next launch. Composer settings now
+change through the existing ThreadManager thread/start path before rehydrating
+the still-runnable first Turn, preserving the base's pinned-launch regression.
+
+The updated base also removed the caller-provided clock from
+claim_unactivated_agent_turn. Three cancellation test callers now use its actual
+signature. Their fixture creates a live lease against the clock used by the
+writer, retaining the same 100-second lease duration; replacement-owner cases
+derive their synthetic expired times from that lease. No assertion, generation
+fence or production timeout was relaxed.
+
+The current origin/main commit is
+`6a446fac6d8ad60eb0ed8e1ffae5fcf3c59d4984`. Static git merge-tree inspection
+found no conflict with it. Formatting and whitespace checks are the only local
+checks used during publication; local builds, tests and project execution remain
+prohibited. The friendly English PR body was edited with the humanizer skill
+and contains no validation-execution section.
+
+One durable CI monitor, `yzK5AbQsY0y2kZwNKFvV2`, posts results to the initiating
+conversation. Its instructions preserve the PR URL, worktree, branch, restrictions,
+15-minute schedule, pause-during-repair rule, current-head GREEN checks and
+permanent stop condition. Future firings were paused during this conflict repair;
+the verified next schedule is reported separately after publication.
+
 ## Доработка по двум P2: текущая передача
 
 Предыдущая передача `c3374ebe…` не закрывала два случая ниже. Начальное

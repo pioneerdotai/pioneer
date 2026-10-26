@@ -703,6 +703,7 @@ fn real_internal_completion_keeps_type_ownership_and_durable_agent_contract() {
             continuation_thread_id: "test-continuation".to_owned(),
             context_thread_id: "test-context".to_owned(),
             agent_author: author,
+            admitted_outcome: None,
             completion: Arc::new(std::sync::Mutex::new(Some(sender))),
         };
         // Expected failure avoids a raw diagnostic in the unchanged DurableAgent reporter.

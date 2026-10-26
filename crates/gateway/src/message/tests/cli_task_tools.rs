@@ -263,6 +263,259 @@ async fn wait_for_task_cli_activation(processor: &MessageProcessor, turn_id: &st
     .expect("CLI task fixture activation");
 }
 
+#[test]
+fn threads_first_cli_outbox_dispatch_uses_committed_turn_once() {
+    run_standard_stack_message_test("Threads committed CLI first dispatch", async {
+        // The parent exercises ordinary fresh CLI admission. The child below
+        // must go through the same dispatcher with its already-admitted Turn.
+        let (harness, processor, parent) = start_task_cli_fixture(CLIAgentRuntimeKind::Codex).await;
+        let starts_before = harness.cli_session.turn_starts.lock().await.len();
+        let options = invoke_task(
+            &processor,
+            &parent,
+            "first-cli-options",
+            "threads_start_options",
+            json!({}),
+        )
+        .await
+        .unwrap();
+        assert!(!options.is_error, "{options:?}");
+        let options = options.structured_content.unwrap();
+        let creation = options["threadCreationOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|option| option["label"] == "New delegated root")
+            .unwrap();
+        let created = invoke_task(
+            &processor,
+            &parent,
+            "first-cli-target",
+            "thread_create",
+            json!({"optionId": creation["id"]}),
+        )
+        .await
+        .unwrap();
+        assert!(!created.is_error, "{created:?}");
+        let created = created.structured_content.unwrap();
+        let target = created["targetOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|target| {
+                !options["targetOptions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|old| old["id"] == target["id"])
+            })
+            .unwrap();
+        let arguments = json!({
+            "targetOptionId": target["id"],
+            "input": [{"type":"text", "text":"First command in the delegated CLI root"}]
+        });
+        let accepted = invoke_task(
+            &processor,
+            &parent,
+            "first-cli-start",
+            "threads_turn_start",
+            arguments.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!accepted.is_error, "{accepted:?}");
+        let db = processor.crud_store.database_connection();
+        let accepted = accepted.structured_content.unwrap();
+        let outbox = pioneer_entity::agent_action_outbox::Entity::find_by_id(
+            accepted["outboxId"].as_str().unwrap(),
+        )
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+        let action_id = outbox.action_id.clone();
+        let payload: JsonValue = serde_json::from_str(&outbox.payload_json).unwrap();
+        let params: pioneer_protocol::TurnStartParams =
+            serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+        let child = &params.turn_id;
+        assert!(
+            processor
+                .crud_store
+                .get_turn_runtime_snapshot(child)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            processor
+                .crud_store
+                .get_cli_runtime_turn_binding(child)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            processor
+                .crud_store
+                .latest_cli_runtime_turn_attempt(child)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let before = processor
+            .crud_store
+            .get_turn(&params.thread_id, child)
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        assert!(matches!(&before.author.as_ref().unwrap().actor,
+            pioneer_protocol::PersistedActorRef::AgentExecution(id) if id.as_str() == outbox.owner_execution_id));
+        let admission = processor
+            .crud_store
+            .get_turn_admission(child)
+            .await
+            .unwrap()
+            .unwrap();
+        let grant = pioneer_crud::load_agent_execution_grant(
+            &db,
+            payload["spawned_execution_id"].as_str().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let authority = processor
+            .load_turn_execution_authorization_context(child)
+            .await
+            .unwrap()
+            .to_persisted_json()
+            .unwrap();
+        let security = processor
+            .crud_store
+            .get_turn_execution_security_snapshot(child)
+            .await
+            .unwrap()
+            .unwrap();
+        // Canonical admission must not be inserted again, even idempotently.
+        db.execute_unprepared(&format!(
+            "CREATE TRIGGER reject_repeat_thread_admission BEFORE INSERT ON turn_admission WHEN NEW.turn_id='{child}' BEGIN SELECT RAISE(ABORT,'repeated committed admission'); END"
+        )).await.unwrap();
+        let batch =
+            crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                .await
+                .unwrap();
+        assert!(batch.errors.is_empty(), "{:#?}", batch.errors);
+        wait_for_task_cli_activation(&processor, child).await;
+        let starts = harness.cli_session.turn_starts.lock().await.clone();
+        assert_eq!(starts.len(), starts_before + 1);
+        assert!(
+            starts
+                .last()
+                .unwrap()
+                .input
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["text"] == "First command in the delegated CLI root" })
+        );
+        assert_eq!(starts.last().unwrap().model, params.model);
+        assert_eq!(
+            starts.last().unwrap().effort.as_deref(),
+            params.reasoning.as_ref().map(|r| r.effort.as_str())
+        );
+        assert_eq!(
+            processor
+                .crud_store
+                .get_turn_admission(child)
+                .await
+                .unwrap()
+                .unwrap(),
+            admission
+        );
+        assert_eq!(
+            pioneer_crud::load_agent_execution_grant(&db, &grant.execution_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            grant
+        );
+        assert_eq!(
+            processor
+                .load_turn_execution_authorization_context(child)
+                .await
+                .unwrap()
+                .to_persisted_json()
+                .unwrap(),
+            authority
+        );
+        assert_eq!(
+            processor
+                .crud_store
+                .get_turn_execution_security_snapshot(child)
+                .await
+                .unwrap()
+                .unwrap(),
+            security
+        );
+        let after = processor
+            .crud_store
+            .get_turn(&params.thread_id, child)
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_eq!(after.author, before.author);
+        assert_eq!(after.mode, before.mode);
+        assert_eq!(after.origin, before.origin);
+        assert_eq!(
+            processor.crud_store.get_turn_inputs(child).await.unwrap(),
+            params.input
+        );
+        assert_eq!(
+            processor
+                .thread_manager
+                .thread_get(&params.thread_id)
+                .await
+                .unwrap()
+                .turns
+                .iter()
+                .filter(|turn| &turn.id == child)
+                .count(),
+            1
+        );
+        assert!(
+            processor
+                .crud_store
+                .latest_cli_runtime_turn_attempt(child)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let delivered = pioneer_crud::load_agent_action_outbox(&db, action_id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.status, "delivered");
+        let replay = invoke_task(
+            &processor,
+            &parent,
+            "first-cli-start",
+            "threads_turn_start",
+            arguments,
+        )
+        .await
+        .unwrap();
+        assert!(!replay.is_error, "{replay:?}");
+        crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+            .await
+            .unwrap();
+        assert_eq!(
+            harness.cli_session.turn_starts.lock().await.len(),
+            starts_before + 1
+        );
+    });
+}
+
 // Creation returns a durable TaskRun before its asynchronously admitted child
 // necessarily exists. Observe that run's authoritative binding, rather than
 // assuming nullable child ids in a creation response are already populated.
@@ -3956,6 +4209,9 @@ async fn start_threads_cli_fixture_with_policy(
         .await
         .unwrap()
         .unwrap();
+    let mut params = params;
+    params.model = Some(source.model.clone());
+    params.model_provider = Some(cli_runtime_provider_key(&harness.runtime_id));
     let admission = ExecutionAdmissionRequest::for_turn(
         ExecutionAdmissionEntryPoint::CliRuntime,
         ResourceAction::AgentTurnStart,
@@ -4003,6 +4259,62 @@ async fn start_threads_cli_fixture_with_policy(
     let (sender, receiver) = tokio::sync::oneshot::channel();
     // Durable authority must use the committed-agent response and activation
     // path; a fresh TurnStart response is rejected before native preparation.
+    let author = super::super::message_turn::resolve_turn_author_snapshot(
+        processor.crud_store.as_ref(),
+        &pioneer_protocol::PersistedActorRef::Principal(
+            connection.principal().principal_id.clone(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let outcome = processor
+        .thread_manager
+        .agent_turn_start_with_permission_profile(params.clone(), profile.clone(), author.clone())
+        .await
+        .unwrap();
+    let admission = context
+        .durable_turn_admission_after_revalidation(
+            &thread,
+            &turn,
+            params.execution_backend.as_ref(),
+            &revalidation,
+        )
+        .unwrap();
+    processor
+        .crud_store
+        .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
+            &outcome.materialization.thread,
+            outcome.materialization.sandbox_mode,
+            &outcome.materialization.turn,
+            &outcome.materialization.input,
+            params
+                .reasoning
+                .as_ref()
+                .map(|reasoning| reasoning.effort.as_str()),
+            Default::default(),
+            author.actor.clone(),
+            processor
+                .turn_profile_selected_audit_event(&outcome)
+                .unwrap(),
+            &context.to_persisted_json().unwrap(),
+            None,
+            Some(admission),
+            Some(
+                crate::message::turn_handlers::new_turn_execution(
+                    processor.turn_execution_owner_id.as_ref(),
+                    params.execution_backend.as_ref(),
+                    &outcome.materialization,
+                )
+                .unwrap(),
+            ),
+            &security,
+            Vec::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
     // Threads-only catalogs do not include task_create, whose normal launch
     // path persists this snapshot before binding the root Agent execution.
     processor
@@ -4034,15 +4346,8 @@ async fn start_threads_cli_fixture_with_policy(
         execution_security_snapshot: security,
         continuation_thread_id: thread.clone(),
         context_thread_id: thread.clone(),
-        agent_author: super::super::message_turn::resolve_turn_author_snapshot(
-            processor.crud_store.as_ref(),
-            &pioneer_protocol::PersistedActorRef::Principal(
-                connection.principal().principal_id.clone(),
-            ),
-        )
-        .await
-        .expect("Threads fixture principal author should resolve")
-        .expect("Threads fixture principal should have an author snapshot"),
+        agent_author: author,
+        admitted_outcome: Some(Box::new(outcome)),
         completion: Arc::new(std::sync::Mutex::new(Some(sender))),
     };
     let (_, diagnostics) =

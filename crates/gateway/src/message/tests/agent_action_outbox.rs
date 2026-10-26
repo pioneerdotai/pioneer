@@ -565,19 +565,30 @@ fn agent_start_proof_preserves_typed_storage_faults_without_retrying_semantic_de
         DbErr::ConnectionAcquire(sea_orm::ConnAcquireErr::Timeout),
     ] {
         for semantic in [Failure::AuthorityDenied, Failure::InvalidStart] {
-            let proof_error = agent_start_proof_error(
-                anyhow::Error::new(storage.clone()).context("context proof unavailable"),
-                semantic,
-            );
-            assert_eq!(
-                proof_error.downcast_ref::<Failure>(),
-                Some(&Failure::StorageUnavailable)
-            );
-            assert!(proof_error.downcast_ref::<DbErr>().is_some());
-            assert_eq!(
-                proof_error.downcast_ref::<Failure>().unwrap().safe_name(),
-                "outbox_storage_unavailable"
-            );
+            let source =
+                || anyhow::Error::new(storage.clone()).context("context proof unavailable");
+            // CLI preparation completes through TaskStartFailure before the
+            // outbox adds its own semantic context. Its source chain must be
+            // classified just like the direct API proof failure.
+            for error in [
+                source(),
+                anyhow::Error::new(pioneer_tasks::TaskStartFailure::from_error(
+                    pioneer_tasks::TaskStartStage::CliPreparation,
+                    source(),
+                ))
+                .context(Failure::PreparationUnavailable),
+            ] {
+                let proof_error = agent_start_proof_error(error, semantic);
+                assert_eq!(
+                    proof_error.downcast_ref::<Failure>(),
+                    Some(&Failure::StorageUnavailable)
+                );
+                assert!(proof_error.chain().any(|cause| cause.is::<DbErr>()));
+                assert_eq!(
+                    proof_error.downcast_ref::<Failure>().unwrap().safe_name(),
+                    "outbox_storage_unavailable"
+                );
+            }
         }
     }
     for semantic in [Failure::AuthorityDenied, Failure::InvalidStart] {
