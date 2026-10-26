@@ -1532,7 +1532,7 @@ impl ThreadManager {
     pub async fn commit_terminal_turn(&self, thread_id: &str, terminal: &Turn) -> Result<bool> {
         let now = unix_timestamp_secs()? as i64;
         let mut state = self.state.write().await;
-        Self::commit_terminal_turn_in_state(&mut state, thread_id, terminal, now)
+        Self::commit_terminal_turn_in_state(&mut state, thread_id, terminal, now, false)
     }
 
     /// Validate the canonical source while holding the memory lock also used by
@@ -1563,7 +1563,7 @@ impl ThreadManager {
         {
             return Ok(true);
         }
-        Self::commit_terminal_turn_in_state(&mut state, thread_id, terminal, now)?;
+        Self::commit_terminal_turn_in_state(&mut state, thread_id, terminal, now, true)?;
         Ok(true) // unloaded state needs no synchronization
     }
 
@@ -1623,6 +1623,7 @@ impl ThreadManager {
         thread_id: &str,
         terminal: &Turn,
         now: i64,
+        hydrate_interrupted_manifest: bool,
     ) -> Result<bool> {
         let Some(entry) = state.threads.get_mut(thread_id) else {
             return Ok(false);
@@ -1644,6 +1645,21 @@ impl ThreadManager {
         if current.status != TurnStatus::InProgress {
             if current == terminal {
                 return Ok(true);
+            }
+            // Snapshot restoration intentionally omits the persisted manifest.
+            // Only the guarded canonical projection may hydrate this one field;
+            // every other identity/result field must still match exactly.
+            if hydrate_interrupted_manifest
+                && current.status == TurnStatus::Interrupted
+                && current.prompt_manifest.is_none()
+                && terminal.prompt_manifest.is_some()
+            {
+                let mut hydrated = current.clone();
+                hydrated.prompt_manifest = terminal.prompt_manifest.clone();
+                if &hydrated == terminal {
+                    *current = hydrated;
+                    return Ok(true);
+                }
             }
             bail!(
                 "turn `{}` already has conflicting terminal status `{:?}`",

@@ -9598,18 +9598,24 @@ impl MessageProcessor {
             };
             if !stopped_cli {
                 if target.parent_task_id.is_none() {
-                    if !self
-                        .mark_turn_interrupted(
+                    if let Err(error) = self
+                        .commit_turn_interrupted_with_recovery_disposition(
                             thread_id.to_owned(),
                             turn_id.to_owned(),
                             reason.to_owned(),
+                            None,
+                            true,
                         )
                         .await
                     {
-                        direct_failure.get_or_insert_with(|| {
-                            anyhow::anyhow!("direct Agent descendant cancellation remains pending")
-                        });
-                        continue;
+                        // Preserve completion failure, but keep process control
+                        // and siblings downstream of the committed graph fence.
+                        direct_failure.get_or_insert_with(|| anyhow::Error::msg(error.clone()));
+                        if !error.is_retryable() {
+                            // A semantic refusal grants no control over a
+                            // replacement owner/generation or conflicting result.
+                            continue;
+                        }
                     }
                 }
                 let _ = self
@@ -10700,79 +10706,87 @@ impl MessageProcessor {
             .agent_manager
             .turn_owner_generation(thread_id.as_str(), turn_id.as_str())
             .await;
-        if let Some(accepted) = self
+        let accepted = self
             .crud_store
             .native_cancellation_accepted_notification_owned(
                 &turn_id,
                 self.turn_execution_owner_id.as_ref(),
             )
             .await
-            .map_err(classify_native_preparation_error)?
-        {
-            self.thread_manager
-                .commit_terminal_turn(&thread_id, &accepted.turn)
-                .await
-                .map_err(|_| {
-                    DurableCommitRejection::permanent(
-                        "terminal_result_conflict",
-                        "local interruption conflicts with accepted canonical result",
-                    )
-                })?;
-        }
-        if let Some((workspace_id, current_turn)) = self
-            .thread_manager
-            .turn_get(thread_id.as_str(), turn_id.as_str())
-            .await
-        {
-            if current_turn.status == TurnStatus::Interrupted {
-                self.retire_execution_progress_state(turn_id.as_str()).await;
-                let notification = TurnFailedNotification {
-                    workspace_id,
+            .map_err(classify_native_preparation_error)?;
+        let loaded = self.thread_manager.turn_get(&thread_id, &turn_id).await;
+        // Projection may enrich memory with a persisted prompt manifest. Replay
+        // the immutable accepted payload, whose full-payload idempotency key
+        // must not be reconstructed from that enriched runtime snapshot.
+        if let Some(notification) = accepted.or_else(|| {
+            loaded
+                .as_ref()
+                .filter(|(_, turn)| turn.status == TurnStatus::Interrupted)
+                .map(|(workspace, turn)| TurnFailedNotification {
+                    workspace_id: workspace.clone(),
                     thread_id: thread_id.clone(),
-                    turn: current_turn,
-                };
-                if let Err(error) = self
-                    .materialize_native_agent_turn_event(
-                        pioneer_crud::CanonicalTurnEventPayload::TurnFailed(notification),
-                        now_timestamp_secs(),
-                        None,
+                    turn: turn.clone(),
+                })
+        }) {
+            self.retire_execution_progress_state(turn_id.as_str()).await;
+            if let Err(error) = self
+                .materialize_native_agent_turn_event(
+                    pioneer_crud::CanonicalTurnEventPayload::TurnFailed(notification),
+                    now_timestamp_secs(),
+                    None,
+                )
+                .await
+            {
+                if error
+                    .downcast_ref::<pioneer_crud::UnactivatedTurnPhaseChanged>()
+                    .is_none()
+                    && (pioneer_crud::turn_event_was_appended_before_error(&error)
+                        || error
+                            .downcast_ref::<NativeTurnControlTransitionPending>()
+                            .is_some())
+                {
+                    self.observe_accepted_native_cancellation(
+                        &thread_id,
+                        &turn_id,
+                        terminal_actor_generation,
+                    )
+                    .await;
+                }
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to confirm idempotent interrupted Turn commit"
+                );
+                return Err(classify_native_preparation_error(error));
+            }
+            self.observe_accepted_native_cancellation(
+                &thread_id,
+                &turn_id,
+                terminal_actor_generation,
+            )
+            .await;
+            if user_cancellation
+                && let Err(error) = self
+                    .task_agent_executor
+                    .reconcile_child_turn_cancelled(
+                        thread_id.as_str(),
+                        turn_id.as_str(),
+                        reason.as_str(),
+                        TaskChildReconciliationOrigin::Live,
                     )
                     .await
-                {
-                    warn!(
-                        thread_id,
-                        turn_id,
-                        error = %format!("{error:#}"),
-                        "failed to confirm idempotent interrupted Turn commit"
-                    );
-                    return Err(classify_native_preparation_error(error));
-                }
-                self.observe_accepted_native_cancellation(
-                    &thread_id,
-                    &turn_id,
-                    terminal_actor_generation,
-                )
-                .await;
-                if user_cancellation
-                    && let Err(error) = self
-                        .task_agent_executor
-                        .reconcile_child_turn_cancelled(
-                            thread_id.as_str(),
-                            turn_id.as_str(),
-                            reason.as_str(),
-                            TaskChildReconciliationOrigin::Live,
-                        )
-                        .await
-                {
-                    warn!(
-                        thread_id,
-                        turn_id,
-                        error = %format!("{error:#}"),
-                        "failed to reconcile already-interrupted child task turn as cancelled"
-                    );
-                }
-                return Ok(());
+            {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to reconcile already-interrupted child task turn as cancelled"
+                );
             }
+            return Ok(());
+        }
+        if let Some((_, current_turn)) = loaded {
             if current_turn.status != TurnStatus::InProgress {
                 self.retire_execution_progress_state(turn_id.as_str()).await;
                 return Err(DurableCommitRejection::permanent(
@@ -10836,15 +10850,22 @@ impl MessageProcessor {
                     .await
                     && current_turn.status == TurnStatus::Interrupted
                 {
+                    let notification = self
+                        .crud_store
+                        .native_cancellation_accepted_notification_owned(
+                            &turn_id,
+                            self.turn_execution_owner_id.as_ref(),
+                        )
+                        .await
+                        .map_err(classify_native_preparation_error)?
+                        .unwrap_or(TurnFailedNotification {
+                            workspace_id,
+                            thread_id: thread_id.clone(),
+                            turn: current_turn,
+                        });
                     match self
                         .materialize_native_agent_turn_event(
-                            pioneer_crud::CanonicalTurnEventPayload::TurnFailed(
-                                TurnFailedNotification {
-                                    workspace_id,
-                                    thread_id: thread_id.clone(),
-                                    turn: current_turn,
-                                },
-                            ),
+                            pioneer_crud::CanonicalTurnEventPayload::TurnFailed(notification),
                             now_timestamp_secs(),
                             None,
                         )
@@ -10860,7 +10881,24 @@ impl MessageProcessor {
                             self.retire_execution_progress_state(turn_id.as_str()).await;
                             return Ok(());
                         }
-                        Err(error) => return Err(classify_native_preparation_error(error)),
+                        Err(error) => {
+                            if error
+                                .downcast_ref::<pioneer_crud::UnactivatedTurnPhaseChanged>()
+                                .is_none()
+                                && (pioneer_crud::turn_event_was_appended_before_error(&error)
+                                    || error
+                                        .downcast_ref::<NativeTurnControlTransitionPending>()
+                                        .is_some())
+                            {
+                                self.observe_accepted_native_cancellation(
+                                    &thread_id,
+                                    &turn_id,
+                                    terminal_actor_generation,
+                                )
+                                .await;
+                            }
+                            return Err(classify_native_preparation_error(error));
+                        }
                     }
                 }
                 warn!(
@@ -10891,6 +10929,21 @@ impl MessageProcessor {
             )
             .await
         {
+            if error
+                .downcast_ref::<pioneer_crud::UnactivatedTurnPhaseChanged>()
+                .is_none()
+                && (pioneer_crud::turn_event_was_appended_before_error(&error)
+                    || error
+                        .downcast_ref::<NativeTurnControlTransitionPending>()
+                        .is_some())
+            {
+                self.observe_accepted_native_cancellation(
+                    &thread_id,
+                    &turn_id,
+                    terminal_actor_generation,
+                )
+                .await;
+            }
             if error
                 .downcast_ref::<NativeTurnControlTransitionPending>()
                 .is_some()

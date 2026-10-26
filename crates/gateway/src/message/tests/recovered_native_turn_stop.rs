@@ -77,6 +77,20 @@ fn recovered_native_turn_stop_restore_failure_rejects_pre_start_ack() {
 struct RecoveryProvider {
     barrier: CancellationBarrierProvider,
     calls: Arc<AtomicU64>,
+    cancelled: Arc<AtomicU64>,
+}
+
+struct PendingProviderCall {
+    cancelled: Arc<AtomicU64>,
+    returned: bool,
+}
+
+impl Drop for PendingProviderCall {
+    fn drop(&mut self) {
+        if !self.returned {
+            self.cancelled.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 #[async_trait::async_trait]
 impl Provider for RecoveryProvider {
@@ -88,7 +102,13 @@ impl Provider for RecoveryProvider {
     }
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.barrier.chat(request).await
+        let mut pending = PendingProviderCall {
+            cancelled: self.cancelled.clone(),
+            returned: false,
+        };
+        let response = self.barrier.chat(request).await;
+        pending.returned = true;
+        response
     }
     async fn stream_chat(
         &self,
@@ -354,6 +374,7 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
             release: Arc::new(Notify::new()),
         },
         calls: calls.clone(),
+        cancelled: Arc::new(AtomicU64::new(0)),
     });
     let mut processor = MessageProcessor::new(
         Arc::new(ThreadManager::new("test-model", "openai")),
@@ -1614,12 +1635,14 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
     let (workspaces, store, workspace) = setup_workspace_manager().await;
     ensure_test_superuser_execution_authority(store.as_ref()).await;
     let calls = Arc::new(AtomicU64::new(0));
+    let provider_cancelled = Arc::new(AtomicU64::new(0));
     let provider = Arc::new(RecoveryProvider {
         barrier: CancellationBarrierProvider {
             entered: Arc::new(Notify::new()),
             release: Arc::new(Notify::new()),
         },
         calls: calls.clone(),
+        cancelled: provider_cancelled.clone(),
     });
     let processor = Arc::new(MessageProcessor::new(
         Arc::new(ThreadManager::new("test-model", "openai")),
@@ -1873,6 +1896,7 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                 .unwrap();
             let mut children = Vec::new();
             let mut child_owners = std::collections::BTreeMap::new();
+            let mut child_permits = std::collections::BTreeMap::new();
             for index in 0..if matches!(
                 phase,
                 InitialStopPhase::GraphFenceStorageUnavailable
@@ -1928,6 +1952,50 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                 );
                 children.push(payload);
             }
+            if matches!(phase, InitialStopPhase::GraphFenceProjectionUnavailable) {
+                // Both descendants must be inside real provider work when the
+                // public root Stop accepts the first interruption. Never release
+                // the provider: dropping its future is the cancellation proof.
+                crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+                    .await
+                    .unwrap();
+                timeout(Duration::from_secs(10), async {
+                    while calls.load(Ordering::SeqCst) < children.len() as u64 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                for payload in &children {
+                    let child_thread = payload["dispatch"]["thread_id"].as_str().unwrap();
+                    let child_turn = payload["dispatch"]["turn_id"].as_str().unwrap();
+                    assert_eq!(
+                        processor
+                            .agent_manager
+                            .active_turn_id(child_thread)
+                            .await
+                            .as_deref(),
+                        Some(child_turn)
+                    );
+                    assert!(
+                        store
+                            .native_cancellation_context(child_turn)
+                            .await
+                            .unwrap()
+                            .is_some()
+                    );
+                    let resource = pioneer_crud::load_agent_execution_resource_state(
+                        &db,
+                        payload["spawned_execution_id"].as_str().unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(resource.status, "running");
+                    child_permits.insert(child_turn.to_owned(), resource.permit_id.unwrap());
+                }
+                assert_eq!(provider_cancelled.load(Ordering::SeqCst), 0);
+            }
             if matches!(
                 phase,
                 InitialStopPhase::GraphFenceStorageUnavailable
@@ -1972,7 +2040,7 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                 let first_turn = first_turn
                     .expect("the first child holds provisional interruption before its writer");
                 // The graph fence has committed; fail the actual first child's
-                // terminal append, irrespective of repository traversal order.
+                // append or projection, irrespective of traversal order.
                 let trigger = if matches!(phase, InitialStopPhase::GraphFenceProjectionUnavailable)
                 {
                     format!(
@@ -2034,6 +2102,20 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                             .await
                             .unwrap()
                     );
+                    timeout(Duration::from_secs(10), async {
+                        while provider_cancelled.load(Ordering::SeqCst) != children.len() as u64 {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    for payload in &children {
+                        wait_for_cancelled_native_actor_cleanup(
+                            &processor.agent_manager,
+                            payload["dispatch"]["thread_id"].as_str().unwrap(),
+                        )
+                        .await;
+                    }
                     let id = generate_test_request_id("initialstop", "graph-repeat-pending");
                     let mut pending: JsonValue = serde_json::from_str(&request).unwrap();
                     pending["id"] = json!(id);
@@ -2083,6 +2165,44 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                         .unwrap()
                         .status,
                         "cancelled"
+                    );
+                    if matches!(phase, InitialStopPhase::GraphFenceProjectionUnavailable) {
+                        wait_for_cancelled_native_actor_cleanup(
+                            &processor.agent_manager,
+                            child_thread,
+                        )
+                        .await;
+                        assert_eq!(
+                            pioneer_entity::agent_running_permit::Entity::find_by_id(
+                                child_permits[child_turn].clone(),
+                            )
+                            .one(&db)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .status,
+                            "released"
+                        );
+                        assert_eq!(
+                            processor
+                                .thread_manager
+                                .turn_get(child_thread, child_turn)
+                                .await
+                                .unwrap()
+                                .1,
+                            store
+                                .get_turn(child_thread, child_turn)
+                                .await
+                                .unwrap()
+                                .unwrap()
+                                .1
+                        );
+                    }
+                }
+                if matches!(phase, InitialStopPhase::GraphFenceProjectionUnavailable) {
+                    assert_eq!(
+                        provider_cancelled.load(Ordering::SeqCst),
+                        children.len() as u64
                     );
                 }
                 drop(prepared);
@@ -2635,10 +2755,15 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
         .unwrap();
     assert_eq!(permit.status, "released");
     wait_for_cancelled_native_actor_cleanup(&processor.agent_manager, thread).await;
+    let expected_calls = if matches!(phase, InitialStopPhase::GraphFenceProjectionUnavailable) {
+        2
+    } else {
+        0
+    };
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        0,
-        "confirmed Stop must fence delayed provider work"
+        expected_calls,
+        "confirmed Stop must fence delayed or repeated provider work"
     );
     let repeat_id = generate_test_request_id("initialstop", "repeat");
     processor
@@ -2652,5 +2777,5 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
     let repeat = recv_response_by_id(&mut rx, &repeat_id).await;
     let repeat: TurnCancelResponse = serde_json::from_value(repeat.result).unwrap();
     assert_eq!(repeat.turn, terminal);
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
 }

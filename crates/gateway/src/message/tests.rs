@@ -23604,6 +23604,7 @@ fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_co
         "recovered hidden Task preflight ordering",
         recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
             TaskAttachmentMode::Detached,
+            false,
         ),
     );
 }
@@ -23614,12 +23615,25 @@ fn compaction_attached_task_restores_its_frozen_basis_without_changing_hook_scop
         "attached Task frozen basis and recovery",
         recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
             TaskAttachmentMode::Attached,
+            false,
+        ),
+    );
+}
+
+#[test]
+fn recovered_task_public_stop_preserves_prompt_manifest_and_canonical_identity() {
+    run_standard_stack_message_test(
+        "recovered Task Stop before prompt compilation",
+        recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
+            TaskAttachmentMode::Detached,
+            true,
         ),
     );
 }
 
 async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
     attachment: TaskAttachmentMode,
+    stop_before_prompt: bool,
 ) {
     let initial_provider = Arc::new(HangingChildProvider::new());
     let initial_provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
@@ -23759,6 +23773,15 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         initial_provider.child_main_call_count() > 0,
         "initial child task provider should be hanging in the main child request"
     );
+    let saved_manifest = crud_store
+        .get_turn(&lineage.child_thread_id, &lineage.child_turn_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .1
+        .prompt_manifest
+        .expect("the first model call must persist a prompt manifest");
+    assert!(!saved_manifest.section_ids.is_empty());
     let child_snapshot = crud_store
         .get_turn_runtime_snapshot(&lineage.child_turn_id)
         .await
@@ -23999,11 +24022,145 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         test_tool_loop_config(),
     ));
     recovery_processor.bind_task_bridge().await;
+    if stop_before_prompt {
+        recovery_processor
+            .arm_completed_history_preparation_barrier("__native_recovery_before_control_ack__");
+    }
     recovery_processor
         .task_runtime
         .start()
         .await
         .expect("startup recovery should run");
+
+    if stop_before_prompt {
+        timeout(
+            Duration::from_secs(10),
+            recovery_processor.wait_for_completed_history_preparation_barrier(),
+        )
+        .await
+        .unwrap();
+        let restored = recovery_processor
+            .thread_manager
+            .turn_get(&lineage.child_thread_id, &lineage.child_turn_id)
+            .await
+            .unwrap()
+            .1;
+        assert_eq!(restored.status, TurnStatus::InProgress);
+        assert!(
+            restored.prompt_manifest.is_none(),
+            "the production thread snapshot intentionally omits the manifest"
+        );
+        assert_eq!(
+            crud_store
+                .get_turn(&lineage.child_thread_id, &lineage.child_turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .prompt_manifest
+                .as_ref(),
+            Some(&saved_manifest),
+        );
+        assert!(recovery_provider.snapshot_requests().is_empty());
+        let (tx, mut rx) = mpsc::channel(256);
+        let connection =
+            register_authenticated_test_connection(recovery_processor.session_manager.as_ref(), tx)
+                .await;
+        let mut terminal_events = None;
+        for delivery in ["first", "repeat"] {
+            let id = generate_test_request_id("taskstop", delivery);
+            recovery_processor
+                .process_request_for_connection(
+                    connection,
+                    &json!({"jsonrpc":"2.0", "id":id, "method":"turn/cancel",
+                    "params":{"thread_id":lineage.child_thread_id,
+                        "turn_id":lineage.child_turn_id}})
+                    .to_string(),
+                )
+                .await;
+            let reply = recv_response_by_id(&mut rx, &id).await;
+            let reply: TurnCancelResponse = serde_json::from_value(reply.result).unwrap();
+            assert_eq!(reply.turn.status, TurnStatus::Interrupted);
+            let persisted = crud_store
+                .get_turn(&lineage.child_thread_id, &lineage.child_turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1;
+            assert_eq!(persisted.prompt_manifest.as_ref(), Some(&saved_manifest));
+            assert_eq!(
+                recovery_processor
+                    .thread_manager
+                    .turn_get(&lineage.child_thread_id, &lineage.child_turn_id)
+                    .await
+                    .unwrap()
+                    .1,
+                persisted
+            );
+            let accepted = crud_store
+                .native_cancellation_accepted_notification_owned(
+                    &lineage.child_turn_id,
+                    recovery_processor.turn_execution_owner_id.as_ref(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                accepted.turn.prompt_manifest.is_none(),
+                "hydration must not rewrite the original canonical payload"
+            );
+            let events = pioneer_entity::turn_event::Entity::find()
+                .filter(
+                    pioneer_entity::turn_event::Column::TurnId.eq(lineage.child_turn_id.clone()),
+                )
+                .filter(pioneer_entity::turn_event::Column::EventType.eq(events::TURN_FAILED))
+                .all(&crud_store.database_connection())
+                .await
+                .unwrap();
+            assert_eq!(events.len(), 1);
+            if let Some(first) = terminal_events.as_ref() {
+                assert_eq!(
+                    &events, first,
+                    "repeat Stop must retain the exact canonical ID, payload and idempotency key"
+                );
+            } else {
+                terminal_events = Some(events);
+            }
+        }
+        recovery_processor.release_completed_history_preparation_barrier();
+        wait_for_cancelled_native_actor_cleanup(
+            &recovery_processor.agent_manager,
+            &lineage.child_thread_id,
+        )
+        .await;
+        assert_eq!(
+            crud_store
+                .get_task_run(&run.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskRunStatus::Cancelled
+        );
+        assert!(
+            recovery_provider.snapshot_requests().is_empty(),
+            "recovery Stop must not compile another model request"
+        );
+        assert_eq!(initial_provider.child_main_call_count(), 1);
+        assert_eq!(
+            pioneer_entity::turn_event::Entity::find()
+                .filter(
+                    pioneer_entity::turn_event::Column::TurnId.eq(lineage.child_turn_id.clone())
+                )
+                .filter(pioneer_entity::turn_event::Column::EventType.eq(events::TURN_FAILED))
+                .all(&crud_store.database_connection())
+                .await
+                .unwrap(),
+            terminal_events.unwrap(),
+            "actor cleanup must retain the same accepted terminal event"
+        );
+        return;
+    }
 
     let mut recovered_task_status = crud_store
         .get_task(response.task.id.as_str())

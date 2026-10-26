@@ -5,7 +5,9 @@
 - Ветка: `fix/threads-turn-cancellation`.
 - Worktree: `/Users/alexander/Code/pioneer/pioneer/.worktrees/threads-turn-cancellation`.
 - Фактический начальный commit текущей доработки:
-  `a30fc0bba9922916cc93df5ddac38b0658167387` — совпал с проверенным HEAD.
+  `c3374ebeaab2a63fd8fec3f220ae206607950918` — совпал с проверенным HEAD.
+- Начальный commit предыдущей доработки по трём замечаниям:
+  `a30fc0bba9922916cc93df5ddac38b0658167387`.
 - Начальный commit предыдущего самоаудита:
   `4ea81a4c67a9d24876e4333989dae1955b00b943`
   (`Split Threads Stop, foreground control and terminal synchronization`).
@@ -23,6 +25,130 @@
 
 Это повторный статический самоаудит части 3/4, а не приёмка. Интеграцию принятых
 исправлений в следующие части выполняет родительский ревьюер.
+
+## Доработка по двум P2: текущая передача
+
+Предыдущая передача `c3374ebe…` не закрывала два случая ниже. Начальное
+дерево было чистым; база части осталась `13b22123…`. Изменены только
+`crates/agent/src/lib.rs`, cancellation-фрагменты
+`crates/gateway/src/message/agent_runtime.rs`,
+`crates/gateway/src/thread/mod.rs`, существующие fixtures
+`message/tests.rs`, `message/tests/recovered_native_turn_stop.rs` и этот отчёт.
+CRUD, canonical payload/schema, Task protocol и другие части не менялись.
+
+### P2: runtime прямого потомка после ошибки projection
+
+Причина: direct graph path прекращал обработку конкретного потомка после
+неуспешного `mark_turn_interrupted`, до cancellation observation и runtime
+control. После replay ответ уже Interrupted и больше не выбирается graph
+query, поэтому повторный Stop не мог остановить оставшийся provider work.
+
+Graph path теперь сохраняет исходный `DurableCommitRejection` в ошибке
+общего Stop, продолжает штатный runtime cancel при retryable completion
+failure и обрабатывает siblings. Permanent semantic refusal по-прежнему
+не разрешает отменять заменивший источник. В первой и idempotent ветках
+interruption подтверждённый append также передаётся существующему
+`observe_accepted_native_cancellation` до возврата ошибки projection.
+Observation перечитывает durable receipt для текущего owner и привязывает
+его к захваченному actor generation и текущему run control. Обычная команда
+CancelTurn теперь также несёт run ID уже захваченного control, используя
+имеющийся run fence. Process ACK остаётся быстрым и не ждёт projection.
+
+Ошибка materialization не превращается в успешный completion; exact cleanup,
+projection и guarded sync остаются обязательными. Post-append тип проверяется
+структурно, текст DB-ошибки не классифицируется. Owner/generation phase denial
+не разрешает receipt observation. Реальные Tasks продолжают использовать
+свой aggregate cancellation protocol.
+
+Расширен `GraphFenceProjectionUnavailable` в существующем
+`public_root_stop_retries_a_direct_child_after_real_projection_failure`:
+оба прямых потомка dispatch-нуты настоящим action outbox и удерживаются
+в recording provider. Первый public Stop получает реальную ошибку UPDATE
+проектора после append; sibling завершается. До восстановления проекции
+проверяются принятый terminal при DB InProgress первого ребёнка, ошибка Stop,
+сброс обоих provider futures и cleanup активных actor controls. Provider
+не освобождается успешным ответом. Повторный Stop до replay также ошибочен;
+после штатного replay и повторного public Stop проверяются Interrupted,
+точные owner/generation, memory/DB, cancelled resources, released permits
+и отсутствие дополнительных model calls. Drop recorder существует только
+в тестовой fixture и отличает отмену запроса от успешного завершения.
+
+### P2: manifest восстановленного Task и identity повторной отмены
+
+Причина: штатный thread snapshot намеренно опускает prompt_manifest, а
+terminal upsert сохраняет прежний manifest в БД. Полное сравнение loaded
+Interrupted(None) с projected Interrupted(Some) отклоняло подтверждённую
+отмену. Начальный unguarded commit accepted payload при повторном Stop
+затем конфликтовал с уже обогащённой памятью.
+
+Только guarded terminal synchronization может заполнить отсутствующий
+manifest у Interrupted. После заполнения одного поля весь Turn должен
+точно совпадать с подтверждённой DB projection. Другой status/outcome,
+другая причина/результат, конфликтующий уже заполненный manifest, duplicate
+loaded Turns и scope mismatch остаются отказами. Unguarded terminal commit
+сохраняет прежнее строгое сравнение. Owner/generation и повторная проверка
+projection под общим с resume memory lock не менялись; terminal N не получает
+права заменить InProgress N+1.
+
+Начальная и idempotent ветки повторно materialize-ят исходную accepted
+notification вместо записи её snapshot в память или создания события из
+обогащённого Turn. Дополнительное чтение accepted notification закрывает
+также гонку, когда другая отмена успела между первым чтением и turn_finish.
+CRUD уже умеет переиспользовать accepted payload из receipt; его identity,
+ID, payload и full-payload idempotency key не переписываются. Manifest в БД
+не стирается. Completion достигается через прежний finish_turn_cancellation
+и guarded sync; Task reconciliation остаётся у существующего consumer.
+
+Добавлен вариант той же настоящей Task recovery fixture:
+`recovered_task_public_stop_preserves_prompt_manifest_and_canonical_identity`.
+Первый настоящий model call сохраняет непустой manifest, затем существующая
+fixture делает execution lease stale, убирает прежний actor и запускает
+штатный Task restart. Существующий recovery control barrier задерживает
+продолжение до повторной компиляции промпта. Проверяются loaded InProgress
+с None при сохранённом Some, первый и повторный публичные turn/cancel,
+совпадение памяти с projected Interrupted(Some), сохранность manifest,
+accepted payload с None, единственный неизменный terminal event после обоих
+Stop и cleanup актора, TaskRun Cancelled и отсутствие recovery model calls.
+Оба прежних recovery/preflight варианта используют тот же helper без Stop.
+
+### Статический самоаудит и выполненные проверки текущей доработки
+
+Перечитан весь собственный итоговый diff от `13b22123…` и непосредственные
+callers. Проверены public Stop → graph fence/Task intent → canonical append →
+projection error/replay → receipt observation → runtime CancelTurn → cleanup →
+guarded sync/completion, включая повторный Stop. Отдельно прослежены snapshot
+mapper, terminal upsert columns, get_turn с полным manifest, immutable accepted
+payload, memory sync и оба порядка existing recovery/resume regression.
+Shared signatures проверены по определениям текущей ревизии.
+
+Три предыдущих исправления сохранены: owned initial Stop удерживает publication
+при обеих формах typed post-append error; ранний и повторный Interrupted не
+подтверждают provisional memory и ожидают projection/cleanup/sync; победивший
+CLI initial attempt продолжает тот же Stop через существующий gate и binding
+checks. Native/CLI constructors и optional cancellation_owner остаются
+совместимыми. Existing отрицательные проверки competing terminal, duplicate
+loaded Turns, смены owner/generation и InProgress N+1 не удалялись и не
+ослаблялись. Нового control API, очереди, receipt system или lifecycle нет.
+Другие ветки/worktree и части 1/2/4 не менялись и не интегрировались.
+
+Выполнены только чтение (`cat`, `rg`, `sed`, включая AGENTS.md, prompt и review),
+Git inspection (`pwd`, `git branch --show-current`, `git rev-parse HEAD`,
+`git status --short`, `git diff`, тематические полные diff от базы и их
+статические срезы), текстовые правки `apply_patch`/`python3`,
+`cargo fmt -p pioneer-agent -p pioneer-gateway`, затем
+`cargo fmt --all --check`, `git diff --check` и
+`git diff --check 13b22123b19026b1ab4701e72c884f3efe4a15b3`.
+Formatting/whitespace checks завершились с кодом 0. Перед commit выполнен
+`git diff --cached --check`; commit — с `git -c core.hooksPath=/dev/null commit`.
+Финальные `git rev-parse HEAD` и `git status --porcelain=v1` переданы отдельно;
+итоговый commit включает этот отчёт и потому не указан в нём самом.
+
+Тесты только дополнены и прочитаны. Тесты, cargo check, компиляция, сборки,
+приложение, Gateway, тестовые CLI-агенты, миграции, EXPLAIN, benchmarks и
+генераторы не запускались. Компилируемость и прохождение тестов, включая
+новые race/fault сценарии, не подтверждены. Нужны повторное внешнее ревью
+и отдельное разрешение пользователя на исполнение проверок после приёмки.
+Это передача своей части, не окончательная приёмка.
 
 ## Доработка по трём подтверждённым замечаниям внешнего аудита
 
