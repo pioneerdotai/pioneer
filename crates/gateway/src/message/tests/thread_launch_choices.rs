@@ -1079,41 +1079,66 @@ async fn source_at_max_depth_can_start_only_an_independent_root() {
             .unwrap()
             .to_owned();
         context.turn_id = payload["dispatch"]["turn_id"].as_str().unwrap().to_owned();
-        // This admission-depth fixture has no provider dispatch. Seed the
-        // child's runtime input just as fixture() seeds the first source;
-        // thread_create requires a source snapshot matching its pinned profile.
-        let child_params: TurnStartParams =
-            serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
-        let now = pioneer_crud::utc_now();
-        processor
-            .crud_store
-            .upsert_turn_runtime_snapshot(pioneer_crud::NewTurnRuntimeSnapshot {
-                turn_id: context.turn_id.clone(),
-                thread_id: context.thread_id.clone(),
-                workspace_id: context.workspace_id.clone(),
-                mode_json: serde_json::to_string(&ThreadMode::Agent).unwrap(),
-                model: child_params.model.clone().unwrap(),
-                provider_name: child_params.model_provider.clone().unwrap(),
-                reasoning_effort: child_params
-                    .reasoning
-                    .as_ref()
-                    .map(|value| value.effort.clone()),
-                agent_skill_versions_json: None,
-                hook_runtime_context_json: serde_json::to_string(
-                    &pioneer_agent::AgentTurnHookRuntimeContext::default(),
-                )
-                .unwrap(),
-                workspace_skill_policies_json: "[]".into(),
-                input_json: serde_json::to_string(&child_params.input).unwrap(),
-                capabilities_json: serde_json::to_string(&child_params.capabilities).unwrap(),
-                resolved_artifacts_json: "[]".into(),
-                runtime_environment_json: "{}".into(),
-                history_json: "[]".into(),
-                created_at: now,
-                updated_at: now,
-            })
-            .await
-            .unwrap();
+        if depth == max_depth {
+            // Canonical admission alone has no runtime snapshot. Prepare the
+            // source before it invokes thread_create, as a running agent would.
+            let params: TurnStartParams =
+                serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+            let input = processor
+                .crud_store
+                .get_turn_inputs(&context.turn_id)
+                .await
+                .unwrap();
+            let outcome = processor
+                .thread_manager
+                .rehydrate_committed_agent_turn(&params, input)
+                .await
+                .unwrap();
+            let authority = processor
+                .load_turn_execution_authorization_context(&context.turn_id)
+                .await
+                .unwrap();
+            processor
+                .prepare_committed_agent_api_turn(&params, outcome, &authority)
+                .await
+                .unwrap();
+        } else {
+            // This admission-depth fixture has no provider dispatch. Seed the
+            // child's runtime input just as fixture() seeds the first source;
+            // thread_create requires a source snapshot matching its pinned profile.
+            let child_params: TurnStartParams =
+                serde_json::from_value(payload["dispatch"]["params"].clone()).unwrap();
+            let now = pioneer_crud::utc_now();
+            processor
+                .crud_store
+                .upsert_turn_runtime_snapshot(pioneer_crud::NewTurnRuntimeSnapshot {
+                    turn_id: context.turn_id.clone(),
+                    thread_id: context.thread_id.clone(),
+                    workspace_id: context.workspace_id.clone(),
+                    mode_json: serde_json::to_string(&ThreadMode::Agent).unwrap(),
+                    model: child_params.model.clone().unwrap(),
+                    provider_name: child_params.model_provider.clone().unwrap(),
+                    reasoning_effort: child_params
+                        .reasoning
+                        .as_ref()
+                        .map(|value| value.effort.clone()),
+                    agent_skill_versions_json: None,
+                    hook_runtime_context_json: serde_json::to_string(
+                        &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+                    )
+                    .unwrap(),
+                    workspace_skill_policies_json: "[]".into(),
+                    input_json: serde_json::to_string(&child_params.input).unwrap(),
+                    capabilities_json: serde_json::to_string(&child_params.capabilities).unwrap(),
+                    resolved_artifacts_json: "[]".into(),
+                    runtime_environment_json: "{}".into(),
+                    history_json: "[]".into(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await
+                .unwrap();
+        }
         tools = processor
             .materialize_agent_action_tools(context.clone())
             .await
