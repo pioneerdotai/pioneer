@@ -4845,18 +4845,10 @@ fn task_resume_preserves_persisted_admission_but_constrains_a_new_legacy_seed() 
             );
             // A different, still-running execution in the same capsule may
             // manage A without lending its own create rights to a new admission.
-            harness
-                .cli_session
-                .set_next_native_turn_id("immutable-resume-caller")
-                .await;
-            let sibling = facade.call("resume-caller-create", "resume-caller-create", "task_create",
-                json!({"title":"Authorized Task controller","goal":"Manage another permitted Task"}),
-            ).await;
-            let caller =
-                wait_for_task_cli_child(&processor, sibling["runId"].as_str().unwrap(), None).await;
-            assert_ne!(caller.turn_id, turn);
+            // Model the restricted source on the principal-authored root fixture
+            // before task_create derives the sibling admission and execution graph.
             let source = processor
-                .load_turn_execution_authorization_context(&caller.turn_id)
+                .load_turn_execution_authorization_context(&turn)
                 .await
                 .unwrap();
             let mut encoded: JsonValue =
@@ -4877,9 +4869,34 @@ fn task_resume_preserves_persisted_admission_but_constrains_a_new_legacy_seed() 
                 });
             processor
                 .crud_store
-                .set_turn_execution_authorization_context(&caller.turn_id, &encoded.to_string())
+                .set_turn_execution_authorization_context(&turn, &encoded.to_string())
                 .await
                 .unwrap();
+            harness
+                .cli_session
+                .set_next_native_turn_id("immutable-resume-caller")
+                .await;
+            let sibling = facade.call("resume-caller-create", "resume-caller-create", "task_create",
+                json!({"title":"Authorized Task controller","goal":"Manage another permitted Task"}),
+            ).await;
+            let caller =
+                wait_for_task_cli_child(&processor, sibling["runId"].as_str().unwrap(), None).await;
+            assert_ne!(caller.turn_id, turn);
+            // The normal loader checks the child's graph fingerprint and lineage.
+            // Never rewrite an already-pinned Task child's authority envelope.
+            let caller_authority = processor
+                .load_turn_execution_authorization_context(&caller.turn_id)
+                .await
+                .unwrap();
+            assert!(
+                !caller_authority
+                    .grants_action(crate::authorization::ResourceAction::ThreadCreatePrivate)
+            );
+            assert!(
+                !caller_authority
+                    .grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace)
+            );
+            assert_eq!(caller_authority.root_thread_id(), saved.root_thread_id);
             if !persisted {
                 // Model the supported legacy case with no immutable admission;
                 // source ceiling applies when the real readmission path creates it.
@@ -4888,7 +4905,6 @@ fn task_resume_preserves_persisted_admission_but_constrains_a_new_legacy_seed() 
                     .await
                     .unwrap();
             }
-            assert_eq!(source.root_thread_id(), saved.root_thread_id);
             let caller_facade =
                 ThreadsFacade::new(&processor, &caller.turn_id, CLIAgentRuntimeKind::Codex).await;
             let resumed = caller_facade

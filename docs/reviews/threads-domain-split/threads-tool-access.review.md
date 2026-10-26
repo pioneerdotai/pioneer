@@ -1,5 +1,9 @@
 # Threads tool access: статический самоаудит части 1
 
+Первичный проход передан commit `0218ad63df5addef7da32ad923693bbe32f99359`.
+Ниже сохранены его результаты; последующий раздел «Исправление P2» уточняет
+пропущенный в нём дефект подготовки регрессии.
+
 ## Ревизии и состояние
 
 - Ветка: `fix/threads-tool-access`.
@@ -31,7 +35,7 @@ Production diff прочитан целиком:
 authorization resolver/service/Agent action service, protocol Agent tool
 catalog, permission/request_tools handlers и CRUD commit boundary.
 
-В этом проходе изменены только существующая регрессия в
+В первичном проходе изменены только существующая регрессия в
 `crates/gateway/src/message/tests/thread_launch_choices.rs` и этот отчёт.
 Production-код остался побайтово равен начальному HEAD; его дополнительных
 исправлений по результатам статического аудита не потребовалось.
@@ -182,3 +186,77 @@ skills и соседние worktree не менялись.
 
 Внешняя приёмка всех четырёх частей и совместная интеграция ещё предстоят.
 Даже после приёмки запуск проверок требует отдельного разрешения пользователя.
+
+## Исправление P2: согласованный caller для Task readmission
+
+Начальный HEAD повторного прохода:
+`0218ad63df5addef7da32ad923693bbe32f99359`, ветка и worktree совпали с указанными
+выше, дерево было чистым. База части остаётся
+`bb85dcdf7080164c4dc6480d12410e5e38edade8`. Итоговый hash commit с этим
+исправлением передаётся отдельно; обновления базы и интеграции не было.
+
+Подтверждённый дефект находился в подготовке существующего теста
+`task_resume_preserves_persisted_admission_but_constrains_a_new_legacy_seed`
+в `crates/gateway/src/message/tests/cli_task_tools.rs`. Он удалял create-grants
+из JSON уже запущенного sibling Task child. Setter меняет только Turn context,
+а `authorization_fingerprint()` включает grant manifest. Execution graph
+сохранял старый fingerprint, поэтому штатная загрузка child и последующая
+MCP validation отклоняли context до dispatch/readmission. Первичный самоаудит
+этого несоответствия не обнаружил. Дефект установлен статически, без запуска.
+
+Исправлена только последовательность подготовки этого теста:
+
+1. Проверяемый Task создаётся с исходным admission, его запись сохраняется
+   для сравнения, Task переводится в Blocked прежним путём.
+2. Оба create-grant удаляются из admission principal-authored корневого fixture.
+   Существующий `task_create` через тот же MCP facade создаёт sibling уже после
+   ограничения source ceiling.
+3. Child sibling загружается через
+   `load_turn_execution_authorization_context` до resume; добавлены проверки
+   отсутствия обоих create-grants и совпадения capsule root.
+4. `task_resume` вызывается через существующий `ThreadsFacade::call`. Сохранены
+   проверки результата, выхода Task из Blocked и итогового admission:
+   при `persisted=true` сравнивается вся исходная запись, включая неизменную
+   строку `authorization_context_json`; при `persisted=false` новый legacy seed
+   не содержит ни одного create-grant. После resume caller загружается повторно.
+
+Статически прослежена цепочка:
+
+- `start_task_cli_fixture` запускает principal-authored root через
+  `process_request_for_connection`. В `verify_durable_turn_binding` такой root
+  проверяется по principal/workspace/root lineage; к нему не применяется
+  fingerprint-проверка ветки agent-authored Task child.
+- `resolve_task_tool_action_scope` читает актуальный source manifest;
+  `TaskToolAuthorizationScope::authorize_execution_intent` пересекает create-grants
+  до сериализации нового seed. В `task_agent_executor` child context сначала
+  выводится из Task admission, затем его fingerprint передаётся в
+  `persist_task_agent_execution_graph`.
+- `load_for_turn` проверяет child graph fingerprint и derivation от admission,
+  затем проходит родительский root. Новый child context не переписывается.
+  `GatewayTurnMcpInvoker::revalidate_execution_authorization` использует ту же
+  штатную загрузку перед dispatch. Уникальный resume call проходит в
+  `TaskToolHandler::handle_resume`, затем в `task_execution_readmission_seed`.
+- Persisted branch helper возвращает исходный JSON до ограничения source
+  ceiling; legacy branch применяет ceiling к новому context до сохранения.
+
+Shared test helpers и их сигнатуры не менялись. Просмотрены их определения,
+существующий соседний сценарий ограничения root admission в permission matrix,
+обе ветви исправленного теста и весь diff повторного прохода. Production-код,
+fingerprint guards, сохранённые fingerprints и Tasks/Subagents policies не
+изменялись. Independent-root lifecycle, Stop, dispatch/recovery не затронуты.
+
+Фактические проверки повторного прохода: чтение через `cat`, `sed -n`, `rg`;
+`git branch --show-current`, `git rev-parse HEAD`, `git status --porcelain=v1`,
+`git diff --check`, `git diff --exit-code HEAD` до правок и проверка diff с
+исключением изменённого test-only файла после правки. Выполнен
+`cargo fmt --all --check` без записи исходников; formatting и whitespace checks
+завершились успешно. При финализации используются
+`git diff --cached --check` и commit с `-c core.hooksPath=/dev/null`, затем
+проверяются итоговый HEAD и чистота дерева; результаты передаются в сообщении.
+
+Тесты, cargo check, компиляция, сборки, приложение, Gateway, тестовые CLI-агенты
+и генераторы не запускались. Компилируемость и прохождение тестов не
+подтверждены. Статическая прослеживаемость пути не является результатом
+выполнения теста; проверки до/после запрещены пользователем. Для запуска после
+приёмки требуется отдельное разрешение. Merge, push, deploy и изменения
+соседних веток/worktree не выполнялись.
