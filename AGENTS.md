@@ -1,7 +1,29 @@
 # Database Architecture
 
-These rules apply to the whole repository. More specific `AGENTS.md` files may
-add crate-local rules, but must not weaken the database invariants below.
+These implementation rules apply across the repository. More specific
+`AGENTS.md` files may add crate-local rules, but must not weaken the database
+invariants below.
+
+## Diagnostics
+
+For debugging development or production databases, use direct SQL with `sqlite3`,
+another SQL client, or a short script. Raw SQL and direct connections are allowed
+for this work; the application architecture/ORM requirements below govern code
+implementation. Do not add Rust files/crates or generate Entity/ORM scaffolding
+solely to inspect a database. Use read-only connections for inspection; data
+changes must stay within the task's authorized scope.
+
+## Database Changes
+
+Follow this dependency order: standalone migrations → database schema →
+SeaORM CLI → generated Entity → CRUD. Migrations must not depend on Entity.
+
+For any database behavior change, including callers in other crates, read
+[CRUD rules](crates/crud/AGENTS.md). Also read the rules for layers you change:
+
+- Schema: [migration](crates/migration/AGENTS.md).
+- Entity generation: [entity](crates/entity/AGENTS.md).
+- Data migration/backfill: [Gateway database](crates/gateway/src/database/AGENTS.md).
 
 ## Runtime Model
 
@@ -11,7 +33,7 @@ The Gateway SQLite runtime has two independent contours:
 - one serialized writer executor, because SQLite still has only one effective
   writer.
 
-All database access must go through `SqliteDatabase`, `CrudStore`, and the
+Application database access must go through `SqliteDatabase`, `CrudStore`, and the
 existing repositories. Do not open ad hoc SQLite connections, use the writer
 pool directly, acquire scheduling permits manually, or bypass the writer
 executor.
