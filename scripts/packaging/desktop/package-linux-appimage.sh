@@ -110,6 +110,7 @@ if [[ ! -x "$APPIMAGETOOL_BIN" ]] && ! command -v "$APPIMAGETOOL_BIN" >/dev/null
 fi
 
 if [[ "$SKIP_BUILD" != true ]]; then
+  cargo update -p cua-driver-sdk
   cargo build --locked --release -p pioneer-desktop --target "$TARGET"
   cargo build --locked --release -p pioneer-app-updater --target "$TARGET"
   cargo build --locked --release -p pioneer-cli --features computer-use --target "$TARGET"

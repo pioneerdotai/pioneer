@@ -69,6 +69,8 @@ def build(args):
                 else f"pioneer-gateway-{platform}.{extension}")
     if args.asset != expected:
         raise ValueError(f"Gateway variant requires asset {expected}")
+    if args.variant == "computer-use":
+        subprocess.run(["cargo", "update", "-p", "cua-driver-sdk"], check=True)
     command = ["cargo", "build", "--locked", "--release", "-p", "pioneer-cli",
                "--target", args.target, "--bin", "pioneer"]
     if args.variant == "computer-use":

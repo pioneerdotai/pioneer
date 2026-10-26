@@ -1864,8 +1864,6 @@ fn validate_cua_payload(payload: &Path) -> Result<()> {
     if manifest["schema_version"] != 1
         || manifest["repository"] != "https://github.com/trycua/cua"
         || manifest["target"].as_str() != Some(target.as_str())
-        || manifest["revision"] != "6df77f678d17bb42e97f496e1f0b137e83fd2c9d"
-        || manifest["version"] != "0.38.0"
         || manifest["daemon"] != daemon
         || manifest["permission_owner"] != "gateway"
         || manifest["sha256"].as_str() != Some(sha256_file(&payload.join(daemon))?.as_str())
@@ -3047,8 +3045,8 @@ mod tests {
                         } else {
                             "unknown-linux-gnu"
                         }),
-                    "revision": "6df77f678d17bb42e97f496e1f0b137e83fd2c9d",
-                    "version": "0.38.0",
+                    "revision": "upstream-revision",
+                    "version": "future-driver-version",
                     "daemon": daemon,
                     "permission_owner": "gateway",
                     "sha256": super::sha256_file(&next.join(daemon)).unwrap(),
@@ -3076,11 +3074,11 @@ mod tests {
             #[cfg(windows)]
             let archive_gateway = b"candidate Gateway bytes".to_vec();
 
-            for defect in ["manifest", "pin", "hash", "companion", "none"] {
+            for defect in ["manifest", "owner", "hash", "companion", "none"] {
                 let mut manifest: serde_json::Value =
                     serde_json::from_slice(&manifest_bytes).unwrap();
-                if defect == "pin" {
-                    manifest["revision"] = "wrong-pin".into();
+                if defect == "owner" {
+                    manifest["permission_owner"] = "client".into();
                 }
                 if defect == "hash" {
                     manifest["sha256"] = "wrong-hash".into();

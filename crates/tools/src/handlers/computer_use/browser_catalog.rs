@@ -1,4 +1,4 @@
-// Browser schema expressions copied from trycua/cua at 6df77f678d17bb42e97f496e1f0b137e83fd2c9d.
+// Browser schema expressions copied from trycua/cua.
 // Source: libs/cua-driver/rust/crates/cua-driver-core/src/browser/tools.rs (MIT).
 use serde_json::{Value, json};
 fn schema_delivery_mode() -> Value {

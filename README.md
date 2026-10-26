@@ -110,6 +110,7 @@ Install Rust with [rustup](https://rustup.rs). See [rust-toolchain.toml](./rust-
 ```bash
 git clone https://github.com/pioneerdotai/pioneer.git
 cd pioneer
+cargo update -p cua-driver-sdk
 cargo build --workspace
 ```
 
@@ -121,10 +122,12 @@ variable `PIONEER_INSTALL_COMPUTER_USE=1` also selects computer use; an explicit
 switch overrides it. Source builds enable it with `--features computer-use` on
 `pioneer-cli` or `pioneer-gateway`; on macOS set `MACOSX_DEPLOYMENT_TARGET=13.0`
 for those CU builds. Desktop bundles the computer-use variant.
+Release packaging refreshes the SDK and fetches the current upstream driver
+before building. Cargo.lock records the dependencies selected for that build.
 
 The server assets retain their existing names and formats: gzip for Linux and
 macOS aarch64, ZIP for Windows and macOS x86_64. Computer-use assets are named
-`pioneer-gateway-{os}-{arch}-computer-use-package.zip` and contain the pinned CUA driver
+`pioneer-gateway-{os}-{arch}-computer-use-package.zip` and contain the CUA driver built from the current upstream default branch
 package. Install the complete CU archive; copying only `pioneer` cannot install
 the driver. The installer keeps the executable and `bin/cua` together and retains
 recovery files when schema compatibility is unknown.

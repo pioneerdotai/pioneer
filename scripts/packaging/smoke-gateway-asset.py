@@ -34,8 +34,8 @@ def fixture(binary, archive, target):
             CFBundleIdentifier="ai.pioneer.gateway", CFBundleExecutable="pioneer",
             CFBundleName="Pioneer Gateway", CFBundlePackageType="APPL")), 0o644)
     manifest = dict(schema_version=1, repository="https://github.com/trycua/cua",
-                    revision="6df77f678d17bb42e97f496e1f0b137e83fd2c9d",
-                    version="0.38.0", target=target, permission_owner="gateway",
+                    revision="installer-fixture",
+                    version="fixture", target=target, permission_owner="gateway",
                     daemon=daemon, sha256=hashlib.sha256(driver).hexdigest())
     members["cua/manifest.json"] = ((json.dumps(manifest) + "\n").encode(), 0o644)
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:

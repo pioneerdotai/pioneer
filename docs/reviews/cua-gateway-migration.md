@@ -1123,3 +1123,43 @@ preserving the threads-policy and continuation matrix. The isolated test-only
 batch preserved its full production prefix and every other tracked file hash;
 cargo fmt --all --check and git diff --check passed. No local build/test ran.
 Fresh remote CI must validate this fixture repair.
+
+
+## 2026-10-26 — use current upstream SDK and driver at build time
+
+The user explicitly replaced the fixed driver revision/release policy with
+current upstream source selection. This supersedes the historical immutable
+CUA pin requirements above. The SDK dependency now specifies only the upstream
+git URL and optional feature gate, without tag/rev/branch selectors.
+
+Gateway/desktop package entry points, CI and installer-smoke builds run the
+standard cargo update -p cua-driver-sdk command before their locked build/check.
+This refreshes Cargo.lock at build time; plain Cargo alone still follows its
+lockfile. The daemon producer fetches origin HEAD on every invocation and builds
+FETCH_HEAD in its existing upstream workspace. Package revision/version fields
+record what was built, using git rev-parse and upstream Cargo.toml; they are not
+selection constraints. No fixed driver version constant or revision/version
+equality check remains in Gateway startup, package admission or the installer.
+Existing payload identity, path, target, digest, ownership and companion checks
+remain, as do Gateway authorization/session/cancellation and server defaults.
+No periodic updater, scheduled PR workflow or additional service was introduced.
+
+The local dependency resolver selected the default-branch CUA source at
+4b84caa4053bd86be7746c5527cee3d1626612ed. Cargo.lock records that resolution;
+package identities/versions and checksums are unchanged. Cargo also normalized
+registry dependency edges while resolving this graph. A second offline locked
+workspace resolution required no changes.
+
+Applied test-audit to the existing installer archive/rollback owner in an isolated
+batch. Its successful candidate now uses arbitrary upstream revision/version
+metadata, protecting acceptance without exact version pins. The obsolete
+wrong-pin refusal case is replaced by the existing Gateway-ownership guard;
+manifest/hash/companion refusal, prior data preservation and rollback assertions
+remain. All other tracked hashes and the full production prefix matched actual
+batch entry before/after edits and formatting. No tests were run locally.
+
+Validation: Cargo dependency resolution only, locked offline resolution, Python
+AST/TOML/JSON parsing, YAML syntax parsing, shell syntax, cargo fmt --all --check
+and git diff --check. No local build/compiler/test/daemon/install/package run
+occurred. Fresh remote CI validates this head; source refresh is now intentionally
+part of each build entry point rather than a separately published update.

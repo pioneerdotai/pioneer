@@ -375,6 +375,7 @@ fi
 mkdir -p "$OUT_DIR"
 
 if [[ "$SKIP_BUILD" != true ]]; then
+  cargo update -p cua-driver-sdk
   cargo build --locked --release -p pioneer-desktop --target "$TARGET"
   cargo build --locked --release -p pioneer-app-updater --target "$TARGET"
   MACOSX_DEPLOYMENT_TARGET=13.0 cargo build --locked --release -p pioneer-cli --features computer-use --target "$TARGET"

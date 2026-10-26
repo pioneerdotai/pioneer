@@ -305,6 +305,8 @@ if ($Target -eq "aarch64-pc-windows-msvc") {
 }
 
 if (-not $SkipBuild) {
+    cargo update -p cua-driver-sdk
+    if ($LASTEXITCODE -ne 0) { throw "CUA SDK refresh failed" }
     cargo build --locked --release -p pioneer-desktop --target $Target
     cargo build --locked --release -p pioneer-app-updater --target $Target
     cargo build --locked --release -p pioneer-cli --features computer-use --target $Target

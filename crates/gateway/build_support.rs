@@ -1,4 +1,4 @@
-// Final-binary Swift inputs for the pinned cua-driver SDK (0.38.0).
+// Final-binary Swift inputs for the cua-driver SDK.
 // Adapted from trycua/cua 688c5fd62a9f13dddc309970c948df494e7de33f,
 // libs/cua-driver/rust/crates/cua-driver/build.rs (MIT; notice in
 // crates/tools/src/handlers/computer_use/LICENSE.cua).

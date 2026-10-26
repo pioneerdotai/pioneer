@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the pinned local daemon and package the Gateway-owned CUA payload.
+"""Build the current upstream daemon and package the Gateway-owned CUA payload.
 
 This script is a release producer, never an installer or a daemon launcher.
 The separate upstream workspace keeps its original lockfile and relative deps.
@@ -15,10 +15,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import zipfile
 
-REVISION = "6df77f678d17bb42e97f496e1f0b137e83fd2c9d"
-VERSION = "0.38.0"
 BUNDLE_ID = "ai.pioneer.gateway"
 TARGETS = {
     "x86_64-apple-darwin", "aarch64-apple-darwin",
@@ -28,18 +27,14 @@ TARGETS = {
 
 
 def build(target):
-    source = Path("target/cua-source") / REVISION
+    source = Path("target/cua-source/latest")
     if not source.exists():
         source.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(["git", "init", str(source)], check=True)
         subprocess.run(["git", "-C", str(source), "remote", "add", "origin",
                         "https://github.com/trycua/cua.git"], check=True)
-        subprocess.run(["git", "-C", str(source), "fetch", "--depth=1", "origin", REVISION], check=True)
-        subprocess.run(["git", "-C", str(source), "checkout", "--detach", REVISION], check=True)
-    actual = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
-    dirty = subprocess.check_output(["git", "-C", str(source), "status", "--porcelain"], text=True)
-    if actual != REVISION or dirty:
-        raise ValueError("CUA source must be the clean immutable pinned revision")
+    subprocess.run(["git", "-C", str(source), "fetch", "--depth=1", "origin", "HEAD"], check=True)
+    subprocess.run(["git", "-C", str(source), "checkout", "--force", "--detach", "FETCH_HEAD"], check=True)
     workspace = source / "libs/cua-driver/rust"
     command = ["cargo", "build", "--locked", "--release", "-p", "cua-driver", "--target", target]
     if "linux" in target:
@@ -91,6 +86,8 @@ def package(target, binary, archive):
     if target not in TARGETS or archive.suffix != ".zip":
         raise ValueError("A supported target and a .zip Gateway asset are required")
     source, driver = build(target)
+    revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+    version = tomllib.loads((source / "libs/cua-driver/rust/Cargo.toml").read_text())["workspace"]["package"]["version"]
     with tempfile.TemporaryDirectory(prefix="pioneer-cua-package-") as temporary:
         root = Path(temporary)
         suffix = ".exe" if "windows" in target else ""
@@ -108,7 +105,7 @@ def package(target, binary, archive):
             with (contents / "Info.plist").open("wb") as output:
                 plistlib.dump(dict(CFBundleIdentifier=BUNDLE_ID, CFBundleName="Pioneer Gateway",
                     CFBundleExecutable="pioneer", CFBundlePackageType="APPL",
-                    CFBundleVersion=VERSION, LSUIElement=True, LSMinimumSystemVersion="13.0"), output)
+                    CFBundleVersion=version, LSUIElement=True, LSMinimumSystemVersion="13.0"), output)
             if target == "x86_64-apple-darwin":
                 libraries = list(Path(os.environ["PIONEER_ONNXRUNTIME_DYLIB_DIR"]).glob("libonnxruntime*.dylib"))
                 if not libraries:
@@ -129,7 +126,7 @@ def package(target, binary, archive):
         shutil.copy2(source / "LICENSE.md", payload / "LICENSE.cua-driver.md")
         shutil.copy2(source / "libs/cua-driver/rust/THIRD_PARTY_NOTICES.md", payload / "THIRD_PARTY_NOTICES.md")
         manifest = dict(schema_version=1, repository="https://github.com/trycua/cua",
-            revision=REVISION, version=VERSION, target=target, permission_owner="gateway",
+            revision=revision, version=version, target=target, permission_owner="gateway",
             upstream_lock_sha256=hashlib.sha256((source / "libs/cua-driver/rust/Cargo.lock").read_bytes()).hexdigest(),
             daemon=daemon.relative_to(payload).as_posix(),
             sha256=hashlib.sha256(daemon.read_bytes()).hexdigest())

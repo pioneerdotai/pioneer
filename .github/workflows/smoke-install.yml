@@ -32,6 +32,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cargo update -p cua-driver-sdk
           MACOSX_DEPLOYMENT_TARGET=13.0 cargo build --locked --release -p pioneer-cli --features computer-use
 
           smoke_dir="${RUNNER_TEMP}/pioneer-path-warning-smoke"
@@ -138,6 +139,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cargo update -p cua-driver-sdk
           cargo build --locked --release -p pioneer-cli --features computer-use
 
           smoke_dir="${RUNNER_TEMP}/pioneer-path-warning-smoke"
@@ -226,6 +228,8 @@ jobs:
       - name: build-cli-and-prepare-local-assets
         shell: pwsh
         run: |
+          cargo update -p cua-driver-sdk
+          if ($LASTEXITCODE -ne 0) { throw "CUA SDK refresh failed" }
           cargo build --locked --release -p pioneer-cli --features computer-use --target x86_64-pc-windows-msvc
 
           $smokeDir = Join-Path $env:RUNNER_TEMP "pioneer-path-warning-smoke"
@@ -341,6 +345,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cargo update -p cua-driver-sdk
           cargo build --locked --release -p pioneer-cli --features computer-use
 
           smoke_dir="${RUNNER_TEMP}/pioneer-smoke"
@@ -427,6 +432,8 @@ jobs:
       - name: build-cli-and-prepare-local-assets
         shell: pwsh
         run: |
+          cargo update -p cua-driver-sdk
+          if ($LASTEXITCODE -ne 0) { throw "CUA SDK refresh failed" }
           cargo build --locked --release -p pioneer-cli --features computer-use --target x86_64-pc-windows-msvc
 
           $smokeDir = Join-Path $env:RUNNER_TEMP "pioneer-smoke"
@@ -549,6 +556,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cargo update -p cua-driver-sdk
           cargo build --locked --release -p pioneer-cli --features computer-use
 
           smoke_dir="${RUNNER_TEMP}/pioneer-desktop-smoke"

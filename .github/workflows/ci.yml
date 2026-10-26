@@ -32,7 +32,7 @@ jobs:
         with:
           submodules: recursive
 
-      # apple-metal (through the pinned CUA SDK) uses macOS 26.2 SDK APIs.
+      # apple-metal (through the CUA SDK) uses macOS 26.2 SDK APIs.
       - name: select-cua-xcode
         if: runner.os == 'macOS'
         run: sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
@@ -52,6 +52,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cargo update -p cua-driver-sdk
           cargo check --locked --workspace
           if [[ "${{ runner.os }}" == "macOS" ]]; then
             export MACOSX_DEPLOYMENT_TARGET=13.0
@@ -144,7 +145,10 @@ jobs:
 
       - name: cargo-check-default-server
         shell: bash
-        run: cargo check --locked -p pioneer-cli
+        run: |
+          set -euo pipefail
+          cargo update -p cua-driver-sdk
+          cargo check --locked -p pioneer-cli
 
       # A separate Cargo invocation keeps CU features out of these server owners.
       - name: cargo-nextest-default-server-contracts
