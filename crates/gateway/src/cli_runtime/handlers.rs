@@ -5534,6 +5534,60 @@ impl MessageProcessor {
         event: RuntimeEvent,
         retained: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
     ) -> bool {
+        if matches!(&event, RuntimeEvent::TurnRetrying(_)) && turn_binding.runtime_kind == "codex" {
+            // Fence native-attempt replacement through the durable ACK, using
+            // the same session transition as admission/recovery/Stop. Do not
+            // transfer ownership to recovery for this informational event.
+            let Ok(Some(selected)) = self
+                .crud_store
+                .cli_runtime_turn_terminal_guard_by_id(&turn_binding.turn_id)
+                .await
+            else {
+                return false;
+            };
+            let transition = match retained {
+                Some(transition) => transition.clone(),
+                None => Arc::new(
+                    self.cli_runtime_session_transition_mutex(instance.key())
+                        .await
+                        .lock_owned()
+                        .await,
+                ),
+            };
+            let Ok(Some(current)) = self
+                .crud_store
+                .cli_runtime_turn_terminal_guard_by_id(&turn_binding.turn_id)
+                .await
+            else {
+                return false;
+            };
+            let Some(attempt) = current.attempt.as_ref() else {
+                return false;
+            };
+            let current_native_turn = current
+                .segment
+                .as_ref()
+                .map(|segment| segment.native_turn_id.as_str())
+                .or(attempt.native_turn_id.as_deref());
+            if !selected.same_execution_after_admission(&current)
+                || current.turn_status != TurnStatus::InProgress
+                || !attempt.status.is_active()
+                || attempt.runtime_kind != "codex"
+                || cli_runtime_native_turn_id_for_event(&event).is_none()
+                || cli_runtime_native_turn_id_for_event(&event) != current_native_turn
+            {
+                return false;
+            }
+            return self
+                .process_bound_cli_runtime_event_inner(
+                    instance,
+                    current.binding,
+                    event,
+                    Some(&transition),
+                    None,
+                )
+                .await;
+        }
         if cli_runtime_turn_status_for_terminal_event(&event).is_none() {
             return self
                 .process_bound_cli_runtime_event_inner(instance, turn_binding, event, None, None)
@@ -6458,6 +6512,10 @@ impl MessageProcessor {
             thread_id: turn_binding.thread_id.clone(),
             turn_id: turn_binding.turn_id.clone(),
             recovery: recovery.clone(),
+            codex_retry_attempt_id: (turn_binding.runtime_kind == "codex"
+                && matches!(&event, RuntimeEvent::TurnRetrying(_)))
+            .then(|| turn_attempt.map(|attempt| attempt.id.clone()))
+            .flatten(),
         };
         let projected = crate::cli_runtime::projector::project_cli_runtime_event(&context, &event);
         for durable in projected.durable {
@@ -7118,6 +7176,7 @@ impl MessageProcessor {
             thread_id: binding.thread_id.clone(),
             turn_id: binding.turn_id.clone(),
             recovery: None,
+            codex_retry_attempt_id: None,
         };
         let projected = crate::cli_runtime::projector::project_cli_runtime_event(&context, &event);
         for durable in projected.durable {

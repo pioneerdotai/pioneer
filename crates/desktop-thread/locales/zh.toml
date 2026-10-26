@@ -221,6 +221,7 @@
 "timeline.system.capability_kind_skill" = "技能"
 "timeline.system.checkpoint_label" = "检查点"
 "timeline.system.code" = "代码："
+"timeline.system.codex_request_retried" = "Codex 报告了临时故障后重试请求的情况。"
 "timeline.system.continued_label" = "已继续"
 "timeline.system.detail_agent_rounds" = "Agent 轮次"
 "timeline.system.detail_checkpoint" = "检查点"

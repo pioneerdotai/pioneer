@@ -99,6 +99,18 @@ pub struct TurnWorkBlock {
     pub last_work_item_id: Option<String>,
 }
 
+/// Read-only presentation of a canonical Codex retry notice owned by a Task's
+/// hidden execution. This never becomes a canonical event in the viewing thread.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexRetryNotice {
+    pub source_thread_id: String,
+    pub source_turn_id: String,
+    pub item_id: String,
+    pub message: String,
+    pub occurred_at_unix_ms: i64,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TimelineBlockKind {
@@ -134,6 +146,8 @@ pub enum TimelineBlockKind {
     #[serde(rename_all = "camelCase")]
     DetachedTaskRun {
         task: TaskTurnItem,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        codex_retry_notices: Vec<CodexRetryNotice>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         author: Option<TurnAuthorSnapshot>,
     },

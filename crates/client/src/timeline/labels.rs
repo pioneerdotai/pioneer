@@ -1189,6 +1189,7 @@ pub enum SystemEventMessage {
     RecoveryAttached,
     RetryScheduled,
     RetryStarted,
+    CodexRequestRetried,
     RecoverySucceeded,
     RecoveryFailed,
     ToolRetryScheduled { tool_name: String },
@@ -1605,6 +1606,10 @@ pub fn system_event_presentation(
         Some("item_recovery_exhausted") => SystemEventPresentation {
             message: SystemEventMessage::RecoveryFailed,
             label: SystemEventLabel::Error,
+        },
+        Some("codex_request_retried") => SystemEventPresentation {
+            message: SystemEventMessage::CodexRequestRetried,
+            label: SystemEventLabel::Retry,
         },
         Some("item_tool_retry_scheduled") => {
             let tool_name = tool_name_from_details(details);

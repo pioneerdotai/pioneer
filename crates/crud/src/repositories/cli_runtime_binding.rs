@@ -1526,6 +1526,33 @@ pub async fn latest_turn_attempt<C: ConnectionTrait>(
         .transpose()
 }
 
+/// Bounded identity-only reads for deterministic retry notice lookup. The
+/// high-water mark keeps concurrent attempt creation out of this page walk.
+pub(crate) async fn list_codex_turn_attempt_id_batch<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    after_index: i64,
+    through_index: i64,
+    limit: u64,
+) -> Result<Vec<(String, i64)>> {
+    turn_cli_runtime_attempt::Entity::find()
+        .select_only()
+        .columns([
+            turn_cli_runtime_attempt::Column::Id,
+            turn_cli_runtime_attempt::Column::AttemptIndex,
+        ])
+        .filter(turn_cli_runtime_attempt::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_cli_runtime_attempt::Column::RuntimeKind.eq("codex"))
+        .filter(turn_cli_runtime_attempt::Column::AttemptIndex.gt(after_index))
+        .filter(turn_cli_runtime_attempt::Column::AttemptIndex.lte(through_index))
+        .order_by_asc(turn_cli_runtime_attempt::Column::AttemptIndex)
+        .limit(limit)
+        .into_tuple::<(String, i64)>()
+        .all(db)
+        .await
+        .context("failed to query Codex turn attempt identities")
+}
+
 pub async fn mark_turn_attempt_running<C: ConnectionTrait>(
     db: &C,
     id: &str,

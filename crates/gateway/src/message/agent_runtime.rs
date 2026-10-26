@@ -3804,6 +3804,27 @@ impl MessageProcessor {
                     Some("completed"),
                 )
                 .await;
+                if matches!(&notification.item, TurnItem::SystemEvent {
+                    level: SystemEventLevel::Warning, code: Some(code), ..
+                } if code == "codex_request_retried")
+                    && let Some(target) = self
+                        .crud_store
+                        .codex_retry_notice_target(&notification.thread_id, &notification.turn_id)
+                        .await?
+                {
+                    // Invalidate the existing parent Task card, never publish a
+                    // child payload as a parent event or create a canonical copy.
+                    self.notify_semantic_timeline_blocks_changed(
+                        &target.workspace_id,
+                        &target.thread_id,
+                        vec![pioneer_crud::detached_task_run_block_id(
+                            &target.turn_id,
+                            &target.task.id,
+                        )],
+                        Vec::new(),
+                    )
+                    .await;
+                }
             }
             Event::ItemUpdated(notification) => {
                 let mut presented = notification.clone();
@@ -4457,6 +4478,14 @@ impl MessageProcessor {
                 ))
                 .await
                 {
+                    if matches!(&notification.item, TurnItem::SystemEvent {
+                        level: SystemEventLevel::Warning, code: Some(code), ..
+                    } if code == "codex_request_retried")
+                    {
+                        warn!(thread_id, turn_id, error = %error,
+                            "failed to persist Codex retry notice; native execution remains owned by CLI");
+                        return false;
+                    }
                     self.report_legacy_turn_failure(
                         thread_id,
                         turn_id,
