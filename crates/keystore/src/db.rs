@@ -30,7 +30,7 @@ impl DbKeyStoreConfig {
 
 #[derive(Clone)]
 pub struct DbKeyStore {
-    config: DbKeyStoreConfig,
+    db: Arc<RawDbKeyStore>,
 }
 
 impl DbKeyStore {
@@ -43,15 +43,15 @@ impl DbKeyStore {
             ensure_private_runtime_dir(parent)?;
         }
 
-        let _db = open_raw_store(&config)?;
+        let db = open_raw_store(&config)?;
 
         ensure_keystore_sqlite_files(&config.path)?;
 
-        Ok(Self { config })
+        Ok(Self { db })
     }
 
-    fn raw_store(&self) -> Result<Arc<RawDbKeyStore>> {
-        open_raw_store(&self.config)
+    fn raw_store(&self) -> &Arc<RawDbKeyStore> {
+        &self.db
     }
 
     fn read_entry(&self, db: &RawDbKeyStore, id: &SecretId) -> Result<keyring_core::Entry> {
@@ -73,8 +73,8 @@ fn open_raw_store(config: &DbKeyStoreConfig) -> Result<Arc<RawDbKeyStore>> {
 
 impl SecretStore for DbKeyStore {
     fn get_string(&self, id: &SecretId) -> Result<Option<String>> {
-        let db = self.raw_store()?;
-        let entry = self.read_entry(&db, id)?;
+        let db = self.raw_store();
+        let entry = self.read_entry(db, id)?;
         match entry.get_password() {
             Ok(value) => Ok(Some(value)),
             Err(err) if is_not_found(&err) => Ok(None),
@@ -83,7 +83,7 @@ impl SecretStore for DbKeyStore {
     }
 
     fn put_string(&self, id: &SecretId, value: &str, meta: SecretMeta) -> Result<()> {
-        let db = self.raw_store()?;
+        let db = self.raw_store();
         let comment = encode_meta(&meta)?;
         let entry = db
             .build(id.service(), id.user(), None)
@@ -100,7 +100,7 @@ impl SecretStore for DbKeyStore {
     }
 
     fn delete(&self, id: &SecretId) -> Result<bool> {
-        let db = self.raw_store()?;
+        let db = self.raw_store();
         let entry = db
             .build(id.service(), id.user(), None)
             .map_err(|err| KeystoreError::DeleteFailed(err.to_string()))?;
@@ -113,8 +113,8 @@ impl SecretStore for DbKeyStore {
     }
 
     fn exists(&self, id: &SecretId) -> Result<bool> {
-        let db = self.raw_store()?;
-        let entry = self.read_entry(&db, id)?;
+        let db = self.raw_store();
+        let entry = self.read_entry(db, id)?;
         match entry.get_attributes() {
             Ok(_) => Ok(true),
             Err(err) if is_not_found(&err) => Ok(false),
@@ -123,7 +123,7 @@ impl SecretStore for DbKeyStore {
     }
 
     fn list(&self, filter: SecretFilter) -> Result<Vec<SecretEntryMeta>> {
-        let db = self.raw_store()?;
+        let db = self.raw_store();
         let entries = db
             .search(&HashMap::new())
             .map_err(|err| KeystoreError::ListFailed(err.to_string()))?;
@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn retired_secret_metadata_remains_listable_and_deletable_by_service() {
         let (_dir, store) = open_temp_store();
-        let raw = store.raw_store().expect("open raw store");
+        let raw = store.raw_store();
         for (service, user, kind) in [
             (
                 "pioneer.desktop.gateway_auth_token",
@@ -318,13 +318,69 @@ mod tests {
     }
 
     #[test]
+    fn clones_reuse_backend_across_operations() {
+        let (_dir, store) = open_temp_store();
+        let backend = Arc::clone(store.raw_store());
+        let cloned = store.clone();
+        let id = SecretId::provider_api_key("openrouter").expect("id");
+
+        for handle in [&store, &cloned, &store, &cloned] {
+            assert!(Arc::ptr_eq(&backend, handle.raw_store()));
+            assert_eq!(handle.get_string(&id).expect("read missing"), None);
+            assert!(Arc::ptr_eq(&backend, handle.raw_store()));
+        }
+    }
+
+    #[test]
+    fn open_rejects_invalid_runtime_directory_and_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_as_parent = dir.path().join("not-a-directory");
+        std::fs::write(&file_as_parent, b"blocked").expect("create blocked parent");
+
+        assert!(matches!(
+            DbKeyStore::open(DbKeyStoreConfig::for_runtime_home(&file_as_parent)),
+            Err(KeystoreError::PermissionFailed(_))
+        ));
+
+        let directory_as_db = dir.path().join("keystore.db");
+        std::fs::create_dir(&directory_as_db).expect("create invalid backend path");
+        assert!(matches!(
+            DbKeyStore::open(DbKeyStoreConfig::new(directory_as_db)),
+            Err(KeystoreError::OpenFailed(_))
+        ));
+    }
+
+    #[test]
+    fn open_requires_sqlite_file_permissions_before_returning_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = DbKeyStoreConfig::for_runtime_home(dir.path());
+        let invalid_sidecar = dir.path().join("keystore.db-shm");
+        // The file backend does not use SQLite's -shm file. Its constructor
+        // succeeds, but our subsequent permission check must reject this path.
+        std::fs::create_dir(&invalid_sidecar).expect("create invalid sidecar");
+        drop(open_raw_store(&config).expect("backend opens with invalid sidecar"));
+
+        assert!(matches!(
+            DbKeyStore::open(config.clone()),
+            Err(KeystoreError::PermissionFailed(_))
+        ));
+
+        std::fs::remove_dir(&invalid_sidecar).expect("remove invalid sidecar");
+        let store = DbKeyStore::open(config).expect("open after permission failure");
+        let id = SecretId::provider_api_key("openrouter").expect("id");
+        assert_eq!(store.get_string(&id).expect("read missing"), None);
+    }
+
+    #[test]
     fn live_handles_do_not_hold_the_keystore_file_lock() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = DbKeyStoreConfig::for_runtime_home(dir.path());
         let first = DbKeyStore::open(config.clone()).expect("open first");
         let second = DbKeyStore::open(config).expect("open second");
+        let second_clone = second.clone();
         let id = SecretId::provider_api_key("openrouter").expect("id");
 
+        assert_eq!(second_clone.get_string(&id).expect("read missing"), None);
         first
             .put_string(
                 &id,
@@ -336,6 +392,38 @@ mod tests {
         assert_eq!(
             second.get_string(&id).expect("read through second handle"),
             Some("shared-secret".to_owned())
+        );
+        assert_eq!(
+            second_clone.get_string(&id).expect("read through clone"),
+            Some("shared-secret".to_owned())
+        );
+        let entries = first
+            .list(SecretFilter::All)
+            .expect("list before overwrite");
+        assert_eq!(entries[0].label.as_deref(), Some("openrouter"));
+
+        second_clone
+            .put_string(
+                &id,
+                "updated-secret",
+                meta(SecretKind::ProviderApiKey, "updated", 1, 2),
+            )
+            .expect("overwrite through clone");
+        assert_eq!(
+            first.get_string(&id).expect("read external overwrite"),
+            Some("updated-secret".to_owned())
+        );
+        let entries = first.list(SecretFilter::All).expect("list after overwrite");
+        assert_eq!(entries[0].label.as_deref(), Some("updated"));
+
+        assert!(first.delete(&id).expect("delete through first handle"));
+        assert_eq!(second.get_string(&id).expect("read external delete"), None);
+        assert!(!second_clone.exists(&id).expect("deleted exists via clone"));
+        assert!(
+            second_clone
+                .list(SecretFilter::All)
+                .expect("list external delete")
+                .is_empty()
         );
     }
 
