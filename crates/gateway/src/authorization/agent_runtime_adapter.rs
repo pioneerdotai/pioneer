@@ -239,6 +239,31 @@ impl BoundAgentActionAdapter {
         safe
     }
 
+    /// Bind only the resolved model metadata. This does not change the identity,
+    /// capability or route options the caller already selected, so their option
+    /// IDs and generation must remain stable during launch resolution.
+    pub(crate) fn install_selected_launch_profiles(
+        &mut self,
+        profiles: Vec<AgentExecutionProfileProjection>,
+    ) -> AgentToolOptionsProjection {
+        self.start_options.profiles = super::project_bounded_start_options(
+            self.start_options.agents.clone(),
+            profiles,
+            &self.envelope,
+            self.current_policy_generation,
+        )
+        .profiles;
+        let mut safe = self.start_options.clone().safe_tool_projection();
+        populate_binding_options(
+            &self.root,
+            self.same_capsule_targets.as_slice(),
+            self.routes.as_slice(),
+            &task_agent_capabilities(&self.envelope),
+            &mut safe,
+        );
+        safe
+    }
+
     pub(crate) fn resolve_task_launch(
         &self,
         selection: &pioneer_protocol::AgentLaunchSelection,
@@ -276,12 +301,11 @@ impl BoundAgentActionAdapter {
         })
     }
 
-    pub(crate) fn resolve_named_task_reviewer_launch(
+    pub(crate) fn named_task_reviewer_identity(
         &self,
         nickname: &str,
         saved_ceiling: &pioneer_protocol::ChildAgentLaunchGrantSet,
-    ) -> Result<(AgentIdentityProjection, AgentExecutionProfileProjection), AgentToolAdapterError>
-    {
+    ) -> Result<AgentIdentityProjection, AgentToolAdapterError> {
         let nickname = nickname.trim();
         if nickname.is_empty() {
             return Err(AgentToolAdapterError::InvalidInput(
@@ -304,6 +328,16 @@ impl BoundAgentActionAdapter {
                 "reviewer agent nickname is ambiguous".to_owned(),
             ));
         }
+        Ok(identity)
+    }
+
+    pub(crate) fn resolve_named_task_reviewer_launch(
+        &self,
+        nickname: &str,
+        saved_ceiling: &pioneer_protocol::ChildAgentLaunchGrantSet,
+    ) -> Result<(AgentIdentityProjection, AgentExecutionProfileProjection), AgentToolAdapterError>
+    {
+        let identity = self.named_task_reviewer_identity(nickname, saved_ceiling)?;
         let mut profiles = self.start_options.profiles.iter().filter(|profile| {
             profile
                 .compatible_agent_identity_ids
@@ -461,27 +495,24 @@ impl BoundAgentActionAdapter {
         if !identities.iter().any(|candidate| candidate == identity) {
             identities.push(identity.clone());
         }
-        let mut profiles = self.start_options.profiles.clone();
-        if !profiles.iter().any(|candidate| candidate == profile) {
-            profiles.push(profile.clone());
-        }
-        let child_launch_grant =
-            pioneer_protocol::ChildAgentLaunchGrantSet::new(identities, profiles)
-                .and_then(|grant| {
-                    grant.with_policy(
-                        self.start_options.inherit_parent_agent_available,
-                        self.start_options.derived_ephemeral_available,
-                        self.start_options.inherit_parent_profile_available,
-                        self.start_options.allowed_skill_ids.clone(),
-                        self.start_options.allowed_mcp_server_ids.clone(),
-                        self.start_options.max_permission_profile.clone(),
-                    )
-                })
-                .map_err(|_| {
-                    AgentToolAdapterError::InvalidInput(
-                        "Task child launch grant is invalid".to_owned(),
-                    )
-                })?;
+        pioneer_protocol::validate_selected_agent_launch_profile(identity, profile, &identities)
+            .map_err(|_| {
+                AgentToolAdapterError::InvalidInput("Task selected profile is invalid".to_owned())
+            })?;
+        let child_launch_grant = pioneer_protocol::ChildAgentLaunchGrantSet::new(identities)
+            .and_then(|grant| {
+                grant.with_policy(
+                    self.start_options.inherit_parent_agent_available,
+                    self.start_options.derived_ephemeral_available,
+                    self.start_options.inherit_parent_profile_available,
+                    self.start_options.allowed_skill_ids.clone(),
+                    self.start_options.allowed_mcp_server_ids.clone(),
+                    self.start_options.max_permission_profile.clone(),
+                )
+            })
+            .map_err(|_| {
+                AgentToolAdapterError::InvalidInput("Task child launch grant is invalid".to_owned())
+            })?;
         Ok(task_authorization_grant_seed_from_envelope(
             envelope,
             child_launch_grant,
@@ -915,7 +946,7 @@ fn validate_tool_launch(
     };
     let profile = match &selection.profile {
         AgentToolProfileChoice::InheritParent if options.inherit_parent_profile_available => None,
-        // The internal catalog resolves this against the immutable profile set.
+        // The server resolves this against current metadata before materialization.
         AgentToolProfileChoice::Model { .. } => None,
         AgentToolProfileChoice::Exact { id } => {
             let profile = options

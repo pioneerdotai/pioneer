@@ -208,7 +208,6 @@ async fn task_child_launch_grant(
     // presentation/revision is captured with this execution; catalog additions
     // and current defaults never enter the grant.
     let mut identities = child_launch_grant.identities.clone();
-    let mut profiles = child_launch_grant.profiles.clone();
     if facts.identity.source_kind == AgentIdentitySourceKind::Ephemeral
         && matches!(
             facts.profile.backend,
@@ -243,15 +242,13 @@ async fn task_child_launch_grant(
         bail!("Task execution exceeds its saved child launch ceiling");
     }
     *selected = facts.identity.clone();
-    let selected_profile = profiles
-        .iter_mut()
-        .find(|profile| {
-            profile.id == facts.profile.id
-                && pioneer_protocol::agent_execution_profile_is_no_wider(&facts.profile, profile)
-        })
-        .context("Task execution profile is outside its saved child launch ceiling")?;
-    *selected_profile = facts.profile.clone();
-    pioneer_protocol::ChildAgentLaunchGrantSet::new(identities, profiles)
+    pioneer_protocol::validate_selected_agent_launch_profile(
+        &facts.identity,
+        &facts.profile,
+        &identities,
+    )
+    .map_err(|error| anyhow!("Task selected profile is invalid: {error:?}"))?;
+    pioneer_protocol::ChildAgentLaunchGrantSet::new(identities)
         .and_then(|grant| {
             grant.with_policy(
                 child_launch_grant.allow_inherit_parent_identity,
@@ -5486,6 +5483,14 @@ impl TaskAgentExecutor {
                     .await?
                     .context("reviewer Task has no saved actor contract")?;
                 let saved_ceiling = task_saved_child_launch_grant(&actor_contract)?;
+                super::agent_action_tools::prepare_named_reviewer_launch(
+                    &mut catalog_binding,
+                    processor,
+                    candidate.turn_id.as_str(),
+                    nickname,
+                    &saved_ceiling,
+                )
+                .await?;
                 let (identity, profile) = catalog_binding
                     .adapter
                     .lock()
@@ -7077,12 +7082,25 @@ async fn load_task_execution_conversation_scope(
     AgentTurnHookRuntimeContext,
     Vec<pioneer_provider::ChatMessage>,
 )> {
-    scope_current_stage(Stage::TaskHistory, async {
+    let (hook_context, mut history) = scope_current_stage(Stage::TaskHistory, async {
         let expected_hook_context = task_hook_runtime_context(task, parent, task_run_turn_kind);
         // The Task transition itself retains its narrow Critical writes. History
         // preparation may register legacy metadata, so give that entire operation
         // the normal class of its caller rather than inheriting Critical writes.
         let history_store = ordinary_history_store(processor.crud_store.as_ref());
+        // A Composer snapshot is the next user's root history consumer. Share
+        // priority with root preparation before accepting that immutable input.
+        let history_cancellation = tokio_util::sync::CancellationToken::new();
+        let _conversation_lease = processor
+            .acquire_composer_history_priority(
+                &history_store,
+                &task.workspace_id,
+                execution_thread_id,
+                execution_turn_id,
+                &history_cancellation,
+            )
+            .await?;
+
         if let Some(snapshot) = processor
             .crud_store
             .get_turn_runtime_snapshot(execution_turn_id)
@@ -7259,7 +7277,21 @@ async fn load_task_execution_conversation_scope(
         .await?;
         Ok((expected_hook_context, history))
     })
-    .await
+    .await?;
+    // Accepted history may have been captured in the parent context. Express
+    // its roles relative to this execution before freezing runtime history,
+    // across initial capture, accepted-snapshot restore and retries. Explicit
+    // OWN imports already name this execution as their context owner.
+    for message in &mut history {
+        if let Some(origin) = &mut message.provenance {
+            origin.inherited |= origin
+                .context_thread
+                .as_deref()
+                .unwrap_or(&origin.thread_id)
+                != execution_thread_id;
+        }
+    }
+    Ok((hook_context, history))
 }
 
 #[allow(clippy::too_many_arguments)]

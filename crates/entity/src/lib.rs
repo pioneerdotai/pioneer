@@ -78,6 +78,7 @@ pub mod compaction_operation_projection;
 pub mod compaction_projection_epoch;
 pub mod compaction_publication_fence;
 pub mod compaction_publication_source_fence;
+pub mod compaction_root_activity;
 pub mod compaction_runner_plan;
 pub mod compaction_runner_state;
 pub mod compaction_source_revision;

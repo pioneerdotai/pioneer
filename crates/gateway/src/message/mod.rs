@@ -169,9 +169,9 @@ use pioneer_artifacts::{
 };
 use pioneer_config::{
     GatewayArtifactsConfig, GatewayCliAgentRuntimeCommandHeartbeatConfig,
-    GatewayCommandExecutionTimeoutConfig, GatewayContextCompactionTimeoutConfig,
-    GatewayHookRecoveryConfig, GatewayProviderStreamItemTimeoutConfig,
-    GatewayThreadEpisodicVectorSearchConfig,
+    GatewayCommandExecutionTimeoutConfig, GatewayContextCompactionConfig,
+    GatewayContextCompactionTimeoutConfig, GatewayHookRecoveryConfig,
+    GatewayProviderStreamItemTimeoutConfig, GatewayThreadEpisodicVectorSearchConfig,
 };
 use pioneer_crud::{
     CliRuntimePendingRequestRecord,
@@ -463,6 +463,7 @@ pub(crate) struct MessageProcessorResilienceConfig {
     pub command_execution_timeout: GatewayCommandExecutionTimeoutConfig,
     pub provider_stream_item_timeout: GatewayProviderStreamItemTimeoutConfig,
     pub context_compaction_timeout: GatewayContextCompactionTimeoutConfig,
+    pub context_compaction: GatewayContextCompactionConfig,
     pub cli_runtime_command_heartbeat: GatewayCliAgentRuntimeCommandHeartbeatConfig,
 }
 
@@ -472,6 +473,7 @@ impl Default for MessageProcessorResilienceConfig {
             command_execution_timeout: GatewayCommandExecutionTimeoutConfig::default(),
             provider_stream_item_timeout: GatewayProviderStreamItemTimeoutConfig::default(),
             context_compaction_timeout: GatewayContextCompactionTimeoutConfig::default(),
+            context_compaction: GatewayContextCompactionConfig::default(),
             cli_runtime_command_heartbeat: GatewayCliAgentRuntimeCommandHeartbeatConfig::default(),
         }
     }
@@ -617,6 +619,8 @@ pub struct MessageProcessor {
     task_cli_readiness_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
     #[cfg(test)]
     task_output_capture_failures: Arc<std::sync::Mutex<HashMap<String, anyhow::Error>>>,
+    pub(crate) context_compaction_config: GatewayContextCompactionConfig,
+    pub(crate) compaction_clock: Arc<dyn crate::compaction::CompactionClock>,
     pub(crate) compaction_coordinator: Arc<crate::compaction::ContextCompactionCoordinator>,
     cli_history_shutdown: tokio_util::sync::CancellationToken,
     #[cfg(test)]
@@ -1265,6 +1269,8 @@ impl MessageProcessor {
             task_cli_readiness_failure: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             task_output_capture_failures: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            context_compaction_config: resilience_config.context_compaction,
+            compaction_clock: Arc::new(crate::compaction::SystemCompactionClock::default()),
             compaction_coordinator: Arc::new(
                 crate::compaction::ContextCompactionCoordinator::default(),
             ),
@@ -4945,6 +4951,8 @@ impl MessageProcessor {
             task_cli_readiness_failure: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             task_output_capture_failures: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            context_compaction_config: GatewayContextCompactionConfig::default(),
+            compaction_clock: Arc::new(crate::compaction::SystemCompactionClock::default()),
             compaction_coordinator: Arc::new(
                 crate::compaction::ContextCompactionCoordinator::default(),
             ),

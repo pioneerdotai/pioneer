@@ -97,9 +97,9 @@ pub use agent_launch::{
     AgentExecutionProfileProjection, AgentExecutionProfileSelection, AgentExecutionSelection,
     AgentIdentitySelection, AgentLaunchSelection, AgentLaunchSelectionError,
     AgentStartOptionsProjection, AgentStartTarget, ChildAgentLaunchGrantMigrationError,
-    ChildAgentLaunchGrantSet, ChildAgentLaunchGrantSetError, ReasoningCeiling, StartAgentIntent,
+    ChildAgentLaunchGrantSet, ChildAgentLaunchGrantSetError, StartAgentIntent,
     agent_execution_profile_is_no_wider, agent_identity_has_same_launch_source,
-    migrate_embedded_child_launch_grant_json_to_current,
+    migrate_embedded_child_launch_grant_json_to_current, validate_selected_agent_launch_profile,
 };
 pub use agent_route::{
     AgentDelegationRouteCreateParams, AgentDelegationRouteListParams,

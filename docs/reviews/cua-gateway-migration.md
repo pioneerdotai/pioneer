@@ -1034,3 +1034,48 @@ Existing monitor `1EuSrEXDwGwWI6UvduAfp` could not be inspected: Pioneer task_ge
 returned `session_binding_unavailable` / MCP turn not active. No monitor was
 created, paused, cancelled or rescheduled; run 40's outcome and current schedule
 remain unconfirmed in this execution.
+
+
+## 2026-10-26 — refresh from current main with approved lockfile update
+
+The user requested merging current main into feature/cua-gateway-migration,
+resolving conflicts, committing and pushing to existing PR #172. Landing the PR
+in main remains outside scope. Entry HEAD and remote PR HEAD both equal
+`892906a87bbbd6f858d23f5d17716caa982a7ba8`; worktree and index were clean.
+Fetched main is `4f212561708f5918f2a32f43849c0cc65e115857`.
+
+A normal `git merge --no-commit --no-ff origin/main` exposed two conflicts:
+Cargo.lock and the existing native request-tools catalog test in agent/chat.
+The test resolution retains the backend availability matrix and adds main's
+threads-policy argument. Five test callers now supply all six policy/availability
+booleans. Production callers retain both threads policy and CUA availability;
+CUA typed delivery, cancellation and no-replay code was not rewritten.
+
+The test-only edit batch followed test-audit: all other tracked file hashes and
+the mixed file's complete production prefix matched its actual batch-entry
+snapshot before/after editing and check-only formatting. Static tree comparison
+confirmed all 111 feature-only paths match entry HEAD and all 78 main-only paths
+match fetched main. Overlapping paths retain both sides' changes.
+
+A separate reviewable Cargo.lock candidate is saved with its patch at:
+`/var/folders/zp/86t3bm991zxb00f0gryyx6km0000gn/T/cua-merge-test-audit-xywmdi50/`.
+Candidate SHA256: `21070a7551937e885ab83185c0ffa13f3f527bc640cdd9f834de475230756590`.
+It accepts main's workspace 0.65.1, longbridge/gpui-kit source and dependency
+updates; preserves feature dependencies and CUA pin
+`688c5fd62a9f13dddc309970c948df494e7de33f`; omits the removed legacy xa11y
+packages. The clipboard-win 5.4.3 block uses main's exact dependencies rather
+than the obsolete windows-win dependency retained by automatic text merging.
+Static standard-library TOML checks confirmed unique resolution of every
+lockfile dependency reference, workspace versions and inherited checksums.
+No dependency resolver or project script was executed.
+
+`cargo fmt --all --check` and `git diff --cached --check` passed. No local build,
+test, compiler, linter, resolver, package/install or runtime/platform probe ran.
+The existing monitor was not changed and no task or subagent was created.
+
+The user explicitly approved inclusion of the prepared Cargo.lock update.
+The exact candidate above has been applied. The CUA revision is an existing
+upstream dependency pin, not a driver fork; changing its update policy is outside
+this main-integration change. All conflicts are resolved for a normal merge
+commit and push to the existing feature branch. Fresh remote CI must validate
+this new HEAD independently of the previous GREEN result.

@@ -285,9 +285,17 @@ impl TurnToolProvider for GatewayArtifactToolProvider {
             .collect::<Vec<_>>();
         bundles.extend(agent_actions.bundles);
         bundles.push(processor.html_tools(context_for_results.clone()));
-        bundles.push(processor.thread_read_tools(context_for_results.clone()));
-        bundles.push(processor.thread_search_tools(context_for_results.clone()));
-        bundles.push(processor.thread_result_tools(context_for_results));
+        // Hidden registration is a discoverable capability. Do not advertise
+        // readers to a native execution that cannot read its source capsule.
+        if processor
+            .thread_read_authority(&context_for_results)
+            .await
+            .is_ok()
+        {
+            bundles.push(processor.thread_read_tools(context_for_results.clone()));
+            bundles.push(processor.thread_search_tools(context_for_results.clone()));
+            bundles.push(processor.thread_result_tools(context_for_results));
+        }
 
         Ok(TurnToolMaterialization {
             bundles,

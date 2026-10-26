@@ -94,19 +94,6 @@ impl ArtifactRepository {
             .map(|row| row.map(blob_record_from_model))
     }
 
-    pub async fn create_blob<C: ConnectionTrait>(
-        &self,
-        db: &C,
-        record: NewArtifactBlobRecord,
-    ) -> ArtifactCrudResult<ArtifactBlobRecord> {
-        let now = now();
-        let id = generate_id(21);
-        let size_bytes = to_i64_size(record.size_bytes)?;
-        let metadata_json = metadata_to_db(&record.metadata)?;
-        self.create_blob_prepared(db, record, id, now, size_bytes, metadata_json)
-            .await
-    }
-
     pub(crate) async fn create_blob_prepared<C: ConnectionTrait>(
         &self,
         db: &C,
@@ -136,42 +123,6 @@ impl ArtifactRepository {
             source,
         })?;
         Ok(blob_record_from_model(model))
-    }
-
-    pub async fn find_or_create_blob<C: ConnectionTrait>(
-        &self,
-        db: &C,
-        record: NewArtifactBlobRecord,
-    ) -> ArtifactCrudResult<ArtifactBlobRecord> {
-        if let Some(existing) = self
-            .find_blob_by_workspace_sha(
-                db,
-                &record.workspace_id,
-                &record.sha256,
-                record.size_bytes,
-                &record.storage_backend,
-            )
-            .await?
-        {
-            return Ok(existing);
-        }
-
-        match self.create_blob(db, record.clone()).await {
-            Ok(model) => Ok(model),
-            Err(ArtifactCrudError::Database { .. }) => self
-                .find_blob_by_workspace_sha(
-                    db,
-                    &record.workspace_id,
-                    &record.sha256,
-                    record.size_bytes,
-                    &record.storage_backend,
-                )
-                .await?
-                .ok_or_else(|| ArtifactCrudError::NotFound {
-                    message: "artifact blob insert failed and no existing row was found".to_owned(),
-                }),
-            Err(error) => Err(error),
-        }
     }
 
     pub(crate) async fn find_or_create_blob_prepared<C: ConnectionTrait>(

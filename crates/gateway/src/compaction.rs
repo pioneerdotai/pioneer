@@ -5,7 +5,9 @@ mod background_history;
 mod checkpoint;
 mod compatible;
 mod coordination;
-pub(crate) use coordination::{ContextCompactionCoordinator, ContextWorkPriority};
+pub(crate) use coordination::{
+    ContextCompactionCoordinator, ContextCompactionLease, ContextWorkPriority,
+};
 mod coverage;
 #[cfg(test)]
 pub(crate) use coverage::{CheckpointGraphResolver, observe_preparation_work};

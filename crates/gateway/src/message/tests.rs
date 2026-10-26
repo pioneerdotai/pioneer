@@ -1,3 +1,6 @@
+#[path = "tests/root_conversation_compaction.rs"]
+mod root_conversation_compaction;
+
 #[path = "tests/scoped_push.rs"]
 mod scoped_push;
 
@@ -2182,7 +2185,10 @@ async fn setup_cli_runtime_skill_preflight_harness(
     for entry in
         crate::system_skills::bundled_system_skill_catalog_entries(&harness.system_root).unwrap()
     {
-        if matches!(entry.slug.as_str(), "tasks" | "subagents" | "html") {
+        if matches!(
+            entry.slug.as_str(),
+            "tasks" | "subagents" | "html" | "threads"
+        ) {
             let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../resources/skills/pioneer")
                 .join(&entry.slug);
@@ -2561,9 +2567,10 @@ async fn capability_persistence_order_impl() {
                 turn_id: committed_turn_id,
                 bindings,
                 ..
-            } if committed_turn_id == turn_id && bindings.len() == 5
-                && bindings.iter().filter(|binding| binding.source_kind == "system").count() == 3
+            } if committed_turn_id == turn_id && bindings.len() == 6
+                && bindings.iter().filter(|binding| binding.source_kind == "system").count() == 4
                 && bindings.iter().any(|binding| binding.source_kind == "system" && binding.skill_slug == "html")
+                && bindings.iter().any(|binding| binding.source_kind == "system" && binding.skill_slug == "threads")
         ));
         if matches!(
             runtime_kind,
@@ -2580,6 +2587,7 @@ async fn capability_persistence_order_impl() {
                                 "pioneer-system-tasks"
                                     | "pioneer-system-subagents"
                                     | "pioneer-system-html"
+                                    | "pioneer-system-threads"
                             )
                         )
                 })
@@ -2730,7 +2738,7 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
 
         let first_receipt_bytes = first_receipt_snapshot.unwrap();
         let first_receipt = pioneer_skills::read_external_runtime_receipt(&receipt_path).unwrap();
-        assert_eq!(first_receipt.entries.len(), 4);
+        assert_eq!(first_receipt.entries.len(), 5);
         assert_eq!(first_receipt.entries[0].skill_id, lifecycle_id);
         assert_eq!(first_receipt.entries[0].owner.as_deref(), Some("tests"));
         assert_eq!(first_receipt.entries[0].slug, "lifecycle");
@@ -2827,8 +2835,8 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
             .find_turn_skill_bindings(&zero_turn)
             .await
             .expect("must read zero-skill CLI runtime turn bindings");
-        assert_eq!(zero_bindings.len(), 3);
-        for slug in ["tasks", "subagents", "html"] {
+        assert_eq!(zero_bindings.len(), 4);
+        for slug in ["tasks", "subagents", "html", "threads"] {
             assert!(
                 zero_bindings
                     .iter()
@@ -2856,6 +2864,7 @@ fn cli_html_skill_resolves_without_task_tools_or_explicit_attachments() {
                 &harness.workspace_id,
                 &[],
                 &pioneer_agent::AgentMcpAvailability::default(),
+                false,
                 false,
                 true,
             )
@@ -4019,6 +4028,27 @@ impl Provider for DelayedProvider {
             transcription: false,
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
+    }
+
+    async fn list_models(&self) -> anyhow::Result<Vec<pioneer_protocol::ProviderModelInfo>> {
+        Ok(vec![pioneer_protocol::ProviderModelInfo {
+            id: "test-model".to_owned(),
+            name: Some("Delayed fixture model".to_owned()),
+            description: None,
+            created: None,
+            provider: "openai".to_owned(),
+            owned_by: None,
+            limits: Default::default(),
+            capabilities: pioneer_protocol::ProviderModelCapabilities {
+                tool_calling: Some(false),
+                ..Default::default()
+            },
+            transcription: None,
+            pricing: None,
+            active: Some(true),
+            family: None,
+            lifecycle_status: None,
+        }])
     }
 
     async fn chat(&self, _request: ChatRequest) -> anyhow::Result<ChatResponse> {
@@ -21503,6 +21533,10 @@ async fn review_enabled_child_completion_creates_pending_candidate_without_final
         workspace_manager,
         crud_store.clone(),
     );
+    processor
+        .gateway_secrets
+        .set_workspace_provider_api_key(workspace_id.as_str(), "openai", "fixture-key")
+        .expect("fixture provider should be configured");
     processor.bind_task_bridge().await;
 
     let mut params = test_task_create_params(
@@ -25171,7 +25205,8 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
             r#"<task_result>{{"summary":"immediate background result","data":{{"rawText":"{}"}}}}</task_result>"#,
             "🧪".repeat(60_000)
         ))
-        .with_first_delay(Duration::from_millis(250)),
+        .with_first_delay(Duration::from_millis(250))
+        .with_valid_summary_completion(),
     );
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
@@ -25475,15 +25510,51 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
     processor
         .set_thread_episodic_ingestor_for_test(delivery_ingestor.clone())
         .await;
+    // Occupy optional preparation with a published user root, independently
+    // of the detached occurrence whose delivery/order/provenance we observe.
+    let history = Phase13CompactionHarness {
+        processor: processor.clone(),
+        crud_store: crud_store.clone(),
+        workspace_id: workspace_id.clone(),
+    };
+    let history_thread = "thr_delivery_background_root";
+    let history_turn = "turn_delivery_background_root";
+    let history_at = super::now_timestamp_secs();
+    crate::compaction::load_test_catalog();
+    root_conversation_compaction::human_input(
+        &history,
+        history_thread,
+        history_turn,
+        history_at,
+        "background root question",
+    )
+    .await;
+    root_conversation_compaction::answer(
+        &history,
+        history_thread,
+        history_turn,
+        history_at,
+        // Exceed the context budget with dense tokens, rather than megabytes
+        // of low-density text that require many incremental fragment fits.
+        // The spaces keep tokenizer pieces bounded as well.
+        &"🧪 ".repeat(60_000),
+    )
+    .await;
     let pending = crud_store
         .compaction_pending_history_checks()
         .await
-        .expect("Native completion intent should be queryable before worker admission");
+        .expect("published root work should be discoverable before worker admission");
     assert!(
         pending
             .iter()
-            .any(|check| check.turn_id == lineage.child_turn_id),
-        "Native child completion must expose its intent before delivery"
+            .any(|check| { check.thread_id == history_thread && check.turn_id == history_turn }),
+        "the actual ready root answer must enqueue background preparation"
+    );
+    assert!(
+        pending.iter().all(|check| {
+            check.thread_id != lineage.child_thread_id && check.turn_id != lineage.child_turn_id
+        }),
+        "retained child results must not become optional conversation warming"
     );
     let before_delivery = processor
         .task_runtime
@@ -25508,7 +25579,7 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
     let summary_calls = provider.call_count();
     match barrier {
         CompletedHistoryDeliveryBarrier::Preparation => {
-            processor.arm_completed_history_preparation_barrier(&lineage.child_turn_id)
+            processor.arm_completed_history_preparation_barrier(history_turn)
         }
         CompletedHistoryDeliveryBarrier::Summarizer => {
             provider.pause_first.store(true, Ordering::SeqCst)
@@ -25517,21 +25588,50 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
     processor
         .poll_completed_history_checks()
         .await
-        .expect("Native history worker should start");
+        .expect("published root history worker should start");
     match barrier {
         CompletedHistoryDeliveryBarrier::Preparation => timeout(
             Duration::from_secs(10),
             processor.wait_for_completed_history_preparation_barrier(),
         )
         .await
-        .expect("Native worker must reach the preparation barrier"),
+        .expect("root worker must reach the preparation barrier"),
         CompletedHistoryDeliveryBarrier::Summarizer => timeout(Duration::from_secs(10), async {
-            while provider.call_count() == summary_calls {
+            // The first whole-unit portion may contain only the short question.
+            while provider.call_count() == summary_calls
+                || !provider
+                    .snapshot_requests()
+                    .iter()
+                    .skip(summary_calls)
+                    .any(|request| {
+                        request.messages.first().is_some_and(|message| {
+                            message.content == pioneer_compaction::summary::INSTRUCTIONS
+                        }) && request
+                            .messages
+                            .iter()
+                            .skip(1)
+                            .any(|message| message.content.contains("background root question"))
+                    })
+            {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("Native summarizer must reach the provider barrier"),
+        .expect("root summarizer must reach the provider barrier"),
+    }
+
+    {
+        let jobs = processor.completed_history_checks.lock().await;
+        let root_job = jobs
+            .get(&(workspace_id.clone(), history_thread.to_owned()))
+            .expect("the published root must own the blocked preparation");
+        assert!(
+            root_job
+                .handle
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished()),
+            "delivery must overlap occupied background preparation"
+        );
     }
 
     processor
@@ -25587,7 +25687,7 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         }
         CompletedHistoryDeliveryBarrier::Summarizer => provider.release_paused_call(),
     }
-    timeout(Duration::from_secs(30), async {
+    let settled = timeout(Duration::from_secs(30), async {
         loop {
             let finished = processor
                 .completed_history_checks
@@ -25605,8 +25705,36 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
             sleep(Duration::from_millis(25)).await;
         }
     })
-    .await
-    .expect("released Native history worker should finish");
+    .await;
+    if settled.is_err() {
+        let operations = pioneer_entity::compaction_operation::Entity::find()
+            .all(&crud_store.database_connection())
+            .await
+            .unwrap();
+        let progress: Vec<_> = operations
+            .iter()
+            .map(|operation| {
+                (
+                    &operation.status,
+                    operation.attempts,
+                    operation.next_portion,
+                    &operation.outcome,
+                )
+            })
+            .collect();
+        eprintln!(
+            "Native history operations: {progress:?}; provider calls: {}",
+            provider.call_count()
+        );
+    }
+    assert!(
+        settled.is_ok(),
+        "released Native history worker should finish; barrier: {barrier:?}; checks: {:?}",
+        pioneer_entity::compaction_history_check::Entity::find()
+            .all(&crud_store.database_connection())
+            .await
+            .unwrap()
+    );
     processor.poll_completed_history_checks().await.unwrap();
     assert_eq!(
         deliveries.deliveries[0].delivered_turn_id.as_deref(),
@@ -26378,8 +26506,8 @@ fn composer_cli_skill_pack_matches_individual_members_and_preserves_presentation
                     .list_turn_skill_bindings(&lineage.child_turn_id)
                     .await
                     .unwrap();
-                assert_eq!(bindings.len(), skill_ids.len() + 3);
-                for slug in ["tasks", "subagents", "html"] {
+                assert_eq!(bindings.len(), skill_ids.len() + 4);
+                for slug in ["tasks", "subagents", "html", "threads"] {
                     assert!(bindings.iter().any(|binding| {
                         binding.source_kind == "system"
                             && binding.skill_owner.as_deref() == Some("pioneer")
@@ -34013,7 +34141,8 @@ async fn cli_task_bootstrap_honors_empty_parent_context_policy_impl() {
         vec![
             "pioneer-system-tasks",
             "pioneer-system-subagents",
-            "pioneer-system-html"
+            "pioneer-system-html",
+            "pioneer-system-threads"
         ]
     );
     let adapter_messages = adapter_input
@@ -35802,11 +35931,11 @@ async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissio
         r#"<task_result>{"summary":"nested work completed"}</task_result>"#,
     ));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "nested",
+        "openai",
         provider.clone(),
     ));
     let session_manager = Arc::new(SessionManager::new());
-    let thread_manager = Arc::new(ThreadManager::new("test-model", "nested"));
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     // This scenario intentionally drives three concurrent Agent Turns. A
     // pooled `sqlite::memory:` URL can open isolated per-connection databases
     // under that load, so use one unique file-backed database for the exact
@@ -35837,6 +35966,10 @@ async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissio
             crate::compaction::GatewayNativeContextController::new(Arc::downgrade(&processor)),
         )))
         .await;
+    processor
+        .gateway_secrets
+        .set_workspace_provider_api_key(workspace_id.as_str(), "openai", "fixture-key")
+        .expect("fixture provider should be configured");
     processor.bind_task_bridge().await;
 
     let root_thread_id = "thread_nested_permission_root";
@@ -35852,7 +35985,7 @@ async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissio
         .agent_spec
         .as_mut()
         .expect("root agent spec should exist")
-        .model_provider = Some("nested".to_owned());
+        .model_provider = Some("openai".to_owned());
     let root = create_task_for_test(&processor, root_params)
         .await
         .expect("root task should start");
@@ -36598,13 +36731,13 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
         destination.display().to_string(),
     ));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "direct-agent-sandbox",
+        "openai",
         provider.clone(),
     ));
     let (tx, mut rx) = mpsc::channel(256);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("test-model", "direct-agent-sandbox"));
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     session_manager
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
@@ -36619,6 +36752,10 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
         test_summary_config(),
         test_tool_loop_config(),
     ));
+    processor
+        .gateway_secrets
+        .set_workspace_provider_api_key(workspace_id.as_str(), "openai", "fixture-key")
+        .expect("fixture provider should be configured");
     processor.bind_agent_tool_bridges().await;
 
     let thread_id = "thread_direct_agent_permission";
@@ -36631,7 +36768,7 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
         thread_id,
         root_turn_id,
         "Agent",
-        "direct-agent-sandbox",
+        "openai",
     )
     .await;
 
@@ -37207,6 +37344,11 @@ async fn task_create_inherits_exact_turn_capabilities_for_attached_and_backgroun
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     )
     .await;
+    harness
+        .processor
+        .gateway_secrets
+        .set_workspace_provider_api_key(harness.workspace_id.as_str(), "openai", "fixture-key")
+        .expect("fixture provider should be configured");
     harness.processor.bind_task_bridge().await;
     harness.processor.start_task_event_listener().await;
     let skill_id = seed_test_skill_installation(
@@ -37447,7 +37589,7 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
     let (tx, mut rx) = mpsc::channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("test-model", "parent"));
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let child_title = "Idempotent delegated task";
     let task_arguments = json!({
@@ -37474,7 +37616,7 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
         "parent observed child result",
     ));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "parent",
+        "openai",
         provider.clone(),
     ));
     provider_registry
@@ -37490,6 +37632,10 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
         test_summary_config(),
         test_tool_loop_config(),
     ));
+    processor
+        .gateway_secrets
+        .set_workspace_provider_api_key(workspace_id.as_str(), "openai", "fixture-key")
+        .expect("fixture provider should be configured");
     processor.bind_agent_tool_bridges().await;
     processor
         .start_resilience_workers()
@@ -37504,7 +37650,7 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
         "thr_task_tool_idempotency",
         "turn_task_tool_idempotency",
         "Agent",
-        "parent",
+        "openai",
     )
     .await;
     let _ = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
@@ -38651,11 +38797,11 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
         let session_manager = Arc::new(SessionManager::new());
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-        let thread_manager = Arc::new(ThreadManager::new("test-model", "parent"));
+        let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
         let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
         let provider = Arc::new(GuardAwareProvider::new());
         let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-            "parent",
+            "openai",
             provider.clone(),
         ));
         provider_registry
@@ -38677,6 +38823,10 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
             test_summary_config(),
             test_tool_loop_config(),
         ));
+        processor
+            .gateway_secrets
+            .set_workspace_provider_api_key(workspace_id.as_str(), "openai", "fixture-key")
+            .expect("fixture provider should be configured");
         processor.bind_task_bridge().await;
 
         start_thread_and_turn(
@@ -38687,7 +38837,7 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
             "thr_task_guard_parent",
             "turn_task_guard_parent",
             "Agent",
-            "parent",
+            "openai",
         )
         .await;
         let mut observed_notifications = Vec::new();
@@ -38921,11 +39071,11 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
     let (tx, mut rx) = mpsc::channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("test-model", "parent"));
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let provider = Arc::new(CreateThenHangProvider::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "parent",
+        "openai",
         provider.clone(),
     ));
     let processor = Arc::new(MessageProcessor::new(
@@ -38938,6 +39088,10 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
         test_summary_config(),
         test_tool_loop_config(),
     ));
+    processor
+        .gateway_secrets
+        .set_workspace_provider_api_key(workspace_id.as_str(), "openai", "fixture-key")
+        .expect("fixture provider should be configured");
     processor.bind_task_bridge().await;
 
     let thread_id = "thr_task_anchor_progress";
@@ -38950,7 +39104,7 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
         thread_id,
         turn_id,
         "Agent",
-        "parent",
+        "openai",
     )
     .await;
 
@@ -39009,11 +39163,11 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() 
     let (tx, mut rx) = mpsc::channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("test-model", "parent"));
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let provider = Arc::new(CreateThenHangProvider::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "parent",
+        "openai",
         provider.clone(),
     ));
     provider_registry
@@ -39035,6 +39189,10 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() 
         test_summary_config(),
         test_tool_loop_config(),
     ));
+    processor
+        .gateway_secrets
+        .set_workspace_provider_api_key(workspace_id.as_str(), "openai", "fixture-key")
+        .expect("fixture provider should be configured");
     processor.bind_task_bridge().await;
 
     start_thread_and_turn(
@@ -39045,7 +39203,7 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() 
         "thr_task_cancel_parent",
         "turn_task_cancel_parent",
         "Agent",
-        "parent",
+        "openai",
     )
     .await;
 
@@ -73758,6 +73916,7 @@ async fn completed_command_history_fits_real_background_preflight_after_projecti
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         None,
+        None,
         &mut diagnostic,
     )
     .await
@@ -73866,6 +74025,7 @@ async fn genuinely_large_command_history_compacts_through_real_background_prefli
         0,
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
         None,
         None,
         &mut diagnostic,
@@ -79325,43 +79485,6 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
             .is_empty(),
         "an unfinished turn intent must not be executable"
     );
-    let completion = harness
-        .crud_store
-        .database_connection()
-        .begin()
-        .await
-        .unwrap();
-    turn::Entity::update_many()
-        .col_expr(turn::Column::Status, Expr::value("completed"))
-        .filter(turn::Column::Id.eq(turn))
-        .exec(&completion)
-        .await
-        .unwrap();
-    let visible_inside_completion = completion
-        .query_one_raw(sea_orm::Statement::from_string(
-            sea_orm::DbBackend::Sqlite,
-            format!(
-                "SELECT count(*) AS n FROM compaction_history_check h JOIN turn t ON t.id=h.turn_id WHERE h.turn_id='{turn}' AND t.status='completed' AND h.state='pending'"
-            ),
-        ))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        visible_inside_completion.try_get::<i64>("", "n").unwrap(),
-        1,
-        "the pre-registered intent becomes eligible in the completion transaction"
-    );
-    completion.rollback().await.unwrap();
-    assert!(
-        harness
-            .crud_store
-            .compaction_pending_history_checks()
-            .await
-            .unwrap()
-            .is_empty(),
-        "rolling completion back must keep the intent unavailable to the worker"
-    );
     let mut foreign = context.clone();
     foreign.workspace_id = "foreign-workspace".into();
     assert!(
@@ -79373,6 +79496,25 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
         "idempotency must not bypass workspace/thread/turn validation"
     );
 
+    harness
+        .crud_store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: TurnItem::AgentMessage {
+                    id: "native-intent-published-answer".into(),
+                    text: "Ready answer".into(),
+                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            phase_13_now_secs(),
+        )
+        .await
+        .unwrap();
     let mut completed = harness
         .crud_store
         .get_turn(thread, turn)
@@ -79401,7 +79543,7 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
     assert_eq!(
         due.len(),
         1,
-        "durable completion must activate the pre-registered intent"
+        "canonical ready publication must expose the pre-registered root work"
     );
     let descriptor: serde_json::Value =
         serde_json::from_str(due[0].descriptor.as_deref().unwrap()).unwrap();
@@ -79750,8 +79892,8 @@ async fn history_intents_are_per_execution_turn_for_followups_nested_and_cli() {
     );
     assert_eq!(
         row.try_get::<i64>("", "cli").unwrap(),
-        1,
-        "CLI completion must keep using its existing trigger registration"
+        0,
+        "CLI completion without a published answer must not register hypothetical continuation work"
     );
 }
 
@@ -79983,6 +80125,7 @@ async fn production_background_preflight_ignores_technical_noise_but_budgets_rea
                 fixed_input_tokens,
                 None,
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
                 None,
                 None,
                 &mut diagnostic,
@@ -80539,6 +80682,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         None,
+        None,
         &mut baseline,
     )
     .await
@@ -80648,6 +80792,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         None,
+        None,
         &mut fitting,
     )
     .await
@@ -80678,6 +80823,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
         fixed,
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
         None,
         None,
         &mut overflowing,
@@ -80731,24 +80877,19 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
         let thread_id = "creation-order";
         let historical_turn = "creation-history";
         let current_turn = "creation-current";
-        for (turn_id, input) in [
-            (historical_turn, "initial input"),
-            (current_turn, "current input marker"),
-        ] {
-            store
-                .materialize_turn_start(
-                    &phase_13_test_thread(workspace, thread_id, phase_13_now_secs()),
-                    SandboxMode::FullAccess,
-                    &phase_13_turn(turn_id, TurnStatus::InProgress),
-                    &[UserInput::Text {
-                        text: input.into(),
-                        text_elements: vec![],
-                    }],
-                    pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
-                )
-                .await
-                .unwrap();
-        }
+        store
+            .materialize_turn_start(
+                &phase_13_test_thread(workspace, thread_id, phase_13_now_secs()),
+                SandboxMode::FullAccess,
+                &phase_13_turn(historical_turn, TurnStatus::InProgress),
+                &[UserInput::Text {
+                    text: "initial input".into(),
+                    text_elements: vec![],
+                }],
+                pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
+            )
+            .await
+            .unwrap();
         let call = ChatMessage::assistant_tool_calls(
             Some("call order marker"),
             vec![ProviderToolCall {
@@ -80865,6 +81006,22 @@ async fn creation_order_reaches_native_request_and_both_compaction_inputs() {
                 &phase_13_turn("creation-middle", TurnStatus::InProgress),
                 &[UserInput::Text {
                     text: format!("middle order marker {}", "middle detail ".repeat(12_000)),
+                    text_elements: vec![],
+                }],
+                pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
+            )
+            .await
+            .unwrap();
+        // Accept the current request last: a later principal input would
+        // correctly Stop it. Saved source times below still interleave its
+        // input with the historical round and middle turn.
+        store
+            .materialize_turn_start(
+                &phase_13_test_thread(workspace, thread_id, phase_13_now_secs()),
+                SandboxMode::FullAccess,
+                &phase_13_turn(current_turn, TurnStatus::InProgress),
+                &[UserInput::Text {
+                    text: "current input marker".into(),
                     text_elements: vec![],
                 }],
                 pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
@@ -81311,6 +81468,27 @@ async fn check_completed_history(
             native_owner_context = Some(native_context);
         }
     }
+    // Optional preparation now follows a published human answer, rather than
+    // execution completion alone. Keep the existing lifecycle/recovery proof.
+    harness
+        .crud_store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: TurnItem::AgentMessage {
+                    id: format!("{turn}-published-answer"),
+                    text: "Ready answer".into(),
+                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            phase_13_now_secs(),
+        )
+        .await
+        .unwrap();
     let mut completed = harness
         .crud_store
         .get_turn(thread, turn)
@@ -81723,6 +81901,27 @@ async fn compaction_history_waits_for_changed_settings_without_spending_provider
         &"completed work ".repeat(80_000),
     )
     .await;
+    // Optional preparation now follows a published human answer, rather than
+    // execution completion alone. Keep the existing lifecycle/recovery proof.
+    harness
+        .crud_store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: TurnItem::AgentMessage {
+                    id: format!("{turn}-published-answer"),
+                    text: "Ready answer".into(),
+                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            phase_13_now_secs(),
+        )
+        .await
+        .unwrap();
     let mut completed = harness
         .crud_store
         .get_turn(thread, turn)
@@ -82016,6 +82215,7 @@ async fn background_completed_history_projects_reasoning_before_fit_and_compacti
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         None,
+        None,
         &mut fitting,
     )
     .await
@@ -82045,6 +82245,7 @@ async fn background_completed_history_projects_reasoning_before_fit_and_compacti
         fixed,
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
         None,
         None,
         &mut compacted,
@@ -82344,6 +82545,7 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
             None,
+            None,
             &mut diagnostic,
         )
         .await
@@ -82402,6 +82604,7 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
         compaction_fixed,
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
         None,
         None,
         &mut diagnostic,

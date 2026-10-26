@@ -1,6 +1,8 @@
 // Gateway transcription boundary. The concrete Parakeet backend plugs in here.
 
-use super::vad::{VoiceNoSpeechReason, VoiceSpeechSegment, VoiceVadSegmentationOutcome};
+use super::vad::VoiceSpeechSegment;
+#[cfg(test)]
+use super::vad::{VoiceNoSpeechReason, VoiceVadSegmentationOutcome};
 use pioneer_config::GatewayVoiceTranscriptionStrategy;
 use pioneer_protocol::{VoiceError, VoiceErrorKind};
 #[cfg(test)]
@@ -42,6 +44,7 @@ pub(crate) struct PreparedSpeechBuffer {
 }
 
 impl PreparedSpeechBuffer {
+    #[cfg(test)]
     pub(crate) fn from_segments(
         sample_rate_hz: u32,
         total_samples: usize,
@@ -61,6 +64,7 @@ impl PreparedSpeechBuffer {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn from_vad_outcome(
         sample_rate_hz: u32,
         outcome: VoiceVadSegmentationOutcome,
@@ -96,6 +100,7 @@ impl PreparedSpeechBuffer {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum VoiceTranscriptionOutcome {
     Ready(PreparedSpeechBuffer),
@@ -110,12 +115,15 @@ pub(crate) struct VoiceTranscriptionNoSpeech {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VoiceTranscriptionNoSpeechReason {
+    #[cfg(test)]
     TooShort,
     NoSpeechDetected,
+    #[cfg(test)]
     EmptyBuffer,
     EmptyTranscript,
 }
 
+#[cfg(test)]
 impl From<VoiceNoSpeechReason> for VoiceTranscriptionNoSpeechReason {
     fn from(reason: VoiceNoSpeechReason) -> Self {
         match reason {
@@ -320,6 +328,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub(crate) fn transcribe_prepared_speech_buffer<T>(
     transcriber: &T,
     buffer: PreparedSpeechBuffer,
@@ -334,6 +343,7 @@ where
     )
 }
 
+#[cfg(test)]
 pub(crate) fn transcribe_prepared_speech_buffer_with_strategy<T>(
     transcriber: &T,
     buffer: PreparedSpeechBuffer,

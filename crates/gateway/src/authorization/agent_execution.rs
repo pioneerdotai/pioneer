@@ -179,11 +179,8 @@ fn select_profile(
             let mut candidates = options.profiles.iter().filter(|profile| {
                 (profile.compatible_agent_identity_ids.contains(&identity.id)
                     || (identity.source_kind == AgentIdentitySourceKind::Ephemeral
-                        && inherited_profile.is_some_and(|parent| {
-                            parent
-                                .compatible_agent_identity_ids
-                                .iter()
-                                .any(|id| profile.compatible_agent_identity_ids.contains(id))
+                        && options.agents.iter().any(|source| {
+                            profile.compatible_agent_identity_ids.contains(&source.id)
                         })))
                     && profile.model_id == *model_id
                     && selected_provider.is_none_or(|provider| profile.provider_id == provider)
@@ -420,32 +417,22 @@ pub(crate) fn derive_child_launch_grant(
     {
         child_identities.push(identity.clone());
     }
-    let mut child_profiles = options.profiles.clone();
-    if let Some(candidate) = child_profiles
-        .iter_mut()
-        .find(|candidate| candidate.id == profile.id)
-    {
-        *candidate = profile.clone();
-    } else {
-        child_profiles.push(profile.clone());
-    }
-    let child_launch_ceiling =
-        pioneer_protocol::ChildAgentLaunchGrantSet::new(child_identities, child_profiles)
-            .and_then(|grant| {
-                grant.with_policy(
-                    options.inherit_parent_agent_available,
-                    options.derived_ephemeral_available,
-                    options.inherit_parent_profile_available,
-                    options.allowed_skill_ids.clone(),
-                    options.allowed_mcp_server_ids.clone(),
-                    options.max_permission_profile.clone(),
-                )
-            })
-            .map_err(|_| {
-                ExecutionMaterializationError::InvalidLaunchSelection(
-                    "child launch grant ceiling is invalid",
-                )
-            })?;
+    let child_launch_ceiling = pioneer_protocol::ChildAgentLaunchGrantSet::new(child_identities)
+        .and_then(|grant| {
+            grant.with_policy(
+                options.inherit_parent_agent_available,
+                options.derived_ephemeral_available,
+                options.inherit_parent_profile_available,
+                options.allowed_skill_ids.clone(),
+                options.allowed_mcp_server_ids.clone(),
+                options.max_permission_profile.clone(),
+            )
+        })
+        .map_err(|_| {
+            ExecutionMaterializationError::InvalidLaunchSelection(
+                "child launch grant ceiling is invalid",
+            )
+        })?;
     Ok(ChildAgentLaunchGrant {
         execution_id,
         parent_execution_id: parent.execution_id.clone(),
@@ -888,9 +875,9 @@ mod tests {
         .unwrap();
 
         child.child_launch_ceiling.validate().unwrap();
-        assert_eq!(child.child_launch_ceiling.profiles.len(), 1);
         assert!(
-            child.child_launch_ceiling.profiles[0]
+            child
+                .profile
                 .compatible_agent_identity_ids
                 .contains(&child.identity.id)
         );

@@ -98,11 +98,7 @@ async fn graph_for_source(
         policy_generation: 1,
         fingerprint: "profile".to_owned(),
     };
-    let ceiling = pioneer_protocol::ChildAgentLaunchGrantSet::new(
-        vec![identity.clone()],
-        vec![profile.clone()],
-    )
-    .unwrap();
+    let ceiling = pioneer_protocol::ChildAgentLaunchGrantSet::new(vec![identity.clone()]).unwrap();
     let grant_json = serde_json::json!({"identity": identity, "profile": profile, "child_launch_grant": ceiling}).to_string();
     let root_id = parent_id.unwrap_or(execution_id).to_owned();
     let execution = AgentExecutionInput {
@@ -257,8 +253,7 @@ async fn updated_allowed_child_reaches_atomic_graph_admission_and_replay_preserv
 }
 
 #[tokio::test]
-async fn graph_rejects_widened_child_models_skills_mcp_permissions_and_foreign_sources_atomically()
-{
+async fn graph_rejects_widened_child_skills_mcp_permissions_and_foreign_sources_atomically() {
     let store = store().await;
     sync(&store, true, "original").await;
     let root = graph(&store, "Econtinuityroot123456", None).await;
@@ -266,43 +261,34 @@ async fn graph_rejects_widened_child_models_skills_mcp_permissions_and_foreign_s
         .commit_agent_execution_graph(root.clone())
         .await
         .unwrap();
-    for change in 0..7 {
+    for change in 0..5 {
         let mut child = graph(
             &store,
             "Econtinuitychild12345",
             Some(&root.child_execution.id),
         )
         .await;
-        let (identity, mut profile, ceiling) =
+        let (identity, profile, ceiling) =
             parse_agent_execution_launch_grant(&child.grant.grant_json).unwrap();
         let mut skills = Vec::new();
         let mut mcp = Vec::new();
         let mut cap = ceiling.max_permission_profile.clone();
         match change {
-            0 => profile.model_id = "added-model".to_owned(),
-            1 => profile
-                .allowed_reasoning
-                .push(pioneer_protocol::TurnReasoningSelection {
-                    effort: "high".to_owned(),
-                }),
-            2 => skills
+            0 => skills
                 .push(pioneer_protocol::SkillId::new("Scontinuity1234567890".to_owned()).unwrap()),
-            3 => mcp.push("mcp-server:workspace:added".to_owned()),
-            4 => {
+            1 => mcp.push("mcp-server:workspace:added".to_owned()),
+            2 => {
                 cap = pioneer_protocol::task_permission_cap_for_mode(
                     pioneer_protocol::TurnPermissionMode::FullAccess,
                 )
             }
-            5 => child.identity.workspace_id = "another-workspace".to_owned(),
+            3 => child.identity.workspace_id = "another-workspace".to_owned(),
             _ => child.identity.source_id = "another-source".to_owned(),
         }
-        let ceiling = pioneer_protocol::ChildAgentLaunchGrantSet::new(
-            vec![identity.clone()],
-            vec![profile.clone()],
-        )
-        .unwrap()
-        .with_policy(false, false, false, skills, mcp, cap)
-        .unwrap();
+        let ceiling = pioneer_protocol::ChildAgentLaunchGrantSet::new(vec![identity.clone()])
+            .unwrap()
+            .with_policy(false, false, false, skills, mcp, cap)
+            .unwrap();
         child.child_execution.resolved_profile_fingerprint = Some(profile.fingerprint.clone());
         child.grant.grant_json = serde_json::json!({"identity": identity, "profile": profile, "child_launch_grant": ceiling}).to_string();
         child.grant.grant_fingerprint =
@@ -349,13 +335,10 @@ async fn narrowed_child_reasoning_and_tool_cap_reach_graph_admission() {
     profile.allowed_reasoning.clear();
     let mut cap = ceiling.max_permission_profile;
     cap.effective_policy.denied_tools = vec!["shell_command".to_owned()];
-    let ceiling = pioneer_protocol::ChildAgentLaunchGrantSet::new(
-        vec![identity.clone()],
-        vec![profile.clone()],
-    )
-    .unwrap()
-    .with_policy(false, false, false, Vec::new(), Vec::new(), cap)
-    .unwrap();
+    let ceiling = pioneer_protocol::ChildAgentLaunchGrantSet::new(vec![identity.clone()])
+        .unwrap()
+        .with_policy(false, false, false, Vec::new(), Vec::new(), cap)
+        .unwrap();
     child.grant.grant_json = serde_json::json!({"identity": identity, "profile": profile, "child_launch_grant": ceiling}).to_string();
     child.grant.grant_fingerprint =
         agent_execution_grant_fingerprint(&child.grant.grant_json).unwrap();
@@ -506,11 +489,7 @@ async fn changed_cli_engine_cannot_reuse_an_old_label_to_pass_parent_ceiling() {
     assert_eq!(identity.role_label.as_deref(), Some("claude"));
     // The source revision/fingerprint are real, but the claimed engine is old.
     identity.role_label = Some("codex".to_owned());
-    let ceiling = pioneer_protocol::ChildAgentLaunchGrantSet::new(
-        vec![identity.clone()],
-        vec![profile.clone()],
-    )
-    .unwrap();
+    let ceiling = pioneer_protocol::ChildAgentLaunchGrantSet::new(vec![identity.clone()]).unwrap();
     child.grant.grant_json = serde_json::json!({"identity": identity, "profile": profile, "child_launch_grant": ceiling}).to_string();
     child.grant.grant_fingerprint =
         agent_execution_grant_fingerprint(&child.grant.grant_json).unwrap();
@@ -599,11 +578,8 @@ async fn ephemeral_cli_execution_is_fenced_by_its_registered_runtime_source() {
     child.child_execution.identity_source_fingerprint = actor.source_fingerprint.clone();
     child.child_execution.presentation_snapshot_id = Some(child.presentation.id.clone());
     child.grant.child_identity_id = child.identity.id.clone();
-    let ceiling = pioneer_protocol::ChildAgentLaunchGrantSet::new(
-        vec![actor.clone(), backing],
-        vec![profile.clone()],
-    )
-    .unwrap();
+    let ceiling =
+        pioneer_protocol::ChildAgentLaunchGrantSet::new(vec![actor.clone(), backing]).unwrap();
     child.grant.grant_json =
         serde_json::json!({"identity": actor, "profile": profile, "child_launch_grant": ceiling})
             .to_string();
@@ -633,11 +609,8 @@ async fn ephemeral_cli_execution_is_fenced_by_its_registered_runtime_source() {
         .grant_json,
     )
     .unwrap();
-    let ceiling = pioneer_protocol::ChildAgentLaunchGrantSet::new(
-        vec![actor.clone(), current],
-        vec![profile.clone()],
-    )
-    .unwrap();
+    let ceiling =
+        pioneer_protocol::ChildAgentLaunchGrantSet::new(vec![actor.clone(), current]).unwrap();
     child.grant.grant_json =
         serde_json::json!({"identity": actor, "profile": profile, "child_launch_grant": ceiling})
             .to_string();

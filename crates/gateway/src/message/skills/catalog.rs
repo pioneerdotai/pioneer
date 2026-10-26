@@ -454,9 +454,14 @@ impl MessageProcessor {
         attachments: &[crate::cli_runtime::skills::CliRuntimeSkillAttachment],
         mcp_availability: &pioneer_agent::AgentMcpAvailability,
         include_task_orchestration: bool,
+        include_threads: bool,
         include_html: bool,
     ) -> anyhow::Result<Vec<pioneer_skills::ResolvedSkill>> {
-        if attachments.is_empty() && !include_task_orchestration && !include_html {
+        if attachments.is_empty()
+            && !include_task_orchestration
+            && !include_threads
+            && !include_html
+        {
             return Ok(Vec::new());
         }
         let context = self.skills_runtime_context(workspace_id)?;
@@ -522,6 +527,24 @@ impl MessageProcessor {
                 {
                     selected.push(skill.clone());
                 }
+            }
+        }
+        if include_threads {
+            let skill = resolution
+                .active
+                .iter()
+                .find(|skill| {
+                    crate::cli_runtime::skills::cli_orchestration_skill(&skill.definition)
+                        && skill.definition.identity.slug == "threads"
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("required CLI skill pioneer/threads is unavailable")
+                })?;
+            if !selected
+                .iter()
+                .any(|selected| selected.skill_id == skill.skill_id)
+            {
+                selected.push(skill.clone());
             }
         }
         Ok(selected)

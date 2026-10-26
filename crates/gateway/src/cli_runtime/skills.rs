@@ -12,9 +12,9 @@ use pioneer_skills::{
     ExternalRuntimeReceiptConversionCandidate, ExternalRuntimeSkillReceiptEntry,
     compute_skill_folder_hash, ensure_external_runtime_receipt_v2,
     external_runtime_skill_is_current, find_external_runtime_receipt_destination_entry,
-    prepare_external_runtime_receipt_v2, read_external_runtime_receipt,
-    remove_external_runtime_receipt_destination_entry, replace_external_runtime_skill,
-    upsert_external_runtime_receipt_entry, write_external_runtime_receipt_atomic,
+    read_external_runtime_receipt, remove_external_runtime_receipt_destination_entry,
+    replace_external_runtime_skill, upsert_external_runtime_receipt_entry,
+    write_external_runtime_receipt_atomic,
 };
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
@@ -68,31 +68,40 @@ impl std::fmt::Display for CliRuntimeClaudeSkillNotModelInvocable {
 
 impl std::error::Error for CliRuntimeClaudeSkillNotModelInvocable {}
 
-// Provider-visible aliases are deliberately independent of ordinary user skill names.
-const CLI_TASKS_SKILL_EXPORT_NAME: &str = "pioneer-system-tasks";
-const CLI_HTML_SKILL_EXPORT_NAME: &str = "pioneer-system-html";
-const CLI_SUBAGENTS_SKILL_EXPORT_NAME: &str = "pioneer-system-subagents";
+// This namespace is managed by Pioneer, independently of ordinary user skills.
+const CLI_SYSTEM_SKILL_EXPORT_PREFIX: &str = "pioneer-system-";
 
-fn cli_orchestration_export_name(
+fn cli_system_skill_export_name(
     source_kind: &str,
     owner: Option<&str>,
     slug: &str,
-) -> Option<&'static str> {
-    match (source_kind, owner, slug) {
-        ("system", Some("pioneer"), "html") => Some(CLI_HTML_SKILL_EXPORT_NAME),
-        ("system", Some("pioneer"), "tasks") => Some(CLI_TASKS_SKILL_EXPORT_NAME),
-        ("system", Some("pioneer"), "subagents") => Some(CLI_SUBAGENTS_SKILL_EXPORT_NAME),
-        _ => None,
-    }
+) -> Option<String> {
+    (source_kind == "system" && owner == Some("pioneer"))
+        .then(|| pioneer_skills::sanitize_name(&format!("{CLI_SYSTEM_SKILL_EXPORT_PREFIX}{slug}")))
+}
+
+fn verify_system_skill_export_alias(
+    source_kind: &str,
+    owner: Option<&str>,
+    slug: &str,
+    name: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        !name.starts_with(CLI_SYSTEM_SKILL_EXPORT_PREFIX)
+            || cli_system_skill_export_name(source_kind, owner, slug).as_deref() == Some(name),
+        "cli_runtime.skill_destination_not_owned: reserved Pioneer system skill alias"
+    );
+    Ok(())
 }
 
 pub(crate) fn cli_orchestration_skill(definition: &pioneer_skills::SkillDefinition) -> bool {
-    cli_orchestration_export_name(
-        definition.identity.source_kind.as_db_value(),
-        definition.identity.owner.as_deref(),
-        &definition.identity.slug,
-    )
-    .is_some()
+    // Required-skill export eligibility is separate from installation naming.
+    definition.identity.source_kind == pioneer_skills::SkillSourceKind::System
+        && definition.identity.owner.as_deref() == Some("pioneer")
+        && matches!(
+            definition.identity.slug.as_str(),
+            "html" | "tasks" | "subagents" | "threads"
+        )
 }
 
 pub(crate) fn ensure_cli_runtime_skills_exportable(
@@ -181,13 +190,18 @@ pub(crate) fn build_cli_runtime_skill_install_plans(
     let mut destinations = std::collections::BTreeMap::<PathBuf, String>::new();
     let mut plans = Vec::with_capacity(resolved.len());
     for skill in resolved {
-        let install_name = cli_orchestration_export_name(
+        let install_name = cli_system_skill_export_name(
             skill.definition.identity.source_kind.as_db_value(),
             skill.definition.identity.owner.as_deref(),
             &skill.definition.identity.slug,
         )
-        .map(str::to_owned)
         .unwrap_or_else(|| pioneer_skills::sanitize_name(&skill.definition.identity.name));
+        verify_system_skill_export_alias(
+            skill.definition.identity.source_kind.as_db_value(),
+            skill.definition.identity.owner.as_deref(),
+            &skill.definition.identity.slug,
+            &install_name,
+        )?;
         let destination = normalized_destination(&native_skills_root.join(&install_name))?;
         if let Some(first_slug) = destinations.insert(destination.clone(), skill.slug.clone()) {
             anyhow::bail!(
@@ -265,7 +279,7 @@ pub(crate) fn restore_cli_runtime_selected_skills(
                 entry.runtime_id == runtime.id
                     && entry.runtime_kind == runtime_kind_name
                     && entry.skill_id == binding.skill_id
-                    && cli_orchestration_export_name(
+                    && cli_system_skill_export_name(
                         &binding.source_kind,
                         binding.skill_owner.as_deref(),
                         &binding.skill_slug,
@@ -279,6 +293,12 @@ pub(crate) fn restore_cli_runtime_selected_skills(
                 binding.skill_id
             );
         };
+        verify_system_skill_export_alias(
+            &binding.source_kind,
+            binding.skill_owner.as_deref(),
+            &binding.skill_slug,
+            &entry.install_name,
+        )?;
         if entry.owner != binding.skill_owner
             || entry.slug != binding.skill_slug
             || entry.source_kind != binding.source_kind
@@ -313,7 +333,7 @@ pub(crate) fn restore_cli_runtime_selected_skills(
                 binding.skill_id
             );
         }
-        if cli_orchestration_export_name(
+        if cli_system_skill_export_name(
             &binding.source_kind,
             binding.skill_owner.as_deref(),
             &binding.skill_slug,
@@ -388,6 +408,34 @@ pub(crate) struct CliRuntimeCombinedPreflightPlan {
     pub(crate) mcp_projection: Option<crate::turn_mcp::ResolvedMcpTurnProjection>,
     pub(crate) skill_install_plans: Vec<CliRuntimeSkillInstallPlan>,
     pub(crate) skill_bindings: Vec<TurnSkillBinding>,
+}
+
+/// Attachments must describe the final catalog, including narrowing after
+/// execution admission. Explicit skill selections keep their existing meaning.
+pub(crate) fn reconcile_implicit_threads_skill(plan: &mut CliRuntimeCombinedPreflightPlan) {
+    if plan.mcp_projection.as_ref().is_some_and(|projection| {
+        projection
+            .tools
+            .iter()
+            .any(crate::turn_mcp::native_tools::is_threads_operation)
+    }) {
+        return;
+    }
+    let omitted = plan
+        .skill_bindings
+        .iter()
+        .filter(|binding| {
+            binding.source_kind == "system"
+                && binding.skill_owner.as_deref() == Some("pioneer")
+                && binding.skill_slug == "threads"
+                && binding.resolved_reason == "implicit"
+        })
+        .map(|binding| binding.skill_id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    plan.skill_bindings
+        .retain(|binding| !omitted.contains(&binding.skill_id));
+    plan.skill_install_plans
+        .retain(|plan| !omitted.contains(&plan.skill_id));
 }
 
 pub(crate) fn partition_cli_runtime_capabilities(
@@ -554,25 +602,14 @@ fn planned_receipt_entry(
     }
 }
 
-/// Refuse to adopt a user directory, a symlink, or content edited since its receipt.
-/// This check runs before the current-install shortcut and before any receipt removal.
-fn verify_managed_orchestration_destination(
-    plan: &CliRuntimeSkillInstallPlan,
-    previous: Option<&ExternalRuntimeSkillReceiptEntry>,
-    expected: &ExternalRuntimeSkillReceiptEntry,
-) -> Result<()> {
-    if let Some(previous) = previous {
-        let mut ownership = expected.clone();
-        ownership.source_folder_hash = previous.source_folder_hash.clone();
-        ownership.installed_at_unix_ms = previous.installed_at_unix_ms;
-        ownership.updated_at_unix_ms = previous.updated_at_unix_ms;
-        if &ownership != previous {
-            anyhow::bail!(
-                "cli_runtime.skill_destination_not_owned: conflicting installation receipt for `{}`",
-                plan.install_name
-            );
-        }
-    }
+/// Pioneer replaces its reserved exports regardless of this environment's receipt.
+/// Keep the path and symlink checks before replacement or receipt persistence.
+fn verify_managed_orchestration_destination(plan: &CliRuntimeSkillInstallPlan) -> Result<()> {
+    anyhow::ensure!(
+        normalized_destination(&plan.destination)?
+            == normalized_destination(&plan.native_skills_root.join(&plan.install_name))?,
+        "cli_runtime.skill_destination_not_owned: destination escapes native skills root"
+    );
     match fs::symlink_metadata(&plan.destination) {
         Ok(metadata) => {
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -581,16 +618,7 @@ fn verify_managed_orchestration_destination(
                     plan.destination.display()
                 );
             }
-            let previous = previous.context("cli_runtime.skill_destination_not_owned: existing directory has no ownership receipt")?;
             verify_managed_skill_tree(&plan.destination)?;
-            let actual = compute_skill_folder_hash(&plan.destination)?;
-            // A crash after copying but before receipt commit can leave the new,
-            // exact exported content behind an otherwise matching old receipt.
-            if actual != previous.source_folder_hash && actual != expected.source_folder_hash {
-                anyhow::bail!(
-                    "cli_runtime.skill_destination_not_owned: managed skill content was modified"
-                );
-            }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
@@ -684,18 +712,26 @@ pub(crate) async fn install_one_cli_runtime_skill(
     receipt_conversion_candidates: &[ExternalRuntimeReceiptConversionCandidate],
     plan: &CliRuntimeSkillInstallPlan,
 ) -> Result<CliRuntimeSkillInstallResult> {
+    verify_system_skill_export_alias(
+        &plan.source_kind,
+        plan.owner.as_deref(),
+        &plan.slug,
+        &plan.install_name,
+    )?;
     let _destination_guard =
         acquire_cli_runtime_skill_destination_lock(destination_locks, &plan.destination).await?;
     let managed =
-        cli_orchestration_export_name(&plan.source_kind, plan.owner.as_deref(), &plan.slug);
-    if let Some(name) = managed {
+        cli_system_skill_export_name(&plan.source_kind, plan.owner.as_deref(), &plan.slug);
+    if let Some(name) = managed.as_deref() {
         anyhow::ensure!(
             plan.install_name == name,
             "invalid orchestration skill export binding"
         );
         verify_orchestration_paths(&plan.native_skills_root, &plan.receipt_path)?;
+        verify_managed_orchestration_destination(plan)?;
     }
     let export = managed
+        .as_ref()
         .map(|_| prepare_orchestration_export(plan))
         .transpose()?;
     let source = export
@@ -706,42 +742,21 @@ pub(crate) async fn install_one_cli_runtime_skill(
 
     let (receipt, previous) = {
         let _receipt_guard = skills_write_lock.clone().lock_owned().await;
-        let (receipt, converted) = prepare_external_runtime_receipt_v2(
-            &plan.receipt_path,
-            receipt_conversion_candidates,
-            // An explicit user plan can precede the automatic plans. No
-            // reserved receipt may be discarded by that earlier conversion.
-            &[
-                (
-                    plan.native_skills_root.as_path(),
-                    CLI_HTML_SKILL_EXPORT_NAME,
-                ),
-                (
-                    plan.native_skills_root.as_path(),
-                    CLI_TASKS_SKILL_EXPORT_NAME,
-                ),
-                (
-                    plan.native_skills_root.as_path(),
-                    CLI_SUBAGENTS_SKILL_EXPORT_NAME,
-                ),
-            ],
-        )?;
+        let receipt =
+            ensure_external_runtime_receipt_v2(&plan.receipt_path, receipt_conversion_candidates)?;
         let previous = find_external_runtime_receipt_destination_entry(
             &receipt,
             &plan.native_skills_root,
             &plan.install_name,
         )?
         .cloned();
-        if managed.is_some() {
-            verify_managed_orchestration_destination(plan, previous.as_ref(), &expected)?;
-        }
-        if converted {
-            write_external_runtime_receipt_atomic(&plan.receipt_path, &receipt)?;
-        }
         (receipt, previous)
     };
     if let Some(entry) = previous.as_ref()
         && external_runtime_skill_is_current(&receipt, &expected, &plan.destination)?
+        // Another Pioneer environment may have updated the shared export while
+        // this environment's receipt still describes its previous contents.
+        && (managed.is_none() || compute_skill_folder_hash(&plan.destination)? == source_folder_hash)
     {
         return Ok(CliRuntimeSkillInstallResult {
             status: CliRuntimeSkillInstallStatus::Current,
@@ -1105,7 +1120,7 @@ mod tests {
 
     #[test]
     fn cli_required_task_skills_are_supported_without_enabling_other_required_skills() {
-        for slug in ["tasks", "subagents", "html"] {
+        for slug in ["tasks", "subagents", "html", "threads"] {
             let mut skill = resolved_skill(slug, SkillSourceKind::System);
             skill.definition.identity.owner = Some("pioneer".to_owned());
             skill.definition.policy_hints.implicit_invocation =
@@ -1123,7 +1138,7 @@ mod tests {
     }
 
     fn canonical_orchestration_skills() -> Vec<pioneer_skills::ResolvedSkill> {
-        ["tasks", "subagents", "html"]
+        ["tasks", "subagents", "html", "threads"]
             .into_iter()
             .map(|slug| {
                 let mut skill = resolved_skill(slug, SkillSourceKind::System);
@@ -1160,7 +1175,7 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let home = temp.path().join("native");
             let runtime = runtime_instance(config_kind, home.display().to_string(), None);
-            for name in ["tasks", "subagents", "html"] {
+            for name in ["tasks", "subagents", "html", "threads"] {
                 let foreign = home.join("skills").join(name);
                 fs::create_dir_all(&foreign).unwrap();
                 fs::write(foreign.join("SKILL.md"), format!("user {name}")).unwrap();
@@ -1226,7 +1241,7 @@ mod tests {
                 &receipt_path,
             )
             .unwrap();
-            assert_eq!(restored.len(), 3);
+            assert_eq!(restored.len(), 4);
             let initial = normalize_cli_runtime_selected_skills(
                 installed.iter().map(CliRuntimeSelectedSkill::from),
             )
@@ -1240,13 +1255,43 @@ mod tests {
                 [
                     "pioneer-system-html",
                     "pioneer-system-subagents",
-                    "pioneer-system-tasks"
+                    "pioneer-system-tasks",
+                    "pioneer-system-threads"
                 ]
             );
             if kind == pioneer_protocol::CLIAgentRuntimeKind::Claude {
-                assert_claude_skill_projection_reuses_process(initial, restored);
+                assert_claude_skill_projection_reuses_process(initial.clone(), restored.clone());
             }
-            for name in ["tasks", "subagents", "html"] {
+            // Only the legacy receipt uses owner/slug labels. Resolved skills
+            // and their frozen bindings retain the resolver's short slugs.
+            let mut legacy = read_external_runtime_receipt(&receipt_path).unwrap();
+            legacy.version = 1;
+            for entry in &mut legacy.entries {
+                entry.skill_slug = match entry.owner.as_deref() {
+                    Some(owner) => format!("{owner}/{}", entry.slug),
+                    None => entry.slug.clone(),
+                };
+            }
+            fs::write(&receipt_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+            // Conversion preserves legacy labels; restore must still accept
+            // the unchanged modern bindings, independently of install plans.
+            let converted = ensure_external_runtime_receipt_v2(&receipt_path, &candidates).unwrap();
+            assert_eq!(converted.version, 2);
+            assert_eq!(
+                read_external_runtime_receipt(&receipt_path).unwrap(),
+                converted
+            );
+            assert_eq!(
+                restore_cli_runtime_selected_skills(
+                    &runtime,
+                    kind,
+                    &cli_runtime_turn_skill_bindings(&resolved),
+                    &receipt_path
+                )
+                .unwrap(),
+                restored
+            );
+            for name in ["tasks", "subagents", "html", "threads"] {
                 let foreign = home.join("skills").join(name);
                 assert_eq!(
                     fs::read_to_string(foreign.join("SKILL.md")).unwrap(),
@@ -1340,6 +1385,7 @@ mod tests {
                 "pioneer-system-html",
                 "pioneer-system-subagents",
                 "pioneer-system-tasks",
+                "pioneer-system-threads",
                 "z-user"
             ]
         );
@@ -1353,10 +1399,167 @@ mod tests {
                 "z-user",
                 "pioneer-system-tasks",
                 "pioneer-system-subagents",
-                "pioneer-system-html"
+                "pioneer-system-html",
+                "pioneer-system-threads"
             ]
         );
         assert_claude_skill_projection_reuses_process(initial, restored);
+    }
+
+    #[tokio::test]
+    async fn system_skill_namespace_rejects_foreign_plans_before_writes() {
+        for alias in ["pioneer-system-threads", "pioneer-system-future-skill"] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut plan = install_plan(temp.path(), "selected-user");
+            plan.install_name = alias.to_owned();
+            plan.destination = plan.native_skills_root.join(alias);
+            fs::create_dir_all(&plan.destination).unwrap();
+            fs::write(plan.destination.join("sentinel"), b"foreign").unwrap();
+            let before = fs::read(&plan.receipt_path).ok();
+            let error = install_one_cli_runtime_skill(
+                &new_cli_runtime_skill_destination_locks(),
+                &Arc::new(Mutex::new(())),
+                &[receipt_candidate(&plan)],
+                &plan,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("reserved Pioneer system skill alias")
+            );
+            assert_eq!(fs::read(&plan.receipt_path).ok(), before);
+            assert_eq!(
+                fs::read(plan.destination.join("sentinel")).unwrap(),
+                b"foreign"
+            );
+
+            let mut selected = resolved_skill("selected-user", SkillSourceKind::Registry);
+            selected.definition.identity.owner = Some("registry".to_owned());
+            selected.definition.identity.name = alias.to_owned();
+            let runtime = runtime_instance(
+                pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex,
+                plan.native_skills_root
+                    .parent()
+                    .unwrap()
+                    .display()
+                    .to_string(),
+                None,
+            );
+            assert!(
+                build_cli_runtime_skill_install_plans(
+                    &runtime,
+                    pioneer_protocol::CLIAgentRuntimeKind::Codex,
+                    &[selected.clone()],
+                    &plan.receipt_path,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("reserved Pioneer system skill alias")
+            );
+            let entry = planned_receipt_entry(
+                &plan,
+                compute_skill_folder_hash(&plan.destination).unwrap(),
+                1,
+                1,
+            );
+            let mut receipt = pioneer_skills::ExternalRuntimeSkillReceipt::default();
+            upsert_external_runtime_receipt_entry(&mut receipt, entry).unwrap();
+            write_external_runtime_receipt_atomic(&plan.receipt_path, &receipt).unwrap();
+            let before = fs::read(&plan.receipt_path).unwrap();
+            let error = restore_cli_runtime_selected_skills(
+                &runtime,
+                pioneer_protocol::CLIAgentRuntimeKind::Codex,
+                &cli_runtime_turn_skill_bindings(&[selected]),
+                &plan.receipt_path,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("reserved Pioneer system skill alias")
+            );
+            assert_eq!(fs::read(&plan.receipt_path).unwrap(), before);
+            assert_eq!(
+                fs::read(plan.destination.join("sentinel")).unwrap(),
+                b"foreign"
+            );
+        }
+    }
+
+    #[test]
+    fn final_threads_catalog_reconciles_implicit_attachments_without_changing_task_selection() {
+        use crate::turn_mcp::native_tools::NativeToolFamily;
+        use crate::turn_mcp::{McpProjectionLimits, ResolvedMcpTurnProjection};
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime_instance(
+            pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex,
+            temp.path().join("native").display().to_string(),
+            None,
+        );
+        for (operations, explicit) in [
+            (vec![], false),
+            (vec!["threads_start_options"], false),
+            (vec!["threads_list", "threads_start_options"], false),
+            (vec![], true),
+        ] {
+            let mut resolved = canonical_orchestration_skills();
+            if explicit {
+                resolved
+                    .iter_mut()
+                    .find(|skill| skill.definition.identity.slug == "threads")
+                    .unwrap()
+                    .reason = SkillResolvedReason::ExplicitCapability;
+            }
+            let selected_operations = &operations;
+            let definitions = [NativeToolFamily::Tasks, NativeToolFamily::Threads]
+                .into_iter()
+                .flat_map(|family| {
+                    family
+                        .definitions()
+                        .into_iter()
+                        .filter(move |tool| selected_operations.contains(&tool.spec.name.as_str()))
+                        .map(move |tool| (family, tool))
+                })
+                .collect();
+            let mut plan = CliRuntimeCombinedPreflightPlan {
+                mcp_projection: Some(
+                    ResolvedMcpTurnProjection::empty("workspace", "turn")
+                        .with_native_tools(definitions, McpProjectionLimits::default())
+                        .unwrap(),
+                ),
+                skill_install_plans: build_cli_runtime_skill_install_plans(
+                    &runtime,
+                    pioneer_protocol::CLIAgentRuntimeKind::Codex,
+                    &resolved,
+                    &temp.path().join("receipt.json"),
+                )
+                .unwrap(),
+                skill_bindings: cli_runtime_turn_skill_bindings(&resolved),
+            };
+            reconcile_implicit_threads_skill(&mut plan);
+            let expected = explicit || operations.contains(&"threads_list");
+            assert_eq!(
+                plan.skill_bindings
+                    .iter()
+                    .any(|binding| binding.skill_slug == "threads"),
+                expected
+            );
+            assert_eq!(
+                plan.skill_install_plans
+                    .iter()
+                    .any(|plan| plan.slug == "threads"),
+                expected
+            );
+            for slug in ["tasks", "subagents"] {
+                assert!(
+                    plan.skill_bindings
+                        .iter()
+                        .any(|binding| binding.skill_slug == slug)
+                );
+            }
+        }
     }
 
     #[test]
@@ -1371,47 +1574,24 @@ mod tests {
 
     #[tokio::test]
     async fn orchestration_export_update_recovers_after_copy_without_receipt_commit() {
-        let temp = tempfile::tempdir().unwrap();
-        let runtime = runtime_instance(
-            pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude,
-            temp.path().join("native").display().to_string(),
-            None,
-        );
-        let resolved = canonical_orchestration_skills();
-        let mut plan = build_cli_runtime_skill_install_plans(
-            &runtime,
-            pioneer_protocol::CLIAgentRuntimeKind::Claude,
-            &resolved,
-            &temp.path().join("state/receipt.json"),
-        )
-        .unwrap()
-        .remove(0);
-        let candidates = [receipt_candidate(&plan)];
-        let original = install_one_cli_runtime_skill(
-            &new_cli_runtime_skill_destination_locks(),
-            &Arc::new(Mutex::new(())),
-            &candidates,
-            &plan,
-        )
-        .await
-        .unwrap();
-        let updated_source = temp.path().join("updated-source");
-        replace_external_runtime_skill(&plan.source, &updated_source).unwrap();
-        plan.source = updated_source;
-        for lost_receipt in [false, true] {
-            fs::write(
-                plan.source.join("references/update.txt"),
-                format!("updated {lost_receipt}"),
+        for skill_index in 0..4 {
+            let temp = tempfile::tempdir().unwrap();
+            let runtime = runtime_instance(
+                pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude,
+                temp.path().join("native").display().to_string(),
+                None,
+            );
+            let resolved = canonical_orchestration_skills();
+            let mut plan = build_cli_runtime_skill_install_plans(
+                &runtime,
+                pioneer_protocol::CLIAgentRuntimeKind::Claude,
+                &resolved,
+                &temp.path().join("state/receipt.json"),
             )
-            .unwrap();
-            if lost_receipt {
-                // Model a restart after successful copy, with the old ownership
-                // receipt still durable. Use fresh locks rather than an in-memory
-                // installation result when retrying.
-                let export = prepare_orchestration_export(&plan).unwrap();
-                replace_external_runtime_skill(export.path(), &plan.destination).unwrap();
-            }
-            let updated = install_one_cli_runtime_skill(
+            .unwrap()
+            .remove(skill_index);
+            let candidates = [receipt_candidate(&plan)];
+            let original = install_one_cli_runtime_skill(
                 &new_cli_runtime_skill_destination_locks(),
                 &Arc::new(Mutex::new(())),
                 &candidates,
@@ -1419,211 +1599,267 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(updated.status, CliRuntimeSkillInstallStatus::Updated);
-            assert_ne!(updated.source_folder_hash, original.source_folder_hash);
-            assert_eq!(
-                compute_skill_folder_hash(&plan.destination).unwrap(),
-                updated.source_folder_hash
-            );
-            let restored = restore_cli_runtime_selected_skills(
-                &runtime,
-                pioneer_protocol::CLIAgentRuntimeKind::Claude,
-                &cli_runtime_turn_skill_bindings(&resolved[..1]),
-                &plan.receipt_path,
-            )
-            .unwrap();
-            assert_eq!(restored, vec![CliRuntimeSelectedSkill::from(&updated)]);
-            assert_eq!(
-                fs::read(plan.destination.join("references/update.txt")).unwrap(),
-                format!("updated {lost_receipt}").as_bytes()
-            );
+            let updated_source = temp.path().join("updated-source");
+            replace_external_runtime_skill(&plan.source, &updated_source).unwrap();
+            plan.source = updated_source;
+            for lost_receipt in [false, true] {
+                fs::write(
+                    plan.source.join("references/update.txt"),
+                    format!("updated {lost_receipt}"),
+                )
+                .unwrap();
+                if lost_receipt {
+                    // Model a restart after successful copy, with the previous
+                    // receipt still durable. Use fresh locks rather than an in-memory
+                    // installation result when retrying.
+                    let export = prepare_orchestration_export(&plan).unwrap();
+                    replace_external_runtime_skill(export.path(), &plan.destination).unwrap();
+                }
+                let updated = install_one_cli_runtime_skill(
+                    &new_cli_runtime_skill_destination_locks(),
+                    &Arc::new(Mutex::new(())),
+                    &candidates,
+                    &plan,
+                )
+                .await
+                .unwrap();
+                assert_eq!(updated.status, CliRuntimeSkillInstallStatus::Updated);
+                assert_ne!(updated.source_folder_hash, original.source_folder_hash);
+                assert_eq!(
+                    compute_skill_folder_hash(&plan.destination).unwrap(),
+                    updated.source_folder_hash
+                );
+                let restored = restore_cli_runtime_selected_skills(
+                    &runtime,
+                    pioneer_protocol::CLIAgentRuntimeKind::Claude,
+                    &cli_runtime_turn_skill_bindings(&resolved[skill_index..skill_index + 1]),
+                    &plan.receipt_path,
+                )
+                .unwrap();
+                assert_eq!(restored, vec![CliRuntimeSelectedSkill::from(&updated)]);
+                assert_eq!(
+                    fs::read(plan.destination.join("references/update.txt")).unwrap(),
+                    format!("updated {lost_receipt}").as_bytes()
+                );
+            }
         }
     }
 
     #[tokio::test]
-    async fn orchestration_exports_refuse_foreign_destinations_receipts_and_local_edits() {
-        for case in [
-            "unreceipted",
-            "foreign-receipt",
-            "stale-foreign-receipt",
-            "legacy-foreign-receipt",
-            "legacy-stale-foreign-receipt",
-            "legacy-sibling-foreign-receipt",
-            "edited-managed",
-            "hashed-exclusion",
-        ] {
+    async fn system_skill_exports_share_native_home_with_independent_receipts() {
+        for slug in ["tasks", "future-skill"] {
             let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("native");
             let runtime = runtime_instance(
                 pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex,
-                temp.path().join("native").display().to_string(),
+                home.display().to_string(),
                 None,
             );
-            let plan = if case == "legacy-sibling-foreign-receipt" {
-                // The explicitly selected user plan runs before automatic
-                // orchestration delivery and must preserve either reserved claim.
-                install_plan(temp.path(), "selected-user")
-            } else {
-                build_cli_runtime_skill_install_plans(
+            let mut prod_skill = resolved_skill(slug, SkillSourceKind::System);
+            prod_skill.definition.identity.owner = Some("pioneer".to_owned());
+            let prod_source = temp.path().join("prod-source");
+            fs::create_dir_all(prod_source.join("references")).unwrap();
+            fs::write(
+                prod_source.join("SKILL.md"),
+                format!("---\nname: {slug}\n---\nprod\n"),
+            )
+            .unwrap();
+            fs::write(prod_source.join("references/guide.md"), b"prod reference").unwrap();
+            prod_skill.definition.identity.skill_dir = prod_source.display().to_string();
+            assert!(
+                ensure_cli_runtime_skills_exportable(std::slice::from_ref(&prod_skill)).is_ok()
+            );
+            let mut dev_skill = prod_skill.clone();
+            let dev_source = temp.path().join("dev-source");
+            fs::create_dir_all(dev_source.join("references")).unwrap();
+            fs::write(
+                dev_source.join("SKILL.md"),
+                format!("---\nname: {slug}\n---\ndev\n"),
+            )
+            .unwrap();
+            fs::write(dev_source.join("references/guide.md"), b"dev reference").unwrap();
+            dev_skill.definition.identity.skill_dir = dev_source.display().to_string();
+            let prod_plan = build_cli_runtime_skill_install_plans(
+                &runtime,
+                pioneer_protocol::CLIAgentRuntimeKind::Codex,
+                std::slice::from_ref(&prod_skill),
+                &temp.path().join("prod/receipt.json"),
+            )
+            .unwrap()
+            .remove(0);
+            let dev_plan = build_cli_runtime_skill_install_plans(
+                &runtime,
+                pioneer_protocol::CLIAgentRuntimeKind::Codex,
+                &[dev_skill],
+                &temp.path().join("dev/receipt.json"),
+            )
+            .unwrap()
+            .remove(0);
+            assert_eq!(prod_plan.install_name, format!("pioneer-system-{slug}"));
+            assert_eq!(prod_plan.destination, dev_plan.destination);
+            let ordinary = home.join("skills").join(slug);
+            fs::create_dir_all(&ordinary).unwrap();
+            fs::write(ordinary.join("SKILL.md"), b"user skill").unwrap();
+            let candidates = [receipt_candidate(&prod_plan)];
+            let prod_locks = new_cli_runtime_skill_destination_locks();
+            let prod_receipt_lock = Arc::new(Mutex::new(()));
+            let original = install_one_cli_runtime_skill(
+                &prod_locks,
+                &prod_receipt_lock,
+                &candidates,
+                &prod_plan,
+            )
+            .await
+            .unwrap();
+            let original_receipt = fs::read(&prod_plan.receipt_path).unwrap();
+            assert!(!dev_plan.receipt_path.exists());
+            let dev = install_one_cli_runtime_skill(
+                &new_cli_runtime_skill_destination_locks(),
+                &Arc::new(Mutex::new(())),
+                &candidates,
+                &dev_plan,
+            )
+            .await
+            .unwrap();
+            assert_ne!(dev.source_folder_hash, original.source_folder_hash);
+            assert_eq!(
+                fs::read_to_string(dev_plan.destination.join("SKILL.md")).unwrap(),
+                format!("---\nname: pioneer-system-{slug}\n---\ndev\n")
+            );
+            assert_eq!(
+                fs::read(dev_plan.destination.join("references/guide.md")).unwrap(),
+                b"dev reference"
+            );
+            assert_eq!(fs::read(&prod_plan.receipt_path).unwrap(), original_receipt);
+            let dev_receipt = fs::read(&dev_plan.receipt_path).unwrap();
+            let refreshed = install_one_cli_runtime_skill(
+                &prod_locks,
+                &prod_receipt_lock,
+                &candidates,
+                &prod_plan,
+            )
+            .await
+            .unwrap();
+            assert_eq!(refreshed.status, CliRuntimeSkillInstallStatus::Updated);
+            assert_eq!(
+                fs::read_to_string(prod_plan.destination.join("SKILL.md")).unwrap(),
+                format!("---\nname: pioneer-system-{slug}\n---\nprod\n")
+            );
+            assert_eq!(
+                fs::read(prod_plan.destination.join("references/guide.md")).unwrap(),
+                b"prod reference"
+            );
+            assert_eq!(fs::read(&dev_plan.receipt_path).unwrap(), dev_receipt);
+            assert_eq!(
+                restore_cli_runtime_selected_skills(
+                    &runtime,
+                    pioneer_protocol::CLIAgentRuntimeKind::Codex,
+                    &cli_runtime_turn_skill_bindings(&[prod_skill]),
+                    &prod_plan.receipt_path,
+                )
+                .unwrap(),
+                vec![CliRuntimeSelectedSkill::from(&refreshed)]
+            );
+            assert_eq!(fs::read(ordinary.join("SKILL.md")).unwrap(), b"user skill");
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestration_exports_preserve_unhashed_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime_instance(
+            pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex,
+            temp.path().join("native").display().to_string(),
+            None,
+        );
+        let plan = build_cli_runtime_skill_install_plans(
+            &runtime,
+            pioneer_protocol::CLIAgentRuntimeKind::Codex,
+            &canonical_orchestration_skills(),
+            &temp.path().join("state/receipt.json"),
+        )
+        .unwrap()
+        .remove(0);
+        let locks = new_cli_runtime_skill_destination_locks();
+        let receipt_lock = Arc::new(Mutex::new(()));
+        let candidates = [receipt_candidate(&plan)];
+        install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, &plan)
+            .await
+            .unwrap();
+        fs::create_dir_all(plan.destination.join("node_modules")).unwrap();
+        let sentinel = plan.destination.join("node_modules/sentinel");
+        fs::write(&sentinel, b"preserve user files").unwrap();
+        let before = fs::read(&plan.receipt_path).unwrap();
+        let error = install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, &plan)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unhashed directory"));
+        assert_eq!(fs::read(sentinel).unwrap(), b"preserve user files");
+        assert_eq!(fs::read(&plan.receipt_path).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn orchestration_exports_never_replace_or_follow_foreign_symlinks() {
+        for skill_index in 0..4 {
+            use std::os::unix::fs::symlink;
+            for case in ["destination", "receipt", "root", "nested"] {
+                let temp = tempfile::tempdir().unwrap();
+                let runtime = runtime_instance(
+                    pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex,
+                    temp.path().join("native").display().to_string(),
+                    None,
+                );
+                let plan = build_cli_runtime_skill_install_plans(
                     &runtime,
                     pioneer_protocol::CLIAgentRuntimeKind::Codex,
                     &canonical_orchestration_skills(),
                     &temp.path().join("state/receipt.json"),
                 )
                 .unwrap()
-                .remove(0)
-            };
-            let locks = new_cli_runtime_skill_destination_locks();
-            let receipt_lock = Arc::new(Mutex::new(()));
-            let candidates = [receipt_candidate(&plan)];
-            if matches!(case, "edited-managed" | "hashed-exclusion") {
-                install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, &plan)
-                    .await
-                    .unwrap();
-            } else {
-                fs::create_dir_all(&plan.destination).unwrap();
-                fs::write(plan.destination.join("SKILL.md"), b"foreign skill").unwrap();
-            }
-            let sentinel = if case == "hashed-exclusion" {
-                fs::create_dir_all(plan.destination.join("node_modules")).unwrap();
-                plan.destination.join("node_modules/sentinel")
-            } else {
-                plan.destination.join("sentinel")
-            };
-            fs::write(&sentinel, b"preserve user files").unwrap();
-            if matches!(
-                case,
-                "foreign-receipt"
-                    | "stale-foreign-receipt"
-                    | "legacy-foreign-receipt"
-                    | "legacy-stale-foreign-receipt"
-                    | "legacy-sibling-foreign-receipt"
-            ) {
-                let mut entry = planned_receipt_entry(
-                    &plan,
-                    compute_skill_folder_hash(&plan.destination).unwrap(),
-                    1,
-                    1,
-                );
-                entry.skill_id = test_skill_id("another", SkillSourceKind::User);
-                entry.owner = None;
-                entry.slug = "another".to_owned();
-                entry.source_kind = "user".to_owned();
-                if case == "legacy-sibling-foreign-receipt" {
-                    entry.install_name = CLI_SUBAGENTS_SKILL_EXPORT_NAME.to_owned();
-                    entry.install_path = plan
-                        .native_skills_root
-                        .join(&entry.install_name)
-                        .display()
-                        .to_string();
-                }
-                let mut receipt = pioneer_skills::ExternalRuntimeSkillReceipt::default();
-                upsert_external_runtime_receipt_entry(&mut receipt, entry).unwrap();
-                write_external_runtime_receipt_atomic(&plan.receipt_path, &receipt).unwrap();
-                if matches!(
-                    case,
-                    "legacy-foreign-receipt"
-                        | "legacy-stale-foreign-receipt"
-                        | "legacy-sibling-foreign-receipt"
-                ) {
-                    let mut legacy = serde_json::to_value(&receipt).unwrap();
-                    legacy["version"] = serde_json::json!(1);
-                    fs::write(&plan.receipt_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
-                }
-            }
-            if matches!(
-                case,
-                "stale-foreign-receipt" | "legacy-stale-foreign-receipt"
-            ) {
-                fs::remove_dir_all(&plan.destination).unwrap();
-            }
-            let receipt_before = fs::read(&plan.receipt_path).ok();
-            let failed = install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, &plan)
-                .await
-                .unwrap_err();
-            assert!(
-                format!("{failed:#}").contains(if case.starts_with("legacy-") {
-                    "ownership of protected destination"
-                } else {
-                    "skill_destination_not_owned"
-                }),
-                "{case}: {failed:#}"
-            );
-            assert_eq!(fs::read(&plan.receipt_path).ok(), receipt_before, "{case}");
-            if matches!(
-                case,
-                "stale-foreign-receipt" | "legacy-stale-foreign-receipt"
-            ) {
-                assert!(!plan.destination.exists());
-            } else {
-                assert_eq!(
-                    fs::read(sentinel).unwrap(),
-                    b"preserve user files",
-                    "{case}"
-                );
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn orchestration_exports_never_replace_or_follow_foreign_symlinks() {
-        use std::os::unix::fs::symlink;
-        for case in ["destination", "receipt", "root", "nested"] {
-            let temp = tempfile::tempdir().unwrap();
-            let runtime = runtime_instance(
-                pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex,
-                temp.path().join("native").display().to_string(),
-                None,
-            );
-            let plan = build_cli_runtime_skill_install_plans(
-                &runtime,
-                pioneer_protocol::CLIAgentRuntimeKind::Codex,
-                &canonical_orchestration_skills(),
-                &temp.path().join("state/receipt.json"),
-            )
-            .unwrap()
-            .remove(0);
-            let locks = new_cli_runtime_skill_destination_locks();
-            let receipt_lock = Arc::new(Mutex::new(()));
-            let candidates = [receipt_candidate(&plan)];
-            let foreign = temp.path().join("foreign");
-            fs::create_dir_all(&foreign).unwrap();
-            fs::write(foreign.join("sentinel"), b"foreign").unwrap();
-            let link = match case {
-                "receipt" => {
-                    fs::create_dir_all(plan.receipt_path.parent().unwrap()).unwrap();
-                    fs::write(foreign.join("receipt.json"), b"foreign receipt").unwrap();
-                    symlink(foreign.join("receipt.json"), &plan.receipt_path).unwrap();
-                    plan.receipt_path.clone()
-                }
-                "root" => {
-                    fs::create_dir_all(plan.native_skills_root.parent().unwrap()).unwrap();
-                    symlink(&foreign, &plan.native_skills_root).unwrap();
-                    plan.native_skills_root.clone()
-                }
-                "nested" => {
+                .remove(skill_index);
+                let locks = new_cli_runtime_skill_destination_locks();
+                let receipt_lock = Arc::new(Mutex::new(()));
+                let candidates = [receipt_candidate(&plan)];
+                let foreign = temp.path().join("foreign");
+                fs::create_dir_all(&foreign).unwrap();
+                fs::write(foreign.join("sentinel"), b"foreign").unwrap();
+                let link = match case {
+                    "receipt" => {
+                        fs::create_dir_all(plan.receipt_path.parent().unwrap()).unwrap();
+                        fs::write(foreign.join("receipt.json"), b"foreign receipt").unwrap();
+                        symlink(foreign.join("receipt.json"), &plan.receipt_path).unwrap();
+                        plan.receipt_path.clone()
+                    }
+                    "root" => {
+                        fs::create_dir_all(plan.native_skills_root.parent().unwrap()).unwrap();
+                        symlink(&foreign, &plan.native_skills_root).unwrap();
+                        plan.native_skills_root.clone()
+                    }
+                    "nested" => {
+                        install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, &plan)
+                            .await
+                            .unwrap();
+                        let link = plan.destination.join("references/foreign");
+                        symlink(&foreign, &link).unwrap();
+                        link
+                    }
+                    _ => {
+                        fs::create_dir_all(&plan.native_skills_root).unwrap();
+                        symlink(&foreign, &plan.destination).unwrap();
+                        plan.destination.clone()
+                    }
+                };
+                let receipt_before = fs::read(&plan.receipt_path).ok();
+                assert!(
                     install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, &plan)
                         .await
-                        .unwrap();
-                    let link = plan.destination.join("references/foreign");
-                    symlink(&foreign, &link).unwrap();
-                    link
-                }
-                _ => {
-                    fs::create_dir_all(&plan.native_skills_root).unwrap();
-                    symlink(&foreign, &plan.destination).unwrap();
-                    plan.destination.clone()
-                }
-            };
-            let receipt_before = fs::read(&plan.receipt_path).ok();
-            assert!(
-                install_one_cli_runtime_skill(&locks, &receipt_lock, &candidates, &plan)
-                    .await
-                    .is_err()
-            );
-            assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
-            assert_eq!(fs::read(foreign.join("sentinel")).unwrap(), b"foreign");
-            assert_eq!(fs::read(&plan.receipt_path).ok(), receipt_before);
+                        .is_err()
+                );
+                assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+                assert_eq!(fs::read(foreign.join("sentinel")).unwrap(), b"foreign");
+                assert_eq!(fs::read(&plan.receipt_path).ok(), receipt_before);
+            }
         }
     }
 
