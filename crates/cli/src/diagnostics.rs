@@ -115,11 +115,22 @@ pub(crate) fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&result)?);
     if let Some(sql_cpu) = result.get("sql_cpu") {
         eprintln!(
-            "local SQL CPU: {}; coverage and independent capture window are in the manifest and sql-cpu.json",
+            "local SQL CPU: {}; observed-group aggregation: {}; coverage and independent capture window are in the manifest and sql-cpu.json",
             sql_cpu
                 .get("status")
                 .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
+                .unwrap_or("unknown"),
+            match sql_cpu.get("status").and_then(|v| v.as_str()) {
+                Some("recorded") => match sql_cpu
+                    .pointer("/aggregation/complete")
+                    .and_then(|v| v.as_bool())
+                {
+                    Some(true) => "complete",
+                    Some(false) => "INCOMPLETE (inspect aggregation reason and group_overflow)",
+                    None => "unknown (legacy schema)",
+                },
+                _ => "unavailable (table not retained)",
+            }
         );
     }
     ensure!(

@@ -105,6 +105,58 @@ metadata explain adapter failures. A native `.trace` is a directory; preserve th
 whole directory. The bundle is a separate snapshot with references to captures.
 A manifest's `files` inventory is the authority for what was retained.
 
+Gateway parent CPU captures also retain `sql-cpu.json` when the local SQL
+collector is available. SQL schema v2 contains the full retained `groups` table,
+ranked after aggregation by measured CPU (measured zero precedes null), rather
+than the first 64 groups. Read `sql_cpu.status` **and**
+`sql_cpu.aggregation.complete` in the manifest: `recorded` alone only confirms
+storage. A complete aggregation means all observed groups fit independent
+first-admission reservations: up to 20,000 measured keys (including measured
+zero), plus 8320 initially unmeasured keys (8192 sequential completions and
+128 active/incomplete scopes of headroom). The extra allowance is finite;
+segment/simultaneous-scope limits do not bound all unmeasured completions.
+The full fingerprint/workload/site/control key is preserved. Text allowances
+are cumulative per class: 2,560,000 measured / 1,064,960 unmeasured UTF-8 bytes,
+not a truncation of individual keys. Current fixed labels fit <=95 bytes/key.
+An admitted key keeps its original charge if later measured, and all its updates
+continue accumulating without admission. Early unmeasured keys cannot spend the
+measured reservation.
+
+Completeness does not assert full SQL instrumentation or all process CPU
+coverage. An incomplete table names its first exhausted class/count/text budget
+in `incomplete_reason`; `coverage.group_overflow_scopes` counts rejected scopes,
+not an estimated number of distinct lost keys.
+
+`aggregation.accounted` equals the sum of retained groups plus disjoint
+`group_overflow`, for each counter and measured CPU. `measured_unknown` overlaps
+null-fingerprint groups and possibly overflow; never add it again. CPU null means
+unmeasured, while zero is a successfully measured zero. Error/cancellation
+counters can overlap completed/incomplete and are not extra calls. Scope/segment
+losses, unknown fingerprint/workload, clock failures and unfinished segments
+remain separate coverage facts; unobserved CPU is unknown, never residual zero.
+Native status/window remain independent: a stored SQL table does not repair a
+failed native profile. A storage failure reports `status=unavailable` and retains
+summary counters, without claiming that the table was saved.
+
+Eligible Gateway parent CPU captures reserve a maximum 44,703,744-byte compact
+SQL sidecar, derived from all 28,320 admitted keys, cumulative text with JSON
+escaping, maximum-width counters and metadata. The full table is only in this
+local sidecar; read it with its SQL byte bound, not the generic 8 MiB JSON limit.
+Manifest/API/CLI carry a short summary and file reference. Their existing 8 MiB
+JSON/read limits remain; the full manifest allowance is reserved before native
+spawn, including build provenance which may use the library fallback.
+
+Inside the unchanged 128 MiB capture budget, native artifacts plus owner/active
+markers are limited to 81,125,376 bytes, 1022 files and 2046 directory entries.
+SQL JSON and manifest each have a reserved file/entry while the active lease is
+still held. Inventory before manifest has a 120 MiB allowance; the manifest can
+use up to its existing 8 MiB limit. Checks run before spawn, periodically and
+after native exit/stop, including final flush. Overshoot can trim/discard owned
+native output with a partial/failed status; the sealed SQL table survives native
+failure recovery and is then saved independently. Disk/permissions/checksum
+errors can still make SQL storage unavailable; consent revocation retains its
+existing priority over retention. Other capture modes keep their limits.
+
 Artifacts are private local data. Retained captures are bounded to 128 MiB each,
 16 entries / 512 MiB total and 7 days. Native output is checked periodically and
 can overshoot temporarily. Overflows may leave partial data or omit a profile.
