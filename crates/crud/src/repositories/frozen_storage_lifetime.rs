@@ -1810,12 +1810,13 @@ impl FrozenStorageLifetimeProgress {
         };
         let (table, key, field) = ROOTS[kind];
         if self.locator_pending[kind].is_empty() {
-            // Page actual PK metadata, not a filtered LIMIT that could walk an
-            // unbounded number of already-verified records in one read.
+            // Seek only unknown roots through (frozen_manifest_id, PK), so
+            // verified ID/NULL rows do not consume this bounded metadata page.
             let query = Query::select().from(Alias::new(table))
                 .expr_as(Expr::col(Alias::new(key)), Alias::new("id"))
                 .columns([Alias::new("workspace_id"), Alias::new("frozen_manifest_id")])
                 .expr_as(Expr::cust(format!("CASE WHEN frozen_manifest_id='' THEN length(CAST({field} AS BLOB)) ELSE 0 END")), Alias::new("size"))
+                .and_where(Expr::col(Alias::new("frozen_manifest_id")).eq(""))
                 .and_where(Expr::col(Alias::new(key)).gt(&self.locators[kind]))
                 .order_by(Alias::new(key), Order::Asc).limit(META_ROWS).to_owned();
             let page = store.connection.query_all(&query).await?;
@@ -3327,6 +3328,13 @@ mod tests {
     }
 
     async fn legacy_locator_fixture() -> (CrudStore, FrozenHistoryRef) {
+        legacy_locator_fixture_with_poison(127, "malformed retaining legacy receipt").await
+    }
+
+    async fn legacy_locator_fixture_with_poison(
+        poison_index: usize,
+        poison: &str,
+    ) -> (CrudStore, FrozenHistoryRef) {
         let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
         options.max_connections(1).min_connections(1);
         let db = Database::connect(options).await.unwrap();
@@ -3353,8 +3361,8 @@ mod tests {
             let id = format!("root-{index:04}");
             db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
                 "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES(?1,'ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", [id.clone().into()])).await.unwrap();
-            let json = if index == 127 {
-                "malformed retaining legacy receipt".into()
+            let json = if index == poison_index {
+                poison.into()
             } else if index == 0 || index == 2 {
                 serde_json::json!({"provider":"claude","padding":"x".repeat(if index == 2 { 150_000 } else { 0 }),"pioneerContext":{"version":4,"nativeThreadId":"native","acceptedTurnId":"turn","acceptedTurnRevision":1,"acceptedTurnDeleted":false,"contextOwnerThreadId":"root-0000","contextManifestOwnerThreadId":"root-0000","contextHistoryJson":serde_json::to_string(&h).unwrap()}}).to_string()
             } else {
@@ -3383,6 +3391,210 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn locator_sparse_pending_seek_revisits_poison_without_blocking_later_keys() {
+        for poison in [
+            "malformed retaining legacy receipt".to_owned(),
+            serde_json::json!({"padding":"я".repeat(LEGACY_LOCATOR_BYTES as usize / 2)})
+                .to_string(),
+        ] {
+            let (store, h) = legacy_locator_fixture_with_poison(63, &poison).await;
+            let receipt: String = store.connection.query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT resume_cursor_json FROM thread_cli_runtime_binding WHERE thread_id='root-0000'",
+            )).await.unwrap().unwrap().try_get("", "resume_cursor_json").unwrap();
+            // Genuine verified ID/NULL replacements surround four remaining
+            // legacy roots, including both sides of the old 64-PK boundary.
+            for index in 0..128 {
+                if [2, 63, 64, 127].contains(&index) {
+                    continue;
+                }
+                let (json, marker) = if index % 2 == 0 {
+                    (receipt.clone(), Some(h.manifest_id.clone()))
+                } else {
+                    ("{}".to_owned(), None)
+                };
+                store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                    "UPDATE thread_cli_runtime_binding SET resume_cursor_json=?2,frozen_manifest_id=?3 WHERE thread_id=?1",
+                    [format!("root-{index:04}").into(), json.into(), marker.into()])).await.unwrap();
+            }
+            let mut progress = FrozenStorageLifetimeProgress {
+                pass_done: [false, true, true, true, true, true],
+                locator_kind: 2,
+                ..Default::default()
+            };
+            progress.locator_quantum(&store).await.unwrap();
+            assert_eq!(progress.locators[2], "root-0127");
+            assert_eq!(
+                progress.locator_pending[2]
+                    .iter()
+                    .map(|(id, _, _)| id.as_str())
+                    .collect::<Vec<_>>(),
+                ["root-0002", "root-0063", "root-0064", "root-0127"]
+            );
+            // Use the public error/refusal handling, rather than treating an
+            // oversize or malformed candidate as a successful locator EOF.
+            let mut finished = false;
+            for _ in 0..100 {
+                progress.pass_done[1..].fill(true);
+                let more = progress.quantum(&store).await.unwrap();
+                assert!(
+                    progress
+                        .locator_pending
+                        .iter()
+                        .all(|p| p.len() <= META_ROWS as usize)
+                );
+                if !more {
+                    finished = true;
+                    break;
+                }
+            }
+            assert!(finished, "locator-only passes must reach checked EOF");
+            assert_eq!(
+                locator_marker(&store, "root-0002").await,
+                Some(h.manifest_id)
+            );
+            assert_eq!(
+                locator_marker(&store, "root-0063").await.as_deref(),
+                Some("")
+            );
+            assert_eq!(locator_marker(&store, "root-0064").await, None);
+            assert_eq!(locator_marker(&store, "root-0127").await, None);
+            assert!(
+                progress.accounting.refused >= 2,
+                "the next pass revisits poison"
+            );
+            // Restart sees only the refused unknown, never the committed IDs
+            // or NULLs. A supported repair verifies absence instead of forging
+            // a fresh legacy sentinel (which installed guards prohibit).
+            let mut restart = FrozenStorageLifetimeProgress {
+                locator_kind: 2,
+                ..Default::default()
+            };
+            restart.locator_quantum(&store).await.unwrap();
+            assert_eq!(restart.locator_pending[2].len(), 1);
+            assert_eq!(restart.locator_pending[2][0].0, "root-0063");
+            store.connection.execute_unprepared("UPDATE thread_cli_runtime_binding SET resume_cursor_json='{}',frozen_manifest_id=NULL WHERE thread_id='root-0063'").await.unwrap();
+            drop(restart);
+            assert_eq!(locator_marker(&store, "root-0063").await, None);
+            let mut repaired = FrozenStorageLifetimeProgress {
+                locator_kind: 2,
+                ..Default::default()
+            };
+            repaired.locator_quantum(&store).await.unwrap();
+            assert!(repaired.locator_done[2] && repaired.locator_pending[2].is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn locator_index_upgrade_supports_parameterized_sentinel_pk_seek() {
+        let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1).min_connections(1);
+        let db = Database::connect(options).await.unwrap();
+        db.execute_unprepared("PRAGMA foreign_keys=OFF")
+            .await
+            .unwrap();
+        let migration_name = "m20261026_000001_frozen_locator_discovery_indexes";
+        let before = Migrator::migrations()
+            .iter()
+            .position(|m| m.name() == migration_name)
+            .unwrap();
+        Migrator::up(&db, Some(before as u32)).await.unwrap();
+        let store = CrudStore::new(db.clone()).with_maintenance_access();
+        for (table, _, _) in ROOTS {
+            let manager = migration::SchemaManager::new(&db);
+            assert!(
+                manager
+                    .has_index(table, &format!("{table}_frozen_root"))
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !manager
+                    .has_index(table, &format!("{table}_frozen_locator_discovery"))
+                    .await
+                    .unwrap()
+            );
+        }
+        Migrator::up(&db, None).await.unwrap();
+        // Run again to exercise the normal registered-migration retry path.
+        Migrator::up(&db, None).await.unwrap();
+        for (table, key, field) in ROOTS {
+            let name = format!("{table}_frozen_locator_discovery");
+            let columns = store
+                .connection
+                .query_all_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    format!("PRAGMA index_info('{name}')"),
+                ))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| r.try_get::<String>("", "name").unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(columns, ["frozen_manifest_id", key]);
+            // Bind the sentinel just as SeaQuery does in discovery. Assert the
+            // access property, not a full SQL/EXPLAIN snapshot or a latency win.
+            let query = Query::select().from(Alias::new(table))
+                .expr_as(Expr::col(Alias::new(key)), Alias::new("id"))
+                .columns([Alias::new("workspace_id"), Alias::new("frozen_manifest_id")])
+                .expr_as(Expr::cust(format!("CASE WHEN frozen_manifest_id='' THEN length(CAST({field} AS BLOB)) ELSE 0 END")), Alias::new("size"))
+                .and_where(Expr::col(Alias::new("frozen_manifest_id")).eq(""))
+                .and_where(Expr::col(Alias::new(key)).gt("root-0063"))
+                .order_by(Alias::new(key), Order::Asc).limit(META_ROWS).to_owned();
+            let mut statement = store.connection.get_database_backend().build(&query);
+            statement.sql = format!("EXPLAIN QUERY PLAN {}", statement.sql);
+            let details = store
+                .connection
+                .query_all_raw(statement)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| r.try_get::<String>("", "detail").unwrap())
+                .collect::<Vec<_>>();
+            assert!(
+                details.iter().any(|d| d.starts_with("SEARCH ")
+                    && d.contains(&name)
+                    && d.contains("frozen_manifest_id=?")
+                    && d.contains(&format!("{key}>?"))),
+                "{details:?}"
+            );
+            assert!(
+                !details.iter().any(|d| d.contains("TEMP B-TREE")),
+                "{details:?}"
+            );
+        }
+        // Roll back this migration alone, even if later migrations are added.
+        let migrations = Migrator::migrations();
+        let own = &migrations[before];
+        let manager = migration::SchemaManager::new(&db);
+        own.down(&manager).await.unwrap();
+        for (table, _, _) in ROOTS {
+            assert!(
+                !manager
+                    .has_index(table, &format!("{table}_frozen_locator_discovery"))
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                manager
+                    .has_index(table, &format!("{table}_frozen_root"))
+                    .await
+                    .unwrap()
+            );
+        }
+        own.up(&manager).await.unwrap();
+        own.up(&manager).await.unwrap();
+        for (table, _, _) in ROOTS {
+            assert!(
+                manager
+                    .has_index(table, &format!("{table}_frozen_locator_discovery"))
+                    .await
+                    .unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn locator_portion_and_restart_keep_committed_ids_nulls_and_partial_byte_bounds() {
         let (store, h) = legacy_locator_fixture().await;
         let mut progress = FrozenStorageLifetimeProgress::default();
@@ -3396,9 +3608,9 @@ mod tests {
                 break;
             }
         }
-        assert!(
-            progress.locators[2].as_str() < "root-0127",
-            "only bounded metadata page was loaded"
+        assert_eq!(
+            progress.locators[2], "root-0063",
+            "one 64-root metadata page"
         );
         assert!(progress.locator_pending[2].len() <= META_ROWS as usize);
         assert_eq!(
@@ -3545,6 +3757,121 @@ mod tests {
             Some("")
         );
         assert!(store.frozen_readers.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn locator_fragment_cancel_and_foreground_mutation_preserve_scope_and_capacity() {
+        for mutation in ["workspace", "json", "delete"] {
+            let (store, _) = legacy_locator_fixture().await;
+            let mut progress = FrozenStorageLifetimeProgress {
+                locator_kind: 2,
+                locators: [
+                    String::new(),
+                    String::new(),
+                    "root-0001".into(),
+                    String::new(),
+                ],
+                ..Default::default()
+            };
+            progress.locator_quantum(&store).await.unwrap();
+            // Select kind 2 again after its metadata fetch.
+            progress.locator_kind = 2;
+            progress.locator_quantum(&store).await.unwrap();
+            progress.locator_quantum(&store).await.unwrap();
+            let read = progress.locator.as_ref().unwrap();
+            assert_eq!(read.id, "root-0002");
+            assert_eq!(read.bytes.len(), FRAGMENT_BYTES as usize);
+            // Existing single-connection fixture: cancel a fragment while it
+            // waits for DB capacity, then prove a foreground write can proceed.
+            let holder = store.connection.begin_read().await.unwrap();
+            let mut attempt = Box::pin(progress.locator_quantum(&store));
+            assert!(futures_util::poll!(attempt.as_mut()).is_pending());
+            drop(attempt);
+            assert_eq!(
+                progress.locator.as_ref().unwrap().bytes.len(),
+                FRAGMENT_BYTES as usize
+            );
+            holder.rollback().await.unwrap();
+            let foreground = store.with_interactive_writes();
+            match mutation {
+                "workspace" => {
+                    foreground.connection.execute_unprepared("INSERT INTO workspace(id,name,is_active,is_current) VALUES('other','other',1,0)").await.unwrap();
+                    foreground.connection.execute_unprepared("UPDATE thread_cli_runtime_binding SET workspace_id='other',resume_cursor_json='{}',frozen_manifest_id=NULL WHERE thread_id='root-0002'").await.unwrap();
+                }
+                "json" => {
+                    foreground.connection.execute_unprepared("UPDATE thread_cli_runtime_binding SET resume_cursor_json='{}',frozen_manifest_id=NULL WHERE thread_id='root-0002'").await.unwrap();
+                }
+                "delete" => {
+                    foreground
+                        .connection
+                        .execute_unprepared(
+                            "DELETE FROM thread_cli_runtime_binding WHERE thread_id='root-0002'",
+                        )
+                        .await
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            progress.locator_quantum(&store).await.unwrap();
+            assert!(
+                progress.locator.is_none(),
+                "stale partial fragments must be abandoned"
+            );
+            drop(progress);
+            let mut restart = FrozenStorageLifetimeProgress {
+                locator_kind: 2,
+                ..Default::default()
+            };
+            restart.locator_quantum(&store).await.unwrap();
+            assert!(
+                restart.locator_pending[2]
+                    .iter()
+                    .all(|(id, _, _)| id != "root-0002")
+            );
+            let current = store.connection.query_one_raw(Statement::from_string(DbBackend::Sqlite,
+                "SELECT workspace_id,resume_cursor_json,frozen_manifest_id FROM thread_cli_runtime_binding WHERE thread_id='root-0002'",
+            )).await.unwrap();
+            if mutation == "delete" {
+                assert!(current.is_none());
+            } else {
+                let current = current.unwrap();
+                assert_eq!(
+                    current
+                        .try_get::<Option<String>>("", "frozen_manifest_id")
+                        .unwrap(),
+                    None
+                );
+                assert_eq!(
+                    current.try_get::<String>("", "resume_cursor_json").unwrap(),
+                    "{}"
+                );
+                assert_eq!(
+                    current.try_get::<String>("", "workspace_id").unwrap(),
+                    if mutation == "workspace" {
+                        "other"
+                    } else {
+                        "ws"
+                    }
+                );
+            }
+            assert!(store.frozen_readers.lock().unwrap().is_empty());
+            assert_eq!(
+                store.connection.read_class(),
+                pioneer_sqlite::SqliteReadClass::Maintenance
+            );
+            assert_eq!(
+                store.connection.write_class(),
+                pioneer_sqlite::SqliteWriteClass::Maintenance
+            );
+            store
+                .connection
+                .begin_read()
+                .await
+                .unwrap()
+                .rollback()
+                .await
+                .unwrap();
+        }
     }
 
     async fn scope_layout_fixture() -> CrudStore {
@@ -5128,7 +5455,7 @@ mod tests {
 
     #[tokio::test]
     async fn fragment_scan_cas_checks_real_replacement_recreate_and_metadata_orders() {
-        for mutation in ["replace", "recreate", "metadata"] {
+        for mutation in ["replace", "recreate", "metadata", "workspace"] {
             let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
             options.max_connections(1).min_connections(1);
             let db = Database::connect(options).await.unwrap();
@@ -5202,6 +5529,9 @@ mod tests {
                         .await
                         .unwrap();
                     store.connection.execute_unprepared("INSERT INTO thread_cli_runtime_binding(thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,resume_cursor_json,status,frozen_manifest_id) VALUES('thread','ws','runtime','claude','native','{}','active',NULL)").await.unwrap();
+                } else if mutation == "workspace" {
+                    store.connection.execute_unprepared("INSERT INTO workspace(id,name,is_active,is_current) VALUES('other','other',1,0)").await.unwrap();
+                    store.connection.execute_unprepared("UPDATE thread_cli_runtime_binding SET workspace_id='other',resume_cursor_json='{}',frozen_manifest_id=NULL WHERE thread_id='thread'").await.unwrap();
                 } else {
                     // Raw equivalent of the cut-over ID/NULL writer; same
                     // updated_at does not participate in sentinel CAS.
@@ -5209,7 +5539,15 @@ mod tests {
                 }
                 assert!(read.step(&store).await.unwrap());
             }
-            let current=store.connection.query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT resume_cursor_json,frozen_manifest_id FROM thread_cli_runtime_binding WHERE thread_id='thread'")).await.unwrap().unwrap();
+            let current=store.connection.query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT workspace_id,resume_cursor_json,frozen_manifest_id FROM thread_cli_runtime_binding WHERE thread_id='thread'")).await.unwrap().unwrap();
+            assert_eq!(
+                current.try_get::<String>("", "workspace_id").unwrap(),
+                if mutation == "workspace" {
+                    "other"
+                } else {
+                    "ws"
+                }
+            );
             assert_eq!(
                 current
                     .try_get::<Option<String>>("", "frozen_manifest_id")
