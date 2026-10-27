@@ -23,6 +23,7 @@ use std::{
     fmt,
     io::Read,
     sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 pub const MAX_BLOCK_BYTES: usize = 65_536;
@@ -43,6 +44,58 @@ const HEADER_BYTES: usize = 78;
 const MAX_BODY_BYTES: usize = MAX_BLOCK_BYTES + 1024;
 const ZERO_DIGEST: [u8; 32] = [0; 32];
 
+/// Caller-owned, fixed-size observations. All durations are elapsed wall time,
+/// not measured CPU. Phases do not overlap each other, but are nested within
+/// the caller's encode/decode/train/from-bytes duration. No content is retained.
+/// Unobserved public entry points do not read the clock.
+#[derive(Default)]
+pub(crate) struct CodecDiagnostics {
+    /// Both cache critical sections, including mutex wait and byte comparison.
+    pub(crate) lookup_elapsed: Duration,
+    /// Native encoder/decoder dictionary construction on a cache miss.
+    pub(crate) prepare_elapsed: Duration,
+    /// Actual native training attempts, including unsuccessful fallback attempts.
+    pub(crate) train_elapsed: Duration,
+    /// Compressor creation/configuration, compression and compressor destruction.
+    pub(crate) compress_elapsed: Duration,
+    /// Decoder creation/configuration, bounded decode/frame check and destruction.
+    pub(crate) decompress_elapsed: Duration,
+    /// Input/header/hash validation, raw copy, envelope and training sample assembly.
+    /// Adapter UTF-8/assembly is outside this module and must be measured there.
+    pub(crate) verify_elapsed: Duration,
+    /// One initial cache probe per request; the insertion recheck is not another hit/miss.
+    /// A probe returning an error (poison/collision) has elapsed time but no hit/miss.
+    pub(crate) cache_hits: u64,
+    pub(crate) cache_misses: u64,
+    /// Attempts, incremented before native work; failure is not a successful prepare/train.
+    pub(crate) preparations: u64,
+    pub(crate) trainings: u64,
+    /// Native training errors handled by the existing raw-content fallback.
+    pub(crate) training_fallbacks: u64,
+}
+
+/// Keeps partial elapsed time on early Result return and unwind. No clock read
+/// or diagnostic state is needed for existing, unobserved codec consumers.
+struct Elapsed<'a> {
+    started: Option<Instant>,
+    elapsed: Option<&'a mut Duration>,
+}
+impl<'a> Elapsed<'a> {
+    fn new(elapsed: Option<&'a mut Duration>) -> Self {
+        Self {
+            started: elapsed.as_ref().map(|_| Instant::now()),
+            elapsed,
+        }
+    }
+}
+impl Drop for Elapsed<'_> {
+    fn drop(&mut self) {
+        if let (Some(started), Some(elapsed)) = (self.started, self.elapsed.as_deref_mut()) {
+            *elapsed = elapsed.saturating_add(started.elapsed());
+        }
+    }
+}
+
 /// Immutable dictionary content; identity is its actual bytes, not a DB ID.
 #[derive(Clone)]
 pub struct Dictionary {
@@ -61,20 +114,37 @@ impl fmt::Debug for Dictionary {
 
 impl Dictionary {
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
-        ensure!(
-            !bytes.is_empty() && bytes.len() <= MAX_DICTIONARY_BYTES,
-            "portable payload dictionary size is invalid"
-        );
-        let digest = Sha256::digest(&bytes).into();
-        ensure!(digest != ZERO_DIGEST, "reserved dictionary digest");
-        let dictionary = Self {
-            digest,
-            bytes: bytes.into(),
+        Self::from_bytes_impl(bytes, None)
+    }
+
+    pub(crate) fn from_bytes_observed(
+        bytes: Vec<u8>,
+        diagnostics: &mut CodecDiagnostics,
+    ) -> Result<Self> {
+        Self::from_bytes_impl(bytes, Some(diagnostics))
+    }
+
+    fn from_bytes_impl(
+        bytes: Vec<u8>,
+        mut diagnostics: Option<&mut CodecDiagnostics>,
+    ) -> Result<Self> {
+        let dictionary = {
+            let _elapsed = Elapsed::new(diagnostics.as_deref_mut().map(|d| &mut d.verify_elapsed));
+            ensure!(
+                !bytes.is_empty() && bytes.len() <= MAX_DICTIONARY_BYTES,
+                "portable payload dictionary size is invalid"
+            );
+            let digest = Sha256::digest(&bytes).into();
+            ensure!(digest != ZERO_DIGEST, "reserved dictionary digest");
+            Self {
+                digest,
+                bytes: bytes.into(),
+            }
         };
         // Reject malformed trained dictionaries here, before an adapter can
         // publish a reference to unusable bytes. Raw-content dictionaries are
         // supported by Zstd as well. Preparation is shared with encode/decode.
-        prepared_dictionary(&dictionary)?;
+        prepared_dictionary(&dictionary, diagnostics)?;
         Ok(dictionary)
     }
 
@@ -120,33 +190,54 @@ fn cached_dictionary(
     Ok(Some(entry))
 }
 
-fn prepared_dictionary(dictionary: &Dictionary) -> Result<Arc<PreparedDictionary>> {
+fn prepared_dictionary(
+    dictionary: &Dictionary,
+    mut diagnostics: Option<&mut CodecDiagnostics>,
+) -> Result<Arc<PreparedDictionary>> {
     let cache = CACHE.get_or_init(|| Mutex::new(VecDeque::new()));
-    {
+    let cached = {
+        let _elapsed = Elapsed::new(diagnostics.as_deref_mut().map(|d| &mut d.lookup_elapsed));
         let mut entries = cache
             .lock()
             .map_err(|_| anyhow::anyhow!("portable payload dictionary cache unavailable"))?;
-        if let Some(prepared) = cached_dictionary(&mut entries, dictionary)? {
-            return Ok(prepared);
+        cached_dictionary(&mut entries, dictionary)?
+    };
+    if let Some(diagnostics) = diagnostics.as_deref_mut() {
+        if cached.is_some() {
+            diagnostics.cache_hits = diagnostics.cache_hits.saturating_add(1);
+        } else {
+            diagnostics.cache_misses = diagnostics.cache_misses.saturating_add(1);
         }
+    }
+    if let Some(prepared) = cached {
+        return Ok(prepared);
     }
     // Native preparation and allocation occur without holding the cache lock.
     // Concurrent misses can prepare the same key, then converge below.
-    let encoder = zstd::dict::EncoderDictionary::try_copy(dictionary.bytes(), LEVEL)
-        .context("invalid portable payload encoder dictionary")?;
-    let decoder = zstd::dict::DecoderDictionary::try_copy(dictionary.bytes())
-        .context("invalid portable payload decoder dictionary")?;
-    let memory = encoder.as_cdict().sizeof() + decoder.as_ddict().sizeof() + dictionary.bytes.len();
-    let prepared = Arc::new(PreparedDictionary {
-        digest: dictionary.digest,
-        level: LEVEL,
-        bytes: dictionary.bytes.clone(),
-        encoder,
-        decoder,
-        memory,
-    });
+    if let Some(diagnostics) = diagnostics.as_deref_mut() {
+        diagnostics.preparations = diagnostics.preparations.saturating_add(1);
+    }
+    let (prepared, memory) = {
+        let _elapsed = Elapsed::new(diagnostics.as_deref_mut().map(|d| &mut d.prepare_elapsed));
+        let encoder = zstd::dict::EncoderDictionary::try_copy(dictionary.bytes(), LEVEL)
+            .context("invalid portable payload encoder dictionary")?;
+        let decoder = zstd::dict::DecoderDictionary::try_copy(dictionary.bytes())
+            .context("invalid portable payload decoder dictionary")?;
+        let memory =
+            encoder.as_cdict().sizeof() + decoder.as_ddict().sizeof() + dictionary.bytes.len();
+        let prepared = Arc::new(PreparedDictionary {
+            digest: dictionary.digest,
+            level: LEVEL,
+            bytes: dictionary.bytes.clone(),
+            encoder,
+            decoder,
+            memory,
+        });
+        (prepared, memory)
+    };
     let mut evicted = Vec::new();
     let result = {
+        let _elapsed = Elapsed::new(diagnostics.as_deref_mut().map(|d| &mut d.lookup_elapsed));
         let mut entries = cache
             .lock()
             .map_err(|_| anyhow::anyhow!("portable payload dictionary cache unavailable"))?;
@@ -178,50 +269,107 @@ fn prepared_dictionary(dictionary: &Dictionary) -> Result<Arc<PreparedDictionary
 /// an endlessly failing training job. No sample bytes are logged or persisted
 /// here. Families and immutable dictionary publication are adapter concerns.
 pub fn train(samples: &[&[u8]]) -> Result<Dictionary> {
-    let mut data = Vec::new();
-    let mut sizes = Vec::new();
-    for sample in samples.iter().take(MAX_TRAINING_SAMPLES) {
-        let count = sample
-            .len()
-            .min(MAX_BLOCK_BYTES)
-            .min(MAX_TRAINING_BYTES - data.len());
-        if count != 0 {
-            data.extend_from_slice(&sample[..count]);
-            sizes.push(count);
+    train_impl(samples, None)
+}
+
+pub(crate) fn train_observed(
+    samples: &[&[u8]],
+    diagnostics: &mut CodecDiagnostics,
+) -> Result<Dictionary> {
+    train_impl(samples, Some(diagnostics))
+}
+
+fn train_impl(
+    samples: &[&[u8]],
+    mut diagnostics: Option<&mut CodecDiagnostics>,
+) -> Result<Dictionary> {
+    let (data, sizes) = {
+        let _elapsed = Elapsed::new(diagnostics.as_deref_mut().map(|d| &mut d.verify_elapsed));
+        let mut data = Vec::new();
+        let mut sizes = Vec::new();
+        for sample in samples.iter().take(MAX_TRAINING_SAMPLES) {
+            let count = sample
+                .len()
+                .min(MAX_BLOCK_BYTES)
+                .min(MAX_TRAINING_BYTES - data.len());
+            if count != 0 {
+                data.extend_from_slice(&sample[..count]);
+                sizes.push(count);
+            }
+            if data.len() == MAX_TRAINING_BYTES {
+                break;
+            }
         }
-        if data.len() == MAX_TRAINING_BYTES {
-            break;
-        }
-    }
+        (data, sizes)
+    };
     if sizes.len() >= 8 && data.len() >= 2048 {
         let capacity = (data.len() / 8).clamp(256, MAX_DICTIONARY_BYTES);
-        if let Ok(bytes) = zstd::dict::from_continuous(&data, &sizes, capacity) {
-            return Dictionary::from_bytes(bytes);
+        if let Some(diagnostics) = diagnostics.as_deref_mut() {
+            diagnostics.trainings = diagnostics.trainings.saturating_add(1);
+        }
+        let trained = {
+            let _elapsed = Elapsed::new(diagnostics.as_deref_mut().map(|d| &mut d.train_elapsed));
+            zstd::dict::from_continuous(&data, &sizes, capacity)
+        };
+        if let Ok(bytes) = trained {
+            return Dictionary::from_bytes_impl(bytes, diagnostics);
+        }
+        if let Some(diagnostics) = diagnostics.as_deref_mut() {
+            diagnostics.training_fallbacks = diagnostics.training_fallbacks.saturating_add(1);
         }
     }
     // A leading zero guarantees that arbitrary sample bytes cannot masquerade
     // as a malformed trained dictionary (whose magic starts with 0x37).
-    let mut bytes = Vec::with_capacity((data.len() + 1).min(MAX_DICTIONARY_BYTES));
-    bytes.push(0);
-    bytes.extend_from_slice(&data[..data.len().min(MAX_DICTIONARY_BYTES - 1)]);
-    Dictionary::from_bytes(bytes)
+    let bytes = {
+        let _elapsed = Elapsed::new(diagnostics.as_deref_mut().map(|d| &mut d.verify_elapsed));
+        let mut bytes = Vec::with_capacity((data.len() + 1).min(MAX_DICTIONARY_BYTES));
+        bytes.push(0);
+        bytes.extend_from_slice(&data[..data.len().min(MAX_DICTIONARY_BYTES - 1)]);
+        bytes
+    };
+    Dictionary::from_bytes_impl(bytes, diagnostics)
 }
 
 /// Encode a block at Zstd level 6, or raw when tiny or unprofitable.
 pub fn encode(input: &[u8], dictionary: &Dictionary) -> Result<Vec<u8>> {
-    ensure!(
-        input.len() <= MAX_BLOCK_BYTES,
-        "portable payload block exceeds limit"
-    );
-    let content_digest: [u8; 32] = Sha256::digest(input).into();
+    encode_impl(input, dictionary, None)
+}
+
+pub(crate) fn encode_observed(
+    input: &[u8],
+    dictionary: &Dictionary,
+    diagnostics: &mut CodecDiagnostics,
+) -> Result<Vec<u8>> {
+    encode_impl(input, dictionary, Some(diagnostics))
+}
+
+fn encode_impl(
+    input: &[u8],
+    dictionary: &Dictionary,
+    mut diagnostics: Option<&mut CodecDiagnostics>,
+) -> Result<Vec<u8>> {
+    let content_digest: [u8; 32] = {
+        let _elapsed = Elapsed::new(diagnostics.as_deref_mut().map(|d| &mut d.verify_elapsed));
+        ensure!(
+            input.len() <= MAX_BLOCK_BYTES,
+            "portable payload block exceeds limit"
+        );
+        Sha256::digest(input).into()
+    };
     if input.len() >= 64 {
-        let prepared = prepared_dictionary(dictionary)?;
-        let mut compressor = zstd::bulk::Compressor::with_prepared_dictionary(&prepared.encoder)?;
-        compressor.set_parameter(zstd::zstd_safe::CParameter::WindowLog(WINDOW_LOG))?;
-        compressor.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))?;
-        compressor.set_parameter(zstd::zstd_safe::CParameter::ContentSizeFlag(true))?;
-        let compressed = compressor.compress(input)?;
+        let prepared = prepared_dictionary(dictionary, diagnostics.as_deref_mut())?;
+        let compressed = {
+            let _elapsed =
+                Elapsed::new(diagnostics.as_deref_mut().map(|d| &mut d.compress_elapsed));
+            let mut compressor =
+                zstd::bulk::Compressor::with_prepared_dictionary(&prepared.encoder)?;
+            compressor.set_parameter(zstd::zstd_safe::CParameter::WindowLog(WINDOW_LOG))?;
+            compressor.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))?;
+            compressor.set_parameter(zstd::zstd_safe::CParameter::ContentSizeFlag(true))?;
+            compressor.compress(input)?
+        };
         if compressed.len() < input.len() {
+            let _elapsed = Elapsed::new(diagnostics.as_deref_mut().map(|d| &mut d.verify_elapsed));
             return Ok(envelope(
                 ZSTD,
                 input.len(),
@@ -231,6 +379,7 @@ pub fn encode(input: &[u8], dictionary: &Dictionary) -> Result<Vec<u8>> {
             ));
         }
     }
+    let _elapsed = Elapsed::new(diagnostics.as_deref_mut().map(|d| &mut d.verify_elapsed));
     Ok(envelope(
         RAW,
         input.len(),
@@ -355,16 +504,45 @@ pub fn is_compressed(envelope: &[u8]) -> Result<bool> {
 
 /// Decode exactly one bounded block. No recovery to empty bytes on corruption.
 pub fn decode(envelope: &[u8], dictionary: Option<&Dictionary>) -> Result<Vec<u8>> {
-    let header = header(envelope)?;
+    decode_impl(envelope, dictionary, None)
+}
+
+pub(crate) fn decode_observed(
+    envelope: &[u8],
+    dictionary: Option<&Dictionary>,
+    diagnostics: &mut CodecDiagnostics,
+) -> Result<Vec<u8>> {
+    decode_impl(envelope, dictionary, Some(diagnostics))
+}
+
+fn decode_impl(
+    envelope: &[u8],
+    dictionary: Option<&Dictionary>,
+    mut diagnostics: Option<&mut CodecDiagnostics>,
+) -> Result<Vec<u8>> {
+    let header = {
+        let _elapsed = Elapsed::new(diagnostics.as_deref_mut().map(|d| &mut d.verify_elapsed));
+        header(envelope)?
+    };
     let result = if header.codec == RAW {
+        let _elapsed = Elapsed::new(diagnostics.as_deref_mut().map(|d| &mut d.verify_elapsed));
         header.body.to_vec()
     } else {
-        let dictionary = dictionary.context("portable payload dictionary is missing")?;
-        ensure!(
-            dictionary.digest == header.dictionary,
-            "portable payload dictionary mismatch"
+        let dictionary = {
+            let _elapsed = Elapsed::new(diagnostics.as_deref_mut().map(|d| &mut d.verify_elapsed));
+            let dictionary = dictionary.context("portable payload dictionary is missing")?;
+            ensure!(
+                dictionary.digest == header.dictionary,
+                "portable payload dictionary mismatch"
+            );
+            dictionary
+        };
+        let prepared = prepared_dictionary(dictionary, diagnostics.as_deref_mut())?;
+        let _elapsed = Elapsed::new(
+            diagnostics
+                .as_deref_mut()
+                .map(|d| &mut d.decompress_elapsed),
         );
-        let prepared = prepared_dictionary(dictionary)?;
         let mut decoder =
             zstd::stream::read::Decoder::with_prepared_dictionary(header.body, &prepared.decoder)?
                 .single_frame();
@@ -387,6 +565,7 @@ pub fn decode(envelope: &[u8], dictionary: Option<&Dictionary>) -> Result<Vec<u8
         );
         result
     };
+    let _elapsed = Elapsed::new(diagnostics.as_deref_mut().map(|d| &mut d.verify_elapsed));
     ensure!(
         result.len() == header.original_len,
         "portable payload decoded length mismatch"

@@ -7,6 +7,7 @@ use pioneer_entity::{
     portable_payload as value, portable_payload_block as block,
     portable_payload_dictionary as dictionary,
 };
+use pioneer_observability::portable_payload as observe;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func, OnConflict};
 use sea_orm::{
     ActiveValue::Set, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter,
@@ -70,9 +71,10 @@ impl PayloadReadHold {
     /// Capture synchronously while mapping a row, before its writer commits.
     /// A reader losing the gap to cleanup must retry the entire source fetch.
     pub(crate) fn capture(id: &str) -> Result<Self> {
-        let guard = payload_gate(id)
-            .try_read_owned()
-            .map_err(|_| PreflightRace)?;
+        let guard = payload_gate(id).try_read_owned().map_err(|_| {
+            observe::outcome(observe::Outcome::Stale);
+            PreflightRace
+        })?;
         Ok(Self(Arc::new(PayloadReadLease {
             id: id.to_owned(),
             guard: Some(guard),
@@ -133,6 +135,15 @@ impl Family {
             Self::TaskEvent => ("task_event", "id", "payload_json"),
         }
     }
+    fn observed(self) -> observe::Family {
+        match self {
+            Self::ToolText => observe::Family::ToolText,
+            Self::ToolMetadata => observe::Family::ToolMetadata,
+            Self::CliMapping => observe::Family::CliMapping,
+            Self::TaskHistory => observe::Family::TaskHistory,
+            Self::TaskEvent => observe::Family::TaskEvent,
+        }
+    }
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::ToolText => "tool.text",
@@ -143,6 +154,58 @@ impl Family {
         }
     }
 }
+fn observed_family(name: &str) -> observe::Family {
+    match name {
+        "tool.text" => observe::Family::ToolText,
+        "tool.metadata" => observe::Family::ToolMetadata,
+        "cli.mapping" => observe::Family::CliMapping,
+        "task.history" => observe::Family::TaskHistory,
+        "task.event" => observe::Family::TaskEvent,
+        _ => observe::Family::Mixed,
+    }
+}
+
+// The codec remains DB-neutral. This fixed-size adapter drains its private
+// cache/native timings even on an error or unwind, without retaining input.
+struct CodecObservation(codec::CodecDiagnostics);
+impl Drop for CodecObservation {
+    fn drop(&mut self) {
+        let d = &self.0;
+        for (stage, elapsed) in [
+            (observe::Stage::DictionaryLookup, d.lookup_elapsed),
+            (observe::Stage::DictionaryPrepare, d.prepare_elapsed),
+            (observe::Stage::DictionaryTrain, d.train_elapsed),
+            (observe::Stage::Compress, d.compress_elapsed),
+            (observe::Stage::Decompress, d.decompress_elapsed),
+            (observe::Stage::VerifyAssemble, d.verify_elapsed),
+        ] {
+            if !elapsed.is_zero() {
+                observe::phase(stage, elapsed);
+            }
+        }
+        for (event, count) in [
+            (observe::DictionaryEvent::Hit, d.cache_hits),
+            (observe::DictionaryEvent::Miss, d.cache_misses),
+            (observe::DictionaryEvent::Train, d.trainings),
+            (observe::DictionaryEvent::Prepare, d.preparations),
+            (
+                observe::DictionaryEvent::TrainFallback,
+                d.training_fallbacks,
+            ),
+        ] {
+            for _ in 0..count {
+                observe::dictionary_event(event);
+            }
+        }
+    }
+}
+fn codec_observed<T>(
+    operation: impl FnOnce(&mut codec::CodecDiagnostics) -> Result<T>,
+) -> Result<T> {
+    let mut observation = CodecObservation(Default::default());
+    operation(&mut observation.0)
+}
+
 // The only varying schema facts are these five existing Entity columns. Keep
 // ordinary owner access typed rather than dispatching SQL table/column strings.
 macro_rules! target {
@@ -192,6 +255,7 @@ async fn pending_source(
     upper: Option<&str>,
     descending: bool,
 ) -> Result<Option<PendingSource>> {
+    let _phase = observe::stage(observe::Stage::SourceRead);
     store
         .run_background_database_quantum(|| async {
             target!(family, |Target, Col, key, field, reference| {
@@ -277,6 +341,13 @@ struct Prepared {
 
 impl PortablePayloadProgress {
     pub async fn quantum(&mut self, store: &CrudStore) -> Result<bool> {
+        let family = self
+            .pending
+            .as_ref()
+            .map_or(observe::Family::Mixed, |p| p.family.observed());
+        observe::scope_result(family, observe::Mode::Background, self.quantum_inner(store)).await
+    }
+    async fn quantum_inner(&mut self, store: &CrudStore) -> Result<bool> {
         if let Some(mut pending) = self.pending.take() {
             let result = pending.step(store).await;
             match result {
@@ -314,6 +385,7 @@ impl PortablePayloadProgress {
             Family::TaskEvent,
         ];
         let family = FAMILIES[self.family];
+        observe::set_family(family.observed());
         self.family = (self.family + 1) % FAMILIES.len();
         // NULL metadata is final SQL NULL, not an empty/pending value.
         let index = family as usize;
@@ -323,6 +395,7 @@ impl PortablePayloadProgress {
                 .map(|row| row.owner);
         }
         let Some(upper) = self.upper[index].as_deref() else {
+            observe::outcome(observe::Outcome::NoWork);
             return Ok(false);
         };
         let row = pending_source(
@@ -377,6 +450,7 @@ impl PortablePayloadProgress {
         }
         self.after[family as usize] = None;
         self.upper[family as usize] = None;
+        observe::outcome(observe::Outcome::NoWork);
         Ok(false)
     }
 }
@@ -384,6 +458,7 @@ impl Preparation {
     async fn step(&mut self, store: &CrudStore) -> Result<bool> {
         let prepared = &mut self.prepared;
         if !prepared.installed {
+            let _phase = observe::stage(observe::Stage::Publish);
             store
                 .run_background_database_quantum(|| async {
                     value::Entity::insert(prepared.header.clone().into_active_model())
@@ -404,6 +479,7 @@ impl Preparation {
         if prepared.blocks.len() >= 16
             || (self.offset == self.size && self.bytes.is_empty() && !prepared.blocks.is_empty())
         {
+            let _phase = observe::stage(observe::Stage::Publish);
             store
                 .run_background_database_quantum(|| async {
                     block::Entity::insert_many(
@@ -458,6 +534,7 @@ impl Preparation {
                     .limit(1)
                     .build(DbBackend::Sqlite)
             });
+            let read_phase = observe::stage(observe::Stage::SourceRead);
             let row = store
                 .run_background_database_quantum(|| async {
                     Ok(store
@@ -472,9 +549,13 @@ impl Preparation {
                         .await?)
                 })
                 .await?;
+            drop(read_phase);
             let Some(fragment) = row else {
+                observe::outcome(observe::Outcome::Stale);
                 return Ok(true);
             };
+            observe::bytes(observe::ByteKind::ReadOriginal, fragment.len() as u64);
+            let verify_source = observe::stage(observe::Stage::VerifyAssemble);
             ensure!(
                 fragment.len() == count,
                 "portable source fragment incomplete"
@@ -483,10 +564,12 @@ impl Preparation {
                 self.family != Family::TaskHistory || !fragment.contains(&0),
                 "portable Task history contains unsupported legacy NUL"
             );
+            drop(verify_source);
             if self.dictionary.is_none() {
                 self.dictionary =
                     Some(load_or_prepare_dictionary(store, self.family, &fragment).await?);
             }
+            let _verify = observe::stage(observe::Stage::VerifyAssemble);
             if self.shape.is_none() {
                 self.shape = fragment.iter().copied().find(|b| *b != b' ');
             }
@@ -498,6 +581,7 @@ impl Preparation {
             self.bytes.extend(fragment);
         }
         if !self.bytes.is_empty() {
+            let verify = observe::stage(observe::Stage::VerifyAssemble);
             let mut end = self.bytes.len().min(BLOCK);
             // SQL byte fragments may end inside a scalar. Retain at most the
             // unfinished scalar for the next short read, never re-read bytes.
@@ -515,12 +599,21 @@ impl Preparation {
             if end > 0 {
                 let text = std::str::from_utf8(&self.bytes[..end])?;
                 let chars = text.chars().count() as i64;
-                let data = codec::encode(
-                    text.as_bytes(),
-                    self.dictionary
-                        .as_ref()
-                        .context("portable dictionary missing")?,
-                )?;
+                drop(verify);
+                observe::live_stage(observe::Stage::Compress);
+                let data = codec_observed(|diagnostics| {
+                    codec::encode_observed(
+                        text.as_bytes(),
+                        self.dictionary
+                            .as_ref()
+                            .context("portable dictionary missing")?,
+                        diagnostics,
+                    )
+                })?;
+                observe::bytes(observe::ByteKind::EncodedOriginal, end as u64);
+                observe::bytes(observe::ByteKind::Encoded, data.len() as u64);
+                observe::blocks(observe::BlockKind::Encoded, 1);
+                let _assembly = observe::stage(observe::Stage::VerifyAssemble);
                 prepared.encoded_bytes = prepared
                     .encoded_bytes
                     .checked_add(data.len() + 48)
@@ -545,6 +638,7 @@ impl Preparation {
             return Ok(false);
         }
         if !prepared.finalized {
+            let verify = observe::stage(observe::Stage::VerifyAssemble);
             ensure!(
                 prepared.written == self.size as i64,
                 "portable staged byte total mismatch"
@@ -597,6 +691,8 @@ impl Preparation {
                     _ => String::new(),
                 })
             };
+            drop(verify);
+            let _publication = observe::stage(observe::Stage::Publish);
             store
                 .run_background_database_quantum(|| async {
                     value::Entity::update_many()
@@ -625,11 +721,12 @@ impl Preparation {
         }
         // An unprofitable value is terminal raw. Discard staged blocks in
         // bounded portions before publishing its completed reference.
-        if prepared.header.raw == 1
-            && store
+        if prepared.header.raw == 1 && {
+            let _phase = observe::stage(observe::Stage::Cleanup);
+            store
                 .run_background_database_quantum(|| clear_blocks(store, &prepared.header.id))
                 .await?
-        {
+        } {
             return Ok(false);
         }
         store
@@ -655,7 +752,7 @@ async fn load_or_prepare_dictionary(
     sample: &[u8],
 ) -> Result<codec::Dictionary> {
     if let Some(row) = dictionary_row(store, family).await? {
-        let result = codec::Dictionary::from_bytes(row.data)?;
+        let result = codec_observed(|d| codec::Dictionary::from_bytes_observed(row.data, d))?;
         ensure!(
             dictionary_key(family.name(), result.digest()) == row.id,
             "portable dictionary digest mismatch"
@@ -665,7 +762,9 @@ async fn load_or_prepare_dictionary(
     let samples = sample[..sample.len().min(1024 * 1024)]
         .chunks(1024)
         .collect::<Vec<_>>();
-    let dict = codec::train(&samples)?;
+    observe::live_stage(observe::Stage::DictionaryTrain);
+    let dict = codec_observed(|d| codec::train_observed(&samples, d))?;
+    let publish_dictionary = observe::stage(observe::Stage::Publish);
     store
         .run_background_database_quantum(|| async {
             dictionary::Entity::insert(dictionary::ActiveModel {
@@ -684,10 +783,11 @@ async fn load_or_prepare_dictionary(
             Ok(())
         })
         .await?;
+    drop(publish_dictionary);
     let winner = dictionary_row(store, family)
         .await?
         .context("portable dictionary publication missing")?;
-    let dict = codec::Dictionary::from_bytes(winner.data)?;
+    let dict = codec_observed(|d| codec::Dictionary::from_bytes_observed(winner.data, d))?;
     ensure!(
         dictionary_key(family.name(), dict.digest()) == winner.id,
         "portable dictionary digest mismatch"
@@ -695,6 +795,7 @@ async fn load_or_prepare_dictionary(
     Ok(dict)
 }
 async fn cleanup(store: &CrudStore, after: Option<&str>) -> Result<(bool, Option<String>)> {
+    let _phase = observe::stage(observe::Stage::Cleanup);
     // A held/staging value must not starve other retired values. Fetch only
     // IDs (never payload bytes); skip held IDs with a bounded seek page.
     let mut query = value::Entity::find()
@@ -729,6 +830,7 @@ async fn cleanup(store: &CrudStore, after: Option<&str>) -> Result<(bool, Option
         if marked.rows_affected == 0 {
             continue;
         }
+        observe::outcome(observe::Outcome::Cleanup);
         if !clear_blocks(store, &id).await? {
             value::Entity::delete_many()
                 .filter(value::Column::Id.eq(id))
@@ -774,10 +876,14 @@ async fn read_header(
     hold: PayloadReadHold,
     captured: bool,
 ) -> Result<PayloadHeader> {
-    let row = value::Entity::find_by_id(id)
-        .one(db)
-        .await?
-        .ok_or(PreflightRace)?;
+    let row = {
+        let _read = observe::stage(observe::Stage::BlockRead);
+        value::Entity::find_by_id(id).one(db).await?
+    }
+    .ok_or_else(|| {
+        observe::outcome(observe::Outcome::Stale);
+        PreflightRace
+    })?;
     ensure!(
         row.family == family.name()
             && matches!(row.retired, 0 | 1)
@@ -794,6 +900,7 @@ async fn read_header(
         "portable payload header invalid"
     );
     if row.retired == 1 && (!captured || row.sha256 == RECLAIMING_SHA256) {
+        observe::outcome(observe::Outcome::Stale);
         return Err(PreflightRace.into());
     }
     Ok(PayloadHeader {
@@ -818,8 +925,24 @@ pub(crate) async fn hydrate_with_hold(
     plain: String,
     hold: Option<&PayloadReadHold>,
 ) -> Result<String> {
+    observe::scope_result(
+        family.observed(),
+        observe::Mode::Full,
+        hydrate_with_hold_inner(db, family, id, plain, hold),
+    )
+    .await
+}
+
+async fn hydrate_with_hold_inner(
+    db: &pioneer_sqlite::SqliteDatabase,
+    family: Family,
+    id: Option<&str>,
+    plain: String,
+    hold: Option<&PayloadReadHold>,
+) -> Result<String> {
     let Some(id) = id else {
         ensure!(hold.is_none(), "portable plain value has a payload hold");
+        observe::bytes(observe::ByteKind::ReadOriginal, plain.len() as u64);
         return Ok(plain);
     };
     let meta = match hold {
@@ -834,13 +957,29 @@ pub(crate) async fn hydrate_header(
     meta: &PayloadHeader,
     plain: String,
 ) -> Result<String> {
+    observe::scope_result(
+        observed_family(&meta.family),
+        observe::Mode::Full,
+        hydrate_header_inner(db, meta, plain),
+    )
+    .await
+}
+
+async fn hydrate_header_inner(
+    db: &pioneer_sqlite::SqliteDatabase,
+    meta: &PayloadHeader,
+    plain: String,
+) -> Result<String> {
     if meta.raw == 1 {
+        let _verify = observe::stage(observe::Stage::VerifyAssemble);
+        observe::bytes(observe::ByteKind::ReadOriginal, plain.len() as u64);
         ensure!(
             plain.len() as i64 == meta.original_bytes
                 && plain.chars().count() as i64 == meta.original_chars
                 && hex::encode(Sha256::digest(plain.as_bytes())) == meta.sha256,
             "portable raw payload mismatch"
         );
+        observe::outcome(observe::Outcome::Raw);
         return Ok(plain);
     }
     let size = usize::try_from(meta.original_bytes)?;
@@ -850,8 +989,10 @@ pub(crate) async fn hydrate_header(
         let part = read_range(db, meta, offset as i64, (size - offset).min(BLOCK), false).await?;
         ensure!(!part.is_empty(), "portable payload block missing");
         offset += part.len();
+        let _assembly = observe::stage(observe::Stage::VerifyAssemble);
         bytes.extend(part);
     }
+    let _verify = observe::stage(observe::Stage::VerifyAssemble);
     ensure!(
         bytes.len() == size && hex::encode(Sha256::digest(&bytes)) == meta.sha256,
         "portable payload original digest mismatch"
@@ -968,6 +1109,21 @@ pub(crate) async fn read_range(
     count: usize,
     characters: bool,
 ) -> Result<Vec<u8>> {
+    observe::scope_result(
+        observed_family(&meta.family),
+        observe::Mode::Range,
+        read_range_inner(db, meta, start, count, characters),
+    )
+    .await
+}
+
+async fn read_range_inner(
+    db: &pioneer_sqlite::SqliteDatabase,
+    meta: &PayloadHeader,
+    start: i64,
+    count: usize,
+    characters: bool,
+) -> Result<Vec<u8>> {
     ensure!(
         meta.raw == 0 && start >= 0 && count <= if characters { 16384 } else { BLOCK },
         "portable range budget invalid"
@@ -988,6 +1144,7 @@ pub(crate) async fn read_range(
     } else {
         block::Column::ByteOffset
     };
+    let read_phase = observe::stage(observe::Stage::BlockRead);
     let anchor = block::Entity::find()
         .select_only()
         .columns([
@@ -1047,6 +1204,8 @@ pub(crate) async fn read_range(
             .one(db)
             .await?
             .context("portable range block missing")?;
+        observe::bytes(observe::ByteKind::ReadEncoded, b.data.len() as u64);
+        observe::blocks(observe::BlockKind::Read, 1);
         let offset = if characters {
             b.char_offset
         } else {
@@ -1068,19 +1227,22 @@ pub(crate) async fn read_range(
             .checked_add(1)
             .context("portable range ordinal overflow")?;
     }
+    drop(read_phase);
     let dictionary_id = meta
         .dictionary_id
         .as_deref()
         .context("portable payload dictionary reference missing")?;
+    let dictionary_phase = observe::stage(observe::Stage::DictionaryLoad);
     let dict = dictionary::Entity::find_by_id(dictionary_id)
         .one(db)
         .await?
         .context("portable payload dictionary missing")?;
+    drop(dictionary_phase);
     ensure!(
         dict.family == meta.family,
         "portable dictionary family mismatch"
     );
-    let dict = codec::Dictionary::from_bytes(dict.data)?;
+    let dict = codec_observed(|d| codec::Dictionary::from_bytes_observed(dict.data, d))?;
     ensure!(
         dictionary_key(&meta.family, dict.digest()) == dictionary_id,
         "portable dictionary digest mismatch"
@@ -1117,7 +1279,10 @@ pub(crate) async fn read_range(
             offset <= position && position < offset + length,
             "portable range block does not contain position"
         );
-        let decoded = codec::decode(&b.data, Some(&dict))?;
+        observe::live_stage(observe::Stage::Decompress);
+        let decoded = codec_observed(|d| codec::decode_observed(&b.data, Some(&dict), d))?;
+        observe::bytes(observe::ByteKind::ReadOriginal, decoded.len() as u64);
+        let _verify = observe::stage(observe::Stage::VerifyAssemble);
         ensure!(
             decoded.len() as i64 == b.original_bytes,
             "portable block length mismatch"
@@ -1173,6 +1338,7 @@ async fn publish(
     prepared: &Prepared,
 ) -> Result<()> {
     let (table, _, _) = family.spec();
+    let _phase = observe::stage(observe::Stage::Publish);
     let tx = store.connection.begin().await?;
     // Source revision triggers cover logical payload and ownership updates.
     // Unknown/expired roots cannot pass the existing verified root trigger.
@@ -1229,10 +1395,36 @@ async fn publish(
     // A stale/unavailable owner is not committed completion. Diagnose it and
     // use the existing worker's bounded backoff rather than repeatedly encoding
     // an expired root or orphan source without an observable refusal.
+    if affected != 1 {
+        observe::outcome(observe::Outcome::Stale);
+    }
     ensure!(affected == 1, "portable source changed before publication");
+    let raw = prepared.header.raw == 1;
+    let original = prepared.header.original_bytes as u64;
+    let encoded = if raw {
+        original
+    } else {
+        // Existing benefit selection includes a 48-byte row estimate per block.
+        // Exclude that estimate: this counter measures the actual PPAY bytes.
+        prepared
+            .encoded_bytes
+            .saturating_sub(prepared.next as usize * 48) as u64
+    };
+    observe::bytes(observe::ByteKind::PublishedOriginal, original);
+    observe::bytes(observe::ByteKind::PublishedEncoded, encoded);
+    observe::blocks(
+        observe::BlockKind::Published,
+        if raw { 0 } else { prepared.next as u64 },
+    );
+    observe::outcome(if raw {
+        observe::Outcome::Raw
+    } else {
+        observe::Outcome::Published
+    });
     Ok(())
 }
 async fn dictionary_row(store: &CrudStore, family: Family) -> Result<Option<dictionary::Model>> {
+    let _phase = observe::stage(observe::Stage::DictionaryLoad);
     store
         .run_background_database_quantum(|| async {
             Ok(dictionary::Entity::find()
@@ -1257,11 +1449,12 @@ async fn clear_blocks(store: &CrudStore, id: &str) -> Result<bool> {
     if ordinals.is_empty() {
         return Ok(false);
     }
-    block::Entity::delete_many()
+    let deleted = block::Entity::delete_many()
         .filter(block::Column::PayloadId.eq(id))
         .filter(block::Column::Ordinal.is_in(ordinals))
         .exec(&store.connection)
         .await?;
+    observe::blocks(observe::BlockKind::Cleaned, deleted.rows_affected);
     Ok(true)
 }
 

@@ -2,6 +2,7 @@
 //! range; no reader/statement/permit survives into this UTF-8 scan. A bounded,
 //! store-local continuation avoids rescanning the prefix on sequential reads.
 use anyhow::{Result, ensure};
+use pioneer_observability::portable_payload as observe;
 use pioneer_sqlite::{SqliteBlobSource, SqliteDatabase};
 use sea_orm::Statement;
 use std::collections::VecDeque;
@@ -53,7 +54,8 @@ async fn bytes(
     count: usize,
     size: u64,
 ) -> Result<Vec<u8>> {
-    Ok(db
+    let _read = observe::stage(observe::Stage::SourceRead);
+    let result = db
         .read_blob_range(
             SqliteBlobSource {
                 table: "task_run_conversation_snapshot",
@@ -65,7 +67,12 @@ async fn bytes(
             size,
         )
         .await?
-        .ok_or(super::portable_payload::PreflightRace)?)
+        .ok_or_else(|| {
+            observe::outcome(observe::Outcome::Stale);
+            super::portable_payload::PreflightRace
+        })?;
+    observe::bytes(observe::ByteKind::ReadOriginal, result.len() as u64);
+    Ok(result)
 }
 
 /// No payload bytes enter the continuation cache. Its key includes the insert
@@ -93,6 +100,7 @@ pub(crate) async fn fragment(
         while offset < size {
             let count = BLOCK.min(usize::try_from(size - offset)?);
             let block = bytes(&store.connection, &guard, offset, count, size).await?;
+            let _verify = observe::stage(observe::Stage::VerifyAssemble);
             if let Some(first) = block.iter().find(|b| **b != b' ') {
                 array = *first == b'[';
                 break;
@@ -121,6 +129,7 @@ pub(crate) async fn fragment(
             size,
         )
         .await?;
+        let verify = observe::stage(observe::Stage::VerifyAssemble);
         let end = match std::str::from_utf8(&block) {
             Ok(_) => block.len(),
             Err(error) if error.error_len().is_none() => error.valid_up_to(),
@@ -148,6 +157,7 @@ pub(crate) async fn fragment(
                     more = if let Some(next) = block.get(next) {
                         *next != 0
                     } else {
+                        drop(verify);
                         bytes(&store.connection, &guard, byte, 1, size).await?[0] != 0
                     };
                 }

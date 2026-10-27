@@ -15,6 +15,7 @@ use pioneer_entity::{
     compaction_runner_plan as plan, compaction_runner_state as runner, task,
     task_run_conversation_snapshot as task_input,
 };
+use pioneer_observability::portable_payload as observe;
 use sea_orm::sea_query::{
     Alias, Expr, ExprTrait, Func, JoinType, Order, Query, SimpleExpr, UnionType,
 };
@@ -106,6 +107,17 @@ impl LocatorRead {
         }
     }
     async fn step(&mut self, store: &CrudStore) -> Result<bool> {
+        let family = match self.kind {
+            0 => observe::Family::TaskHistory,
+            3 => observe::Family::CliMapping,
+            _ => return self.step_inner(store).await,
+        };
+        // Root preparation is a prerequisite of these two portable fields.
+        // Preserve the existing frozen-storage caller/workload and scope.
+        observe::scope_result(family, observe::Mode::Background, self.step_inner(store)).await
+    }
+    async fn step_inner(&mut self, store: &CrudStore) -> Result<bool> {
+        let portable = matches!(self.kind, 0 | 3);
         let (table, key, field) = ROOTS[self.kind];
         // SQLite BLOB fragment, fixed actual-byte budget; sentinel/identity CAS
         // below stays typed and never compares source JSON in the writer.
@@ -121,6 +133,7 @@ impl LocatorRead {
                     self.size.into(),
                 ],
             );
+            let read = portable.then(|| observe::stage(observe::Stage::SourceRead));
             let bytes = store
                 .connection
                 .read_blob_range(
@@ -134,9 +147,17 @@ impl LocatorRead {
                     u64::try_from(self.size)?,
                 )
                 .await?;
+            drop(read);
             let Some(bytes) = bytes else {
+                if portable {
+                    observe::outcome(observe::Outcome::Stale);
+                }
                 return Ok(true);
             };
+            if portable {
+                observe::bytes(observe::ByteKind::ReadOriginal, bytes.len() as u64);
+            }
+            let _verify = portable.then(|| observe::stage(observe::Stage::VerifyAssemble));
             ensure!(
                 bytes.len() as i64 == FRAGMENT_BYTES.min(self.size - self.offset),
                 "legacy locator fragment missing"
@@ -155,6 +176,7 @@ impl LocatorRead {
             "legacy locator exact size mismatch"
         );
         if self.prepared.is_none() {
+            let _verify = portable.then(|| observe::stage(observe::Stage::VerifyAssemble));
             self.prepared = Some(
                 self.stream
                     .take()
@@ -168,6 +190,7 @@ impl LocatorRead {
         // All JSON/root-identity mutations have already cut over to ID/NULL.
         // Metadata-only changes keep ''. Delete/recreate cannot regain ''.
         // No updated_at comparison or large JSON comparison under writer.
+        let _publish = portable.then(|| observe::stage(observe::Stage::Publish));
         store
             .run_serialized_write(|| async {
                 let tx = store.connection.begin().await?;
@@ -222,6 +245,10 @@ impl LocatorRead {
                             .to_owned(),
                     )
                     .await?;
+                } else {
+                    if portable {
+                        observe::outcome(observe::Outcome::Stale);
+                    }
                 }
                 tx.commit().await?;
                 Ok(())

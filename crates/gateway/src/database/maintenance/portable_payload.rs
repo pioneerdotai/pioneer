@@ -1,5 +1,6 @@
 //! The same cancellation/maintenance lifecycle as the existing storage jobs.
 use pioneer_crud::{CrudStore, PortablePayloadProgress};
+use pioneer_observability::{DatabaseOperationSite, DatabaseWorkload, portable_payload as observe};
 use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 pub(crate) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) {
@@ -10,8 +11,13 @@ pub(crate) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
         let result = tokio::select! {
             biased;
             _=cancellation.cancelled()=>return,
-            result=progress.quantum(&store)=>result,
+            result=crate::database::attribution::scope_database_workload_result(
+                DatabaseWorkload::PortablePayloadMaintenance,
+                DatabaseOperationSite::PortablePayloadQuantum,
+                progress.quantum(&store),
+            )=>result,
         };
+        let backoff = result.is_err();
         let pause = match result {
             Ok(true) => {
                 empty = 0;
@@ -33,9 +39,17 @@ pub(crate) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
                 Duration::from_secs(60)
             }
         };
-        tokio::select! {
-            _=cancellation.cancelled()=>return,
-            _=tokio::time::sleep(pause)=>{},
+        // The completed quantum is gone before a separate bounded sleep work.
+        // Its duration/policy are unchanged; only the wait's cause is observed.
+        let cancelled = observe::pause(pause, backoff, async {
+            tokio::select! {
+                _=cancellation.cancelled()=>true,
+                _=tokio::time::sleep(pause)=>false,
+            }
+        })
+        .await;
+        if cancelled {
+            return;
         }
     }
 }

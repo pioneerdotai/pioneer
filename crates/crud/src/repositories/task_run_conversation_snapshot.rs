@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use pioneer_entity::task_run_conversation_snapshot;
+use pioneer_observability::portable_payload as observe;
 use sea_orm::sea_query::{Expr, ExprTrait, OnConflict};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, FromQueryResult, QueryFilter,
@@ -168,6 +169,17 @@ pub(crate) async fn hydrate_record(
     db: &pioneer_sqlite::SqliteDatabase,
     stored: StoredTaskRunConversationSnapshot,
 ) -> Result<TaskRunConversationSnapshotRecord> {
+    observe::scope_result(
+        observe::Family::TaskHistory,
+        observe::Mode::Full,
+        hydrate_record_inner(db, stored),
+    )
+    .await
+}
+async fn hydrate_record_inner(
+    db: &pioneer_sqlite::SqliteDatabase,
+    stored: StoredTaskRunConversationSnapshot,
+) -> Result<TaskRunConversationSnapshotRecord> {
     use task_run_conversation_snapshot::Column as Col;
     const BLOCK: usize = 64 * 1024;
     let size = usize::try_from(stored.history_bytes)?;
@@ -223,7 +235,10 @@ pub(crate) async fn hydrate_record(
             .into_tuple::<Option<String>>()
             .one(db)
             .await?
-            .ok_or(super::portable_payload::PreflightRace)?;
+            .ok_or_else(|| {
+                observe::outcome(observe::Outcome::Stale);
+                super::portable_payload::PreflightRace
+            })?;
         let meta = match &current_ref {
             Some(id) => Some(
                 super::portable_payload::header(
@@ -256,6 +271,7 @@ pub(crate) async fn hydrate_record(
                 })
                 .limit(1)
                 .build(DbBackend::Sqlite);
+            let _read = observe::stage(observe::Stage::SourceRead);
             db.read_blob_range(
                 pioneer_sqlite::SqliteBlobSource {
                     table: "task_run_conversation_snapshot",
@@ -267,11 +283,19 @@ pub(crate) async fn hydrate_record(
                 u64::try_from(size)?,
             )
             .await?
-            .ok_or(super::portable_payload::PreflightRace)?
+            .ok_or_else(|| {
+                observe::outcome(observe::Outcome::Stale);
+                super::portable_payload::PreflightRace
+            })?
         };
         anyhow::ensure!(fragment.len() == count, "Task snapshot fragment incomplete");
+        if meta.as_ref().is_none_or(|meta| meta.raw != 0) {
+            observe::bytes(observe::ByteKind::ReadOriginal, fragment.len() as u64);
+        }
+        let _assembly = observe::stage(observe::Stage::VerifyAssemble);
         bytes.extend(fragment);
     }
+    let _verify = observe::stage(observe::Stage::VerifyAssemble);
     if let Some(digest) = original_digest {
         use sha2::{Digest, Sha256};
         anyhow::ensure!(

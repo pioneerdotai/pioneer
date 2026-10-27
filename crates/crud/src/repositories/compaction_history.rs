@@ -9,6 +9,7 @@ use pioneer_entity::{
     compaction_turn_creation, task, task_delivery, task_run, task_run_conversation_snapshot,
     task_run_turn, thread, thread_lineage, turn, turn_event, turn_input, turn_llm_context,
 };
+use pioneer_observability::portable_payload as observe;
 use pioneer_protocol::{TASK_COMPOSER_WORK_VERSION, TaskMetadata, UserInput};
 use sea_orm::sea_query::{Alias, BinOper, Expr, ExprTrait, Func, JoinType, Order, Query};
 use sea_orm::{ColumnTrait, DbBackend, EntityTrait, QueryFilter, QueryTrait};
@@ -1133,6 +1134,20 @@ pub(crate) async fn compaction_task_basis_snapshot(
     thread: &str,
     turn: &str,
 ) -> Result<Option<AcceptedTaskBasis>> {
+    observe::scope_result(
+        observe::Family::TaskHistory,
+        observe::Mode::Full,
+        compaction_task_basis_snapshot_inner(db, workspace, thread, turn),
+    )
+    .await
+}
+async fn compaction_task_basis_snapshot_inner(
+    db: &pioneer_sqlite::SqliteDatabase,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+) -> Result<Option<AcceptedTaskBasis>> {
+    let metadata_read = observe::stage(observe::Stage::SourceRead);
     let Some(row) = task_run_turn::Entity::find()
         .select_only()
         .join(
@@ -1252,6 +1267,7 @@ pub(crate) async fn compaction_task_basis_snapshot(
     else {
         return Ok(None);
     };
+    drop(metadata_read);
     let run_id: String = row.run_id;
     let parent_thread: String = row.conversation_thread_id;
     let created_at: String = row.created_at;
@@ -1405,7 +1421,10 @@ pub(crate) async fn compaction_task_basis_snapshot(
             .into_tuple::<Option<String>>()
             .one(db)
             .await?
-            .ok_or(super::portable_payload::PreflightRace)?;
+            .ok_or_else(|| {
+                observe::outcome(observe::Outcome::Stale);
+                super::portable_payload::PreflightRace
+            })?;
         let meta = match &payload_id {
             Some(id) => Some(
                 super::portable_payload::header(
@@ -1435,6 +1454,7 @@ pub(crate) async fn compaction_task_basis_snapshot(
                 })
                 .limit(1)
                 .build(DbBackend::Sqlite);
+            let _read = observe::stage(observe::Stage::SourceRead);
             db.read_blob_range(
                 pioneer_sqlite::SqliteBlobSource {
                     table: "task_run_conversation_snapshot",
@@ -1446,14 +1466,22 @@ pub(crate) async fn compaction_task_basis_snapshot(
                 u64::try_from(history_bytes)?,
             )
             .await?
-            .ok_or(super::portable_payload::PreflightRace)?
+            .ok_or_else(|| {
+                observe::outcome(observe::Outcome::Stale);
+                super::portable_payload::PreflightRace
+            })?
         };
         ensure!(
             fragment.len() == count,
             "accepted Task basis fragment is incomplete"
         );
+        if meta.as_ref().is_none_or(|meta| meta.raw != 0) {
+            observe::bytes(observe::ByteKind::ReadOriginal, fragment.len() as u64);
+        }
+        let _assembly = observe::stage(observe::Stage::VerifyAssemble);
         bytes.extend(fragment);
     }
+    let _verify = observe::stage(observe::Stage::VerifyAssemble);
     if let Some(expected) = original_digest {
         use sha2::{Digest, Sha256};
         ensure!(

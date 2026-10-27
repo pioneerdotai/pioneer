@@ -1,5 +1,8 @@
 use crate::query_scope::{DiagnosticStream, ScopedFuture, observe_control, open_stream};
 use async_trait::async_trait;
+use pioneer_observability::portable_payload::{
+    Family as PortableFamily, NativeOutcome, NativeRead,
+};
 use pioneer_observability::query_cpu::{self, QueryScope};
 use sea_orm::{
     AccessMode, ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, DbErr,
@@ -181,6 +184,27 @@ impl SqliteReadPool {
         }
         let bindings = crate::blob_range::bindings(&mut guard)?;
         let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
+        // Attribute only the five portable source columns. Frozen-history and
+        // other native readers keep their existing read/admission/pool signals.
+        let mut native = match (source.table, source.column) {
+            ("tool_output_chunk", "text") => Some(NativeRead::new(PortableFamily::ToolText)),
+            ("tool_output_chunk", "metadata") => {
+                Some(NativeRead::new(PortableFamily::ToolMetadata))
+            }
+            ("turn_cli_runtime_binding", "input_mapping_json") => {
+                Some(NativeRead::new(PortableFamily::CliMapping))
+            }
+            ("task_run_conversation_snapshot", "history_json") => {
+                Some(NativeRead::new(PortableFamily::TaskHistory))
+            }
+            ("task_event", "payload_json") => Some(NativeRead::new(PortableFamily::TaskEvent)),
+            _ => None,
+        };
+        // Keep the recorder outside the resource-owning future. On Ready and
+        // cancellation, observe destroys that future (and its borrowed handle,
+        // pool connection and permit) before NativeRead can finish/export.
+        // This scope has no SeaORM callback: query_cpu retains its existing
+        // no-callback coverage and does not measure this runtime thread's CPU.
         let result = query_cpu::observe(async {
             let _permit = self.acquire(class).await?;
             let _startup_execute = pioneer_observability::turn_startup::current_stage(
@@ -192,10 +216,28 @@ impl SqliteReadPool {
                 .acquire()
                 .await
                 .map_err(|_| crate::blob_range::error("SQLite blob reader acquisition failed"))?;
-            let mut locked = connection
-                .lock_handle()
+            if let Some(native) = &mut native {
+                native.waiting_for_handle();
+            }
+            let mut locked = {
+                let mut lock = std::pin::pin!(connection.lock_handle());
+                std::future::poll_fn(|context| {
+                    let result = lock.as_mut().poll(context);
+                    // A ready lock needs no extra live journal transition per
+                    // block. Real waits remain visible and cancellation-safe.
+                    if result.is_pending()
+                        && let Some(native) = &mut native
+                    {
+                        native.handle_pending();
+                    }
+                    result
+                })
                 .await
-                .map_err(|_| crate::blob_range::error("SQLite blob reader handle lock failed"))?;
+            }
+            .map_err(|_| crate::blob_range::error("SQLite blob reader handle lock failed"))?;
+            if let Some(native) = &mut native {
+                native.executing();
+            }
             // SAFETY: SQLx's LockedSqliteHandle excludes its worker from all
             // native calls. rusqlite uses the same linked libsqlite3-sys and
             // from_handle borrows rather than closes this physical handle.
@@ -215,6 +257,16 @@ impl SqliteReadPool {
         })
         .instrument(reader_pool_span(class))
         .await;
+        if let Some(native) = native {
+            let (outcome, bytes) = match &result {
+                Ok(Some(bytes)) => (NativeOutcome::Ok, bytes.len() as u64),
+                Ok(None) => (NativeOutcome::Missing, 0),
+                Err(_) => (NativeOutcome::Error, 0),
+            };
+            // One native operation includes PRAGMA/guard/blob work. It is not
+            // an ordinary SQL query count or fingerprint, nor measured CPU.
+            native.finish(outcome, bytes);
+        }
         operation.finish(if result.is_ok() {
             SqliteReadOutcome::Ok
         } else {
