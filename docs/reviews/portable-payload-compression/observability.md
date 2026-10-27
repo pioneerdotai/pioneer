@@ -10,7 +10,10 @@ Correction base / rejected HEAD: `7850cdc544cca126064fb80a1f64adccf2427c1e`.
 Rejected source commit: `428ab9e4936df0dedd25d7c643e40d085c83c2e2`.
 Final correction source/test SHA: `3c3d2cedc812717768bb740029c304352c129675`;
 the report-only handoff commit is identified in the final answer to avoid a
-self-referential hash. This report describes the corrected signal contract.
+self-referential hash. That ledger is historical. The current R1 correction
+starts at clean
+`dd023d428f3573cb34a861637df0a9187b995507`; its ledger and release-order
+contract are below. This report describes the current signal contract.
 
 The audit and independent review in
 `/Users/alexander/Downloads/pioneer-portable-payload-observability-20261027/`
@@ -36,9 +39,11 @@ This change instruments exactly these existing portable targets:
 | `task.event` | `task_event.payload_json` |
 | `mixed` | Common discovery/cleanup, or genuinely unavailable family; never inferred from identifiers |
 
-No schema, migration, Entity, format, Zstd level, dictionary-selection rule,
-cache/storage bound, block size, SQL projection/predicate, retry policy,
-publication write set, read hold or lifetime fence changes are intended.
+The observability changes preserve format, Zstd level, dictionary selection,
+cache/storage bounds, block sizes, SQL predicates, retry policy, publication
+guards and early read holds. The separately authorized compact metadata change
+now amends the unreleased portable schema/Entity and reservation/checksum types;
+see [compact-metadata.md](compact-metadata.md). It adds no telemetry dimensions.
 Existing `turn_event`/`turn_item`, other frozen-root kinds, vectors and
 `patch_snapshot` are outside this instrumentation.
 
@@ -130,13 +135,17 @@ on the existing caller, without a new work token, mode or read completion. At th
 initial Task event/CLI/snapshot capture boundary, `PayloadReadHold::capture` now
 receives its static family. If a portable owner already exists, refusal sets its
 stale outcome once and emits no separate rejection counter/receipt. Otherwise
-`hold_rejected` records `hold.rejections` and the existing caller's bounded local
-receipt. There is no successful-capture signal or fictitious full-read scope.
-This rare refusal path uses existing SDK/local registry bookkeeping (including
-the existing registry mutex); it adds no DB call, payload transform, network
-await or own global lock. A caller without live work still has the metric when
-the normal Gateway pipeline is initialized. Counts are refused captures, not
-completed reads or all stale operations; do not add them to the read denominator.
+`hold_rejected` captures a bounded typed receipt (static family, original
+WorkContext and consent epoch) in the unchanged retryable PreflightRace error
+chain. Capture performs no SDK/live registry write. The receipt has no diagnostic
+Drop. After actual DB owners are released, the attempt/rollback boundary claims
+it once and records `hold.rejections` plus the original caller's bounded local
+receipt. Consent generation is checked again at flush, so a receipt cannot revive
+an old generation. There is no successful-capture signal or fictitious full-read
+scope. SDK/local registry bookkeeping, including the existing registry mutex,
+occurs only at that released boundary. Counts are refused captures, not completed
+reads or all stale operations; do not add them to the read denominator. Scoped
+refusals still only update their bounded aggregate and emit no second receipt.
 
 ## Integration map
 
@@ -157,7 +166,7 @@ local operation/family/mode. Existing DB waits and query callbacks remain.
 | CLI/history legacy-root prerequisite | `frozen_storage_lifetime::LocatorRead::step` kinds 3 / 0 only | `background` under original frozen workload; source bytes, incremental parsing/finalization, locator publication wall time; no compressed-publication counters |
 | Dictionary load | `dictionary_row`, dictionary query in `read_range` | `dictionary_load` wall time for DB portion; no native preparation hidden within this timer |
 | Train / prepare / cache | Codec observed entry points → private `prepared_dictionary`, `train_impl` | Separate `dictionary_train`, `dictionary_prepare`, `dictionary_lookup` elapsed; hit/miss/attempt/fallback events drained by CRUD adapter |
-| Initial backing-hold refusal | `task_event::hydrate_rows`, `cli_runtime_binding::turn_binding_record_from_model`, `task_run_conversation_snapshot::find_by_run` → `PayloadReadHold::capture` | Static family passed before the unchanged early capture; out-of-scope rejection counter/local receipt, scoped stale outcome |
+| Initial backing-hold refusal | `task_event::hydrate_rows`, `cli_runtime_binding::turn_binding_record_from_model`, `task_run_conversation_snapshot::find_by_run` → `PayloadReadHold::capture` | Static family captured at the unchanged early boundary; unscoped receipt deferred to released attempt/rollback, scoped stale outcome |
 | Compress / decompress | Observed `encode_impl` / `decode_impl` | Actual native elapsed phases, aggregated without a block span |
 | Staging / dictionary / locator writes | Existing preparation/header/block/dictionary/locator write points | `publish` elapsed; staging alone is not a `published` outcome or committed byte count |
 | Atomic source cutover | `portable_payload::publish` | `publish`; published/raw outcome and volumes only after successful commit and affected-row check; rejection `stale` |
@@ -393,7 +402,8 @@ before handoff:
   status separate from actual Error;
 - checked legacy UTF-8 scan timer ends before its possible asynchronous EOF probe.
 
-The new observability test owner uses `test-audit`; no storage suite is copied.
+The observability-only test owner uses `test-audit`; no storage suite is copied
+for that owner. Compact-metadata storage additions are documented separately.
 The test-only follow-up preserved protected file hashes and the mixed-file
 production prefix. No production hook, payload fixture, test dependency or production
 compile gate was introduced. Tests are written/updated but **not run**:
@@ -407,14 +417,15 @@ compile gate was introduced. Tests are written/updated but **not run**:
 | `native_observations_join_one_owner_and_cancel_outside_poll` | Replaces the removed Lock-guard contract: no lock-journal transitions; real Ok/Missing/Error/Cancelled counts and partial phase presence share one owner; delayed native drop precedes its sole final flush |
 | `first_training_and_preparation_entry_remains_visible_during_coalescing` | Pending background work must show train/prepare after fast read/load despite a closed elapsed gate; repeated entries cannot flood the journal; no sleeps/native load |
 | `summary_generation_is_rejected_by_existing_exporter_filter_after_consent_cycle` | Actual summary builder → existing exporter filter accepts the captured epoch and rejects it after off/on; test-only privacy bridge, no exporter changes |
-| CRUD `initial_capture_rejection_is_observable_without_a_hydration_scope` | A real exclusive cleanup gate rejects the original capture and exposes a TaskEvent-family receipt without full-read work; subsequent successful capture adds no receipt |
+| CRUD `initial_capture_rejection_records_only_after_transaction_release` | Real transaction plus exclusive cleanup gate: no receipt at capture or writer Released observer; then one original-family/context receipt after implicit release or explicit rollback; cancellation, consent generation and no fictitious read |
 | `pause_owns_separate_sleep_work_preserves_database_and_cancels_cleanly` | Sleep inherits wrong owner/database, becomes a portable logical quantum, short pacing adds portable work, cancellation leaks sleeping work |
 | Existing `database_workload::workload_names_are_stable_and_bounded` owner | Missing new workload index/name/cardinality consistency |
 
 These tests do not establish compilation, exported metric observations, commit
-boundary behavior in a running DB or performance. Existing storage assertions,
-fixtures, independent SQL oracle, idempotency/materialization tests and negative
-controls are unchanged. No pre-fix/post-fix dynamic baseline proof is available.
+boundary behavior in a running DB or performance. Existing assertions,
+independent legacy ten-bind SQL oracle and negative controls remain. The authorized metadata follow-up extends storage coverage and changes
+only the accepted-import digest fixture type; details are in compact-metadata.md.
+No pre-fix/post-fix dynamic baseline proof is available.
 
 ## Requirement disposition
 
@@ -432,8 +443,9 @@ controls are unchanged. No pre-fix/post-fix dynamic baseline proof is available.
 | Honest CPU/query coverage | Existing coverage retained; native CPU unknown, wall timers only; profile symbols plan below |
 | Existing exporter/consent only | Registry and consent-gated OTEL path inspected; no transport/backend settings changed |
 | Cardinality/privacy/hot-path cost | Fixed enums, conservative 840 sets, no raw content or extra DB/hash/codec work; overhead unmeasured |
-| Storage compatibility/NULL/empty/Unicode/CAS/ABA/restart/cleanup holds/order | Algorithms/SQL/guards unchanged by diff inspection, not dynamically re-proven by this instrumentation |
-| Schema/Entity/new adapter/new targets/profiler/UI/retention | Not applicable; no such changes |
+| Storage compatibility/NULL/empty/Unicode/CAS/ABA/restart/cleanup holds/order | Instrumentation preserves storage SQL/guards; the authorized reservation/checksum follow-up is documented in compact-metadata.md. No dynamic proof |
+| Schema/Entity | Separate authorized compact-metadata scope only; draft BLOB checksum and one Entity field, documented separately |
+| New adapter/new targets/profiler/UI/retention | Not applicable; no such changes |
 | Actual runtime/export/backend retention evidence | Deferred under explicit review gate; not confirmed |
 
 ## Changed files and performed checks
@@ -456,7 +468,8 @@ Changed source files (all intentional):
 
 The missing direct CRUD dependency is corrected manually in the manifest and
 one existing lock package block. No versions, resolver, other package contents
-or exporter manifests change; no new raw SQL, migration or Entity edits. The
+or exporter manifests change. R1 adds no SQL; the separately authorized compact
+metadata change amends one draft migration and one Entity field. The
 codec retains its public byte API and database neutrality. Private observed
 entry points, a fixed Duration/counter carrier and an optional neutral native
 stage callback are needed because the adapter cannot observe private cache
@@ -555,7 +568,7 @@ that pass. No tests, compiler or project code ran.
 | F3 / P2 | `Aggregate::live` admits first train/prepare; neutral codec stage entry callback runs outside DB/cache lock; repeated and short background phases coalesced | Pending-operation snapshot test, deterministic closed coalescing gate and bounded repeated journal updates |
 | F4 / P2 | Removed native WaitGuard/Pending wrapper; `executing` changes only local clocks/fields | Native owner test now asserts no new live Lock state; native resource path inspected through teardown |
 | F5 / P2 | Fixed `NativeTotals` per family in Aggregate; recorder captures owner Arc; single last-recorder drop flush; explicit operation-sum histogram name | Expanded native owner checks multiple real outcomes, returned bytes, partial phases, cancellation outside poll, one local terminal and aggregate release; actual SDK/export behavior remains deferred |
-| F6 / P2 | Static family passed to unchanged early capture sites; unscoped refusal counter/caller receipt; scoped stale only | Real gate/capture-boundary rejection test without portable scope; existing aggregate test uses `hold_rejected` and checks no unscoped receipt |
+| F6 / P2 (initial correction, superseded below) | Static family at unchanged early capture sites; scoped stale only. Unscoped release order was not yet correct | Prior capture-only test missed transactional order; replaced by current R1 owner below |
 
 Self-review also checked: every required capture argument and CodecDiagnostics
 constructor; metric registry/descriptions/840-set budget; serde defaults and all
@@ -605,3 +618,74 @@ backend retention, overhead and compilability remain unconfirmed.
 External acceptance is still required before dynamic verification. Native CPU,
 runtime correctness, compilability, delivered metrics/spans and backend retention
 are not confirmed by static review, formatting or these local commits.
+
+
+## R1 deferred refusal correction (current review)
+
+Current correction base: clean `dd023d428f3573cb34a861637df0a9187b995507`.
+F1–F5 were accepted by the round-two static review; their implementations and
+signal semantics are retained. R1 was confirmed against actual snapshot and
+indirect CLI transactional callers, not just the original direct examples.
+
+| Boundary | Current behavior / source |
+| --- | --- |
+| Capture while DB owners live | `PayloadReadHold::capture` attaches `observe::HoldRejection` to PreflightRace. Static family/context/epoch only; no SDK/live registry write or diagnostic error Drop |
+| Scoped capture | Existing Aggregate gets Stale atomically; no extra unscoped receipt/read |
+| Released attempts | Both `CrudStore` retry owners wrap each attempt in `after_database_owners`, explicitly drop its owned future, then claim/record; terminal failed attempt is included before its WorkCarrier retires |
+| Awaited rollback | `rollback_with_hold_refusal` claims before awaiting the transaction-owning rollback future; a local RAII record is dropped after that future's completion or cancellation, before returning the same error |
+| Explicit error arms | 16 in lib.rs plus TaskRun occurrence commit: pending-request projection, finalization/item materialization, message edit/delete, recovery terminalization, semantic event materialization/projection, Task creation and occurrence terminalization |
+| Direct compaction lifecycle | Repair/materialize existing outer boundaries drain after their operation future drops; no new retry is added |
+| Epoch / duplicate protection | Receipt claim is atomic and single-use; its consumed record is not Clone. Flush checks saved epoch, uses saved context, adds one existing family-only counter/local receipt; outer wrappers cannot record it twice |
+
+Source traversal includes indirect `timeline_live_projection::refresh_turn_work_summary`
+→ CLI binding conversion as well as Task snapshot `find_by_run` and Task-event
+initial capture. No capture was moved, no hold was reacquired later, and no SQL,
+root/ownership guard, retry predicate/count/delay or worker pause was changed for
+R1. `anyhow` typed context preserves downcast to PreflightRace. Rollback errors
+remain intentionally ignored in the same original arms; the original error is
+returned. Cancellation can destroy the resource-owning rollback future first,
+then the claimed receipt; it does not report a read success. This ordering concerns
+Rust DB owners and admission capacity: SeaORM drop rollback is queued, so this
+report does not assert synchronous completion of SQLite's internal rollback.
+
+No instruments, labels, exporter configuration, consent policy or series budget
+were added: the conservative total remains **840 attribute sets**. The five fixed
+families plus mixed, native-operation sums, query/CPU coverage limits, elapsed
+semantics and original sampling/export route described above are unchanged.
+Refusal capture stores only bounded metadata; released attempt wrapping currently
+uses one bounded boxed future per attempt. Allocation/clock/registry overhead and
+SDK/backend delivery have not been measured.
+
+The former F6 test was replaced in its existing owner by an actual transactional
+regression. A real write-executor Released observer detects an eager receipt,
+implicit drop and explicit rollback exercise both release paths, another caller
+at rollback verifies saved attribution, and claimed-receipt cancellation and a
+consent cycle check loss/epoch behavior. The aggregate owner still checks scoped
+stale without a separate receipt. No test was run and there is no dynamic pre-fix/
+post-fix proof. Production was frozen during three separate test-audit phases;
+protected hashes/prefixes were checked after each. A Rust move-out-of-Drop issue
+found during review was corrected in an explicit production phase between the
+first two freezes. Final test-only review corrected three tool-output fixture
+queries to filter by unique id instead of the ordinal primary key.
+
+Static review covered this correction and the entire cumulative observability
+inventory against `0c597c1e`, including manifests/lock, the new authorized schema/
+Entity delta, tests and reports. Targeted formatting and diff checks are recorded
+in [compact-metadata.md](compact-metadata.md), along with current commits. No
+runtime, CI/push, monitor resume, service or production database action occurred.
+After full external acceptance only, run the transactional rejection owner with
+the other planned isolated-DB/local/Axiom checks above. Compilability, actual
+release-time samples, runtime behavior and exporter/backend delivery remain
+unconfirmed. Self-review does not authorize dynamic checks.
+
+
+Current R1/metadata source commit:
+`bc2d6e64c8772507132ddac62fbe7cd22bbc4cd0`.
+Final test-only correction:
+`fc577b77900c0638eb81314a8763c798a9f70a25`.
+The following `docs(storage): record compact metadata review handoff` commit
+records both reports; its final HEAD SHA/clean-tree check is in the handoff.
+Full file/check/test inventory and the authorized draft-schema/Entity exception
+are in [compact-metadata.md](compact-metadata.md#current-commit-and-verification-ledger).
+Only source/text/Git/formatting checks were performed. No tests, builds, cargo
+check, Migrator or codegen ran; renewed full external review remains required.
