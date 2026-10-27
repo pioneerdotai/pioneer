@@ -423,6 +423,13 @@ struct RenderAudit {
     closures: bool,
 }
 impl<'ast> Visit<'ast> for RenderAudit {
+    fn visit_expr_block(&mut self, e: &'ast syn::ExprBlock) {
+        // Test probes are absent from production Render implementations.
+        if !is_test(&e.attrs) {
+            visit::visit_expr_block(self, e);
+        }
+    }
+
     fn visit_expr_call(&mut self, e: &'ast syn::ExprCall) {
         // This feature helper's last parameter is passed to PopupMenuItem::on_click.
         if matches!(e.func.as_ref(),syn::Expr::Path(p) if p.path.segments.last().is_some_and(|s|s.ident=="composer_add_menu_item"))
@@ -444,6 +451,9 @@ impl<'ast> Visit<'ast> for RenderAudit {
         }
     }
     fn visit_expr_method_call(&mut self, e: &'ast syn::ExprMethodCall) {
+        if is_test(&e.attrs) {
+            return;
+        }
         if [
             "notify",
             "spawn",
@@ -649,6 +659,8 @@ fn render_units_are_pure_and_optional_caches_are_absent() {
     for text in [
         "rows.map(|row| { cx.notify(); row })",
         "popover.content(|cx| cx.new(|cx| State::new(cx)))",
+        "{ #[cfg(not(test))] { self.cache = value; } }",
+        "{ #[cfg(not(test))] probe.borrow_mut(); }",
     ] {
         let mut audit = RenderAudit {
             violations: vec![],
@@ -657,8 +669,19 @@ fn render_units_are_pure_and_optional_caches_are_absent() {
         audit.visit_expr(&syn::parse_str::<syn::Expr>(text).unwrap());
         assert!(
             !audit.violations.is_empty(),
-            "value callback bypass: {text}"
+            "production Render bypass: {text}"
         );
+    }
+    for text in [
+        "{ #[cfg(test)] { *probe.borrow_mut() = value; } }",
+        "{ #[cfg(test)] probe.borrow_mut(); }",
+    ] {
+        let mut audit = RenderAudit {
+            violations: vec![],
+            closures: true,
+        };
+        audit.visit_expr(&syn::parse_str::<syn::Expr>(text).unwrap());
+        assert!(audit.violations.is_empty(), "test probe in audit: {text}");
     }
     let mut event = RenderAudit {
         violations: vec![],

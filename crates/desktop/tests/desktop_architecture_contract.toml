@@ -179,6 +179,8 @@ artifact_preview = { owner = "Client ArtifactRegistry", source = "client/src/art
 "desktop:SidebarHostView" = ["Render", "DesktopShellView", "TUI-04"]
 "desktop:DesktopBody" = ["RenderOnce", "DesktopShellView", "TUI-04"]
 "desktop-workspaces:ThreadSidebarView" = ["Render", "WorkspaceNavigationView", "TUI-10"]
+# ThreadSidebarView owns node-keyed row views and reconciles their inputs outside Render.
+"desktop-workspaces:SidebarRowView" = ["Render", "ThreadSidebarView", "TUI-10"]
 # The sidebar retains row hosts to isolate the stock Spinner's animation invalidation.
 "desktop-workspaces:TaskActivityIndicator" = ["Render", "ThreadSidebarView", "TUI-10"]
 "desktop-workspaces:WorkspaceSelectorTrigger" = ["RenderOnce", "WorkspaceNavigationView", "TUI-09"]
