@@ -5439,20 +5439,11 @@ fn task_resume_preserves_persisted_admission_but_constrains_a_new_legacy_seed() 
                     .status,
                 pioneer_protocol::TaskStatus::Blocked
             );
-            // A different, still-running execution in the same capsule may
-            // manage A without lending its own create rights to a new admission.
-            harness
-                .cli_session
-                .set_next_native_turn_id("immutable-resume-caller")
-                .await;
-            let sibling = facade.call("resume-caller-create", "resume-caller-create", "task_create",
-                json!({"title":"Authorized Task controller","goal":"Manage another permitted Task"}),
-            ).await;
-            let caller =
-                wait_for_task_cli_child(&processor, sibling["runId"].as_str().unwrap(), None).await;
-            assert_ne!(caller.turn_id, turn);
+            // Admit a different controller under an older, narrower source
+            // ceiling. Editing an already-admitted child's authority would
+            // break its immutable execution fingerprint before task_resume.
             let source = processor
-                .load_turn_execution_authorization_context(&caller.turn_id)
+                .load_turn_execution_authorization_context(&turn)
                 .await
                 .unwrap();
             let mut encoded: JsonValue =
@@ -5473,9 +5464,31 @@ fn task_resume_preserves_persisted_admission_but_constrains_a_new_legacy_seed() 
                 });
             processor
                 .crud_store
-                .set_turn_execution_authorization_context(&caller.turn_id, &encoded.to_string())
+                .set_turn_execution_authorization_context(&turn, &encoded.to_string())
                 .await
                 .unwrap();
+            harness
+                .cli_session
+                .set_next_native_turn_id("immutable-resume-caller")
+                .await;
+            let sibling = facade.call("resume-caller-create", "resume-caller-create", "task_create",
+                json!({"title":"Authorized Task controller","goal":"Manage another permitted Task"}),
+            ).await;
+            let caller =
+                wait_for_task_cli_child(&processor, sibling["runId"].as_str().unwrap(), None).await;
+            assert_ne!(caller.turn_id, turn);
+            let caller_authority = processor
+                .load_turn_execution_authorization_context(&caller.turn_id)
+                .await
+                .unwrap();
+            assert!(
+                !caller_authority
+                    .grants_action(crate::authorization::ResourceAction::ThreadCreatePrivate)
+            );
+            assert!(
+                !caller_authority
+                    .grants_action(crate::authorization::ResourceAction::ThreadCreateWorkspace)
+            );
             if !persisted {
                 // Model the supported legacy case with no immutable admission;
                 // source ceiling applies when the real readmission path creates it.

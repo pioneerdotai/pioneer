@@ -5907,37 +5907,46 @@ impl DirectAgentSandboxProvider {
     }
 }
 
-fn find_current_agent_target_option(value: &JsonValue) -> Option<String> {
+fn find_agent_option(value: &JsonValue, field: &str, label: Option<&str>) -> Option<String> {
     match value {
         JsonValue::Object(object) => {
-            if let Some(options) = object
-                .get("targetOptions")
-                .or_else(|| object.get("target_options"))
-                .and_then(JsonValue::as_array)
+            if let Some(options) = object.get(field).and_then(JsonValue::as_array)
                 && let Some(id) = options.iter().find_map(|option| {
-                    let label = option.get("label").and_then(JsonValue::as_str)?;
-                    (label == "Current thread")
+                    let actual = option.get("label").and_then(JsonValue::as_str)?;
+                    let selected = label.map_or(
+                        actual != "Current thread" && actual != "Current collaboration",
+                        |label| actual == label,
+                    );
+                    selected
                         .then(|| option.get("id").and_then(JsonValue::as_str))
                         .flatten()
                 })
             {
                 return Some(id.to_owned());
             }
-            object.values().find_map(find_current_agent_target_option)
+            object
+                .values()
+                .find_map(|value| find_agent_option(value, field, label))
         }
-        JsonValue::Array(values) => values.iter().find_map(find_current_agent_target_option),
+        JsonValue::Array(values) => values
+            .iter()
+            .find_map(|value| find_agent_option(value, field, label)),
         JsonValue::String(encoded) => serde_json::from_str::<JsonValue>(encoded)
             .ok()
             .as_ref()
-            .and_then(find_current_agent_target_option),
+            .and_then(|value| find_agent_option(value, field, label)),
         _ => None,
     }
 }
 
-fn current_agent_target_option_from_request(request: &ChatRequest) -> Option<String> {
+fn agent_option_from_request(
+    request: &ChatRequest,
+    field: &str,
+    label: Option<&str>,
+) -> Option<String> {
     for message in request.messages.iter().rev() {
         if let Ok(value) = serde_json::from_str::<JsonValue>(message.content.as_str())
-            && let Some(id) = find_current_agent_target_option(&value)
+            && let Some(id) = find_agent_option(&value, field, label)
         {
             return Some(id);
         }
@@ -5945,7 +5954,7 @@ fn current_agent_target_option_from_request(request: &ChatRequest) -> Option<Str
             let mut values = serde_json::Deserializer::from_str(&message.content[index..])
                 .into_iter::<JsonValue>();
             if let Some(Ok(value)) = values.next()
-                && let Some(id) = find_current_agent_target_option(&value)
+                && let Some(id) = find_agent_option(&value, field, label)
             {
                 return Some(id);
             }
@@ -7011,6 +7020,7 @@ impl Provider for DirectAgentSandboxProvider {
             } else {
                 test_turn_preflight_response_with_visible_tools(&[
                     "threads_start_options",
+                    "thread_create",
                     "threads_turn_start",
                 ])
             });
@@ -7056,13 +7066,34 @@ impl Provider for DirectAgentSandboxProvider {
                 }],
             },
             1 => {
-                let target_option_id = current_agent_target_option_from_request(&request)
+                let option = agent_option_from_request(
+                    &request,
+                    "threadCreationOptions",
+                    Some("Current collaboration"),
+                )
+                .expect("parent options must allow an internal child thread");
+                ChatResponse {
+                    messages: Vec::new(),
+                    text: String::new(),
+                    usage: None,
+                    reasoning_content: None,
+                    provider_replay_state: None,
+                    termination: pioneer_provider::ProviderTermination::ToolCalls,
+                    tool_calls: vec![ProviderToolCall {
+                        id: "call_direct_agent_create".to_owned(),
+                        name: "thread_create".to_owned(),
+                        arguments: json!({"optionId":option}).to_string(),
+                    }],
+                }
+            }
+            2 => {
+                let target_option_id = agent_option_from_request(&request, "targetOptions", None)
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "threads_start_options output did not contain a current-thread target: {:#?}",
-                            request.messages
-                        )
-                    })?;
+                    anyhow::anyhow!(
+                        "thread_create output did not contain a child-thread target: {:#?}",
+                        request.messages
+                    )
+                })?;
                 ChatResponse {
                     messages: Vec::new(),
                     text: String::new(),
@@ -37005,12 +37036,19 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
         .expect("direct Agent child permission request should be present");
     assert_eq!(opened_request["tool_name"], json!("exec_command"));
     assert_eq!(opened_request["action"], json!("shell_command"));
-    assert_eq!(opened_request["thread_id"], json!(thread_id));
+    let child_thread_id = opened_request["thread_id"].as_str().unwrap().to_owned();
+    assert_ne!(child_thread_id, thread_id);
+    let lineage = crud_store
+        .get_task_thread_lineage(&child_thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(lineage.root_thread_id, thread_id);
     let child_turn_id = opened_request["turn_id"]
         .as_str()
         .expect("direct Agent child turn id should be present")
         .to_owned();
-    assert_admitted_turn_owner(&processor, thread_id, &child_turn_id).await;
+    assert_admitted_turn_owner(&processor, &child_thread_id, &child_turn_id).await;
     assert_ne!(child_turn_id, root_turn_id);
     let permission_request_id = opened_request["request_id"]
         .as_str()
@@ -37078,7 +37116,7 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
     let expected_artifact_root = pioneer_artifacts::artifact_output_dir_path(
         processor.artifact_runtime_home.join("artifacts").as_path(),
         workspace_id.as_str(),
-        thread_id,
+        child_thread_id.as_str(),
         child_turn_id.as_str(),
     )
     .expect("direct Agent child artifact root should resolve");
@@ -37113,7 +37151,7 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
     assert!(permission_records[0].status.is_terminal());
 
     let child_events = crud_store
-        .get_turn_item_events(thread_id, child_turn_id.as_str())
+        .get_turn_item_events(&child_thread_id, child_turn_id.as_str())
         .await
         .expect("direct Agent child event stream should load")
         .expect("direct Agent child event stream should exist");

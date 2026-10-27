@@ -1724,6 +1724,17 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
     match phase {
         InitialStopPhase::BeforeActorProjectionStorageUnavailable => {
             drop(prepared);
+            // Preparation creates an idle actor before dispatch. Remove that
+            // idle actor to exercise the durable Stop path without a runtime.
+            assert!(
+                processor
+                    .agent_manager
+                    .active_turn_id(thread)
+                    .await
+                    .is_none()
+            );
+            processor.agent_manager.remove_thread(thread).await;
+            assert!(!processor.agent_manager.has_thread(thread).await);
             db.execute_unprepared("CREATE TRIGGER reject_early_projection BEFORE UPDATE OF status ON turn WHEN NEW.status = 'interrupted' BEGIN SELECT RAISE(ABORT, 'fixture projection unavailable'); END").await.unwrap();
             for suffix in ["first-pending", "repeat-pending"] {
                 let id = generate_test_request_id("initialstop", suffix);
@@ -1950,7 +1961,8 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                     .clone();
                 let start_id = format!("initial-stop-child-start-{index}");
                 super::thread_launch_choices::call(&tools,"threads_turn_start",&start_id,json!({
-                "targetOptionId":target,"input":[{"type":"text","text":"Run in the root work graph"}]
+                "targetOptionId":target,"input":[{"type":"text","text":"Run in the root work graph"}],
+                "launch":{"useDefaultReasoning":true}
             })).await;
                 let row = pioneer_crud::load_agent_action_outbox(
                     &db,
