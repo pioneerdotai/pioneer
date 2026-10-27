@@ -1935,7 +1935,8 @@ mod tests {
             .exec(&store.connection)
             .await
             .unwrap();
-        pioneer_entity::tool_output_chunk::Entity::delete_by_id("original")
+        pioneer_entity::tool_output_chunk::Entity::delete_many()
+            .filter(pioneer_entity::tool_output_chunk::Column::Id.eq("original"))
             .exec(&store.connection)
             .await
             .unwrap();
@@ -2046,7 +2047,8 @@ mod tests {
             .reservation_attempts = RESERVATION_ATTEMPTS - 1;
         assert!(progress.quantum(&store).await.is_err());
         assert!(progress.pending.is_none());
-        let source = pioneer_entity::tool_output_chunk::Entity::find_by_id("exhausted")
+        let source = pioneer_entity::tool_output_chunk::Entity::find()
+            .filter(pioneer_entity::tool_output_chunk::Column::Id.eq("exhausted"))
             .one(&store.connection)
             .await
             .unwrap()
@@ -2088,7 +2090,8 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let source = pioneer_entity::tool_output_chunk::Entity::find_by_id("exhausted")
+        let source = pioneer_entity::tool_output_chunk::Entity::find()
+            .filter(pioneer_entity::tool_output_chunk::Column::Id.eq("exhausted"))
             .one(&store.connection)
             .await
             .unwrap()
