@@ -219,22 +219,10 @@ impl SqliteReadPool {
             if let Some(native) = &mut native {
                 native.waiting_for_handle();
             }
-            let mut locked = {
-                let mut lock = std::pin::pin!(connection.lock_handle());
-                std::future::poll_fn(|context| {
-                    let result = lock.as_mut().poll(context);
-                    // A ready lock needs no extra live journal transition per
-                    // block. Real waits remain visible and cancellation-safe.
-                    if result.is_pending()
-                        && let Some(native) = &mut native
-                    {
-                        native.handle_pending();
-                    }
-                    result
-                })
+            let mut locked = connection
+                .lock_handle()
                 .await
-            }
-            .map_err(|_| crate::blob_range::error("SQLite blob reader handle lock failed"))?;
+                .map_err(|_| crate::blob_range::error("SQLite blob reader handle lock failed"))?;
             if let Some(native) = &mut native {
                 native.executing();
             }

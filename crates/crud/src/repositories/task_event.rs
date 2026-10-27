@@ -809,7 +809,12 @@ pub(crate) async fn hydrate_rows(
             let hold = row
                 .payload_json_payload_id
                 .as_deref()
-                .map(super::portable_payload::PayloadReadHold::capture)
+                .map(|id| {
+                    super::portable_payload::PayloadReadHold::capture(
+                        id,
+                        super::portable_payload::Family::TaskEvent,
+                    )
+                })
                 .transpose()?;
             Ok((row, hold))
         })

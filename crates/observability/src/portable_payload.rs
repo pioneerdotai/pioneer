@@ -23,7 +23,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context as TaskContext, Poll},
     time::{Duration, Instant, SystemTime},
@@ -92,7 +92,7 @@ const LIVE_INTERVAL_MS: u64 = 250;
 pub const MAX_METRIC_SERIES: usize = Family::ALL.len()
     * Mode::ALL.len()
     * (2 * Outcome::ALL.len() + STAGES + BYTE_KINDS + BLOCK_KINDS + DICTIONARY_EVENTS)
-    + Family::ALL.len() * (NativeOutcome::ALL.len() + 2 + 1);
+    + Family::ALL.len() * (NativeOutcome::ALL.len() + 2 + 1 + 1);
 const _: () = assert!(MAX_METRIC_SERIES < 2_000);
 
 pub(crate) struct Metrics {
@@ -105,6 +105,7 @@ pub(crate) struct Metrics {
     native_reads: Counter<u64>,
     native_duration: Histogram<f64>,
     native_bytes: Counter<u64>,
+    hold_rejections: Counter<u64>,
 }
 impl Metrics {
     pub(crate) fn new(meter: &Meter) -> Self {
@@ -130,12 +131,15 @@ impl Metrics {
             native_reads: meter.u64_counter("pioneer.gateway.portable.native.reads")
                 .with_description("Native guard/blob read operations; outside ordinary SQL callback/query-count and named SQLite worker-thread CPU coverage")
                 .with_unit("{read}").build(),
-            native_duration: meter.f64_histogram("pioneer.gateway.portable.native.duration")
-                .with_description("Native handle wait or native guard/blob execution elapsed wall time; excludes pool/admission waits; not CPU")
+            native_duration: meter.f64_histogram("pioneer.gateway.portable.native.operation.duration")
+                .with_description("Sum of native handle wait or guard/blob execution elapsed per logical operation/family (standalone read when unowned); not per-read latency or CPU; excludes pool/admission waits")
                 .with_unit("ms").build(),
             native_bytes: meter.u64_counter("pioneer.gateway.portable.native.bytes")
                 .with_description("Bytes returned by successful native guard/blob reads; not ordinary query bytes")
                 .with_unit("By").build(),
+            hold_rejections: meter.u64_counter("pioneer.gateway.portable.hold.rejections")
+                .with_description("Pre-scope backing-hold rejections by static family; not completed reads; rejections inside an operation use its stale outcome instead")
+                .with_unit("{rejection}").build(),
         }
     }
 }
@@ -152,6 +156,52 @@ fn ms(value: u64) -> f64 {
     Duration::from_nanos(value).as_secs_f64() * 1_000.0
 }
 
+#[derive(Default)]
+struct NativeTotals {
+    reads: [AtomicU64; NativeOutcome::ALL.len()],
+    bytes: AtomicU64,
+    elapsed: [AtomicU64; 2],
+    calls: [AtomicU64; 2],
+}
+impl NativeTotals {
+    fn record(&self, outcome: NativeOutcome, bytes: u64, durations: [Option<Duration>; 2]) {
+        add(&self.reads[outcome as usize], 1);
+        if outcome == NativeOutcome::Ok {
+            add(&self.bytes, bytes);
+        }
+        for (index, elapsed) in durations.into_iter().enumerate() {
+            if let Some(elapsed) = elapsed {
+                add(&self.elapsed[index], nanos(elapsed));
+                add(&self.calls[index], 1);
+            }
+        }
+    }
+    fn emit(&self, metrics: &Metrics, family: Family) {
+        let family = KeyValue::new("family", family.as_str());
+        for outcome in NativeOutcome::ALL {
+            let count = self.reads[*outcome as usize].load(Ordering::Relaxed);
+            if count > 0 {
+                metrics.native_reads.add(
+                    count,
+                    &[family.clone(), KeyValue::new("outcome", outcome.as_str())],
+                );
+            }
+        }
+        for (index, stage) in ["handle_wait", "execute"].into_iter().enumerate() {
+            if self.calls[index].load(Ordering::Relaxed) > 0 {
+                metrics.native_duration.record(
+                    ms(self.elapsed[index].load(Ordering::Relaxed)),
+                    &[family.clone(), KeyValue::new("stage", stage)],
+                );
+            }
+        }
+        let bytes = self.bytes.load(Ordering::Relaxed);
+        if bytes > 0 {
+            metrics.native_bytes.add(bytes, &[family]);
+        }
+    }
+}
+
 struct Aggregate {
     family: AtomicUsize,
     mode: Mode,
@@ -161,13 +211,25 @@ struct Aggregate {
     bytes: [[AtomicU64; BYTE_KINDS]; FAMILIES],
     blocks: [[AtomicU64; BLOCK_KINDS]; FAMILIES],
     dictionary: [[AtomicU64; DICTIONARY_EVENTS]; FAMILIES],
+    native: [NativeTotals; FAMILIES],
+    parent: Context,
+    started: Instant,
+    started_at: SystemTime,
+    finished: AtomicBool,
+    elapsed_nanos: AtomicU64,
     epoch: u64,
     work: Option<work::WorkContext>,
     last_live_ms: AtomicU64,
     live_stages_seen: AtomicU64,
 }
 impl Aggregate {
-    fn new(family: Family, mode: Mode, epoch: u64, work: Option<work::WorkContext>) -> Self {
+    fn new(
+        family: Family,
+        mode: Mode,
+        epoch: u64,
+        work: Option<work::WorkContext>,
+        parent: Context,
+    ) -> Self {
         Self {
             family: AtomicUsize::new(family as usize),
             mode,
@@ -177,6 +239,12 @@ impl Aggregate {
             bytes: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             blocks: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             dictionary: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            native: std::array::from_fn(|_| NativeTotals::default()),
+            parent,
+            started: Instant::now(),
+            started_at: SystemTime::now(),
+            finished: AtomicBool::new(false),
+            elapsed_nanos: AtomicU64::new(0),
             epoch,
             work,
             last_live_ms: AtomicU64::new(0),
@@ -212,23 +280,21 @@ impl Aggregate {
             return;
         }
         let now = crate::identity::monotonic_ms();
-        // Short CPU phases are aggregate-only until the live interval elapses.
-        // In particular a one-block background quantum must not add one live
-        // journal event for each codec/cache phase. First I/O stages remain
-        // immediately visible; repeated transitions are coalesced to 4/second.
+        // First train/prepare entry is visible even after a fast DB phase.
+        // Full/range reads also expose their first codec/verification entry.
+        // Short background block phases and cache lookups stay coalesced: a
+        // one-block quantum must not journal every CPU transition. There is
+        // at most one immediate entry per eligible phase per operation.
         let first_stage = stage.is_some_and(|stage| {
             let bit = 1_u64 << stage as usize;
             let first = self.live_stages_seen.fetch_or(bit, Ordering::Relaxed) & bit == 0;
             first
-                && !matches!(
-                    stage,
-                    Stage::DictionaryTrain
-                        | Stage::DictionaryPrepare
-                        | Stage::DictionaryLookup
-                        | Stage::Compress
-                        | Stage::Decompress
-                        | Stage::VerifyAssemble
-                )
+                && !matches!(stage, Stage::DictionaryLookup)
+                && !(self.mode == Mode::Background
+                    && matches!(
+                        stage,
+                        Stage::Compress | Stage::Decompress | Stage::VerifyAssemble
+                    ))
         });
         if !force && !first_stage {
             if self
@@ -259,6 +325,19 @@ impl Aggregate {
             nanos(elapsed),
         );
         add(&self.phase_calls[family as usize][stage as usize], 1);
+    }
+}
+// The last phase/native recorder owns the final flush. A native guard can
+// drop outside its originating poll without losing its owner, and cannot write
+// after this flush: its Arc must have been released before Aggregate::drop.
+impl Drop for Aggregate {
+    fn drop(&mut self) {
+        if self.finished.load(Ordering::Relaxed) {
+            emit(
+                self,
+                Duration::from_nanos(self.elapsed_nanos.load(Ordering::Relaxed)),
+            );
+        }
     }
 }
 thread_local! { static CURRENT: RefCell<Option<Arc<Aggregate>>> = const { RefCell::new(None) }; }
@@ -293,6 +372,28 @@ pub fn outcome(outcome: Outcome) {
     if let Some(s) = current() {
         s.record_outcome(outcome);
     }
+}
+/// A known hold refusal before hydration has an owner. Successful captures do
+/// nothing. An already scoped refusal is accounted once as that operation's
+/// stale outcome; otherwise record a separate rejection, never a full read.
+pub fn hold_rejected(family: Family) {
+    if let Some(state) = current() {
+        state.record_outcome(Outcome::Stale);
+        return;
+    }
+    let (enabled, epoch) = crate::telemetry_consent_snapshot();
+    if !enabled {
+        return;
+    }
+    if let Some(metrics) = crate::telemetry::state().and_then(|s| s.gateway_metrics.as_ref()) {
+        if crate::telemetry_sample_allowed(Some(epoch)) {
+            metrics
+                .portable_payload
+                .hold_rejections
+                .add(1, &[KeyValue::new("family", family.as_str())]);
+        }
+    }
+    live::portable_hold_rejected(work::current(), family);
 }
 pub fn bytes(kind: ByteKind, count: u64) {
     if let Some(s) = current() {
@@ -351,9 +452,6 @@ struct Operation {
     state: Arc<Aggregate>,
     carrier: work::WorkCarrier,
     live: live::WorkGuard,
-    parent: Context,
-    started: Instant,
-    started_at: SystemTime,
 }
 /// A work boundary carries IDs but has no OTEL attachment and does not retain
 /// sampling flags or trace state. Reuse a valid active context when available;
@@ -389,16 +487,19 @@ impl Operation {
             .context()
             .map_or(work::ExecutorRole::Gateway, |c| c.executor);
         let carrier = parent_carrier.execution_child(work::WorkKind::Database, executor);
-        let state = Arc::new(Aggregate::new(family, mode, epoch, carrier.context()));
+        let state = Arc::new(Aggregate::new(
+            family,
+            mode,
+            epoch,
+            carrier.context(),
+            parent,
+        ));
         let live = live::WorkGuard::start(carrier.context(), false);
         state.live(None, None, true);
         Self {
             state,
             carrier,
             live,
-            parent,
-            started: Instant::now(),
-            started_at: SystemTime::now(),
         }
     }
     fn finish(mut self, cancelled: bool) {
@@ -412,7 +513,12 @@ impl Operation {
             Outcome::Cancelled => work::Outcome::Cancelled,
             _ => work::Outcome::Completed,
         });
-        emit(&self, self.started.elapsed());
+        self.state
+            .elapsed_nanos
+            .store(nanos(self.state.started.elapsed()), Ordering::Relaxed);
+        self.state.finished.store(true, Ordering::Relaxed);
+        // Export occurs when the last captured recorder is dropped, after its
+        // partial native counts/timings have joined this same fixed aggregate.
     }
 }
 
@@ -451,7 +557,10 @@ where
                 .or(this.shared.as_ref())
                 .map(|state| CurrentScope::enter(state.clone()));
             // TLS and OTEL attachment live for one poll only, never across await.
-            let _otel = this.operation.as_ref().map(|op| op.parent.clone().attach());
+            let _otel = this
+                .operation
+                .as_ref()
+                .map(|op| op.state.parent.clone().attach());
             this.future
                 .as_mut()
                 .expect("portable future polled after completion")
@@ -562,8 +671,7 @@ pub async fn pause<F: Future>(duration: Duration, backoff: bool, future: F) -> F
         .await
 }
 
-fn emit(op: &Operation, elapsed: Duration) {
-    let s = &op.state;
+fn emit(s: &Aggregate, elapsed: Duration) {
     if !crate::telemetry_sample_allowed(Some(s.epoch)) {
         return;
     }
@@ -588,6 +696,7 @@ fn emit(op: &Operation, elapsed: Duration) {
         .record(elapsed.as_secs_f64() * 1_000.0, &terminal);
     for family in Family::ALL {
         let family_index = *family as usize;
+        s.native[family_index].emit(metrics, *family);
         let dimensions = [KeyValue::new("family", family.as_str()), base[1].clone()];
         for stage in Stage::ALL {
             if s.phase_calls[family_index][*stage as usize].load(Ordering::Relaxed) > 0 {
@@ -692,11 +801,8 @@ fn emit(op: &Operation, elapsed: Duration) {
             i64::try_from(count).unwrap_or(i64::MAX),
         ));
     }
-    let builder = SpanBuilder::from_name("gateway.portable_payload.summary")
-        .with_kind(SpanKind::Internal)
-        .with_start_time(op.started_at)
-        .with_attributes(attributes);
-    let mut span = state.tracer.build_with_context(builder, &op.parent);
+    let builder = summary_builder(s.epoch, s.started_at, attributes);
+    let mut span = state.tracer.build_with_context(builder, &s.parent);
     span.set_status(match s.outcome() {
         Outcome::Error => Status::Error {
             description: "portable operation failed".into(),
@@ -705,17 +811,34 @@ fn emit(op: &Operation, elapsed: Duration) {
         _ => Status::Ok,
     });
     span.end_with_timestamp(
-        op.started_at
+        s.started_at
             .checked_add(elapsed)
             .unwrap_or_else(SystemTime::now),
     );
 }
 
+fn summary_builder(
+    epoch: u64,
+    started_at: SystemTime,
+    mut attributes: Vec<KeyValue>,
+) -> SpanBuilder {
+    // The existing batch exporter rechecks this saved generation at delivery.
+    attributes.push(KeyValue::new(
+        "pioneer.consent.generation",
+        epoch.to_string(),
+    ));
+    SpanBuilder::from_name("gateway.portable_payload.summary")
+        .with_kind(SpanKind::Internal)
+        .with_start_time(started_at)
+        .with_attributes(attributes)
+}
+
 /// Separate native read accounting. Construct before resource acquisition,
-/// start the timer immediately before lock_handle; call handle_pending only
-/// after that future returns Poll::Pending, then executing after lock succeeds,
-/// and finish only after handle/reader/permit release. No query callbacks, SQL
-/// fingerprints or CPU samples are fabricated.
+/// start the timer immediately before lock_handle, then executing after lock
+/// succeeds, and finish only after handle/reader/permit release. The transition
+/// performs only clock/field updates, never live registry/SDK work under a
+/// handle. The captured aggregate receives counts even on drop outside a poll.
+/// No query callbacks, SQL fingerprints or CPU samples are fabricated.
 pub struct NativeRead {
     family: Family,
     epoch: Option<u64>,
@@ -723,7 +846,7 @@ pub struct NativeRead {
     executing: Option<Instant>,
     wait_elapsed: Option<Duration>,
     execute_elapsed: Option<Duration>,
-    live_wait: Option<live::WaitGuard>,
+    owner: Option<Arc<Aggregate>>,
     finished: bool,
 }
 impl NativeRead {
@@ -736,7 +859,7 @@ impl NativeRead {
             executing: None,
             wait_elapsed: None,
             execute_elapsed: None,
-            live_wait: None,
+            owner: current().filter(|s| s.epoch == epoch),
             finished: false,
         }
     }
@@ -746,21 +869,10 @@ impl NativeRead {
         }
         self.waiting = Some(Instant::now());
     }
-    /// Lazy local wait registration avoids journal churn for immediately-ready
-    /// locks. Repeated Pending polls retain the same single wait guard.
-    pub fn handle_pending(&mut self) {
-        if self.waiting.is_some()
-            && self.live_wait.is_none()
-            && crate::telemetry_sample_allowed(self.epoch)
-        {
-            self.live_wait = Some(live::WaitGuard::new(live::WaitKind::Lock));
-        }
-    }
     pub fn executing(&mut self) {
         if let Some(start) = self.waiting.take() {
             self.wait_elapsed = Some(start.elapsed());
         }
-        self.live_wait = None;
         if self.epoch.is_some() {
             self.executing = Some(Instant::now());
         }
@@ -779,34 +891,20 @@ impl NativeRead {
         if let Some(start) = self.executing.take() {
             self.execute_elapsed = Some(start.elapsed());
         }
-        self.live_wait = None;
         if !crate::telemetry_sample_allowed(self.epoch) {
             return;
         }
-        let Some(state) = crate::telemetry::state() else {
+        let durations = [self.wait_elapsed, self.execute_elapsed];
+        if let Some(owner) = &self.owner {
+            owner.native[self.family as usize].record(outcome, read_bytes, durations);
             return;
-        };
-        let Some(metrics) = state.gateway_metrics.as_ref().map(|m| &m.portable_payload) else {
-            return;
-        };
-        let family = KeyValue::new("family", self.family.as_str());
-        metrics.native_reads.add(
-            1,
-            &[family.clone(), KeyValue::new("outcome", outcome.as_str())],
-        );
-        for (phase, elapsed) in [
-            ("handle_wait", self.wait_elapsed),
-            ("execute", self.execute_elapsed),
-        ] {
-            if let Some(elapsed) = elapsed {
-                metrics.native_duration.record(
-                    elapsed.as_secs_f64() * 1_000.0,
-                    &[family.clone(), KeyValue::new("stage", phase)],
-                );
-            }
         }
-        if outcome == NativeOutcome::Ok && read_bytes > 0 {
-            metrics.native_bytes.add(read_bytes, &[family]);
+        // Genuinely standalone native call. No artificial portable scope; use
+        // the same one-operation sum semantics as an owned logical operation.
+        if let Some(metrics) = crate::telemetry::state().and_then(|s| s.gateway_metrics.as_ref()) {
+            let totals = NativeTotals::default();
+            totals.record(outcome, read_bytes, durations);
+            totals.emit(&metrics.portable_payload, self.family);
         }
     }
 }
@@ -986,12 +1084,13 @@ mod tests {
                     .load(Ordering::Relaxed),
                 u64::MAX
             );
-            outcome(Outcome::Stale);
+            hold_rejected(Family::TaskEvent);
             Err::<(), ()>(())
         }));
         assert_eq!(poll(future.as_mut()), Poll::Ready(Err(())));
         let terminal = terminals();
         assert_eq!(terminal.len(), 1);
+        assert!(terminal[0].portable_hold_rejection.is_none());
         assert_eq!(
             terminal[0].portable_payload.unwrap().family,
             Family::TaskEvent
@@ -1059,38 +1158,138 @@ mod tests {
     }
 
     #[test]
-    fn native_lock_journals_only_actual_pending_and_releases_on_drop() {
-        for pending in [false, true] {
-            let _consent = Consent::enabled();
-            let caller = work::WorkCarrier::independent(
-                work::Boundary::Timer,
-                work::WorkKind::Maintenance,
-                work::Trigger::Timer,
-                work::ExecutorRole::Gateway,
-            );
-            let token = caller.context().unwrap().token;
-            caller.run(|| {
+    fn native_observations_join_one_owner_and_cancel_outside_poll() {
+        let _consent = Consent::enabled();
+        let captured = std::cell::RefCell::new(None);
+        let escaped = std::cell::RefCell::new(None);
+        let mut future = Box::pin(scope_result(Family::ToolText, Mode::Full, async {
+            captured.replace(current());
+            for (outcome, bytes) in [
+                (NativeOutcome::Ok, 17),
+                (NativeOutcome::Missing, 0),
+                (NativeOutcome::Error, 0),
+            ] {
                 let mut native = NativeRead::new(Family::ToolText);
                 native.waiting_for_handle();
-                let waits = || live::snapshot().unwrap().journal.iter().filter(|r| {
-                    matches!(&r.payload, live::JournalPayload::Work(w)
-                        if w.context.token == token && w.state == live::WorkState::Waiting(live::WaitKind::Lock))
-                }).count();
-                assert_eq!(waits(), 0); // timer alone is not a live wait
-                if pending {
-                    native.handle_pending();
-                    native.handle_pending(); // same guard across multiple pending polls
-                    assert_eq!(waits(), 1);
-                    drop(native); // cancellation also retires the live wait
-                } else {
-                    native.executing();
-                    native.finish(NativeOutcome::Ok, 17);
-                    assert_eq!(waits(), 0);
-                }
-                assert_eq!(live::snapshot().unwrap().active.iter().find(|w| w.context.token == token).unwrap().state, live::WorkState::Running);
-            });
-            assert!(live::snapshot().unwrap().active.is_empty());
-        }
+                native.executing();
+                native.finish(outcome, bytes);
+            }
+            let mut native = NativeRead::new(Family::ToolText);
+            native.waiting_for_handle();
+            escaped.replace(Some(native));
+            std::future::pending::<Result<(), ()>>().await
+        }));
+        assert!(poll(future.as_mut()).is_pending());
+        assert!(current().is_none());
+        let state = captured.borrow_mut().take().unwrap();
+        let weak = Arc::downgrade(&state);
+        let native = &state.native[Family::ToolText as usize];
+        assert_eq!(
+            native.reads[NativeOutcome::Ok as usize].load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            native.reads[NativeOutcome::Cancelled as usize].load(Ordering::Relaxed),
+            0
+        );
+        assert!(!live::snapshot().unwrap().journal.iter().any(|r| matches!(
+            &r.payload, live::JournalPayload::Work(w)
+                if w.state == live::WorkState::Waiting(live::WaitKind::Lock)
+        ))); // native transition creates no new live lock guard
+        drop(future);
+        assert!(state.finished.load(Ordering::Relaxed));
+        // The real guard's drop happens without CURRENT and after work retirement.
+        // Its captured Arc retains the one aggregate until this observation joins.
+        drop(escaped.borrow_mut().take());
+        assert_eq!(
+            native.reads.each_ref().map(|n| n.load(Ordering::Relaxed)),
+            [1, 1, 1, 1]
+        );
+        assert_eq!(native.bytes.load(Ordering::Relaxed), 17);
+        assert_eq!(
+            native.calls.each_ref().map(|n| n.load(Ordering::Relaxed)),
+            [4, 3]
+        );
+        assert!(live::snapshot().unwrap().active.is_empty());
+        let terminal = terminals();
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(
+            terminal[0].portable_payload.unwrap().outcome,
+            Some(Outcome::Cancelled)
+        );
+        drop(state); // final aggregate flush; no recorder can write afterward
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn first_training_and_preparation_entry_remains_visible_during_coalescing() {
+        let _consent = Consent::enabled();
+        let token = std::cell::Cell::new(None);
+        let mut future = Box::pin(scope_result(Family::TaskHistory, Mode::Background, async {
+            let state = current().unwrap();
+            token.set(state.work.map(|w| w.token));
+            live_stage(Stage::SourceRead);
+            live_stage(Stage::DictionaryLoad);
+            let before = live::snapshot().unwrap().journal.len();
+            // Keep the ordinary elapsed gate closed deterministically: no sleeps,
+            // benchmark or fake long CPU work. First-entry admission must win.
+            state.last_live_ms.store(u64::MAX, Ordering::Relaxed);
+            live_stage(Stage::DictionaryTrain);
+            let snapshot = live::snapshot().unwrap();
+            let work = snapshot
+                .active
+                .iter()
+                .find(|w| Some(w.context.token) == token.get())
+                .unwrap();
+            assert_eq!(
+                work.portable_payload.unwrap().stage,
+                Some(Stage::DictionaryTrain)
+            );
+            assert_eq!(snapshot.journal.len(), before + 1);
+            for _ in 0..100 {
+                state.last_live_ms.store(u64::MAX, Ordering::Relaxed);
+                live_stage(Stage::DictionaryPrepare);
+                state.last_live_ms.store(u64::MAX, Ordering::Relaxed);
+                live_stage(Stage::DictionaryTrain);
+            }
+            assert_eq!(live::snapshot().unwrap().journal.len(), before + 2);
+            std::future::pending::<Result<(), ()>>().await
+        }));
+        assert!(poll(future.as_mut()).is_pending());
+        let snapshot = live::snapshot().unwrap();
+        let work = snapshot
+            .active
+            .iter()
+            .find(|w| Some(w.context.token) == token.get())
+            .unwrap();
+        assert_eq!(
+            work.portable_payload.unwrap().stage,
+            Some(Stage::DictionaryPrepare)
+        );
+        assert!(matches!(work.state, live::WorkState::Running));
+        drop(future);
+        assert!(live::snapshot().unwrap().active.is_empty());
+    }
+
+    #[test]
+    fn summary_generation_is_rejected_by_existing_exporter_filter_after_consent_cycle() {
+        let _consent = Consent::enabled();
+        let epoch = crate::telemetry_consent_snapshot().1;
+        let attributes = summary_builder(epoch, SystemTime::UNIX_EPOCH, Vec::new())
+            .attributes
+            .unwrap();
+        assert!(crate::telemetry::portable_summary_epoch_allowed(
+            &attributes,
+            epoch as i64
+        ));
+        crate::set_telemetry_enabled(false);
+        crate::set_telemetry_enabled(true);
+        let next = crate::telemetry_consent_snapshot().1;
+        assert_ne!(next, epoch);
+        assert!(!crate::telemetry::portable_summary_epoch_allowed(
+            &attributes,
+            next as i64
+        ));
     }
 
     #[test]

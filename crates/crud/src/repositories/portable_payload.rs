@@ -70,9 +70,9 @@ impl std::fmt::Debug for PayloadReadHold {
 impl PayloadReadHold {
     /// Capture synchronously while mapping a row, before its writer commits.
     /// A reader losing the gap to cleanup must retry the entire source fetch.
-    pub(crate) fn capture(id: &str) -> Result<Self> {
+    pub(crate) fn capture(id: &str, family: Family) -> Result<Self> {
         let guard = payload_gate(id).try_read_owned().map_err(|_| {
-            observe::outcome(observe::Outcome::Stale);
+            observe::hold_rejected(family.observed());
             PreflightRace
         })?;
         Ok(Self(Arc::new(PayloadReadLease {
@@ -202,7 +202,17 @@ impl Drop for CodecObservation {
 fn codec_observed<T>(
     operation: impl FnOnce(&mut codec::CodecDiagnostics) -> Result<T>,
 ) -> Result<T> {
-    let mut observation = CodecObservation(Default::default());
+    let mut observation = CodecObservation(codec::CodecDiagnostics {
+        on_stage: Some(|stage| {
+            observe::live_stage(match stage {
+                codec::CodecStage::Train => observe::Stage::DictionaryTrain,
+                codec::CodecStage::Prepare => observe::Stage::DictionaryPrepare,
+                codec::CodecStage::Compress => observe::Stage::Compress,
+                codec::CodecStage::Decompress => observe::Stage::Decompress,
+            })
+        }),
+        ..Default::default()
+    });
     operation(&mut observation.0)
 }
 
@@ -424,7 +434,7 @@ impl PortablePayloadProgress {
                 json_projection: (family == Family::CliMapping)
                     .then(super::portable_payload_json::Projection::default),
                 prepared: Prepared {
-                    _read_hold: PayloadReadHold::capture(&payload_id)?,
+                    _read_hold: PayloadReadHold::capture(&payload_id, family)?,
                     header: value::Model {
                         id: payload_id,
                         family: family.name().into(),
@@ -600,7 +610,6 @@ impl Preparation {
                 let text = std::str::from_utf8(&self.bytes[..end])?;
                 let chars = text.chars().count() as i64;
                 drop(verify);
-                observe::live_stage(observe::Stage::Compress);
                 let data = codec_observed(|diagnostics| {
                     codec::encode_observed(
                         text.as_bytes(),
@@ -762,7 +771,6 @@ async fn load_or_prepare_dictionary(
     let samples = sample[..sample.len().min(1024 * 1024)]
         .chunks(1024)
         .collect::<Vec<_>>();
-    observe::live_stage(observe::Stage::DictionaryTrain);
     let dict = codec_observed(|d| codec::train_observed(&samples, d))?;
     let publish_dictionary = observe::stage(observe::Stage::Publish);
     store
@@ -853,7 +861,7 @@ pub(crate) async fn header(
     id: &str,
     family: Family,
 ) -> Result<PayloadHeader> {
-    let hold = PayloadReadHold::capture(id)?;
+    let hold = PayloadReadHold::capture(id, family)?;
     read_header(db, id, family, hold, false).await
 }
 
@@ -1279,7 +1287,6 @@ async fn read_range_inner(
             offset <= position && position < offset + length,
             "portable range block does not contain position"
         );
-        observe::live_stage(observe::Stage::Decompress);
         let decoded = codec_observed(|d| codec::decode_observed(&b.data, Some(&dict), d))?;
         observe::bytes(observe::ByteKind::ReadOriginal, decoded.len() as u64);
         let _verify = observe::stage(observe::Stage::VerifyAssemble);
@@ -1475,5 +1482,54 @@ fn owner_stamp_sql(family: Family) -> &'static str {
         Family::TaskEvent => {
             "coalesce((SELECT json_array(t.workspace_id,t.owner_kind,t.owner_id,t.status,t.updated_at) FROM task t WHERE t.id=task_event.task_id),'')"
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pioneer_observability::{live, work};
+
+    #[test]
+    fn initial_capture_rejection_is_observable_without_a_hydration_scope() {
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                pioneer_observability::set_telemetry_enabled(self.0);
+            }
+        }
+        let _reset = Reset(pioneer_observability::telemetry_enabled());
+        pioneer_observability::set_telemetry_enabled(true);
+        let caller = work::WorkCarrier::independent(
+            work::Boundary::Rpc,
+            work::WorkKind::RpcRead,
+            work::Trigger::Rpc,
+            work::ExecutorRole::Gateway,
+        );
+        let token = caller.context().unwrap().token;
+        let id = uuid::Uuid::new_v4().to_string();
+        let cleanup = PayloadCleanupHold::try_acquire(&id).unwrap();
+        caller.run(|| {
+            let error = PayloadReadHold::capture(&id, Family::TaskEvent).unwrap_err();
+            assert!(error.downcast_ref::<PreflightRace>().is_some());
+            let snapshot = live::snapshot().unwrap();
+            let owner = snapshot.active.iter().find(|w| w.context.token == token).unwrap();
+            assert_eq!(owner.portable_hold_rejection, Some(observe::Family::TaskEvent));
+            assert!(owner.portable_payload.is_none()); // no fictitious full-read operation
+            let receipts = snapshot.journal.iter().filter(|r| matches!(
+                &r.payload, live::JournalPayload::Work(w)
+                    if w.context.token == token && w.portable_hold_rejection == Some(observe::Family::TaskEvent)
+            )).count();
+            assert_eq!(receipts, 1);
+            drop(cleanup);
+            let _hold = PayloadReadHold::capture(&id, Family::TaskEvent).unwrap();
+            // Successful capture neither adds a refusal nor starts hydration work.
+            let after = live::snapshot().unwrap();
+            assert_eq!(after.journal.iter().filter(|r| matches!(
+                &r.payload, live::JournalPayload::Work(w)
+                    if w.context.token == token && w.portable_hold_rejection == Some(observe::Family::TaskEvent)
+            )).count(), receipts);
+            assert!(after.active.iter().find(|w| w.context.token == token).unwrap().portable_payload.is_none());
+        });
     }
 }

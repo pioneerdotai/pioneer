@@ -10731,6 +10731,7 @@ dependencies = [
  "pioneer-entity",
  "pioneer-hooks",
  "pioneer-migration",
+ "pioneer-observability",
  "pioneer-protocol",
  "pioneer-sqlite",
  "sea-orm",

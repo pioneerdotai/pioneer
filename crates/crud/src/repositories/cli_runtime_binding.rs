@@ -2776,7 +2776,12 @@ fn turn_binding_record_from_model(
     let read_hold = model
         .input_mapping_json_payload_id
         .as_deref()
-        .map(super::portable_payload::PayloadReadHold::capture)
+        .map(|id| {
+            super::portable_payload::PayloadReadHold::capture(
+                id,
+                super::portable_payload::Family::CliMapping,
+            )
+        })
         .transpose()?;
     Ok(CliRuntimeTurnBindingRecord {
         input_mapping_payload_id: model.input_mapping_json_payload_id,

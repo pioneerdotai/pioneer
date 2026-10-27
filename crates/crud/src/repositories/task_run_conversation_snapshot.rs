@@ -147,7 +147,12 @@ pub async fn find_by_run<C: ConnectionTrait>(
             stored.history_json_read_hold = stored
                 .history_json_payload_id
                 .as_deref()
-                .map(super::portable_payload::PayloadReadHold::capture)
+                .map(|id| {
+                    super::portable_payload::PayloadReadHold::capture(
+                        id,
+                        super::portable_payload::Family::TaskHistory,
+                    )
+                })
                 .transpose()?;
             Ok(stored)
         })

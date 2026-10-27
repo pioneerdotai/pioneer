@@ -44,12 +44,23 @@ const HEADER_BYTES: usize = 78;
 const MAX_BODY_BYTES: usize = MAX_BLOCK_BYTES + 1024;
 const ZERO_DIGEST: [u8; 32] = [0; 32];
 
+/// Optional adapter notification at actual native CPU entry points. This
+/// byte codec does not know telemetry, database owners or scheduling classes.
+#[derive(Clone, Copy)]
+pub(crate) enum CodecStage {
+    Train,
+    Prepare,
+    Compress,
+    Decompress,
+}
+
 /// Caller-owned, fixed-size observations. All durations are elapsed wall time,
 /// not measured CPU. Phases do not overlap each other, but are nested within
 /// the caller's encode/decode/train/from-bytes duration. No content is retained.
 /// Unobserved public entry points do not read the clock.
 #[derive(Default)]
 pub(crate) struct CodecDiagnostics {
+    pub(crate) on_stage: Option<fn(CodecStage)>,
     /// Both cache critical sections, including mutex wait and byte comparison.
     pub(crate) lookup_elapsed: Duration,
     /// Native encoder/decoder dictionary construction on a cache miss.
@@ -217,6 +228,9 @@ fn prepared_dictionary(
     if let Some(diagnostics) = diagnostics.as_deref_mut() {
         diagnostics.preparations = diagnostics.preparations.saturating_add(1);
     }
+    if let Some(on_stage) = diagnostics.as_ref().and_then(|d| d.on_stage) {
+        on_stage(CodecStage::Prepare);
+    }
     let (prepared, memory) = {
         let _elapsed = Elapsed::new(diagnostics.as_deref_mut().map(|d| &mut d.prepare_elapsed));
         let encoder = zstd::dict::EncoderDictionary::try_copy(dictionary.bytes(), LEVEL)
@@ -307,6 +321,9 @@ fn train_impl(
         if let Some(diagnostics) = diagnostics.as_deref_mut() {
             diagnostics.trainings = diagnostics.trainings.saturating_add(1);
         }
+        if let Some(on_stage) = diagnostics.as_ref().and_then(|d| d.on_stage) {
+            on_stage(CodecStage::Train);
+        }
         let trained = {
             let _elapsed = Elapsed::new(diagnostics.as_deref_mut().map(|d| &mut d.train_elapsed));
             zstd::dict::from_continuous(&data, &sizes, capacity)
@@ -358,6 +375,9 @@ fn encode_impl(
     };
     if input.len() >= 64 {
         let prepared = prepared_dictionary(dictionary, diagnostics.as_deref_mut())?;
+        if let Some(on_stage) = diagnostics.as_ref().and_then(|d| d.on_stage) {
+            on_stage(CodecStage::Compress);
+        }
         let compressed = {
             let _elapsed =
                 Elapsed::new(diagnostics.as_deref_mut().map(|d| &mut d.compress_elapsed));
@@ -538,6 +558,9 @@ fn decode_impl(
             dictionary
         };
         let prepared = prepared_dictionary(dictionary, diagnostics.as_deref_mut())?;
+        if let Some(on_stage) = diagnostics.as_ref().and_then(|d| d.on_stage) {
+            on_stage(CodecStage::Decompress);
+        }
         let _elapsed = Elapsed::new(
             diagnostics
                 .as_deref_mut()
