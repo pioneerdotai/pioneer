@@ -1,10 +1,10 @@
 # Portable payload compression — implementation record
 
-Review status (2026-10-27): candidate `50f6611e7e4200bd7864ac2fbee2cc234401158d`
-was **not accepted** by external review, following the previously rejected
-`f4c09602973c82d555e1286bf6e5efb8b5ccbcae`. The repeat-review corrections and their
-limits are recorded at the end of this document. Internal review or a local commit
-does not constitute external acceptance; execution remains prohibited.
+Review status (2026-10-27): the user accepted candidate
+`184e070e9a1035441327d0c73fa55878e36199ca` and authorized publication to GitHub.
+The rejected candidates and repair records below describe earlier review rounds.
+Local builds and tests remain disabled at the user's request. GitHub CI will
+provide the next execution evidence.
 
 ## Baseline and boundaries
 
