@@ -4260,14 +4260,16 @@ async fn prepared_agent_start_retries_before_claim_but_reconciles_after_claim_or
                             .unwrap()
                             .is_none()
                     );
-                    assert_ne!(
-                        pioneer_crud::load_agent_action_outbox(&db, action.as_str())
-                            .await
-                            .unwrap()
-                            .unwrap()
-                            .status,
-                        "delivered"
-                    );
+                    // The durable activation claim transfers ownership even
+                    // when admission cannot persist recovery or a terminal.
+                    // ACK confirms that boundary, not a successful model call.
+                    let acknowledged = pioneer_crud::load_agent_action_outbox(&db, action.as_str())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(acknowledged.status, "delivered");
+                    assert!(acknowledged.delivered_at.is_some());
+                    assert!(acknowledged.next_attempt_at.is_none());
                     db.execute_unprepared(
                         "DROP TRIGGER fail_recovery_admission; DROP TRIGGER fail_dispatch_terminal",
                     )
