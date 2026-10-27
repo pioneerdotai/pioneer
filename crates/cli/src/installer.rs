@@ -142,10 +142,13 @@ struct VersionOutput {
     version: String,
     #[serde(default)]
     compiled_database_migrations: Option<Vec<String>>,
+    #[cfg(feature = "computer-use")]
     #[serde(default)]
     os: Option<String>,
+    #[cfg(feature = "computer-use")]
     #[serde(default)]
     arch: Option<String>,
+    #[cfg(feature = "computer-use")]
     #[serde(default)]
     computer_use: Option<bool>,
 }

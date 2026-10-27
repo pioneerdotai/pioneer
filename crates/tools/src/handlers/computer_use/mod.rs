@@ -1,4 +1,5 @@
 //! Gateway-owned computer use. This module never launches or connects to a driver.
+#[cfg(feature = "computer-use")]
 mod browser_catalog;
 mod catalog;
 mod images;

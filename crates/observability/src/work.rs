@@ -325,7 +325,7 @@ fn make(
         return None;
     }
     let Some(token) = NEXT
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
         .ok()
     else {
         loss("token_overflow");

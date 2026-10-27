@@ -1303,10 +1303,6 @@ fn safe_metadata_from_unknown(input: &ToolProjectionInput<'_>) -> JsonValue {
     })
 }
 
-fn remove_raw_like_fields(value: &JsonValue) -> JsonValue {
-    sanitize_known_metadata_value(value, None)
-}
-
 fn safe_metadata_from_projection(
     input: &ToolProjectionInput<'_>,
     target: &ToolResultEnvelope,

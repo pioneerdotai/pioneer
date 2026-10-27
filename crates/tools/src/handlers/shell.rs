@@ -907,7 +907,7 @@ impl OneShotOutputBudget {
     fn claim(&self, stream_seen: usize, requested: usize) -> (usize, bool) {
         let total_before = self
             .total_seen
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 Some(used.saturating_add(requested as u64))
             })
             .unwrap_or(u64::MAX) as usize;
