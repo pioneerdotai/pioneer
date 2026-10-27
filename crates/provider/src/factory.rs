@@ -359,94 +359,10 @@ mod tests {
     }
 
     #[test]
-    fn creates_openrouter_provider() {
-        let provider = create_provider("openrouter", "sk-or-test").unwrap();
-        assert_eq!(provider.name(), "openrouter");
-    }
-
-    #[test]
-    fn creates_anthropic_provider() {
-        let provider = create_provider("anthropic", "sk-ant-test").unwrap();
-        assert_eq!(provider.name(), "anthropic");
-    }
-
-    #[test]
-    fn creates_openai_provider() {
-        let provider = create_provider("openai", "sk-test").unwrap();
-        assert_eq!(provider.name(), "openai");
-    }
-
-    #[test]
-    fn creates_gemini_aliases() {
-        for name in &["gemini", "google", "google-gemini"] {
-            let provider = create_provider(name, "key").unwrap();
-            assert_eq!(provider.name(), "gemini");
-        }
-    }
-
-    #[test]
-    fn creates_groq_provider() {
-        let provider = create_provider("groq", "gsk-test").unwrap();
-        assert_eq!(provider.name(), "groq");
-    }
-
-    #[test]
-    fn creates_xai_aliases() {
-        for name in &["xai", "grok"] {
-            let provider = create_provider(name, "key").unwrap();
-            assert_eq!(provider.name(), "xai");
-        }
-    }
-
-    #[test]
-    fn creates_ollama_provider() {
-        let provider = create_provider("ollama", "").unwrap();
-        assert_eq!(provider.name(), "ollama");
-    }
-
-    #[test]
     fn creates_local_provider() {
         let provider = create_provider("local", "").unwrap();
         assert_eq!(provider.name(), "local");
         assert!(provider.capabilities().embeddings);
-    }
-
-    #[test]
-    fn creates_deepseek_provider() {
-        let provider = create_provider("deepseek", "key").unwrap();
-        assert_eq!(provider.name(), "deepseek");
-    }
-
-    #[test]
-    fn creates_together_aliases() {
-        for name in &["together", "together-ai"] {
-            let provider = create_provider(name, "key").unwrap();
-            assert_eq!(provider.name(), "together");
-        }
-    }
-
-    #[test]
-    fn rejects_unused_cli_providers() {
-        for name in ["claude-code", "gemini-cli", "kilocli", "kilo"] {
-            let err = match create_provider(name, "") {
-                Err(error) => error,
-                Ok(_) => panic!("CLI providers are not factory-backed"),
-            };
-            assert!(
-                err.to_string().contains("unknown provider"),
-                "unexpected error for {name}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_unknown_provider() {
-        let result = create_provider("nonexistent", "key");
-        let err = match result {
-            Err(e) => e,
-            Ok(_) => panic!("should reject unknown provider"),
-        };
-        assert!(err.to_string().contains("unknown provider"));
     }
 
     #[test]
@@ -1048,6 +964,48 @@ mod tests {
                     assert_eq!(json["stream"], index == 1, "{name}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn factory_dispatch_preserves_canonical_names_and_aliases() {
+        for (name, api_key, expected) in [
+            ("openrouter", "sk-or-test", "openrouter"),
+            ("anthropic", "sk-ant-test", "anthropic"),
+            ("openai", "sk-test", "openai"),
+            ("gemini", "key", "gemini"),
+            ("google", "key", "gemini"),
+            ("google-gemini", "key", "gemini"),
+            ("groq", "gsk-test", "groq"),
+            ("xai", "key", "xai"),
+            ("grok", "key", "xai"),
+            ("ollama", "", "ollama"),
+            ("deepseek", "key", "deepseek"),
+            ("together", "key", "together"),
+            ("together-ai", "key", "together"),
+        ] {
+            let provider = create_provider(name, api_key).unwrap();
+            assert_eq!(provider.name(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn factory_rejects_unknown_and_cli_provider_names() {
+        for (name, api_key) in [
+            ("claude-code", ""),
+            ("gemini-cli", ""),
+            ("kilocli", ""),
+            ("kilo", ""),
+            ("nonexistent", "key"),
+        ] {
+            let err = match create_provider(name, api_key) {
+                Err(error) => error,
+                Ok(_) => panic!("should reject unknown provider {name}"),
+            };
+            assert!(
+                err.to_string().contains("unknown provider"),
+                "{name}: {err}"
+            );
         }
     }
 }

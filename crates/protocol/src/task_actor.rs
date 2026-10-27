@@ -803,48 +803,6 @@ mod tests {
     }
 
     #[test]
-    fn contract_requires_a_destination() {
-        let mut value = contract();
-        value.delivery.destination_thread_id = None;
-        assert_eq!(
-            value.validate(),
-            Err(TaskActorContractError::MissingDeliveryDestination)
-        );
-    }
-
-    #[test]
-    fn contract_accepts_one_exact_webhook_fingerprint() {
-        let mut value = contract();
-        value.delivery.destination_thread_id = None;
-        value.delivery.destination_webhook_url_fingerprint = Some("a".repeat(64));
-        assert!(value.validate().is_ok());
-
-        value.delivery.destination_user_id = Some("USER1234567890123456".to_owned());
-        assert_eq!(
-            value.validate(),
-            Err(TaskActorContractError::ConflictingDeliveryDestinations)
-        );
-    }
-
-    #[test]
-    fn delivery_route_supports_thread_or_user_notification_but_not_webhook() {
-        let mut value = contract();
-        value.delivery.destination_thread_id = None;
-        value.delivery.destination_user_id = Some("USER1234567890123456".to_owned());
-        value.delivery.route_id = Some("ROUTE123456789012345".to_owned());
-        value.delivery.route_receipt_json =
-            Some(route_receipt("ROUTE123456789012345", "deliver_result"));
-        assert!(value.validate().is_ok());
-
-        value.delivery.destination_user_id = None;
-        value.delivery.destination_webhook_url_fingerprint = Some("a".repeat(64));
-        assert_eq!(
-            value.validate(),
-            Err(TaskActorContractError::InvalidDeliveryDestination)
-        );
-    }
-
-    #[test]
     fn execution_route_requires_exact_destination_and_receipt() {
         let mut value = contract();
         value.execution_route_id = Some("ROUTE123456789012345".to_owned());
@@ -1090,5 +1048,45 @@ mod tests {
             ),
             Err(TaskActorContractError::GenerationOverflow)
         );
+    }
+
+    #[test]
+    fn delivery_destination_validation_preserves_webhook_and_route_boundaries() {
+        for (user, webhook, route_id, expected) in [
+            (
+                None,
+                None,
+                None,
+                Err(TaskActorContractError::MissingDeliveryDestination),
+            ),
+            (None, Some("a".repeat(64)), None, Ok(())),
+            (
+                Some("USER1234567890123456"),
+                Some("a".repeat(64)),
+                None,
+                Err(TaskActorContractError::ConflictingDeliveryDestinations),
+            ),
+            (
+                Some("USER1234567890123456"),
+                None,
+                Some("ROUTE123456789012345"),
+                Ok(()),
+            ),
+            (
+                None,
+                Some("a".repeat(64)),
+                Some("ROUTE123456789012345"),
+                Err(TaskActorContractError::InvalidDeliveryDestination),
+            ),
+        ] {
+            let mut value = contract();
+            value.delivery.destination_thread_id = None;
+            value.delivery.destination_user_id = user.map(str::to_owned);
+            value.delivery.destination_webhook_url_fingerprint = webhook;
+            value.delivery.route_id = route_id.map(str::to_owned);
+            value.delivery.route_receipt_json =
+                route_id.map(|id| route_receipt(id, "deliver_result"));
+            assert_eq!(value.validate(), expected);
+        }
     }
 }

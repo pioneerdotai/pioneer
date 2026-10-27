@@ -610,4 +610,83 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn documented_provider_model_profiles_preserve_efforts_and_defaults() {
+        // None means the original case did not assert this field.
+        for (provider, model, efforts, check_supported, default) in [
+            (
+                "openai",
+                "gpt-5.5",
+                &["none", "low", "medium", "high", "xhigh"][..],
+                true,
+                Some("medium"),
+            ),
+            (
+                "openai",
+                "gpt-5.4-mini",
+                &["none", "low", "medium", "high", "xhigh"][..],
+                true,
+                None,
+            ),
+            (
+                "anthropic",
+                "claude-opus-4-8",
+                &["none", "low", "medium", "high", "xhigh", "max"][..],
+                true,
+                Some("high"),
+            ),
+            (
+                "anthropic",
+                "claude-sonnet-4-6",
+                &["none", "low", "medium", "high", "max"][..],
+                true,
+                None,
+            ),
+            (
+                "gemini",
+                "gemini-3-flash-preview",
+                &["minimal", "low", "medium", "high"][..],
+                false,
+                Some("high"),
+            ),
+            ("gemini", "gemini-2.5-flash", &["none"][..], false, None),
+            (
+                "bedrock",
+                "anthropic.claude-opus-4-5",
+                &["none", "low", "medium", "high"][..],
+                true,
+                Some("high"),
+            ),
+        ] {
+            let reasoning = reasoning_capabilities_for_model(provider, model)
+                .unwrap_or_else(|| panic!("missing reasoning metadata: {provider}/{model}"));
+            assert_eq!(reasoning.effort_options, efforts, "{provider}/{model}");
+            if check_supported {
+                assert_eq!(reasoning.supported, Some(true), "{provider}/{model}");
+            }
+            if let Some(default) = default {
+                assert_eq!(
+                    reasoning.default_effort.as_deref(),
+                    Some(default),
+                    "{provider}/{model}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn undocumented_provider_model_profiles_remain_unset() {
+        for (provider, model) in [
+            ("openai", "custom-model"),
+            ("anthropic", "claude-sonnet-3-7"),
+            ("bedrock", "anthropic.claude-3-7-sonnet"),
+            ("bedrock", "amazon.nova-pro-v1:0"),
+        ] {
+            assert!(
+                reasoning_capabilities_for_model(provider, model).is_none(),
+                "{provider}/{model}"
+            );
+        }
+    }
 }

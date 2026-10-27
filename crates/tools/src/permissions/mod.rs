@@ -2331,47 +2331,6 @@ mod tests {
     }
 
     #[test]
-    fn permission_semantics_cover_every_registered_native_tool() {
-        let mut registered = crate::builtin_tool_specs()
-            .into_iter()
-            .map(|configured| configured.spec.name)
-            .collect::<BTreeSet<_>>();
-        for domain in crate::BuiltinToolDomain::ALL {
-            registered.extend(domain.tool_names().iter().map(|name| (*name).to_owned()));
-        }
-        registered.insert("read_skill".to_owned());
-        registered.extend(
-            [
-                "threads_start_options",
-                "thread_message_send",
-                "thread_create",
-                "threads_turn_start",
-            ]
-            .map(str::to_owned),
-        );
-
-        assert_eq!(registered.len(), 38, "native tool inventory changed");
-        let unknown = registered
-            .iter()
-            .filter(|name| {
-                let invocation = invocation_for_tool(
-                    name,
-                    ToolPayload::Function {
-                        arguments: serde_json::json!({}),
-                    },
-                );
-                extract_permission_intent(&invocation).action == PermissionActionKind::Unknown
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-
-        assert!(
-            unknown.is_empty(),
-            "registered native tools without semantic permission classification: {unknown:?}"
-        );
-    }
-
-    #[test]
     fn every_registered_native_tool_has_the_expected_three_mode_permission_matrix() {
         let expected_actions = BTreeMap::from([
             ("exec_command", PermissionActionKind::ShellCommand),
@@ -2483,9 +2442,18 @@ mod tests {
                 assert!(
                     matches!(
                         (expected_behavior, decision),
-                        (PermissionBehavior::Allow, PermissionDecision::Allow { .. })
-                            | (PermissionBehavior::Ask, PermissionDecision::Ask { .. })
-                            | (PermissionBehavior::Deny, PermissionDecision::Deny { .. })
+                        (
+                            PermissionBehavior::Allow,
+                            PermissionDecision::Allow {
+                                reason: PermissionDecisionReason::PolicyAllowsAction,
+                            },
+                        ) | (
+                            PermissionBehavior::Ask,
+                            PermissionDecision::Ask {
+                                reason: PermissionDecisionReason::PolicyRequiresApproval,
+                                ..
+                            },
+                        ) | (PermissionBehavior::Deny, PermissionDecision::Deny { .. })
                     ),
                     "unexpected {mode:?} decision for {tool_name} ({expected_action:?})"
                 );
@@ -2532,29 +2500,6 @@ mod tests {
     }
 
     #[test]
-    fn profile_evaluator_denies_task_policy_denied_tool() {
-        let mut policy = ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow);
-        policy.denied_tools = vec!["exec_command".to_owned()];
-        let context = context_with_policy(policy);
-        let invocation = invocation_for_tool(
-            "exec_command",
-            ToolPayload::Function {
-                arguments: serde_json::json!({ "cmd": "pwd" }),
-            },
-        );
-        let intent = extract_permission_intent(&invocation);
-        let decision = ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent);
-
-        assert!(matches!(
-            decision,
-            PermissionDecision::Deny {
-                reason: PermissionDecisionReason::PolicyDeniesAction,
-                ..
-            }
-        ));
-    }
-
-    #[test]
     fn profile_evaluator_allows_task_policy_allowed_tool() {
         let mut policy = ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow);
         policy.allowed_tools = vec!["read_file".to_owned()];
@@ -2564,67 +2509,6 @@ mod tests {
         let decision = ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent);
 
         assert!(matches!(decision, PermissionDecision::Allow { .. }));
-    }
-
-    #[test]
-    fn profile_evaluator_denies_file_path_outside_task_policy_scope() {
-        let mut policy = ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow);
-        policy.allowed_paths = vec!["/workspace/src".to_owned()];
-        let context = context_with_policy(policy);
-        let invocation = invocation_for_tool(
-            "read_file",
-            ToolPayload::Function {
-                arguments: serde_json::json!({ "path": "README.md" }),
-            },
-        );
-        let intent = extract_permission_intent(&invocation);
-        let decision = ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent);
-
-        assert!(matches!(
-            decision,
-            PermissionDecision::Deny {
-                reason: PermissionDecisionReason::PolicyDeniesAction,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn profile_evaluator_denies_every_tool_for_a_restricted_empty_tool_set() {
-        let mut policy = ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow);
-        policy.allowed_tools_restricted = true;
-        let context = context_with_policy(policy);
-        let invocation = invocation();
-        let intent = extract_permission_intent(&invocation);
-
-        let decision = ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent);
-
-        assert!(matches!(
-            decision,
-            PermissionDecision::Deny {
-                reason: PermissionDecisionReason::PolicyDeniesAction,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn profile_evaluator_denies_every_file_for_a_restricted_empty_path_set() {
-        let mut policy = ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow);
-        policy.allowed_paths_restricted = true;
-        let context = context_with_policy(policy);
-        let invocation = invocation();
-        let intent = extract_permission_intent(&invocation);
-
-        let decision = ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent);
-
-        assert!(matches!(
-            decision,
-            PermissionDecision::Deny {
-                reason: PermissionDecisionReason::PolicyDeniesAction,
-                ..
-            }
-        ));
     }
 
     #[test]
@@ -2735,21 +2619,6 @@ mod tests {
     }
 
     #[test]
-    fn extractor_classifies_read_file_as_file_read_with_resolved_path() {
-        let intent = extract_permission_intent(&invocation());
-
-        assert_eq!(intent.action, PermissionActionKind::FileRead);
-        assert_eq!(
-            intent.scope.entries.get("path"),
-            Some(&"/workspace/src/lib.rs".to_owned())
-        );
-        assert_eq!(
-            intent.scope.entries.get("operation"),
-            Some(&"read file".to_owned())
-        );
-    }
-
-    #[test]
     fn file_permission_scope_uses_the_dynamic_security_snapshot_cwd() {
         let dynamic_cwd = tempfile::tempdir().unwrap();
         let stale_workdir = tempfile::tempdir().unwrap();
@@ -2801,45 +2670,6 @@ mod tests {
             intent.scope.entries.get("operation"),
             Some(&"create task/subagent".to_owned())
         );
-    }
-
-    #[test]
-    fn extractor_classifies_list_dir_default_path_as_file_read() {
-        let invocation = invocation_for_tool(
-            "list_dir",
-            ToolPayload::Function {
-                arguments: serde_json::json!({}),
-            },
-        );
-        let intent = extract_permission_intent(&invocation);
-
-        assert_eq!(intent.action, PermissionActionKind::FileRead);
-        assert_eq!(
-            intent.scope.entries.get("path"),
-            Some(&"/workspace".to_owned())
-        );
-    }
-
-    #[test]
-    fn extractor_classifies_grep_files_with_path_and_glob_as_file_read() {
-        let invocation = invocation_for_tool(
-            "grep_files",
-            ToolPayload::Function {
-                arguments: serde_json::json!({
-                    "pattern": "permission",
-                    "path": "crates/tools",
-                    "glob": "*.rs"
-                }),
-            },
-        );
-        let intent = extract_permission_intent(&invocation);
-
-        assert_eq!(intent.action, PermissionActionKind::FileRead);
-        assert_eq!(
-            intent.scope.entries.get("path"),
-            Some(&"/workspace/crates/tools".to_owned())
-        );
-        assert_eq!(intent.scope.entries.get("glob"), Some(&"*.rs".to_owned()));
     }
 
     #[test]
@@ -3094,38 +2924,6 @@ mod tests {
     }
 
     #[test]
-    fn restricted_profiles_ask_before_exec_command() {
-        let invocation = invocation_for_tool(
-            "exec_command",
-            ToolPayload::LocalShell(crate::context::LocalShellPayload::ExecCommand(
-                ExecCommandArgs {
-                    command: Some(vec!["echo".to_owned(), "hello".to_owned()]),
-                    workdir: None,
-                    timeout_ms: None,
-                    max_output_tokens: None,
-                    yield_time_ms: None,
-                    tty: None,
-                },
-            )),
-        );
-        let intent = extract_permission_intent(&invocation);
-
-        for mode in [
-            pioneer_protocol::TurnPermissionMode::AutoAcceptEdits,
-            pioneer_protocol::TurnPermissionMode::Supervised,
-        ] {
-            let context = test_context(mode);
-            assert!(matches!(
-                ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent),
-                PermissionDecision::Ask {
-                    reason: PermissionDecisionReason::PolicyRequiresApproval,
-                    ..
-                }
-            ));
-        }
-    }
-
-    #[test]
     fn extractor_classifies_write_stdin_without_exposing_stdin_content() {
         let invocation = invocation_for_tool(
             "write_stdin",
@@ -3191,90 +2989,6 @@ mod tests {
     }
 
     #[test]
-    fn extractor_marks_download_url_localhost_destination_hint() {
-        let invocation = invocation_for_tool(
-            "download_url",
-            ToolPayload::Function {
-                arguments: serde_json::json!({
-                    "url": "http://127.0.0.1:8080/archive.tgz",
-                    "destination": "downloads/archive.tgz"
-                }),
-            },
-        );
-
-        let intent = extract_permission_intent(&invocation);
-
-        assert_eq!(intent.action, PermissionActionKind::Network);
-        assert_eq!(
-            intent.scope.entries.get("destination_hint"),
-            Some(&"private_or_local".to_owned())
-        );
-        assert_eq!(
-            intent.scope.entries.get("destination"),
-            Some(&"/workspace/downloads/archive.tgz".to_owned())
-        );
-    }
-
-    #[test]
-    fn extractor_marks_download_url_implicit_destination_under_workdir() {
-        let invocation = invocation_for_tool(
-            "download_url",
-            ToolPayload::Function {
-                arguments: serde_json::json!({
-                    "url": "https://example.com/archive.tgz"
-                }),
-            },
-        );
-
-        let intent = extract_permission_intent(&invocation);
-
-        assert_eq!(intent.action, PermissionActionKind::Network);
-        assert_eq!(
-            intent.scope.entries.get("destination"),
-            Some(&"/workspace/archive.tgz".to_owned())
-        );
-        assert_eq!(
-            intent.scope.entries.get("overwrite"),
-            Some(&"false".to_owned())
-        );
-        assert_eq!(
-            intent.scope.entries.get("create_dirs"),
-            Some(&"true".to_owned())
-        );
-        assert_eq!(
-            intent.scope.entries.get("follow_redirects"),
-            Some(&"true".to_owned())
-        );
-        assert!(intent.scope.entries.contains_key("payload_hash"));
-    }
-
-    #[test]
-    fn restricted_profiles_ask_before_network_tools() {
-        let invocation = invocation_for_tool(
-            "web_search",
-            ToolPayload::Function {
-                arguments: serde_json::json!({ "query": "pioneer permissions" }),
-            },
-        );
-        let intent = extract_permission_intent(&invocation);
-
-        assert_eq!(intent.action, PermissionActionKind::Network);
-        for mode in [
-            pioneer_protocol::TurnPermissionMode::AutoAcceptEdits,
-            pioneer_protocol::TurnPermissionMode::Supervised,
-        ] {
-            let context = test_context(mode);
-            assert!(matches!(
-                ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent),
-                PermissionDecision::Ask {
-                    reason: PermissionDecisionReason::PolicyRequiresApproval,
-                    ..
-                }
-            ));
-        }
-    }
-
-    #[test]
     fn web_search_permission_scope_preserves_configured_origins() {
         let mut invocation = invocation_for_tool(
             "web_search",
@@ -3303,24 +3017,6 @@ mod tests {
                 "http://answers.example:8080".to_owned(),
                 "https://search.example:8443".to_owned(),
             ]
-        );
-    }
-
-    #[test]
-    fn full_access_allows_network_tools() {
-        let invocation = invocation_for_tool(
-            "web_fetch",
-            ToolPayload::Function {
-                arguments: serde_json::json!({ "url": "https://example.com" }),
-            },
-        );
-        let intent = extract_permission_intent(&invocation);
-
-        assert_eq!(
-            ProfileToolPermissionEvaluator.evaluate(&full_access_context(), &invocation, &intent),
-            PermissionDecision::Allow {
-                reason: PermissionDecisionReason::PolicyAllowsAction
-            }
         );
     }
 
@@ -4207,5 +3903,166 @@ mod tests {
         );
         let rendered = serde_json::to_string(&first_intent.scope.entries).expect("scope JSON");
         assert!(!rendered.contains("first-private-body"));
+    }
+
+    #[test]
+    fn download_permission_destination_matrix() {
+        let cases: [(JsonValue, &[(&str, &str)], &[&str]); 2] = [
+            (
+                serde_json::json!({
+                    "url": "http://127.0.0.1:8080/archive.tgz",
+                    "destination": "downloads/archive.tgz"
+                }),
+                &[
+                    ("destination_hint", "private_or_local"),
+                    ("destination", "/workspace/downloads/archive.tgz"),
+                ],
+                &[],
+            ),
+            (
+                serde_json::json!({ "url": "https://example.com/archive.tgz" }),
+                &[
+                    ("destination", "/workspace/archive.tgz"),
+                    ("overwrite", "false"),
+                    ("create_dirs", "true"),
+                    ("follow_redirects", "true"),
+                ],
+                &["payload_hash"],
+            ),
+        ];
+        for (arguments, expected_scope, required_keys) in cases {
+            let invocation =
+                invocation_for_tool("download_url", ToolPayload::Function { arguments });
+            let intent = extract_permission_intent(&invocation);
+            assert_eq!(intent.action, PermissionActionKind::Network);
+            for (key, expected) in expected_scope {
+                assert_eq!(
+                    intent.scope.entries.get(*key).map(String::as_str),
+                    Some(*expected),
+                    "{key}"
+                );
+            }
+            for key in required_keys {
+                assert!(intent.scope.entries.contains_key(*key), "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn profile_policy_restrictions_preserve_typed_denials() {
+        for (case, policy, invocation) in [
+            (
+                "denied_tool",
+                {
+                    let mut policy = ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow);
+                    policy.denied_tools = vec!["exec_command".to_owned()];
+                    policy
+                },
+                invocation_for_tool(
+                    "exec_command",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({"cmd": "pwd"}),
+                    },
+                ),
+            ),
+            (
+                "outside_path_scope",
+                {
+                    let mut policy = ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow);
+                    policy.allowed_paths = vec!["/workspace/src".to_owned()];
+                    policy
+                },
+                invocation_for_tool(
+                    "read_file",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({"path": "README.md"}),
+                    },
+                ),
+            ),
+            (
+                "restricted_empty_tool_set",
+                {
+                    let mut policy = ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow);
+                    policy.allowed_tools_restricted = true;
+                    policy
+                },
+                invocation(),
+            ),
+            (
+                "restricted_empty_path_set",
+                {
+                    let mut policy = ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow);
+                    policy.allowed_paths_restricted = true;
+                    policy
+                },
+                invocation(),
+            ),
+        ] {
+            let context = context_with_policy(policy);
+            let intent = extract_permission_intent(&invocation);
+            let decision = ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent);
+            assert!(
+                matches!(
+                    decision,
+                    PermissionDecision::Deny {
+                        reason: PermissionDecisionReason::PolicyDeniesAction,
+                        ..
+                    }
+                ),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_read_permission_action_and_scope_matrix() {
+        let cases: [(ToolInvocation, &[(&str, &str)]); 3] = [
+            (
+                invocation(),
+                &[
+                    ("path", "/workspace/src/lib.rs"),
+                    ("operation", "read file"),
+                ],
+            ),
+            (
+                invocation_for_tool(
+                    "list_dir",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({}),
+                    },
+                ),
+                &[("path", "/workspace")],
+            ),
+            (
+                invocation_for_tool(
+                    "grep_files",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({
+                            "pattern": "permission",
+                            "path": "crates/tools",
+                            "glob": "*.rs"
+                        }),
+                    },
+                ),
+                &[("path", "/workspace/crates/tools"), ("glob", "*.rs")],
+            ),
+        ];
+        for (invocation, expected_scope) in cases {
+            let intent = extract_permission_intent(&invocation);
+            assert_eq!(
+                intent.action,
+                PermissionActionKind::FileRead,
+                "{}",
+                invocation.tool_name
+            );
+            for (key, expected) in expected_scope {
+                assert_eq!(
+                    intent.scope.entries.get(*key),
+                    Some(&(*expected).to_owned()),
+                    "{} {key}",
+                    invocation.tool_name
+                );
+            }
+        }
     }
 }

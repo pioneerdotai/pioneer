@@ -383,39 +383,14 @@ mod tests {
     }
 
     #[test]
-    fn shell_candidates_keep_user_shell_first() {
-        assert_eq!(
-            shell_candidates_from_env(Some("/bin/zsh")),
-            vec![
-                "/bin/zsh".to_owned(),
-                "/bin/bash".to_owned(),
-                "/bin/sh".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn shell_candidates_keep_bash_first_when_user_shell_is_bash() {
-        assert_eq!(
-            shell_candidates_from_env(Some("/bin/bash")),
-            vec![
-                "/bin/bash".to_owned(),
-                "/bin/zsh".to_owned(),
-                "/bin/sh".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn shell_candidates_ignore_empty_shell_and_dedup_without_sorting() {
-        assert_eq!(
-            shell_candidates_from_env(Some("  ")),
-            vec![
-                "/bin/zsh".to_owned(),
-                "/bin/bash".to_owned(),
-                "/bin/sh".to_owned(),
-            ]
-        );
+    fn shell_candidates_preserve_user_priority_and_fallback_order() {
+        for (shell, expected) in [
+            (Some("/bin/zsh"), vec!["/bin/zsh", "/bin/bash", "/bin/sh"]),
+            (Some("/bin/bash"), vec!["/bin/bash", "/bin/zsh", "/bin/sh"]),
+            (Some("  "), vec!["/bin/zsh", "/bin/bash", "/bin/sh"]),
+        ] {
+            assert_eq!(shell_candidates_from_env(shell), expected, "{shell:?}");
+        }
     }
 }
 

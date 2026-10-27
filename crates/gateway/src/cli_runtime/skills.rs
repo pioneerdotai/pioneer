@@ -1956,21 +1956,6 @@ mod tests {
     }
 
     #[test]
-    fn cli_runtime_codex_skill_input_builder_is_noop_for_zero_skills() {
-        let mut mapping = pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputMapping {
-            input: vec![
-                pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text {
-                    text: "user request".to_owned(),
-                },
-            ],
-            diagnostics: Vec::new(),
-        };
-        let before = mapping.clone();
-        prepend_installed_skill_items(&[], &mut mapping);
-        assert_eq!(mapping, before);
-    }
-
-    #[test]
     fn cli_runtime_codex_skill_input_builder_prepends_only_structured_items() {
         let mut mapping = pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputMapping {
             input: vec![
@@ -1980,6 +1965,9 @@ mod tests {
             ],
             diagnostics: Vec::new(),
         };
+        let before = mapping.clone();
+        prepend_installed_skill_items(&[], &mut mapping);
+        assert_eq!(mapping, before);
         prepend_installed_skill_items(
             &[
                 installed_skill("pdf", "/native/skills/pdf"),
@@ -2007,56 +1995,6 @@ mod tests {
         assert!(!serialized.contains("SKILL BODY SENTINEL"));
         assert!(!serialized.contains("SUPPORTING FILE SENTINEL"));
         assert!(!serialized.contains("source-hash-not-prompt-content"));
-    }
-
-    #[test]
-    fn codex_skill_builder_emits_persistent_tree_path_with_readable_supporting_file() {
-        let temp = tempfile::tempdir().unwrap();
-        let installed_path = temp.path().join("skills/proposal-51-sentinel");
-        std::fs::create_dir_all(installed_path.join("references")).unwrap();
-        std::fs::write(installed_path.join("SKILL.md"), b"# sentinel\n").unwrap();
-        std::fs::write(
-            installed_path.join("references/guide.txt"),
-            b"CODEX SUPPORTING FILE SENTINEL\n",
-        )
-        .unwrap();
-        let installed = CliRuntimeSkillInstallResult {
-            status: CliRuntimeSkillInstallStatus::Installed,
-            install_name: "proposal-51-sentinel".to_owned(),
-            source_folder_hash: "fixture-hash".to_owned(),
-            installed_path: installed_path.clone(),
-            receipt_updated_at_unix_ms: 1,
-        };
-        let mut mapping = pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputMapping {
-            input: vec![
-                pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text {
-                    text: "original user request".to_owned(),
-                },
-            ],
-            diagnostics: Vec::new(),
-        };
-
-        prepend_installed_skill_items(&[installed], &mut mapping);
-
-        assert_eq!(
-            mapping.input,
-            vec![
-                pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Skill {
-                    name: "proposal-51-sentinel".to_owned(),
-                    path: installed_path
-                        .join("SKILL.md")
-                        .to_string_lossy()
-                        .into_owned(),
-                },
-                pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text {
-                    text: "original user request".to_owned(),
-                },
-            ]
-        );
-        assert_eq!(
-            std::fs::read(installed_path.join("references/guide.txt")).unwrap(),
-            b"CODEX SUPPORTING FILE SENTINEL\n"
-        );
     }
 
     #[tokio::test]

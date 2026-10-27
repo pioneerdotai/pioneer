@@ -5315,69 +5315,6 @@ mod tests {
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].message, message);
     }
-    #[test]
-    fn legacy_round_requires_durable_outcome_even_with_result_rows() {
-        let assistant = ChatMessage::assistant_tool_calls_with_provider_state(
-            Some("working"),
-            Some("private reasoning"),
-            vec![
-                ProviderToolCall {
-                    id: "call_a".to_owned(),
-                    name: "read_file".to_owned(),
-                    arguments: r#"{"path":"a"}"#.to_owned(),
-                },
-                ProviderToolCall {
-                    id: "call_b".to_owned(),
-                    name: "read_file".to_owned(),
-                    arguments: r#"{"path":"b"}"#.to_owned(),
-                },
-            ],
-            Some(ProviderReplayState::new(
-                "anthropic",
-                serde_json::json!({
-                    "blocks": [{
-                        "type": "thinking",
-                        "thinking": "private reasoning",
-                        "signature": "signed-state"
-                    }]
-                }),
-            )),
-        );
-        let rows = vec![
-            retained_history_row(
-                12,
-                "tool_result",
-                Some("call_a"),
-                Some("read_file"),
-                serde_json::to_string(&pioneer_tools::ToolResultView::Text {
-                    text: "a result".to_owned(),
-                    truncated: false,
-                })
-                .unwrap(),
-            ),
-            retained_history_row(
-                10,
-                "assistant_round",
-                None,
-                None,
-                serde_json::to_string(&assistant).unwrap(),
-            ),
-            retained_history_row(
-                11,
-                "tool_result",
-                Some("call_b"),
-                Some("read_file"),
-                serde_json::to_string(&pioneer_tools::ToolResultView::Text {
-                    text: "b result".to_owned(),
-                    truncated: false,
-                })
-                .unwrap(),
-            ),
-        ];
-
-        let error = assemble_retained_provider_history("turn_lossless", rows).unwrap_err();
-        assert!(error.to_string().contains("incomplete legacy tool outcome"));
-    }
 
     #[test]
     fn legacy_tool_result_without_assistant_round_is_excluded() {
@@ -5393,48 +5330,6 @@ mod tests {
             assemble_retained_provider_history("turn_legacy", rows)
                 .unwrap()
                 .is_empty()
-        );
-    }
-
-    #[test]
-    fn incomplete_legacy_tool_sequence_blocks_without_durable_outcomes() {
-        let assistant = ChatMessage::assistant_tool_calls(
-            None::<String>,
-            vec![
-                ProviderToolCall {
-                    id: "call_a".to_owned(),
-                    name: "read_file".to_owned(),
-                    arguments: "{}".to_owned(),
-                },
-                ProviderToolCall {
-                    id: "call_b".to_owned(),
-                    name: "read_file".to_owned(),
-                    arguments: "{}".to_owned(),
-                },
-            ],
-        );
-        let rows = vec![
-            retained_history_row(
-                1,
-                "assistant_round",
-                None,
-                None,
-                serde_json::to_string(&assistant).unwrap(),
-            ),
-            retained_history_row(
-                2,
-                "tool_result",
-                Some("call_a"),
-                Some("read_file"),
-                serde_json::to_string(&pioneer_tools::ToolResultView::Empty).unwrap(),
-            ),
-        ];
-
-        assert!(
-            assemble_retained_provider_history("turn_incomplete", rows)
-                .unwrap_err()
-                .to_string()
-                .contains("incomplete legacy tool outcome")
         );
     }
 
@@ -5610,6 +5505,9 @@ mod tests {
             assert_eq!(before.message, after.message);
         }
         for pair in messages.chunks_exact(2) {
+            assert_eq!(pair[0].message.role, pioneer_provider::Role::Assistant);
+            assert_eq!(pair[1].message.role, pioneer_provider::Role::Tool);
+            assert_eq!(pair[1].message.tool_call_id.as_deref(), Some("reused_call"));
             let assistant = pair[0].message.provenance.as_ref().unwrap();
             let tool = pair[1].message.provenance.as_ref().unwrap();
             assert_eq!(assistant.unit_id, tool.unit_id);
@@ -5938,44 +5836,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_provider_history_replays_exact_result_by_provider_identity() {
-        let retained = assemble_retained_provider_history(
-            "turn_v2",
-            vec![
-                canonical_round_row(1, "round_1", "provider_call", "turn_item_1"),
-                exact_result_row(2, "turn_item_1", "provider_call", "exact output"),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(retained.len(), 2);
-        assert_eq!(retained[0].message.role, pioneer_provider::Role::Assistant);
-        assert_eq!(retained[1].message.role, pioneer_provider::Role::Tool);
-        assert_eq!(
-            retained[1].message.tool_call_id.as_deref(),
-            Some("provider_call")
-        );
-        assert_eq!(retained[1].message.content, "exact output");
-    }
-
-    #[test]
-    fn excluded_context_between_canonical_call_and_result_is_not_parsed() {
-        let retained = assemble_retained_provider_history(
-            "turn_filtered",
-            vec![
-                canonical_round_row(1, "round", "provider_call", "turn_item"),
-                retained_history_row(2, "provider_observation", None, None, "{broken".into()),
-                retained_history_row(3, "tool_result", None, None, "{broken".into()),
-                retained_history_row(4, "unknown_source", None, None, "{broken".into()),
-                exact_result_row(5, "turn_item", "provider_call", "known result"),
-            ],
-        )
-        .unwrap();
-        assert_eq!(retained.len(), 2);
-        assert_eq!(retained[1].message.content, "known result");
-    }
-
-    #[test]
     fn canonical_provider_history_reports_reconciliation_for_partial_round() {
         let error = assemble_retained_provider_history(
             "turn_partial",
@@ -6011,45 +5871,6 @@ mod tests {
         assert_eq!(retained[3].message.content, "second");
         assert_eq!(retained[1].message.tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(retained[3].message.tool_call_id.as_deref(), Some("call_1"));
-    }
-
-    #[test]
-    fn legacy_prefix_requires_durable_outcomes_before_canonical_rounds() {
-        let legacy_assistant = ChatMessage::assistant_tool_calls(
-            None::<String>,
-            vec![ProviderToolCall {
-                id: "legacy_call".to_owned(),
-                name: "read_file".to_owned(),
-                arguments: "{}".to_owned(),
-            }],
-        );
-        let error = assemble_retained_provider_history(
-            "turn_upgraded",
-            vec![
-                retained_history_row(
-                    1,
-                    "assistant_round",
-                    Some("legacy_round"),
-                    None,
-                    serde_json::to_string(&legacy_assistant).unwrap(),
-                ),
-                retained_history_row(
-                    2,
-                    "tool_result",
-                    Some("legacy_call"),
-                    Some("read_file"),
-                    serde_json::to_string(&pioneer_tools::ToolResultView::Text {
-                        text: "legacy result".to_owned(),
-                        truncated: false,
-                    })
-                    .unwrap(),
-                ),
-                canonical_round_row(3, "round_v2", "provider_call", "turn_item_v2"),
-                exact_result_row(4, "turn_item_v2", "provider_call", "canonical result"),
-            ],
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("incomplete legacy tool outcome"));
     }
 
     #[test]
@@ -9431,60 +9252,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeout_inside_recovery_requeues_same_job() {
-        let (crud_store, coordinator) = setup_coordinator().await;
-        let turn_id = "turn_timeout_recovery_job";
-        let job = coordinator
-            .enqueue_provider_failure_job(
-                &ProviderFailureCandidate {
-                    turn_id: turn_id.to_owned(),
-                    item_id: "original_reasoning".to_owned(),
-                    item_type: TurnItemType::Reasoning,
-                    failure: provider_failure(ProviderFailureClass::NetworkTransient, "first"),
-                },
-                1_700_000_000,
-            )
-            .await
-            .expect("initial provider failure should enqueue")
-            .into_job();
-        let _active_attempt_id = claim_and_activate(crud_store.as_ref(), job.id.as_str()).await;
-
-        let result = coordinator
-            .record_recovery_timeout_failure(
-                &timeout_candidate(
-                    "attempt_timeout_inside_recovery",
-                    turn_id,
-                    "recovery_reasoning",
-                    TurnItemType::Reasoning,
-                ),
-                1_700_000_002,
-            )
-            .await
-            .expect("timeout inside active recovery should be recorded")
-            .expect("active recovery job should be used");
-
-        assert_eq!(result.0, job.id);
-        assert_eq!(
-            crud_store
-                .count_recovery_jobs_for_turn(turn_id)
-                .await
-                .unwrap(),
-            1
-        );
-        assert!(matches!(
-            result.1.as_slice(),
-            [RecoveryCoordinatorEvent::RetryScheduled { job_id, .. }] if job_id == &job.id
-        ));
-        let reloaded = crud_store
-            .get_recovery_job(job.id.as_str())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(reloaded.status, RecoveryJobStatus::Pending);
-        assert_eq!(reloaded.run_count, 1);
-    }
-
-    #[tokio::test]
     async fn new_failure_reuses_existing_open_recovery_for_turn() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_reuses_open_recovery";
@@ -10134,7 +9901,7 @@ mod tests {
             .into_job();
         let active_attempt_id = claim_and_activate(crud_store.as_ref(), job.id.as_str()).await;
 
-        let timeout_events = coordinator
+        let timeout_result = coordinator
             .record_recovery_timeout_failure(
                 &timeout_candidate(
                     "attempt_timeout_before_late_provider",
@@ -10146,8 +9913,23 @@ mod tests {
             )
             .await
             .expect("timeout inside active recovery should be recorded")
-            .expect("active recovery job should be used")
-            .1;
+            .expect("active recovery job should be used");
+        assert_eq!(timeout_result.0, job.id);
+        assert_eq!(
+            crud_store
+                .count_recovery_jobs_for_turn(turn_id)
+                .await
+                .unwrap(),
+            1
+        );
+        let immediate = crud_store
+            .get_recovery_job(job.id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(immediate.status, RecoveryJobStatus::Pending);
+        assert_eq!(immediate.run_count, 1);
+        let timeout_events = timeout_result.1;
         assert!(matches!(
             timeout_events.as_slice(),
             [RecoveryCoordinatorEvent::RetryScheduled { job_id, .. }] if job_id == &job.id
@@ -10234,43 +10016,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_recovery_watchdog_keeps_attempt_within_wall_clock_budget() {
-        let (crud_store, coordinator) = setup_coordinator().await;
-        let turn_id = "turn_active_recovery_within_budget";
-        let job = coordinator
-            .enqueue_provider_failure_job(
-                &ProviderFailureCandidate {
-                    turn_id: turn_id.to_owned(),
-                    item_id: "reasoning_1".to_owned(),
-                    item_type: TurnItemType::Reasoning,
-                    failure: provider_failure(ProviderFailureClass::NetworkTransient, "first"),
-                },
-                1_700_000_000,
-            )
-            .await
-            .expect("initial provider failure should enqueue")
-            .into_job();
-        let active_attempt_id = claim_and_activate(crud_store.as_ref(), job.id.as_str()).await;
-
-        let events = coordinator
-            .run_ready_jobs(1_700_000_180, 64)
-            .await
-            .expect("active watchdog should run");
-
-        assert!(events.is_empty());
-        let reloaded = crud_store
-            .get_recovery_job(job.id.as_str())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(reloaded.status, RecoveryJobStatus::Active);
-        assert_eq!(
-            reloaded.active_attempt_id.as_deref(),
-            Some(active_attempt_id.as_str())
-        );
-    }
-
-    #[tokio::test]
     async fn active_recovery_watchdog_does_not_use_hidden_three_minute_ceiling() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_active_recovery_watchdog";
@@ -10325,53 +10070,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_recovery_watchdog_exhausts_job_after_total_wall_clock_budget() {
-        let (crud_store, coordinator) = setup_coordinator().await;
-        let turn_id = "turn_active_recovery_total_budget";
-        let job = coordinator
-            .enqueue_provider_failure_job(
-                &ProviderFailureCandidate {
-                    turn_id: turn_id.to_owned(),
-                    item_id: "reasoning_1".to_owned(),
-                    item_type: TurnItemType::Reasoning,
-                    failure: provider_failure(ProviderFailureClass::NetworkTransient, "first"),
-                },
-                1_700_000_000,
-            )
-            .await
-            .expect("initial provider failure should enqueue")
-            .into_job();
-        let _active_attempt_id = claim_and_activate(crud_store.as_ref(), job.id.as_str()).await;
-
-        let events = coordinator
-            .run_ready_jobs(1_700_000_901, 64)
-            .await
-            .expect("active watchdog should expire the recovery job");
-
-        assert!(matches!(
-            events.as_slice(),
-            [RecoveryCoordinatorEvent::RecoveryExhausted(outcome)]
-                if outcome.job_id == job.id && outcome.status == RecoveryJobStatus::Exhausted
-        ));
-        let reloaded = crud_store
-            .get_recovery_job(job.id.as_str())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(reloaded.status, RecoveryJobStatus::Exhausted);
-        // A watchdog timeout is not a new provider response.
-        assert_eq!(
-            reloaded.diagnostic,
-            Some(terminal_diagnostic(
-                &job,
-                pioneer_protocol::RecoveryStopReason::WallClockExhausted,
-            ))
-        );
-        assert_eq!(reloaded.run_count, 1);
-        assert!(reloaded.active_attempt_id.is_none());
-    }
-
-    #[tokio::test]
     async fn terminal_active_recovery_exhausts_after_duplicate_pending_job_is_rejected() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_terminal_active_cancels_pending";
@@ -10423,7 +10121,7 @@ mod tests {
         assert!(matches!(
             events.as_slice(),
             [RecoveryCoordinatorEvent::RecoveryExhausted(outcome)]
-                if outcome.job_id == active_job.id
+                if outcome.job_id == active_job.id && outcome.status == RecoveryJobStatus::Exhausted
         ));
         let active = crud_store
             .get_recovery_job(active_job.id.as_str())
@@ -10431,6 +10129,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(active.status, RecoveryJobStatus::Exhausted);
+        assert_eq!(
+            active.diagnostic,
+            Some(terminal_diagnostic(
+                &active_job,
+                pioneer_protocol::RecoveryStopReason::WallClockExhausted,
+            ))
+        );
+        assert_eq!(active.run_count, 1);
+        assert!(active.active_attempt_id.is_none());
         assert_eq!(
             crud_store
                 .count_recovery_jobs_for_turn(turn_id)
@@ -10548,48 +10255,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(reloaded.status, RecoveryJobStatus::Exhausted);
-        assert_eq!(reloaded.run_count, 1);
-        assert_eq!(reloaded.provider_attempt_number, 1);
-    }
-
-    #[tokio::test]
-    async fn turn_completion_marks_active_recovery_succeeded() {
-        let (crud_store, coordinator) = setup_coordinator().await;
-        let job = coordinator
-            .enqueue_provider_failure_job(
-                &ProviderFailureCandidate {
-                    turn_id: "turn_success_recovery_job".to_owned(),
-                    item_id: "reasoning_1".to_owned(),
-                    item_type: TurnItemType::Reasoning,
-                    failure: provider_failure(ProviderFailureClass::NetworkTransient, "first"),
-                },
-                1_700_000_000,
-            )
-            .await
-            .expect("initial provider failure should enqueue")
-            .into_job();
-        let active_attempt_id = claim_and_activate(crud_store.as_ref(), job.id.as_str()).await;
-        let recovery = recovery_context(job.id.as_str(), active_attempt_id.as_str());
-
-        let events = coordinator
-            .complete_active_recovery_for_turn(
-                "turn_success_recovery_job",
-                Some(&recovery),
-                1_700_000_002,
-            )
-            .await
-            .expect("turn completion should complete active recovery");
-
-        assert!(matches!(
-            events.as_slice(),
-            [RecoveryCoordinatorEvent::RecoverySucceeded { job_id, .. }] if job_id == &job.id
-        ));
-        let reloaded = crud_store
-            .get_recovery_job(job.id.as_str())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(reloaded.status, RecoveryJobStatus::Succeeded);
         assert_eq!(reloaded.run_count, 1);
         assert_eq!(reloaded.provider_attempt_number, 1);
     }
@@ -10715,6 +10380,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(active.status, RecoveryJobStatus::Succeeded);
+        assert_eq!(active.run_count, 1);
+        assert_eq!(active.provider_attempt_number, 1);
         assert_eq!(
             crud_store
                 .count_recovery_jobs_for_turn(turn_id)

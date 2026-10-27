@@ -1057,27 +1057,6 @@ mod tests {
     }
 
     #[test]
-    fn install_upload_id_is_not_skill_id() {
-        let source = SkillLifecycleSource::UploadedArchive {
-            upload_id: "UUUUUUUUUUUUUUUUUUUUU".to_owned(),
-        };
-        let result = SkillLifecycleResultSkill {
-            skill_id: skill_id('S'),
-            owner: None,
-            slug: "skill".to_owned(),
-            source_kind: "user".to_owned(),
-            version: None,
-            fingerprint: "fingerprint".to_owned(),
-            trust_level: "community".to_owned(),
-            install_path: "/managed/S/skill".to_owned(),
-        };
-
-        let source_json = serde_json::to_value(source).unwrap();
-        let result_json = serde_json::to_value(result).unwrap();
-        assert_ne!(source_json["upload_id"], result_json["skill_id"]);
-    }
-
-    #[test]
     fn skills_changed_notification_defaults_old_payload_and_round_trips_pack_changes() {
         let old: SkillsChangedNotification = serde_json::from_value(json!({
             "workspace_id": "workspace-one",

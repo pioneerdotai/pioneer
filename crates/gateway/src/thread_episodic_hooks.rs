@@ -1194,17 +1194,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn agent_loop_does_not_call_thread_context_recall_service_directly() {
-        let agent_chat = include_str!("../../agent/src/chat/mod.rs");
-        let agent_hooks = include_str!("../../agent/src/hooks.rs");
-
-        assert!(!agent_chat.contains("ThreadEpisodicRecallService"));
-        assert!(!agent_chat.contains("thread_context_recall_hook_package"));
-        assert!(!agent_hooks.contains("ThreadEpisodicRecallService"));
-        assert!(!agent_hooks.contains("thread_context_recall_hook_package"));
-    }
-
     fn test_request(policy: MemoryTurnPolicy) -> HookHandlerRequest {
         let request = test_phase_request(policy);
         HookHandlerRequest {

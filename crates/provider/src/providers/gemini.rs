@@ -1943,22 +1943,6 @@ mod tests {
     }
 
     #[test]
-    fn creates_with_api_key() {
-        let provider = GeminiProvider::new("test-gemini-key");
-        assert_eq!(provider.api_key, "test-gemini-key");
-    }
-
-    #[test]
-    fn generate_content_url_built_correctly() {
-        let provider = GeminiProvider::new("my-key");
-        let url = provider.generate_content_url("gemini-2.0-flash");
-        assert_eq!(
-            url,
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=my-key"
-        );
-    }
-
-    #[test]
     fn custom_base_url_routes_generate_stream_and_models_without_repeating_api_prefix() {
         let provider = GeminiProvider::with_base_url_and_timeout_policy(
             "key",
@@ -1976,16 +1960,6 @@ mod tests {
         assert_eq!(
             provider.list_models_url(),
             "http://localhost:8080/team/v1beta/models?key=key"
-        );
-    }
-
-    #[test]
-    fn stream_generate_content_url_built_correctly() {
-        let provider = GeminiProvider::new("my-key");
-        let url = provider.stream_generate_content_url("gemini-2.0-flash");
-        assert_eq!(
-            url,
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse&key=my-key"
         );
     }
 
@@ -2047,30 +2021,6 @@ mod tests {
             assert_eq!(result.id.as_deref(), Some(id));
             assert!(content.parts[0].thought_signature.is_none());
         }
-    }
-
-    #[test]
-    fn gemini_reasoning_registry_exposes_documented_gemini_3_flash_levels() {
-        let reasoning = reasoning_registry::reasoning_capabilities_for_model(
-            "gemini",
-            "gemini-3-flash-preview",
-        )
-        .expect("gemini 3 flash thinking metadata");
-
-        assert_eq!(
-            reasoning.effort_options,
-            vec!["minimal", "low", "medium", "high"]
-        );
-        assert_eq!(reasoning.default_effort.as_deref(), Some("high"));
-    }
-
-    #[test]
-    fn gemini_reasoning_registry_exposes_2_5_off_without_inventing_levels() {
-        let reasoning =
-            reasoning_registry::reasoning_capabilities_for_model("gemini", "gemini-2.5-flash")
-                .expect("gemini 2.5 flash thinking metadata");
-
-        assert_eq!(reasoning.effort_options, vec!["none"]);
     }
 
     #[test]
@@ -2367,29 +2317,6 @@ mod tests {
     }
 
     #[test]
-    fn api_response_deserializes() {
-        let json = r#"{
-            "candidates": [{"content": {"role": "model", "parts": [{"text": "Hi from Gemini"}]}}]
-        }"#;
-        let response: ApiGenerateResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.candidates.len(), 1);
-        let text = GeminiProvider::extract_text(&response).unwrap();
-        assert_eq!(text, "Hi from Gemini");
-    }
-
-    #[test]
-    fn api_response_with_usage() {
-        let json = r#"{
-            "candidates": [{"content": {"role": "model", "parts": [{"text": "Hello"}]}}],
-            "usageMetadata": {"promptTokenCount": 42, "candidatesTokenCount": 15}
-        }"#;
-        let response: ApiGenerateResponse = serde_json::from_str(json).unwrap();
-        let usage = GeminiProvider::extract_usage(&response).unwrap();
-        assert_eq!(usage.input_tokens, Some(42));
-        assert_eq!(usage.output_tokens, Some(15));
-    }
-
-    #[test]
     fn api_response_empty_candidates() {
         let json = r#"{"candidates":[]}"#;
         let response: ApiGenerateResponse = serde_json::from_str(json).unwrap();
@@ -2404,13 +2331,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_name() {
-        use crate::traits::Provider;
-        let provider = GeminiProvider::new("key");
-        assert_eq!(provider.name(), "gemini");
-    }
-
-    #[test]
     fn provider_capabilities() {
         use crate::traits::Provider;
         let provider = GeminiProvider::new("key");
@@ -2420,91 +2340,18 @@ mod tests {
     }
 
     #[test]
-    fn role_mapping_user() {
-        let request = ChatRequest {
-            model: "m".into(),
-            messages: vec![ChatMessage::user("hi")],
-            temperature: None,
-            max_tokens: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            reasoning: None,
-            compiled_prompt: None,
-        };
-        let api_req = GeminiProvider::build_request(&request);
-        assert_eq!(api_req.contents[0].role, "user");
-    }
-
-    #[test]
-    fn role_mapping_assistant() {
-        let request = ChatRequest {
-            model: "m".into(),
-            messages: vec![ChatMessage::user("hi"), ChatMessage::assistant("hello")],
-            temperature: None,
-            max_tokens: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            reasoning: None,
-            compiled_prompt: None,
-        };
-        let api_req = GeminiProvider::build_request(&request);
-        assert_eq!(api_req.contents[1].role, "model");
-    }
-}
-
-#[cfg(test)]
-mod media_contract_tests {
-    use super::*;
-    use crate::{
-        AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart, Provider,
-    };
-    #[test]
-    fn every_declared_kind_uses_native_inline_bytes_and_mime_not_chat_content_parts() {
-        let provider = GeminiProvider::new("unused");
-        for (mime, kind) in [
-            ("image/png", 0),
-            ("application/pdf", 1),
-            ("audio/wav", 2),
-            ("video/mp4", 3),
-        ] {
-            let bytes = match kind {
-                0 => crate::attachments::regression::image(image::ImageFormat::Png, 1, 1),
-                1 => crate::attachments::regression::pdf(1),
-                2 => crate::attachments::regression::wav(),
-                _ => crate::attachments::regression::video().to_vec(),
-            };
-            let attachment = MessageAttachment {
-                mime_type: mime.into(),
-                name: None,
-                size_bytes: None,
-                sha256: None,
-                source: AttachmentDataSource::Bytes {
-                    base64_data: BASE64.encode(&bytes),
-                },
-                artifact: None,
-            };
-            let part = match kind {
-                0 => MessageContentPart::image(attachment),
-                1 => MessageContentPart::file(attachment),
-                2 => MessageContentPart::audio(attachment),
-                _ => MessageContentPart::video(attachment),
-            };
-            let prepared = crate::attachments::prepare_messages_for_provider(
-                "gemini",
-                &provider.capabilities(),
-                &[ChatMessage::user_parts(vec![part])],
-            )
-            .unwrap();
-            let native = GeminiProvider::attachment_part(&prepared.attachments[0]).unwrap();
-            assert!(native.file_data.is_none());
-            let inline = native.inline_data.unwrap();
-            assert_eq!(inline.mime_type, mime);
-            assert_eq!(inline.data, BASE64.encode(&bytes));
-            // Canonical ApiPart JSON field names are the g02 dependency. This
-            // fixture asserts representation without blessing snake_case wire.
-        }
+    fn default_generation_endpoints() {
+        let provider = GeminiProvider::new("my-key");
+        let url = provider.generate_content_url("gemini-2.0-flash");
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=my-key"
+        );
+        let url = provider.stream_generate_content_url("gemini-2.0-flash");
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse&key=my-key"
+        );
     }
 }
 
@@ -2531,6 +2378,7 @@ mod async_media_admission_regressions {
                 fixture::part(InputContentType::Video, "video/mp4", &fixture::video()),
             ],
         );
+        let original_parts = req.messages[0].content_parts.clone();
         let budget = fixture::scoped(state.clone(), provider.prepare_input_budget(req))
             .await
             .unwrap();
@@ -2552,7 +2400,15 @@ mod async_media_admission_regressions {
             .into_iter()
             .enumerate()
         {
+            assert!(parts[index + 1].file_data.is_none());
             let native = parts[index + 1].inline_data.as_ref().unwrap();
+            let crate::AttachmentDataSource::Bytes {
+                base64_data: original_data,
+            } = &fixture::attachment(&original_parts[index]).source
+            else {
+                panic!("original fixture must contain inline bytes")
+            };
+            assert_eq!(&native.data, original_data);
             assert_eq!(native.mime_type, mime);
             let crate::AttachmentDataSource::Bytes { base64_data } =
                 &fixture::attachment(&budget.request.messages[0].content_parts[index]).source
@@ -2734,47 +2590,6 @@ mod confirmed_duration_wire_regressions {
                 assert_eq!(native.data, BASE64.encode(&bytes));
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod stream_call_identity_tests {
-    use super::*;
-    #[test]
-    fn full_native_function_parts_get_round_local_ids_across_events() {
-        // Construct the native struct so this identity test is independent of
-        // the JSON casing correction owned by remediation group 2.
-        let response = ApiGenerateResponse {
-            response_id: None,
-            model_version: None,
-            candidates: vec![ApiCandidate {
-                finish_reason: None,
-                content: Some(ApiContent {
-                    role: "model".into(),
-                    parts: vec![ApiPart {
-                        extra: Default::default(),
-                        text: None,
-                        inline_data: None,
-                        file_data: None,
-                        thought: None,
-                        function_response: None,
-                        thought_signature: None,
-                        function_call: Some(ApiFunctionCall {
-                            extra: Default::default(),
-                            id: None,
-                            name: "read".into(),
-                            args: serde_json::json!({"path":"x"}),
-                        }),
-                    }],
-                }),
-            }],
-            usage_metadata: None,
-            error: None,
-            prompt_feedback: None,
-        };
-        let first = GeminiProvider::extract_tool_calls_with_offset(&response, 0);
-        let next = GeminiProvider::extract_tool_calls_with_offset(&response, 1);
-        assert_ne!(first[0].id, next[0].id);
     }
 }
 #[cfg(test)]

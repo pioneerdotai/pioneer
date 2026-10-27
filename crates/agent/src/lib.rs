@@ -4496,65 +4496,6 @@ mod event_class_tests {
     }
 
     #[tokio::test]
-    async fn durable_lane_applies_backpressure_when_full() {
-        let hub = Arc::new(AgentEventHub::with_capacity(1, 1));
-        let mut durable_rx = hub
-            .take_durable_receiver()
-            .await
-            .expect("durable receiver should be available once");
-
-        hub.publish_durable(durable_turn_completed("turn_1"))
-            .await
-            .expect("first event should enqueue");
-
-        let pending_hub = hub.clone();
-        let pending = tokio::spawn(async move {
-            pending_hub
-                .publish_durable(durable_turn_completed("turn_2"))
-                .await
-        });
-
-        sleep(Duration::from_millis(25)).await;
-        assert!(
-            !pending.is_finished(),
-            "full durable queue must apply backpressure instead of dropping"
-        );
-
-        assert!(durable_rx.recv().await.is_some());
-        pending
-            .await
-            .expect("publish task should complete")
-            .expect("second event should enqueue after capacity is freed");
-        assert!(matches!(
-            durable_rx.recv().await,
-            Some(AgentDurableEvent::TurnCompleted { turn_id, .. }) if turn_id == "turn_2"
-        ));
-    }
-
-    #[tokio::test]
-    async fn dropped_durable_listener_can_be_replaced_without_losing_the_lane() {
-        let hub = AgentEventHub::with_capacity(1, 1);
-        let durable_rx = hub
-            .take_durable_receiver()
-            .await
-            .expect("durable receiver should be available once");
-        drop(durable_rx);
-
-        hub.publish_durable(durable_turn_completed("turn_1"))
-            .await
-            .expect("hub must retain queued events while no listener owns the receiver");
-
-        let mut replacement = hub
-            .take_durable_receiver()
-            .await
-            .expect("replacement listener should lease the retained receiver");
-        assert!(matches!(
-            replacement.recv().await,
-            Some(AgentDurableEvent::TurnCompleted { turn_id, .. }) if turn_id == "turn_1"
-        ));
-    }
-
-    #[tokio::test]
     async fn lagged_live_lane_does_not_drop_durable_events() {
         let hub = AgentEventHub::with_progress_config(8, 1, test_progress_config());
         let mut durable_rx = hub

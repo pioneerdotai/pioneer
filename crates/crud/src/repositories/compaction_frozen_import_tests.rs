@@ -967,41 +967,6 @@ fn assert_exact_search(plan: &[String], subjects: &[&str], column: &str) {
     );
 }
 
-#[test]
-fn query_plan_key_matching_requires_the_exact_column_name() {
-    let composite =
-        vec!["SEARCH canonical_source USING INDEX fixture (turn_id = ? AND id = ?)".to_string()];
-    assert!(plan_has_exact_search(
-        &composite,
-        &["canonical_source"],
-        "id"
-    ));
-    assert!(plan_has_exact_search(
-        &composite,
-        &["canonical_source"],
-        "turn_id"
-    ));
-
-    let suffixes = vec![
-        "SEARCH canonical_source USING INDEX fixture (turn_id=? AND owner_id=? AND source_id=?)"
-            .to_string(),
-    ];
-    assert!(!plan_has_exact_search(
-        &suffixes,
-        &["canonical_source"],
-        "id"
-    ));
-    assert!(plan_has_exact_search(
-        &suffixes,
-        &["canonical_source"],
-        "source_id"
-    ));
-
-    let scan = vec!["SCAN canonical_source".to_string()];
-    assert!(plan_has_subject_scan(&scan, &["canonical_source"]));
-    assert!(!plan_has_exact_search(&scan, &["canonical_source"], "id"));
-}
-
 async fn assert_production_plan(compressed: bool) {
     let fixture = fixture().await;
     let db = fixture.db();

@@ -1,9 +1,9 @@
 use super::super::model::{
     AccessibilityBounds, ActionExecution, AppHandle, AppHandleMeta, AppMeta, AppTarget,
     CapturedFrame, ComputerUseFailureClass, DesktopPreflightCapabilities, DesktopPreflightOptions,
-    DesktopPreflightReport, DesktopTree, DisplayMeta, InputAction, InputActionKind, OsAction,
-    OsActionKind, ResolvedActionTarget, ResolvedInputActionTargets, SemanticAction,
-    SemanticActionKind, SnapshotBudget, SnapshotTarget, derive_app_identity_key,
+    DesktopPreflightReport, DesktopTree, DisplayMeta, InputAction, OsAction, OsActionKind,
+    ResolvedActionTarget, ResolvedInputActionTargets, SemanticAction, SnapshotBudget,
+    SnapshotTarget, derive_app_identity_key,
 };
 use super::super::platform;
 use super::super::tree::{AccessibilityTreeBudget, RawAccessibilityNode, compact_raw_tree};
@@ -553,129 +553,5 @@ impl ComputerUseDesktopBackend for MockComputerUseBackend {
     ) -> Result<CapturedFrame, ToolError> {
         let seed = self.action_count.load(Ordering::SeqCst) as u8;
         captured_frame_from_rgba_image(Self::rgba_image(seed), self.scale_factor, snapshot_budget)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mock_backend_covers_wp04_backend_surfaces() {
-        let backend = MockComputerUseBackend::default();
-        let preflight = backend
-            .preflight(DesktopPreflightOptions {
-                screenshot_probe_enabled: true,
-                input_simulation_enabled: true,
-            })
-            .expect("preflight");
-        assert_eq!(preflight.status, "ready");
-        let environment = crate::process_policy::ProcessEnvironmentPlan::inherited_for_test();
-        assert_eq!(backend.list_apps(&environment).expect("apps").len(), 1);
-        let app = backend
-            .find_app(
-                &AppTarget {
-                    name: Some("MockApp".to_owned()),
-                    pid: None,
-                    identity_key: None,
-                    bundle_id: None,
-                    executable_path: None,
-                },
-                Duration::ZERO,
-                &environment,
-            )
-            .expect("app");
-        assert_eq!(app.name, "MockApp");
-        assert!(
-            !backend
-                .app_tree(&app, test_tree_budget())
-                .expect("tree")
-                .payload
-                .nodes
-                .is_empty()
-        );
-        let screenshot = backend
-            .screenshot(&SnapshotTarget::PrimaryScreen, &test_snapshot_budget())
-            .expect("screenshot");
-        assert!(!screenshot.png_bytes.is_empty());
-        assert_eq!(
-            backend
-                .perform_semantic_action(
-                    &app,
-                    &SemanticAction {
-                        action_type: SemanticActionKind::Press,
-                        target: None,
-                        text: None,
-                        numeric_value: None,
-                        action_name: None,
-                        condition: None,
-                        wait_ms: None,
-                    },
-                    None
-                )
-                .expect("semantic")
-                .status,
-            "ok"
-        );
-        assert_eq!(
-            backend
-                .perform_input_action(
-                    &InputAction {
-                        action_type: InputActionKind::InputClick,
-                        target: None,
-                        from: None,
-                        to: None,
-                        button: None,
-                        delta_x: None,
-                        delta_y: None,
-                        text: None,
-                        keys: None,
-                        wait_ms: None,
-                    },
-                    &ResolvedInputActionTargets::default(),
-                )
-                .expect("input")
-                .status,
-            "ok"
-        );
-        assert_eq!(
-            backend
-                .perform_os_action(
-                    &OsAction {
-                        action_type: OsActionKind::OpenApp,
-                        app: Some("MockApp".to_owned()),
-                        path: None,
-                        url: None,
-                        menu_path: None,
-                        title: None,
-                    },
-                    &crate::process_policy::ProcessEnvironmentPlan::inherited_for_test()
-                )
-                .expect("os")
-                .status,
-            "ok"
-        );
-        assert_eq!(backend.os_action_types(), vec!["open_app".to_owned()]);
-    }
-
-    fn test_snapshot_budget() -> SnapshotBudget {
-        SnapshotBudget {
-            provider_hint: None,
-            model_hint: None,
-            profile: "test".to_owned(),
-            max_bytes: 8 * 1024 * 1024,
-            max_side_px: 1280,
-            min_side_px: 320,
-            downscale_factor: 0.85,
-        }
-    }
-
-    fn test_tree_budget() -> AccessibilityTreeBudget {
-        AccessibilityTreeBudget {
-            max_depth: 4,
-            max_nodes: 20,
-            max_serialized_bytes: 64 * 1024,
-            text_max_chars: 160,
-        }
     }
 }

@@ -470,12 +470,6 @@ fn database_query_kind(
     }
 }
 
-#[cfg(test)]
-fn stable_sql_fingerprint(sql: &str) -> u64 {
-    let normalized = normalize_sql_shape(sql);
-    stable_normalized_sql_fingerprint(normalized.as_str())
-}
-
 fn stable_normalized_sql_fingerprint(normalized: &str) -> u64 {
     let digest = Sha256::digest(normalized.as_bytes());
     let mut bytes = [0_u8; 8];
@@ -716,41 +710,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_database_file_name() {
-        let error = normalize_relative_database_file_name("   ", "gateway.database.file_name")
-            .expect_err("must reject empty file name");
-        assert!(
-            format!("{error:#}").contains("gateway.database.file_name must not be empty"),
-            "unexpected error: {error:#}"
-        );
-    }
-
-    #[test]
-    fn rejects_absolute_database_file_name() {
-        let error =
-            normalize_relative_database_file_name("/tmp/gateway.db", "gateway.database.file_name")
-                .expect_err("must reject absolute file name");
-        assert!(
-            format!("{error:#}").contains("gateway.database.file_name must be relative"),
-            "unexpected error: {error:#}"
-        );
-    }
-
-    #[test]
-    fn builds_sqlite_connection_url() {
-        let path = Path::new("/tmp/gateway.db");
-        let url = sqlite_connection_url(path);
-        assert_eq!(url, "sqlite:///tmp/gateway.db?mode=rwc");
-    }
-
-    #[test]
-    fn builds_sqlite_connection_url_with_windows_drive_path() {
-        let path = Path::new(r"C:\Users\alex\gateway.db");
-        let url = sqlite_connection_url(path);
-        assert_eq!(url, "sqlite:///C:/Users/alex/gateway.db?mode=rwc");
-    }
-
-    #[test]
     fn builds_read_only_sqlite_connection_url() {
         let path = Path::new("/tmp/gateway.db");
         let url = sqlite_read_only_connection_url(path);
@@ -778,33 +737,6 @@ mod tests {
         assert_eq!(
             super::sqlite_operation("WITH rows AS (...) SELECT 1"),
             DatabaseOperation::Other
-        );
-    }
-
-    #[test]
-    fn normalizes_literals_comments_case_and_spacing_into_one_sql_shape() {
-        let first = super::normalize_sql_shape(
-            "SELECT payload FROM turn_event WHERE sequence = 42 AND id = 'secret' -- request",
-        );
-        let second = super::normalize_sql_shape(
-            " select payload from turn_event where sequence=9001 and id='different' ",
-        );
-
-        assert_eq!(
-            first,
-            "select payload from turn_event where sequence=? and id=?"
-        );
-        assert_eq!(
-            second,
-            "select payload from turn_event where sequence=? and id=?"
-        );
-        assert_eq!(
-            super::stable_sql_fingerprint(
-                "SELECT payload FROM turn_event WHERE sequence=42 AND id='secret'"
-            ),
-            super::stable_sql_fingerprint(
-                "select payload from turn_event where sequence=9001 and id='different'"
-            )
         );
     }
 
@@ -887,8 +819,11 @@ mod tests {
             )
         };
 
-        let first = fingerprint("SELECT payload FROM turn_event WHERE sequence = 42");
-        let second = fingerprint("select payload from turn_event where sequence=9001");
+        let first = fingerprint(
+            "SELECT payload FROM turn_event WHERE sequence = 42 AND id = 'secret' -- request",
+        );
+        let second =
+            fingerprint(" select payload from turn_event where sequence=9001 and id='different' ");
         assert_ne!(first, 0);
         assert_eq!(second, first);
 
@@ -900,6 +835,15 @@ mod tests {
                 .normalized_fingerprints
                 .keys()
                 .all(|shape| !shape.contains("42") && !shape.contains("9001"))
+        );
+
+        assert_eq!(
+            state
+                .normalized_fingerprints
+                .keys()
+                .map(|shape| shape.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["select payload from turn_event where sequence=? and id=?"]
         );
     }
 
@@ -1037,5 +981,43 @@ mod tests {
             .expect("normalize database config");
 
         assert_eq!(runtime.max_connections, super::MIN_READER_CONNECTIONS);
+    }
+
+    #[test]
+    fn sqlite_connection_urls_preserve_path_forms() {
+        for (path, expected) in [
+            ("/tmp/gateway.db", "sqlite:///tmp/gateway.db?mode=rwc"),
+            (
+                r"C:\Users\alex\gateway.db",
+                "sqlite:///C:/Users/alex/gateway.db?mode=rwc",
+            ),
+        ] {
+            let path = Path::new(path);
+            let url = sqlite_connection_url(path);
+            assert_eq!(url, expected);
+        }
+    }
+
+    #[test]
+    fn relative_database_file_names_reject_invalid_inputs() {
+        for (input, rejection_message, expected) in [
+            (
+                "   ",
+                "must reject empty file name",
+                "gateway.database.file_name must not be empty",
+            ),
+            (
+                "/tmp/gateway.db",
+                "must reject absolute file name",
+                "gateway.database.file_name must be relative",
+            ),
+        ] {
+            let error = normalize_relative_database_file_name(input, "gateway.database.file_name")
+                .expect_err(rejection_message);
+            assert!(
+                format!("{error:#}").contains(expected),
+                "unexpected error: {error:#}"
+            );
+        }
     }
 }

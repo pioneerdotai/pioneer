@@ -32,6 +32,7 @@ async fn computer_use_preflight_ready_does_not_create_session() {
             .and_then(JsonValue::as_array)
             .is_some_and(|value| !value.is_empty())
     );
+    assert!(payload.get("running_binary").is_some());
     assert!(payload.get("session_id").is_none());
     let artifacts_dir = root.join("tools/computer_use");
     let session_artifact_count = std::fs::read_dir(artifacts_dir.as_path())

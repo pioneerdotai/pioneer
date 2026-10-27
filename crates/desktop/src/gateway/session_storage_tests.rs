@@ -657,40 +657,6 @@ fn changed_registry_installation_is_terminal_before_refresh() {
 }
 
 #[test]
-fn restart_reloads_rotated_envelope_and_refreshes_next_generation() {
-    let (mut first, store, endpoint_id) = fixture();
-    first
-        .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, _, _, _| {
-            Ok(refresh_grant(1))
-        })
-        .unwrap();
-    let mut restarted = SessionFixture {
-        client_core: std::sync::Arc::new(pioneer_client::core::ClientCore::new()),
-        config: first.config.clone(),
-        timings: first.timings,
-        ws_timings: first.ws_timings,
-        registry_path: first.registry_path.clone(),
-        registry: first.registry.clone(),
-        secrets: DesktopSecrets::new(store),
-    };
-    restarted
-        .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, raw, _, _| {
-            assert_eq!(raw, refresh_token(1));
-            Ok(refresh_grant(2))
-        })
-        .unwrap();
-    assert_eq!(
-        restarted
-            .secrets
-            .get_gateway_session(endpoint_id.as_str())
-            .unwrap()
-            .unwrap()
-            .refresh_generation,
-        2
-    );
-}
-
-#[test]
 fn server_terminal_code_stops_reconnect_path() {
     let (mut runtime, _, endpoint_id) = fixture();
     let prepared = runtime

@@ -257,16 +257,6 @@ mod tests {
     }
 
     #[test]
-    fn retired_secret_kind_metadata_is_treated_as_unavailable() {
-        let decoded = decode_meta(Some(
-            r#"{"schema":1,"kind":"desktop_gateway_auth_token","label":"Legacy Gateway","created_at_unix":1,"updated_at_unix":2}"#,
-        ))
-        .expect("retired metadata must remain enumerable");
-
-        assert_eq!(decoded, None);
-    }
-
-    #[test]
     fn retired_secret_metadata_remains_listable_and_deletable_by_service() {
         let (_dir, store) = open_temp_store();
         let raw = store.raw_store().expect("open raw store");

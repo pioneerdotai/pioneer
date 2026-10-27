@@ -470,51 +470,6 @@ mod active_recall_local_preflight_tests {
     }
 
     #[test]
-    fn active_recall_local_preflight_marks_policy_disabled_as_host_local_final() {
-        let plan = build_active_recall_local_preflight_plan(
-            &test_context(None),
-            &test_input(),
-            &MemoryTurnPolicy::no_use(),
-            &MemoryActiveRecallConfig::default(),
-            &empty_deterministic(),
-            MemoryEpisodicRecallCapabilities::default(),
-            true,
-        );
-
-        assert!(!plan.provider_planning_needed);
-        assert_eq!(
-            plan.local_decision.reason_code,
-            ActiveMemoryDecisionReasonCode::PolicyDisabled
-        );
-        assert_eq!(plan.local_decision.status, ActiveMemoryDecisionStatus::Skip);
-    }
-
-    #[test]
-    fn active_recall_local_preflight_marks_config_disabled_as_host_local_final() {
-        let config = MemoryActiveRecallConfig {
-            mode: MemoryActiveRecallMode::Disabled,
-            ..MemoryActiveRecallConfig::default()
-        };
-
-        let plan = build_active_recall_local_preflight_plan(
-            &test_context(None),
-            &test_input(),
-            &MemoryTurnPolicy::normal_default_allow(),
-            &config,
-            &empty_deterministic(),
-            MemoryEpisodicRecallCapabilities::default(),
-            true,
-        );
-
-        assert!(!plan.provider_planning_needed);
-        assert_eq!(
-            plan.local_decision.reason_code,
-            ActiveMemoryDecisionReasonCode::ConfigDisabled
-        );
-        assert_eq!(plan.local_decision.status, ActiveMemoryDecisionStatus::Skip);
-    }
-
-    #[test]
     fn active_recall_local_preflight_does_not_gate_on_nonempty_deterministic_recall() {
         let plan = build_active_recall_local_preflight_plan(
             &test_context(None),
@@ -593,31 +548,6 @@ mod active_recall_local_preflight_tests {
         );
         assert_eq!(plan.local_decision.episodic.queries.len(), 1);
         assert_eq!(plan.local_decision.episodic.queries[0].query, None);
-    }
-
-    #[test]
-    fn active_recall_local_preflight_marks_deterministic_only_as_host_local_final() {
-        let config = MemoryActiveRecallConfig {
-            mode: MemoryActiveRecallMode::DeterministicOnly,
-            ..MemoryActiveRecallConfig::default()
-        };
-
-        let plan = build_active_recall_local_preflight_plan(
-            &test_context(None),
-            &test_input(),
-            &MemoryTurnPolicy::normal_default_allow(),
-            &config,
-            &empty_deterministic(),
-            MemoryEpisodicRecallCapabilities::default(),
-            true,
-        );
-
-        assert!(!plan.provider_planning_needed);
-        assert_eq!(
-            plan.local_decision.reason_code,
-            ActiveMemoryDecisionReasonCode::DeterministicOnly
-        );
-        assert_eq!(plan.local_decision.status, ActiveMemoryDecisionStatus::Skip);
     }
 
     #[test]
@@ -824,6 +754,50 @@ mod active_recall_local_preflight_tests {
                 .iter()
                 .any(|diagnostic| diagnostic == "memory.active_recall.provider_disabled")
         );
+    }
+
+    #[test]
+    fn active_recall_local_preflight_host_local_skip_matrix() {
+        for (policy, config, reason) in [
+            (
+                MemoryTurnPolicy::no_use(),
+                MemoryActiveRecallConfig::default(),
+                ActiveMemoryDecisionReasonCode::PolicyDisabled,
+            ),
+            (
+                MemoryTurnPolicy::normal_default_allow(),
+                MemoryActiveRecallConfig {
+                    mode: MemoryActiveRecallMode::Disabled,
+                    ..MemoryActiveRecallConfig::default()
+                },
+                ActiveMemoryDecisionReasonCode::ConfigDisabled,
+            ),
+            (
+                MemoryTurnPolicy::normal_default_allow(),
+                MemoryActiveRecallConfig {
+                    mode: MemoryActiveRecallMode::DeterministicOnly,
+                    ..MemoryActiveRecallConfig::default()
+                },
+                ActiveMemoryDecisionReasonCode::DeterministicOnly,
+            ),
+        ] {
+            let plan = build_active_recall_local_preflight_plan(
+                &test_context(None),
+                &test_input(),
+                &policy,
+                &config,
+                &empty_deterministic(),
+                MemoryEpisodicRecallCapabilities::default(),
+                true,
+            );
+            assert!(!plan.provider_planning_needed, "{reason:?}");
+            assert_eq!(plan.local_decision.reason_code, reason);
+            assert_eq!(
+                plan.local_decision.status,
+                ActiveMemoryDecisionStatus::Skip,
+                "{reason:?}"
+            );
+        }
     }
 }
 

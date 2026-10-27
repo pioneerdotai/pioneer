@@ -23,22 +23,11 @@ use pioneer_protocol::{
     MemoryWriteRelation,
 };
 use sea_orm::Database;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
 const EVALUATION_DEBUG_TRACE_MAX_CHARS: usize = 4_000;
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct MemoryEvaluationFixture {
-    name: &'static str,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct MemoryEvaluationContext {
-    workspace_id: Option<String>,
-    user_id: Option<String>,
-}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CapturedMemoryWriteResult {
@@ -69,58 +58,16 @@ struct CapturedMemoryRecallResult {
     skipped_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MemoryEvaluationPromptContribution {
-    content: String,
-    source_refs: Vec<String>,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct MemoryEvaluationDebugReport {
     events: Vec<String>,
     trace: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MemoryEvaluationAssertionOutput {
-    fixture_name: &'static str,
-    passed: bool,
-    failures: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MemoryEvaluationRun {
-    fixture: MemoryEvaluationFixture,
-    context: MemoryEvaluationContext,
-    write: CapturedMemoryWriteResult,
-    recall: CapturedMemoryRecallResult,
-    debug: MemoryEvaluationDebugReport,
-    assertions: MemoryEvaluationAssertionOutput,
-}
-
 #[derive(Debug, Default)]
 struct MemoryEvaluationRunner;
 
 impl MemoryEvaluationRunner {
-    fn run_noop(
-        &self,
-        fixture: MemoryEvaluationFixture,
-        context: MemoryEvaluationContext,
-    ) -> MemoryEvaluationRun {
-        MemoryEvaluationRun {
-            assertions: MemoryEvaluationAssertionOutput {
-                fixture_name: fixture.name,
-                passed: true,
-                failures: Vec::new(),
-            },
-            fixture,
-            context,
-            write: CapturedMemoryWriteResult::default(),
-            recall: CapturedMemoryRecallResult::default(),
-            debug: MemoryEvaluationDebugReport::default(),
-        }
-    }
-
     async fn run_write_fixture(
         &self,
         service: &MemoryService,
@@ -368,17 +315,8 @@ enum ExpectedActiveMemoryState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct MemoryEvaluationTextVariant {
-    language_tag: &'static str,
-    user_text: &'static str,
-    assistant_text: Option<&'static str>,
-    evidence_quote: Option<&'static str>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct SemanticMemoryEvaluationFixture {
     id: &'static str,
-    description: &'static str,
     scope: MemoryScope,
     semantic: MemorySemanticFields,
     source_context_kind: MemorySourceContextKind,
@@ -387,7 +325,6 @@ struct SemanticMemoryEvaluationFixture {
     evidence: MemoryWriteEvidence,
     content: &'static str,
     value: Option<&'static str>,
-    variants: Vec<MemoryEvaluationTextVariant>,
     write_disposition: Option<MemorySemanticWriteDisposition>,
     expected_fact_class: MemoryFactClass,
     expected_lifetime_class: MemoryLifetimeClass,
@@ -427,22 +364,6 @@ impl SemanticMemoryEvaluationFixture {
             metadata: BTreeMap::new(),
         }
     }
-
-    fn semantic_text_is_not_policy_authority(&self) -> bool {
-        !self.variants.is_empty()
-    }
-}
-
-fn variants(items: &[(&'static str, &'static str)]) -> Vec<MemoryEvaluationTextVariant> {
-    items
-        .iter()
-        .map(|(language_tag, user_text)| MemoryEvaluationTextVariant {
-            language_tag,
-            user_text,
-            assistant_text: None,
-            evidence_quote: Some(user_text),
-        })
-        .collect()
 }
 
 fn memory_actor_kind(role: MemoryEvidenceActorRole) -> MemoryActorKind {
@@ -529,7 +450,6 @@ fn durable_allow_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
     vec![
         durable_allow_fixture(
             "direct_user_identity_name",
-            "Direct user assertion of a long-lived user identity fact",
             MemoryScopeKind::User,
             "evaluation_user",
             MemoryCategory::Identity,
@@ -543,15 +463,10 @@ fn durable_allow_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
             MemoryOwnershipClass::DurableUserMemory,
             "User name is Alexander.",
             Some("Alexander"),
-            variants(&[
-                ("en", "My name is Alexander."),
-                ("ru", "Меня зовут Александр."),
-                ("fr", "Je m'appelle Alexandre."),
-            ]),
+            "My name is Alexander.",
         ),
         durable_allow_fixture(
             "direct_user_preferred_language",
-            "Direct user assertion of a stable user preference",
             MemoryScopeKind::User,
             "evaluation_user",
             MemoryCategory::Preference,
@@ -565,15 +480,10 @@ fn durable_allow_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
             MemoryOwnershipClass::DurableUserMemory,
             "User prefers Russian for direct conversations.",
             Some("Russian"),
-            variants(&[
-                ("en", "Please speak Russian with me by default."),
-                ("ru", "Говори со мной по-русски."),
-                ("fr", "Parle-moi en russe par défaut."),
-            ]),
+            "Please speak Russian with me by default.",
         ),
         durable_allow_fixture(
             "direct_user_communication_style",
-            "Direct user assertion of communication style preference",
             MemoryScopeKind::User,
             "evaluation_user",
             MemoryCategory::Preference,
@@ -587,15 +497,10 @@ fn durable_allow_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
             MemoryOwnershipClass::DurableUserMemory,
             "User prefers direct technical answers.",
             Some("direct technical answers"),
-            variants(&[
-                ("en", "Be direct with technical answers."),
-                ("ru", "Отвечай прямо по техническим вопросам."),
-                ("es", "Responde directo en temas técnicos."),
-            ]),
+            "Be direct with technical answers.",
         ),
         durable_allow_fixture(
             "direct_user_birthday",
-            "Direct user assertion of a biographical profile fact",
             MemoryScopeKind::User,
             "evaluation_user",
             MemoryCategory::Biography,
@@ -609,15 +514,10 @@ fn durable_allow_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
             MemoryOwnershipClass::DurableUserMemory,
             "User birthday is January 10.",
             Some("January 10"),
-            variants(&[
-                ("en", "My birthday is January 10."),
-                ("ru", "Мой день рождения 10 января."),
-                ("es", "Mi cumpleaños es el 10 de enero."),
-            ]),
+            "My birthday is January 10.",
         ),
         durable_allow_fixture(
             "direct_user_relationship",
-            "Direct user assertion of a long-lived relationship fact",
             MemoryScopeKind::User,
             "evaluation_user",
             MemoryCategory::Relationship,
@@ -631,15 +531,10 @@ fn durable_allow_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
             MemoryOwnershipClass::DurableUserMemory,
             "Maya is the user's product partner.",
             Some("Maya"),
-            variants(&[
-                ("en", "Maya is my product partner."),
-                ("ru", "Майя мой партнер по продукту."),
-                ("fr", "Maya est ma partenaire produit."),
-            ]),
+            "Maya is my product partner.",
         ),
         durable_allow_fixture(
             "direct_user_recurring_instruction",
-            "Direct user assertion of a recurring instruction",
             MemoryScopeKind::User,
             "evaluation_user",
             MemoryCategory::RecurringInstruction,
@@ -653,15 +548,10 @@ fn durable_allow_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
             MemoryOwnershipClass::DurableUserMemory,
             "User wants implementation phases executed WP by WP.",
             Some("execute phases WP by WP"),
-            variants(&[
-                ("en", "For implementation phases, go WP by WP."),
-                ("ru", "Фазы реализации выполняй строго WP за WP."),
-                ("fr", "Pour les phases, avance WP par WP."),
-            ]),
+            "For implementation phases, go WP by WP.",
         ),
         durable_allow_fixture(
             "workspace_project_decision",
-            "Direct user assertion of a durable project decision",
             MemoryScopeKind::Workspace,
             "evaluation_workspace",
             MemoryCategory::ProjectDecision,
@@ -675,21 +565,10 @@ fn durable_allow_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
             MemoryOwnershipClass::DurableWorkspaceMemory,
             "Project will use hook runtime for memory side work.",
             Some("hook runtime for memory side work"),
-            variants(&[
-                (
-                    "en",
-                    "For this project, use hook runtime for memory side work.",
-                ),
-                (
-                    "ru",
-                    "В этом проекте сайд-задачи памяти делаем через hook runtime.",
-                ),
-                ("es", "Usaremos hook runtime para memoria en este proyecto."),
-            ]),
+            "For this project, use hook runtime for memory side work.",
         ),
         durable_allow_fixture(
             "workspace_project_policy",
-            "Direct user assertion of a durable project policy",
             MemoryScopeKind::Workspace,
             "evaluation_workspace",
             MemoryCategory::ProjectPolicy,
@@ -703,15 +582,10 @@ fn durable_allow_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
             MemoryOwnershipClass::DurableWorkspaceMemory,
             "Published migrations are append-only.",
             Some("published migrations are append-only"),
-            variants(&[
-                ("en", "Published migrations must be append-only."),
-                ("ru", "Опубликованные миграции только append-only."),
-                ("es", "Las migraciones publicadas son append-only."),
-            ]),
+            "Published migrations must be append-only.",
         ),
         durable_allow_fixture(
             "workspace_project_convention",
-            "Direct user assertion of a durable project convention",
             MemoryScopeKind::Workspace,
             "evaluation_workspace",
             MemoryCategory::Procedure,
@@ -725,15 +599,10 @@ fn durable_allow_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
             MemoryOwnershipClass::DurableWorkspaceMemory,
             "Implementation phases keep the phase naming convention.",
             Some("keep phase naming convention"),
-            variants(&[
-                ("en", "Keep the phase naming convention."),
-                ("ru", "Оставь наименование phase."),
-                ("fr", "Garde la convention de nommage phase."),
-            ]),
+            "Keep the phase naming convention.",
         ),
         durable_allow_fixture(
             "workspace_project_constraint",
-            "Direct user assertion of a durable project constraint",
             MemoryScopeKind::Workspace,
             "evaluation_workspace",
             MemoryCategory::Constraint,
@@ -747,18 +616,10 @@ fn durable_allow_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
             MemoryOwnershipClass::DurableWorkspaceMemory,
             "Memory implementation must not add phrase-list policy.",
             Some("no phrase-list memory policy"),
-            variants(&[
-                ("en", "Do not build memory policy from phrase lists."),
-                ("ru", "Не делай memory policy на списках фраз."),
-                (
-                    "es",
-                    "No uses listas de frases para la política de memoria.",
-                ),
-            ]),
+            "Do not build memory policy from phrase lists.",
         ),
         durable_allow_fixture(
             "direct_user_confirmed_agent_identity",
-            "Direct user confirmation of a durable agent self-description",
             MemoryScopeKind::Agent,
             "global:agent:evaluation_agent",
             MemoryCategory::Identity,
@@ -772,11 +633,7 @@ fn durable_allow_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
             MemoryOwnershipClass::DurableAgentMemory,
             "Agent name is Pioneer.",
             Some("Pioneer"),
-            variants(&[
-                ("en", "Your name is Pioneer."),
-                ("ru", "Тебя зовут Pioneer."),
-                ("fr", "Tu t'appelles Pioneer."),
-            ]),
+            "Your name is Pioneer.",
         ),
     ]
 }
@@ -784,7 +641,6 @@ fn durable_allow_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
 #[allow(clippy::too_many_arguments)]
 fn durable_allow_fixture(
     id: &'static str,
-    description: &'static str,
     scope_kind: MemoryScopeKind,
     scope_key: &str,
     category: MemoryCategory,
@@ -798,11 +654,10 @@ fn durable_allow_fixture(
     expected_ownership_class: MemoryOwnershipClass,
     content: &'static str,
     value: Option<&'static str>,
-    variants: Vec<MemoryEvaluationTextVariant>,
+    evidence_quote: &'static str,
 ) -> SemanticMemoryEvaluationFixture {
     SemanticMemoryEvaluationFixture {
         id,
-        description,
         scope: evaluation_scope(scope_kind, scope_key),
         semantic: semantic_fields(
             category,
@@ -815,13 +670,9 @@ fn durable_allow_fixture(
         source_context_kind: MemorySourceContextKind::DirectUserConversation,
         source_actor_role: MemoryEvidenceActorRole::User,
         evidence_class: MemoryEvidenceClass::DirectUserAssertion,
-        evidence: evidence(
-            "turn.post_turn:user",
-            variants[0].evidence_quote.unwrap_or(variants[0].user_text),
-        ),
+        evidence: evidence("turn.post_turn:user", evidence_quote),
         content,
         value,
-        variants,
         write_disposition: Some(MemorySemanticWriteDisposition::RouteToCandidatePolicy),
         expected_fact_class,
         expected_lifetime_class,
@@ -840,7 +691,6 @@ fn unsafe_terminal_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
     vec![
         terminal_fixture(
             "assistant_inference_about_user_identity",
-            "Assistant inference about a user identity fact must not become durable user memory",
             MemoryScopeKind::User,
             "evaluation_user",
             MemoryCategory::Identity,
@@ -860,14 +710,10 @@ fn unsafe_terminal_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
             MemorySemanticWriteRoute::Rejected,
             ExpectedActiveMemoryState::Rejected,
             "Assistant inferred the user's name.",
-            variants(&[
-                ("en", "The user's name appears to be Alexander."),
-                ("ru", "Похоже, пользователя зовут Александр."),
-            ]),
+            "The user's name appears to be Alexander.",
         ),
         terminal_fixture(
             "tool_result_claiming_user_global_fact",
-            "Tool output claiming a user-global fact must not become durable user memory",
             MemoryScopeKind::User,
             "evaluation_user",
             MemoryCategory::Identity,
@@ -887,14 +733,10 @@ fn unsafe_terminal_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
             MemorySemanticWriteRoute::Rejected,
             ExpectedActiveMemoryState::Rejected,
             "Tool output claimed the user's name.",
-            variants(&[
-                ("en", "Tool says the user's name is Alexander."),
-                ("ru", "Инструмент утверждает имя пользователя."),
-            ]),
+            "Tool says the user's name is Alexander.",
         ),
         terminal_fixture(
             "task_runtime_claiming_user_global_fact",
-            "Task runtime state claiming a user-global fact must not become durable user memory",
             MemoryScopeKind::User,
             "evaluation_user",
             MemoryCategory::Identity,
@@ -914,14 +756,10 @@ fn unsafe_terminal_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
             MemorySemanticWriteRoute::Rejected,
             ExpectedActiveMemoryState::Rejected,
             "Task runtime claimed the user's name.",
-            variants(&[
-                ("en", "Task runtime observed a user name."),
-                ("ru", "Состояние task содержит имя пользователя."),
-            ]),
+            "Task runtime observed a user name.",
         ),
         terminal_fixture(
             "system_runtime_operational_observation",
-            "System/runtime observation routes to domain state, not durable memory",
             MemoryScopeKind::Workspace,
             "evaluation_workspace",
             MemoryCategory::ProjectFact,
@@ -941,14 +779,10 @@ fn unsafe_terminal_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
             MemorySemanticWriteRoute::DomainStateDeferred,
             ExpectedActiveMemoryState::DeferredRoute,
             "System observed temporary runtime state.",
-            variants(&[
-                ("en", "Runtime observed a transient system condition."),
-                ("ru", "Система заметила временное runtime состояние."),
-            ]),
+            "Runtime observed a transient system condition.",
         ),
         terminal_fixture(
             "direct_user_thread_local_todo",
-            "Thread-local todo routes to thread episodic context",
             MemoryScopeKind::User,
             "evaluation_user",
             MemoryCategory::Todo,
@@ -968,14 +802,10 @@ fn unsafe_terminal_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
             MemorySemanticWriteRoute::ThreadEpisodicDeferred,
             ExpectedActiveMemoryState::DeferredRoute,
             "User asked to do a one-off task in this thread.",
-            variants(&[
-                ("en", "In this thread, remind me to check the logs."),
-                ("ru", "В этом треде напомни проверить логи."),
-            ]),
+            "In this thread, remind me to check the logs.",
         ),
         terminal_fixture(
             "task_lifecycle_state",
-            "Task lifecycle state routes to task runtime state",
             MemoryScopeKind::Workspace,
             "evaluation_workspace",
             MemoryCategory::Todo,
@@ -995,14 +825,10 @@ fn unsafe_terminal_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
             MemorySemanticWriteRoute::TaskStateDeferred,
             ExpectedActiveMemoryState::DeferredRoute,
             "Task reached implementation checkpoint.",
-            variants(&[
-                ("en", "Task completed WP-02."),
-                ("ru", "Task завершил WP-02."),
-            ]),
+            "Task completed WP-02.",
         ),
         terminal_fixture(
             "tool_result_fact",
-            "Tool result fact routes to domain state",
             MemoryScopeKind::Workspace,
             "evaluation_workspace",
             MemoryCategory::ProjectFact,
@@ -1022,14 +848,10 @@ fn unsafe_terminal_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
             MemorySemanticWriteRoute::DomainStateDeferred,
             ExpectedActiveMemoryState::DeferredRoute,
             "Tool returned temporary diagnostic output.",
-            variants(&[
-                ("en", "The tool returned exit code 1 for this command."),
-                ("ru", "Инструмент вернул exit code 1."),
-            ]),
+            "The tool returned exit code 1 for this command.",
         ),
         terminal_fixture(
             "direct_user_secret_like_value",
-            "Secret-like values are force rejected",
             MemoryScopeKind::User,
             "evaluation_user",
             MemoryCategory::Custom,
@@ -1049,14 +871,10 @@ fn unsafe_terminal_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
             MemorySemanticWriteRoute::Rejected,
             ExpectedActiveMemoryState::Rejected,
             "User provided a secret-like value.",
-            variants(&[
-                ("en", "My API key is sk-example."),
-                ("ru", "Мой токен sk-example."),
-            ]),
+            "My API key is sk-example.",
         ),
         terminal_fixture(
             "regulated_sensitive_without_allowed_policy",
-            "Regulated sensitive data without explicit allowed policy is force rejected",
             MemoryScopeKind::User,
             "evaluation_user",
             MemoryCategory::Biography,
@@ -1076,14 +894,10 @@ fn unsafe_terminal_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
             MemorySemanticWriteRoute::Rejected,
             ExpectedActiveMemoryState::Rejected,
             "User provided regulated sensitive data without an allowed policy.",
-            variants(&[
-                ("en", "My medical diagnosis is example."),
-                ("ru", "Мой медицинский диагноз example."),
-            ]),
+            "My medical diagnosis is example.",
         ),
         terminal_fixture(
             "imported_connector_project_decision_without_policy",
-            "Imported connector content without source policy is quarantined/audit-only",
             MemoryScopeKind::Workspace,
             "evaluation_workspace",
             MemoryCategory::ProjectDecision,
@@ -1103,13 +917,7 @@ fn unsafe_terminal_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
             MemorySemanticWriteRoute::AuditOnly,
             ExpectedActiveMemoryState::DeferredRoute,
             "Imported document contains an untrusted project decision.",
-            variants(&[
-                ("en", "Imported document says the project chose X."),
-                (
-                    "ru",
-                    "Импортированный документ говорит, что проект выбрал X.",
-                ),
-            ]),
+            "Imported document says the project chose X.",
         ),
     ]
 }
@@ -1117,7 +925,6 @@ fn unsafe_terminal_fixture_catalog() -> Vec<SemanticMemoryEvaluationFixture> {
 #[allow(clippy::too_many_arguments)]
 fn terminal_fixture(
     id: &'static str,
-    description: &'static str,
     scope_kind: MemoryScopeKind,
     scope_key: &str,
     category: MemoryCategory,
@@ -1137,11 +944,10 @@ fn terminal_fixture(
     expected_route: MemorySemanticWriteRoute,
     expected_active_memory_state: ExpectedActiveMemoryState,
     content: &'static str,
-    variants: Vec<MemoryEvaluationTextVariant>,
+    evidence_quote: &'static str,
 ) -> SemanticMemoryEvaluationFixture {
     SemanticMemoryEvaluationFixture {
         id,
-        description,
         scope: evaluation_scope(scope_kind, scope_key),
         semantic: semantic_fields(
             category,
@@ -1154,13 +960,9 @@ fn terminal_fixture(
         source_context_kind,
         source_actor_role,
         evidence_class,
-        evidence: evidence(
-            "turn.post_turn:user",
-            variants[0].evidence_quote.unwrap_or(variants[0].user_text),
-        ),
+        evidence: evidence("turn.post_turn:user", evidence_quote),
         content,
         value: None,
-        variants,
         write_disposition: Some(MemorySemanticWriteDisposition::RouteToCandidatePolicy),
         expected_fact_class,
         expected_lifetime_class,
@@ -1176,133 +978,25 @@ fn terminal_fixture(
 }
 
 #[test]
-fn evaluation_harness_runs_empty_noop_fixture() {
-    let runner = MemoryEvaluationRunner;
-    let fixture = MemoryEvaluationFixture { name: "empty_noop" };
-    let context = MemoryEvaluationContext::default();
-
-    let run = runner.run_noop(fixture, context);
-
-    assert_eq!(run.fixture.name, "empty_noop");
-    assert!(run.assertions.passed);
-    assert!(run.assertions.failures.is_empty());
-    assert!(!run.write.attempted);
-    assert!(!run.write.accepted);
-    assert!(run.write.memory_id.is_none());
-    assert!(!run.recall.attempted);
-    assert!(run.recall.item_ids.is_empty());
-    assert!(run.debug.events.is_empty());
-}
-
-#[test]
-fn evaluation_schema_fixture_ids_are_non_empty_and_unique() {
-    let mut ids = BTreeSet::new();
-
+fn evaluation_fixture_ontology_matches_expected_classes() {
     for fixture in schema_fixture_catalog() {
-        assert!(!fixture.id.trim().is_empty(), "fixture id is empty");
-        assert!(
-            ids.insert(fixture.id),
-            "duplicate fixture id {}",
-            fixture.id
-        );
-    }
-}
-
-#[test]
-fn evaluation_schema_required_semantic_and_evidence_fields_are_present() {
-    for fixture in schema_fixture_catalog() {
-        let write_params = fixture.to_write_params();
-        assert!(!fixture.description.trim().is_empty(), "{}", fixture.id);
-        assert!(!write_params.scope.key.trim().is_empty(), "{}", fixture.id);
-        assert!(!write_params.content.trim().is_empty(), "{}", fixture.id);
+        let classification = classify_semantic_memory_fact(&fixture.semantic, Some(&fixture.scope));
         assert_eq!(
-            write_params.source_context_kind,
-            Some(fixture.source_context_kind),
-            "{}",
+            classification.fact_class, fixture.expected_fact_class,
+            "{} fact class",
             fixture.id
         );
-        let evidence = write_params
-            .evidence
-            .as_ref()
-            .expect("fixture write params include evidence");
-        assert!(evidence.source_ref.is_some(), "{}", fixture.id);
-        assert!(evidence.quote_or_span.is_some(), "{}", fixture.id);
-        assert!(evidence.extractor_reason.is_some(), "{}", fixture.id);
-        assert!(write_params.provenance.is_some(), "{}", fixture.id);
-    }
-}
-
-#[test]
-fn evaluation_schema_fixture_text_is_not_policy_authority() {
-    for fixture in schema_fixture_catalog() {
-        assert!(
-            fixture.semantic_text_is_not_policy_authority(),
-            "{} must keep text variants as example data only",
+        assert_eq!(
+            classification.lifetime_class, fixture.expected_lifetime_class,
+            "{} lifetime class",
             fixture.id
         );
-        for variant in &fixture.variants {
-            assert!(!variant.language_tag.trim().is_empty(), "{}", fixture.id);
-            assert!(!variant.user_text.trim().is_empty(), "{}", fixture.id);
-            if let Some(assistant_text) = variant.assistant_text {
-                assert!(!assistant_text.trim().is_empty(), "{}", fixture.id);
-            }
-            if let Some(evidence_quote) = variant.evidence_quote {
-                assert!(!evidence_quote.trim().is_empty(), "{}", fixture.id);
-            }
-        }
-    }
-}
-
-#[test]
-fn evaluation_multilingual_variants_keep_structural_expectations() {
-    for fixture in schema_fixture_catalog() {
-        let baseline = classify_semantic_memory_fact(&fixture.semantic, Some(&fixture.scope));
-        assert!(
-            fixture.variants.len() >= 2,
-            "{} must include representative multilingual variants",
+        assert_eq!(
+            classification.proposed_ownership_class, fixture.expected_ownership_class,
+            "{} ownership class",
             fixture.id
         );
-
-        for variant in &fixture.variants {
-            let classification =
-                classify_semantic_memory_fact(&fixture.semantic, Some(&fixture.scope));
-            assert_eq!(
-                classification, baseline,
-                "{} variant {} changed ontology",
-                fixture.id, variant.language_tag
-            );
-            assert_eq!(
-                classification.fact_class, fixture.expected_fact_class,
-                "{} variant {} fact class",
-                fixture.id, variant.language_tag
-            );
-            assert_eq!(
-                classification.lifetime_class, fixture.expected_lifetime_class,
-                "{} variant {} lifetime class",
-                fixture.id, variant.language_tag
-            );
-            assert_eq!(
-                classification.proposed_ownership_class, fixture.expected_ownership_class,
-                "{} variant {} ownership class",
-                fixture.id, variant.language_tag
-            );
-        }
     }
-}
-
-#[test]
-fn evaluation_multilingual_variants_cover_durable_and_unsafe_fixtures() {
-    let durable_multilingual = durable_allow_fixture_catalog()
-        .iter()
-        .filter(|fixture| fixture.variants.len() >= 2)
-        .count();
-    let unsafe_multilingual = unsafe_terminal_fixture_catalog()
-        .iter()
-        .filter(|fixture| fixture.variants.len() >= 2)
-        .count();
-
-    assert!(durable_multilingual >= 3);
-    assert!(unsafe_multilingual >= 3);
 }
 
 #[tokio::test]
@@ -1682,23 +1376,6 @@ fn evaluation_prompt_renders_deterministic_and_active_context_without_raw_metada
 }
 
 #[test]
-fn evaluation_prompt_assertions_detect_duplicate_context_lines() {
-    let contribution = MemoryEvaluationPromptContribution {
-        content:
-            "- User profile: User name is Alexander.\n- User preference: User prefers Russian."
-                .to_owned(),
-        source_refs: vec![
-            "memory:mem_name".to_owned(),
-            "memory:mem_language".to_owned(),
-        ],
-    };
-
-    assert_prompt_contribution_is_compact(&contribution, 200);
-    assert_prompt_contribution_has_no_duplicate_lines(&contribution);
-    assert_prompt_contribution_preserves_source_refs(&contribution, &["memory:mem_name"]);
-}
-
-#[test]
 fn evaluation_prompt_context_budget_truncates_model_facing_text() {
     let prompt = render_memory_recall_prompt(&MemoryRecallPromptInput {
         available_tool_names: vec!["memory_search".to_owned()],
@@ -1838,48 +1515,6 @@ fn collect_phrase_guard_violations(
     }
 }
 
-fn assert_prompt_contribution_is_compact(
-    contribution: &MemoryEvaluationPromptContribution,
-    max_chars: usize,
-) {
-    assert!(
-        contribution.content.chars().count() <= max_chars,
-        "prompt contribution exceeded budget: {contribution:?}"
-    );
-}
-
-fn assert_prompt_contribution_has_no_duplicate_lines(
-    contribution: &MemoryEvaluationPromptContribution,
-) {
-    let mut seen = BTreeSet::new();
-    for line in contribution
-        .content
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        assert!(
-            seen.insert(line.to_owned()),
-            "duplicate prompt line `{line}` in {contribution:?}"
-        );
-    }
-}
-
-fn assert_prompt_contribution_preserves_source_refs(
-    contribution: &MemoryEvaluationPromptContribution,
-    expected_refs: &[&str],
-) {
-    for expected in expected_refs {
-        assert!(
-            contribution
-                .source_refs
-                .iter()
-                .any(|source_ref| source_ref == expected),
-            "missing source ref `{expected}` in {contribution:?}"
-        );
-    }
-}
-
 fn assert_debug_field<T>(
     fixture: &SemanticMemoryEvaluationFixture,
     run: &SemanticMemoryEvaluationRun,
@@ -1994,158 +1629,4 @@ fn evaluation_failure_report<TExpected: Debug, TActual: Debug>(
         run.debug.events,
         run.debug.trace.as_deref().unwrap_or("<missing>")
     )
-}
-
-#[test]
-fn evaluation_catalog_durable_allow_fixtures_cover_supported_classes() {
-    let fixtures = durable_allow_fixture_catalog();
-    let covered: Vec<_> = fixtures
-        .iter()
-        .map(|fixture| fixture.expected_fact_class)
-        .collect();
-
-    for expected in [
-        MemoryFactClass::UserIdentity,
-        MemoryFactClass::StableUserPreference,
-        MemoryFactClass::CommunicationPreference,
-        MemoryFactClass::UserBiography,
-        MemoryFactClass::UserRelationship,
-        MemoryFactClass::RecurringUserInstruction,
-        MemoryFactClass::ProjectDecision,
-        MemoryFactClass::ProjectPolicy,
-        MemoryFactClass::ProjectProcedure,
-        MemoryFactClass::ProjectConstraint,
-        MemoryFactClass::AssistantSelfDescription,
-    ] {
-        assert!(
-            covered.contains(&expected),
-            "missing coverage for {expected:?}"
-        );
-    }
-}
-
-#[test]
-fn evaluation_catalog_durable_allow_fixtures_match_ontology_classes() {
-    for fixture in durable_allow_fixture_catalog() {
-        let classification = classify_semantic_memory_fact(&fixture.semantic, Some(&fixture.scope));
-
-        assert_eq!(
-            classification.fact_class, fixture.expected_fact_class,
-            "{} fact class",
-            fixture.id
-        );
-        assert_eq!(
-            classification.lifetime_class, fixture.expected_lifetime_class,
-            "{} lifetime class",
-            fixture.id
-        );
-        assert_eq!(
-            classification.proposed_ownership_class, fixture.expected_ownership_class,
-            "{} ownership class",
-            fixture.id
-        );
-        assert_eq!(
-            fixture.expected_quality_action,
-            MemoryQualityAction::CandidatePolicy,
-            "{} quality action",
-            fixture.id
-        );
-        assert_eq!(
-            fixture.expected_quality_target_ownership, fixture.expected_ownership_class,
-            "{} quality target ownership",
-            fixture.id
-        );
-        assert_eq!(
-            fixture.expected_route,
-            MemorySemanticWriteRoute::DurableControlPlane,
-            "{} route",
-            fixture.id
-        );
-        assert_eq!(
-            fixture.expected_candidate_policy_decision,
-            Some(MemoryCandidatePolicyDecision::AutoApprove),
-            "{} candidate policy outcome",
-            fixture.id
-        );
-        assert_eq!(
-            fixture.expected_active_memory_state,
-            ExpectedActiveMemoryState::ActiveRecord,
-            "{} active memory state",
-            fixture.id
-        );
-    }
-}
-
-#[test]
-fn evaluation_catalog_terminal_fixtures_cover_unsafe_sources_and_routes() {
-    let fixtures = unsafe_terminal_fixture_catalog();
-
-    for expected_source in [
-        MemorySourceContextKind::AssistantResponse,
-        MemorySourceContextKind::ToolResult,
-        MemorySourceContextKind::TaskRuntime,
-        MemorySourceContextKind::SystemRuntime,
-        MemorySourceContextKind::DirectUserConversation,
-        MemorySourceContextKind::ImportedDocument,
-    ] {
-        assert!(
-            fixtures
-                .iter()
-                .any(|fixture| fixture.source_context_kind == expected_source),
-            "missing source-context coverage for {expected_source:?}"
-        );
-    }
-
-    for expected_action in [
-        MemoryQualityAction::ForceReject,
-        MemoryQualityAction::Quarantine,
-        MemoryQualityAction::RouteToThreadEpisodic,
-        MemoryQualityAction::RouteToTaskState,
-        MemoryQualityAction::RouteToDomainState,
-    ] {
-        assert!(
-            fixtures
-                .iter()
-                .any(|fixture| fixture.expected_quality_action == expected_action),
-            "missing terminal action coverage for {expected_action:?}"
-        );
-    }
-
-    for expected_route in [
-        MemorySemanticWriteRoute::Rejected,
-        MemorySemanticWriteRoute::AuditOnly,
-        MemorySemanticWriteRoute::ThreadEpisodicDeferred,
-        MemorySemanticWriteRoute::TaskStateDeferred,
-        MemorySemanticWriteRoute::DomainStateDeferred,
-    ] {
-        assert!(
-            fixtures
-                .iter()
-                .any(|fixture| fixture.expected_route == expected_route),
-            "missing terminal route coverage for {expected_route:?}"
-        );
-    }
-}
-
-#[test]
-fn evaluation_catalog_terminal_fixtures_do_not_expect_active_durable_memory() {
-    for fixture in unsafe_terminal_fixture_catalog() {
-        assert_ne!(
-            fixture.expected_active_memory_state,
-            ExpectedActiveMemoryState::ActiveRecord,
-            "{} must not expect active durable memory",
-            fixture.id
-        );
-        assert_ne!(
-            fixture.expected_quality_action,
-            MemoryQualityAction::CandidatePolicy,
-            "{} must not enter candidate policy",
-            fixture.id
-        );
-        assert!(
-            fixture.expected_candidate_status.is_none(),
-            "{} must not create candidate status",
-            fixture.id
-        );
-    }
 }

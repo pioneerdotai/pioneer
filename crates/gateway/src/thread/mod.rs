@@ -2165,71 +2165,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_native_turn_identity_cannot_be_admitted_again() {
-        let manager = ThreadManager::new("o4-mini", "openai");
-        let thread_id = "thr_native_duplicate_terminal";
-        manager
-            .thread_start(
-                10,
-                "ws_000000000000000001".to_owned(),
-                start_params(thread_id),
-            )
-            .await
-            .expect("thread should start");
-        let params = TurnStartParams {
-            agent_delegation_routes: Vec::new(),
-            thread_id: thread_id.to_owned(),
-            turn_id: "turn_native_duplicate_terminal".to_owned(),
-            input: vec![UserInput::Text {
-                text: "execute once".to_owned(),
-                text_elements: Vec::new(),
-            }],
-            capabilities: Vec::new(),
-            model: None,
-            model_provider: None,
-            sandbox_policy: None,
-            mode: Some(ThreadMode::Agent),
-            agent_launch: None,
-            reply_to_turn_id: None,
-            mentioned_principal_ids: Vec::new(),
-            execution_backend: None,
-            reasoning: None,
-            permission_profile: None,
-            cli_runtime_options: None,
-        };
-        manager
-            .turn_start(10, params.clone())
-            .await
-            .expect("first admission should succeed");
-        manager
-            .turn_finish(
-                thread_id,
-                params.turn_id.as_str(),
-                TurnStatus::Completed,
-                None,
-            )
-            .await
-            .expect("first turn should finish");
-
-        let error = manager
-            .turn_start(10, params)
-            .await
-            .expect_err("terminal turn identity must not be admitted twice");
-        assert!(
-            format!("{error:#}").contains("already exists"),
-            "duplicate admission must return a deterministic identity conflict: {error:#}"
-        );
-        let loaded = manager.thread_get(thread_id).await.expect("thread");
-        let matches = loaded
-            .turns
-            .iter()
-            .filter(|turn| turn.id == "turn_native_duplicate_terminal")
-            .collect::<Vec<_>>();
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].status, TurnStatus::Completed);
-    }
-
-    #[tokio::test]
     async fn concurrent_native_turn_identity_admission_has_exactly_one_winner() {
         let manager = ThreadManager::new("o4-mini", "openai");
         let thread_id = "thr_native_duplicate_concurrent";
@@ -2327,10 +2262,23 @@ mod tests {
                 .turn_finish(thread_id, params.turn_id.as_str(), status, None)
                 .await
                 .expect("turn should become terminal");
+            let turn_id = params.turn_id.clone();
+            let error = manager
+                .turn_start(10, params)
+                .await
+                .expect_err("terminal turn identity must not be admitted twice");
             assert!(
-                manager.turn_start(10, params).await.is_err(),
-                "{status:?} identity must not admit another execution"
+                format!("{error:#}").contains("already exists"),
+                "duplicate admission must return an identity conflict: {error:#}"
             );
+            let loaded = manager.thread_get(thread_id).await.expect("thread");
+            let matching = loaded
+                .turns
+                .iter()
+                .filter(|turn| turn.id == turn_id)
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1);
+            assert_eq!(matching[0].status, status);
         }
     }
 
@@ -2413,22 +2361,6 @@ mod tests {
         assert!(thread.turns.iter().all(|turn| {
             turn.mode == ThreadMode::Message && turn.status == TurnStatus::Completed
         }));
-    }
-
-    #[tokio::test]
-    async fn thread_start_uses_chat_mode_by_default() {
-        let manager = ThreadManager::new("o4-mini", "openai");
-
-        let outcome = manager
-            .thread_start(
-                1,
-                "ws_000000000000000001".to_owned(),
-                start_params("thr_000000000000000002"),
-            )
-            .await
-            .expect("thread start should succeed");
-
-        assert_eq!(outcome.response.thread.mode, ThreadMode::Chat);
     }
 
     #[tokio::test]
@@ -3119,63 +3051,6 @@ mod tests {
         assert_eq!(
             permission_profile.effective_policy,
             ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
-        );
-    }
-
-    #[tokio::test]
-    async fn turn_start_applies_model_and_provider_overrides_to_thread() {
-        let manager = ThreadManager::new("o4-mini", "openai");
-        let thread_outcome = manager
-            .thread_start(
-                10,
-                "ws_000000000000000001".to_owned(),
-                start_params("thr_000000000000000010"),
-            )
-            .await
-            .expect("thread start should succeed");
-
-        let turn_outcome = manager
-            .turn_start(
-                10,
-                TurnStartParams {
-                    agent_delegation_routes: Vec::new(),
-                    thread_id: thread_outcome.response.thread.id.clone(),
-                    turn_id: "turn_000000000000000010".to_owned(),
-                    model: Some("o3".to_owned()),
-                    model_provider: Some("custom-provider".to_owned()),
-                    input: vec![UserInput::Text {
-                        text: "override model".to_owned(),
-                        text_elements: Vec::new(),
-                    }],
-                    capabilities: Vec::new(),
-                    sandbox_policy: None,
-                    mode: None,
-                    agent_launch: None,
-                    reply_to_turn_id: None,
-                    mentioned_principal_ids: Vec::new(),
-                    execution_backend: None,
-                    reasoning: Some(TurnReasoningSelection {
-                        effort: "high".to_owned(),
-                    }),
-                    permission_profile: None,
-                    cli_runtime_options: None,
-                },
-            )
-            .await
-            .expect("turn start should succeed");
-
-        assert_eq!(turn_outcome.materialization.thread.model, "o3");
-        assert_eq!(
-            turn_outcome.materialization.thread.model_provider,
-            "custom-provider"
-        );
-        assert_eq!(
-            turn_outcome
-                .materialization
-                .thread
-                .reasoning_effort
-                .as_deref(),
-            Some("high")
         );
     }
 

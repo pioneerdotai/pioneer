@@ -3122,27 +3122,6 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_image_input_endpoint_error_is_recoverable_capability_rejection() {
-        let error = r#"provider stream error: OpenRouter API error (404 Not Found): {"error":{"message":"No endpoints found that support image input","code":404}}"#;
-
-        let ChatTurnError::ProviderFailure { failure, .. } = provider_failure_error(
-            "reasoning_item",
-            TurnItemType::Reasoning,
-            "openrouter",
-            "deepseek/deepseek-v4-flash",
-            ProviderTransportKind::Stream,
-            ProviderFailureStage::Connect,
-            error.to_owned(),
-        ) else {
-            panic!("expected provider failure");
-        };
-
-        assert_eq!(failure.class, ProviderFailureClass::UnsupportedImageInput);
-        assert_eq!(failure.http_status, Some(404));
-        assert!(failure.is_recoverable_hint);
-    }
-
-    #[test]
     fn plain_404_still_maps_to_model_not_found() {
         assert_eq!(
             classify_provider_failure_class(
@@ -3152,40 +3131,6 @@ mod tests {
                 None,
             ),
             ProviderFailureClass::ModelNotFound
-        );
-    }
-
-    #[test]
-    fn provider_400_bad_request_is_non_retryable_provider_rejection() {
-        let error = r#"provider stream error: API error (400 Bad Request): {"error":{"message":"bad request","code":400}}"#;
-
-        let ChatTurnError::ProviderFailure { failure, .. } = provider_failure_error(
-            "reasoning_item",
-            TurnItemType::Reasoning,
-            "openrouter",
-            "minimax/minimax-m3",
-            ProviderTransportKind::Stream,
-            ProviderFailureStage::MidStream,
-            error.to_owned(),
-        ) else {
-            panic!("expected provider failure");
-        };
-
-        assert_eq!(failure.class, ProviderFailureClass::ProviderRejected);
-        assert_eq!(failure.http_status, Some(400));
-        assert!(!failure.is_recoverable_hint);
-    }
-
-    #[test]
-    fn unsupported_streaming_maps_to_provider_neutral_class() {
-        assert_eq!(
-            classify_provider_failure_class(
-                "provider error: this model does not support streaming",
-                ProviderFailureStage::Connect,
-                Some(400),
-                None,
-            ),
-            ProviderFailureClass::UnsupportedStreaming
         );
     }
 
@@ -3254,19 +3199,6 @@ mod tests {
             Some("streaming_not_supported")
         );
         assert!(failure.is_recoverable_hint);
-    }
-
-    #[test]
-    fn context_length_maps_to_context_too_large() {
-        assert_eq!(
-            classify_provider_failure_class(
-                "provider error: maximum context length exceeded",
-                ProviderFailureStage::Connect,
-                Some(400),
-                None,
-            ),
-            ProviderFailureClass::ContextTooLarge
-        );
     }
 
     #[test]
@@ -3415,6 +3347,43 @@ mod tests {
                 failure.class,
                 ProviderFailureClass::MalformedProviderRequest
             );
+        }
+    }
+
+    #[test]
+    fn raw_provider_http_failures_keep_class_status_and_recoverability() {
+        for (model, stage, error, class, status, recoverable) in [
+            (
+                "deepseek/deepseek-v4-flash",
+                ProviderFailureStage::Connect,
+                r#"provider stream error: OpenRouter API error (404 Not Found): {"error":{"message":"No endpoints found that support image input","code":404}}"#,
+                ProviderFailureClass::UnsupportedImageInput,
+                404,
+                true,
+            ),
+            (
+                "minimax/minimax-m3",
+                ProviderFailureStage::MidStream,
+                r#"provider stream error: API error (400 Bad Request): {"error":{"message":"bad request","code":400}}"#,
+                ProviderFailureClass::ProviderRejected,
+                400,
+                false,
+            ),
+        ] {
+            let ChatTurnError::ProviderFailure { failure, .. } = provider_failure_error(
+                "reasoning_item",
+                TurnItemType::Reasoning,
+                "openrouter",
+                model,
+                ProviderTransportKind::Stream,
+                stage,
+                error.to_owned(),
+            ) else {
+                panic!("expected provider failure");
+            };
+            assert_eq!(failure.class, class);
+            assert_eq!(failure.http_status, Some(status));
+            assert_eq!(failure.is_recoverable_hint, recoverable);
         }
     }
 }

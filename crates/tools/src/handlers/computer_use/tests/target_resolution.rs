@@ -47,6 +47,13 @@ async fn target_resolution_ambiguous_role_includes_candidate_summaries() {
             .and_then(JsonValue::as_str),
         Some("act_with_nth")
     );
+
+    assert_eq!(
+        result
+            .pointer("/result/execution/details/target_resolution/failure_class")
+            .and_then(JsonValue::as_str),
+        Some("AmbiguousTarget")
+    );
 }
 
 #[tokio::test]
@@ -86,6 +93,17 @@ async fn target_resolution_stale_node_requests_snapshot() {
             .pointer("/next_call/arguments/action")
             .and_then(JsonValue::as_str),
         Some("snapshot")
+    );
+
+    assert_eq!(
+        result.get("failure_class").and_then(JsonValue::as_str),
+        Some("element_stale")
+    );
+    assert_eq!(
+        result
+            .pointer("/result/execution/details/target_resolution/failure_class")
+            .and_then(JsonValue::as_str),
+        Some("ElementStale")
     );
 }
 

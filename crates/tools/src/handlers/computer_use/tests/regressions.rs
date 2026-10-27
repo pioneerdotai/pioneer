@@ -137,81 +137,6 @@ async fn assert_invalid_act_fixture_does_not_mutate_session(
 }
 
 #[tokio::test]
-async fn computer_use_regression_unsupported_open_action_is_rejected_without_session_mutation() {
-    let (handler, _) = test_handler();
-    let session_id = start_app_session_with_snapshot(&handler).await;
-
-    // Generic class: LLM invents a high-level OS action instead of using start/list_apps/semantic actions.
-    assert_invalid_act_fixture_does_not_mutate_session(
-        &handler,
-        session_id,
-        serde_json::json!({
-            "type": "open",
-            "target": { "node_id": "n2" }
-        }),
-        "unsupported act.type `open`",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn computer_use_regression_input_key_multiple_keys_is_rejected_without_session_mutation() {
-    let (handler, _) = test_handler();
-    let session_id = start_app_session_with_snapshot(&handler).await;
-
-    // Generic class: LLM sends a chord through the single-key action shape.
-    assert_invalid_act_fixture_does_not_mutate_session(
-        &handler,
-        session_id,
-        serde_json::json!({
-            "type": "input_key",
-            "keys": ["meta", "space"]
-        }),
-        "input_key requires exactly one key",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn computer_use_regression_nested_input_chord_action_is_rejected_without_session_mutation() {
-    let (handler, _) = test_handler();
-    let session_id = start_app_session_with_snapshot(&handler).await;
-
-    // Generic class: LLM nests another action object inside act instead of using flat schema fields.
-    assert_invalid_act_fixture_does_not_mutate_session(
-        &handler,
-        session_id,
-        serde_json::json!({
-            "type": "input_chord",
-            "action": {
-                "type": "input_chord",
-                "keys": ["meta", "space"]
-            }
-        }),
-        "unknown field `action`",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn computer_use_regression_direct_input_click_point_is_rejected_without_session_mutation() {
-    let (handler, _) = test_handler();
-    let session_id = start_app_session_with_snapshot(&handler).await;
-
-    // Generic class: LLM places coordinates directly on act; valid shape is target.point.
-    assert_invalid_act_fixture_does_not_mutate_session(
-        &handler,
-        session_id,
-        serde_json::json!({
-            "type": "input_click",
-            "point": { "x": 745, "y": 2060 }
-        }),
-        "unknown field `point`",
-    )
-    .await;
-}
-
-#[tokio::test]
 async fn computer_use_regression_action_failure_returns_actionable_diagnostics() {
     let config = ComputerUseToolsConfig {
         runtime_home_dir: std::env::temp_dir().join(format!(
@@ -411,4 +336,55 @@ async fn computer_use_regression_completed_stop_requires_final_evidence() {
     .expect_err("completion without evidence must be rejected");
 
     assert!(error.to_string().contains("completion_evidence_required"));
+}
+
+#[tokio::test]
+async fn computer_use_regression_malformed_actions_are_rejected_without_session_mutation() {
+    for (act, expected_error) in [
+        // Generic class: LLM invents a high-level OS action instead of using start/list_apps/semantic actions.
+        (
+            serde_json::json!({
+                "type": "open",
+                "target": { "node_id": "n2" }
+            }),
+            "unsupported act.type `open`",
+        ),
+        // Generic class: LLM sends a chord through the single-key action shape.
+        (
+            serde_json::json!({
+                "type": "input_key",
+                "keys": ["meta", "space"]
+            }),
+            "input_key requires exactly one key",
+        ),
+        // Generic class: LLM nests another action object inside act instead of using flat schema fields.
+        (
+            serde_json::json!({
+                "type": "input_chord",
+                "action": {
+                    "type": "input_chord",
+                    "keys": ["meta", "space"]
+                }
+            }),
+            "unknown field `action`",
+        ),
+        // Generic class: LLM places coordinates directly on act; valid shape is target.point.
+        (
+            serde_json::json!({
+                "type": "input_click",
+                "point": { "x": 745, "y": 2060 }
+            }),
+            "unknown field `point`",
+        ),
+    ] {
+        let (handler, _) = test_handler();
+        let session_id = start_app_session_with_snapshot(&handler).await;
+        assert_invalid_act_fixture_does_not_mutate_session(
+            &handler,
+            session_id,
+            act,
+            expected_error,
+        )
+        .await;
+    }
 }

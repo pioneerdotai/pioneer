@@ -1452,6 +1452,7 @@ mod tests {
                     .unwrap();
                     assert_eq!(wire["stream"], stream);
                     assert_eq!(wire["max_tokens"], 128);
+                    assert!(wire.get("reasoning_effort").is_none());
                     assert_eq!(
                         wire.get("model").and_then(serde_json::Value::as_str),
                         provider.deployment_model().as_deref()
@@ -1519,15 +1520,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn creates_with_defaults() {
-        let provider = AzureOpenAiProvider::new("key", "my-resource", "gpt-4o");
-        assert_eq!(provider.api_key, "key");
-        assert_eq!(provider.resource_name, "my-resource");
-        assert_eq!(provider.deployment_name, "gpt-4o");
-        assert_eq!(provider.api_version, DEFAULT_API_VERSION);
     }
 
     #[test]
@@ -1607,12 +1599,6 @@ mod tests {
     }
 
     #[test]
-    fn creates_with_custom_api_version() {
-        let provider = AzureOpenAiProvider::with_api_version("key", "res", "deploy", "2025-01-01");
-        assert_eq!(provider.api_version, "2025-01-01");
-    }
-
-    #[test]
     fn v1_prefix_and_legacy_version_keep_deployment_in_the_right_place() {
         let v1 = AzureOpenAiProvider::with_base_url_and_timeout_policy(
             "dummy-key",
@@ -1670,15 +1656,6 @@ mod tests {
 
         assert!(capabilities.reasoning.is_none());
         assert!(capabilities.thinking.is_none());
-    }
-
-    #[test]
-    fn chat_completions_url_built_correctly() {
-        let provider = AzureOpenAiProvider::new("key", "my-resource", "gpt-4o");
-        assert_eq!(
-            provider.chat_completions_url(),
-            "https://my-resource.openai.azure.com/openai/v1/chat/completions"
-        );
     }
 
     #[test]
@@ -1775,12 +1752,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_name() {
-        let provider = AzureOpenAiProvider::new("key", "res", "deploy");
-        assert_eq!(provider.name(), "azure_openai");
-    }
-
-    #[test]
     fn provider_capabilities() {
         let provider = AzureOpenAiProvider::new("key", "res", "deploy");
         let caps = provider.capabilities();
@@ -1789,30 +1760,16 @@ mod tests {
     }
 
     #[test]
-    fn api_request_serializes_reasoning_effort_only_when_selected() {
-        let request = ApiChatRequest {
-            generation: Default::default(),
-            model: None,
-            messages: Vec::new(),
-            temperature: None,
-            max_tokens: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            reasoning_effort: Some("high".to_owned()),
-            stream: false,
-            stream_options: None,
-        };
-
-        let json = serde_json::to_value(&request).unwrap();
-        assert_eq!(json["reasoning_effort"], "high");
-
-        let request_without_reasoning = ApiChatRequest {
-            reasoning_effort: None,
-            ..request
-        };
-        let json = serde_json::to_value(&request_without_reasoning).unwrap();
-        assert!(json.get("reasoning_effort").is_none());
+    fn default_configuration_and_chat_endpoint() {
+        let provider = AzureOpenAiProvider::new("key", "my-resource", "gpt-4o");
+        assert_eq!(provider.api_key, "key");
+        assert_eq!(provider.resource_name, "my-resource");
+        assert_eq!(provider.deployment_name, "gpt-4o");
+        assert_eq!(provider.api_version, DEFAULT_API_VERSION);
+        assert_eq!(
+            provider.chat_completions_url(),
+            "https://my-resource.openai.azure.com/openai/v1/chat/completions"
+        );
     }
 }
 

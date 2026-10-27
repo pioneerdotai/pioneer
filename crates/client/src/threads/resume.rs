@@ -1174,30 +1174,6 @@ mod tests {
     }
 
     #[test]
-    fn status_plan_maps_turn_status_to_resume_follow_up() {
-        assert_eq!(
-            plan_turn_resume_after_status(TurnStatus::InProgress),
-            TurnResumeStatusPlan::PollAfter(TURN_RESUME_IN_PROGRESS_POLL_DELAY)
-        );
-        assert_eq!(
-            plan_turn_resume_after_status(TurnStatus::Completed),
-            TurnResumeStatusPlan::Complete
-        );
-        assert_eq!(
-            plan_turn_resume_after_status(TurnStatus::Failed),
-            TurnResumeStatusPlan::Fail
-        );
-        assert_eq!(
-            plan_turn_resume_after_status(TurnStatus::Interrupted),
-            TurnResumeStatusPlan::Fail
-        );
-        assert_eq!(
-            plan_turn_resume_after_status(TurnStatus::Blocked),
-            TurnResumeStatusPlan::Block
-        );
-    }
-
-    #[test]
     fn snapshot_and_event_matching_are_scope_strict() {
         let turn_params = turn_resume_turn_params("thread_a".to_owned(), "turn_a".to_owned());
         assert_eq!(turn_params.thread_id, "thread_a");
@@ -1215,98 +1191,6 @@ mod tests {
         assert!(!turn_item_event_matches_snapshot(
             "ws_b", "thread_a", "ws_a", "thread_a"
         ));
-    }
-
-    #[test]
-    fn terminal_event_maps_terminal_turns() {
-        let completed = Turn {
-            id: "turn_a".to_owned(),
-            status: TurnStatus::Completed,
-            turn_kind: TurnKind::Conversation,
-            origin: TurnOrigin::User,
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-        };
-        match turn_resume_terminal_event("thread_a".to_owned(), completed) {
-            Some(ConversationEvent::TurnCompleted { thread_id, turn }) => {
-                assert_eq!(thread_id, "thread_a");
-                assert_eq!(turn.status, TurnStatus::Completed);
-            }
-            event => panic!("unexpected event: {event:?}"),
-        }
-
-        let failed = Turn {
-            id: "turn_b".to_owned(),
-            status: TurnStatus::Interrupted,
-            turn_kind: TurnKind::Conversation,
-            origin: TurnOrigin::User,
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-        };
-        match turn_resume_terminal_event("thread_b".to_owned(), failed) {
-            Some(ConversationEvent::TurnFailed { thread_id, turn }) => {
-                assert_eq!(thread_id, "thread_b");
-                assert_eq!(turn.status, TurnStatus::Interrupted);
-            }
-            event => panic!("unexpected event: {event:?}"),
-        }
-
-        let blocked = Turn {
-            id: "turn_blocked".to_owned(),
-            status: TurnStatus::Blocked,
-            turn_kind: TurnKind::Conversation,
-            origin: TurnOrigin::User,
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: Some("needs review".to_owned()),
-            prompt_manifest: None,
-            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-        };
-        match turn_resume_terminal_event("thread_blocked".to_owned(), blocked) {
-            Some(ConversationEvent::TurnBlocked {
-                thread_id, turn, ..
-            }) => {
-                assert_eq!(thread_id, "thread_blocked");
-                assert_eq!(turn.status, TurnStatus::Blocked);
-                assert_eq!(turn.error.as_deref(), Some("needs review"));
-            }
-            event => panic!("unexpected event: {event:?}"),
-        }
-
-        let in_progress = Turn {
-            id: "turn_c".to_owned(),
-            status: TurnStatus::InProgress,
-            turn_kind: TurnKind::Conversation,
-            origin: TurnOrigin::User,
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-        };
-        assert!(turn_resume_terminal_event("thread_c".to_owned(), in_progress).is_none());
     }
 
     #[test]
@@ -1428,13 +1312,71 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_reduction_completed_turn_terminalizes_ticks_and_resets() {
-        let turn_snapshot = TurnGetResponse {
-            thread_id: "thread_a".to_owned(),
-            workspace_id: "ws_a".to_owned(),
-            turn: Turn {
-                id: "turn_a".to_owned(),
-                status: TurnStatus::Completed,
+    fn snapshot_reduction_maps_status_to_terminal_events_polling_and_reset() {
+        for (
+            expected_thread_id,
+            expected_turn_id,
+            status,
+            event_kind,
+            schedule_after,
+            reset,
+            tick,
+            error,
+        ) in [
+            (
+                "thread_c",
+                "turn_c",
+                TurnStatus::InProgress,
+                None,
+                Some(Duration::from_millis(800)),
+                false,
+                false,
+                None,
+            ),
+            (
+                "thread_a",
+                "turn_a",
+                TurnStatus::Completed,
+                Some("completed"),
+                None,
+                true,
+                true,
+                None,
+            ),
+            (
+                "thread_failed",
+                "turn_failed",
+                TurnStatus::Failed,
+                Some("failed"),
+                None,
+                true,
+                false,
+                None,
+            ),
+            (
+                "thread_b",
+                "turn_b",
+                TurnStatus::Interrupted,
+                Some("failed"),
+                None,
+                true,
+                false,
+                None,
+            ),
+            (
+                "thread_blocked",
+                "turn_blocked",
+                TurnStatus::Blocked,
+                Some("blocked"),
+                None,
+                true,
+                false,
+                Some("needs review"),
+            ),
+        ] {
+            let turn = Turn {
+                id: expected_turn_id.to_owned(),
+                status,
                 turn_kind: TurnKind::Conversation,
                 origin: TurnOrigin::User,
                 mode: Default::default(),
@@ -1443,27 +1385,57 @@ mod tests {
                 mentions: Vec::new(),
                 message_revision: 0,
                 message_deleted: false,
-                error: None,
+                error: error.map(str::to_owned),
                 prompt_manifest: None,
                 permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-            },
-        };
-        let TurnResumeSnapshotReduction::Apply(reduction) =
-            reduce_turn_resume_turn_snapshot("thread_a", "turn_a", turn_snapshot)
-        else {
-            panic!("expected apply reduction");
-        };
-
-        assert_eq!(reduction.thread_id, "thread_a");
-        assert_eq!(reduction.workspace_id, "ws_a");
-        assert_eq!(reduction.schedule_after, None);
-        assert!(reduction.reset_thread_resume);
-        assert!(reduction.tick_conversation_after_terminal_event);
-        assert!(matches!(
-            reduction.terminal_event,
-            Some(ConversationEvent::TurnCompleted { thread_id, turn })
-                if thread_id == "thread_a" && turn.status == TurnStatus::Completed
-        ));
+            };
+            let TurnResumeSnapshotReduction::Apply(reduction) = reduce_turn_resume_turn_snapshot(
+                expected_thread_id,
+                expected_turn_id,
+                TurnGetResponse {
+                    thread_id: expected_thread_id.to_owned(),
+                    workspace_id: "ws_a".to_owned(),
+                    turn: turn.clone(),
+                },
+            ) else {
+                panic!("expected apply reduction");
+            };
+            assert_eq!(reduction.thread_id, expected_thread_id);
+            assert_eq!(reduction.workspace_id, "ws_a");
+            assert!(reduction.replay_events.is_empty());
+            assert_eq!(reduction.schedule_after, schedule_after);
+            assert_eq!(reduction.reset_thread_resume, reset);
+            assert_eq!(reduction.tick_conversation_after_terminal_event, tick);
+            match (event_kind, reduction.terminal_event) {
+                (None, None) => {}
+                (
+                    Some("completed"),
+                    Some(ConversationEvent::TurnCompleted {
+                        thread_id,
+                        turn: actual,
+                    }),
+                )
+                | (
+                    Some("failed"),
+                    Some(ConversationEvent::TurnFailed {
+                        thread_id,
+                        turn: actual,
+                    }),
+                )
+                | (
+                    Some("blocked"),
+                    Some(ConversationEvent::TurnBlocked {
+                        thread_id,
+                        turn: actual,
+                        ..
+                    }),
+                ) => {
+                    assert_eq!(thread_id, expected_thread_id);
+                    assert_eq!(actual, turn);
+                }
+                _ => panic!("wrong terminal event for {:?}", turn.status),
+            }
+        }
     }
 
     #[test]

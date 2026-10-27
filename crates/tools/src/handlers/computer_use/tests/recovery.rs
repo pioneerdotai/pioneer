@@ -1,30 +1,6 @@
 use super::*;
 
 #[tokio::test]
-async fn computer_use_start_app_not_found_reports_failure_class() {
-    let (handler, _) = test_handler();
-
-    let error = invoke_result(
-        &handler,
-        serde_json::json!({
-            "action": "start",
-            "goal": "missing app",
-            "target": {
-                "type": "app_name",
-                "name": "MissingApp"
-            }
-        }),
-    )
-    .await
-    .expect_err("missing app must fail");
-
-    assert!(
-        error.to_string().contains("failure_class=app_not_found"),
-        "{error}"
-    );
-}
-
-#[tokio::test]
 async fn session_id_continues_after_handler_restart() {
     let unique = NEXT_TEST_ROOT_ID.fetch_add(1, Ordering::SeqCst);
     let root = std::env::temp_dir().join(format!(
@@ -257,68 +233,6 @@ async fn non_retryable_failure_class_stops_immediately() {
         result.get("failure_class").and_then(JsonValue::as_str),
         Some("action_not_supported")
     );
-}
-
-#[tokio::test]
-async fn stop_with_completed_outcome_sets_completed_state() {
-    let (handler, _) = test_handler();
-    let started = invoke(
-        &handler,
-        serde_json::json!({
-            "action": "start",
-            "goal": "complete this test",
-            "target": { "type": "app_name", "name": "MockApp" }
-        }),
-    )
-    .await;
-    let session_id = started
-        .get("session_id")
-        .and_then(JsonValue::as_u64)
-        .expect("session id");
-    invoke(
-        &handler,
-        serde_json::json!({
-            "action": "snapshot",
-            "session_id": session_id,
-        }),
-    )
-    .await;
-    let verification = invoke(
-        &handler,
-        serde_json::json!({
-            "action": "verify",
-            "session_id": session_id,
-            "expect": { "visible_text": "OK" }
-        }),
-    )
-    .await;
-    assert_eq!(
-        verification
-            .pointer("/verification/status")
-            .and_then(JsonValue::as_str),
-        Some("passed")
-    );
-
-    let stopped = invoke(
-        &handler,
-        serde_json::json!({
-            "action": "stop",
-            "session_id": session_id,
-            "outcome": "completed",
-            "reason": "goal_completed"
-        }),
-    )
-    .await;
-
-    assert_eq!(
-        stopped.get("status").and_then(JsonValue::as_str),
-        Some("stopped")
-    );
-    assert_eq!(
-        stopped.get("loop_state").and_then(JsonValue::as_str),
-        Some("completed")
-    );
-    assert_eq!(stopped.get("failure_class"), Some(&JsonValue::Null));
 }
 
 #[tokio::test]

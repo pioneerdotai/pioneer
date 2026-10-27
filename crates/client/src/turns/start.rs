@@ -436,86 +436,6 @@ mod tests {
     }
 
     #[test]
-    fn prepared_turn_snapshot_update_sets_model_preview_and_updated_at() {
-        let mut thread = Thread {
-            workspace_id: "ws_1".to_owned(),
-            id: "thr_1".to_owned(),
-            name: None,
-            preview: "   ".to_owned(),
-            preview_author: None,
-            mode: ThreadMode::Chat,
-            model: "old-model".to_owned(),
-            model_provider: "old-provider".to_owned(),
-            reasoning_effort: None,
-            created_at: 10,
-            updated_at: 10,
-            status: pioneer_protocol::ThreadStatus::Idle,
-            origin_kind: pioneer_protocol::ThreadOriginKind::User,
-            sidebar_visibility: pioneer_protocol::ThreadSidebarVisibility::Visible,
-            agent_nickname: None,
-            agent_role: None,
-            visibility: None,
-            turns: Vec::new(),
-        };
-
-        apply_prepared_turn_to_thread_snapshot(
-            &mut thread,
-            ThreadMode::Agent,
-            Some("new-model"),
-            Some("new-provider"),
-            Some(" high "),
-            "hello",
-            42,
-        );
-
-        assert_eq!(thread.model, "new-model");
-        assert_eq!(thread.model_provider, "new-provider");
-        assert_eq!(thread.reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(thread.preview, "hello");
-        assert_eq!(thread.updated_at, 42);
-    }
-
-    #[test]
-    fn prepared_turn_snapshot_update_preserves_existing_preview_and_partial_model_selection() {
-        let mut thread = Thread {
-            workspace_id: "ws_1".to_owned(),
-            id: "thr_1".to_owned(),
-            name: None,
-            preview: "existing".to_owned(),
-            preview_author: None,
-            mode: ThreadMode::Chat,
-            model: "old-model".to_owned(),
-            model_provider: "old-provider".to_owned(),
-            reasoning_effort: None,
-            created_at: 10,
-            updated_at: 10,
-            status: pioneer_protocol::ThreadStatus::Idle,
-            origin_kind: pioneer_protocol::ThreadOriginKind::User,
-            sidebar_visibility: pioneer_protocol::ThreadSidebarVisibility::Visible,
-            agent_nickname: None,
-            agent_role: None,
-            visibility: None,
-            turns: Vec::new(),
-        };
-
-        apply_prepared_turn_to_thread_snapshot(
-            &mut thread,
-            ThreadMode::Agent,
-            Some("new-model"),
-            None,
-            None,
-            "hello",
-            42,
-        );
-
-        assert_eq!(thread.model, "old-model");
-        assert_eq!(thread.model_provider, "old-provider");
-        assert!(thread.reasoning_effort.is_none());
-        assert_eq!(thread.preview, "existing");
-        assert_eq!(thread.updated_at, 42);
-    }
-
-    #[test]
     fn message_snapshot_update_preserves_execution_selection() {
         let mut thread = Thread {
             workspace_id: "ws_1".to_owned(),
@@ -755,5 +675,65 @@ mod tests {
             ConversationEvent::TurnCompleted { thread_id, turn: completed }
                 if thread_id == "thread" && completed == &turn
         ));
+    }
+
+    #[test]
+    fn prepared_turn_snapshot_update_projects_complete_and_partial_selection() {
+        for (preview, selected_provider, selected_reasoning_effort, expected) in [
+            (
+                "   ",
+                Some("new-provider"),
+                Some(" high "),
+                ("new-model", "new-provider", Some("high"), "hello"),
+            ),
+            (
+                "existing",
+                None,
+                None,
+                ("old-model", "old-provider", None, "existing"),
+            ),
+        ] {
+            let (expected_model, expected_provider, expected_reasoning_effort, expected_preview) =
+                expected;
+            let mut thread = Thread {
+                workspace_id: "ws_1".to_owned(),
+                id: "thr_1".to_owned(),
+                name: None,
+                preview: preview.to_owned(),
+                preview_author: None,
+                mode: ThreadMode::Chat,
+                model: "old-model".to_owned(),
+                model_provider: "old-provider".to_owned(),
+                reasoning_effort: None,
+                created_at: 10,
+                updated_at: 10,
+                status: pioneer_protocol::ThreadStatus::Idle,
+                origin_kind: pioneer_protocol::ThreadOriginKind::User,
+                sidebar_visibility: pioneer_protocol::ThreadSidebarVisibility::Visible,
+                agent_nickname: None,
+                agent_role: None,
+                visibility: None,
+                turns: Vec::new(),
+            };
+
+            apply_prepared_turn_to_thread_snapshot(
+                &mut thread,
+                ThreadMode::Agent,
+                Some("new-model"),
+                selected_provider,
+                selected_reasoning_effort,
+                "hello",
+                42,
+            );
+
+            assert_eq!(thread.model, expected_model);
+            assert_eq!(thread.model_provider, expected_provider);
+            assert_eq!(
+                thread.reasoning_effort.as_deref(),
+                expected_reasoning_effort
+            );
+            assert_eq!(thread.preview, expected_preview);
+            assert_eq!(thread.updated_at, 42);
+        }
     }
 }

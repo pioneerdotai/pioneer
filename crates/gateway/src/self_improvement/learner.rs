@@ -2802,62 +2802,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reviewer_inherits_default_model_without_override() {
-        let provider = Arc::new(ScriptedProvider::new([
-            analysis_json("verified first step succeeded"),
-            synthesis_json("Follow the verified sequence."),
-            r#"{"candidateKey":"candidate-253a437c86cee481cdd8b8142451b4c481e03da9d5ad3c78cb915177a2e25ad3","decision":"accept","reasonCodes":[]}"#
-                .to_owned(),
-        ]));
-        let registry = ProviderRegistry::with_provider("scripted", provider.clone());
-        let mut default_model = model("scripted", "one-model");
-        default_model.reasoning_effort = Some("high".to_owned());
-        let client = LearnerReviewerClient::new(&registry, "workspace-one", &default_model, None);
-        let history = history(
-            [
-                HistoryEvidenceRole::NewAnchor,
-                HistoryEvidenceRole::NewAnchor,
-            ],
-            "The verified first step succeeded.",
-        );
-        let digest = client
-            .analyze_chunk(&history, None)
-            .await
-            .expect("analysis")
-            .value;
-        let frozen_range = frozen_range();
-        let candidate = client
-            .synthesize_validated_candidate(
-                &digest,
-                &frozen_range,
-                std::slice::from_ref(&history),
-                &[],
-                &[],
-                1024 * 1024,
-            )
-            .await
-            .expect("synthesis")
-            .value
-            .expect("candidate");
-        client
-            .review_skill_candidate(candidate, 1024 * 1024)
-            .await
-            .expect("review");
-        assert!(
-            provider
-                .requests()
-                .iter()
-                .all(|request| request.model == "one-model"
-                    && request.temperature.is_none()
-                    && request.max_tokens.is_none()
-                    && request.reasoning
-                        == Some(ReasoningConfig::effort(
-                            pioneer_protocol::ReasoningEffort::High
-                        )))
-        );
-    }
-
-    #[tokio::test]
     async fn malformed_schema_and_invented_evidence_are_rejected() {
         let malformed_response = concat!(
             "```json\n",

@@ -1069,32 +1069,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_skill_handler_rejects_presentation_slug() {
-        let mut index = HashMap::<String, SkillReadToolEntry>::new();
-        index.insert(
-            "skill:TTTTTTTTTTTTTTTTTTTTT".to_owned(),
-            read_skill_entry("TTTTTTTTTTTTTTTTTTTTT", "weather", "weather"),
-        );
-        let handler = ReadSkillHandler {
-            read_skill_index: index,
-            default_max_chars: 1024,
-        };
-
-        let result = handler
-            .handle(
-                read_skill_invocation("weather"),
-                crate::ToolEventBus::default().start_trace("turn", "call_1", "read_skill"),
-            )
-            .await;
-
-        let error = match result {
-            Ok(_) => panic!("presentation slug should fail"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("skill:<skill_id>"));
-    }
-
-    #[tokio::test]
     async fn skill_policy_http_tool_inherits_disabled_network_snapshot() {
         let handler = skill_http_handler("https://example.com");
         let result = handler

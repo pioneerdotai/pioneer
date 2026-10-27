@@ -351,30 +351,31 @@ mod tests {
     }
 
     #[test]
-    fn agents_md_builtin_round_trips_manifest_identity() {
-        let id = PromptRuntimeBuiltInSectionId::from_manifest_id("agents_md")
-            .expect("agents_md builtin should resolve");
-        assert_eq!(id, PromptRuntimeBuiltInSectionId::AgentsMd);
-        assert_eq!(id.manifest_id(), "agents_md");
-        assert_eq!(id.prompt_section_id(), PromptSectionId::AgentsMd);
-        assert_eq!(id.default_title(), "AGENTS.md");
-        assert!(PromptSectionId::is_builtin_manifest_id("agents_md"));
-    }
-
-    #[test]
-    fn execution_continuation_builtin_round_trips_manifest_identity() {
-        let id = PromptRuntimeBuiltInSectionId::from_manifest_id("execution_continuation")
-            .expect("execution_continuation builtin should resolve");
-        assert_eq!(id, PromptRuntimeBuiltInSectionId::ExecutionContinuation);
-        assert_eq!(id.manifest_id(), "execution_continuation");
-        assert_eq!(
-            id.prompt_section_id(),
-            PromptSectionId::ExecutionContinuation
-        );
-        assert_eq!(id.default_title(), "Execution Continuation");
-        assert!(PromptSectionId::is_builtin_manifest_id(
-            "execution_continuation"
-        ));
+    fn runtime_builtins_preserve_manifest_identity() {
+        for (manifest_id, expected_id, expected_section, expected_title, resolve_message) in [
+            (
+                "agents_md",
+                PromptRuntimeBuiltInSectionId::AgentsMd,
+                PromptSectionId::AgentsMd,
+                "AGENTS.md",
+                "agents_md builtin should resolve",
+            ),
+            (
+                "execution_continuation",
+                PromptRuntimeBuiltInSectionId::ExecutionContinuation,
+                PromptSectionId::ExecutionContinuation,
+                "Execution Continuation",
+                "execution_continuation builtin should resolve",
+            ),
+        ] {
+            let id = PromptRuntimeBuiltInSectionId::from_manifest_id(manifest_id)
+                .expect(resolve_message);
+            assert_eq!(id, expected_id);
+            assert_eq!(id.manifest_id(), manifest_id);
+            assert_eq!(id.prompt_section_id(), expected_section);
+            assert_eq!(id.default_title(), expected_title);
+            assert!(PromptSectionId::is_builtin_manifest_id(manifest_id));
+        }
     }
 
     #[test]

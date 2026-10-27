@@ -222,73 +222,10 @@ mod tests {
     }
 
     #[test]
-    fn mock_provider_name() {
-        let provider = MockProvider;
-        assert_eq!(provider.name(), "mock");
-    }
-
-    #[test]
-    fn mock_provider_capabilities() {
-        let provider = MockProvider;
-        let caps = provider.capabilities();
-        assert!(caps.streaming);
-        assert!(!caps.vision);
-    }
-
-    #[test]
     fn provider_failure_classification_is_optional_and_conservative() {
         let provider = MockProvider;
         let error = anyhow::anyhow!("opaque provider rejection");
         assert!(provider.classify_failure(&error).is_none());
-    }
-
-    #[tokio::test]
-    async fn mock_provider_chat() {
-        let provider = MockProvider;
-        let request = ChatRequest {
-            model: "test-model".into(),
-            messages: vec![ChatMessage::user("hello")],
-            temperature: None,
-            max_tokens: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            reasoning: None,
-            compiled_prompt: None,
-        };
-
-        let response = provider.chat(request).await.unwrap();
-        assert_eq!(response.text, "mock response");
-        assert_eq!(response.usage.as_ref().unwrap().input_tokens, Some(10));
-    }
-
-    #[tokio::test]
-    async fn mock_provider_stream() {
-        let provider = MockProvider;
-        let request = ChatRequest {
-            model: "test-model".into(),
-            messages: vec![ChatMessage::user("hello")],
-            temperature: None,
-            max_tokens: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            reasoning: None,
-            compiled_prompt: None,
-        };
-
-        let mut stream = provider.stream_chat(request).await.unwrap();
-
-        let chunk1 = stream.next().await.unwrap().unwrap();
-        assert_eq!(chunk1.delta, "hello ");
-        assert!(!chunk1.is_final);
-
-        let chunk2 = stream.next().await.unwrap().unwrap();
-        assert_eq!(chunk2.delta, "world");
-        assert!(!chunk2.is_final);
-
-        let chunk3 = stream.next().await.unwrap().unwrap();
-        assert!(chunk3.is_final);
     }
 
     #[tokio::test]

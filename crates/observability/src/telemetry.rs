@@ -749,90 +749,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn production_endpoints_require_https() {
-        assert!(
-            validate_config(&config(
-                "https://telemetry.example/v1/metrics",
-                "https://telemetry.example/v1/traces"
-            ))
-            .is_ok()
-        );
-        assert!(
-            validate_config(&config(
-                "http://telemetry.example/v1/metrics",
-                "https://telemetry.example/v1/traces"
-            ))
-            .is_err()
-        );
-        assert!(
-            validate_config(&config(
-                "https://telemetry.example/v1/metrics",
-                "http://telemetry.example/v1/traces"
-            ))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn service_version_is_bounded_and_non_empty_when_overridden() {
-        let mut valid = config(
-            "https://telemetry.example/v1/metrics",
-            "https://telemetry.example/v1/traces",
-        );
-        valid.service_version = Some("1.2.3+456".to_owned());
-        assert!(validate_config(&valid).is_ok());
-
-        valid.service_version = Some("   ".to_owned());
-        assert!(validate_config(&valid).is_err());
-
-        valid.service_version = Some("v".repeat(129));
-        assert!(validate_config(&valid).is_err());
-    }
-
-    #[test]
-    fn loopback_http_endpoints_are_available_for_development() {
-        assert!(
-            validate_config(&config(
-                "http://127.0.0.1:4318/v1/metrics",
-                "http://localhost:4318/v1/traces"
-            ))
-            .is_ok()
-        );
-        assert!(
-            validate_config(&config(
-                "http://localhost.example/v1/metrics",
-                "http://127.0.0.1:4318/v1/traces"
-            ))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn export_timing_is_bounded() {
-        let mut candidate = config(
-            "https://telemetry.example/v1/metrics",
-            "https://telemetry.example/v1/traces",
-        );
-        candidate.export_interval = Duration::from_secs(1);
-        assert!(validate_config(&candidate).is_err());
-        candidate.export_interval = Duration::from_secs(30);
-        candidate.export_timeout = Duration::from_secs(31);
-        assert!(validate_config(&candidate).is_err());
-    }
-
-    #[test]
-    fn deployment_environment_is_bounded() {
-        let mut candidate = config(
-            "https://telemetry.example/v1/metrics",
-            "https://telemetry.example/v1/traces",
-        );
-        candidate.deployment_environment = Some("development".to_owned());
-        assert!(validate_config(&candidate).is_ok());
-        candidate.deployment_environment = Some("customer-provided".to_owned());
-        assert!(validate_config(&candidate).is_err());
-    }
-
-    #[test]
     fn consent_gate_covers_metric_and_trace_exporters() {
         let _guard = TELEMETRY_TEST_LOCK.lock().expect("telemetry test lock");
         let _reset = TelemetryEnabledReset(super::super::telemetry_enabled());
@@ -1233,8 +1149,19 @@ pub(crate) mod tests {
         };
         for failed in [true, false, true] {
             fail.store(failed, Ordering::Relaxed);
-            let metric_result = await_ready(metrics.export(&ResourceMetrics::default()));
-            let span_result = await_ready(spans.export(Vec::new()));
+            let (metric_result, span_result) = if failed {
+                (
+                    await_ready(metrics.export(&ResourceMetrics::default())),
+                    await_ready(spans.export(Vec::new())),
+                )
+            } else {
+                let span_result = await_ready(spans.export(Vec::new()));
+                assert_eq!(availability.state.lock().unwrap().unavailable_signals, 0b01);
+                (
+                    await_ready(metrics.export(&ResourceMetrics::default())),
+                    span_result,
+                )
+            };
             for result in [metric_result, span_result] {
                 if failed {
                     assert!(
@@ -1353,18 +1280,104 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn exporter_availability_coalesces_signals_until_every_failed_signal_recovers() {
-        let availability = ExportAvailability::default();
-        let failure = Err(OTelSdkError::InternalFailure("network error".to_owned()));
-
-        availability.observe("traces", 0b10, &failure);
-        availability.observe("metrics", 0b01, &failure);
-        assert_eq!(availability.state.lock().unwrap().unavailable_signals, 0b11);
-
-        availability.observe("traces", 0b10, &Ok(()));
-        assert_eq!(availability.state.lock().unwrap().unavailable_signals, 0b01);
-        availability.observe("metrics", 0b01, &Ok(()));
-        assert_eq!(availability.state.lock().unwrap().unavailable_signals, 0);
+    fn telemetry_config_validation_preserves_endpoint_and_metadata_limits() {
+        let base = config(
+            "https://telemetry.example/v1/metrics",
+            "https://telemetry.example/v1/traces",
+        );
+        for (case, candidate, valid) in [
+            ("production_https", base.clone(), true),
+            (
+                "insecure_metrics",
+                config(
+                    "http://telemetry.example/v1/metrics",
+                    "https://telemetry.example/v1/traces",
+                ),
+                false,
+            ),
+            (
+                "insecure_traces",
+                config(
+                    "https://telemetry.example/v1/metrics",
+                    "http://telemetry.example/v1/traces",
+                ),
+                false,
+            ),
+            (
+                "loopback_development",
+                config(
+                    "http://127.0.0.1:4318/v1/metrics",
+                    "http://localhost:4318/v1/traces",
+                ),
+                true,
+            ),
+            (
+                "localhost_suffix_is_remote",
+                config(
+                    "http://localhost.example/v1/metrics",
+                    "http://127.0.0.1:4318/v1/traces",
+                ),
+                false,
+            ),
+            (
+                "explicit_version",
+                OtlpTelemetryConfig {
+                    service_version: Some("1.2.3+456".to_owned()),
+                    ..base.clone()
+                },
+                true,
+            ),
+            (
+                "blank_version",
+                OtlpTelemetryConfig {
+                    service_version: Some("   ".to_owned()),
+                    ..base.clone()
+                },
+                false,
+            ),
+            (
+                "oversized_version",
+                OtlpTelemetryConfig {
+                    service_version: Some("v".repeat(129)),
+                    ..base.clone()
+                },
+                false,
+            ),
+            (
+                "short_interval",
+                OtlpTelemetryConfig {
+                    export_interval: Duration::from_secs(1),
+                    ..base.clone()
+                },
+                false,
+            ),
+            (
+                "long_timeout",
+                OtlpTelemetryConfig {
+                    export_timeout: Duration::from_secs(31),
+                    ..base.clone()
+                },
+                false,
+            ),
+            (
+                "development_environment",
+                OtlpTelemetryConfig {
+                    deployment_environment: Some("development".to_owned()),
+                    ..base.clone()
+                },
+                true,
+            ),
+            (
+                "unbounded_environment",
+                OtlpTelemetryConfig {
+                    deployment_environment: Some("customer-provided".to_owned()),
+                    ..base.clone()
+                },
+                false,
+            ),
+        ] {
+            assert_eq!(validate_config(&candidate).is_ok(), valid, "{case}");
+        }
     }
 }
 

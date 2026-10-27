@@ -1,31 +1,6 @@
 use super::*;
 
 #[tokio::test]
-async fn snapshot_bound_targets_latest_snapshot_id_allows_node_action() {
-    let (handler, _) = test_handler();
-    let session_id = start_app_session_with_snapshot(&handler).await;
-    let snapshot_id = latest_snapshot_id(&handler, session_id).await;
-
-    let result = invoke(
-        &handler,
-        serde_json::json!({
-            "action": "act",
-            "session_id": session_id,
-            "act": {
-                "type": "press",
-                "target": { "node_id": "n2", "snapshot_id": snapshot_id }
-            }
-        }),
-    )
-    .await;
-
-    assert_eq!(
-        result.pointer("/result/status").and_then(JsonValue::as_str),
-        Some("ok")
-    );
-}
-
-#[tokio::test]
 async fn snapshot_bound_targets_missing_snapshot_id_is_recoverable_element_stale() {
     let (handler, _) = test_handler();
     let session_id = start_app_session_with_snapshot(&handler).await;

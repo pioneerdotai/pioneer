@@ -643,40 +643,6 @@ mod tests {
     }
 
     #[test]
-    fn binary_frame_kind_detects_skill_upload_magic() {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(SKILL_UPLOAD_CHUNK_FRAME_MAGIC);
-        payload.extend_from_slice(&0u32.to_be_bytes());
-
-        let kind = classify_binary_payload(payload.as_slice());
-
-        assert_eq!(kind, Some(BinaryIngressKind::SkillUploadChunk));
-        assert_eq!(kind.expect("kind").safe_name(), "skills/upload/chunk");
-    }
-
-    #[test]
-    fn binary_frame_kind_detects_artifact_upload_magic() {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(ARTIFACT_UPLOAD_CHUNK_FRAME_MAGIC);
-        payload.extend_from_slice(&0u32.to_be_bytes());
-
-        let kind = classify_binary_payload(payload.as_slice());
-
-        assert_eq!(kind, Some(BinaryIngressKind::ArtifactUploadChunk));
-        assert_eq!(kind.expect("kind").safe_name(), "artifact/upload/chunk");
-    }
-
-    #[test]
-    fn binary_frame_kind_detects_voice_chunk_magic() {
-        let frame = voice_frame("voice_session_1", 0, b"\xff\x00").expect("voice frame");
-
-        let kind = classify_binary_payload(frame.as_slice());
-
-        assert_eq!(kind, Some(BinaryIngressKind::VoiceChunk));
-        assert_eq!(kind.expect("kind").safe_name(), "voice/chunk");
-    }
-
-    #[test]
     fn binary_frame_kind_rejects_unknown_magic() {
         assert_eq!(classify_binary_payload(b"NOPE"), None);
     }

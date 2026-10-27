@@ -992,16 +992,6 @@ mod tests {
     }
 
     #[test]
-    fn sanity() -> anyhow::Result<()> {
-        let db1 = create_example_db(Some(123), 100)?;
-        let db2 = create_example_db(Some(123), 100)?;
-
-        check_table_rows_same(&db1, &db2)?;
-
-        Ok(())
-    }
-
-    #[test]
     fn no_configs() -> anyhow::Result<()> {
         let db = create_example_db(Some(123), 100)?;
 

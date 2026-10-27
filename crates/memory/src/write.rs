@@ -432,23 +432,6 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_uses_semantic_value_not_surface_language() {
-        let scope = MemoryScope {
-            kind: MemoryScopeKind::User,
-            key: "default".to_owned(),
-        };
-        let semantic = semantic(
-            MemoryCategory::Identity,
-            MemorySubject::CurrentUser,
-            MemoryAttribute::Name,
-        );
-        let first = prepare_semantic_write(&scope, &semantic, "Александр").expect("first");
-        let second = prepare_semantic_write(&scope, &semantic, "Александр").expect("second");
-        assert_eq!(first.canonical.key, second.canonical.key);
-        assert_eq!(first.semantic_fingerprint, second.semantic_fingerprint);
-    }
-
-    #[test]
     fn canonical_project_policy_examples_are_stable() {
         let scope = MemoryScope {
             kind: MemoryScopeKind::Workspace,

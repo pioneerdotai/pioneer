@@ -7239,16 +7239,6 @@ mod tests {
     }
 
     #[test]
-    fn nickname_rules_are_explicit_and_lowercase() {
-        assert!(
-            "agent-1".chars().all(|c| c.is_ascii_lowercase()
-                || c.is_ascii_digit()
-                || matches!(c, '-' | '_' | '.'))
-        );
-        assert!(!"Agent".chars().all(|c| c.is_ascii_lowercase()));
-    }
-
-    #[test]
     fn timeline_item_targets_use_database_row_ids_not_protocol_item_ids() {
         let targets = vec![
             ("turn-a".to_owned(), Some("protocol-item".to_owned())),

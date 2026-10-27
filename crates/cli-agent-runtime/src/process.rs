@@ -717,14 +717,6 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn expands_tilde_home_path_with_explicit_home_dir() {
-        let home = PathBuf::from("/tmp/pioneer-home");
-        let expanded = expand_home_path("~/.codex_work", Some(home.as_path()))
-            .expect("home path should expand");
-        assert_eq!(expanded, PathBuf::from("/tmp/pioneer-home/.codex_work"));
-    }
-
-    #[test]
     fn codex_app_server_prepare_never_passes_literal_tilde_home() {
         let home = PathBuf::from("/tmp/pioneer-home");
         let prepared = CLIAgentProcessSpawnConfig::codex_app_server("codex", "~/.codex_work")

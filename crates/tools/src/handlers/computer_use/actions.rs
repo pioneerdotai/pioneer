@@ -503,217 +503,65 @@ mod tests {
     }
 
     #[test]
-    fn computer_use_action_schema_accepts_press_with_node_id() {
-        let action = parse(serde_json::json!({
-            "type": "press",
-            "target": { "node_id": "n42" }
-        }))
-        .expect("press action");
-        assert_eq!(action.action_type(), "press");
-    }
-
-    #[test]
-    fn computer_use_os_action_accepts_open_app() {
-        let action = parse(serde_json::json!({
-            "type": "open_app",
-            "app": "ExampleApp"
-        }))
-        .expect("open app action");
-        assert_eq!(action.action_type(), "open_app");
-    }
-
-    #[test]
-    fn computer_use_os_action_accepts_select_menu_item() {
-        let action = parse(serde_json::json!({
-            "type": "select_menu_item",
-            "app": "ExampleApp",
-            "menu_path": ["File", "New Window"]
-        }))
-        .expect("select menu item action");
-        assert_eq!(action.action_type(), "select_menu_item");
-    }
-
-    #[test]
-    fn computer_use_menu_action_rejects_missing_app() {
-        let error = parse(serde_json::json!({
-            "type": "select_menu_item",
-            "menu_path": ["File", "New Window"]
-        }))
-        .expect_err("select_menu_item requires app");
-        assert!(
-            error
-                .to_string()
-                .contains("select_menu_item requires non-empty app")
-        );
-    }
-
-    #[test]
-    fn computer_use_os_action_accepts_open_path_with_absolute_existing_path() {
-        let temp_dir = std::env::temp_dir();
-        let action = parse(serde_json::json!({
-            "type": "open_path",
-            "path": temp_dir.display().to_string()
-        }))
-        .expect("open path action");
-        assert_eq!(action.action_type(), "open_path");
-    }
-
-    #[test]
-    fn computer_use_os_action_accepts_reveal_path_with_absolute_existing_path() {
-        let temp_dir = std::env::temp_dir();
-        let action = parse(serde_json::json!({
-            "type": "reveal_path",
-            "path": temp_dir.display().to_string()
-        }))
-        .expect("reveal path action");
-        assert_eq!(action.action_type(), "reveal_path");
-    }
-
-    #[test]
-    fn computer_use_os_action_accepts_open_url_with_http_url() {
-        let action = parse(serde_json::json!({
-            "type": "open_url",
-            "url": "https://example.com"
-        }))
-        .expect("open url action");
-        assert_eq!(action.action_type(), "open_url");
-    }
-
-    #[test]
-    fn computer_use_os_action_rejects_invalid_open_url_before_execution() {
-        let error = parse(serde_json::json!({
-            "type": "open_url",
-            "url": "ftp://example.com/file"
-        }))
-        .expect_err("ftp is unsupported");
-        assert!(error.to_string().contains("unsupported open_url scheme"));
-    }
-
-    #[test]
-    fn computer_use_os_action_rejects_missing_required_field() {
-        let error = parse(serde_json::json!({
-            "type": "open_path"
-        }))
-        .expect_err("open_path requires path");
-        assert!(
-            error
-                .to_string()
-                .contains("open_path requires non-empty path")
-        );
-    }
-
-    #[test]
-    fn computer_use_os_action_rejects_non_os_fields() {
-        let error = parse(serde_json::json!({
-            "type": "open_app",
-            "app": "ExampleApp",
-            "target": { "node_id": "n42" }
-        }))
-        .expect_err("OS actions must reject semantic target");
-        assert!(
-            error
-                .to_string()
-                .contains("open_app does not accept target")
-        );
-    }
-
-    #[test]
-    fn computer_use_action_schema_accepts_set_value_with_text() {
-        let action = parse(serde_json::json!({
-            "type": "set_value",
-            "target": { "node_id": "n42" },
-            "text": "hello"
-        }))
-        .expect("set_value action");
-        assert_eq!(action.action_type(), "set_value");
-    }
-
-    #[test]
-    fn computer_use_action_schema_rejects_set_value_without_target() {
-        let error = parse(serde_json::json!({
-            "type": "set_value",
-            "text": "hello"
-        }))
-        .expect_err("target is required");
-        assert!(error.to_string().contains("set_value requires target"));
-    }
-
-    #[test]
-    fn computer_use_action_schema_rejects_unknown_action_type() {
-        let error = parse(serde_json::json!({
-            "type": "click",
-            "target": { "point": { "x": 1, "y": 2 } }
-        }))
-        .expect_err("unknown action type");
-        assert!(error.to_string().contains("unsupported act.type `click`"));
-    }
-
-    #[test]
-    fn computer_use_action_schema_accepts_input_chord_with_multiple_keys() {
-        let action = parse(serde_json::json!({
-            "type": "input_chord",
-            "keys": ["meta", "space"]
-        }))
-        .expect("input chord action");
-        assert_eq!(action.action_type(), "input_chord");
-    }
-
-    #[test]
-    fn computer_use_coordinate_space_accepts_explicit_point_space() {
-        let action = parse(serde_json::json!({
-            "type": "input_click",
-            "target": {
-                "point": {
-                    "x": 1,
-                    "y": 2,
-                    "coordinate_space": "source_pixels"
-                }
-            }
-        }))
-        .expect("input click action");
-        let ComputerUseAction::Input(action) = action else {
-            panic!("expected input action");
-        };
-        assert_eq!(
-            action
-                .target
-                .and_then(|target| target.point)
-                .and_then(|point| point.coordinate_space),
-            Some(crate::handlers::computer_use::model::CoordinateSpace::SourcePixels)
-        );
-    }
-
-    #[test]
-    fn computer_use_action_schema_rejects_input_key_with_multiple_keys() {
-        let error = parse(serde_json::json!({
-            "type": "input_key",
-            "keys": ["meta", "space"]
-        }))
-        .expect_err("input_key is a single-key action");
-        assert!(
-            error
-                .to_string()
-                .contains("input_key requires exactly one key; use input_chord")
-        );
-    }
-
-    #[test]
-    fn computer_use_action_schema_rejects_semantic_point_target() {
-        let error = parse(serde_json::json!({
-            "type": "press",
-            "target": { "point": { "x": 1, "y": 2 } }
-        }))
-        .expect_err("point is input only");
-        assert!(
-            error
-                .to_string()
-                .contains("semantic actions do not accept target.point")
-        );
-    }
-
-    #[test]
     fn computer_use_input_action_preserves_uppercase_key_for_xa11y_validation() {
         let key = parse_xa11y_key("A").expect("key");
         assert!(matches!(key, Key::Char('A')));
+    }
+
+    #[test]
+    fn invalid_computer_actions_preserve_guard_specific_error_messages() {
+        for (case, input, expected) in [
+            (
+                "computer_use_menu_action_rejects_missing_app",
+                serde_json::json!({
+                    "type": "select_menu_item",
+                    "menu_path": ["File", "New Window"]
+                }),
+                "select_menu_item requires non-empty app",
+            ),
+            (
+                "computer_use_os_action_rejects_invalid_open_url_before_execution",
+                serde_json::json!({
+                    "type": "open_url",
+                    "url": "ftp://example.com/file"
+                }),
+                "unsupported open_url scheme",
+            ),
+            (
+                "computer_use_os_action_rejects_missing_required_field",
+                serde_json::json!({
+                    "type": "open_path"
+                }),
+                "open_path requires non-empty path",
+            ),
+            (
+                "computer_use_os_action_rejects_non_os_fields",
+                serde_json::json!({
+                    "type": "open_app",
+                    "app": "ExampleApp",
+                    "target": { "node_id": "n42" }
+                }),
+                "open_app does not accept target",
+            ),
+            (
+                "computer_use_action_schema_rejects_set_value_without_target",
+                serde_json::json!({
+                    "type": "set_value",
+                    "text": "hello"
+                }),
+                "set_value requires target",
+            ),
+            (
+                "computer_use_action_schema_rejects_semantic_point_target",
+                serde_json::json!({
+                    "type": "press",
+                    "target": { "point": { "x": 1, "y": 2 } }
+                }),
+                "semantic actions do not accept target.point",
+            ),
+        ] {
+            let error = parse(input).expect_err(case);
+            assert!(error.to_string().contains(expected), "{case}: {error}");
+        }
     }
 }

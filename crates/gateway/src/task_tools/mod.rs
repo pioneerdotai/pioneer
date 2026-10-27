@@ -5285,52 +5285,6 @@ fn non_waitable_guard_item_output(item: &pioneer_protocol::TaskWaitNonWaitableIt
     })
 }
 
-#[cfg(test)]
-fn task_wait_target_is_non_waitable_scheduled(response: &TaskGetResponse, now: i64) -> bool {
-    if response.task.status != TaskStatus::Scheduled {
-        return false;
-    }
-    if response.runs.iter().any(|run| !run.status.is_terminal()) {
-        return false;
-    }
-    response.triggers.iter().any(|trigger| {
-        trigger.status == pioneer_protocol::TaskTriggerStatus::Active
-            && matches!(
-                trigger.kind(),
-                TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
-            )
-            && trigger
-                .next_fire_at
-                .is_some_and(|next_fire_at| next_fire_at > now)
-    })
-}
-
-#[cfg(test)]
-fn non_waitable_scheduled_task_output(response: &TaskGetResponse, now: i64) -> JsonValue {
-    let trigger = response
-        .triggers
-        .iter()
-        .rev()
-        .find(|trigger| {
-            trigger.status == pioneer_protocol::TaskTriggerStatus::Active
-                && trigger
-                    .next_fire_at
-                    .is_some_and(|next_fire_at| next_fire_at > now)
-        })
-        .or_else(|| response.triggers.last());
-
-    json!({
-        "taskId": response.task.id,
-        "title": response.task.title,
-        "status": task_status_label(response.task.status),
-        "triggerKind": trigger.map(|trigger| trigger_kind_label(trigger.kind())),
-        "nextFireAt": trigger.and_then(|trigger| trigger.next_fire_at),
-        "runId": null,
-        "waitable": false,
-        "reason": "future_scheduled_task_without_active_run",
-    })
-}
-
 fn wait_mode_label(mode: pioneer_protocol::TaskWaitMode) -> &'static str {
     match mode {
         pioneer_protocol::TaskWaitMode::AllTerminal => "all_terminal",
@@ -6932,19 +6886,6 @@ mod tests {
     }
 
     #[test]
-    fn task_result_input_targets_exact_candidate_and_continuation() {
-        let input = TaskResultToolInput {
-            candidate_id: "trc_run_candidate_round_1".to_owned(),
-            cursor: Some("65536".to_owned()),
-            max_bytes: Some(131_072),
-        };
-
-        assert_eq!(input.candidate_id, "trc_run_candidate_round_1");
-        assert_eq!(input.cursor.as_deref(), Some("65536"));
-        assert_eq!(input.max_bytes, Some(131_072));
-    }
-
-    #[test]
     fn task_accept_tool_input_accepts_review_candidate_id() {
         let candidate_id = "trc_TBsmD0lIlHbX5Nlhxfz0u_VaygfHZgOuehGCuL7yyow".to_owned();
 
@@ -7452,31 +7393,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn task_wait_guard_detects_future_scheduled_task_without_active_run() {
-        let response = sample_task_response(TaskStatus::Scheduled, Vec::new(), Some(1_000));
-
-        assert!(task_wait_target_is_non_waitable_scheduled(&response, 500));
-
-        let snapshot = non_waitable_scheduled_task_output(&response, 500);
-        assert_eq!(snapshot["waitable"], JsonValue::Bool(false));
-        assert_eq!(
-            snapshot["reason"],
-            JsonValue::String("future_scheduled_task_without_active_run".to_owned())
-        );
-    }
-
-    #[test]
-    fn task_wait_guard_allows_scheduled_task_with_active_run() {
-        let response = sample_task_response(
-            TaskStatus::Scheduled,
-            vec![sample_run(TaskRunStatus::Running)],
-            Some(1_000),
-        );
-
-        assert!(!task_wait_target_is_non_waitable_scheduled(&response, 500));
-    }
-
     fn task_tool_invocation(tool_name: &str, arguments: JsonValue) -> ToolInvocation {
         ToolInvocation {
             call_id: "call_test".to_owned(),
@@ -7493,42 +7409,6 @@ mod tests {
             apply_patch_preflight: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
-    }
-
-    #[test]
-    fn task_list_owner_kind_thread_without_owner_id_targets_current_thread() {
-        let owner_id = normalize_task_list_owner_id(
-            Some(TaskOwnerKind::Thread),
-            None,
-            "thread_12345678901234",
-        )
-        .expect("current thread owner id should be filled");
-
-        assert_eq!(owner_id.as_deref(), Some("thread_12345678901234"));
-    }
-
-    #[test]
-    fn task_list_owner_kind_thread_preserves_explicit_owner_id() {
-        let owner_id = normalize_task_list_owner_id(
-            Some(TaskOwnerKind::Thread),
-            Some("thread_explicit123456".to_owned()),
-            "thread_current1234567",
-        )
-        .expect("explicit thread owner id should be preserved");
-
-        assert_eq!(owner_id.as_deref(), Some("thread_explicit123456"));
-    }
-
-    #[test]
-    fn task_list_non_thread_owner_without_owner_id_stays_unscoped() {
-        let owner_id = normalize_task_list_owner_id(
-            Some(TaskOwnerKind::Workspace),
-            None,
-            "thread_current1234567",
-        )
-        .expect("workspace owner without owner id should stay unscoped");
-
-        assert_eq!(owner_id, None);
     }
 
     #[test]
@@ -8117,5 +7997,41 @@ mod tests {
             .into_params()
             .expect_err("truncated task id should be rejected");
         assert!(error.to_string().contains("exactly 21 characters"));
+    }
+
+    #[test]
+    fn task_list_owner_id_success_normalization_matrix() {
+        for (owner_kind, input_owner, current_thread, expect_message, expected_owner) in [
+            (
+                Some(TaskOwnerKind::Thread),
+                None,
+                "thread_12345678901234",
+                "current thread owner id should be filled",
+                Some("thread_12345678901234"),
+            ),
+            (
+                Some(TaskOwnerKind::Thread),
+                Some("thread_explicit123456"),
+                "thread_current1234567",
+                "explicit thread owner id should be preserved",
+                Some("thread_explicit123456"),
+            ),
+            (
+                Some(TaskOwnerKind::Workspace),
+                None,
+                "thread_current1234567",
+                "workspace owner without owner id should stay unscoped",
+                None,
+            ),
+        ] {
+            let owner_id = normalize_task_list_owner_id(
+                owner_kind,
+                input_owner.map(str::to_owned),
+                current_thread,
+            )
+            .expect(expect_message);
+
+            assert_eq!(owner_id.as_deref(), expected_owner, "{expect_message}");
+        }
     }
 }

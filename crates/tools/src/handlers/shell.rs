@@ -1564,45 +1564,10 @@ mod tests {
             .await
             .expect("exec command should execute");
 
+        assert!(output.success(), "full access output should succeed");
         assert!(
             output.raw_text().contains("/tmp/pioneer-output-test"),
             "expected invocation env in command output: {}",
-            output.raw_text()
-        );
-    }
-
-    #[tokio::test]
-    async fn shell_security_full_access_runs_with_unrestricted_backend() {
-        let handler = UnifiedExecHandler::default();
-        let mut tool_invocation = invocation(
-            "exec_command",
-            ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
-                command: Some(vec![
-                    "sh".to_owned(),
-                    "-c".to_owned(),
-                    "printf full-access-ok".to_owned(),
-                ]),
-                workdir: None,
-                timeout_ms: None,
-                max_output_tokens: None,
-                yield_time_ms: None,
-                tty: Some(false),
-            })),
-        );
-        tool_invocation.execution_security_snapshot = Some(shell_security_snapshot(
-            TurnPermissionMode::FullAccess,
-            tool_invocation.workdir.as_path(),
-        ));
-
-        let output = handler
-            .handle(tool_invocation, trace("exec_command"))
-            .await
-            .expect("full access command should run");
-
-        assert!(output.success(), "full access output should succeed");
-        assert!(
-            output.raw_text().contains("full-access-ok"),
-            "unexpected full access output: {}",
             output.raw_text()
         );
     }

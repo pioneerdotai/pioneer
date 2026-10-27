@@ -3123,35 +3123,6 @@ backend = "keystore"
     }
 
     #[test]
-    fn self_improvement_update_requires_workspace_scope() {
-        let mut settings = toml::from_str::<super::GatewaySettings>(
-            r#"
-version = 1
-
-[secrets]
-backend = "keystore"
-"#,
-        )
-        .expect("gateway settings should parse");
-
-        let error = settings
-            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
-                self_improvement: Some(pioneer_protocol::GatewaySelfImprovementSettings {
-                    enabled: true,
-                    default_model: None,
-                    reviewer_model: None,
-                }),
-                ..Default::default()
-            })
-            .expect_err("self-improvement update without workspace must fail");
-
-        assert!(
-            format!("{error:#}")
-                .contains("workspace context is required to update self-improvement settings")
-        );
-    }
-
-    #[test]
     fn legacy_gateway_wide_self_improvement_is_removed_and_does_not_enable_a_workspace() {
         let temp_dir = unique_temp_dir();
         fs::create_dir_all(&temp_dir).expect("create temp dir");
@@ -4095,38 +4066,6 @@ backend = "keystore"
     }
 
     #[test]
-    fn gateway_thread_episodic_vector_update_requires_workspace_scope() {
-        let mut settings = toml::from_str::<super::GatewaySettings>(
-            r#"
-version = 1
-
-[secrets]
-backend = "keystore"
-"#,
-        )
-        .expect("gateway settings should parse");
-
-        let error = settings
-            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
-                thread_episodic: Some(pioneer_protocol::GatewayThreadEpisodicSettingsUpdate {
-                    vector_search: Some(
-                        pioneer_protocol::GatewayThreadEpisodicVectorSearchSettingsUpdate {
-                            enabled: Some(true),
-                            ..Default::default()
-                        },
-                    ),
-                    ..pioneer_protocol::GatewayThreadEpisodicSettingsUpdate::default()
-                }),
-                ..pioneer_protocol::GatewaySettingsUpdate::default()
-            })
-            .expect_err("vector settings update without workspace should fail");
-
-        assert!(format!("{error:#}").contains(
-            "workspace context is required to update thread episodic vector search settings"
-        ));
-    }
-
-    #[test]
     fn gateway_thread_episodic_workspace_vector_update_is_workspace_scoped() {
         let mut settings = toml::from_str::<super::GatewaySettings>(
             r#"
@@ -4738,93 +4677,49 @@ model = "legacy-model"
     }
 
     #[test]
-    fn rejects_gateway_settings_with_unsupported_version() {
-        let temp_dir = unique_temp_dir();
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        let path = temp_dir.join("gateway-settings.toml");
-        fs::write(
-            &path,
-            r#"
+    fn gateway_settings_file_rejects_unsupported_and_removed_configuration() {
+        for (case, content, write_message, rejection_message, expected_error) in [
+            (
+                "rejects_gateway_settings_with_unsupported_version",
+                r#"
             version = 2
 
             [secrets]
             backend = "keystore"
             "#,
-        )
-        .expect("write unsupported-version settings");
-
-        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
-            .expect_err("unsupported settings version should be rejected");
-        assert!(
-            format!("{error:#}").contains("unsupported gateway settings version"),
-            "unexpected error: {error:#}"
-        );
-
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn rejects_gateway_settings_with_removed_jwt_secret_field() {
-        let temp_dir = unique_temp_dir();
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        let path = temp_dir.join("gateway-settings.toml");
-        fs::write(
-            &path,
-            r#"
+                "write unsupported-version settings",
+                "unsupported settings version should be rejected",
+                "unsupported gateway settings version",
+            ),
+            (
+                "rejects_gateway_settings_with_removed_jwt_secret_field",
+                r#"
             version = 1
             jwt_secret = "abcd"
 
             [secrets]
             backend = "keystore"
             "#,
-        )
-        .expect("write settings with removed jwt field");
-
-        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
-            .expect_err("removed jwt_secret field should be rejected");
-        assert!(
-            format!("{error:#}").contains("unknown field `jwt_secret`"),
-            "unexpected error: {error:#}"
-        );
-
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn rejects_gateway_settings_with_top_level_keepawake_field() {
-        let temp_dir = unique_temp_dir();
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        let path = temp_dir.join("gateway-settings.toml");
-        fs::write(
-            &path,
-            r#"
+                "write settings with removed jwt field",
+                "removed jwt_secret field should be rejected",
+                "unknown field `jwt_secret`",
+            ),
+            (
+                "rejects_gateway_settings_with_top_level_keepawake_field",
+                r#"
             version = 1
             keepawake = true
 
             [secrets]
             backend = "keystore"
             "#,
-        )
-        .expect("write settings with top-level keepawake field");
-
-        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
-            .expect_err("top-level keepawake field should be rejected");
-        assert!(
-            format!("{error:#}").contains("unknown field `keepawake`"),
-            "unexpected error: {error:#}"
-        );
-
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn rejects_gateway_settings_with_removed_providers_field() {
-        let temp_dir = unique_temp_dir();
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        let path = temp_dir.join("gateway-settings.toml");
-        fs::write(
-            &path,
-            r#"
+                "write settings with top-level keepawake field",
+                "top-level keepawake field should be rejected",
+                "unknown field `keepawake`",
+            ),
+            (
+                "rejects_gateway_settings_with_removed_providers_field",
+                r#"
             version = 1
 
             [secrets]
@@ -4833,27 +4728,13 @@ model = "legacy-model"
             [providers.keys]
             openrouter = "sk-test"
             "#,
-        )
-        .expect("write settings with removed providers field");
-
-        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
-            .expect_err("removed providers field should be rejected");
-        assert!(
-            format!("{error:#}").contains("unknown field `providers`"),
-            "unexpected error: {error:#}"
-        );
-
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn rejects_gateway_settings_with_removed_mcp_field() {
-        let temp_dir = unique_temp_dir();
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        let path = temp_dir.join("gateway-settings.toml");
-        fs::write(
-            &path,
-            r#"
+                "write settings with removed providers field",
+                "removed providers field should be rejected",
+                "unknown field `providers`",
+            ),
+            (
+                "rejects_gateway_settings_with_removed_mcp_field",
+                r#"
             version = 1
 
             [secrets]
@@ -4861,27 +4742,13 @@ model = "legacy-model"
 
             [mcp]
             "#,
-        )
-        .expect("write settings with removed mcp field");
-
-        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
-            .expect_err("removed mcp field should be rejected");
-        assert!(
-            format!("{error:#}").contains("unknown field `mcp`"),
-            "unexpected error: {error:#}"
-        );
-
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn rejects_gateway_settings_with_removed_mcp_secrets_field() {
-        let temp_dir = unique_temp_dir();
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        let path = temp_dir.join("gateway-settings.toml");
-        fs::write(
-            &path,
-            r#"
+                "write settings with removed mcp field",
+                "removed mcp field should be rejected",
+                "unknown field `mcp`",
+            ),
+            (
+                "rejects_gateway_settings_with_removed_mcp_secrets_field",
+                r#"
             version = 1
 
             [secrets]
@@ -4890,43 +4757,37 @@ model = "legacy-model"
             [mcp.secrets]
             token = "secret"
             "#,
-        )
-        .expect("write settings with removed mcp secrets field");
-
-        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
-            .expect_err("removed mcp secrets field should be rejected");
-        assert!(
-            format!("{error:#}").contains("unknown field `mcp`"),
-            "unexpected error: {error:#}"
-        );
-
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn rejects_gateway_settings_with_unsupported_secret_backend() {
-        let temp_dir = unique_temp_dir();
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        let path = temp_dir.join("gateway-settings.toml");
-        fs::write(
-            &path,
-            r#"
+                "write settings with removed mcp secrets field",
+                "removed mcp secrets field should be rejected",
+                "unknown field `mcp`",
+            ),
+            (
+                "rejects_gateway_settings_with_unsupported_secret_backend",
+                r#"
             version = 1
 
             [secrets]
             backend = "db-keystore"
             "#,
-        )
-        .expect("write settings with unsupported backend");
+                "write settings with unsupported backend",
+                "unsupported backend should be rejected",
+                "unknown variant `db-keystore`",
+            ),
+        ] {
+            let temp_dir = unique_temp_dir();
+            fs::create_dir_all(&temp_dir).expect("create temp dir");
+            let path = temp_dir.join("gateway-settings.toml");
+            fs::write(&path, content).expect(write_message);
 
-        let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
-            .expect_err("unsupported backend should be rejected");
-        assert!(
-            format!("{error:#}").contains("unknown variant `db-keystore`"),
-            "unexpected error: {error:#}"
-        );
+            let error = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
+                .expect_err(rejection_message);
+            assert!(
+                format!("{error:#}").contains(expected_error),
+                "{case}: unexpected error: {error:#}"
+            );
 
-        let _ = fs::remove_dir_all(temp_dir);
+            let _ = fs::remove_dir_all(temp_dir);
+        }
     }
 
     fn unique_temp_dir() -> PathBuf {
@@ -5130,6 +4991,59 @@ model = "legacy-model"
                 device_activation_code_ttl_seconds: 600,
                 ..GatewayAuthConfig::default()
             },
+        }
+    }
+
+    #[test]
+    fn workspace_specific_settings_updates_require_workspace_context() {
+        for (update, rejection_message, expected_error) in [
+            (
+                pioneer_protocol::GatewaySettingsUpdate {
+                    self_improvement: Some(pioneer_protocol::GatewaySelfImprovementSettings {
+                        enabled: true,
+                        default_model: None,
+                        reviewer_model: None,
+                    }),
+                    ..Default::default()
+                },
+                "self-improvement update without workspace must fail",
+                "workspace context is required to update self-improvement settings",
+            ),
+            (
+                pioneer_protocol::GatewaySettingsUpdate {
+                    thread_episodic: Some(pioneer_protocol::GatewayThreadEpisodicSettingsUpdate {
+                        vector_search: Some(
+                            pioneer_protocol::GatewayThreadEpisodicVectorSearchSettingsUpdate {
+                                enabled: Some(true),
+                                ..Default::default()
+                            },
+                        ),
+                        ..pioneer_protocol::GatewayThreadEpisodicSettingsUpdate::default()
+                    }),
+                    ..pioneer_protocol::GatewaySettingsUpdate::default()
+                },
+                "vector settings update without workspace should fail",
+                "workspace context is required to update thread episodic vector search settings",
+            ),
+        ] {
+            let mut settings = toml::from_str::<super::GatewaySettings>(
+                r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+"#,
+            )
+            .expect("gateway settings should parse");
+
+            let error = settings
+                .apply_protocol_update(update)
+                .expect_err(rejection_message);
+
+            assert!(
+                format!("{error:#}").contains(expected_error),
+                "{rejection_message}: {error:#}"
+            );
         }
     }
 }

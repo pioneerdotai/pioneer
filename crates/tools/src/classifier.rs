@@ -1297,18 +1297,6 @@ mod tests {
     }
 
     #[test]
-    fn rejected_tool_error_is_a_local_non_retryable_permission_denial() {
-        let outcome = DefaultErrorClassifier.classify_error(
-            &invocation_for("read_file"),
-            &ToolError::Rejected("path is outside allowed roots".to_owned()),
-        );
-
-        assert_eq!(outcome.status, ToolOutcomeStatus::FatalError);
-        assert_eq!(outcome.error_class, Some(ToolErrorClass::PermissionDenied));
-        assert!(!outcome.should_retry);
-    }
-
-    #[test]
     fn bounded_list_dir_page_is_success_even_when_more_entries_exist() {
         let outcome = DefaultErrorClassifier.classify_result(
             &invocation_for("list_dir"),
@@ -1432,20 +1420,6 @@ mod tests {
     }
 
     #[test]
-    fn wrapped_filesystem_permission_error_is_not_retryable() {
-        let outcome = DefaultErrorClassifier.classify_error(
-            &invocation_for("read_file"),
-            &ToolError::ExecutionFailed(
-                "failed to read `/restricted`: Permission denied (os error 13)".to_owned(),
-            ),
-        );
-
-        assert_eq!(outcome.status, ToolOutcomeStatus::FatalError);
-        assert_eq!(outcome.error_class, Some(ToolErrorClass::PermissionDenied));
-        assert!(!outcome.should_retry);
-    }
-
-    #[test]
     fn shell_permission_denial_is_not_retryable() {
         let payload = build_exec_model_payload(ExecPayloadInput {
             exit_code: Some(1),
@@ -1544,35 +1518,46 @@ mod tests {
     }
 
     #[test]
-    fn computer_use_stale_session_error_is_terminal() {
-        let classifier = DefaultErrorClassifier;
-        let invocation = computer_use_invocation();
-        let outcome = classifier.classify_error(
-            &invocation,
-            &ToolError::NotFound("computer_use session 2 not found".to_owned()),
-        );
-        assert_eq!(outcome.status, ToolOutcomeStatus::FatalError);
-        assert_eq!(outcome.error_class, Some(ToolErrorClass::InvalidArguments));
-        assert!(!outcome.should_retry);
-    }
-
-    #[test]
-    fn computer_use_app_target_not_found_error_is_terminal() {
-        let classifier = DefaultErrorClassifier;
-        let invocation = computer_use_invocation();
-        let outcome = classifier.classify_error(
-            &invocation,
-            &ToolError::NotFound(
-                "computer_use app target not found; failure_class=app_not_found".to_owned(),
+    fn context_sensitive_tool_errors_are_fatal_and_non_retryable() {
+        for (case, invocation, error, expected_class) in [
+            (
+                "rejected_tool_error_is_a_local_non_retryable_permission_denial",
+                invocation_for("read_file"),
+                ToolError::Rejected("path is outside allowed roots".to_owned()),
+                ToolErrorClass::PermissionDenied,
             ),
-        );
-        assert_eq!(outcome.status, ToolOutcomeStatus::FatalError);
-        assert_eq!(outcome.error_class, Some(ToolErrorClass::NotFound));
-        assert!(!outcome.should_retry);
+            (
+                "wrapped_filesystem_permission_error_is_not_retryable",
+                invocation_for("read_file"),
+                ToolError::ExecutionFailed(
+                    "failed to read `/restricted`: Permission denied (os error 13)".to_owned(),
+                ),
+                ToolErrorClass::PermissionDenied,
+            ),
+            (
+                "computer_use_stale_session_error_is_terminal",
+                computer_use_invocation(),
+                ToolError::NotFound("computer_use session 2 not found".to_owned()),
+                ToolErrorClass::InvalidArguments,
+            ),
+            (
+                "computer_use_app_target_not_found_error_is_terminal",
+                computer_use_invocation(),
+                ToolError::NotFound(
+                    "computer_use app target not found; failure_class=app_not_found".to_owned(),
+                ),
+                ToolErrorClass::NotFound,
+            ),
+        ] {
+            let outcome = DefaultErrorClassifier.classify_error(&invocation, &error);
+            assert_eq!(outcome.status, ToolOutcomeStatus::FatalError, "{case}");
+            assert_eq!(outcome.error_class, Some(expected_class), "{case}");
+            assert!(!outcome.should_retry, "{case}");
+        }
     }
 
     #[test]
-    fn computer_use_classifier_covers_every_failure_class_for_act_failures() {
+    fn computer_use_failure_taxonomy_preserves_act_and_stopped_results() {
         let classifier = DefaultErrorClassifier;
         let invocation = computer_use_invocation();
         let expected = [
@@ -1601,7 +1586,6 @@ mod tests {
             ("recovery_budget_exceeded", ToolOutcomeStatus::FatalError),
             ("runtime_action_error", ToolOutcomeStatus::FatalError),
         ];
-
         for (failure_class, expected_status) in expected {
             let outcome = classifier.classify_result(
                 &invocation,
@@ -1629,41 +1613,7 @@ mod tests {
                     _ => None,
                 }
             });
-        }
-    }
 
-    #[test]
-    fn computer_use_classifier_covers_every_failure_class_for_stopped_sessions() {
-        let classifier = DefaultErrorClassifier;
-        let invocation = computer_use_invocation();
-        let expected = [
-            ("permission_denied", ToolOutcomeStatus::FatalError),
-            ("accessibility_unavailable", ToolOutcomeStatus::FatalError),
-            ("accessibility_not_enabled", ToolOutcomeStatus::FatalError),
-            ("app_not_found", ToolOutcomeStatus::FatalError),
-            ("element_not_found", ToolOutcomeStatus::RecoverableError),
-            ("element_stale", ToolOutcomeStatus::RecoverableError),
-            ("action_not_supported", ToolOutcomeStatus::FatalError),
-            (
-                "input_simulation_unavailable",
-                ToolOutcomeStatus::FatalError,
-            ),
-            (
-                "screenshot_unavailable",
-                ToolOutcomeStatus::RecoverableError,
-            ),
-            (
-                "attachment_transport_failure",
-                ToolOutcomeStatus::RecoverableError,
-            ),
-            ("provider_timeout", ToolOutcomeStatus::RecoverableError),
-            ("provider_rate_limit", ToolOutcomeStatus::RecoverableError),
-            ("loop_guard_triggered", ToolOutcomeStatus::FatalError),
-            ("recovery_budget_exceeded", ToolOutcomeStatus::FatalError),
-            ("runtime_action_error", ToolOutcomeStatus::FatalError),
-        ];
-
-        for (failure_class, expected_status) in expected {
             let outcome = classifier.classify_result(
                 &invocation,
                 &serde_json::json!({

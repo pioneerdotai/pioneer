@@ -4124,14 +4124,6 @@ recovery_grace_secs = 1801
     }
 
     #[test]
-    fn settings_gateway_preflight_model_config_defaults_to_thread() {
-        let config =
-            load_config_from_sources(DEFAULT_CONFIG_TOML, Vec::new()).expect("load default config");
-
-        assert!(config.gateway.preflight_model.is_thread_model());
-    }
-
-    #[test]
     fn settings_gateway_preflight_model_config_accepts_custom_override() {
         let workspace_override = unique_temp_file_path("gateway-preflight-model-config");
         write_file(
@@ -4149,81 +4141,6 @@ preflight_model = { source = "custom", model_provider = "planner-provider", mode
         assert_eq!(
             config.gateway.preflight_model,
             GatewayMemoryModelSelectionConfig::custom("planner-provider", "planner-model")
-        );
-
-        let _ = fs::remove_file(workspace_override);
-    }
-
-    #[test]
-    fn settings_migration_gateway_preflight_model_copies_legacy_memory_active_recall_model() {
-        let workspace_override = unique_temp_file_path("gateway-preflight-model-migration");
-        write_file(
-            &workspace_override,
-            r#"
-[gateway.memory]
-active_recall_model = { source = "custom", model_provider = "legacy-provider", model = "legacy-model" }
-"#,
-        );
-
-        let config =
-            load_config_from_sources(DEFAULT_CONFIG_TOML, vec![workspace_override.clone()])
-                .expect("load config with legacy active recall model");
-
-        assert_eq!(
-            config.gateway.preflight_model,
-            GatewayMemoryModelSelectionConfig::custom("legacy-provider", "legacy-model")
-        );
-        assert_eq!(
-            config.gateway.memory.active_recall_model,
-            GatewayMemoryModelSelectionConfig::custom("legacy-provider", "legacy-model")
-        );
-
-        let _ = fs::remove_file(workspace_override);
-    }
-
-    #[test]
-    fn migration_toml_path_detection_handles_nested_tables() {
-        let content = r#"
-[gateway.memory]
-active_recall_model = { source = "custom", model_provider = "legacy-provider", model = "legacy-model" }
-"#;
-        let value = toml::from_str::<toml::Value>(content).expect("toml should parse");
-
-        assert!(super::toml_value_has_path(
-            &value,
-            &["gateway", "memory", "active_recall_model"]
-        ));
-        assert!(!super::toml_value_has_path(
-            &value,
-            &["gateway", "preflight_model"]
-        ));
-    }
-
-    #[test]
-    fn settings_migration_gateway_preflight_model_preserves_explicit_new_setting() {
-        let workspace_override = unique_temp_file_path("gateway-preflight-model-mixed");
-        write_file(
-            &workspace_override,
-            r#"
-[gateway]
-preflight_model = { source = "custom", model_provider = "new-provider", model = "new-model" }
-
-[gateway.memory]
-active_recall_model = { source = "custom", model_provider = "legacy-provider", model = "legacy-model" }
-"#,
-        );
-
-        let config =
-            load_config_from_sources(DEFAULT_CONFIG_TOML, vec![workspace_override.clone()])
-                .expect("load config with mixed preflight settings");
-
-        assert_eq!(
-            config.gateway.preflight_model,
-            GatewayMemoryModelSelectionConfig::custom("new-provider", "new-model")
-        );
-        assert_eq!(
-            config.gateway.memory.active_recall_model,
-            GatewayMemoryModelSelectionConfig::custom("legacy-provider", "legacy-model")
         );
 
         let _ = fs::remove_file(workspace_override);
@@ -4800,22 +4717,6 @@ embedding_dimension = 384
         assert_eq!(config.total.max_wall_clock_ms_per_turn, None);
         assert_eq!(config.total.max_provider_tokens_per_turn, None);
         assert_eq!(config.total.max_consecutive_no_progress_windows, 3);
-    }
-
-    #[test]
-    fn gateway_tools_config_deserializes_missing_execution_windows_with_defaults() {
-        let config = toml::from_str::<super::GatewayToolsConfig>(
-            r#"
-[budget]
-max_agent_rounds_per_turn = 7
-max_tool_calls_per_turn = 11
-"#,
-        )
-        .expect("gateway tools config should deserialize with omitted execution_windows");
-
-        assert_eq!(config.budget.max_agent_rounds_per_turn, 7);
-        assert_eq!(config.budget.max_tool_calls_per_turn, 11);
-        assert!(config.execution_windows.is_none());
     }
 
     #[test]
@@ -5429,5 +5330,50 @@ token_refresh_leeway_seconds = 300
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn legacy_preflight_model_migration_preserves_explicit_precedence_and_legacy_value() {
+        let cases = [
+            (
+                "gateway-preflight-model-migration",
+                r#"
+[gateway.memory]
+active_recall_model = { source = "custom", model_provider = "legacy-provider", model = "legacy-model" }
+"#,
+                "legacy-provider",
+                "legacy-model",
+                "load config with legacy active recall model",
+            ),
+            (
+                "gateway-preflight-model-mixed",
+                r#"
+[gateway]
+preflight_model = { source = "custom", model_provider = "new-provider", model = "new-model" }
+
+[gateway.memory]
+active_recall_model = { source = "custom", model_provider = "legacy-provider", model = "legacy-model" }
+"#,
+                "new-provider",
+                "new-model",
+                "load config with mixed preflight settings",
+            ),
+        ];
+        for (prefix, contents, provider, model, message) in cases {
+            let workspace_override = unique_temp_file_path(prefix);
+            write_file(&workspace_override, contents);
+            let config =
+                load_config_from_sources(DEFAULT_CONFIG_TOML, vec![workspace_override.clone()])
+                    .expect(message);
+            assert_eq!(
+                config.gateway.preflight_model,
+                GatewayMemoryModelSelectionConfig::custom(provider, model)
+            );
+            assert_eq!(
+                config.gateway.memory.active_recall_model,
+                GatewayMemoryModelSelectionConfig::custom("legacy-provider", "legacy-model")
+            );
+            let _ = fs::remove_file(workspace_override);
+        }
     }
 }

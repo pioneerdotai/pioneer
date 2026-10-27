@@ -4,9 +4,7 @@ use super::vad::{VoiceNoSpeechReason, VoiceSpeechSegment, VoiceVadSegmentationOu
 use pioneer_config::GatewayVoiceTranscriptionStrategy;
 use pioneer_protocol::{VoiceError, VoiceErrorKind};
 #[cfg(test)]
-use std::panic::{AssertUnwindSafe, catch_unwind};
-#[cfg(test)]
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 // Private one-shot result, retaining only timing actually supplied by the SDK.
 // No confidence, fabricated word times, or persistent decoder state.
@@ -265,61 +263,6 @@ impl VoiceSpeechTranscriber for Box<dyn VoiceSpeechTranscriber> {
     }
 }
 
-#[cfg(test)]
-pub(crate) struct GatewayVoiceTranscriptionRuntime<T> {
-    transcriber: Arc<Mutex<T>>,
-    strategy: VoiceTranscriptionStrategy,
-}
-
-#[cfg(test)]
-impl<T> Clone for GatewayVoiceTranscriptionRuntime<T> {
-    fn clone(&self) -> Self {
-        Self {
-            transcriber: Arc::clone(&self.transcriber),
-            strategy: self.strategy,
-        }
-    }
-}
-
-#[cfg(test)]
-impl<T> GatewayVoiceTranscriptionRuntime<T>
-where
-    T: VoiceSpeechTranscriber + 'static,
-{
-    pub(crate) fn new(transcriber: T) -> Self {
-        Self::new_with_strategy(
-            transcriber,
-            VoiceTranscriptionStrategy::BufferedGatewaySession,
-        )
-    }
-
-    pub(crate) fn new_with_strategy(transcriber: T, strategy: VoiceTranscriptionStrategy) -> Self {
-        Self {
-            transcriber: Arc::new(Mutex::new(transcriber)),
-            strategy,
-        }
-    }
-
-    pub(crate) fn transcribe(
-        &self,
-        buffer: PreparedSpeechBuffer,
-    ) -> Result<Result<VoiceTranscript, VoiceTranscriptionNoSpeech>, VoiceTranscriptionError> {
-        let transcriber = match self.transcriber.lock() {
-            Ok(transcriber) => transcriber,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        catch_unwind(AssertUnwindSafe(|| {
-            transcribe_prepared_speech_buffer_with_strategy(&*transcriber, buffer, self.strategy)
-        }))
-        .unwrap_or_else(|_| {
-            Err(transcription_error(
-                VoiceTranscriptionErrorKind::RuntimeFailure,
-                "voice transcription runtime panicked and was recovered",
-            ))
-        })
-    }
-}
-
 pub(crate) fn transcribe_prepared_speech_buffer<T>(
     transcriber: &T,
     buffer: PreparedSpeechBuffer,
@@ -381,9 +324,6 @@ pub(crate) fn transcription_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
 
     #[derive(Clone, Debug)]
     struct StaticTranscriber {
@@ -411,58 +351,6 @@ mod tests {
                 VoiceTranscriptionErrorKind::RuntimeFailure,
                 "synthetic transcription failure",
             ))
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    struct CountingTranscriber {
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl VoiceSpeechTranscriber for CountingTranscriber {
-        fn transcribe_speech(
-            &self,
-            _buffer: &PreparedSpeechBuffer,
-        ) -> Result<String, VoiceTranscriptionError> {
-            let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(format!("phrase {call_index}"))
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    struct PanicOnceTranscriber {
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl VoiceSpeechTranscriber for PanicOnceTranscriber {
-        fn transcribe_speech(
-            &self,
-            _buffer: &PreparedSpeechBuffer,
-        ) -> Result<String, VoiceTranscriptionError> {
-            let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
-            if call_index == 0 {
-                panic!("synthetic panic");
-            }
-            Ok("recovered transcript".to_owned())
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    struct SerializingTranscriber {
-        active_calls: Arc<AtomicUsize>,
-        max_active_calls: Arc<AtomicUsize>,
-    }
-
-    impl VoiceSpeechTranscriber for SerializingTranscriber {
-        fn transcribe_speech(
-            &self,
-            _buffer: &PreparedSpeechBuffer,
-        ) -> Result<String, VoiceTranscriptionError> {
-            let active = self.active_calls.fetch_add(1, Ordering::SeqCst) + 1;
-            self.max_active_calls.fetch_max(active, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(10));
-            self.active_calls.fetch_sub(1, Ordering::SeqCst);
-            Ok("serialized".to_owned())
         }
     }
 
@@ -613,76 +501,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn runtime_reuses_warm_transcriber_without_reload() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let runtime = GatewayVoiceTranscriptionRuntime::new(CountingTranscriber {
-            calls: Arc::clone(&calls),
-        });
-
-        let first = runtime
-            .transcribe(ready_buffer())
-            .expect("first")
-            .expect("first transcript");
-        let second = runtime
-            .transcribe(ready_buffer())
-            .expect("second")
-            .expect("second transcript");
-
-        assert_eq!(first.text, "phrase 0");
-        assert_eq!(second.text, "phrase 1");
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn runtime_recovers_from_transcription_panic() {
-        let runtime = GatewayVoiceTranscriptionRuntime::new(PanicOnceTranscriber {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-
-        let panic_error = runtime
-            .transcribe(ready_buffer())
-            .expect_err("panic maps to error");
-        let recovered = runtime
-            .transcribe(ready_buffer())
-            .expect("recovered")
-            .expect("recovered transcript");
-
-        assert_eq!(
-            panic_error.kind,
-            VoiceTranscriptionErrorKind::RuntimeFailure
-        );
-        assert_eq!(recovered.text, "recovered transcript");
-    }
-
-    #[test]
-    fn runtime_serializes_concurrent_transcription_work() {
-        let active_calls = Arc::new(AtomicUsize::new(0));
-        let max_active_calls = Arc::new(AtomicUsize::new(0));
-        let runtime = GatewayVoiceTranscriptionRuntime::new(SerializingTranscriber {
-            active_calls: Arc::clone(&active_calls),
-            max_active_calls: Arc::clone(&max_active_calls),
-        });
-
-        let first_runtime = runtime.clone();
-        let second_runtime = runtime.clone();
-        let first = std::thread::spawn(move || first_runtime.transcribe(ready_buffer()));
-        let second = std::thread::spawn(move || second_runtime.transcribe(ready_buffer()));
-
-        first
-            .join()
-            .expect("first join")
-            .expect("first result")
-            .expect("first transcript");
-        second
-            .join()
-            .expect("second join")
-            .expect("second result")
-            .expect("second transcript");
-
-        assert_eq!(max_active_calls.load(Ordering::SeqCst), 1);
-    }
-
     fn speech_segment(samples: impl IntoIterator<Item = f32>) -> VoiceSpeechSegment {
         let samples = samples.into_iter().collect::<Vec<_>>();
         VoiceSpeechSegment {
@@ -690,14 +508,5 @@ mod tests {
             end_sample: samples.len(),
             samples,
         }
-    }
-
-    fn ready_buffer() -> PreparedSpeechBuffer {
-        let VoiceTranscriptionOutcome::Ready(buffer) =
-            PreparedSpeechBuffer::from_segments(16_000, 4, vec![speech_segment([0.1, 0.2])])
-        else {
-            panic!("expected ready buffer");
-        };
-        buffer
     }
 }

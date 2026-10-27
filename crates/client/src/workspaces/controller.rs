@@ -1306,22 +1306,13 @@ mod tests {
         assert!(core.workspace_controller.lock().unwrap().refresh.is_empty());
         core.workspace_demand_changed(&scope, crate::core::ClientDemand::Visible);
         assert_eq!(core.workspace_controller.lock().unwrap().refresh.len(), 1);
-    }
-
-    #[test]
-    fn repeated_hints_keep_one_follow_up_and_teardown_discards_pending_work() {
-        let mut owner = WorkspaceController::default();
-        for _ in 0..1000 {
-            owner.refresh.insert("workspace".into(), Some(1));
-        }
-        assert_eq!(owner.refresh.len(), 1);
-        assert!(matches!(
-            owner.next(Instant::now()),
-            Some(WorkspaceRequest::Refresh { .. })
-        ));
-        assert!(owner.next(Instant::now()).is_none());
-        owner.refresh.insert("workspace".into(), Some(2));
-        owner.stop();
-        assert!(owner.next(Instant::now()).is_none());
+        core.shutdown();
+        assert!(
+            core.workspace_controller
+                .lock()
+                .unwrap()
+                .next(Instant::now())
+                .is_none()
+        );
     }
 }

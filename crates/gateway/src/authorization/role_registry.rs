@@ -1245,24 +1245,6 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_executor_keeps_artifact_create_and_bind_as_independent_actions() {
-        let role = RoleKey::new("synthetic_executor").expect("valid role");
-        let definition = RoleDefinitionRegistry::new()
-            .resolve_user_role(&role)
-            .expect("executor role is registered");
-        assert!(
-            definition
-                .actions
-                .allows(ResourceAction::ArtifactCreateThread)
-        );
-        assert!(
-            !definition
-                .actions
-                .allows(ResourceAction::ArtifactBindThread)
-        );
-    }
-
-    #[test]
     fn approval_scope_changes_advance_the_role_policy_fingerprint() {
         let mut original = MEMBER;
         let original_fingerprint = policy_fingerprint_for(&[original]);

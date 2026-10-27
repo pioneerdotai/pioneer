@@ -4182,41 +4182,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn populated_epic2_fixture_accepts_independent_device_activations() {
-        let populated = crate::auth::test_support::populated_epic2_database().await;
-        Migrator::up(&populated.database, None).await.unwrap();
-        crate::auth::ensure_auth_readiness(&populated.database, &populated.identity)
-            .await
-            .unwrap();
-        let identity = Arc::new(populated.identity);
-        let service = GatewayAuthService::new(
-            populated.database,
-            GatewayAuthConfig::default(),
-            identity.clone(),
-            &AuthKeyMaterial::from_test_bytes(vec![8; 64]),
-            &AuthKeyMaterial::from_test_bytes(vec![9; 64]),
-        )
-        .unwrap();
-        service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        service
-            .create_initial_session_with_ids(
-                params("mobile-installation", ClientKind::Mobile),
-                ids(2),
-            )
-            .await
-            .unwrap();
-        assert_eq!(count(&service.database, "gateway_principal").await, 1);
-        assert_eq!(count(&service.database, "device").await, 2);
-        assert_eq!(count(&service.database, "auth_session").await, 2);
-    }
-
-    #[tokio::test]
     async fn populated_epic2_two_client_rollout_survives_restart_and_independent_revoke() {
         let populated = crate::auth::test_support::populated_epic2_database().await;
         Migrator::up(&populated.database, None).await.unwrap();
@@ -4246,6 +4211,10 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(count(&service.database, "gateway_principal").await, 1);
+        assert_eq!(count(&service.database, "device").await, 2);
+        assert_eq!(count(&service.database, "auth_session").await, 2);
+
         let desktop = service
             .exchange_refresh(
                 refresh_admission(desktop.refresh_token.expose_secret()),

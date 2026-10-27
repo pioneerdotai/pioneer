@@ -57,20 +57,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_tools_hidden_domain_catalog_contains_exact_runtime_map() {
-        let catalog = render_request_tools_hidden_domain_catalog_prompt();
-
-        assert!(catalog.contains("call request_tools"));
-        for (domain, tool_names) in pioneer_tools::builtin_tool_domain_map() {
-            let expected = format!("- {}: {}.", domain.as_str(), tool_names.join(", "));
-            assert!(
-                catalog.contains(expected.as_str()),
-                "catalog missing domain line `{expected}`"
-            );
-        }
-    }
-
-    #[test]
     fn request_tools_hidden_domain_catalog_domain_lines_cannot_drift_from_runtime_map() {
         let catalog = render_request_tools_hidden_domain_catalog_prompt();
         let domain_lines = catalog

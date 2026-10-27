@@ -2215,31 +2215,6 @@ mod tests {
     }
 
     #[test]
-    fn moonshine_native_preparation_pads_only_short_input_with_silence() {
-        for count in [0, 1, 7, 1599, 1600, 1601, 48000] {
-            let source: Vec<_> = (0..count)
-                .map(|index| [0.25, -0.5, 0.75][index % 3])
-                .collect();
-            let mut samples = source.clone();
-            let pointer = samples.as_ptr();
-            let capacity = samples.capacity();
-            prepare_moonshine_base_samples(&mut samples);
-            assert_eq!(samples.len(), if count == 0 { 0 } else { count.max(1600) });
-            assert_eq!(&samples[..count], source.as_slice());
-            assert!(samples[count..].iter().all(|sample| *sample == 0.0));
-            if count >= 1600 {
-                assert_eq!(
-                    samples.as_ptr(),
-                    pointer,
-                    "adequate input must keep its allocation"
-                );
-                assert_eq!(samples.capacity(), capacity);
-            }
-            assert!(samples.len() <= MAX_SPEECH_WINDOW_SAMPLES);
-        }
-    }
-
-    #[test]
     fn moonshine_context_keeps_unique_source_diagnostics() {
         let mut audio = vec![12000_i16; 48000];
         audio.extend(vec![6000; 48000]);

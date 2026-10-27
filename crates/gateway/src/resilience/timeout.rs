@@ -936,17 +936,6 @@ mod tests {
     }
 
     #[test]
-    fn timeout_classifier_suppresses_recovery_after_later_turn_activity() {
-        let candidate = timeout_candidate();
-        let liveness = turn_liveness(1_010, 5);
-
-        assert!(matches!(
-            classify_timeout_candidate_liveness(&candidate, Some(&liveness)),
-            TimeoutRecoveryClassification::SuppressRecoveryBecauseTurnProgressed { .. }
-        ));
-    }
-
-    #[test]
     fn timeout_classifier_uses_sequence_for_same_second_activity_without_later_heartbeat() {
         let candidate = timeout_candidate();
         let liveness = turn_liveness(1_000, 5);

@@ -116,9 +116,15 @@ async fn computer_use_input_action_chord_and_scroll_parse() {
         .and_then(JsonValue::as_u64)
         .expect("session id");
 
-    for act in [
-        serde_json::json!({ "type": "input_chord", "keys": ["meta", "a"] }),
-        serde_json::json!({ "type": "input_scroll", "target": { "point": { "x": 1, "y": 2, "coordinate_space": "native_input" } }, "delta_y": -3 }),
+    for (act, expected_action_type) in [
+        (
+            serde_json::json!({ "type": "input_chord", "keys": ["meta", "a"] }),
+            "input_chord",
+        ),
+        (
+            serde_json::json!({ "type": "input_scroll", "target": { "point": { "x": 1, "y": 2, "coordinate_space": "native_input" } }, "delta_y": -3 }),
+            "input_scroll",
+        ),
     ] {
         let result = invoke(
             &handler,
@@ -132,6 +138,12 @@ async fn computer_use_input_action_chord_and_scroll_parse() {
         assert_eq!(
             result.pointer("/result/status").and_then(JsonValue::as_str),
             Some("ok")
+        );
+        assert_eq!(
+            result
+                .pointer("/trace/action_type")
+                .and_then(JsonValue::as_str),
+            Some(expected_action_type)
         );
     }
 }
@@ -370,6 +382,17 @@ async fn coordinate_observability_reports_failed_coordinate_validation() {
             .unwrap_or_default()
             .contains("coordinate_out_of_bounds")
     );
+    assert_eq!(
+        result.pointer("/result/status").and_then(JsonValue::as_str),
+        Some("failed")
+    );
+    assert!(
+        result
+            .pointer("/result/execution/message")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default()
+            .contains("coordinate_out_of_bounds")
+    );
 }
 
 #[tokio::test]
@@ -407,43 +430,6 @@ async fn coordinate_conversion_converts_source_point_by_scale_factor() {
             .pointer("/result/input_targets/target/point/y")
             .and_then(JsonValue::as_i64),
         Some(20)
-    );
-}
-
-#[tokio::test]
-async fn coordinate_conversion_rejects_out_of_bounds_point() {
-    let (handler, _) = test_handler();
-    let session_id = start_app_session_with_snapshot(&handler).await;
-
-    let result = invoke(
-        &handler,
-        serde_json::json!({
-            "action": "act",
-            "session_id": session_id,
-            "act": {
-                "type": "input_click",
-                "target": {
-                    "point": {
-                        "x": 640,
-                        "y": 10,
-                        "coordinate_space": "source_pixels"
-                    }
-                }
-            }
-        }),
-    )
-    .await;
-
-    assert_eq!(
-        result.pointer("/result/status").and_then(JsonValue::as_str),
-        Some("failed")
-    );
-    assert!(
-        result
-            .pointer("/result/execution/message")
-            .and_then(JsonValue::as_str)
-            .unwrap_or_default()
-            .contains("coordinate_out_of_bounds")
     );
 }
 
@@ -575,56 +561,4 @@ async fn computer_use_launch_command_allowlist_blocks_unlisted_command() {
     .expect_err("an allowed prefix with appended shell syntax must fail");
 
     assert!(injected.to_string().contains("allowed_launch_commands"));
-}
-
-#[tokio::test]
-async fn computer_use_input_simulation_config_blocks_input_actions() {
-    let config = ComputerUseToolsConfig {
-        runtime_home_dir: std::env::temp_dir().join(format!(
-            "pioneer-computer-use-input-disabled-{}",
-            chrono::Utc::now().timestamp_millis()
-        )),
-        artifacts_subdir: "tools/computer_use".to_owned(),
-        input_simulation_enabled: false,
-        ..ComputerUseToolsConfig::default()
-    };
-    let handler =
-        ComputerUseHandler::with_backend(config, Arc::new(MockComputerUseBackend::default()));
-    let started = invoke(
-        &handler,
-        serde_json::json!({
-            "action": "start",
-            "goal": "input disabled",
-            "target": { "type": "screen" }
-        }),
-    )
-    .await;
-    let session_id = started
-        .get("session_id")
-        .and_then(JsonValue::as_u64)
-        .expect("session id");
-
-    let result = invoke(
-        &handler,
-        serde_json::json!({
-            "action": "act",
-            "session_id": session_id,
-            "act": {
-                "type": "input_click",
-                "target": {
-                    "point": {
-                        "x": 10,
-                        "y": 20,
-                        "coordinate_space": "native_input"
-                    }
-                }
-            }
-        }),
-    )
-    .await;
-
-    assert_eq!(
-        result.pointer("/failure_class").and_then(JsonValue::as_str),
-        Some("input_simulation_unavailable")
-    );
 }

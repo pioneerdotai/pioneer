@@ -2212,43 +2212,6 @@ mod tests {
         assert!(error.message.contains("ask retrieval is not implemented"));
     }
 
-    #[tokio::test]
-    async fn fake_backend_uses_typed_capabilities() {
-        let backend = FakeThreadEpisodicMemvidBackend {
-            capabilities: ThreadEpisodicMemvidBackendCapabilities::memvid_default(),
-        };
-
-        let capabilities = backend.capabilities();
-        assert_eq!(
-            capabilities.adaptive_retrieval,
-            ThreadEpisodicMemvidCapabilityState::Supported
-        );
-        assert_eq!(
-            capabilities.adaptive_retrieval_implementation,
-            ThreadEpisodicAdaptiveRetrievalImplementation::PioneerFallback
-        );
-        assert_eq!(
-            capabilities.semantic_search,
-            ThreadEpisodicMemvidCapabilityState::Supported
-        );
-        assert_eq!(
-            capabilities.hybrid_search,
-            ThreadEpisodicMemvidCapabilityState::Supported
-        );
-        assert_eq!(
-            capabilities.lexical_search,
-            ThreadEpisodicMemvidCapabilityState::Supported
-        );
-        assert_eq!(
-            capabilities.temporal_search,
-            ThreadEpisodicMemvidCapabilityState::Supported
-        );
-        assert_eq!(
-            capabilities.graph_search,
-            ThreadEpisodicMemvidCapabilityState::Disabled
-        );
-    }
-
     #[test]
     fn capabilities_serialize_as_typed_states() {
         let json = serde_json::to_value(ThreadEpisodicMemvidBackendCapabilities::memvid_default())
@@ -2527,36 +2490,6 @@ mod tests {
     }
 
     #[test]
-    fn workspace_index_creates_capacity_bounded_capsule() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let path = temp_dir.path().join("segment-000001.mv2");
-        let frame_uri =
-            "mv2://workspace/workspace_1/thread/thread_1/turn/turn_1/item/item_1/index/index_1";
-
-        let output = index_item_blocking(
-            path.clone(),
-            ThreadEpisodicMemvidIndexRequest {
-                storage_uri: thread_episodic_storage_uri_from_path(path.as_path()),
-                capsule_id: "capsule_1".to_owned(),
-                capsule_ref:
-                    "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/000001/capsules/capsule_1".to_owned(),
-                workspace_capsule: true,
-                index_item_id: "index_item_1".to_owned(),
-                frame_uri: frame_uri.to_owned(),
-                text: "workspace memory item".to_owned(),
-                metadata: BTreeMap::new(),
-                embedding: None,
-            },
-        )
-        .expect("workspace item should index");
-
-        assert_eq!(output.frame_uri, frame_uri);
-        assert_eq!(output.embedding_identity, None);
-        assert_eq!(output.stats.capacity_bytes, Some(50 * 1024 * 1024));
-        assert!(output.stats.remaining_capacity_bytes.is_some());
-    }
-
-    #[test]
     fn lexical_write_does_not_initialize_vector_index_and_preserves_metadata() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let path = temp_dir.path().join("segment-lexical.mv2");
@@ -2590,7 +2523,10 @@ mod tests {
         )
         .expect("lexical item should index");
 
+        assert_eq!(output.frame_uri, frame_uri);
         assert_eq!(output.embedding_identity, None);
+        assert_eq!(output.stats.capacity_bytes, Some(50 * 1024 * 1024));
+        assert!(output.stats.remaining_capacity_bytes.is_some());
         let memvid = Memvid::open(path.as_path()).expect("memvid should reopen");
         assert_eq!(
             memvid

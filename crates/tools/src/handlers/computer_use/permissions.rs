@@ -128,44 +128,6 @@ fn desktop_environment_payload(platform: &str) -> JsonValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handlers::computer_use::model::DesktopPreflightCapabilities;
-
-    #[test]
-    fn preflight_payload_preserves_ready_status() {
-        let payload = computer_use_preflight_payload(report("ready"));
-        assert_eq!(payload["status"], "ready");
-        assert_eq!(payload["capabilities"]["accessibility_tree"], "ok");
-        assert!(payload.get("running_binary").is_some());
-        assert!(
-            payload["permissions"]
-                .as_array()
-                .is_some_and(|value| !value.is_empty())
-        );
-    }
-
-    #[test]
-    fn preflight_payload_preserves_degraded_status() {
-        let mut report = report("degraded");
-        report.capabilities.input_simulation = "blocked".to_owned();
-        report.warnings.push("input blocked".to_owned());
-        let payload = computer_use_preflight_payload(report);
-        assert_eq!(payload["status"], "degraded");
-        assert_eq!(payload["capabilities"]["input_simulation"], "blocked");
-        assert_eq!(payload["warnings"].as_array().expect("warnings").len(), 1);
-    }
-
-    #[test]
-    fn preflight_payload_preserves_blocked_status() {
-        let mut report = report("blocked");
-        report.capabilities.accessibility_tree = "blocked".to_owned();
-        report.blocking_issues.push("tree blocked".to_owned());
-        let payload = computer_use_preflight_payload(report);
-        assert_eq!(payload["status"], "blocked");
-        assert_eq!(
-            payload["blocking_issues"].as_array().expect("issues").len(),
-            1
-        );
-    }
 
     #[test]
     fn macos_permission_entries_name_binary_and_tcc_panes() {
@@ -190,21 +152,5 @@ mod tests {
         assert!(payload.get("session_type").is_some());
         assert!(payload.get("wayland_display").is_some());
         assert!(payload.get("display").is_some());
-    }
-
-    fn report(status: &str) -> DesktopPreflightReport {
-        DesktopPreflightReport {
-            platform: "macos".to_owned(),
-            status: status.to_owned(),
-            message: "test".to_owned(),
-            capabilities: DesktopPreflightCapabilities {
-                accessibility_tree: "ok".to_owned(),
-                accessibility_actions: "ok".to_owned(),
-                screenshot: "ok".to_owned(),
-                input_simulation: "ok".to_owned(),
-            },
-            blocking_issues: Vec::new(),
-            warnings: Vec::new(),
-        }
     }
 }

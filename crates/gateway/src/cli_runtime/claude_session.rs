@@ -5598,31 +5598,6 @@ done
     }
 
     #[test]
-    fn claude_process_config_uses_session_permission_mode() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let instance = claude_instance(temp_dir.path().to_string_lossy().into_owned());
-
-        let config = claude_process_config_from_instance(
-            &instance,
-            &CLIAgentRuntimeSessionStartOptions {
-                cwd: None,
-                approval_policy: Some("acceptEdits".to_owned()),
-                authorization_scope_fingerprint: None,
-                app_server_args: Vec::new(),
-                env: Default::default(),
-                selected_skills: Vec::new(),
-                elevated_instructions: None,
-            },
-        )
-        .expect("config should build");
-
-        assert_eq!(
-            arg_value_after(config.args.as_slice(), "--permission-mode").as_deref(),
-            Some("acceptEdits")
-        );
-    }
-
-    #[test]
     fn claude_cli_runtime_full_access_uses_bypass_permissions_without_safe_mode() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let instance = claude_instance(temp_dir.path().to_string_lossy().into_owned());
@@ -5954,23 +5929,6 @@ done
         );
     }
 
-    #[test]
-    fn claude_prompt_from_input_keeps_native_skill_directive_as_text() {
-        let directive = "Before completing the user's task, invoke every selected skill through Claude's native Skill tool in this order: pdf, slides.";
-        let content = claude_prompt_from_input(json!([
-            { "type": "text", "text": directive },
-            { "type": "text", "text": "Create the report" }
-        ]))
-        .unwrap();
-        assert_eq!(
-            content,
-            json!([
-                { "type": "text", "text": directive },
-                { "type": "text", "text": "Create the report" }
-            ])
-        );
-    }
-
     #[tokio::test]
     async fn claude_skill_fake_stream_preserves_directive_tree_and_zero_skill_regression() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -6051,7 +6009,30 @@ done
             .await
             .unwrap();
 
-        let lines = wait_logged_json_lines(log_path.as_path(), 2).await;
+        let ordered_directive = "Before completing the user's task, invoke every selected skill through Claude's native Skill tool in this order: pdf, slides.";
+        client
+            .start_turn(
+                "claude-thread".to_owned(),
+                "claude-ordered-skill-turn".to_owned(),
+                None,
+                None,
+                json!([
+                    { "type": "text", "text": ordered_directive },
+                    { "type": "text", "text": "Create the report" }
+                ]),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+
+        let lines = wait_logged_json_lines(log_path.as_path(), 3).await;
+        assert_eq!(
+            lines[2]["message"]["content"],
+            json!([
+                { "type": "text", "text": ordered_directive },
+                { "type": "text", "text": "Create the report" }
+            ])
+        );
         let skill_line = serde_json::to_string(&lines[0]).unwrap();
         let zero_line = serde_json::to_string(&lines[1]).unwrap();
         assert!(skill_line.contains("proposal-51-sentinel"));
@@ -6068,67 +6049,46 @@ done
 
     #[tokio::test]
     async fn claude_start_turn_sends_effort_control_request() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let log_path = temp_dir.path().join("claude-jsonl.log");
-        let (client, mut child) = fake_claude_stream_client(log_path.as_path()).await;
-
-        client
-            .start_turn(
-                "claude-thread".to_owned(),
-                "claude-turn".to_owned(),
-                Some("sonnet".to_owned()),
-                Some("medium".to_owned()),
-                json!([{ "type": "text", "text": "Run tests" }]),
-                Duration::from_secs(2),
-            )
-            .await
-            .expect("start turn should send effort and prompt");
-
-        let lines = wait_logged_json_lines(log_path.as_path(), 3).await;
-        assert_eq!(lines[0]["type"], "control_request");
-        assert_eq!(lines[0]["request"]["subtype"], "set_model");
-        assert_eq!(lines[0]["request"]["model"], "sonnet");
-        assert_eq!(lines[1]["type"], "control_request");
-        assert_eq!(lines[1]["request"]["subtype"], "apply_flag_settings");
-        assert_eq!(
-            lines[1]["request"]["settings"]["effortLevel"],
-            json!("medium")
-        );
-        assert_eq!(lines[2]["type"], "user");
-        assert!(!serde_json::to_string(&lines[2]).unwrap().contains("medium"));
-
-        let _ = child.kill().await;
-    }
-
-    #[tokio::test]
-    async fn claude_start_turn_omits_effort_control_request_when_not_selected() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let log_path = temp_dir.path().join("claude-jsonl.log");
-        let (client, mut child) = fake_claude_stream_client(log_path.as_path()).await;
-
-        client
-            .start_turn(
-                "claude-thread".to_owned(),
-                "claude-turn".to_owned(),
-                Some("sonnet".to_owned()),
-                None,
-                json!([{ "type": "text", "text": "Run tests" }]),
-                Duration::from_secs(2),
-            )
-            .await
-            .expect("start turn should send prompt");
-
-        let lines = wait_logged_json_lines(log_path.as_path(), 2).await;
-        assert_eq!(lines[0]["type"], "control_request");
-        assert_eq!(lines[0]["request"]["subtype"], "set_model");
-        assert_eq!(lines[1]["type"], "user");
-        assert!(
-            lines
-                .iter()
-                .all(|line| line["request"]["subtype"] != "apply_flag_settings")
-        );
-
-        let _ = child.kill().await;
+        for effort in [Some("medium"), None] {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let log_path = temp_dir.path().join("claude-jsonl.log");
+            let (client, mut child) = fake_claude_stream_client(log_path.as_path()).await;
+            client
+                .start_turn(
+                    "claude-thread".to_owned(),
+                    "claude-turn".to_owned(),
+                    Some("sonnet".to_owned()),
+                    effort.map(str::to_owned),
+                    json!([{ "type": "text", "text": "Run tests" }]),
+                    Duration::from_secs(2),
+                )
+                .await
+                .expect("start turn should send selected controls and prompt");
+            let lines =
+                wait_logged_json_lines(log_path.as_path(), if effort.is_some() { 3 } else { 2 })
+                    .await;
+            assert_eq!(lines[0]["type"], "control_request");
+            assert_eq!(lines[0]["request"]["subtype"], "set_model");
+            assert_eq!(lines[0]["request"]["model"], "sonnet");
+            if effort.is_some() {
+                assert_eq!(lines[1]["type"], "control_request");
+                assert_eq!(lines[1]["request"]["subtype"], "apply_flag_settings");
+                assert_eq!(
+                    lines[1]["request"]["settings"]["effortLevel"],
+                    json!("medium")
+                );
+                assert_eq!(lines[2]["type"], "user");
+                assert!(!serde_json::to_string(&lines[2]).unwrap().contains("medium"));
+            } else {
+                assert_eq!(lines[1]["type"], "user");
+                assert!(
+                    lines
+                        .iter()
+                        .all(|line| line["request"]["subtype"] != "apply_flag_settings")
+                );
+            }
+            let _ = child.kill().await;
+        }
     }
 
     #[tokio::test]

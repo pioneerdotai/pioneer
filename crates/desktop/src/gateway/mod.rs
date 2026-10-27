@@ -12,8 +12,6 @@ pub(crate) mod timings;
 pub use runtime::ensure_runtime_home_dir;
 
 #[cfg(test)]
-pub(crate) mod test_support;
-#[cfg(test)]
 pub(crate) mod tests;
 
 #[cfg(test)]

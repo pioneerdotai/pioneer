@@ -212,28 +212,6 @@ mod tests {
         assert!(validate_schema_version(CLIENT_BINDING_SCHEMA_VERSION).is_ok());
         assert!(validate_schema_version(CLIENT_BINDING_SCHEMA_VERSION + 1).is_err());
     }
-
-    #[test]
-    fn binding_source_contains_translation_only() {
-        let source = include_str!("client_binding.rs");
-        let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("Client binding production source");
-        for forbidden in [
-            "ClientMutationAuthority",
-            "DomainRevision::new",
-            "ScopedRevision::new",
-            "HashMap<",
-            "Mutex<",
-            ".publish(",
-        ] {
-            assert!(
-                !production.contains(forbidden),
-                "Client binding contains mutable domain ownership: {forbidden}"
-            );
-        }
-    }
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

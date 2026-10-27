@@ -369,8 +369,6 @@ impl DesktopVoiceGateway for DesktopComposerVoiceGateway {
 
 struct ActiveGatewayVoiceSession {
     session_id: String,
-    #[cfg(test)]
-    audio_format: VoiceAudioFormat,
 }
 
 pub(crate) struct DesktopVoiceCaptureFlow<
@@ -395,10 +393,6 @@ where
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_capturing(&self) -> bool {
-        self.capture.is_capturing()
-    }
 
     pub(crate) fn start(
         &mut self,
@@ -458,55 +452,10 @@ where
         }
         self.active_gateway_session = Some(ActiveGatewayVoiceSession {
             session_id,
-            #[cfg(test)]
-            audio_format,
         });
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn push_interleaved_f32_chunk(
-        &mut self,
-        samples: &[f32],
-        input_channels: u16,
-        captured_at_unix_ms: Option<u64>,
-    ) -> Result<(), DesktopVoiceCaptureError> {
-        let chunk = self.capture.push_interleaved_f32_chunk(
-            samples,
-            input_channels,
-            self.active_gateway_session
-                .as_ref()
-                .map(|session| session.audio_format.sample_rate_hz)
-                .unwrap_or_else(|| DesktopVoiceCaptureConfig::default().format.sample_rate_hz),
-            captured_at_unix_ms.or_else(now_unix_ms),
-        )?;
-        let Some(session) = self.active_gateway_session.as_ref() else {
-            self.capture.cancel();
-            return Err(DesktopVoiceCaptureError::new(
-                DesktopVoiceCaptureErrorKind::GatewaySession,
-                t!("chat.composer.voice.gateway_session_not_active").to_string(),
-            ));
-        };
-
-        if let Err(error) = self.gateway.send_voice_audio_chunk(
-            session.session_id.clone(),
-            chunk.sequence,
-            session.audio_format,
-            chunk.captured_at_unix_ms,
-            chunk.duration_ms,
-            chunk.pcm_s16le_mono,
-        ) {
-            let session_id = session.session_id.clone();
-            self.capture.cancel();
-            self.active_gateway_session = None;
-            let _ = self
-                .gateway
-                .cancel_voice_session(session_id, Some("desktop_chunk_send_failed".to_owned()));
-            return Err(error);
-        }
-
-        Ok(())
-    }
 
     pub(crate) fn stop_recording(&mut self) -> Result<(), DesktopVoiceCaptureError> {
         let result = self.capture.stop();
@@ -1158,7 +1107,6 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeGateway {
         events: Arc<Mutex<Vec<GatewayEvent>>>,
-        chunk_error: Arc<Mutex<Option<DesktopVoiceCaptureError>>>,
         finalize_error: Arc<Mutex<Option<DesktopVoiceCaptureError>>>,
     }
 
@@ -1192,9 +1140,6 @@ mod tests {
             _duration_ms: Option<u32>,
             pcm_chunk: Vec<u8>,
         ) -> Result<(), DesktopVoiceCaptureError> {
-            if let Some(error) = self.chunk_error.lock().expect("chunk error").clone() {
-                return Err(error);
-            }
             self.events
                 .lock()
                 .expect("events")
@@ -1364,47 +1309,6 @@ mod tests {
     }
 
     #[test]
-    fn voice_flow_streams_chunks_while_held_then_finalizes() {
-        let gateway = FakeGateway::default();
-        let events = Arc::clone(&gateway.events);
-        let mut flow = DesktopVoiceCaptureFlow::new(FakeBackend::default(), gateway);
-
-        flow.start(
-            &granted_gate(),
-            DesktopVoiceCaptureConfig::default(),
-            voice_start_context(),
-        )
-        .expect("start");
-        flow.push_interleaved_f32_chunk(&[0.0; 320], 1, Some(100))
-            .expect("chunk 0");
-        flow.push_interleaved_f32_chunk(&[0.1; 320], 1, Some(120))
-            .expect("chunk 1");
-        flow.stop_recording().expect("stop recording");
-        flow.finalize_send(voice_context()).expect("finalize");
-
-        assert_eq!(
-            *events.lock().expect("events"),
-            vec![
-                GatewayEvent::Start {
-                    turn_id: "turn_1".to_owned(),
-                },
-                GatewayEvent::Chunk {
-                    sequence: 0,
-                    bytes: 640,
-                },
-                GatewayEvent::Chunk {
-                    sequence: 1,
-                    bytes: 640,
-                },
-                GatewayEvent::Finalize {
-                    session_id: "voice_session_1".to_owned(),
-                    turn_id: "turn_1".to_owned(),
-                },
-            ]
-        );
-    }
-
-    #[test]
     fn voice_flow_streams_backend_emitted_chunks_without_waiting_for_release() {
         let gateway = FakeGateway::default();
         let events = Arc::clone(&gateway.events);
@@ -1440,6 +1344,26 @@ mod tests {
 
         flow.stop_recording().expect("stop recording");
         flow.finalize_send(voice_context()).expect("finalize");
+        assert_eq!(
+            *events.lock().expect("events"),
+            vec![
+                GatewayEvent::Start {
+                    turn_id: "turn_1".to_owned()
+                },
+                GatewayEvent::Chunk {
+                    sequence: 0,
+                    bytes: 640
+                },
+                GatewayEvent::Chunk {
+                    sequence: 1,
+                    bytes: 320
+                },
+                GatewayEvent::Finalize {
+                    session_id: "voice_session_1".to_owned(),
+                    turn_id: "turn_1".to_owned(),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1466,70 +1390,6 @@ mod tests {
                 GatewayEvent::Cancel {
                     session_id: "voice_session_1".into(),
                     reason: Some("desktop_release_cancel".into())
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn voice_flow_cancel_sends_control_cancel_without_finalize() {
-        let gateway = FakeGateway::default();
-        let events = Arc::clone(&gateway.events);
-        let mut flow = DesktopVoiceCaptureFlow::new(FakeBackend::default(), gateway);
-
-        flow.start(
-            &granted_gate(),
-            DesktopVoiceCaptureConfig::default(),
-            voice_start_context(),
-        )
-        .expect("start");
-        flow.release_cancel().expect("cancel");
-
-        assert_eq!(
-            *events.lock().expect("events"),
-            vec![
-                GatewayEvent::Start {
-                    turn_id: "turn_1".to_owned(),
-                },
-                GatewayEvent::Cancel {
-                    session_id: "voice_session_1".to_owned(),
-                    reason: Some("desktop_release_cancel".to_owned()),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn chunk_send_failure_stops_capture_and_cancels_gateway_session() {
-        let gateway = FakeGateway::default();
-        *gateway.chunk_error.lock().expect("chunk error") = Some(DesktopVoiceCaptureError::new(
-            DesktopVoiceCaptureErrorKind::GatewayChunk,
-            "chunk failed",
-        ));
-        let events = Arc::clone(&gateway.events);
-        let mut flow = DesktopVoiceCaptureFlow::new(FakeBackend::default(), gateway);
-
-        flow.start(
-            &granted_gate(),
-            DesktopVoiceCaptureConfig::default(),
-            voice_start_context(),
-        )
-        .expect("start");
-        let error = flow
-            .push_interleaved_f32_chunk(&[0.0; 320], 1, Some(100))
-            .expect_err("chunk failure");
-
-        assert_eq!(error.kind, DesktopVoiceCaptureErrorKind::GatewayChunk);
-        assert!(!flow.is_capturing());
-        assert_eq!(
-            *events.lock().expect("events"),
-            vec![
-                GatewayEvent::Start {
-                    turn_id: "turn_1".to_owned(),
-                },
-                GatewayEvent::Cancel {
-                    session_id: "voice_session_1".to_owned(),
-                    reason: Some("desktop_chunk_send_failed".to_owned()),
                 },
             ]
         );

@@ -161,6 +161,13 @@ async fn completion_evidence_verify_pass_allows_completed_stop() {
         Some(true)
     );
 
+    assert_eq!(
+        verification
+            .pointer("/verification/status")
+            .and_then(JsonValue::as_str),
+        Some("passed")
+    );
+
     let stopped = invoke(
         &handler,
         serde_json::json!({
@@ -182,6 +189,11 @@ async fn completion_evidence_verify_pass_allows_completed_stop() {
             .and_then(JsonValue::as_str),
         Some("verify")
     );
+    assert_eq!(
+        stopped.get("status").and_then(JsonValue::as_str),
+        Some("stopped")
+    );
+    assert_eq!(stopped.get("failure_class"), Some(&JsonValue::Null));
 }
 
 #[tokio::test]

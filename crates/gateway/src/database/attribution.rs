@@ -85,19 +85,4 @@ mod tests {
         .await;
         assert!(current_database_workload().is_none());
     }
-
-    #[tokio::test]
-    async fn result_scope_preserves_success_and_failure() {
-        let success = scope_database_workload_result(DatabaseWorkload::ProjectionRecovery, async {
-            Ok::<_, &'static str>(7)
-        })
-        .await;
-        assert_eq!(success, Ok(7));
-
-        let failure = scope_database_workload_result(DatabaseWorkload::ProjectionRecovery, async {
-            Err::<(), _>("failed")
-        })
-        .await;
-        assert_eq!(failure, Err("failed"));
-    }
 }

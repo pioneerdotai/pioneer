@@ -31,21 +31,6 @@ pub(super) fn memory_tool_bundle_contribution(
         tool_names,
     }
 }
-#[cfg(test)]
-pub(crate) fn memory_tool_names(materialization: &MemoryToolMaterialization) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    let mut names = Vec::new();
-    for bundle in &materialization.bundles {
-        for configured in &bundle.specs {
-            let name = configured.spec.name.trim();
-            if !name.is_empty() && seen.insert(name.to_owned()) {
-                names.push(name.to_owned());
-            }
-        }
-    }
-    names
-}
-
 pub(crate) fn filter_memory_tool_materialization(
     materialization: MemoryToolMaterialization,
     policy: &MemoryTurnPolicy,

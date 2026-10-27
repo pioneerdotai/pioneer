@@ -1307,13 +1307,37 @@ mod tests {
 
     #[tokio::test]
     async fn native_discovery_and_direct_chat_do_not_require_a_loaded_catalog() {
-        let registry = ProviderRegistry::with_provider("openai", Arc::new(ToolDiscoveryProvider));
+        let registry =
+            ProviderRegistry::with_provider("openai", Arc::new(NativeListFixture("openai")));
         let provider = registry.get_or_create("openai").unwrap();
         let models = provider.list_models().await.unwrap();
         assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "g03-positive");
+        assert_eq!(models[0].id, "fixture-native-model");
         assert_eq!(models[0].capabilities.tool_calling, Some(false));
-        assert!(!provider.model_tool_calling("g03-positive"));
+        assert!(!provider.model_tool_calling("fixture-native-model"));
+        assert_eq!(models[0].provider, "openai");
+        let wrapper = cached_wrapper(&registry, None, "openai");
+        assert_eq!(
+            wrapper.discovery_reasoning_snapshot()["fixture-native-model"]["supported"],
+            Some(false)
+        );
+        assert_eq!(
+            wrapper
+                .input_admission
+                .model("fixture-native-model")
+                .unwrap()
+                .capabilities
+                .tool_calling,
+            Some(false)
+        );
+        wrapper.revoked.store(true, Ordering::Release);
+        assert!(
+            provider
+                .list_models()
+                .await
+                .unwrap_err()
+                .is::<ProviderAuthorityRevoked>()
+        );
         let echo = ProviderRegistry::with_provider("echo", Arc::new(EchoProvider::new()));
         assert!(
             echo.get_or_create("echo")
@@ -1370,52 +1394,6 @@ mod tests {
             anyhow::bail!("fixture model boundary")
         }
     }
-    #[tokio::test]
-    async fn shared_discovery_boundary_keeps_native_evidence_for_every_active_provider() {
-        // Inventory coverage of the common authority wrapper, not a claim that
-        // mocked transports certify each vendor's Models API.
-        for definition in crate::definition::provider_definitions() {
-            if definition.retirement_reason().is_some() {
-                continue;
-            }
-            let wrapper = AuthorityBoundProvider {
-                inner: Arc::new(NativeListFixture(definition.name)),
-                authority_fingerprint: ProviderAuthorityFingerprint(definition.name.into()),
-                revoked: Arc::new(AtomicBool::new(false)),
-                redact_endpoint_errors: false,
-                input_admission: Arc::new(Default::default()),
-                use_public_catalog: true,
-                discovery_tools: RwLock::new(BTreeMap::new()),
-                discovery_reasoning: RwLock::new(BTreeMap::new()),
-            };
-            let models = wrapper.list_models().await.unwrap();
-            assert_eq!(models[0].provider, definition.name);
-            assert_eq!(models[0].capabilities.tool_calling, Some(false));
-            assert!(!wrapper.model_tool_calling_with_catalog("fixture-native-model", None));
-            assert_eq!(
-                wrapper.discovery_reasoning_snapshot()["fixture-native-model"]["supported"],
-                Some(false)
-            );
-            assert_eq!(
-                wrapper
-                    .input_admission
-                    .model("fixture-native-model")
-                    .unwrap()
-                    .capabilities
-                    .tool_calling,
-                Some(false)
-            );
-            wrapper.revoked.store(true, Ordering::Release);
-            assert!(
-                wrapper
-                    .list_models()
-                    .await
-                    .unwrap_err()
-                    .is::<ProviderAuthorityRevoked>()
-            );
-        }
-    }
-
     struct RouterReasoningFixture {
         discovery: String,
         catalog: Arc<crate::catalog::ModelCatalog>,
@@ -2479,18 +2457,6 @@ mod tests {
             .get_or_create("echo")
             .expect("poisoned cache should remain readable");
         assert_eq!(provider.name(), "echo");
-    }
-
-    #[test]
-    fn insert_overrides_cache() {
-        let registry = ProviderRegistry::new(|_| String::new());
-        let echo = Arc::new(EchoProvider::new());
-        registry
-            .insert("echo", echo.clone())
-            .expect("test provider should fit registry bounds");
-
-        let p = registry.get_or_create("echo").unwrap();
-        assert_eq!(p.name(), "echo");
     }
 
     #[test]

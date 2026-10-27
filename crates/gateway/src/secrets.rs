@@ -11,8 +11,6 @@ use pioneer_keystore::{
     DbKeyStore, DbKeyStoreConfig, SecretEntryMeta, SecretFilter, SecretId, SecretKind, SecretMeta,
     SecretStore, ensure_private_file,
 };
-#[cfg(test)]
-use tracing::warn;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::helpers::{decode_hex, encode_hex, unix_timestamp_secs};
@@ -618,66 +616,6 @@ impl GatewaySecrets {
             }
         }
         Ok(base_urls.into_iter().collect())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn resolve_provider_api_key(&self, provider_name: &str) -> String {
-        if is_local_provider(provider_name) {
-            return String::new();
-        }
-
-        match self.get_provider_api_key(provider_name) {
-            Ok(Some(value)) => value,
-            Ok(None) => String::new(),
-            Err(error) => {
-                warn!(
-                    provider = provider_name,
-                    error = %format!("{error:#}"),
-                    "failed to resolve provider api key from keystore"
-                );
-                String::new()
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn resolve_workspace_provider_proxy(
-        &self,
-        workspace_id: &str,
-        provider_name: &str,
-    ) -> Option<String> {
-        match self.get_workspace_provider_proxy(workspace_id, provider_name) {
-            Ok(value) => value,
-            Err(error) => {
-                warn!(
-                    workspace_id,
-                    provider = provider_name,
-                    error = %format!("{error:#}"),
-                    "failed to resolve workspace provider proxy from keystore"
-                );
-                None
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn resolve_workspace_provider_base_url(
-        &self,
-        workspace_id: &str,
-        provider_name: &str,
-    ) -> Option<String> {
-        match self.get_workspace_provider_base_url(workspace_id, provider_name) {
-            Ok(value) => value,
-            Err(error) => {
-                warn!(
-                    workspace_id,
-                    provider = provider_name,
-                    error = %format!("{error:#}"),
-                    "failed to resolve workspace provider base url from keystore"
-                );
-                None
-            }
-        }
     }
 
     // TODO: Remove sometime
@@ -1380,12 +1318,6 @@ mod tests {
         );
         assert_eq!(
             secrets
-                .resolve_workspace_provider_proxy("ws_default", "openrouter")
-                .as_deref(),
-            Some("socks5://user:pass@127.0.0.1:1080")
-        );
-        assert_eq!(
-            secrets
                 .list_workspace_provider_proxies("ws_default")
                 .expect("list provider proxies"),
             vec![(
@@ -1425,12 +1357,6 @@ mod tests {
                 .get_workspace_provider_base_url("ws_default", "openai")
                 .expect("read base url"),
             Some("https://api.example.com/v1".to_owned())
-        );
-        assert_eq!(
-            secrets
-                .resolve_workspace_provider_base_url("ws_default", "openai")
-                .as_deref(),
-            Some("https://api.example.com/v1")
         );
         assert_eq!(
             secrets
@@ -1793,26 +1719,6 @@ mod tests {
                 .expect("legacy key removed"),
             None
         );
-    }
-
-    #[test]
-    fn provider_methods_reject_empty_key() {
-        let secrets = GatewaySecrets::new(Arc::new(MemorySecretStore::new()));
-
-        let error = secrets
-            .set_provider_api_key("openrouter", "   ")
-            .expect_err("empty api key should fail");
-        assert!(
-            format!("{error:#}").contains("provider api key must not be empty"),
-            "unexpected error: {error:#}"
-        );
-    }
-
-    #[test]
-    fn provider_resolver_does_not_touch_store_for_local_providers() {
-        let secrets = GatewaySecrets::new(Arc::new(FailingSecretStore));
-
-        assert_eq!(secrets.resolve_provider_api_key("ollama"), "");
     }
 
     #[test]

@@ -347,19 +347,15 @@ mod tests {
     use super::parse_linger_enabled;
 
     #[test]
-    fn parses_linger_show_user_property_output() {
-        assert_eq!(parse_linger_enabled("Linger=yes\n"), Some(true));
-        assert_eq!(parse_linger_enabled("Linger=no\n"), Some(false));
-    }
-
-    #[test]
-    fn parses_linger_show_user_value_output() {
-        assert_eq!(parse_linger_enabled("yes\n"), Some(true));
-        assert_eq!(parse_linger_enabled("no\n"), Some(false));
-    }
-
-    #[test]
-    fn ignores_unrelated_linger_output() {
-        assert_eq!(parse_linger_enabled("Name=oskin\nState=active\n"), None);
+    fn linger_output_maps_to_enabled_state() {
+        for (output, expected) in [
+            ("Linger=yes\n", Some(true)),
+            ("Linger=no\n", Some(false)),
+            ("yes\n", Some(true)),
+            ("no\n", Some(false)),
+            ("Name=oskin\nState=active\n", None),
+        ] {
+            assert_eq!(parse_linger_enabled(output), expected);
+        }
     }
 }

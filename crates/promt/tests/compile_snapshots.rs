@@ -289,6 +289,8 @@ fn assistant_none_snapshot() {
 
     insta::assert_snapshot!("assistant_none", compiled.full_system_text);
     assert!(compiled.dynamic_system_text.is_empty());
+
+    assert!(compiled.stable_system_text.contains("personal assistant"));
 }
 
 #[test]

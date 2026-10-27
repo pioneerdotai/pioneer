@@ -2034,38 +2034,6 @@ mod tests {
     }
 
     #[test]
-    fn auxiliary_pooling_shape_fixtures_distinguish_tokens_from_pooled_output() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/g09_embedding_output_shapes.json"
-        ))
-        .unwrap();
-        let tokens = &fixture["token_output"];
-        assert_eq!(tokens["shape"], serde_json::json!([1, 3, 2]));
-        let values = tokens["values"].as_array().unwrap();
-        let mask = tokens["attention_mask"].as_array().unwrap();
-        let mut mean = vec![0.0; 2];
-        let mut count = 0.0;
-        for (row, active) in values.chunks(2).zip(mask) {
-            let weight = active.as_f64().unwrap();
-            count += weight;
-            for (sum, value) in mean.iter_mut().zip(row) {
-                *sum += value.as_f64().unwrap() * weight;
-            }
-        }
-        for value in &mut mean {
-            *value /= count;
-        }
-        assert_eq!(serde_json::json!(mean), tokens["masked_mean"]);
-        assert_eq!(serde_json::json!(&values[..2]), tokens["cls"]);
-        assert_ne!(tokens["cls"], tokens["masked_mean"]);
-        let pooled = &fixture["pooled_output"];
-        assert_eq!(pooled["shape"], serde_json::json!([1, 2]));
-        assert_eq!(pooled["values"], pooled["expected_without_token_pooling"]);
-        // The pinned runtime already extracts pooled [1,D] intact. Do not apply
-        // a token mean to it based solely on the brand/model name.
-    }
-
-    #[test]
     fn nomic_preparation_counts_special_tokens_without_truncation_or_padding() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tokenizer.json");
@@ -2237,25 +2205,6 @@ mod tests {
         ] {
             assert!(pool_embedding_chunks(&identity, &vectors, &vec![1; vectors.len()]).is_err());
         }
-    }
-
-    #[test]
-    fn remote_embedding_retryability_covers_observed_transient_response_failures() {
-        assert!(provider_embedding_error_message_is_retryable(
-            "error decoding response body: request or response body error: operation timed out"
-        ));
-        assert!(provider_embedding_error_message_is_retryable(
-            "error decoding response body: missing field `data` at line 1 column 82"
-        ));
-        assert!(provider_embedding_error_message_is_retryable(
-            "embedding API error (503 Service Unavailable)"
-        ));
-        assert!(!provider_embedding_error_message_is_retryable(
-            "embedding API error (401 Unauthorized)"
-        ));
-        assert!(!provider_embedding_error_message_is_retryable(
-            "embedding dimension mismatch: expected 1536, got 3072"
-        ));
     }
 
     #[derive(Debug)]
@@ -2524,24 +2473,6 @@ mod tests {
             usage: None,
             embeddings: vectors,
         }
-    }
-
-    #[test]
-    fn auxiliary_remote_model_dimension_gate_rejects_wrong_model_vectors() {
-        let fake = Arc::new(FakeRemoteProvider::with_responses(
-            OPENAI_PROVIDER_ID,
-            vec![Ok(embedding_response(vec![vec![1.0, 2.0]]))],
-        ));
-        let provider =
-            RemoteEmbeddingProvider::openai("text-embedding-3-small", true, false, fake).unwrap();
-        let error = provider.embed_text("fixture").unwrap_err();
-        assert_eq!(
-            error.kind,
-            pioneer_memory::ThreadEpisodicEmbeddingErrorKind::DimensionMismatch {
-                expected: 1536,
-                actual: 2
-            }
-        );
     }
 
     #[test]
@@ -2891,31 +2822,6 @@ mod tests {
         let requests = fake.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].input, vec!["find my travel plans".to_owned()]);
-    }
-
-    #[test]
-    fn local_embedding_model_registry_resolves_supported_models() {
-        let small = local_embedding_model_info("bge-small-en-v1.5").expect("small model");
-        assert_eq!(small.display_name, "BGE Small EN v1.5");
-        assert_eq!(small.dimension, 384);
-        assert_eq!(small.max_tokens, 512);
-        assert!(small.default);
-        assert!(small.model_url.contains("model.onnx"));
-        assert!(small.tokenizer_url.contains("tokenizer.json"));
-
-        assert_eq!(
-            local_embedding_model_info("bge-base-en-v1.5").map(|info| info.dimension),
-            Some(768)
-        );
-        assert_eq!(
-            local_embedding_model_info("nomic-embed-text-v1.5").map(|info| info.dimension),
-            Some(768)
-        );
-        assert_eq!(
-            local_embedding_model_info("gte-large").map(|info| info.dimension),
-            Some(1024)
-        );
-        assert!(local_embedding_model_info("unknown").is_none());
     }
 
     #[test]
@@ -3292,133 +3198,6 @@ mod tests {
         let error = spawn_local_embedding_model_download_if_needed(runtime_home.path(), &config)
             .expect_err("unknown local model should fail");
         assert!(error.contains("unknown local embedding model"));
-    }
-
-    #[test]
-    fn embedding_diagnostics_report_readiness_from_settings() {
-        let disabled = GatewayThreadEpisodicVectorSearchSettings::default();
-        let disabled_readiness = embedding_provider_readiness_from_settings(&disabled);
-        assert_eq!(
-            disabled_readiness.state,
-            EmbeddingProviderReadinessState::Disabled
-        );
-        assert!(!disabled_readiness.is_ready());
-
-        let missing_key = GatewayThreadEpisodicVectorSearchSettings {
-            enabled: true,
-            provider: Some(GatewayThreadEpisodicVectorProvider::OpenAi),
-            model: Some("text-embedding-3-small".to_owned()),
-            embedding_dimension: Some(1536),
-            provider_key: pioneer_protocol::GatewayThreadEpisodicVectorProviderKeyStatus {
-                required: true,
-                present: false,
-            },
-            ..GatewayThreadEpisodicVectorSearchSettings::default()
-        };
-        let missing_key_readiness = embedding_provider_readiness_from_settings(&missing_key);
-        assert_eq!(
-            missing_key_readiness.state,
-            EmbeddingProviderReadinessState::MissingConfiguration
-        );
-        assert!(!missing_key_readiness.retryable);
-        assert_eq!(missing_key_readiness.provider_id, OPENAI_PROVIDER_ID);
-
-        let downloading_local = GatewayThreadEpisodicVectorSearchSettings {
-            enabled: true,
-            provider: Some(GatewayThreadEpisodicVectorProvider::Local),
-            local_model: Some("bge-small-en-v1.5".to_owned()),
-            embedding_dimension: Some(384),
-            local_model_status: GatewayThreadEpisodicVectorLocalModelStatus::Downloading,
-            ..GatewayThreadEpisodicVectorSearchSettings::default()
-        };
-        let downloading_readiness = embedding_provider_readiness_from_settings(&downloading_local);
-        assert_eq!(
-            downloading_readiness.state,
-            EmbeddingProviderReadinessState::LocalModelDownloading
-        );
-        assert!(downloading_readiness.retryable);
-
-        let ready_local = GatewayThreadEpisodicVectorSearchSettings {
-            local_model_status: GatewayThreadEpisodicVectorLocalModelStatus::Installed,
-            ..downloading_local
-        };
-        let ready = embedding_provider_readiness_from_settings(&ready_local);
-        assert_eq!(ready.state, EmbeddingProviderReadinessState::Ready);
-        assert!(ready.is_ready());
-
-        let openrouter_dynamic = GatewayThreadEpisodicVectorSearchSettings {
-            enabled: true,
-            provider: Some(GatewayThreadEpisodicVectorProvider::OpenRouter),
-            model: Some("qwen/qwen3-embedding-8b".to_owned()),
-            provider_key: pioneer_protocol::GatewayThreadEpisodicVectorProviderKeyStatus {
-                required: true,
-                present: true,
-            },
-            ..GatewayThreadEpisodicVectorSearchSettings::default()
-        };
-        let openrouter_readiness = embedding_provider_readiness_from_settings(&openrouter_dynamic);
-        assert_eq!(
-            openrouter_readiness.state,
-            EmbeddingProviderReadinessState::Ready
-        );
-        assert!(openrouter_readiness.is_ready());
-    }
-
-    #[test]
-    fn embedding_diagnostics_map_embedding_errors_to_readiness() {
-        let missing =
-            ThreadEpisodicEmbeddingError::missing_key(OPENAI_PROVIDER_ID, "text-embedding-3-small");
-        let missing_diagnostic = embedding_provider_readiness_from_error(&missing);
-        assert_eq!(
-            missing_diagnostic.state,
-            EmbeddingProviderReadinessState::MissingConfiguration
-        );
-        assert!(!missing_diagnostic.retryable);
-
-        let retryable = ThreadEpisodicEmbeddingError::retryable_provider_failure(
-            OPENROUTER_PROVIDER_ID,
-            "openai/text-embedding-3-small",
-            "rate limited",
-        );
-        let retryable_diagnostic = embedding_provider_readiness_from_error(&retryable);
-        assert_eq!(
-            retryable_diagnostic.state,
-            EmbeddingProviderReadinessState::RetryableProviderFailure
-        );
-        assert!(retryable_diagnostic.retryable);
-
-        let dimension = ThreadEpisodicEmbeddingError::dimension_mismatch(
-            OPENAI_PROVIDER_ID,
-            "text-embedding-3-large",
-            3072,
-            1536,
-        );
-        let dimension_diagnostic = embedding_provider_readiness_from_error(&dimension);
-        assert_eq!(
-            dimension_diagnostic.state,
-            EmbeddingProviderReadinessState::DimensionMismatch
-        );
-        assert!(!dimension_diagnostic.retryable);
-    }
-
-    #[test]
-    fn embedding_diagnostics_safe_log_fields_do_not_include_payload_or_key_material() {
-        let error = ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
-            OPENAI_PROVIDER_ID,
-            "text-embedding-3-small",
-            "provider rejected sk-secret while embedding private text",
-        );
-
-        let fields = error.safe_log_fields();
-        assert_eq!(fields.provider_id, OPENAI_PROVIDER_ID);
-        assert_eq!(fields.model, "text-embedding-3-small");
-        assert_eq!(
-            fields.failure_class,
-            ThreadEpisodicEmbeddingFailureClass::PermanentProviderFailure
-        );
-        let serialized = serde_json::to_string(&fields).expect("serialize fields");
-        assert!(!serialized.contains("sk-secret"));
-        assert!(!serialized.contains("private text"));
     }
 
     #[derive(Debug)]

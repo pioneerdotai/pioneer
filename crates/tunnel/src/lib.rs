@@ -696,9 +696,10 @@ mod tests {
             "127.0.0.1:2333",
             "[::1]:2333",
         ] {
-            assert!(
-                normalize_rathole_remote_addr(value).is_ok(),
-                "{value} should be valid"
+            assert_eq!(
+                normalize_rathole_remote_addr(value).expect("valid relay endpoint"),
+                value,
+                "normalization must preserve valid endpoint {value}"
             );
         }
 
@@ -1141,19 +1142,5 @@ mod tests {
         })
         .await
         .expect("canceled apply or its followup failed to complete");
-    }
-
-    #[test]
-    fn remote_addr_normalization_keeps_host_port_endpoint() {
-        assert_eq!(
-            normalize_rathole_remote_addr("relay-eu-west-1.getpioneer.dev:2333")
-                .expect("normalize"),
-            "relay-eu-west-1.getpioneer.dev:2333"
-        );
-        assert_eq!(
-            normalize_rathole_remote_addr("127.0.0.1:2333").expect("normalize"),
-            "127.0.0.1:2333"
-        );
-        assert!(normalize_rathole_remote_addr("https://getpioneer.dev").is_err());
     }
 }

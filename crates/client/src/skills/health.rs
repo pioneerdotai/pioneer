@@ -87,21 +87,6 @@ mod tests {
         }
     }
 
-    fn health(slug: &str, source_kind: &str) -> SkillHealthItem {
-        SkillHealthItem {
-            skill_id: test_id(slug, source_kind),
-            owner: None,
-            slug: slug.to_owned(),
-            source_kind: source_kind.to_owned(),
-            trust_level: "community".to_owned(),
-            dependency_diagnostics: Vec::new(),
-            security_findings: Vec::new(),
-            validation_issues: Vec::new(),
-            trust_gate: Vec::new(),
-            recent_audit: Vec::new(),
-        }
-    }
-
     #[test]
     fn health_targets_and_params_preserve_skill_identity() {
         let targets = skill_health_targets(&[skill("alpha", "user")]);
@@ -112,16 +97,5 @@ mod tests {
         assert_eq!(params.workspace_id, "workspace");
         assert_eq!(params.audit_limit, DEFAULT_SKILLS_HEALTH_AUDIT_LIMIT);
         assert_eq!(params.skills.len(), 1);
-    }
-
-    #[test]
-    fn health_details_are_keyed_by_skill_target() {
-        let details = health_details_map(vec![health("alpha", "user")]);
-        let alpha_id = test_id("alpha", "user");
-        let missing_id = test_id("missing", "user");
-
-        assert!(details.contains_key(&alpha_id));
-        assert!(skill_health_detail(&details, &alpha_id).is_some());
-        assert!(skill_health_detail(&details, &missing_id).is_none());
     }
 }

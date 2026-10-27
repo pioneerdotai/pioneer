@@ -1508,8 +1508,7 @@ mod tests {
     use pioneer_cli_agent_runtime::codex::CodexJsonlRpcNotificationEvent;
     use pioneer_cli_agent_runtime::event::{
         RuntimeAgentMessagePhase, RuntimeEvent, RuntimeEventMappingOptions, RuntimeItemCompleted,
-        RuntimeItemDelta, RuntimeItemDeltaKind, RuntimeItemStarted, RuntimeRawEvent,
-        RuntimeTurnCompleted, map_codex_notification_event,
+        RuntimeItemStarted, RuntimeRawEvent, map_codex_notification_event,
     };
     use pioneer_protocol::{
         AgentDurableEvent, AgentMessagePhase, AgentProgressEvent, ItemDeltaStream,
@@ -1540,74 +1539,6 @@ mod tests {
             RuntimeEventMappingOptions::default(),
         );
         project_cli_runtime_event(&context(), &event)
-    }
-
-    #[test]
-    fn cli_runtime_projector_projects_turn_completed() {
-        let projected = project_cli_runtime_event(
-            &context(),
-            &RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
-                native_thread_id: Some("native_thread_1".to_owned()),
-                native_turn_id: "native_turn_1".to_owned(),
-                status: "completed".to_owned(),
-                native: None,
-            }),
-        );
-
-        assert!(projected.progress.is_empty());
-        assert!(projected.ignored.is_empty());
-        assert_eq!(
-            projected.durable,
-            vec![AgentDurableEvent::TurnCompleted {
-                thread_id: "thread_1".to_owned(),
-                turn_id: "turn_1".to_owned(),
-                recovery: None,
-            }]
-        );
-    }
-
-    #[test]
-    fn cli_runtime_projector_projects_agent_message_delta() {
-        let projected = project_cli_runtime_event(
-            &context(),
-            &RuntimeEvent::ItemDelta(RuntimeItemDelta {
-                native_thread_id: Some("native_thread_1".to_owned()),
-                native_turn_id: "native_turn_1".to_owned(),
-                native_item_id: "item_1".to_owned(),
-                item_kind: "agentMessage".to_owned(),
-                delta_kind: RuntimeItemDeltaKind::AgentMessage,
-                delta: "hello".to_owned(),
-                metadata: None,
-                native: None,
-            }),
-        );
-
-        assert!(projected.durable.is_empty());
-        assert!(projected.ignored.is_empty());
-        assert_eq!(projected.progress.len(), 1);
-        let AgentProgressEvent::ItemDelta { notification } = &projected.progress[0] else {
-            panic!("expected item delta");
-        };
-        assert_eq!(notification.workspace_id, "workspace_1");
-        assert_eq!(notification.thread_id, "thread_1");
-        assert_eq!(notification.turn_id, "turn_1");
-        assert_eq!(notification.item_id, "item_1");
-        assert_eq!(notification.delta, "hello");
-        assert_eq!(notification.stream, Some(ItemDeltaStream::AgentMessage));
-        assert_eq!(
-            notification
-                .payload
-                .as_ref()
-                .and_then(|payload| payload.get("nativeItemId")),
-            Some(&json!("item_1"))
-        );
-        assert_eq!(
-            notification
-                .payload
-                .as_ref()
-                .and_then(|payload| payload.get("runtimeDeltaKind")),
-            Some(&json!("agent_message"))
-        );
     }
 
     #[test]
@@ -1870,6 +1801,12 @@ mod tests {
             }),
         );
 
+        assert!(turn_completed.progress.is_empty());
+        assert!(turn_completed.ignored.is_empty());
+        assert!(delta_one.durable.is_empty());
+        assert!(delta_one.ignored.is_empty());
+        assert_eq!(delta_one.progress.len(), 1);
+
         let AgentDurableEvent::ItemStarted { notification } = &started.durable[0] else {
             panic!("expected item started");
         };
@@ -1883,8 +1820,25 @@ mod tests {
         let AgentProgressEvent::ItemDelta { notification } = &delta_one.progress[0] else {
             panic!("expected first item delta");
         };
+        assert_eq!(notification.workspace_id, "workspace_1");
+        assert_eq!(notification.thread_id, "thread_1");
+        assert_eq!(notification.turn_id, "turn_1");
         assert_eq!(notification.item_id, "native_item_message");
         assert_eq!(notification.delta, "Hel");
+        assert_eq!(
+            notification
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("nativeItemId")),
+            Some(&json!("native_item_message"))
+        );
+        assert_eq!(
+            notification
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("runtimeDeltaKind")),
+            Some(&json!("agent_message"))
+        );
         assert_eq!(notification.stream, Some(ItemDeltaStream::AgentMessage));
         assert_eq!(
             notification

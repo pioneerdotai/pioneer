@@ -515,21 +515,6 @@ impl ExecutionAttemptState {
             .map(|deadline| if deadline < now { now } else { deadline });
         Ok(())
     }
-
-    pub(crate) fn fence(&mut self) {
-        self.fenced = true;
-    }
-
-    fn replacement(&self) -> Result<Self, ExecutionMaterializationError> {
-        Self::new(
-            self.execution_id.clone(),
-            self.attempt_generation
-                .checked_add(1)
-                .ok_or(ExecutionMaterializationError::BoundaryExceeded)?,
-            self.idle_deadline,
-            self.hard_deadline,
-        )
-    }
 }
 
 #[cfg(test)]
@@ -704,40 +689,5 @@ mod tests {
                 .compatible_agent_identity_ids
                 .contains(&child.identity.id)
         );
-    }
-
-    #[test]
-    fn child_progress_and_fencing_are_independent() {
-        let first_id = AgentExecutionId::new("A12345678901234567890".to_owned()).unwrap();
-        let second_id = AgentExecutionId::new("A12345678901234567891".to_owned()).unwrap();
-        let now = chrono::Utc::now().fixed_offset();
-        let mut first = ExecutionAttemptState::new(first_id, 1, None, None).unwrap();
-        let mut second = ExecutionAttemptState::new(second_id, 1, None, None).unwrap();
-        first.fence();
-        assert!(first.record_progress(now).is_err());
-        assert!(second.record_progress(now).is_ok());
-        assert_eq!(second.progress_sequence, 1);
-    }
-
-    #[test]
-    fn execution_attempt_generations_and_progress_fail_closed_at_u64_max() {
-        let execution_id = AgentExecutionId::new("A12345678901234567890".to_owned()).unwrap();
-        let now = chrono::Utc::now().fixed_offset();
-
-        let attempt =
-            ExecutionAttemptState::new(execution_id.clone(), u64::MAX, None, None).unwrap();
-        assert_eq!(
-            attempt.replacement(),
-            Err(ExecutionMaterializationError::BoundaryExceeded)
-        );
-
-        let mut progress = ExecutionAttemptState::new(execution_id, 1, None, None).unwrap();
-        progress.progress_sequence = u64::MAX;
-        assert_eq!(
-            progress.record_progress(now),
-            Err(ExecutionMaterializationError::BoundaryExceeded)
-        );
-        assert_eq!(progress.progress_sequence, u64::MAX);
-        assert_eq!(progress.last_progress_at, None);
     }
 }

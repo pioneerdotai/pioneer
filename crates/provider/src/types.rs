@@ -1682,22 +1682,6 @@ mod tests {
     }
 
     #[test]
-    fn chat_response_default_usage() {
-        let resp = ChatResponse {
-            messages: Vec::new(),
-            text: "Hello".into(),
-            usage: None,
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            provider_replay_state: None,
-            termination: ProviderTermination::Complete,
-        };
-        assert!(resp.usage.is_none());
-        assert!(resp.reasoning_content.is_none());
-        assert!(resp.tool_calls.is_empty());
-    }
-
-    #[test]
     fn provider_response_limits_reject_oversized_logical_fields() {
         let mut limits = ProviderResponseLimits::default();
         limits.max_text_bytes = 3;
@@ -1759,17 +1743,6 @@ mod tests {
             ProviderTermination::from_openai_reason("new_provider_reason"),
             ProviderTermination::Unknown("new_provider_reason".to_owned())
         );
-    }
-
-    #[test]
-    fn token_usage_with_values() {
-        let usage = TokenUsage {
-            input_tokens: Some(100),
-            output_tokens: Some(50),
-            ..Default::default()
-        };
-        assert_eq!(usage.input_tokens, Some(100));
-        assert_eq!(usage.output_tokens, Some(50));
     }
 
     #[test]

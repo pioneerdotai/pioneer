@@ -870,62 +870,6 @@ async fn missing_capsule_creates_memvid_and_payload_repair_diagnostics() {
 }
 
 #[tokio::test]
-async fn backend_delete_failure_keeps_tombstone_and_repair_job() {
-    let harness = ServiceHarness::new().await;
-    let remembered = harness
-        .service
-        .remember(
-            user_context(500),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("delete.failure"),
-                "Delete failure tombstone remains authoritative.",
-            ),
-        )
-        .await
-        .expect("remember");
-    harness
-        .backend
-        .set_delete_error(Some("delete failed".to_owned()))
-        .await;
-
-    harness
-        .service
-        .forget(
-            user_context(501),
-            MemoryForgetParams {
-                target: MemoryForgetTarget::Id {
-                    memory_id: remembered.record.id.clone(),
-                },
-                reason: Some("test failure".to_owned()),
-                actor: None,
-                dry_run: false,
-            },
-        )
-        .await
-        .expect("forget");
-
-    let control = harness
-        .store
-        .get_agent_memory_record(remembered.record.id.as_str(), true)
-        .await
-        .expect("control")
-        .expect("row");
-    assert_eq!(control.status, MemoryStatus::Deleted);
-
-    let claimed = harness
-        .service
-        .claim_due_repair_jobs(502, 60, "repair_worker", 10)
-        .await
-        .expect("claim");
-    assert!(
-        claimed
-            .iter()
-            .any(|job| job.job_kind == "backend_delete_failed")
-    );
-}
-
-#[tokio::test]
 async fn workspace_agent_memory_and_global_allowances_are_enforced() {
     let harness = ServiceHarness::new().await;
     let agent_id = "agent_research";

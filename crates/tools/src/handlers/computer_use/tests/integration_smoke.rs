@@ -158,4 +158,11 @@ async fn computer_use_integration_smoke_mock_desktop_contract() {
         stopped.get("loop_state").and_then(JsonValue::as_str),
         Some("completed")
     );
+
+    assert_eq!(
+        open_path
+            .pointer("/trace/action_type")
+            .and_then(JsonValue::as_str),
+        Some("open_path")
+    );
 }

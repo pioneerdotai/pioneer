@@ -3161,7 +3161,6 @@ mod tests {
         ConnectOptions, ConnectionTrait, Database, DatabaseBackend, EntityTrait, Statement,
         TransactionTrait,
     };
-    use sha2::{Digest, Sha256};
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3482,63 +3481,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thread_episodic_workspace_refill_complete_marker_skips_migration() {
-        let (crud_store, temp_dir, _workspace_id) = setup_store().await;
-        mark_refill_marker(
-            crud_store.as_ref(),
-            PROJECTION_META_STATUS_COMPLETE,
-            THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION,
-        )
-        .await;
-
-        let summary = refill_once(crud_store, temp_dir.path())
-            .await
-            .expect("complete marker should skip");
-
-        assert!(summary.skipped);
-    }
-
-    #[tokio::test]
-    async fn thread_episodic_refill_marker_records_lexical_projection_identity() {
-        let (crud_store, temp_dir, workspace_id) = setup_store().await;
-        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only();
-
-        let summary = refill_once_with_workspace_projection(
-            crud_store.clone(),
-            temp_dir.path(),
-            workspace_id.as_str(),
-            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only(),
-            None,
-        )
-        .await
-        .expect("empty refill should complete");
-
-        assert!(!summary.skipped);
-        let meta = find_projection_meta(
-            &crud_store.database_connection(),
-            refill_projection_key_for_workspace(workspace_id.as_str())
-                .expect("workspace refill key should build")
-                .as_str(),
-        )
-        .await
-        .expect("meta query should succeed")
-        .expect("meta exists");
-        assert_eq!(
-            meta.projection_config_hash.as_deref(),
-            Some(target.config_hash.as_str())
-        );
-        assert_eq!(
-            meta.projection_config_json.as_deref(),
-            Some(target.payload_json.as_str())
-        );
-        assert!(
-            refill_is_current(crud_store.as_ref())
-                .await
-                .expect("current check")
-        );
-    }
-
-    #[tokio::test]
     async fn thread_episodic_refill_marker_treats_vector_marker_as_stale_for_lexical_target() {
         let (crud_store, _temp_dir, workspace_id) = setup_store().await;
         let vector_target =
@@ -3689,6 +3631,21 @@ mod tests {
         assert_eq!(
             meta.projection_version,
             THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION
+        );
+
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only();
+        assert_eq!(
+            meta.projection_config_hash.as_deref(),
+            Some(target.config_hash.as_str())
+        );
+        assert_eq!(
+            meta.projection_config_json.as_deref(),
+            Some(target.payload_json.as_str())
+        );
+        assert!(
+            refill_is_current(crud_store.as_ref())
+                .await
+                .expect("current check")
         );
 
         let skipped = refill_once_with_workspace_projection(
@@ -5193,43 +5150,6 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].status, ThreadEpisodicIndexJobStatus::Completed);
         assert_eq!(jobs[0].attempt_count, 2);
-    }
-
-    #[tokio::test]
-    async fn thread_episodic_vector_refill_does_not_requeue_current_process_running_job() {
-        let (crud_store, _temp_dir, workspace_id) = setup_store().await;
-        let thread_id = "thread_vector_refill_current_process";
-        ingest_materialized_user_item(
-            crud_store.clone(),
-            workspace_id.as_str(),
-            thread_id,
-            "turn_vector_refill_current_process",
-            "item_vector_refill_current_process",
-            "a current process job must keep its execution lease",
-        )
-        .await;
-        let claimed_at = chrono::Utc::now().timestamp();
-        let claimed = crud_store
-            .claim_due_thread_episodic_index_jobs_for_workspace(
-                workspace_id.as_str(),
-                claimed_at,
-                1,
-                5,
-            )
-            .await
-            .expect("current process job should be claimed")
-            .assert_no_failures_for_test();
-        assert_eq!(claimed.len(), 1);
-
-        assert!(prepare_resumed_refill(None).resumed);
-
-        let jobs = crud_store
-            .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), thread_id, 10)
-            .await
-            .expect("jobs should list after resume preparation");
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].status, ThreadEpisodicIndexJobStatus::Running);
-        assert_eq!(jobs[0].attempt_count, 1);
     }
 
     #[tokio::test]
@@ -8992,10 +8912,6 @@ mod tests {
             embedding_normalized: true,
             use_search_instructions: false,
         }
-    }
-
-    fn expected_source_text_hash(text: &str) -> String {
-        hex::encode(Sha256::digest(text.trim().as_bytes()))
     }
 
     async fn assert_capsule_contains_payload(

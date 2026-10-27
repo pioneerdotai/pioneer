@@ -1611,6 +1611,14 @@ mod tests {
         );
         assert!(core.complete_composer_operation(identity, ComposerOperationCompletion::Sent));
         assert!(
+            core.composer_store
+                .lock()
+                .unwrap()
+                .voice_sessions
+                .is_empty()
+        );
+        assert!(core.pending_voice_cleanup().is_none());
+        assert!(
             core.composer_snapshot("thread")
                 .unwrap()
                 .draft()
@@ -1913,26 +1921,5 @@ mod tests {
             .unwrap();
         core.cancel_composer_requests_for_thread("thread");
         assert_eq!(core.pending_voice_cleanup().unwrap().operation, identity);
-    }
-    #[test]
-    fn successful_voice_and_gateway_result_release_cleanup_capacity_without_cancel() {
-        let (core, identity, thread) = fixture();
-        let transport = Transport {
-            thread,
-            calls: Default::default(),
-            on_start: Box::new(|| {}),
-            fail_finalize: false,
-        };
-        core.start_composer_voice_session_using(start_request(identity.clone()), &transport)
-            .unwrap();
-        core.retire_voice_operation(&identity, true);
-        assert!(
-            core.composer_store
-                .lock()
-                .unwrap()
-                .voice_sessions
-                .is_empty()
-        );
-        assert!(core.pending_voice_cleanup().is_none());
     }
 }

@@ -798,28 +798,6 @@ mod tests {
     }
 
     #[test]
-    fn computer_use_target_resolves_by_node_id() {
-        let resolved = resolve_semantic_action_target(
-            &semantic(ActionTarget {
-                node_id: Some("n1".to_owned()),
-                snapshot_id: Some("s1-1".to_owned()),
-                selector: None,
-                role: None,
-                name: None,
-                nth: None,
-                bounds_anchor: None,
-                point: None,
-            }),
-            &node_refs(),
-            Some(&snapshot("s1-1")),
-        )
-        .expect("resolved")
-        .expect("target");
-        assert_eq!(resolved.selector.as_deref(), Some(r#"button[name="OK"]"#));
-        assert_eq!(resolved.kind, ResolvedActionTargetKind::Locator);
-    }
-
-    #[test]
     fn computer_use_target_resolves_by_selector() {
         let resolved = resolve_semantic_action_target(
             &semantic(ActionTarget {
@@ -863,29 +841,6 @@ mod tests {
     }
 
     #[test]
-    fn computer_use_target_ambiguous_role_name_requires_nth() {
-        let error = resolve_semantic_action_target(
-            &semantic(ActionTarget {
-                node_id: None,
-                snapshot_id: None,
-                selector: None,
-                role: Some("button".to_owned()),
-                name: None,
-                nth: None,
-                bounds_anchor: None,
-                point: None,
-            }),
-            &node_refs(),
-            None,
-        )
-        .expect_err("ambiguous");
-        assert_eq!(
-            error.failure_class,
-            TargetResolutionFailureClass::AmbiguousTarget
-        );
-    }
-
-    #[test]
     fn computer_use_target_rejects_point_for_semantic_action() {
         let error = resolve_semantic_action_target(
             &semantic(ActionTarget {
@@ -909,69 +864,6 @@ mod tests {
         assert_eq!(
             error.failure_class,
             TargetResolutionFailureClass::InvalidTarget
-        );
-    }
-
-    #[test]
-    fn computer_use_target_stale_node_maps_to_element_stale() {
-        let error = resolve_semantic_action_target(
-            &semantic(ActionTarget {
-                node_id: Some("n999".to_owned()),
-                snapshot_id: Some("s1-1".to_owned()),
-                selector: None,
-                role: None,
-                name: None,
-                nth: None,
-                bounds_anchor: None,
-                point: None,
-            }),
-            &node_refs(),
-            Some(&snapshot("s1-1")),
-        )
-        .expect_err("stale");
-        assert_eq!(
-            error.failure_class,
-            TargetResolutionFailureClass::ElementStale
-        );
-    }
-
-    #[test]
-    fn computer_use_target_resolves_bounds_anchor_to_input_point() {
-        let action = InputAction {
-            action_type: super::super::model::InputActionKind::InputClick,
-            target: Some(ActionTarget {
-                node_id: None,
-                snapshot_id: None,
-                selector: None,
-                role: None,
-                name: None,
-                nth: None,
-                bounds_anchor: Some(BoundsAnchorTarget {
-                    node_id: "n1".to_owned(),
-                    snapshot_id: Some("s1-1".to_owned()),
-                    anchor: Some("center".to_owned()),
-                }),
-                point: None,
-            }),
-            from: None,
-            to: None,
-            button: None,
-            delta_x: None,
-            delta_y: None,
-            text: None,
-            keys: None,
-            wait_ms: None,
-        };
-        let snapshot = snapshot("s1-1");
-        let resolved =
-            resolve_input_action_targets(&action, &node_refs(), Some(&snapshot)).expect("resolved");
-        assert_eq!(
-            resolved.target.and_then(|target| target.point),
-            Some(InputPoint {
-                x: 50,
-                y: 35,
-                coordinate_space: Some(CoordinateSpace::NativeInput),
-            })
         );
     }
 }

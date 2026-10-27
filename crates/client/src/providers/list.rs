@@ -1321,29 +1321,6 @@ mod tests {
     }
 
     #[test]
-    fn cli_runtime_backend_rejects_non_ready_runtime() {
-        let error = resolve_cli_runtime_execution_backend(
-            Some("cli_runtime:codex"),
-            &[runtime_summary(
-                "codex",
-                "Codex CLI",
-                RuntimeStatus::Initializing,
-            )],
-        )
-        .expect_err("initializing CLI runtime must not be selected");
-
-        assert!(error.contains("not ready"));
-    }
-
-    #[test]
-    fn cli_runtime_backend_rejects_missing_cli_runtime_provider() {
-        let error = resolve_cli_runtime_execution_backend(Some("cli_runtime:missing"), &[])
-            .expect_err("missing CLI runtime must not fall through to API provider");
-
-        assert!(error.contains("missing"));
-    }
-
-    #[test]
     fn provider_model_list_params_preserve_workspace_and_provider() {
         assert_eq!(provider_list_params("ws").workspace_id, "ws");
 
@@ -1362,5 +1339,32 @@ mod tests {
         let params = cli_runtime_list_models_params("ws", "codex_work");
         assert_eq!(params.workspace_id, "ws");
         assert_eq!(params.runtime_id, "codex_work");
+    }
+
+    #[test]
+    fn cli_runtime_backend_rejects_unavailable_runtime_matrix() {
+        for (provider, runtimes, failure_message, expected_error) in [
+            (
+                "cli_runtime:codex",
+                vec![runtime_summary(
+                    "codex",
+                    "Codex CLI",
+                    RuntimeStatus::Initializing,
+                )],
+                "initializing CLI runtime must not be selected",
+                "not ready",
+            ),
+            (
+                "cli_runtime:missing",
+                vec![],
+                "missing CLI runtime must not fall through to API provider",
+                "missing",
+            ),
+        ] {
+            let error = resolve_cli_runtime_execution_backend(Some(provider), &runtimes)
+                .expect_err(failure_message);
+
+            assert!(error.contains(expected_error), "{provider}: {error}");
+        }
     }
 }

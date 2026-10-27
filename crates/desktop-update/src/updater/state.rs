@@ -512,27 +512,6 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn env_flag_accepts_common_truthy_values() {
-        for value in ["1", "true", "TRUE", "yes", "on", " On "] {
-            assert!(env_flag_enabled(Some(value)));
-        }
-    }
-
-    #[test]
-    fn env_flag_rejects_empty_and_false_values() {
-        for value in [
-            None,
-            Some(""),
-            Some("0"),
-            Some("false"),
-            Some("off"),
-            Some("no"),
-        ] {
-            assert!(!env_flag_enabled(value));
-        }
-    }
-
-    #[test]
     fn config_uses_cli_compatible_release_defaults() {
         let config = DesktopUpdateConfig::from_lookup(|_| None);
 
@@ -700,6 +679,26 @@ mod tests {
             arch: "aarch64".to_owned(),
             kind: "macos_app_zip".to_owned(),
             size_bytes: 14,
+        }
+    }
+
+    #[test]
+    fn env_flag_matches_explicit_value_matrix() {
+        for (value, expected) in [
+            (Some("1"), true),
+            (Some("true"), true),
+            (Some("TRUE"), true),
+            (Some("yes"), true),
+            (Some("on"), true),
+            (Some(" On "), true),
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some("false"), false),
+            (Some("off"), false),
+            (Some("no"), false),
+        ] {
+            assert_eq!(env_flag_enabled(value), expected, "{value:?}");
         }
     }
 }

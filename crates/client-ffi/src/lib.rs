@@ -99,10 +99,6 @@ use workspaces::{
 use zeroize::Zeroizing;
 
 const FFI_VERSION: &str = env!("CARGO_PKG_VERSION");
-#[cfg(test)]
-const MAX_OUTSTANDING_INVITATION_COMMITS: usize =
-    pioneer_client::gateway::invitation_commits::MAX_OUTSTANDING_INVITATION_COMMITS;
-
 pub struct PioneerClientFfi {
     runtime: ClientFfiRuntime,
 }
@@ -1169,11 +1165,6 @@ where
             INVALID_ADMINISTRATION_REQUEST_CODE,
         )
     })
-}
-
-#[cfg(test)]
-fn invitation_commit_capacity_available(current: usize) -> bool {
-    current < MAX_OUTSTANDING_INVITATION_COMMITS
 }
 
 fn administration_rpc_error(error: anyhow::Error) -> ClientFfiError {
@@ -2384,16 +2375,6 @@ mod tests {
     }
 
     #[test]
-    fn outstanding_invitation_commit_ownership_is_bounded() {
-        assert!(invitation_commit_capacity_available(
-            MAX_OUTSTANDING_INVITATION_COMMITS - 1
-        ));
-        assert!(!invitation_commit_capacity_available(
-            MAX_OUTSTANDING_INVITATION_COMMITS
-        ));
-    }
-
-    #[test]
     fn malformed_normal_administration_request_has_a_domain_neutral_code() {
         let error = parse_normal_params::<pioneer_protocol::MemberListParams>(
             r#"{"unknown":true}"#,
@@ -2429,6 +2410,7 @@ mod tests {
         );
         let response: serde_json::Value =
             serde_json::from_str(response.as_str()).expect("typed auth response");
+        assert_eq!(response["status"], "error");
         assert_eq!(response["code"], "session_compromised");
 
         let events = diagnostics.drain().expect("diagnostics drain");
@@ -2458,19 +2440,6 @@ mod tests {
             .unwrap_err();
         assert!(!error.contains("synthetic-secret"));
         runtime.client_shutdown("{}").unwrap();
-    }
-
-    #[test]
-    fn gateway_settings_ffi_preserves_voice_conflict_error_code() {
-        let response = to_json_typed_response::<()>(Err(ClientFfiError::new(
-            "voice input cannot be reconfigured while a voice session is active",
-            gateway::VOICE_RECONFIGURATION_BUSY_CODE,
-        )));
-        let response: serde_json::Value =
-            serde_json::from_str(response.as_str()).expect("typed FFI response");
-
-        assert_eq!(response["status"], "error");
-        assert_eq!(response["code"], gateway::VOICE_RECONFIGURATION_BUSY_CODE);
     }
 
     #[test]

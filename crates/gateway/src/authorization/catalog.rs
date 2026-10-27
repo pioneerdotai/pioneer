@@ -527,16 +527,6 @@ mod tests {
             .collect()
     }
 
-    fn unregistered_sensitive_tools<'a>(
-        tool_names: impl IntoIterator<Item = &'a str>,
-    ) -> Vec<&'a str> {
-        let registered = static_tool_catalog_names();
-        tool_names
-            .into_iter()
-            .filter(|tool_name| !registered.contains(tool_name))
-            .collect()
-    }
-
     #[test]
     fn catalog_covers_every_rpc_and_binary_ingress_exactly_once() {
         let catalog = authorization_catalog();
@@ -597,20 +587,16 @@ mod tests {
             .map(|name| name.as_str().to_owned()),
         );
 
-        assert_eq!(
-            unregistered_sensitive_tools(sensitive.iter().map(String::as_str)),
-            Vec::<&str>::new()
-        );
         let registered = static_tool_catalog_names();
-        assert_eq!(registered.len(), INTERNAL_TOOL_RECORDS.len());
-    }
-
-    #[test]
-    fn an_unregistered_sensitive_tool_fails_the_inventory_gate() {
-        assert_eq!(
-            unregistered_sensitive_tools(["read_file", "future_sensitive_tool"]),
-            vec!["future_sensitive_tool"]
+        let sensitive_names = sensitive
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            sensitive_names.is_subset(&registered),
+            "every actual static builtin/domain tool must have an authorization catalog record"
         );
+        assert_eq!(registered.len(), INTERNAL_TOOL_RECORDS.len());
     }
 
     #[test]

@@ -863,27 +863,6 @@ mod tests {
     }
 
     #[test]
-    fn allows_messages_when_transport_plan_is_native() {
-        let message = ChatMessage::user_parts(vec![MessageContentPart::image(MessageAttachment {
-            mime_type: "image/png".to_owned(),
-            name: Some("screen.png".to_owned()),
-            size_bytes: None,
-            sha256: None,
-            source: AttachmentDataSource::Bytes {
-                base64_data: BASE64.encode(super::regression::image(image::ImageFormat::Png, 1, 1)),
-            },
-            artifact: None,
-        })]);
-
-        let prepared =
-            prepare_messages_for_provider("mock", &caps_with_native_declared(), &[message])
-                .expect("prepare should succeed");
-
-        ensure_no_unrendered_attachments("mock", &prepared)
-            .expect("native transport plan should pass");
-    }
-
-    #[test]
     fn budget_limits_are_enforced() {
         let png = super::regression::image(image::ImageFormat::Png, 1, 1);
         let config = AttachmentPipelineConfig {

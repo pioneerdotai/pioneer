@@ -261,24 +261,23 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn execution_continuation_prompt_is_operational() {
-        let prompt = render_execution_continuation_prompt();
-
-        assert!(prompt.contains("same user turn"));
-        assert!(prompt.contains("new execution window"));
-        assert!(prompt.contains("without restarting"));
-        assert!(prompt.contains("Do not replay prior failed tool calls verbatim"));
-        assert!(!prompt.contains("completed"));
-        assert!(!prompt.contains("successful"));
-    }
-
-    #[test]
     fn execution_continuation_section_is_independent() {
         let section = execution_continuation_section();
 
         assert_eq!(section.id, PromptSectionId::ExecutionContinuation);
         assert_eq!(section.title, "Execution Continuation");
         assert_eq!(section.stability, PromptStability::Dynamic);
+
+        assert!(section.content.contains("same user turn"));
+        assert!(section.content.contains("new execution window"));
+        assert!(section.content.contains("without restarting"));
+        assert!(
+            section
+                .content
+                .contains("Do not replay prior failed tool calls verbatim")
+        );
+        assert!(!section.content.contains("completed"));
+        assert!(!section.content.contains("successful"));
     }
 
     #[test]

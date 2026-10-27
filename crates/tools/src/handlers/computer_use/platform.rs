@@ -815,76 +815,46 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn computer_use_macos_launch_plan_uses_open_a_for_app_name() {
-        let plan = launch_command_plan(
-            &AppTarget {
-                name: Some("ExampleApp".to_owned()),
+    fn macos_launch_plan_preserves_target_forms() {
+        for (name, bundle_id, executable_path, expected_args) in [
+            (Some("ExampleApp"), None, None, vec!["-a", "ExampleApp"]),
+            (
+                None,
+                Some("com.example.App"),
+                None,
+                vec!["-b", "com.example.App"],
+            ),
+            (
+                None,
+                None,
+                Some("/Applications/Example.app"),
+                vec!["/Applications/Example.app"],
+            ),
+            (
+                None,
+                None,
+                Some("/Applications/Example.app/Contents/MacOS/Example"),
+                vec!["/Applications/Example.app"],
+            ),
+        ] {
+            let target = AppTarget {
+                name: name.map(str::to_owned),
                 pid: None,
                 identity_key: None,
-                bundle_id: None,
-                executable_path: None,
-            },
-            None,
-        )
-        .expect("plan");
-        assert_eq!(plan.program, "/usr/bin/open");
-        assert_eq!(plan.args, vec!["-a".to_owned(), "ExampleApp".to_owned()]);
-        assert!(plan.wait_for_exit);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn computer_use_macos_launch_plan_supports_bundle_id_and_executable_path() {
-        let bundle_plan = launch_command_plan(
-            &AppTarget {
-                name: None,
-                pid: None,
-                identity_key: None,
-                bundle_id: Some("com.example.App".to_owned()),
-                executable_path: None,
-            },
-            None,
-        )
-        .expect("bundle plan");
-        assert_eq!(bundle_plan.program, "/usr/bin/open");
-        assert_eq!(
-            bundle_plan.args,
-            vec!["-b".to_owned(), "com.example.App".to_owned()]
-        );
-        assert!(bundle_plan.wait_for_exit);
-
-        let path_plan = launch_command_plan(
-            &AppTarget {
-                name: None,
-                pid: None,
-                identity_key: None,
-                bundle_id: None,
-                executable_path: Some("/Applications/Example.app".to_owned()),
-            },
-            None,
-        )
-        .expect("path plan");
-        assert_eq!(path_plan.program, "/usr/bin/open");
-        assert_eq!(path_plan.args, vec!["/Applications/Example.app".to_owned()]);
-        assert!(path_plan.wait_for_exit);
-
-        let executable_plan = launch_command_plan(
-            &AppTarget {
-                name: None,
-                pid: None,
-                identity_key: None,
-                bundle_id: None,
-                executable_path: Some(
-                    "/Applications/Example.app/Contents/MacOS/Example".to_owned(),
-                ),
-            },
-            None,
-        )
-        .expect("executable path plan");
-        assert_eq!(
-            executable_plan.args,
-            vec!["/Applications/Example.app".to_owned()]
-        );
+                bundle_id: bundle_id.map(str::to_owned),
+                executable_path: executable_path.map(str::to_owned),
+            };
+            let expected = CommandPlan {
+                program: "/usr/bin/open".to_owned(),
+                args: expected_args.into_iter().map(str::to_owned).collect(),
+                wait_for_exit: true,
+            };
+            assert_eq!(
+                launch_command_plan(&target, None).expect("launch plan"),
+                expected,
+                "target: {target:?}"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]

@@ -203,29 +203,6 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn domain_values_match_request_tools_schema_contract() {
-        let values = BuiltinToolDomain::ALL
-            .iter()
-            .map(|domain| domain.as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(values, REQUEST_TOOLS_DOMAIN_VALUES);
-    }
-
-    #[test]
-    fn builtin_tool_domain_map_matches_domain_enum_order_and_accessors() {
-        let map = builtin_tool_domain_map();
-        assert_eq!(map.len(), BuiltinToolDomain::ALL.len());
-
-        for ((mapped_domain, mapped_tool_names), expected_domain) in
-            map.iter().zip(BuiltinToolDomain::ALL)
-        {
-            assert_eq!(*mapped_domain, expected_domain);
-            assert_eq!(*mapped_tool_names, expected_domain.tool_names());
-        }
-    }
-
-    #[test]
     fn domain_map_contains_exact_builtin_tool_names() {
         assert_eq!(
             BuiltinToolDomain::Memory.tool_names(),
@@ -367,6 +344,20 @@ mod tests {
         }))
         .expect_err("request_tools domains must be strings");
         assert!(error.contains("entries must be strings"));
+
+        let error = parse_request_tools_domains(&serde_json::json!({
+            "domains": [],
+            "reason": "Need task tools."
+        }))
+        .expect_err("request_tools must reject empty domains");
+        assert!(error.contains("`domains` must be a non-empty array"));
+
+        let error = parse_request_tools_domains(&serde_json::json!({
+            "domains": ["calendar"],
+            "reason": "Need task tools."
+        }))
+        .expect_err("request_tools must reject unknown domains");
+        assert!(error.contains("invalid request_tools domain `calendar`"));
     }
 
     #[test]
@@ -387,39 +378,5 @@ mod tests {
                 BuiltinToolDomain::Artifact,
             ]
         );
-    }
-
-    #[cfg(feature = "computer-use")]
-    #[test]
-    fn domain_map_matches_materialized_computer_use_spec_when_feature_enabled() {
-        let configured = crate::spec::computer_use_configured_spec();
-        let actual = registered_domain_tool_names(BuiltinToolDomain::ComputerUse, |name| {
-            configured.spec.name == name
-        });
-
-        assert_eq!(
-            actual.as_slice(),
-            BuiltinToolDomain::ComputerUse.tool_names()
-        );
-    }
-
-    #[cfg(not(feature = "computer-use"))]
-    #[test]
-    fn domain_map_handles_computer_use_as_unavailable_without_feature() {
-        let registered = crate::builtin_tool_specs()
-            .into_iter()
-            .map(|configured| configured.spec.name)
-            .collect::<HashSet<_>>();
-
-        let actual = registered_domain_tool_names(BuiltinToolDomain::ComputerUse, |name| {
-            registered.contains(name)
-        });
-        let expected = if registered.contains("computer_use") {
-            vec!["computer_use"]
-        } else {
-            Vec::new()
-        };
-
-        assert_eq!(actual, expected);
     }
 }

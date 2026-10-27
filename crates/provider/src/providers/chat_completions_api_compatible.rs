@@ -2580,15 +2580,6 @@ mod tests {
     }
 
     #[test]
-    fn chat_completions_url_appended() {
-        let provider = test_provider();
-        assert_eq!(
-            provider.chat_completions_url(),
-            "https://api.example.com/v1/chat/completions"
-        );
-    }
-
-    #[test]
     fn registry_endpoint_profiles_construct_exact_chat_and_discovery_routes() {
         let profiles: Vec<serde_json::Value> =
             serde_json::from_str(include_str!("../../tests/fixtures/endpoint_profiles.json"))
@@ -2656,34 +2647,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn chat_completions_url_already_present() {
-        let provider = ChatCompletionsApiCompatibleProvider::new(
-            "test",
-            "https://api.example.com/v1/chat/completions",
-            "key",
-            AuthStyle::Bearer,
-        );
-        assert_eq!(
-            provider.chat_completions_url(),
-            "https://api.example.com/v1/chat/completions"
-        );
-    }
-
-    #[test]
-    fn chat_completions_url_trims_trailing_slash() {
-        let provider = ChatCompletionsApiCompatibleProvider::new(
-            "test",
-            "https://api.example.com/v1/",
-            "key",
-            AuthStyle::Bearer,
-        );
-        assert_eq!(
-            provider.chat_completions_url(),
-            "https://api.example.com/v1/chat/completions"
-        );
     }
 
     #[test]
@@ -3034,73 +2997,6 @@ mod tests {
     }
 
     #[test]
-    fn merge_system_into_first_user_message() {
-        let provider = test_provider().with_merge_system_into_user(true);
-        let messages = vec![
-            ChatMessage::system("You are a helpful assistant."),
-            ChatMessage::user("Hello"),
-            ChatMessage::assistant("Hi!"),
-        ];
-
-        let prepared = prepared_for(&provider, messages.as_slice());
-        let api_messages = provider.merge_system_messages(&prepared).unwrap();
-
-        assert_eq!(api_messages.len(), 2);
-        assert_eq!(api_messages[0].role, "user");
-        assert_eq!(
-            text_content(&api_messages[0].content),
-            Some("You are a helpful assistant.\n\nHello")
-        );
-        assert_eq!(api_messages[1].role, "assistant");
-    }
-
-    #[test]
-    fn merge_multiple_system_messages() {
-        let provider = test_provider().with_merge_system_into_user(true);
-        let messages = vec![
-            ChatMessage::system("Rule 1"),
-            ChatMessage::system("Rule 2"),
-            ChatMessage::user("Hello"),
-        ];
-
-        let prepared = prepared_for(&provider, messages.as_slice());
-        let api_messages = provider.merge_system_messages(&prepared).unwrap();
-
-        assert_eq!(api_messages.len(), 1);
-        assert_eq!(api_messages[0].role, "user");
-        assert_eq!(
-            text_content(&api_messages[0].content),
-            Some("Rule 1\nRule 2\n\nHello")
-        );
-    }
-
-    #[test]
-    fn merge_system_only_no_user() {
-        let provider = test_provider().with_merge_system_into_user(true);
-        let messages = vec![ChatMessage::system("System only")];
-
-        let prepared = prepared_for(&provider, messages.as_slice());
-        let api_messages = provider.merge_system_messages(&prepared).unwrap();
-
-        assert_eq!(api_messages.len(), 1);
-        assert_eq!(api_messages[0].role, "user");
-        assert_eq!(text_content(&api_messages[0].content), Some("System only"));
-    }
-
-    #[test]
-    fn merge_no_system_messages() {
-        let provider = test_provider().with_merge_system_into_user(true);
-        let messages = vec![ChatMessage::user("Hello"), ChatMessage::assistant("Hi!")];
-
-        let prepared = prepared_for(&provider, messages.as_slice());
-        let api_messages = provider.merge_system_messages(&prepared).unwrap();
-
-        assert_eq!(api_messages.len(), 2);
-        assert_eq!(api_messages[0].role, "user");
-        assert_eq!(text_content(&api_messages[0].content), Some("Hello"));
-    }
-
-    #[test]
     fn merge_mode_uses_compiled_prompt_full_text() {
         let provider = test_provider().with_merge_system_into_user(true);
         let request = ChatRequest {
@@ -3196,17 +3092,6 @@ mod tests {
     }
 
     #[test]
-    fn api_response_deserializes() {
-        let json = r#"{"choices":[{"message":{"content":"Hello from API"}}]}"#;
-        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.choices.len(), 1);
-        assert_eq!(
-            response.choices[0].message.content.as_deref(),
-            Some("Hello from API")
-        );
-    }
-
-    #[test]
     fn api_response_with_usage() {
         let json = r#"{
             "choices": [{"message": {"content": "Hello"}}],
@@ -3226,22 +3111,6 @@ mod tests {
     }
 
     #[test]
-    fn stream_response_deserializes_delta() {
-        let json = r#"{"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}"#;
-        let response: StreamResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.choices.len(), 1);
-        assert_eq!(response.choices[0].delta.content.as_deref(), Some("Hello"));
-        assert!(response.choices[0].finish_reason.is_none());
-    }
-
-    #[test]
-    fn stream_response_deserializes_finish() {
-        let json = r#"{"choices":[{"delta":{"content":null},"finish_reason":"stop"}]}"#;
-        let response: StreamResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.choices[0].finish_reason.as_deref(), Some("stop"));
-    }
-
-    #[test]
     fn stream_response_deserializes_error_envelope_without_delta() {
         let json = r#"{"error":{"message":"upstream failed","type":"provider_error","code":"overloaded"},"choices":[{"finish_reason":"error"}]}"#;
         let response: StreamResponse = serde_json::from_str(json).unwrap();
@@ -3255,28 +3124,76 @@ mod tests {
     }
 
     #[test]
-    fn provider_name() {
-        use crate::traits::Provider;
-        let provider = test_provider();
-        assert_eq!(provider.name(), "test-provider");
-    }
-
-    #[test]
-    fn provider_capabilities_default() {
-        use crate::traits::Provider;
-        let provider = test_provider();
-        let caps = provider.capabilities();
-        assert!(caps.streaming);
-        assert!(!caps.vision);
-    }
-
-    #[test]
     fn provider_capabilities_with_vision() {
         use crate::traits::Provider;
         let provider = test_provider().with_vision(true);
         let caps = provider.capabilities();
         assert!(caps.streaming);
         assert!(caps.vision);
+    }
+
+    #[test]
+    fn provider_metadata_preserves_default_identity_and_capabilities() {
+        use crate::traits::Provider;
+        let provider = test_provider();
+        assert_eq!(provider.name(), "test-provider");
+        let caps = provider.capabilities();
+        assert!(caps.streaming);
+        assert!(!caps.vision);
+    }
+
+    #[test]
+    fn system_message_merge_matrix() {
+        let cases = [
+            (
+                "merge_system_into_first_user_message",
+                vec![
+                    ChatMessage::system("You are a helpful assistant."),
+                    ChatMessage::user("Hello"),
+                    ChatMessage::assistant("Hi!"),
+                ],
+                vec!["user", "assistant"],
+                "You are a helpful assistant.\n\nHello",
+            ),
+            (
+                "merge_multiple_system_messages",
+                vec![
+                    ChatMessage::system("Rule 1"),
+                    ChatMessage::system("Rule 2"),
+                    ChatMessage::user("Hello"),
+                ],
+                vec!["user"],
+                "Rule 1\nRule 2\n\nHello",
+            ),
+            (
+                "merge_system_only_no_user",
+                vec![ChatMessage::system("System only")],
+                vec!["user"],
+                "System only",
+            ),
+            (
+                "merge_no_system_messages",
+                vec![ChatMessage::user("Hello"), ChatMessage::assistant("Hi!")],
+                vec!["user", "assistant"],
+                "Hello",
+            ),
+        ];
+        for (case, messages, expected_roles, expected_first_text) in cases {
+            let provider = test_provider().with_merge_system_into_user(true);
+            let prepared = prepared_for(&provider, messages.as_slice());
+            let api_messages = provider.merge_system_messages(&prepared).unwrap();
+            assert_eq!(api_messages.len(), expected_roles.len(), "{case}");
+            let roles: Vec<_> = api_messages
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect();
+            assert_eq!(roles, expected_roles, "{case}");
+            assert_eq!(
+                text_content(&api_messages[0].content),
+                Some(expected_first_text),
+                "{case}"
+            );
+        }
     }
 }
 

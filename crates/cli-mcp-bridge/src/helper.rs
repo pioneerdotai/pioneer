@@ -376,6 +376,8 @@ mod tests {
 
     #[test]
     fn helper_hidden_args_require_exact_non_secret_shape() {
+        assert_eq!(HIDDEN_HELPER_COMMAND, "__cli-mcp-stdio");
+        assert_eq!(BOOTSTRAP_FILE_FLAG, "--bootstrap-file");
         assert!(
             parse_hidden_helper_args(std::iter::empty())
                 .unwrap()

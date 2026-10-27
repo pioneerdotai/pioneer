@@ -1120,6 +1120,8 @@ async fn registry_audio_text_continuation_records_actual_chat_route() {
         let response = provider.chat(req).await.unwrap();
         assert_eq!(response.text, "heard");
         let usage = response.usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(5));
+        assert_eq!(usage.output_tokens, Some(2));
         assert_eq!(usage.api.as_deref(), Some("chat_completions"));
         assert!(usage.route.unwrap().ends_with(";path=/chat/completions"));
         assert!(usage.physical_attempt_id.is_some());
