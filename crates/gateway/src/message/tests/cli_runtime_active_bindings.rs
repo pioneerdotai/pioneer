@@ -523,11 +523,18 @@ async fn cli_active_terminal_snapshot_resume_wins_without_new_execution_effects_
         .mcp_service
         .hold_test_turn_mcp_invocation(GUARDED_TURN, cancel.clone());
     let lease = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+    let session_handle = processor
+        .cli_runtime_manager
+        .as_ref()
+        .unwrap()
+        .get_or_start(CLIAgentRuntimeSessionKey::new(&workspace, "codex", GUARDED_THREAD).unwrap())
+        .await
+        .unwrap();
     processor
         .cli_runtime_session_turn_leases
         .lock()
         .await
-        .insert(GUARDED_TURN.into(), lease);
+        .insert(GUARDED_TURN.into(), (lease, session_handle));
     let events = pioneer_entity::turn_event::Entity::find()
         .filter(pioneer_entity::turn_event::Column::TurnId.eq(GUARDED_TURN))
         .count(&store.database_connection())
@@ -1063,11 +1070,18 @@ async fn cli_blocked_observation_rejects_old_segment_at_writer_and_fresh_snapsho
     let now = chrono::Utc::now().fixed_offset();
     let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
     let lease = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+    let session_handle = processor
+        .cli_runtime_manager
+        .as_ref()
+        .unwrap()
+        .existing_session(&key)
+        .await
+        .unwrap();
     processor
         .cli_runtime_session_turn_leases
         .lock()
         .await
-        .insert(BLOCKED_TURN.into(), lease);
+        .insert(BLOCKED_TURN.into(), (lease, session_handle));
     let cancellation = tokio_util::sync::CancellationToken::new();
     let _invocation = processor
         .mcp_service
@@ -1637,13 +1651,25 @@ async fn cli_timeout_terminal_cleanup_rejects_resume_and_late_effects_after_comp
         let _invocation = processor
             .mcp_service
             .hold_test_turn_mcp_invocation(GUARDED_TURN, cancel.clone());
+        let session_handle = processor
+            .cli_runtime_manager
+            .as_ref()
+            .unwrap()
+            .get_or_start(
+                CLIAgentRuntimeSessionKey::new(&workspace, "codex", GUARDED_THREAD).unwrap(),
+            )
+            .await
+            .unwrap();
         processor
             .cli_runtime_session_turn_leases
             .lock()
             .await
             .insert(
                 GUARDED_TURN.into(),
-                Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+                (
+                    Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+                    session_handle,
+                ),
             );
         let binding = store
             .get_cli_runtime_turn_binding(GUARDED_TURN)
@@ -2226,11 +2252,18 @@ async fn cli_old_native_failed_producer_cannot_open_recovery_or_cleanup_resumed_
         .mcp_service
         .hold_test_turn_mcp_invocation(GUARDED_TURN, cancel.clone());
     let lease = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+    let session_handle = processor
+        .cli_runtime_manager
+        .as_ref()
+        .unwrap()
+        .get_or_start(CLIAgentRuntimeSessionKey::new(&workspace, "codex", GUARDED_THREAD).unwrap())
+        .await
+        .unwrap();
     processor
         .cli_runtime_session_turn_leases
         .lock()
         .await
-        .insert(GUARDED_TURN.into(), lease);
+        .insert(GUARDED_TURN.into(), (lease, session_handle));
     let before = store
         .cli_runtime_turn_terminal_guard(
             &store

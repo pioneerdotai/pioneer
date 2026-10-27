@@ -673,7 +673,7 @@ pub struct MessageProcessor {
         >,
     >,
     cli_runtime_session_turn_leases:
-        Arc<Mutex<HashMap<String, tokio::sync::OwnedMutexGuard<()>>>>,
+        Arc<Mutex<HashMap<String, (tokio::sync::OwnedMutexGuard<()>, crate::cli_runtime::manager::CLIAgentRuntimeSessionHandle)>>>,
     cli_runtime_command_heartbeats: CliRuntimeCommandHeartbeatTracker,
     artifact_tool_states: Arc<Mutex<HashMap<String, Arc<ArtifactToolState>>>>,
     artifact_output_dirs: Arc<Mutex<HashMap<String, pioneer_artifacts::ArtifactOutputDir>>>,

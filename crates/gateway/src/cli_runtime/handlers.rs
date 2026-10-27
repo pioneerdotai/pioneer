@@ -3356,11 +3356,8 @@ impl MessageProcessor {
             params: None,
             raw: json!({"id": native_request_id, "method": method}),
         };
-        let responder = CLIAgentRuntimeMachineRequestResponder::new(
-            handle.instance().clone(),
-            native_request_id,
-            handle.session(),
-        );
+        let responder =
+            CLIAgentRuntimeMachineRequestResponder::from_handle(handle.clone(), native_request_id);
         self.register_cli_runtime_machine_request(handle.instance(), &request, responder, opened)
             .await;
         if self
@@ -3450,7 +3447,18 @@ impl MessageProcessor {
             );
         }
         if let Some(receivers) = codex_receivers {
-            self.spawn_codex_event_pumps(instance.clone(), session, receivers, debug_native_events);
+            let idle_retirement = if let Some(manager) = self.cli_runtime_manager.as_ref() {
+                manager.idle_retirement_signal(instance).await
+            } else {
+                None
+            };
+            self.spawn_codex_event_pumps(
+                instance.clone(),
+                session,
+                receivers,
+                debug_native_events,
+                idle_retirement,
+            );
         }
     }
 
@@ -3844,6 +3852,7 @@ impl MessageProcessor {
         session: Arc<dyn CLIAgentRuntimeSession>,
         receivers: CLIAgentRuntimeCodexEventReceivers,
         debug_native_events: bool,
+        idle_retirement: Option<tokio_util::sync::CancellationToken>,
     ) {
         let options = RuntimeEventMappingOptions {
             include_redacted_native_payload: debug_native_events,
@@ -3926,11 +3935,29 @@ impl MessageProcessor {
             while let Some(request) = server_requests.recv().await {
                 let native_request_id = serde_json::to_value(&request.id)
                     .unwrap_or_else(|_| JsonValue::String(request.id.to_string()));
-                let responder = CLIAgentRuntimeMachineRequestResponder::new(
-                    request_instance.clone(),
-                    native_request_id,
-                    session.clone(),
-                );
+                // Acquire a handle under the manager registry lock before any
+                // await that uses this response lane. A pump itself holds only
+                // the raw session Arc so it never pins an otherwise idle process.
+                let current = if let Some(manager) = request_processor.cli_runtime_manager.as_ref()
+                {
+                    manager
+                        .existing_session(&request_key)
+                        .await
+                        .filter(|handle| handle.instance() == &request_instance)
+                } else {
+                    None
+                };
+                let responder = if let Some(handle) = current {
+                    CLIAgentRuntimeMachineRequestResponder::from_handle(handle, native_request_id)
+                } else {
+                    // Stale requests still receive an origin-bound rejection;
+                    // they must never acquire a replacement generation's pin.
+                    CLIAgentRuntimeMachineRequestResponder::new(
+                        request_instance.clone(),
+                        native_request_id,
+                        session.clone(),
+                    )
+                };
                 if !request_processor
                     .cli_runtime_instance_is_current(&request_instance)
                     .await
@@ -3992,6 +4019,12 @@ impl MessageProcessor {
                 if diagnostic.kind
                     == pioneer_cli_agent_runtime::codex::CodexJsonlRpcClientDiagnosticKind::SessionRecoveryRequired
                 {
+                    // Idle eviction is a deliberate generation close. A late
+                    // diagnostic must not recover a subsequently admitted Turn
+                    // while its replacement process has not been published yet.
+                    if idle_retirement.as_ref().is_some_and(|signal| signal.is_cancelled()) {
+                        continue;
+                    }
                     warn!(
                         workspace_id = diagnostic_key.workspace_id.as_str(),
                         runtime_id = diagnostic_key.runtime_id.as_str(),
@@ -4004,6 +4037,7 @@ impl MessageProcessor {
                         .enqueue_codex_transport_session_recovery(
                             &diagnostic_instance,
                             diagnostic.message.as_str(),
+                            idle_retirement.as_ref(),
                         )
                         .await;
                     continue;
@@ -4035,10 +4069,22 @@ impl MessageProcessor {
         &self,
         instance: &CliSessionInstanceId,
         reason: &str,
+        idle_retirement: Option<&tokio_util::sync::CancellationToken>,
     ) {
-        if let Some(manager) = self.cli_runtime_manager.as_ref()
-            && let Some(current) = manager.existing_session(instance.key()).await
-            && current.instance() != instance
+        // Pin a still-current transport while reading/reporting its activity.
+        // If idle retirement won the registry race, its exact-generation signal
+        // remains available after removal. Ordinary EOF recovery is unchanged.
+        let session_use = if let Some(manager) = self.cli_runtime_manager.as_ref() {
+            manager.existing_session(instance.key()).await
+        } else {
+            None
+        };
+        if idle_retirement.is_some_and(|signal| signal.is_cancelled()) {
+            return;
+        }
+        if session_use
+            .as_ref()
+            .is_some_and(|current| current.instance() != instance)
         {
             self.audit_stale_cli_runtime_process_activity(instance, "transport_recovery");
             return;
@@ -8974,11 +9020,8 @@ impl MessageProcessor {
         };
         let native_request_id = serde_json::to_value(&request.id)
             .unwrap_or_else(|_| JsonValue::String(request.id.to_string()));
-        let responder = CLIAgentRuntimeMachineRequestResponder::new(
-            handle.instance().clone(),
-            native_request_id,
-            handle.session(),
-        );
+        let responder =
+            CLIAgentRuntimeMachineRequestResponder::from_handle(handle.clone(), native_request_id);
         self.handle_cli_runtime_codex_server_request_with_responder(
             handle.instance(),
             request,
@@ -11297,6 +11340,10 @@ impl MessageProcessor {
                 }
             };
         let native_request_id = cli_runtime_native_request_id_json_from_record(request)?;
+        // The response lane may be removed before the final interrupt/effects.
+        // Keep its exact current generation pinned through the whole operation,
+        // even if the Turn completes concurrently. Never pin a replacement.
+        let mut _codex_request_use = None;
         let response_session = if request.runtime_kind == "codex" {
             let Some(pending) = self
                 .cli_runtime_machine_request(request.request_id.as_str())
@@ -11307,6 +11354,7 @@ impl MessageProcessor {
                     request.request_id
                 );
             };
+            _codex_request_use = Some(pending.responder.clone());
             if pending.responder.native_request_id() != &native_request_id {
                 let _ = self
                     .take_cli_runtime_machine_request(request.request_id.as_str())

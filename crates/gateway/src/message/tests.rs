@@ -19,6 +19,8 @@ mod cli_task_tools;
 
 #[path = "tests/cli_runtime_active_bindings.rs"]
 mod cli_runtime_active_bindings;
+#[path = "tests/cli_runtime_idle_cleanup.rs"]
+mod cli_runtime_idle_cleanup;
 
 #[cfg(unix)]
 #[path = "tests/opencode_startup.rs"]
@@ -238,7 +240,7 @@ use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -808,6 +810,9 @@ struct RecordingCliRuntimeSession {
     fail_next_resume: TokioMutex<bool>,
     goal_clears: TokioMutex<Vec<String>>,
     closes: AtomicUsize,
+    close_pause: TokioMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    fail_next_close: AtomicBool,
+    interrupt_pause: TokioMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     factory_starts: AtomicUsize,
     event_log: TokioMutex<Option<Arc<TokioMutex<Vec<String>>>>>,
 }
@@ -919,6 +924,13 @@ impl RecordingCliRuntimeSession {
 impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
     async fn close(&self) -> anyhow::Result<()> {
         self.closes.fetch_add(1, Ordering::SeqCst);
+        if let Some((entered, release)) = self.close_pause.lock().await.take() {
+            entered.notify_one();
+            release.notified().await;
+        }
+        if self.fail_next_close.swap(false, Ordering::SeqCst) {
+            anyhow::bail!("injected close failure");
+        }
         Ok(())
     }
 
@@ -1128,6 +1140,10 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         native_thread_id: Option<&str>,
         native_turn_id: Option<&str>,
     ) -> anyhow::Result<()> {
+        if let Some((entered, release)) = self.interrupt_pause.lock().await.take() {
+            entered.notify_one();
+            release.notified().await;
+        }
         self.interrupts.lock().await.push((
             native_thread_id.map(str::to_owned),
             native_turn_id.map(str::to_owned),
@@ -50871,6 +50887,7 @@ async fn codex_transport_observation_gap_enqueues_recovery_without_terminalizing
         .enqueue_codex_transport_session_recovery(
             handle.instance(),
             "oversized frame exceeded the finite spool budget",
+            None,
         )
         .await;
     cli_manager
