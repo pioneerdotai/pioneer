@@ -721,7 +721,7 @@ impl VoiceInputSupervisor {
     }
 
     #[cfg(test)]
-    fn has_loaded_engine(&self) -> bool {
+    pub(crate) fn has_loaded_engine(&self) -> bool {
         self.lock_inner().loaded_engine.is_some()
     }
 
