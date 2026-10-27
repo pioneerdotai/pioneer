@@ -716,7 +716,7 @@ async fn portable_cli_mapping_preserves_sent_bytes_control_updates_and_upsert() 
     .unwrap();
     let original = format!(
         "  {}\n",
-        serde_json::json!({"pioneerContextBasis":{"historyJson":history},"input":"original sent bytes"})
+        serde_json::json!({"pioneerContextBasis":{"historyJson":history,"executionThreadId":"thread","pendingTurn":{"turnId":"turn","messageRevision":0,"messageDeleted":false}},"input":"original sent bytes"})
     );
     let mut binding = pioneer_crud::NewCliRuntimeTurnBinding {
         turn_id: "turn".into(),
@@ -765,7 +765,7 @@ async fn portable_cli_mapping_preserves_sent_bytes_control_updates_and_upsert() 
     );
     assert_eq!(scalar(&store,"SELECT coalesce(json_extract(input_mapping_json,'$.pioneerContextBasis.historyJson'),'[]')<>'[]' n FROM turn_cli_runtime_binding WHERE turn_id='turn'").await,1);
     binding.input_mapping_json =
-        "{ \"pioneerContextBasis\": {\"historyJson\":\"[]\"}, \"input\":\"replacement\" }".into();
+        r#"{ "pioneerContextBasis": {"historyJson":"[]","executionThreadId":"thread","pendingTurn":{"turnId":"turn","messageRevision":0,"messageDeleted":false}}, "input":"replacement" }"#.into();
     let replacement = binding.input_mapping_json.clone();
     assert_eq!(
         store
@@ -795,4 +795,328 @@ async fn portable_cli_mapping_preserves_sent_bytes_control_updates_and_upsert() 
         .await,
         0
     );
+}
+
+async fn task_snapshot_input(
+    store: &CrudStore,
+    history_json: String,
+) -> pioneer_crud::NewTaskRunConversationSnapshot {
+    for sql in [
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('task','ws','thread','thread','thread','turn','agent','running','fixture','fixture')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('run','task','run',1,1,'succeeded','agent')",
+    ] {
+        store
+            .database_connection()
+            .execute_unprepared(sql)
+            .await
+            .unwrap();
+    }
+    pioneer_crud::NewTaskRunConversationSnapshot {
+        run_id: "run".into(),
+        task_id: "task".into(),
+        workspace_id: "ws".into(),
+        conversation_thread_id: "thread".into(),
+        source_turn_id: None,
+        history_json,
+        created_at: chrono::Utc::now().fixed_offset(),
+    }
+}
+
+async fn backfill_task_snapshot(store: &CrudStore) {
+    let mut progress = pioneer_crud::PortablePayloadProgress::default();
+    for _ in 0..240 {
+        progress.quantum(store).await.unwrap();
+    }
+    assert_eq!(
+        scalar(
+            store,
+            "SELECT count(*) n FROM task_run_conversation_snapshot s JOIN portable_payload p ON p.id=s.history_json_payload_id WHERE s.run_id='run' AND p.raw=0 AND p.retired=0 AND octet_length(s.history_json)<256"
+        )
+        .await,
+        1,
+        "exercise published compressed storage, never the plain/raw fallback"
+    );
+}
+
+#[tokio::test]
+async fn portable_task_snapshot_keeps_immutable_winner_and_basis_revision_after_restart() {
+    let (file, store, writer) = fixture().await;
+    // Preserve formatting, escaping, combining marks and multibyte scalars;
+    // returning a parsed/reserialized value would violate this contract.
+    let history = format!(
+        "  [\n {{\"role\": \"user\", \"content\": {}}}\n]\n",
+        serde_json::to_string(&"контекст🦀e\u{301}\"\n".repeat(16_000)).unwrap()
+    );
+    let mut input = task_snapshot_input(&store, history.clone()).await;
+    let inserted = store
+        .insert_task_run_conversation_snapshot_if_absent(input.clone())
+        .await
+        .unwrap();
+    assert_eq!(inserted.history_json, history);
+    let revision = scalar(
+        &store,
+        "SELECT revision n FROM compaction_task_basis_revision WHERE run_id='run'",
+    )
+    .await;
+    assert_eq!(revision, 1);
+    let reference = pioneer_compaction::SourceRef {
+        scope: "task-basis:run".into(),
+        id: "run".into(),
+        version: format!("task-basis-revision:{revision}"),
+    };
+    let epoch = store
+        .compaction_projection_version("ws", "thread")
+        .await
+        .unwrap();
+    backfill_task_snapshot(&store).await;
+    assert_eq!(
+        scalar(&store, "SELECT p.original_bytes n FROM portable_payload p JOIN task_run_conversation_snapshot s ON s.history_json_payload_id=p.id WHERE s.run_id='run'").await,
+        history.len() as i64
+    );
+    assert_eq!(
+        scalar(&store, "SELECT p.original_chars n FROM portable_payload p JOIN task_run_conversation_snapshot s ON s.history_json_payload_id=p.id WHERE s.run_id='run'").await,
+        history.chars().count() as i64
+    );
+    assert_eq!(
+        scalar(
+            &store,
+            "SELECT revision n FROM compaction_task_basis_revision WHERE run_id='run'"
+        )
+        .await,
+        revision
+    );
+    assert_eq!(
+        store
+            .compaction_projection_version("ws", "thread")
+            .await
+            .unwrap(),
+        epoch
+    );
+
+    drop(store);
+    drop(writer);
+    let (store, _writer) = open(&file.0).await;
+    assert_eq!(
+        store
+            .get_task_run_conversation_snapshot("run")
+            .await
+            .unwrap()
+            .unwrap(),
+        inserted
+    );
+    input.history_json = "[ {\"role\":\"assistant\",\"content\":\"losing retry\"} ]".into();
+    input.source_turn_id = Some("turn".into());
+    input.created_at += chrono::Duration::seconds(1);
+    assert_eq!(
+        store
+            .insert_task_run_conversation_snapshot_if_absent(input)
+            .await
+            .unwrap(),
+        inserted,
+        "a retry must return the exact original record after physical cutover"
+    );
+    assert_eq!(
+        store
+            .compaction_reference_payload("ws", "thread", &reference)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(history.as_str())
+    );
+
+    let mut rebuilt = String::new();
+    let mut offset = 0;
+    loop {
+        let fragment = store
+            .compaction_reference_fragment("ws", "thread", &reference, offset)
+            .await
+            .unwrap()
+            .unwrap();
+        let characters = fragment.text.chars().count() as u64;
+        assert!(characters > 0 && characters <= 16_384);
+        assert_eq!(fragment.reference, reference);
+        assert_eq!(
+            fragment.text,
+            history
+                .chars()
+                .skip(offset as usize)
+                .take(16_384)
+                .collect::<String>()
+        );
+        rebuilt.push_str(&fragment.text);
+        offset += characters;
+        if let Some(next) = fragment.next_character {
+            assert_eq!(next, offset);
+        } else {
+            break;
+        }
+    }
+    assert_eq!(rebuilt, history);
+    assert_eq!(offset, history.chars().count() as u64);
+    assert_eq!(
+        scalar(
+            &store,
+            "SELECT revision n FROM compaction_task_basis_revision WHERE run_id='run'"
+        )
+        .await,
+        revision
+    );
+    assert_eq!(
+        store
+            .compaction_projection_version("ws", "thread")
+            .await
+            .unwrap(),
+        epoch
+    );
+}
+
+#[tokio::test]
+async fn portable_task_snapshot_fragment_does_not_decode_distant_corrupt_block() {
+    let (_file, store, _writer) = fixture().await;
+    let history = format!(
+        "[{{\"role\":\"user\",\"content\":{}}}]",
+        serde_json::to_string(&"Ж🦀e\u{301}".repeat(60_000)).unwrap()
+    );
+    let input = task_snapshot_input(&store, history.clone()).await;
+    store
+        .insert_task_run_conversation_snapshot_if_absent(input)
+        .await
+        .unwrap();
+    backfill_task_snapshot(&store).await;
+    assert!(
+        scalar(&store, "SELECT count(*) n FROM portable_payload_block b JOIN task_run_conversation_snapshot s ON s.history_json_payload_id=b.payload_id WHERE s.run_id='run'").await >= 4,
+        "the damaged block must be independent of the first fragment"
+    );
+    let reference = pioneer_compaction::SourceRef {
+        scope: "task-basis:run".into(),
+        id: "run".into(),
+        version: "task-basis-revision:1".into(),
+    };
+    let distant_offset = scalar(&store, "SELECT b.char_offset n FROM portable_payload_block b JOIN task_run_conversation_snapshot s ON s.history_json_payload_id=b.payload_id WHERE s.run_id='run' AND b.ordinal=3").await as u64;
+    assert!(distant_offset >= 16_384);
+    let expected_first = history.chars().take(16_384).collect::<String>();
+    let expected_distant = history
+        .chars()
+        .skip(distant_offset as usize)
+        .take(16_384)
+        .collect::<String>();
+    // A successful control at the same scope/version/offset makes a later
+    // failure attributable to corruption, rather than an invalid fixture.
+    let intact = store
+        .compaction_reference_fragment("ws", "thread", &reference, distant_offset)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(intact.text, expected_distant);
+    let changed = store.database_connection().execute_unprepared(
+        "UPDATE portable_payload_block SET data=zeroblob(78) WHERE ordinal=3 AND payload_id=(SELECT history_json_payload_id FROM task_run_conversation_snapshot WHERE run_id='run')"
+    ).await.unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+    // The fault respects the physical schema's envelope-size CHECK. A whole
+    // decode followed by substr would fail here on the unrelated fourth block.
+    let first = store
+        .compaction_reference_fragment("ws", "thread", &reference, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.text, expected_first);
+    assert_eq!(first.next_character, Some(16_384));
+    assert!(
+        store
+            .compaction_reference_fragment("ws", "thread", &reference, distant_offset)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn portable_cli_projection_keeps_sqlite_json_predicate_across_block_boundaries() {
+    let (_file, store, _writer) = fixture().await;
+    store.database_connection().execute_unprepared("INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,input_mapping_json,status,frozen_manifest_id) VALUES('turn','thread','thread','ws','codex','codex','native','{}','starting',NULL)").await.unwrap();
+    let cases = [
+        r#""pioneerContextBasis":{"historyJson":"[]"}"#,
+        r#""pioneerContextBasis":{"historyJson":null}"#,
+        r#""pioneerContextBasis":{"historyJson":0}"#,
+        r#""pioneerContextBasis":{"historyJson":[]}"#,
+        r#""pioneerContextBasis":{"historyJson":[ ]}"#,
+        r#""pioneerContextBasis":{"historyJson":[1]}"#,
+        r#""pioneerContextBasis":{"historyJson":"\u005b\u005d"}"#,
+        r#""\u0070ioneerContextBasis":{"\u0068istoryJson":"[]"}"#,
+        r#""pioneerContextBasis":{"historyJson":"[]","historyJson":"hold"}"#,
+        r#""pioneerContextBasis":{"historyJson":"hold","historyJson":"[]"}"#,
+        r#""pioneerContextBasis":null,"pioneerContextBasis":{"historyJson":"hold"}"#,
+        r#""pioneerContextBasis":{"historyJson":"[]",}"#,
+    ];
+    let predicate = "SELECT CASE WHEN json_valid(input_mapping_json) THEN coalesce(json_extract(input_mapping_json,'$.pioneerContextBasis.historyJson'),'[]')<>'[]' ELSE 1 END n FROM turn_cli_runtime_binding WHERE turn_id='turn'";
+    for body in cases {
+        // Force the selected key/escape near the streaming fragment boundary.
+        let source = format!("{{\"padding\":\"{}\",{body}}}", "x".repeat(65_500));
+        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "UPDATE turn_cli_runtime_binding SET input_mapping_json=?1,frozen_manifest_id=NULL WHERE turn_id='turn'",[source.clone().into()])).await.unwrap();
+        // The existing SQLite predicate is the independent compatibility oracle.
+        let expected = scalar(&store, predicate).await;
+        let mut progress = pioneer_crud::PortablePayloadProgress::default();
+        for _ in 0..100 {
+            progress.quantum(&store).await.unwrap();
+        }
+        assert_eq!(scalar(&store,"SELECT p.raw n FROM portable_payload p JOIN turn_cli_runtime_binding b ON b.input_mapping_json_payload_id=p.id WHERE b.turn_id='turn'").await,0);
+        assert_eq!(scalar(&store, predicate).await, expected);
+        assert_eq!(
+            store
+                .get_cli_runtime_turn_binding("turn")
+                .await
+                .unwrap()
+                .unwrap()
+                .input_mapping_json,
+            source
+        );
+    }
+}
+
+#[tokio::test]
+async fn portable_active_staging_cannot_be_reclaimed_by_another_progress_owner() {
+    let (_file, store, _writer) = fixture().await;
+    let payload = serde_json::json!({"metadata":"independent staged blocks 🦀".repeat(50_000)});
+    let output = pioneer_protocol::ItemDeltaNotification {
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        turn_id: "turn".into(),
+        item_id: "staging".into(),
+        delta: String::new(),
+        stream: None,
+        payload: Some(payload.clone()),
+        markdown: None,
+        markdown_version: None,
+    };
+    store.record_tool_output("staging", &output).await.unwrap();
+    let mut first = pioneer_crud::PortablePayloadProgress::default();
+    let mut staged = false;
+    for _ in 0..160 {
+        first.quantum(&store).await.unwrap();
+        if scalar(&store,"SELECT count(*) n FROM portable_payload p WHERE p.family='tool.metadata' AND p.retired=1 AND (SELECT count(*) FROM portable_payload_block b WHERE b.payload_id=p.id)>=16").await>0 {
+            staged=true;break;
+        }
+    }
+    assert!(
+        staged,
+        "interrupt only after a full encoded batch with more source bytes pending"
+    );
+    let mut other = pioneer_crud::PortablePayloadProgress::default();
+    other.quantum(&store).await.unwrap();
+    other.quantum(&store).await.unwrap();
+    drop(other);
+    assert_eq!(scalar(&store,"SELECT count(*) n FROM portable_payload p WHERE p.family='tool.metadata' AND p.retired=1 AND (SELECT count(*) FROM portable_payload_block b WHERE b.payload_id=p.id)>=16").await,1);
+    for _ in 0..180 {
+        first.quantum(&store).await.unwrap();
+    }
+    let rows = store
+        .tool_output_page("ws", "thread", "turn", "staging", 0)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].1.metadata,
+        Some(serde_json::to_string(&payload).unwrap())
+    );
+    assert_eq!(scalar(&store,"SELECT count(*) n FROM portable_payload_block b LEFT JOIN portable_payload p ON p.id=b.payload_id WHERE p.id IS NULL").await,0);
 }

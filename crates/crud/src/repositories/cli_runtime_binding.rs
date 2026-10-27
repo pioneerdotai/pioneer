@@ -192,6 +192,8 @@ pub struct CliRuntimeTurnBindingRecord {
     #[doc(hidden)]
     pub input_mapping_payload_id: Option<String>,
     #[doc(hidden)]
+    pub input_mapping_read_hold: Option<super::portable_payload::PayloadReadHold>,
+    #[doc(hidden)]
     pub input_mapping_revision: i64,
     #[doc(hidden)]
     pub input_mapping_identity: String,
@@ -2771,8 +2773,14 @@ fn turn_binding_record_from_model(
     model: turn_cli_runtime_binding::Model,
 ) -> Result<CliRuntimeTurnBindingRecord> {
     let mcp = turn_mcp_metadata_from_model(&model);
+    let read_hold = model
+        .input_mapping_json_payload_id
+        .as_deref()
+        .map(super::portable_payload::PayloadReadHold::capture)
+        .transpose()?;
     Ok(CliRuntimeTurnBindingRecord {
         input_mapping_payload_id: model.input_mapping_json_payload_id,
+        input_mapping_read_hold: read_hold,
         input_mapping_revision: model.portable_revision,
         input_mapping_identity: model.portable_identity,
         turn_id: model.turn_id,
@@ -2967,13 +2975,15 @@ pub(crate) async fn hydrate_record(
     db: &pioneer_sqlite::SqliteDatabase,
     mut record: CliRuntimeTurnBindingRecord,
 ) -> Result<CliRuntimeTurnBindingRecord> {
-    record.input_mapping_json = super::portable_payload::hydrate(
+    record.input_mapping_json = super::portable_payload::hydrate_with_hold(
         db,
         super::portable_payload::Family::CliMapping,
         record.input_mapping_payload_id.as_deref(),
         record.input_mapping_json,
+        record.input_mapping_read_hold.as_ref(),
     )
     .await?;
+    record.input_mapping_read_hold = None;
     Ok(record)
 }
 

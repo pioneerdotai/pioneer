@@ -3230,21 +3230,16 @@ pub(crate) async fn compaction_reference_fragment(
                 }),
             )
             .expr_as(
-                Expr::expr(Func::cust(Alias::new("substr")).args([
-                    Expr::col((
-                        task_run_conversation_snapshot::Entity,
-                        task_run_conversation_snapshot::Column::HistoryJson,
-                    )),
-                    Expr::Value(offset.into()),
-                    Expr::val(16384_i64),
-                ])),
+                // A compressed source exposes only its small projection/ref to
+                // SQL. Indexed blocks are read and decoded after this query.
+                Expr::cust_with_values(
+                    "CASE WHEN (SELECT p.raw FROM portable_payload p WHERE p.id=task_run_conversation_snapshot.history_json_payload_id)=0 THEN '' ELSE substr(task_run_conversation_snapshot.history_json,?,16384) END",
+                    [offset],
+                ),
                 "fragment",
             )
             .expr_as(
-                Expr::expr(Func::cust(Alias::new("length")).args([Expr::col((
-                    task_run_conversation_snapshot::Entity,
-                    task_run_conversation_snapshot::Column::HistoryJson,
-                ))])),
+                Expr::cust("CASE WHEN task_run_conversation_snapshot.history_json_payload_id IS NULL THEN length(task_run_conversation_snapshot.history_json) ELSE (SELECT p.original_chars FROM portable_payload p WHERE p.id=task_run_conversation_snapshot.history_json_payload_id) END"),
                 "characters",
             )
             .filter(
@@ -3282,12 +3277,37 @@ pub(crate) async fn compaction_reference_fragment(
                     .eq(Expr::Value(reference.version.clone().into())),
                 ),
             )
-            .into_tuple::<(String, i64)>()
+            .column(task_run_conversation_snapshot::Column::HistoryJsonPayloadId)
+            .into_tuple::<(String, i64, Option<String>)>()
             .one(&store.connection)
             .await?;
-        let Some((text, characters)) = row else {
+        let Some((mut text, characters, payload_id)) = row else {
             return Ok(None);
         };
+        if let Some(id) = payload_id {
+            let meta = super::portable_payload::header(
+                &store.connection,
+                &id,
+                super::portable_payload::Family::TaskHistory,
+            )
+            .await?;
+            ensure!(
+                meta.original_chars == characters,
+                "Task basis character length changed"
+            );
+            if meta.raw == 0 {
+                text = String::from_utf8(
+                    super::portable_payload::read_range(
+                        &store.connection,
+                        &meta,
+                        i64::try_from(character_offset)?,
+                        16384,
+                        true,
+                    )
+                    .await?,
+                )?;
+            }
+        }
         let characters = u64::try_from(characters)?;
         ensure!(character_offset <= characters, "source offset is past end");
         let end = character_offset.saturating_add(text.chars().count() as u64);
@@ -3419,7 +3439,7 @@ pub(crate) async fn compaction_reference_payload(
     reference: &SourceRef,
 ) -> Result<Option<String>> {
     if reference.scope.starts_with("task-basis:") {
-        return Ok(task_run_conversation_snapshot::Entity::find()
+        let captured = task_run_conversation_snapshot::Entity::find()
             .select_only()
             .join(
                 JoinType::InnerJoin,
@@ -3465,9 +3485,25 @@ pub(crate) async fn compaction_reference_payload(
                 ))
                 .eq(&reference.version),
             )
-            .into_tuple::<String>()
+            .column(task_run_conversation_snapshot::Column::HistoryJsonPayloadId)
+            .into_tuple::<(String, Option<String>)>()
             .one(&store.connection)
-            .await?);
+            .await?;
+        // Plain/raw remains one linear TEXT read. Compressed rows select only
+        // the tiny shape projection and reference; hydrate reads bounded byte
+        // blocks sequentially, never a growing Unicode substr prefix.
+        return match captured {
+            Some((plain, id)) => Ok(Some(
+                super::portable_payload::hydrate(
+                    &store.connection,
+                    super::portable_payload::Family::TaskHistory,
+                    id.as_deref(),
+                    plain,
+                )
+                .await?,
+            )),
+            None => Ok(None),
+        };
     }
     if reference.scope.starts_with("checkpoint:") {
         let row = SourceFragmentRow::find_by_statement(

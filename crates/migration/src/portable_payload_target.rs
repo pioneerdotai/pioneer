@@ -33,25 +33,37 @@ pub(super) async fn up(
                 .to_owned(),
         )
         .await?;
+        let mut pending = Expr::col(Alias::new(&reference))
+            .is_null()
+            .and(Expr::col(Alias::new(*field)).is_not_null());
+        if matches!(
+            table,
+            "turn_cli_runtime_binding" | "task_run_conversation_snapshot"
+        ) {
+            pending = pending.and(Expr::cust(
+                "(frozen_manifest_id IS NULL OR frozen_manifest_id<>'')",
+            ));
+        }
         m.create_index(
             Index::create()
                 .name(format!("{table}_{field}_portable_pending"))
                 .table(Alias::new(table))
                 .col(Alias::new(&reference))
                 .col(Alias::new(key))
+                .and_where(pending)
                 .to_owned(),
         )
         .await?;
         // Trigger DDL and OLD/NEW are absent from the installed builder API.
         // Physical publication changes the explicit reference; ordinary writes
         // leave it unchanged and must invalidate the old storage/revision.
-        m.get_connection().execute_unprepared(&format!("CREATE TRIGGER {table}_{field}_portable_logical AFTER UPDATE OF {field} ON {table} WHEN NEW.{reference} IS OLD.{reference} BEGIN UPDATE {table} SET {reference}=NULL,portable_revision=portable_revision+1 WHERE {key}=NEW.{key}; END")).await?;
+        m.get_connection().execute_unprepared(&format!("CREATE TRIGGER {table}_{field}_portable_logical AFTER UPDATE OF {field} ON {table} WHEN NEW.{reference} IS OLD.{reference} BEGIN UPDATE {table} SET {reference}=NULL,portable_revision=CASE WHEN portable_revision>=9223372036854775807 THEN RAISE(ABORT,'portable revision overflow') ELSE portable_revision+1 END WHERE {key}=NEW.{key}; END")).await?;
         m.get_connection().execute_unprepared(&format!("CREATE TRIGGER {table}_{field}_portable_replace AFTER UPDATE OF {reference} ON {table} WHEN OLD.{reference} IS NOT NULL AND OLD.{reference} IS NOT NEW.{reference} BEGIN UPDATE portable_payload SET retired=1 WHERE id=OLD.{reference}; END")).await?;
         m.get_connection().execute_unprepared(&format!("CREATE TRIGGER {table}_{field}_portable_delete AFTER DELETE ON {table} WHEN OLD.{reference} IS NOT NULL BEGIN UPDATE portable_payload SET retired=1 WHERE id=OLD.{reference}; END")).await?;
     }
     // Ownership/control changes fence a prepared source, but do not discard
     // an already published payload when the logical bytes are unchanged.
-    m.get_connection().execute_unprepared(&format!("CREATE TRIGGER {table}_portable_owner AFTER UPDATE OF {} ON {table} BEGIN UPDATE {table} SET portable_revision=portable_revision+1 WHERE {key}=NEW.{key}; END",ownership.join(","))).await?;
+    m.get_connection().execute_unprepared(&format!("CREATE TRIGGER {table}_portable_owner AFTER UPDATE OF {} ON {table} BEGIN UPDATE {table} SET portable_revision=CASE WHEN portable_revision>=9223372036854775807 THEN RAISE(ABORT,'portable revision overflow') ELSE portable_revision+1 END WHERE {key}=NEW.{key}; END",ownership.join(","))).await?;
     Ok(())
 }
 pub(super) async fn down(m: &SchemaManager<'_>, table: &str, fields: &[&str]) -> Result<(), DbErr> {
@@ -72,6 +84,13 @@ pub(super) async fn down(m: &SchemaManager<'_>, table: &str, fields: &[&str]) ->
             "portable rollback requires restoring original TEXT first".into(),
         ));
     }
+    // Raw values retain original TEXT. Retire their auxiliary metadata before
+    // dropping references so rollback/reapply cannot strand live headers.
+    m.get_connection()
+        .execute_unprepared(&format!(
+            "UPDATE portable_payload SET retired=1 WHERE raw=1 AND id IN ({refs})"
+        ))
+        .await?;
     m.get_connection()
         .execute_unprepared(&format!("DROP TRIGGER {table}_portable_owner"))
         .await?;

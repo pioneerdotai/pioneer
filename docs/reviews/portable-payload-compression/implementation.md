@@ -133,3 +133,51 @@ root triggers, the accumulated storage diff and three affected test constructors
 The physical-reader integration suite now includes restart/staging/cleanup/new
 post-EOF records/NULL and CLI sent bytes/control updates/replacement UPSERT.
 `ad3c3d70` is the common+tool integration commit. No dynamic validation performed.
+
+Stage 4 review: the first snapshot draft attempted to touch retired publication
+triggers. The current chain's 20261008_000009 migration already removed them;
+this was rejected and corrected. Only the surviving task-basis trigger changes.
+Snapshot writer reads now use typed metadata projections, with bounded hydration
+outside the transaction. Full and fragment compaction reads preserve source
+identity/revision/length and scope; accepted-import CAS uses prepared original
+SHA/length where TEXT has been released.
+
+The expanded common-storage review found seven issues. Corrections include
+partial pending indexes (excluding NULL metadata and unknown frozen locators),
+metadata-only tool writer CAS, raw-header retirement on schema rollback, and
+streaming preparation for every value size. The old 32 MiB fallback is removed.
+CLI's opaque predicate is now prepared by a bounded streaming strict-JSON
+projection outside database capacity, retaining at most two short labels and the
+empty-history marker; SQLite's first duplicate-label behavior is preserved.
+Embedded-NUL legacy input is explicitly retained raw and diagnosed, preserving
+SQLite's original predicate. The integration suite compares the real SQLite
+predicate before/after cutover for null, arrays, escaped keys/values, duplicate
+labels and invalid JSON across block boundaries. These checks are written only.
+
+Optional audit schema/tables/ranking artifacts were unavailable when checked
+later in this run; no audit scripts or production payload/dictionary data were
+read or executed. report.md and usage.md were read at the beginning.
+
+Captured compressed payloads and staging now own memory-only read holds, never
+DB capacity. Cleanup tries an exclusive hold without waiting, marks reclamation
+before deleting <=16 blocks and skips held values through bounded ID pages. A
+late capture retries the complete source read; public reader boundaries preserve
+their scheduling class. Range metadata is checked against ordinal bounds, origin
+and predecessor, with checked arithmetic and byte/character continuity. The
+active-staging regression interleaves two real Progress owners and verifies exact
+metadata and absence of orphan blocks. Existing snapshot insert winners are read
+before writer admission; newly inserted plain bytes come from prepared input after
+commit, closing the raw/plain deletion gap without replaying committed writes.
+
+The final stage-4 pass also fixed an ambiguous manual Cargo.lock dependency
+(`zstd 0.14.3`, already locked), sent-basis test fixtures missing required pending
+Turn/execution identity, and moved large CLI input clones before begin. Only
+static source/API inspection and cargo fmt were used. The codec's standalone
+formatting by its child was also a formatting operation, not project execution.
+
+Current limitations preserved deliberately: unknown/unavailable frozen roots stay
+plain until existing verified locator reconciliation; malformed/unsupported legacy
+rows retain original bytes and are diagnosed/revisited without completion claims.
+No readiness gate waits for historical conversion. Dictionary/header/block/index
+costs differ from the audit's compact SQLite format; no achieved size reduction or
+physical file shrinking is claimed.

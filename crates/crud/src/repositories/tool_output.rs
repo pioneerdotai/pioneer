@@ -75,12 +75,18 @@ pub(crate) async fn record_tool_output(
                         .is_some(),
                     "tool output turn mismatch"
                 );
-                if let Some(old) = tool_output_chunk::Entity::find()
+                if let Some(actual) = tool_output_chunk::Entity::find()
+                    .select_only()
+                    .columns([
+                        tool_output_chunk::Column::Ordinal,
+                        tool_output_chunk::Column::PortableRevision,
+                    ])
                     .filter(tool_output_chunk::Column::Id.eq(id))
+                    .into_tuple::<(i64, i64)>()
                     .one(&tx)
                     .await?
                 {
-                    if expected != Some((old.ordinal, old.portable_revision)) {
+                    if expected != Some(actual) {
                         return Err(portable_payload::PreflightRace.into());
                     }
                 } else {

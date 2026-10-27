@@ -164,6 +164,8 @@ pub struct PreparedFrozenImport {
 struct AcceptedImportBasis {
     turn: String,
     history_json: String,
+    history_sha256: String,
+    history_bytes: i64,
     manifest: String,
     digest: String,
     imports_digest: String,
@@ -754,6 +756,9 @@ async fn prepare_accepted_import(
         record,
         accepted_basis: Some(AcceptedImportBasis {
             turn: turn.into(),
+            // Hash original bytes before entering any writer transaction.
+            history_sha256: hex::encode(Sha256::digest(basis.history_json.as_bytes())),
+            history_bytes: i64::try_from(basis.history_json.len())?,
             history_json: basis.history_json,
             manifest: descriptor.manifest_id,
             digest: descriptor.identity_sha256,
@@ -928,7 +933,13 @@ JOIN compaction_frozen_import i
 WHERE execution.thread_id=?
   AND execution.turn_id=?
   AND snapshot.workspace_id=?
-  AND snapshot.history_json=?
+  AND ((snapshot.history_json_payload_id IS NULL AND snapshot.history_json=?)
+    OR (snapshot.history_json_payload_id IS NOT NULL AND EXISTS (
+      SELECT 1 FROM portable_payload original
+      WHERE original.id=snapshot.history_json_payload_id
+        AND original.family='task.history' AND original.retired=0
+        AND original.sha256=? AND original.original_bytes=?
+    )))
   AND h.ready=1 AND h.expired=0
   AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count
   AND i.ordinal>=0 AND i.ordinal<h.import_count
@@ -962,7 +973,13 @@ JOIN compaction_frozen_import i
 WHERE execution.thread_id=?
   AND execution.turn_id=?
   AND snapshot.workspace_id=?
-  AND snapshot.history_json=?
+  AND ((snapshot.history_json_payload_id IS NULL AND snapshot.history_json=?)
+    OR (snapshot.history_json_payload_id IS NOT NULL AND EXISTS (
+      SELECT 1 FROM portable_payload original
+      WHERE original.id=snapshot.history_json_payload_id
+        AND original.family='task.history' AND original.retired=0
+        AND original.sha256=? AND original.original_bytes=?
+    )))
   AND h.ready=1 AND h.expired=0
   AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count
   AND i.ordinal>=0 AND i.ordinal<h.import_count
@@ -1091,6 +1108,8 @@ fn accepted_import_current_statement(
             basis.turn.clone().into(),
             prepared.workspace.clone().into(),
             basis.history_json.clone().into(),
+            basis.history_sha256.clone().into(),
+            basis.history_bytes.into(),
             basis.digest.clone().into(),
             basis.proof_json.clone().into(),
             basis.imports_digest.clone().into(),
