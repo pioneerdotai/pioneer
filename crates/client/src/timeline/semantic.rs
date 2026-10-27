@@ -1444,18 +1444,30 @@ pub fn apply_conversation_event_to_semantic_timeline(
             delta,
             stream,
             markdown,
+            payload,
             ..
-        } => apply_item_delta_to_semantic_timeline(
-            state,
-            workspace_id,
-            thread_id,
-            turn_id,
-            item_id,
-            delta,
-            *stream,
-            markdown.as_ref(),
-            now_unix_ms,
-        ),
+        } => {
+            if payload
+                .as_ref()
+                .and_then(|value| value.get("runtimeDeltaKind"))
+                .and_then(serde_json::Value::as_str)
+                == Some("provider_message_preview")
+            {
+                false
+            } else {
+                apply_item_delta_to_semantic_timeline(
+                    state,
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    item_id,
+                    delta,
+                    *stream,
+                    markdown.as_ref(),
+                    now_unix_ms,
+                )
+            }
+        }
         ConversationEvent::ItemCompleted {
             thread_id,
             turn_id,
@@ -2079,10 +2091,13 @@ fn apply_item_delta_to_semantic_timeline(
             ..
         } = &mut block.kind
     {
+        if is_terminal_turn_work_item_status(*status) {
+            return false;
+        }
         text.push_str(delta);
         *status = TurnWorkItemStatus::Running;
-        if let Some(markdown) = markdown {
-            *block_markdown = Some(markdown.clone());
+        if markdown.is_some() || !delta.is_empty() {
+            *block_markdown = markdown.cloned();
         }
         block.updated_at_unix_ms = Some(now_unix_ms);
         upsert_turn_work_summary(
@@ -2102,6 +2117,14 @@ fn apply_item_delta_to_semantic_timeline(
             .items_by_id
             .get_mut(work_item_id.as_str())
         {
+            if is_terminal_turn_work_item_status(item.status)
+                && matches!(
+                    &item.item,
+                    TurnItem::AgentMessage { .. } | TurnItem::Reasoning { .. }
+                )
+            {
+                return false;
+            }
             append_delta_to_turn_item(&mut item.item, delta, markdown);
             item.status = TurnWorkItemStatus::Running;
             item.completed_at_unix_ms = None;
@@ -3965,15 +3988,26 @@ fn append_delta_to_turn_item(
         TurnItem::AgentMessage {
             text,
             markdown: item_markdown,
+            markdown_version,
             ..
         } => {
             text.push_str(delta);
-            if let Some(markdown) = markdown {
-                *item_markdown = Some(markdown.clone());
+            if markdown.is_some() || !delta.is_empty() {
+                *item_markdown = markdown.cloned();
+                if markdown.is_none() {
+                    *markdown_version = None;
+                }
             }
         }
-        TurnItem::Reasoning { content, .. } => {
-            if let Some(last) = content.last_mut() {
+        TurnItem::Reasoning {
+            summary, content, ..
+        } => {
+            if delta.is_empty() {
+                return;
+            }
+            // Continue the canonical source without copying a summary prefix
+            // into content: consumers may display both independent fields.
+            if let Some(last) = content.last_mut().or_else(|| summary.last_mut()) {
                 last.push_str(delta);
             } else {
                 content.push(delta.to_owned());

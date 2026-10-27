@@ -1043,24 +1043,62 @@ impl MessageProcessor {
         Ok(())
     }
 
+    fn item_type_allows_markdown(item_type: Option<TurnItemType>) -> bool {
+        matches!(
+            item_type,
+            Some(TurnItemType::AgentMessage | TurnItemType::Reasoning | TurnItemType::UserMessage)
+        )
+    }
+
     pub(super) fn enrich_turn_item_events_markdown(events: &mut [TurnItemEvent]) {
-        let mut buffers: HashMap<String, String> = HashMap::new();
+        let mut buffers: HashMap<(String, String, String), String> = HashMap::new();
 
         for event in events {
             match &mut event.payload {
-                TurnItemEventPayload::ItemStarted { item, .. } => {
-                    let (item_id, text) = Self::normalize_item_markdown(item);
-                    buffers.insert(item_id, text);
+                TurnItemEventPayload::ItemStarted {
+                    thread_id,
+                    turn_id,
+                    item,
+                    ..
+                }
+                | TurnItemEventPayload::ItemUpdated {
+                    thread_id,
+                    turn_id,
+                    item,
+                    ..
+                } => {
+                    let key = (
+                        thread_id.clone(),
+                        turn_id.clone(),
+                        item.item_id().to_owned(),
+                    );
+                    if Self::item_type_allows_markdown(Some(item.item_type())) {
+                        let (_, text) = Self::normalize_item_markdown(item);
+                        buffers.insert(key, text);
+                    } else {
+                        buffers.remove(&key);
+                    }
                 }
                 TurnItemEventPayload::ItemDelta {
+                    thread_id,
+                    turn_id,
                     item_id,
                     delta,
+                    payload,
                     markdown,
                     markdown_version,
                     ..
                 } => {
+                    if Self::is_provider_message_preview(payload.as_ref()) {
+                        continue;
+                    }
+                    // A delta cannot establish its own type or full prefix.
+                    // Wait for an allowed lifecycle snapshot in this event set.
+                    let key = (thread_id.clone(), turn_id.clone(), item_id.clone());
+                    let Some(text) = buffers.get_mut(&key) else {
+                        continue;
+                    };
                     let full_text = {
-                        let text = buffers.entry(item_id.clone()).or_default();
                         text.push_str(delta.as_str());
                         text.clone()
                     };
@@ -1072,10 +1110,18 @@ impl MessageProcessor {
                         *markdown_version = Some(MARKDOWN_AST_VERSION);
                     }
                 }
-                TurnItemEventPayload::ItemCompleted { item, .. }
-                | TurnItemEventPayload::ItemUpdated { item, .. } => {
-                    let (item_id, _) = Self::normalize_item_markdown(item);
-                    buffers.remove(item_id.as_str());
+                TurnItemEventPayload::ItemCompleted {
+                    thread_id,
+                    turn_id,
+                    item,
+                    ..
+                } => {
+                    Self::normalize_item_markdown(item);
+                    buffers.remove(&(
+                        thread_id.clone(),
+                        turn_id.clone(),
+                        item.item_id().to_owned(),
+                    ));
                 }
                 _ => {}
             }
@@ -1189,6 +1235,9 @@ impl MessageProcessor {
     }
 
     pub(super) fn normalize_item_markdown(item: &mut TurnItem) -> (String, String) {
+        if !Self::item_type_allows_markdown(Some(item.item_type())) {
+            return (item.item_id().to_owned(), String::new());
+        }
         match item {
             TurnItem::AgentMessage {
                 id,
@@ -1221,11 +1270,7 @@ impl MessageProcessor {
                 };
                 (id.clone(), text)
             }
-            _ => {
-                let id = item.item_id().to_owned();
-                let text = Self::tool_item_output(item).unwrap_or_default();
-                (id, text)
-            }
+            _ => (item.item_id().to_owned(), String::new()),
         }
     }
 
@@ -5119,6 +5164,9 @@ impl MessageProcessor {
                 return Ok(None);
             }
         }
+        #[cfg(test)]
+        self.progress_item_type_lookup_count
+            .fetch_add(1, Ordering::Relaxed);
         let item_type = self.crud_store.get_turn_item_type(turn_id, item_id).await?;
         let mut progress_items = self.progress_items.lock().await;
         if !self.execution_progress_is_current_cached(turn_id).await? {
@@ -5189,16 +5237,7 @@ impl MessageProcessor {
         match event {
             AgentProgressEvent::ItemDelta { notification } => {
                 let mut notification = notification;
-                self.enrich_item_delta_markdown(&mut notification).await;
                 let event_timestamp = now_timestamp_secs();
-                let delta_method = Self::item_delta_event_method(notification.stream);
-                self.send_progress_notification_to_thread_subscribers(
-                    notification.thread_id.as_str(),
-                    delta_method,
-                    &notification,
-                )
-                .await;
-
                 let item_type = match self
                     .progress_item_type(
                         notification.turn_id.as_str(),
@@ -5220,6 +5259,16 @@ impl MessageProcessor {
                         None
                     }
                 };
+
+                self.enrich_item_delta_markdown(&mut notification, item_type)
+                    .await;
+                let delta_method = Self::item_delta_event_method(notification.stream);
+                self.send_progress_notification_to_thread_subscribers(
+                    notification.thread_id.as_str(),
+                    delta_method,
+                    &notification,
+                )
+                .await;
 
                 if matches!(item_type, Some(TurnItemType::Reasoning)) {
                     self.forward_child_reasoning_delta_to_parent_turn(&notification)
@@ -8190,7 +8239,7 @@ impl MessageProcessor {
         }
     }
 
-    fn record_agent_markdown_buffer(
+    pub(super) fn record_agent_markdown_buffer(
         buffer: &AgentMarkdownBuffer,
         final_source_bytes: usize,
         outcome: GatewayMarkdownMessageOutcome,
@@ -8210,13 +8259,21 @@ impl MessageProcessor {
         &self,
         notification: &mut pioneer_protocol::ItemStartedNotification,
     ) {
-        let (item_id, text) = Self::normalize_item_markdown(&mut notification.item);
+        let item_id = notification.item.item_id().to_owned();
         let key = Self::item_markdown_buffer_key(notification.thread_id.as_str(), item_id.as_str());
-        let replaced = self
-            .agent_message_buffers
-            .lock()
-            .await
-            .insert(key, AgentMarkdownBuffer::new(text));
+        let buffer = if Self::item_type_allows_markdown(Some(notification.item.item_type())) {
+            let (_, text) = Self::normalize_item_markdown(&mut notification.item);
+            Some(AgentMarkdownBuffer::new(notification.turn_id.clone(), text))
+        } else {
+            None
+        };
+        let replaced = {
+            let mut buffers = self.agent_message_buffers.lock().await;
+            match buffer {
+                Some(buffer) => buffers.insert(key, buffer),
+                None => buffers.remove(&key),
+            }
+        };
         if let Some(replaced) = replaced {
             Self::record_agent_markdown_buffer(
                 &replaced,
@@ -8226,16 +8283,17 @@ impl MessageProcessor {
         }
     }
 
+    fn is_provider_message_preview(payload: Option<&serde_json::Value>) -> bool {
+        payload.and_then(|value| value["runtimeDeltaKind"].as_str())
+            == Some("provider_message_preview")
+    }
+
     pub(super) async fn enrich_item_delta_markdown(
         &self,
         notification: &mut pioneer_protocol::ItemDeltaNotification,
+        item_type: Option<TurnItemType>,
     ) {
-        if notification
-            .payload
-            .as_ref()
-            .and_then(|value| value["runtimeDeltaKind"].as_str())
-            == Some("provider_message_preview")
-        {
+        if Self::is_provider_message_preview(notification.payload.as_ref()) {
             // Runtime drafts never enter canonical markdown buffers. A late
             // preview must not append to a resolved commentary's buffer, and
             // a final-only preview has no ItemCompleted to reclaim that buffer.
@@ -8246,12 +8304,42 @@ impl MessageProcessor {
             notification.thread_id.as_str(),
             notification.item_id.as_str(),
         );
+        if !Self::item_type_allows_markdown(item_type) {
+            // If classification is lost, this fragment is absent from the
+            // canonical prefix. Do not later publish an AST with that gap.
+            let removed = {
+                let mut buffers = self.agent_message_buffers.lock().await;
+                if buffers
+                    .get(&key)
+                    .is_some_and(|buffer| buffer.turn_id == notification.turn_id)
+                {
+                    buffers.remove(&key)
+                } else {
+                    None
+                }
+            };
+            if let Some(buffer) = removed {
+                Self::record_agent_markdown_buffer(
+                    &buffer,
+                    buffer.text.len(),
+                    GatewayMarkdownMessageOutcome::Abandoned,
+                );
+            }
+            return;
+        }
         let lock_started = Instant::now();
         let (full_text, stats, lock_elapsed, update_elapsed) = {
             let mut buffers = self.agent_message_buffers.lock().await;
             let lock_elapsed = lock_started.elapsed();
             let update_started = Instant::now();
-            let buffer = buffers.entry(key).or_default();
+            // Type resolution alone cannot recover an earlier streaming prefix.
+            // Only a lifecycle snapshot may seed a canonical Markdown buffer.
+            let Some(buffer) = buffers.get_mut(&key) else {
+                return;
+            };
+            if buffer.turn_id != notification.turn_id {
+                return;
+            }
             buffer.text.push_str(notification.delta.as_str());
             let full_text = buffer.text.clone();
             let stats = buffer.stats.clone();
@@ -8278,6 +8366,9 @@ impl MessageProcessor {
             block_count: None,
         });
 
+        #[cfg(test)]
+        self.markdown_delta_parse_count
+            .fetch_add(1, Ordering::Relaxed);
         let parsed = markdown::parse_streaming_markdown_document(full_text.as_str(), stream);
         stats.record_parse_duration(parsed.elapsed);
         notification.markdown = Some(parsed.document);
@@ -8290,7 +8381,17 @@ impl MessageProcessor {
     ) {
         let (item_id, final_text) = Self::normalize_item_markdown(&mut notification.item);
         let key = Self::item_markdown_buffer_key(notification.thread_id.as_str(), item_id.as_str());
-        let buffer = self.agent_message_buffers.lock().await.remove(key.as_str());
+        let buffer = {
+            let mut buffers = self.agent_message_buffers.lock().await;
+            if buffers
+                .get(&key)
+                .is_some_and(|buffer| buffer.turn_id == notification.turn_id)
+            {
+                buffers.remove(&key)
+            } else {
+                None
+            }
+        };
         if let Some(buffer) = buffer {
             Self::record_agent_markdown_buffer(
                 &buffer,

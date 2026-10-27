@@ -1380,7 +1380,26 @@ impl ConversationProjector {
                 item.status = TimelineEntryStatus::Running;
                 item.updated_at_unix_ms = Some(ts_unix_ms);
             }
-            if let Some(markdown) = markdown.clone() {
+            let prose = matches!(
+                &item.item,
+                TurnItem::AgentMessage { .. } | TurnItem::Reasoning { .. }
+            );
+            if prose && !preserve_terminal {
+                // A missing AST means raw fallback for the updated source.
+                // Clear every presentation fallback, including a restored payload.
+                item.final_markdown = None;
+                item.partial_markdown = markdown;
+                if item.partial_markdown.is_none()
+                    && let TurnItem::AgentMessage {
+                        markdown,
+                        markdown_version,
+                        ..
+                    } = &mut item.item
+                {
+                    *markdown = None;
+                    *markdown_version = None;
+                }
+            } else if !prose && let Some(markdown) = markdown {
                 item.partial_markdown = Some(markdown);
             }
         }

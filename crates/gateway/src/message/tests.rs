@@ -9876,6 +9876,7 @@ struct ProgressDeltaHarness {
     processor: MessageProcessor,
     crud_store: Arc<CrudStore>,
     rx: Option<mpsc::Receiver<Message>>,
+    connection_id: Option<ConnectionId>,
     workspace_id: String,
     thread_id: String,
     turn_id: String,
@@ -9907,7 +9908,7 @@ async fn setup_progress_delta_harness(
     let turn_id = generate_test_request_id("turn", case_id);
     let item_id = item.item_id().to_owned();
 
-    let rx = if subscribe {
+    let (connection_id, rx) = if subscribe {
         let (tx, rx) = mpsc::channel(16);
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -9934,9 +9935,9 @@ async fn setup_progress_delta_harness(
             )
             .await
             .expect("thread/start should seed subscribed thread");
-        Some(rx)
+        (Some(connection_id), Some(rx))
     } else {
-        None
+        (None, None)
     };
 
     let thread = pioneer_protocol::Thread {
@@ -9991,23 +9992,25 @@ async fn setup_progress_delta_harness(
         turn_id.as_str(),
     )
     .await;
-    crud_store
-        .materialize_item_started(
-            ItemStartedNotification {
-                workspace_id: workspace_id.clone(),
-                thread_id: thread_id.clone(),
-                turn_id: turn_id.clone(),
-                item,
-            },
-            2,
-        )
-        .await
-        .expect("item/started should materialize");
+    assert!(
+        processor
+            .handle_durable_agent_event(AgentDurableEvent::ItemStarted {
+                notification: ItemStartedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    item,
+                },
+            })
+            .await,
+        "item/started should commit through the Gateway lifecycle"
+    );
 
     ProgressDeltaHarness {
         processor,
         crud_store,
         rx,
+        connection_id,
         workspace_id,
         thread_id,
         turn_id,
@@ -10133,6 +10136,1059 @@ fn web_fetch_item(item_id: &str) -> TurnItem {
 }
 
 #[tokio::test]
+async fn service_items_cannot_gain_markdown_from_stream_or_payload() {
+    let mut harness =
+        setup_progress_delta_harness("markdown_denied", command_execution_item("denied"), true)
+            .await;
+    let mut items = vec![context_compaction_item("denied_system")];
+    // These are real protocol tool variants with their existing default fields.
+    for kind in [
+        "commandExecution",
+        "fileChange",
+        "webSearch",
+        "webFetch",
+        "download",
+        "dynamicToolCall",
+    ] {
+        let mut value = serde_json::to_value(command_execution_item(kind)).unwrap();
+        value["type"] = json!(kind);
+        items.push(serde_json::from_value::<TurnItem>(value).unwrap());
+    }
+    items.push(TurnItem::Task {
+        item: TaskTurnItem {
+            id: "denied_task".into(),
+            task_id: "task_denied".into(),
+            created_by_turn_id: None,
+            run_id: None,
+            parent_task_id: None,
+            root_task_id: None,
+            title: "**service**".into(),
+            status: TaskStatus::Running,
+            attachment: TaskAttachmentMode::Attached,
+            trigger_kind: TaskTriggerKind::Immediate,
+            executor_kind: TaskExecutorKind::Agent,
+            child_thread_id: None,
+            child_turn_id: None,
+            agent_role: None,
+            depth: 0,
+            max_depth: 3,
+            next_fire_at: None,
+            progress_preview: None,
+            result_preview: None,
+            error_preview: None,
+            started_at: None,
+            created_at: 1,
+            updated_at: 1,
+        },
+    });
+    for item in items {
+        let item_type = item.item_type();
+        harness.item_id = item.item_id().to_owned();
+        assert!(
+            harness
+                .processor
+                .handle_durable_agent_event(AgentDurableEvent::ItemStarted {
+                    notification: ItemStartedNotification {
+                        workspace_id: harness.workspace_id.clone(),
+                        thread_id: harness.thread_id.clone(),
+                        turn_id: harness.turn_id.clone(),
+                        item,
+                    },
+                })
+                .await
+        );
+        let streams = if item_type == TurnItemType::CommandExecution {
+            vec![
+                Some(ItemDeltaStream::Generic),
+                None,
+                Some(ItemDeltaStream::AgentMessage),
+            ]
+        } else {
+            vec![Some(ItemDeltaStream::Generic)]
+        };
+        for stream in streams {
+            let mut notification = progress_delta_notification(
+                &harness,
+                "# **not prose** 🦀",
+                ItemDeltaStream::Generic,
+            );
+            notification.stream = stream;
+            notification.payload =
+                Some(json!({"runtimeDeltaKind":"agent_message", "type":"agentMessage"}));
+            harness
+                .processor
+                .handle_progress_agent_event(AgentProgressEvent::ItemDelta { notification })
+                .await;
+            let live = recv_notification_by_method(
+                harness.rx.as_mut().unwrap(),
+                events::ITEM_AGENT_MESSAGE_DELTA,
+            )
+            .await;
+            let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+            assert_eq!(live.delta, "# **not prose** 🦀");
+            assert_eq!(live.stream, stream);
+            assert!(
+                live.markdown.is_none() && live.markdown_version.is_none(),
+                "{item_type:?}"
+            );
+            assert!(
+                harness
+                    .processor
+                    .agent_message_buffers
+                    .lock()
+                    .await
+                    .is_empty(),
+                "{item_type:?}"
+            );
+        }
+    }
+    assert_eq!(
+        harness
+            .processor
+            .markdown_delta_parse_count
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        harness
+            .processor
+            .progress_item_type_lookup_count
+            .load(Ordering::Relaxed),
+        0,
+        "started cache is reused, including for heartbeat; no fallback SQL on a cache hit"
+    );
+}
+
+#[tokio::test]
+async fn unknown_and_late_resolved_items_keep_raw_delta_until_a_full_snapshot() {
+    let mut harness =
+        setup_progress_delta_harness("markdown_late", command_execution_item("known_tool"), true)
+            .await;
+    harness.item_id = "late_message".into();
+    for stream in [Some(ItemDeltaStream::Generic), None] {
+        let mut notification = progress_delta_notification(
+            &harness,
+            "# missing prefix\n```\n",
+            ItemDeltaStream::Generic,
+        );
+        notification.stream = stream;
+        harness
+            .processor
+            .handle_progress_agent_event(AgentProgressEvent::ItemDelta { notification })
+            .await;
+        let live = recv_notification_by_method(
+            harness.rx.as_mut().unwrap(),
+            events::ITEM_AGENT_MESSAGE_DELTA,
+        )
+        .await;
+        let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+        assert_eq!(live.delta, "# missing prefix\n```\n");
+        assert!(live.markdown.is_none() && live.markdown_version.is_none());
+    }
+    assert!(
+        harness
+            .processor
+            .agent_message_buffers
+            .lock()
+            .await
+            .is_empty()
+    );
+    // Existing bounded DB fallback can discover a type without a live prefix.
+    let snapshot = ItemStartedNotification {
+        workspace_id: harness.workspace_id.clone(),
+        thread_id: harness.thread_id.clone(),
+        turn_id: harness.turn_id.clone(),
+        item: TurnItem::AgentMessage {
+            id: harness.item_id.clone(),
+            text: "# recovered\n```\n".into(),
+            phase: Default::default(),
+            markdown: None,
+            markdown_version: None,
+        },
+    };
+    harness
+        .crud_store
+        .materialize_item_started(snapshot.clone(), now_timestamp_secs())
+        .await
+        .unwrap();
+    let previous_lookups = harness
+        .processor
+        .progress_item_type_lookup_count
+        .load(Ordering::Relaxed);
+    harness
+        .processor
+        .progress_items
+        .lock()
+        .await
+        .forget_turn(&harness.turn_id);
+    harness
+        .processor
+        .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+            notification: progress_delta_notification(
+                &harness,
+                "tail 🦀",
+                ItemDeltaStream::AgentMessage,
+            ),
+        })
+        .await;
+    let live = recv_notification_by_method(
+        harness.rx.as_mut().unwrap(),
+        events::ITEM_AGENT_MESSAGE_DELTA,
+    )
+    .await;
+    let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+    assert_eq!(live.delta, "tail 🦀");
+    assert!(live.markdown.is_none() && live.markdown_version.is_none());
+    assert!(
+        harness
+            .processor
+            .agent_message_buffers
+            .lock()
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        harness
+            .processor
+            .markdown_delta_parse_count
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        harness
+            .processor
+            .progress_item_type_lookup_count
+            .load(Ordering::Relaxed),
+        previous_lookups + 1,
+        "one existing fallback resolves the late type without recovering a prefix"
+    );
+    assert!(
+        harness
+            .processor
+            .handle_durable_agent_event(AgentDurableEvent::ItemStarted {
+                notification: snapshot
+            })
+            .await
+    );
+    harness
+        .processor
+        .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+            notification: progress_delta_notification(
+                &harness,
+                "full tail 🦀\n```",
+                ItemDeltaStream::AgentMessage,
+            ),
+        })
+        .await;
+    let live = recv_notification_by_method(
+        harness.rx.as_mut().unwrap(),
+        events::ITEM_AGENT_MESSAGE_DELTA,
+    )
+    .await;
+    let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+    assert_eq!(
+        live.markdown,
+        Some(super::markdown::parse_markdown_document(
+            "# recovered\n```\nfull tail 🦀\n```"
+        ))
+    );
+}
+
+#[test]
+fn replay_markdown_requires_an_allowed_snapshot_and_preserves_its_full_source() {
+    let snapshot = |item: TurnItem, updated: bool| {
+        if updated {
+            TurnItemEventPayload::ItemUpdated {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item,
+            }
+        } else {
+            TurnItemEventPayload::ItemStarted {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item,
+            }
+        }
+    };
+    let message = |text: &str| TurnItem::AgentMessage {
+        id: "message".into(),
+        text: text.into(),
+        phase: Default::default(),
+        markdown: None,
+        markdown_version: None,
+    };
+    let delta =
+        |item_id: &str, text: &str, turn: &str, preview: bool| TurnItemEventPayload::ItemDelta {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: turn.into(),
+            item_id: item_id.into(),
+            delta: text.into(),
+            stream: None,
+            payload: preview.then(|| json!({"runtimeDeltaKind":"provider_message_preview"})),
+            markdown: None,
+            markdown_version: None,
+        };
+    let mut events = vec![
+        snapshot(command_execution_item("tool"), false),
+        delta("tool", "# **tool** 🦀", "turn", false),
+        delta("unknown", "# unknown", "turn", false),
+        delta("message", "lost prefix", "turn", false),
+        snapshot(message("# Начало\r\n```\r\n"), false),
+        delta("message", "stale preview", "turn", true),
+        delta("message", "краб ", "turn", false),
+        delta("message", "🦀\r\n```", "turn", false),
+        delta("message", "other execution", "other-turn", false),
+        snapshot(message("**snapshot"), true),
+        delta("message", " 🦀**", "turn", false),
+        TurnItemEventPayload::ItemCompleted {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item: message("# Final authoritative"),
+        },
+        delta("message", "after completion", "turn", false),
+        snapshot(message("old source"), false),
+        snapshot(command_execution_item("message"), true),
+        delta("message", "denied replacement", "turn", false),
+        snapshot(
+            TurnItem::Reasoning {
+                id: "reasoning".into(),
+                summary: vec!["**мысль".into()],
+                content: vec![],
+            },
+            false,
+        ),
+        delta("reasoning", " 🦀**", "turn", false),
+        snapshot(
+            TurnItem::UserMessage {
+                id: "user".into(),
+                text: "# пользователь\r\n".into(),
+                attachments: vec![],
+            },
+            false,
+        ),
+        delta("user", "🦀", "turn", false),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, payload)| pioneer_protocol::TurnItemEvent {
+        sequence: index as i64,
+        created_at: 1,
+        payload,
+    })
+    .collect::<Vec<_>>();
+    MessageProcessor::enrich_turn_item_events_markdown(&mut events);
+    for index in [1, 2, 3, 5, 8, 12, 15] {
+        let TurnItemEventPayload::ItemDelta {
+            markdown,
+            markdown_version,
+            ..
+        } = &events[index].payload
+        else {
+            panic!("delta")
+        };
+        assert!(
+            markdown.is_none() && markdown_version.is_none(),
+            "event {index}"
+        );
+    }
+    for (index, source) in [
+        (6, "# Начало\r\n```\r\nкраб "),
+        (7, "# Начало\r\n```\r\nкраб 🦀\r\n```"),
+        (10, "**snapshot 🦀**"),
+        (17, "**мысль 🦀**"),
+        (19, "# пользователь\r\n🦀"),
+    ] {
+        let TurnItemEventPayload::ItemDelta {
+            markdown,
+            markdown_version,
+            ..
+        } = &events[index].payload
+        else {
+            panic!("delta")
+        };
+        assert_eq!(
+            markdown.as_ref(),
+            Some(&super::markdown::parse_markdown_document(source)),
+            "event {index}"
+        );
+        assert_eq!(
+            *markdown_version,
+            Some(pioneer_protocol::MARKDOWN_AST_VERSION)
+        );
+    }
+    let TurnItemEventPayload::ItemCompleted {
+        item: TurnItem::AgentMessage { markdown, .. },
+        ..
+    } = &events[11].payload
+    else {
+        panic!("final message")
+    };
+    assert_eq!(
+        markdown.as_ref(),
+        Some(&super::markdown::parse_markdown_document(
+            "# Final authoritative"
+        ))
+    );
+}
+
+#[tokio::test]
+async fn markdown_lifecycle_replaces_denied_items_and_isolates_turns_and_missing_prefixes() {
+    let harness = setup_progress_delta_harness(
+        "markdown_lifecycle",
+        TurnItem::AgentMessage {
+            id: "message".into(),
+            text: "old prefix".into(),
+            phase: Default::default(),
+            markdown: None,
+            markdown_version: None,
+        },
+        false,
+    )
+    .await;
+    let mut delta = progress_delta_notification(&harness, "missing", ItemDeltaStream::Generic);
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut delta, None)
+        .await;
+    assert!(
+        harness
+            .processor
+            .agent_message_buffers
+            .lock()
+            .await
+            .is_empty()
+    );
+    delta.delta = "tail".into();
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut delta, Some(TurnItemType::AgentMessage))
+        .await;
+    assert!(
+        delta.markdown.is_none(),
+        "lost classification invalidates the entire prefix"
+    );
+    let mut start = ItemStartedNotification {
+        workspace_id: harness.workspace_id.clone(),
+        thread_id: harness.thread_id.clone(),
+        turn_id: harness.turn_id.clone(),
+        item: TurnItem::AgentMessage {
+            id: harness.item_id.clone(),
+            text: "replacement".into(),
+            phase: Default::default(),
+            markdown: None,
+            markdown_version: None,
+        },
+    };
+    harness
+        .processor
+        .enrich_item_started_markdown(&mut start)
+        .await;
+    start.item = command_execution_item(&harness.item_id);
+    harness
+        .processor
+        .enrich_item_started_markdown(&mut start)
+        .await;
+    assert!(
+        harness
+            .processor
+            .agent_message_buffers
+            .lock()
+            .await
+            .is_empty()
+    );
+    start.turn_id = "another-turn".into();
+    start.item = TurnItem::AgentMessage {
+        id: harness.item_id.clone(),
+        text: "# new\r\n".into(),
+        phase: Default::default(),
+        markdown: None,
+        markdown_version: None,
+    };
+    harness
+        .processor
+        .enrich_item_started_markdown(&mut start)
+        .await;
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut delta, Some(TurnItemType::AgentMessage))
+        .await;
+    assert!(
+        delta.markdown.is_none(),
+        "previous turn cannot append into the replacement"
+    );
+    let mut completed = ItemCompletedNotification {
+        workspace_id: harness.workspace_id.clone(),
+        thread_id: harness.thread_id.clone(),
+        turn_id: harness.turn_id.clone(),
+        item: start.item.clone(),
+    };
+    harness
+        .processor
+        .enrich_item_completed_markdown(&mut completed)
+        .await;
+    assert_eq!(
+        harness.processor.agent_message_buffers.lock().await.len(),
+        1,
+        "old completion cannot remove the replacement turn"
+    );
+    delta.turn_id = start.turn_id;
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut delta, Some(TurnItemType::AgentMessage))
+        .await;
+    assert_eq!(
+        delta.markdown,
+        Some(super::markdown::parse_markdown_document("# new\r\ntail"))
+    );
+    harness
+        .processor
+        .teardown_agent_thread(&harness.thread_id)
+        .await;
+    assert!(
+        harness
+            .processor
+            .agent_message_buffers
+            .lock()
+            .await
+            .is_empty()
+    );
+    delta.markdown = None;
+    delta.markdown_version = None;
+    harness
+        .processor
+        .enrich_item_delta_markdown(&mut delta, Some(TurnItemType::AgentMessage))
+        .await;
+    assert!(
+        delta.markdown.is_none(),
+        "teardown cannot be followed by a tail-only buffer"
+    );
+}
+
+#[tokio::test]
+async fn gateway_missing_prefix_fallback_replaces_stale_client_markdown_and_recovers() {
+    use pioneer_client::core::{ClientCore, ClientScope};
+    use pioneer_client::timeline::item_presentation::TimelineItemPresentation;
+    use pioneer_client::timeline::semantic::TopLevelPageMergeMode;
+    use pioneer_protocol::{AgentMessagePhase, GatewayNotification};
+    use std::num::NonZeroUsize;
+
+    fn selected(
+        core: &Arc<ClientCore>,
+        thread: &str,
+        turn: &str,
+        id: &str,
+    ) -> (TimelineItemPresentation, TurnItem) {
+        core.set_thread_turn_work_expanded(thread, turn, true);
+        // Public shell subscription materializes the current presentation even
+        // without a background presentation worker in this fixture.
+        let _lease = core.subscribe(
+            ClientScope::Timeline {
+                thread_id: thread.into(),
+            },
+            NonZeroUsize::new(8).unwrap(),
+        );
+        let snapshot = core
+            .thread_presentation_snapshot(thread)
+            .unwrap()
+            .timeline();
+        let row = snapshot
+            .rows()
+            .iter()
+            .find(|row| row.item().is_some_and(|item| item.id == id))
+            .expect("message row must be visible");
+        (
+            row.content().unwrap().clone(),
+            row.item().unwrap().item.clone(),
+        )
+    }
+    fn assert_reasoning_body(item: &TurnItem, expected: &str) {
+        if let TurnItem::Reasoning {
+            summary, content, ..
+        } = item
+        {
+            // Desktop builds its body from this actual row payload, not from
+            // TimelineItemPresentation.text (which prefers content alone).
+            assert_eq!(
+                pioneer_client::timeline::labels::reasoning_text(summary, content, ""),
+                expected,
+            );
+        }
+    }
+    fn projected(
+        core: &ClientCore,
+        thread: &str,
+        id: &str,
+    ) -> pioneer_client::conversation::ItemView {
+        core.thread_coordinator_snapshot(thread)
+            .unwrap()
+            .conversation
+            .projection()
+            .items
+            .iter()
+            .find(|item| item.id == id)
+            .unwrap()
+            .clone()
+    }
+    async fn send(harness: &mut ProgressDeltaHarness, text: &str) -> ItemDeltaNotification {
+        harness
+            .processor
+            .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+                notification: progress_delta_notification(
+                    harness,
+                    text,
+                    ItemDeltaStream::AgentMessage,
+                ),
+            })
+            .await;
+        let live = recv_notification_by_method(
+            harness.rx.as_mut().unwrap(),
+            events::ITEM_AGENT_MESSAGE_DELTA,
+        )
+        .await;
+        serde_json::from_value(live.params.unwrap()).unwrap()
+    }
+
+    // Distinct storage/lifecycle risks: top-level final, work-item commentary,
+    // and Reasoning's existing AST-free semantic representation.
+    let cases: &[(
+        &str,
+        AgentMessagePhase,
+        Option<&[&str]>,
+        &[&str],
+        &str,
+        &str,
+    )] = &[
+        (
+            "fallback_final",
+            AgentMessagePhase::FinalAnswer,
+            None,
+            &[],
+            "**head**",
+            "**head**",
+        ),
+        (
+            "fallback_commentary",
+            AgentMessagePhase::Commentary,
+            None,
+            &[],
+            "**head**",
+            "**head**",
+        ),
+        (
+            "fallback_reasoning_content",
+            AgentMessagePhase::FinalAnswer,
+            Some(&[]),
+            &["**head**"],
+            "**head**",
+            "**head**",
+        ),
+        (
+            "fallback_reasoning_summary",
+            AgentMessagePhase::FinalAnswer,
+            Some(&["**head**", "prefix 🧠"]),
+            &[],
+            "**head**\nprefix 🧠",
+            "**head**\nprefix 🧠",
+        ),
+        (
+            "fallback_reasoning_both",
+            AgentMessagePhase::FinalAnswer,
+            Some(&["summary one", "summary two"]),
+            &["**head**", "independent 🧠"],
+            "**head**\nindependent 🧠",
+            "summary one\nsummary two\n\n**head**\nindependent 🧠",
+        ),
+    ];
+    for &(case, phase, summary, content, head, body) in cases {
+        let reasoning = summary.is_some();
+        let item = if let Some(summary) = summary {
+            TurnItem::Reasoning {
+                id: "message".into(),
+                summary: summary.iter().map(|part| (*part).into()).collect(),
+                content: content.iter().map(|part| (*part).into()).collect(),
+            }
+        } else {
+            TurnItem::AgentMessage {
+                id: "message".into(),
+                text: head.into(),
+                phase,
+                markdown: None,
+                markdown_version: None,
+            }
+        };
+        let mut harness = setup_progress_delta_harness(case, item, true).await;
+        let core = Arc::new(ClientCore::new());
+        let thread = harness
+            .processor
+            .thread_manager
+            .thread_get(&harness.thread_id)
+            .await
+            .unwrap();
+        core.upsert_thread(thread.clone());
+        let started = turn_item_payloads(&harness)
+            .await
+            .into_iter()
+            .find_map(|payload| match payload {
+                TurnItemEventPayload::ItemStarted { item, .. }
+                    if item.item_id() == harness.item_id =>
+                {
+                    Some(item)
+                }
+                _ => None,
+            })
+            .unwrap();
+        core.apply_thread_notification(GatewayNotification::ItemStarted(ItemStartedNotification {
+            workspace_id: harness.workspace_id.clone(),
+            thread_id: harness.thread_id.clone(),
+            turn_id: harness.turn_id.clone(),
+            item: started,
+        }));
+        let (started_content, started_item) = selected(
+            &core,
+            &harness.thread_id,
+            &harness.turn_id,
+            &harness.item_id,
+        );
+        assert_eq!(started_content.text, head);
+        assert_reasoning_body(&started_item, body);
+        if reasoning {
+            let initial = send(&mut harness, " warm").await;
+            assert!(initial.markdown.is_some());
+            core.apply_thread_notification(GatewayNotification::ItemDelta(initial));
+        }
+        let head = if reasoning {
+            format!("{head} warm")
+        } else {
+            head.into()
+        };
+        let body = if reasoning {
+            format!("{body} warm")
+        } else {
+            body.into()
+        };
+        let initial = projected(&core, &harness.thread_id, &harness.item_id);
+        assert!(
+            initial.partial_markdown.is_some(),
+            "the old AST must exist before fallback"
+        );
+        if let TurnItem::AgentMessage { markdown, .. } = &initial.item {
+            assert!(
+                markdown.is_some(),
+                "the payload fallback must also be populated"
+            );
+        }
+        let (before, before_item) = selected(
+            &core,
+            &harness.thread_id,
+            &harness.turn_id,
+            &harness.item_id,
+        );
+        assert_eq!(before.text, head);
+        assert_reasoning_body(&before_item, &body);
+        assert_eq!(before.markdown.is_some(), !reasoning);
+        assert_eq!(before.markdown_presentation.is_some(), !reasoning);
+
+        // Restore the final-answer row through the actual persisted history page
+        // producer and public client page boundary, without a new live ItemStarted.
+        let restored = if !reasoning && phase == AgentMessagePhase::FinalAnswer {
+            let request_id = generate_test_request_id("fallback", "history");
+            harness.processor.process_request_for_connection(harness.connection_id.unwrap(), &json!({
+                "jsonrpc":"2.0", "id":request_id, "method":"thread/timeline/page",
+                "params":{"threadId":harness.thread_id, "anchor":{"kind":"newest"}, "limit":10}
+            }).to_string()).await;
+            let response = recv_response_by_id(harness.rx.as_mut().unwrap(), &request_id).await;
+            let page: pioneer_protocol::ThreadTimelinePageResponse =
+                serde_json::from_value(response.result).unwrap();
+            let restored = Arc::new(ClientCore::new());
+            restored.upsert_thread(thread);
+            assert!(restored.apply_thread_timeline_page(page, TopLevelPageMergeMode::Reset));
+            let (old, _) = selected(
+                &restored,
+                &harness.thread_id,
+                &harness.turn_id,
+                &harness.item_id,
+            );
+            assert!(old.markdown.is_some() && old.markdown_presentation.is_some());
+            assert_eq!(old.text, head);
+            Some(restored)
+        } else {
+            None
+        };
+
+        let mut preview = progress_delta_notification(&harness, " draft", ItemDeltaStream::Generic);
+        preview.payload = Some(json!({"runtimeDeltaKind":"provider_message_preview"}));
+        harness
+            .processor
+            .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+                notification: preview,
+            })
+            .await;
+        let preview = recv_notification_by_method(
+            harness.rx.as_mut().unwrap(),
+            events::ITEM_AGENT_MESSAGE_DELTA,
+        )
+        .await;
+        let preview: ItemDeltaNotification =
+            serde_json::from_value(preview.params.unwrap()).unwrap();
+        assert!(preview.markdown.is_none());
+        for consumer in std::iter::once(&core).chain(restored.iter()) {
+            let (before_preview, before_preview_item) = selected(
+                consumer,
+                &harness.thread_id,
+                &harness.turn_id,
+                &harness.item_id,
+            );
+            consumer.apply_thread_notification(GatewayNotification::ItemDelta(preview.clone()));
+            let (after_preview, after_preview_item) = selected(
+                consumer,
+                &harness.thread_id,
+                &harness.turn_id,
+                &harness.item_id,
+            );
+            assert_eq!(after_preview.text, before_preview.text);
+            assert_eq!(after_preview_item, before_preview_item);
+            assert_reasoning_body(&after_preview_item, &body);
+            assert_eq!(after_preview.markdown, before_preview.markdown);
+            assert_eq!(
+                after_preview.markdown_presentation,
+                before_preview.markdown_presentation
+            );
+        }
+        assert_eq!(
+            projected(&core, &harness.thread_id, &harness.item_id),
+            initial
+        );
+
+        // Real teardown removes the server's canonical prefix while its existing
+        // trusted type cache/turn guard can still deliver the next raw fragment.
+        harness
+            .processor
+            .teardown_agent_thread(&harness.thread_id)
+            .await;
+        let parse_count = harness
+            .processor
+            .markdown_delta_parse_count
+            .load(Ordering::Relaxed);
+        let fallback = send(&mut harness, " tail 🦀\r\n").await;
+        assert!(fallback.markdown.is_none() && fallback.markdown_version.is_none());
+        assert!(
+            harness
+                .processor
+                .agent_message_buffers
+                .lock()
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            harness
+                .processor
+                .markdown_delta_parse_count
+                .load(Ordering::Relaxed),
+            parse_count
+        );
+        let full = format!("{head} tail 🦀\r\n");
+        for consumer in std::iter::once(&core).chain(restored.iter()) {
+            consumer.apply_thread_notification(GatewayNotification::ItemDelta(fallback.clone()));
+            let (raw, raw_item) = selected(
+                consumer,
+                &harness.thread_id,
+                &harness.turn_id,
+                &harness.item_id,
+            );
+            assert_eq!(
+                raw.text, full,
+                "the received tail must be selected for display"
+            );
+            assert!(raw.markdown.is_none() && raw.markdown_presentation.is_none());
+            assert_reasoning_body(&raw_item, &format!("{body} tail 🦀\r\n"));
+        }
+        let raw = projected(&core, &harness.thread_id, &harness.item_id);
+        assert_eq!(raw.partial_text, full);
+        assert!(raw.partial_markdown.is_none() && raw.final_markdown.is_none());
+        if let TurnItem::AgentMessage {
+            markdown,
+            markdown_version,
+            ..
+        } = raw.item
+        {
+            assert!(
+                markdown.is_none() && markdown_version.is_none(),
+                "payload cannot resurrect the old AST"
+            );
+        }
+
+        // Only after proving the fallback, give Gateway a new full authoritative
+        // prefix. Do not send this started event to the existing clients.
+        let recovered = if reasoning {
+            TurnItem::Reasoning {
+                id: harness.item_id.clone(),
+                summary: vec![],
+                content: vec![full.clone()],
+            }
+        } else {
+            TurnItem::AgentMessage {
+                id: harness.item_id.clone(),
+                text: full.clone(),
+                phase,
+                markdown: None,
+                markdown_version: None,
+            }
+        };
+        assert!(
+            harness
+                .processor
+                .handle_durable_agent_event(AgentDurableEvent::ItemStarted {
+                    notification: ItemStartedNotification {
+                        workspace_id: harness.workspace_id.clone(),
+                        thread_id: harness.thread_id.clone(),
+                        turn_id: harness.turn_id.clone(),
+                        item: recovered,
+                    },
+                })
+                .await
+        );
+        let fresh = send(&mut harness, "**again**").await;
+        let recovered_text = format!("{full}**again**");
+        let recovered_ast = super::markdown::parse_markdown_document(&recovered_text);
+        assert_eq!(fresh.markdown, Some(recovered_ast.clone()));
+        for consumer in std::iter::once(&core).chain(restored.iter()) {
+            consumer.apply_thread_notification(GatewayNotification::ItemDelta(fresh.clone()));
+            let (content, content_item) = selected(
+                consumer,
+                &harness.thread_id,
+                &harness.turn_id,
+                &harness.item_id,
+            );
+            assert_eq!(content.text, recovered_text);
+            assert_reasoning_body(&content_item, &format!("{body} tail 🦀\r\n**again**"));
+            if !reasoning {
+                assert_eq!(content.markdown, Some(recovered_ast.clone()));
+                assert!(content.markdown_presentation.is_some());
+            }
+        }
+        assert_eq!(
+            projected(&core, &harness.thread_id, &harness.item_id).partial_markdown,
+            Some(recovered_ast)
+        );
+
+        let final_text = if reasoning {
+            recovered_text.as_str()
+        } else {
+            "# authoritative final"
+        };
+        let final_item = if reasoning {
+            TurnItem::Reasoning {
+                id: harness.item_id.clone(),
+                summary: vec!["authoritative summary".into(), "final detail".into()],
+                content: vec![final_text.into()],
+            }
+        } else {
+            TurnItem::AgentMessage {
+                id: harness.item_id.clone(),
+                text: final_text.into(),
+                phase,
+                markdown: None,
+                markdown_version: None,
+            }
+        };
+        assert!(
+            harness
+                .processor
+                .handle_durable_agent_event(AgentDurableEvent::ItemCompleted {
+                    notification: ItemCompletedNotification {
+                        workspace_id: harness.workspace_id.clone(),
+                        thread_id: harness.thread_id.clone(),
+                        turn_id: harness.turn_id.clone(),
+                        item: final_item,
+                    },
+                })
+                .await
+        );
+        let completed = turn_item_payloads(&harness)
+            .await
+            .into_iter()
+            .find_map(|payload| match payload {
+                TurnItemEventPayload::ItemCompleted { item, .. }
+                    if item.item_id() == harness.item_id =>
+                {
+                    Some(item)
+                }
+                _ => None,
+            })
+            .unwrap();
+        for consumer in std::iter::once(&core).chain(restored.iter()) {
+            consumer.apply_thread_notification(GatewayNotification::ItemCompleted(
+                ItemCompletedNotification {
+                    workspace_id: harness.workspace_id.clone(),
+                    thread_id: harness.thread_id.clone(),
+                    turn_id: harness.turn_id.clone(),
+                    item: completed.clone(),
+                },
+            ));
+        }
+        let (terminal_content, terminal_item) = selected(
+            &core,
+            &harness.thread_id,
+            &harness.turn_id,
+            &harness.item_id,
+        );
+        assert_eq!(terminal_content.text, final_text);
+        assert!(!terminal_content.streaming);
+        if reasoning {
+            assert_eq!(
+                terminal_item, completed,
+                "terminal summary/content must be authoritative"
+            );
+        }
+        assert_reasoning_body(
+            &terminal_item,
+            &format!("authoritative summary\nfinal detail\n\n{final_text}"),
+        );
+        let terminal = projected(&core, &harness.thread_id, &harness.item_id);
+        let late = send(&mut harness, " late raw").await;
+        // A previously valid AST-bearing fragment may also arrive after completion.
+        for late in [late, fresh] {
+            for consumer in std::iter::once(&core).chain(restored.iter()) {
+                consumer.apply_thread_notification(GatewayNotification::ItemDelta(late.clone()));
+                let (content, content_item) = selected(
+                    consumer,
+                    &harness.thread_id,
+                    &harness.turn_id,
+                    &harness.item_id,
+                );
+                assert_eq!(content.text, final_text);
+                assert!(!content.streaming);
+                assert_eq!(
+                    content_item, terminal_item,
+                    "late delta cannot change terminal fields"
+                );
+                assert_reasoning_body(
+                    &content_item,
+                    &format!("authoritative summary\nfinal detail\n\n{final_text}"),
+                );
+                if !reasoning {
+                    assert_eq!(
+                        content.markdown,
+                        Some(super::markdown::parse_markdown_document(final_text))
+                    );
+                    assert!(content.markdown_presentation.is_some());
+                }
+            }
+            let after = projected(&core, &harness.thread_id, &harness.item_id);
+            assert_eq!(after.final_text, terminal.final_text);
+            assert_eq!(after.final_markdown, terminal.final_markdown);
+            assert_eq!(after.partial_markdown, terminal.partial_markdown);
+            assert_eq!(after.item, terminal.item);
+        }
+    }
+}
+
+#[tokio::test]
 async fn provider_preview_deltas_do_not_pollute_canonical_markdown_or_retain_a_draft_buffer() {
     let harness = setup_progress_delta_harness(
         "provider_preview",
@@ -10149,10 +11205,14 @@ async fn provider_preview_deltas_do_not_pollute_canonical_markdown_or_retain_a_d
     preview.payload = Some(json!({"runtimeDeltaKind":"provider_message_preview"}));
     harness
         .processor
-        .enrich_item_delta_markdown(&mut preview)
+        .enrich_item_delta_markdown(&mut preview, Some(TurnItemType::AgentMessage))
         .await;
     assert!(preview.markdown.is_none());
     assert!(preview.markdown_version.is_none());
+    assert_eq!(
+        harness.processor.agent_message_buffers.lock().await.len(),
+        1
+    );
     let mut resolved = ItemStartedNotification {
         workspace_id: harness.workspace_id.clone(),
         thread_id: harness.thread_id.clone(),
@@ -10172,14 +11232,14 @@ async fn provider_preview_deltas_do_not_pollute_canonical_markdown_or_retain_a_d
     preview.delta = "stale preview".into();
     harness
         .processor
-        .enrich_item_delta_markdown(&mut preview)
+        .enrich_item_delta_markdown(&mut preview, Some(TurnItemType::AgentMessage))
         .await;
     assert!(preview.markdown.is_none());
     let mut delta = progress_delta_notification(&harness, " more", ItemDeltaStream::AgentMessage);
     delta.item_id = "provider_preview".into();
     harness
         .processor
-        .enrich_item_delta_markdown(&mut delta)
+        .enrich_item_delta_markdown(&mut delta, Some(TurnItemType::AgentMessage))
         .await;
     assert_eq!(
         delta.markdown,
@@ -10187,74 +11247,136 @@ async fn provider_preview_deltas_do_not_pollute_canonical_markdown_or_retain_a_d
             "working more"
         ))
     );
+    assert_eq!(
+        harness.processor.agent_message_buffers.lock().await.len(),
+        2
+    );
+    let mut completed = ItemCompletedNotification {
+        workspace_id: resolved.workspace_id,
+        thread_id: resolved.thread_id,
+        turn_id: resolved.turn_id,
+        item: resolved.item,
+    };
+    harness
+        .processor
+        .enrich_item_completed_markdown(&mut completed)
+        .await;
+    harness
+        .processor
+        .teardown_agent_thread(&harness.thread_id)
+        .await;
+    assert!(
+        harness
+            .processor
+            .agent_message_buffers
+            .lock()
+            .await
+            .is_empty()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn assistant_progress_delta_is_live_only_and_completed_item_is_durable() {
-    let mut harness = setup_progress_delta_harness(
-        "agent_msg",
-        TurnItem::AgentMessage {
-            id: "item_progress_agent_msg".to_owned(),
-            text: String::new(),
-            phase: Default::default(),
-            markdown: None,
-            markdown_version: None,
-        },
-        true,
-    )
-    .await;
-
-    harness
-        .processor
-        .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
-            notification: progress_delta_notification(
-                &harness,
-                "hel",
-                ItemDeltaStream::AgentMessage,
-            ),
-        })
-        .await;
-
-    let live = recv_notification_by_method(
-        harness.rx.as_mut().expect("live receiver should exist"),
-        events::ITEM_AGENT_MESSAGE_DELTA,
-    )
-    .await;
-    let live_payload: ItemDeltaNotification =
-        serde_json::from_value(live.params.expect("delta params expected"))
-            .expect("live item delta payload should decode");
-    assert_eq!(live_payload.delta, "hel");
-
-    let payloads = turn_item_payloads(&harness).await;
-    assert_no_persisted_item_delta(payloads.as_slice());
-
-    harness
-        .processor
-        .handle_durable_agent_event(AgentDurableEvent::ItemCompleted {
-            notification: ItemCompletedNotification {
-                workspace_id: harness.workspace_id.clone(),
-                thread_id: harness.thread_id.clone(),
-                turn_id: harness.turn_id.clone(),
-                item: TurnItem::AgentMessage {
-                    id: harness.item_id.clone(),
-                    text: "hello".to_owned(),
-                    phase: Default::default(),
-                    markdown: None,
-                    markdown_version: None,
-                },
+    for (case, phase) in [
+        (
+            "agent_final",
+            pioneer_protocol::AgentMessagePhase::FinalAnswer,
+        ),
+        (
+            "agent_commentary",
+            pioneer_protocol::AgentMessagePhase::Commentary,
+        ),
+    ] {
+        let prefix = "# Привет\r\n\r\n```rust\r\n";
+        let mut harness = setup_progress_delta_harness(
+            case,
+            TurnItem::AgentMessage {
+                id: "item_progress_agent_msg".to_owned(),
+                text: prefix.to_owned(),
+                phase,
+                markdown: None,
+                markdown_version: None,
             },
-        })
+            true,
+        )
         .await;
-
-    let payloads = turn_item_payloads(&harness).await;
-    assert_no_persisted_item_delta(payloads.as_slice());
-    assert!(payloads.iter().any(|payload| matches!(
-        payload,
-        TurnItemEventPayload::ItemCompleted {
-            item: TurnItem::AgentMessage { id, text, .. },
-            ..
-        } if id == &harness.item_id && text == "hello"
-    )));
+        let mut full = prefix.to_owned();
+        for fragment in ["let краб = ", "\"🦀\";\r\n", "```\r\n\r\n**готово**"] {
+            full.push_str(fragment);
+            harness
+                .processor
+                .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+                    notification: progress_delta_notification(
+                        &harness,
+                        fragment,
+                        ItemDeltaStream::AgentMessage,
+                    ),
+                })
+                .await;
+            let live = recv_notification_by_method(
+                harness.rx.as_mut().unwrap(),
+                events::ITEM_AGENT_MESSAGE_DELTA,
+            )
+            .await;
+            let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+            assert_eq!(live.delta, fragment);
+            assert_eq!(
+                live.markdown,
+                Some(super::markdown::parse_markdown_document(&full))
+            );
+            assert_eq!(
+                live.markdown_version,
+                Some(pioneer_protocol::MARKDOWN_AST_VERSION)
+            );
+        }
+        assert_eq!(
+            harness
+                .processor
+                .markdown_delta_parse_count
+                .load(Ordering::Relaxed),
+            3
+        );
+        let payloads = turn_item_payloads(&harness).await;
+        assert_no_persisted_item_delta(&payloads);
+        // The final snapshot deliberately differs from the streaming prefix.
+        let final_text = "# Итог\r\n\r\n[результат](https://example.com) 🦀";
+        assert!(
+            harness
+                .processor
+                .handle_durable_agent_event(AgentDurableEvent::ItemCompleted {
+                    notification: ItemCompletedNotification {
+                        workspace_id: harness.workspace_id.clone(),
+                        thread_id: harness.thread_id.clone(),
+                        turn_id: harness.turn_id.clone(),
+                        item: TurnItem::AgentMessage {
+                            id: harness.item_id.clone(),
+                            text: final_text.to_owned(),
+                            phase,
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    },
+                })
+                .await
+        );
+        let payloads = turn_item_payloads(&harness).await;
+        assert_no_persisted_item_delta(&payloads);
+        assert!(payloads.iter().any(|payload| matches!(payload,
+            TurnItemEventPayload::ItemCompleted {
+                item: TurnItem::AgentMessage { id, text, phase: actual_phase, markdown: Some(document), markdown_version: Some(version) }, ..
+            } if id == &harness.item_id && text == final_text && *actual_phase == phase
+                && document == &super::markdown::parse_markdown_document(final_text)
+                && *version == pioneer_protocol::MARKDOWN_AST_VERSION
+        )));
+        assert!(
+            harness
+                .processor
+                .agent_message_buffers
+                .lock()
+                .await
+                .is_empty()
+        );
+    }
 }
 
 #[tokio::test]
@@ -10461,6 +11583,15 @@ async fn retiring_progress_state_drops_the_item_cache_and_execution_lease() {
         .await;
 
     assert!(
+        harness
+            .processor
+            .agent_message_buffers
+            .lock()
+            .await
+            .is_empty()
+    );
+
+    assert!(
         !harness
             .processor
             .execution_leases
@@ -10480,90 +11611,228 @@ async fn retiring_progress_state_drops_the_item_cache_and_execution_lease() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reasoning_progress_delta_is_live_only_by_default() {
-    let harness = setup_progress_delta_harness(
-        "reasoning",
-        TurnItem::Reasoning {
-            id: "item_progress_reasoning".to_owned(),
-            summary: Vec::new(),
-            content: Vec::new(),
-        },
-        false,
-    )
-    .await;
-
-    harness
-        .processor
-        .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
-            notification: progress_delta_notification(
-                &harness,
-                "thinking",
-                ItemDeltaStream::Generic,
-            ),
-        })
-        .await;
-
-    let payloads = turn_item_payloads(&harness).await;
-    assert_no_persisted_item_delta(payloads.as_slice());
+async fn reasoning_and_user_progress_preserve_existing_content_and_heartbeat() {
+    for (case, item, prefix) in [
+        (
+            "reasoning",
+            TurnItem::Reasoning {
+                id: "allowed".into(),
+                summary: vec!["unused summary".into()],
+                content: vec!["# Мысль".into(), "**открыто".into()],
+            },
+            "# Мысль\n**открыто",
+        ),
+        (
+            "user",
+            TurnItem::UserMessage {
+                id: "allowed".into(),
+                text: "# Пользователь\r\n**открыто".into(),
+                attachments: vec![],
+            },
+            "# Пользователь\r\n**открыто",
+        ),
+    ] {
+        let original = item.clone();
+        let mut harness = setup_progress_delta_harness(case, item, true).await;
+        // Make the existing delta heartbeat due without sleeping.
+        let key = super::ProgressItemKey {
+            turn_id: harness.turn_id.clone(),
+            item_id: harness.item_id.clone(),
+        };
+        harness
+            .processor
+            .progress_items
+            .lock()
+            .await
+            .items
+            .get_mut(&key)
+            .unwrap()
+            .last_persisted_heartbeat_at = None;
+        let mut full = prefix.to_owned();
+        for fragment in [" 🦀", "**\r\n"] {
+            full.push_str(fragment);
+            harness
+                .processor
+                .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+                    notification: progress_delta_notification(
+                        &harness,
+                        fragment,
+                        ItemDeltaStream::Generic,
+                    ),
+                })
+                .await;
+            let live = recv_notification_by_method(
+                harness.rx.as_mut().unwrap(),
+                events::ITEM_AGENT_MESSAGE_DELTA,
+            )
+            .await;
+            let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+            assert_eq!(
+                live.markdown,
+                Some(super::markdown::parse_markdown_document(&full))
+            );
+        }
+        assert_eq!(
+            harness
+                .processor
+                .progress_item_type_lookup_count
+                .load(Ordering::Relaxed),
+            0
+        );
+        {
+            let progress = harness.processor.progress_items.lock().await;
+            let state = progress.items.get(&key).unwrap();
+            assert!(state.last_persisted_heartbeat_at.is_some());
+            assert!(
+                state.pending_heartbeat_claim.is_none(),
+                "delta heartbeat completed successfully"
+            );
+        }
+        let attempts = harness
+            .crud_store
+            .list_running_turn_item_attempts_for_turn(&harness.turn_id)
+            .await
+            .unwrap();
+        assert!(
+            attempts
+                .iter()
+                .any(|attempt| attempt.item_id == harness.item_id
+                    && attempt.last_heartbeat_at_unix.is_some())
+        );
+        let payloads = turn_item_payloads(&harness).await;
+        assert_no_persisted_item_delta(&payloads);
+        assert!(
+            payloads.iter().any(|payload| matches!(payload,
+                TurnItemEventPayload::ItemStarted { item, .. } if item == &original
+            )),
+            "Reasoning/UserMessage snapshot representation stays unchanged"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn command_output_is_persisted_before_ack_and_survives_live_progress_cleanup() {
-    let harness = setup_progress_delta_harness(
+    let mut harness = setup_progress_delta_harness(
         "stdout",
         command_execution_item("item_progress_stdout"),
-        false,
+        true,
     )
     .await;
-    let notification = progress_delta_notification(&harness, "chunk\n", ItemDeltaStream::Stdout);
-    for _ in 0..2 {
-        assert!(
-            harness
-                .processor
-                .handle_durable_agent_event(AgentDurableEvent::ToolOutputRecorded {
-                    id: "test-output-1".into(),
-                    notification: notification.clone(),
-                })
+    let chunks = [
+        "# tool output\r\n```rust\r\n".repeat(700),
+        "**строка 🦀** | [file](https://example.com)\n".repeat(700),
+        "```\n- [x] finished\n".repeat(700),
+    ];
+    for (index, chunk) in chunks.iter().enumerate() {
+        let mut notification =
+            progress_delta_notification(&harness, chunk, ItemDeltaStream::Stdout);
+        notification.payload =
+            Some(json!({"runtimeDeltaKind":"command_output", "observation":{"eventSeq":index}}));
+        for _ in 0..2 {
+            assert!(
+                harness
+                    .processor
+                    .handle_durable_agent_event(AgentDurableEvent::ToolOutputRecorded {
+                        id: format!("test-output-{index}"),
+                        notification: notification.clone(),
+                    })
+                    .await,
+                "ACK only after raw output is saved"
+            );
+            let rows = harness
+                .crud_store
+                .tool_output_page(
+                    &harness.workspace_id,
+                    &harness.thread_id,
+                    &harness.turn_id,
+                    &harness.item_id,
+                    0,
+                )
                 .await
-        );
+                .unwrap();
+            assert_eq!(
+                rows.len(),
+                index + 1,
+                "replayed event IDs remain idempotent"
+            );
+            for (ordinal, (_, row)) in rows.iter().enumerate() {
+                assert_eq!(row.id, format!("test-output-{ordinal}"));
+                assert_eq!(row.text, chunks[ordinal]);
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(row.metadata.as_ref().unwrap())
+                        .unwrap(),
+                    json!({"runtimeDeltaKind":"command_output", "observation":{"eventSeq":ordinal}})
+                );
+            }
+            assert!(rows.windows(2).all(|pair| pair[0].0 < pair[1].0));
+            let live = recv_notification_by_method(
+                harness.rx.as_mut().unwrap(),
+                events::ITEM_COMMAND_EXECUTION_OUTPUT_DELTA,
+            )
+            .await;
+            let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+            assert_eq!(live.delta, *chunk);
+            assert_eq!(live.stream, notification.stream);
+            assert_eq!(live.payload, notification.payload);
+            assert!(live.markdown.is_none() && live.markdown_version.is_none());
+            assert!(
+                harness
+                    .processor
+                    .agent_message_buffers
+                    .lock()
+                    .await
+                    .is_empty()
+            );
+            assert_eq!(
+                harness
+                    .processor
+                    .markdown_delta_parse_count
+                    .load(Ordering::Relaxed),
+                0
+            );
+        }
     }
     harness
         .processor
-        .retire_execution_progress_state(harness.turn_id.as_str())
+        .retire_execution_progress_state(&harness.turn_id)
         .await;
-    let rows = harness
-        .processor
-        .crud_store
-        .tool_output_page(
-            &notification.workspace_id,
-            &notification.thread_id,
-            &notification.turn_id,
-            &notification.item_id,
-            0,
-        )
-        .await
+    let mut params = pioneer_protocol::ThreadToolResultReadParams {
+        workspace_id: harness.workspace_id.clone(),
+        thread_id: harness.thread_id.clone(),
+        turn_id: harness.turn_id.clone(),
+        item_id: harness.item_id.clone(),
+        output_log: true,
+        cursor: None,
+        max_tokens: None,
+        max_bytes: Some(4096),
+    };
+    let mut raw = String::new();
+    let mut eof = false;
+    for _ in 0..256 {
+        let page = harness
+            .processor
+            .read_thread_tool_result(params.clone())
+            .await
+            .unwrap();
+        raw.push_str(&page.text);
+        if page.eof {
+            eof = true;
+            break;
+        }
+        params.cursor = page.next;
+        assert!(params.cursor.is_some());
+    }
+    assert!(eof);
+    let values = serde_json::Deserializer::from_str(&raw)
+        .into_iter::<serde_json::Value>()
+        .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].1.text, "chunk\n");
-    let page = harness
-        .processor
-        .read_thread_tool_result(pioneer_protocol::ThreadToolResultReadParams {
-            workspace_id: notification.workspace_id.clone(),
-            thread_id: notification.thread_id.clone(),
-            turn_id: notification.turn_id.clone(),
-            item_id: notification.item_id.clone(),
-            output_log: true,
-            cursor: None,
-            max_tokens: None,
-            max_bytes: None,
-        })
-        .await
-        .unwrap();
-    let value: serde_json::Value = serde_json::from_str(&page.text).unwrap();
-    assert_eq!(value["text"], "chunk\n");
-    assert_eq!(value["stream"], "stdout");
-    assert!(page.eof);
-    let mut invalid = notification;
+    assert_eq!(values.len(), chunks.len());
+    for (value, chunk) in values.iter().zip(&chunks) {
+        assert_eq!(value["text"], *chunk);
+        assert_eq!(value["stream"], "stdout");
+    }
+    let mut invalid = progress_delta_notification(&harness, "rejected", ItemDeltaStream::Stdout);
     invalid.workspace_id = "wrong-workspace".into();
     assert!(
         !harness
@@ -10574,6 +11843,18 @@ async fn command_output_is_persisted_before_ack_and_survives_live_progress_clean
             })
             .await
     );
+    let rows = harness
+        .crud_store
+        .tool_output_page(
+            &harness.workspace_id,
+            &harness.thread_id,
+            &harness.turn_id,
+            &harness.item_id,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), chunks.len());
 }
 
 #[tokio::test]
@@ -39150,6 +40431,75 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
     assert_eq!(
         anchor.child_turn_id.as_deref(),
         Some(lineage.child_turn_id.as_str())
+    );
+
+    // Exercise the real child lineage/resolver and parent subscription path.
+    wait_for_thread_manager_turn_status(
+        &processor.thread_manager,
+        &lineage.child_thread_id,
+        &lineage.child_turn_id,
+        TurnStatus::InProgress,
+    )
+    .await;
+    let reasoning_id = "task_child_reasoning";
+    assert!(
+        processor
+            .handle_durable_agent_event(AgentDurableEvent::ItemStarted {
+                notification: ItemStartedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: lineage.child_thread_id.clone(),
+                    turn_id: lineage.child_turn_id.clone(),
+                    item: TurnItem::Reasoning {
+                        id: reasoning_id.into(),
+                        summary: vec!["**проверка".into()],
+                        content: vec![],
+                    },
+                },
+            })
+            .await
+    );
+    let previous_lookups = processor
+        .progress_item_type_lookup_count
+        .load(Ordering::Relaxed);
+    processor
+        .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+            notification: ItemDeltaNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: lineage.child_thread_id.clone(),
+                turn_id: lineage.child_turn_id.clone(),
+                item_id: reasoning_id.into(),
+                delta: " 🦀**".into(),
+                stream: Some(ItemDeltaStream::Generic),
+                payload: None,
+                markdown: None,
+                markdown_version: None,
+            },
+        })
+        .await;
+    let forwarded = timeout(Duration::from_secs(2), async {
+        loop {
+            let live = recv_notification_by_method(&mut rx, events::ITEM_AGENT_MESSAGE_DELTA).await;
+            let live: ItemDeltaNotification = serde_json::from_value(live.params.unwrap()).unwrap();
+            if live.item_id == reasoning_id {
+                break live;
+            }
+        }
+    })
+    .await
+    .expect("child reasoning must reach the parent subscriber");
+    assert_eq!(forwarded.thread_id, thread_id);
+    assert_eq!(forwarded.turn_id, turn_id);
+    assert_eq!(forwarded.delta, " 🦀**");
+    assert_eq!(
+        forwarded.markdown,
+        Some(super::markdown::parse_markdown_document("**проверка 🦀**"))
+    );
+    assert_eq!(
+        processor
+            .progress_item_type_lookup_count
+            .load(Ordering::Relaxed),
+        previous_lookups,
+        "forwarding reuses the started item type cache"
     );
 
     processor
