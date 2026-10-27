@@ -54,12 +54,13 @@ fn sql(query: String, values: impl IntoIterator<Item = sea_orm::Value>) -> State
 pub struct PortablePayloadProgress {
     family: usize,
     pending: Option<Preparation>,
-    after: [String; 5],
+    after: [Option<String>; 5],
 }
 struct Preparation {
     family: Family,
     owner: String,
     revision: i64,
+    identity: String,
     size: usize,
     offset: usize,
     bytes: Vec<u8>,
@@ -93,12 +94,15 @@ impl PortablePayloadProgress {
             }
             return Ok(true);
         }
-        if cleanup(store).await? {
+        if store
+            .run_background_database_quantum(|| cleanup(store))
+            .await?
+        {
             return Ok(true);
         }
         // Only families installed by the corresponding target migration are
         // registered here. Completed EOF is deliberately revisited next cycle.
-        const FAMILIES: &[Family] = &[Family::ToolText, Family::ToolMetadata];
+        const FAMILIES: &[Family] = &[Family::ToolText, Family::ToolMetadata, Family::CliMapping];
         let family = FAMILIES[self.family];
         self.family = (self.family + 1) % FAMILIES.len();
         let (table, key, field) = family.spec();
@@ -114,14 +118,22 @@ impl PortablePayloadProgress {
         } else {
             ", 0 AS opaque"
         };
-        let row = store.connection.query_one_raw(sql(format!(
-            "SELECT {key} AS owner,portable_revision,octet_length({field}) AS bytes{projection} FROM {table} WHERE {field}_payload_id IS NULL AND {field} IS NOT NULL{eligibility} AND {key}>?1 ORDER BY {key} LIMIT 1"), [self.after[family as usize].clone().into()])).await?;
+        let after = self.after[family as usize].as_deref();
+        let seek = if after.is_some() {
+            format!(" AND {key}>?1")
+        } else {
+            String::new()
+        };
+        let bindings = after.map(|s| vec![s.into()]).unwrap_or_default();
+        let row = select(store,sql(format!(
+            "SELECT {key} AS owner,portable_revision,portable_identity,octet_length({field}) AS bytes{projection} FROM {table} WHERE {field}_payload_id IS NULL AND {field} IS NOT NULL{eligibility}{seek} ORDER BY {key} LIMIT 1"), bindings)).await?;
         if let Some(row) = row {
-            self.after[family as usize] = row.try_get("", "owner")?;
+            self.after[family as usize] = Some(row.try_get("", "owner")?);
             self.pending = Some(Preparation {
                 family,
                 owner: row.try_get("", "owner")?,
                 revision: row.try_get("", "portable_revision")?,
+                identity: row.try_get("", "portable_identity")?,
                 size: usize::try_from(row.try_get::<i64>("", "bytes")?)?,
                 offset: 0,
                 bytes: Vec::new(),
@@ -132,7 +144,7 @@ impl PortablePayloadProgress {
             });
             return Ok(true);
         }
-        self.after[family as usize].clear();
+        self.after[family as usize] = None;
         Ok(false)
     }
 }
@@ -140,9 +152,9 @@ impl Preparation {
     async fn step(&mut self, store: &CrudStore) -> Result<bool> {
         let (table, key, field) = self.family.spec();
         if self.offset < self.size {
-            let row = store.connection.query_one_raw(sql(format!(
-                "SELECT substr(CAST({field} AS BLOB),?3,?4) AS fragment FROM {table} WHERE {key}=?1 AND portable_revision=?2 AND {field}_payload_id IS NULL AND octet_length({field})=?5"),
-                [self.owner.clone().into(),self.revision.into(),i64::try_from(self.offset+1)?.into(),i64::try_from(BLOCK.min(self.size-self.offset))?.into(),i64::try_from(self.size)?.into()])).await?;
+            let row = select(store,sql(format!(
+                "SELECT substr(CAST({field} AS BLOB),?3,?4) AS fragment FROM {table} WHERE {key}=?1 AND portable_revision=?2 AND {field}_payload_id IS NULL AND octet_length({field})=?5 AND portable_identity=?6"),
+                [self.owner.clone().into(),self.revision.into(),i64::try_from(self.offset+1)?.into(),i64::try_from(BLOCK.min(self.size-self.offset))?.into(),i64::try_from(self.size)?.into(),self.identity.clone().into()])).await?;
             let Some(row) = row else {
                 return Ok(true);
             };
@@ -162,7 +174,11 @@ impl Preparation {
         if self.prepared.is_none() {
             // No connection, transaction, permit or writer reservation here.
             // Work/memory is bounded by BUFFER; larger values finish as raw.
-            let dict = load_or_prepare_dictionary(store, self.family, &self.bytes).await?;
+            let dict = if self.bytes.is_empty() {
+                None
+            } else {
+                Some(load_or_prepare_dictionary(store, self.family, &self.bytes).await?)
+            };
             let digest = hex::encode(self.digest.clone().finalize());
             let id = uuid::Uuid::new_v4().to_string();
             let mut blocks = Vec::new();
@@ -175,7 +191,11 @@ impl Preparation {
                     end -= 1;
                 }
                 let part = &text[offset..end];
-                let encoded = codec::encode(part.as_bytes(), &dict)?;
+                let encoded = codec::encode(
+                    part.as_bytes(),
+                    dict.as_ref()
+                        .context("portable encoding dictionary missing")?,
+                )?;
                 blocks.push(block::Model {
                     payload_id: id.clone(),
                     ordinal: blocks.len() as i64,
@@ -189,7 +209,7 @@ impl Preparation {
                 offset = end;
             }
             let encoded_bytes = blocks.iter().map(|b| b.data.len() + 48).sum::<usize>();
-            let raw = self.size > BUFFER || encoded_bytes >= self.size;
+            let raw = self.size > BUFFER || self.size == 0 || encoded_bytes >= self.size;
             if raw {
                 blocks.clear();
             }
@@ -225,8 +245,16 @@ impl Preparation {
                     sha256: digest,
                     raw: i32::from(raw),
                     retired: 1,
-                    dictionary_id: (!raw)
-                        .then(|| dictionary_key(self.family.name(), dict.digest())),
+                    dictionary_id: if raw {
+                        None
+                    } else {
+                        Some(dictionary_key(
+                            self.family.name(),
+                            dict.as_ref()
+                                .context("portable dictionary missing")?
+                                .digest(),
+                        ))
+                    },
                 },
                 blocks,
                 next: 0,
@@ -242,13 +270,18 @@ impl Preparation {
             .as_mut()
             .context("portable preparation missing")?;
         if !prepared.installed {
-            value::Entity::insert(prepared.header.clone().into_active_model())
-                .on_conflict(
-                    OnConflict::column(value::Column::Id)
-                        .do_nothing()
-                        .to_owned(),
-                )
-                .exec_without_returning(&store.connection)
+            store
+                .run_background_database_quantum(|| async {
+                    value::Entity::insert(prepared.header.clone().into_active_model())
+                        .on_conflict(
+                            OnConflict::column(value::Column::Id)
+                                .do_nothing()
+                                .to_owned(),
+                        )
+                        .exec_without_returning(&store.connection)
+                        .await?;
+                    Ok(())
+                })
                 .await?;
             prepared.installed = true;
             return Ok(false);
@@ -260,55 +293,34 @@ impl Preparation {
                 .cloned()
                 .map(|b| b.into_active_model())
                 .collect::<Vec<_>>();
-            block::Entity::insert_many(rows)
-                .on_conflict(
-                    OnConflict::columns([block::Column::PayloadId, block::Column::Ordinal])
-                        .do_nothing()
-                        .to_owned(),
-                )
-                .exec_without_returning(&store.connection)
+            store
+                .run_background_database_quantum(|| async {
+                    block::Entity::insert_many(rows.clone())
+                        .on_conflict(
+                            OnConflict::columns([block::Column::PayloadId, block::Column::Ordinal])
+                                .do_nothing()
+                                .to_owned(),
+                        )
+                        .exec_without_returning(&store.connection)
+                        .await?;
+                    Ok(())
+                })
                 .await?;
             prepared.next = end;
             return Ok(false);
         }
-        let tx = store.connection.begin().await?;
-        // Source revision triggers cover logical payload and ownership updates.
-        // Unknown/expired roots cannot pass the existing verified root trigger.
-        // Revalidate Task/run/workspace at publication, not from preparation.
-        let owner_guard = match self.family {
-            Family::TaskHistory => {
-                " AND EXISTS(SELECT 1 FROM task t JOIN task_run r ON r.task_id=t.id WHERE r.id=task_run_conversation_snapshot.run_id AND t.id=task_run_conversation_snapshot.task_id AND t.workspace_id=task_run_conversation_snapshot.workspace_id)"
-            }
-            Family::ToolText | Family::ToolMetadata => {
-                " AND EXISTS(SELECT 1 FROM turn t JOIN thread th ON th.id=t.thread_id WHERE t.id=tool_output_chunk.turn_id)"
-            }
-            Family::CliMapping => {
-                " AND EXISTS(SELECT 1 FROM turn t JOIN thread th ON th.id=t.thread_id WHERE t.id=turn_cli_runtime_binding.turn_id AND th.workspace_id=turn_cli_runtime_binding.workspace_id AND t.thread_id=turn_cli_runtime_binding.thread_id)"
-            }
-            Family::TaskEvent => " AND EXISTS(SELECT 1 FROM task t WHERE t.id=task_event.task_id)",
-        };
-        let assignment = if prepared.projection.is_some() {
-            format!("{field}=?4,")
-        } else {
-            String::new()
-        };
-        let mut bindings = vec![
-            self.owner.clone().into(),
-            self.revision.into(),
-            prepared.header.id.clone().into(),
-        ];
-        if let Some(projection) = &prepared.projection {
-            bindings.push(projection.clone().into());
-        }
-        let affected=tx.execute_raw(sql(format!("UPDATE {table} SET {assignment}{field}_payload_id=?3 WHERE {key}=?1 AND portable_revision=?2 AND {field}_payload_id IS NULL{owner_guard}"),bindings)).await?.rows_affected();
-        if affected == 1 {
-            value::Entity::update_many()
-                .col_expr(value::Column::Retired, Expr::value(0))
-                .filter(value::Column::Id.eq(&prepared.header.id))
-                .exec(&tx)
-                .await?;
-        }
-        tx.commit().await?;
+        store
+            .run_background_database_quantum(|| {
+                publish(
+                    store,
+                    self.family,
+                    &self.owner,
+                    self.revision,
+                    &self.identity,
+                    prepared,
+                )
+            })
+            .await?;
         Ok(true)
     }
 }
@@ -318,12 +330,7 @@ async fn load_or_prepare_dictionary(
     family: Family,
     sample: &[u8],
 ) -> Result<codec::Dictionary> {
-    if let Some(row) = dictionary::Entity::find()
-        .filter(dictionary::Column::Family.eq(family.name()))
-        .filter(dictionary::Column::Version.eq(1))
-        .one(&store.connection)
-        .await?
-    {
+    if let Some(row) = dictionary_row(store, family).await? {
         let result = codec::Dictionary::from_bytes(row.data)?;
         ensure!(
             dictionary_key(family.name(), result.digest()) == row.id,
@@ -335,23 +342,25 @@ async fn load_or_prepare_dictionary(
         .chunks(1024)
         .collect::<Vec<_>>();
     let dict = codec::train(&samples)?;
-    dictionary::Entity::insert(dictionary::ActiveModel {
-        id: Set(dictionary_key(family.name(), dict.digest())),
-        family: Set(family.name().into()),
-        version: Set(1),
-        data: Set(dict.bytes().to_vec()),
-    })
-    .on_conflict(
-        OnConflict::columns([dictionary::Column::Family, dictionary::Column::Version])
-            .do_nothing()
-            .to_owned(),
-    )
-    .exec_without_returning(&store.connection)
-    .await?;
-    let winner = dictionary::Entity::find()
-        .filter(dictionary::Column::Family.eq(family.name()))
-        .filter(dictionary::Column::Version.eq(1))
-        .one(&store.connection)
+    store
+        .run_background_database_quantum(|| async {
+            dictionary::Entity::insert(dictionary::ActiveModel {
+                id: Set(dictionary_key(family.name(), dict.digest())),
+                family: Set(family.name().into()),
+                version: Set(1),
+                data: Set(dict.bytes().to_vec()),
+            })
+            .on_conflict(
+                OnConflict::columns([dictionary::Column::Family, dictionary::Column::Version])
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec_without_returning(&store.connection)
+            .await?;
+            Ok(())
+        })
+        .await?;
+    let winner = dictionary_row(store, family)
         .await?
         .context("portable dictionary publication missing")?;
     let dict = codec::Dictionary::from_bytes(winner.data)?;
@@ -573,3 +582,78 @@ impl std::fmt::Display for PreflightRace {
     }
 }
 impl std::error::Error for PreflightRace {}
+
+async fn publish(
+    store: &CrudStore,
+    family: Family,
+    owner: &str,
+    revision: i64,
+    identity: &str,
+    prepared: &Prepared,
+) -> Result<()> {
+    let (table, key, field) = family.spec();
+    let tx = store.connection.begin().await?;
+    // Source revision triggers cover logical payload and ownership updates.
+    // Unknown/expired roots cannot pass the existing verified root trigger.
+    // Revalidate Task/run/workspace at publication, not from preparation.
+    let owner_guard = match family {
+        Family::TaskHistory => {
+            " AND EXISTS(SELECT 1 FROM task t JOIN task_run r ON r.task_id=t.id WHERE r.id=task_run_conversation_snapshot.run_id AND t.id=task_run_conversation_snapshot.task_id AND t.workspace_id=task_run_conversation_snapshot.workspace_id)"
+        }
+        Family::ToolText | Family::ToolMetadata => {
+            " AND EXISTS(SELECT 1 FROM turn t JOIN thread th ON th.id=t.thread_id WHERE t.id=tool_output_chunk.turn_id)"
+        }
+        Family::CliMapping => {
+            " AND EXISTS(SELECT 1 FROM turn t JOIN thread th ON th.id=t.thread_id WHERE t.id=turn_cli_runtime_binding.turn_id AND th.workspace_id=turn_cli_runtime_binding.workspace_id AND t.thread_id=turn_cli_runtime_binding.thread_id)"
+        }
+        Family::TaskEvent => " AND EXISTS(SELECT 1 FROM task t WHERE t.id=task_event.task_id)",
+    };
+    let root_guard = if matches!(family, Family::CliMapping | Family::TaskHistory) {
+        format!(
+            " AND (frozen_manifest_id IS NULL OR (frozen_manifest_id<>'' AND EXISTS(SELECT 1 FROM compaction_frozen_history h WHERE h.id={table}.frozen_manifest_id AND h.workspace_id={table}.workspace_id AND h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count)))"
+        )
+    } else {
+        String::new()
+    };
+    let assignment = if prepared.projection.is_some() {
+        format!("{field}=?4,")
+    } else {
+        String::new()
+    };
+    let mut bindings = vec![
+        owner.into(),
+        revision.into(),
+        prepared.header.id.clone().into(),
+    ];
+    bindings.push(prepared.projection.clone().unwrap_or_default().into());
+    bindings.push(identity.into());
+    let affected=tx.execute_raw(sql(format!("UPDATE {table} SET {assignment}{field}_payload_id=?3 WHERE {key}=?1 AND portable_revision=?2 AND portable_identity=?5 AND {field}_payload_id IS NULL{owner_guard}{root_guard}"),bindings)).await?.rows_affected();
+    if affected == 1 {
+        value::Entity::update_many()
+            .col_expr(value::Column::Retired, Expr::value(0))
+            .filter(value::Column::Id.eq(&prepared.header.id))
+            .exec(&tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+async fn select(store: &CrudStore, statement: Statement) -> Result<Option<sea_orm::QueryResult>> {
+    store
+        .run_background_database_quantum(|| async {
+            Ok(store.connection.query_one_raw(statement.clone()).await?)
+        })
+        .await
+}
+
+async fn dictionary_row(store: &CrudStore, family: Family) -> Result<Option<dictionary::Model>> {
+    store
+        .run_background_database_quantum(|| async {
+            Ok(dictionary::Entity::find()
+                .filter(dictionary::Column::Family.eq(family.name()))
+                .filter(dictionary::Column::Version.eq(1))
+                .one(&store.connection)
+                .await?)
+        })
+        .await
+}

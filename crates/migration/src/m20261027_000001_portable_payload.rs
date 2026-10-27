@@ -15,7 +15,7 @@ impl MigrationTrait for Migration {
                 .col(text("id").primary_key())
                 .col(text("family"))
                 .col(integer("version"))
-                .col(binary("data"))
+                .col(binary("data").check(Expr::cust("length(data) BETWEEN 1 AND 32768")))
                 .to_owned(),
         )
         .await?;
@@ -34,11 +34,17 @@ impl MigrationTrait for Migration {
                 .table(Alias::new("portable_payload"))
                 .col(text("id").primary_key())
                 .col(text("family"))
-                .col(big_integer("original_bytes"))
-                .col(big_integer("original_chars"))
-                .col(text("sha256"))
-                .col(integer("raw"))
-                .col(integer("retired").default(1))
+                .col(big_integer("original_bytes").check(Expr::col("original_bytes").gte(0)))
+                .col(big_integer("original_chars").check(Expr::cust(
+                    "original_chars>=0 AND original_chars<=original_bytes",
+                )))
+                .col(text("sha256").check(Expr::cust("length(sha256)=64")))
+                .col(integer("raw").check(Expr::col("raw").is_in([0, 1])))
+                .col(
+                    integer("retired")
+                        .default(1)
+                        .check(Expr::col("retired").is_in([0, 1])),
+                )
                 .col(text_null("dictionary_id"))
                 .to_owned(),
         )
@@ -56,12 +62,17 @@ impl MigrationTrait for Migration {
             Table::create()
                 .table(Alias::new("portable_payload_block"))
                 .col(text("payload_id"))
-                .col(big_integer("ordinal"))
-                .col(big_integer("byte_offset"))
-                .col(big_integer("char_offset"))
-                .col(big_integer("original_bytes"))
-                .col(big_integer("original_chars"))
-                .col(binary("data"))
+                .col(big_integer("ordinal").check(Expr::col("ordinal").gte(0)))
+                .col(big_integer("byte_offset").check(Expr::col("byte_offset").gte(0)))
+                .col(big_integer("char_offset").check(Expr::col("char_offset").gte(0)))
+                .col(
+                    big_integer("original_bytes")
+                        .check(Expr::col("original_bytes").between(1, 65536)),
+                )
+                .col(big_integer("original_chars").check(Expr::cust(
+                    "original_chars>=1 AND original_chars<=original_bytes",
+                )))
+                .col(binary("data").check(Expr::cust("length(data) BETWEEN 78 AND 66638")))
                 .primary_key(Index::create().col("payload_id").col("ordinal"))
                 .to_owned(),
         )

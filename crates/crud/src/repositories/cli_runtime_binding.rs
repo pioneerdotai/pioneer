@@ -186,8 +186,15 @@ impl CliRuntimeActiveTurnBindingStatus {
 
 pub const CLI_RUNTIME_ACTIVE_TURN_BINDING_PAGE_MAX: u64 = 64;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CliRuntimeTurnBindingRecord {
+    /// Storage provenance used only by CRUD. Callers receive logical JSON.
+    #[doc(hidden)]
+    pub input_mapping_payload_id: Option<String>,
+    #[doc(hidden)]
+    pub input_mapping_revision: i64,
+    #[doc(hidden)]
+    pub input_mapping_identity: String,
     pub turn_id: String,
     pub thread_id: String,
     pub continuation_thread_id: String,
@@ -2765,6 +2772,9 @@ fn turn_binding_record_from_model(
 ) -> Result<CliRuntimeTurnBindingRecord> {
     let mcp = turn_mcp_metadata_from_model(&model);
     Ok(CliRuntimeTurnBindingRecord {
+        input_mapping_payload_id: model.input_mapping_json_payload_id,
+        input_mapping_revision: model.portable_revision,
+        input_mapping_identity: model.portable_identity,
         turn_id: model.turn_id,
         thread_id: model.thread_id,
         continuation_thread_id: model.continuation_thread_id,
@@ -2948,6 +2958,70 @@ fn native_event_record_from_model(
         sequence: model.sequence,
         created_at: model.created_at,
     })
+}
+
+/// Restore logical bytes only on a released reader boundary or after commit.
+/// Keep provenance for later short writer CAS; never use a reloaded mapping
+/// that could belong to a newer UPSERT in place of the captured record.
+pub(crate) async fn hydrate_record(
+    db: &pioneer_sqlite::SqliteDatabase,
+    mut record: CliRuntimeTurnBindingRecord,
+) -> Result<CliRuntimeTurnBindingRecord> {
+    record.input_mapping_json = super::portable_payload::hydrate(
+        db,
+        super::portable_payload::Family::CliMapping,
+        record.input_mapping_payload_id.as_deref(),
+        record.input_mapping_json,
+    )
+    .await?;
+    Ok(record)
+}
+
+/// Physical cutover changes reference/projection, not logical revision. Writer
+/// guards compare the recorded logical version and every original control fact
+/// without hashing/parsing/decompressing large mapping bytes in a transaction.
+pub(crate) fn same_binding_version(
+    stored: &CliRuntimeTurnBindingRecord,
+    expected: &CliRuntimeTurnBindingRecord,
+) -> bool {
+    stored.input_mapping_identity == expected.input_mapping_identity
+        && stored.input_mapping_revision == expected.input_mapping_revision
+        && same_binding_control(stored, expected)
+}
+
+// Public record equality remains equality of the original logical fields.
+// A physical reference or storage revision is not part of the public value.
+impl PartialEq for CliRuntimeTurnBindingRecord {
+    fn eq(&self, other: &Self) -> bool {
+        same_binding_control(self, other) && self.input_mapping_json == other.input_mapping_json
+    }
+}
+impl Eq for CliRuntimeTurnBindingRecord {}
+
+fn same_binding_control(
+    stored: &CliRuntimeTurnBindingRecord,
+    expected: &CliRuntimeTurnBindingRecord,
+) -> bool {
+    stored.turn_id == expected.turn_id
+        && stored.thread_id == expected.thread_id
+        && stored.continuation_thread_id == expected.continuation_thread_id
+        && stored.workspace_id == expected.workspace_id
+        && stored.runtime_id == expected.runtime_id
+        && stored.runtime_kind == expected.runtime_kind
+        && stored.native_thread_id == expected.native_thread_id
+        && stored.native_turn_id == expected.native_turn_id
+        && stored.request_id == expected.request_id
+        && stored.status == expected.status
+        && stored.model == expected.model
+        && stored.cwd == expected.cwd
+        && stored.sandbox_json == expected.sandbox_json
+        && stored.approval_policy == expected.approval_policy
+        && stored.mcp == expected.mcp
+        && stored.native_goal_status == expected.native_goal_status
+        && stored.native_goal_turn_id == expected.native_goal_turn_id
+        && stored.native_goal_observed_at == expected.native_goal_observed_at
+        && stored.created_at == expected.created_at
+        && stored.updated_at == expected.updated_at
 }
 
 #[cfg(test)]

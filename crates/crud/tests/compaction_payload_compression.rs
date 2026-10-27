@@ -18,8 +18,13 @@ async fn open(path: &Path) -> (CrudStore, SqliteWriteExecutor) {
     options.max_connections(1).min_connections(1);
     let writer_connection = Database::connect(options).await.unwrap();
     let writer = SqliteWriteExecutor::new(writer_connection.clone());
-    SqliteDatabase::from_executor(writer_connection, writer.clone())
-        .maintenance()
+    let maintenance =
+        SqliteDatabase::from_executor(writer_connection, writer.clone()).maintenance();
+    maintenance
+        .execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
+    maintenance
         .execute_unprepared("PRAGMA journal_mode=WAL")
         .await
         .unwrap();
@@ -590,4 +595,204 @@ async fn whole_and_batch_reads_reject_noncanonical_revision_aliases() {
             "batch read accepted noncanonical version {version}"
         );
     }
+}
+
+#[tokio::test]
+async fn portable_tool_storage_survives_staging_restart_and_preserves_retry_and_null() {
+    let (file, store, _writer) = fixture().await;
+    let output = pioneer_protocol::ItemDeltaNotification {
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        turn_id: "turn".into(),
+        item_id: "portable".into(),
+        delta: "точные bytes 🦀\n".repeat(6000),
+        stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
+        payload: Some(serde_json::json!({"metadata":"separate dictionary ".repeat(400)})),
+        markdown: None,
+        markdown_version: None,
+    };
+    store.record_tool_output("portable", &output).await.unwrap();
+    let before = store
+        .tool_output_page("ws", "thread", "turn", "portable", 0)
+        .await
+        .unwrap();
+    let mut interrupted = pioneer_crud::PortablePayloadProgress::default();
+    for _ in 0..80 {
+        interrupted.quantum(&store).await.unwrap();
+        if scalar(&store, "SELECT count(*) n FROM portable_payload_block").await > 0 {
+            break;
+        }
+    }
+    drop(interrupted);
+    // Reopening discards in-memory preparation. Incomplete blocks are retired,
+    // never selected as a logical payload, and reclaimed in bounded portions.
+    let (reopened, _writer) = open(&file.0).await;
+    let mut restarted = pioneer_crud::PortablePayloadProgress::default();
+    for _ in 0..200 {
+        restarted.quantum(&reopened).await.unwrap();
+    }
+    assert_eq!(
+        scalar(
+            &reopened,
+            "SELECT count(*) n FROM portable_payload WHERE retired=1"
+        )
+        .await,
+        0
+    );
+    assert!(
+        scalar(
+            &reopened,
+            "SELECT count(*) n FROM tool_output_chunk WHERE text_payload_id IS NOT NULL AND text=''"
+        )
+        .await
+            > 0
+    );
+    assert!(scalar(&reopened,"SELECT count(*) n FROM tool_output_chunk WHERE metadata_payload_id IS NOT NULL AND metadata=''").await>0);
+    reopened
+        .record_tool_output("portable", &output)
+        .await
+        .unwrap();
+    let after = reopened
+        .tool_output_page("ws", "thread", "turn", "portable", 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        before.iter().map(|r| r.0).collect::<Vec<_>>(),
+        after.iter().map(|r| r.0).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        after.iter().map(|r| r.1.text.as_str()).collect::<String>(),
+        output.delta
+    );
+    assert_eq!(after[0].1.metadata, before[0].1.metadata);
+    // New values admitted after the old pass reached EOF cannot be skipped.
+    let mut empty = output.clone();
+    empty.delta.clear();
+    empty.payload = None;
+    reopened.record_tool_output("later", &empty).await.unwrap();
+    for _ in 0..80 {
+        restarted.quantum(&reopened).await.unwrap();
+    }
+    let rows = reopened
+        .tool_output_page("ws", "thread", "turn", "portable", after.last().unwrap().0)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1.text, "");
+    assert_eq!(rows[0].1.metadata, None);
+    assert_eq!(scalar(&reopened,"SELECT p.raw n FROM tool_output_chunk c JOIN portable_payload p ON p.id=c.text_payload_id WHERE c.id='later'").await,1);
+    reopened
+        .database_connection()
+        .execute_unprepared("DELETE FROM tool_output_chunk WHERE item_id='portable'")
+        .await
+        .unwrap();
+    for _ in 0..80 {
+        restarted.quantum(&reopened).await.unwrap();
+    }
+    assert_eq!(
+        scalar(&reopened, "SELECT count(*) n FROM portable_payload").await,
+        0
+    );
+    assert_eq!(
+        scalar(&reopened, "SELECT count(*) n FROM portable_payload_block").await,
+        0
+    );
+    assert!(
+        reopened
+            .database_connection()
+            .reader_query_only_enabled()
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn portable_cli_mapping_preserves_sent_bytes_control_updates_and_upsert() {
+    let (_file, store, _writer) = fixture().await;
+    let at = chrono::Utc::now().fixed_offset();
+    let history = serde_json::to_string(
+        &serde_json::json!([{"role":"user","content":"контекст🦀".repeat(12000)}]),
+    )
+    .unwrap();
+    let original = format!(
+        "  {}\n",
+        serde_json::json!({"pioneerContextBasis":{"historyJson":history},"input":"original sent bytes"})
+    );
+    let mut binding = pioneer_crud::NewCliRuntimeTurnBinding {
+        turn_id: "turn".into(),
+        thread_id: "thread".into(),
+        continuation_thread_id: "thread".into(),
+        workspace_id: "ws".into(),
+        runtime_id: "codex".into(),
+        runtime_kind: "codex".into(),
+        native_thread_id: "native".into(),
+        native_turn_id: None,
+        request_id: Some("portable-request".into()),
+        status: "starting".into(),
+        model: None,
+        cwd: None,
+        sandbox_json: None,
+        approval_policy: None,
+        input_mapping_json: original.clone(),
+        created_at: at,
+        updated_at: at,
+    };
+    store
+        .upsert_cli_runtime_turn_binding(binding.clone())
+        .await
+        .unwrap();
+    let mut progress = pioneer_crud::PortablePayloadProgress::default();
+    for _ in 0..180 {
+        progress.quantum(&store).await.unwrap();
+    }
+    assert_eq!(scalar(&store,"SELECT count(*) n FROM turn_cli_runtime_binding WHERE input_mapping_json_payload_id IS NOT NULL AND octet_length(input_mapping_json)<256").await,1);
+    assert_eq!(
+        store
+            .get_cli_runtime_turn_binding_by_request("portable-request")
+            .await
+            .unwrap()
+            .unwrap()
+            .input_mapping_json,
+        original
+    );
+    assert_eq!(
+        store
+            .set_cli_runtime_turn_mcp_metadata("turn", None)
+            .await
+            .unwrap()
+            .input_mapping_json,
+        original
+    );
+    assert_eq!(scalar(&store,"SELECT coalesce(json_extract(input_mapping_json,'$.pioneerContextBasis.historyJson'),'[]')<>'[]' n FROM turn_cli_runtime_binding WHERE turn_id='turn'").await,1);
+    binding.input_mapping_json =
+        "{ \"pioneerContextBasis\": {\"historyJson\":\"[]\"}, \"input\":\"replacement\" }".into();
+    let replacement = binding.input_mapping_json.clone();
+    assert_eq!(
+        store
+            .upsert_cli_runtime_turn_binding(binding)
+            .await
+            .unwrap()
+            .input_mapping_json,
+        replacement
+    );
+    for _ in 0..100 {
+        progress.quantum(&store).await.unwrap();
+    }
+    assert_eq!(
+        store
+            .get_cli_runtime_turn_binding("turn")
+            .await
+            .unwrap()
+            .unwrap()
+            .input_mapping_json,
+        replacement
+    );
+    assert_eq!(
+        scalar(
+            &store,
+            "SELECT count(*) n FROM portable_payload WHERE retired=1"
+        )
+        .await,
+        0
+    );
 }

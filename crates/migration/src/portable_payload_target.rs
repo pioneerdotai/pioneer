@@ -16,6 +16,14 @@ pub(super) async fn up(
             .to_owned(),
     )
     .await?;
+    m.alter_table(
+        Table::alter()
+            .table(Alias::new(table))
+            .add_column(text("portable_identity").default(""))
+            .to_owned(),
+    )
+    .await?;
+    m.get_connection().execute_unprepared(&format!("CREATE TRIGGER {table}_portable_insert AFTER INSERT ON {table} BEGIN UPDATE {table} SET portable_identity=lower(hex(randomblob(16))) WHERE {key}=NEW.{key}; END")).await?;
     for field in fields {
         let reference = format!("{field}_payload_id");
         m.alter_table(
@@ -41,12 +49,9 @@ pub(super) async fn up(
         m.get_connection().execute_unprepared(&format!("CREATE TRIGGER {table}_{field}_portable_replace AFTER UPDATE OF {reference} ON {table} WHEN OLD.{reference} IS NOT NULL AND OLD.{reference} IS NOT NEW.{reference} BEGIN UPDATE portable_payload SET retired=1 WHERE id=OLD.{reference}; END")).await?;
         m.get_connection().execute_unprepared(&format!("CREATE TRIGGER {table}_{field}_portable_delete AFTER DELETE ON {table} WHEN OLD.{reference} IS NOT NULL BEGIN UPDATE portable_payload SET retired=1 WHERE id=OLD.{reference}; END")).await?;
     }
-    let clear = fields
-        .iter()
-        .map(|f| format!("{f}_payload_id=NULL"))
-        .collect::<Vec<_>>()
-        .join(",");
-    m.get_connection().execute_unprepared(&format!("CREATE TRIGGER {table}_portable_owner AFTER UPDATE OF {} ON {table} BEGIN UPDATE {table} SET {clear},portable_revision=portable_revision+1 WHERE {key}=NEW.{key}; END",ownership.join(","))).await?;
+    // Ownership/control changes fence a prepared source, but do not discard
+    // an already published payload when the logical bytes are unchanged.
+    m.get_connection().execute_unprepared(&format!("CREATE TRIGGER {table}_portable_owner AFTER UPDATE OF {} ON {table} BEGIN UPDATE {table} SET portable_revision=portable_revision+1 WHERE {key}=NEW.{key}; END",ownership.join(","))).await?;
     Ok(())
 }
 pub(super) async fn down(m: &SchemaManager<'_>, table: &str, fields: &[&str]) -> Result<(), DbErr> {
@@ -70,6 +75,9 @@ pub(super) async fn down(m: &SchemaManager<'_>, table: &str, fields: &[&str]) ->
     m.get_connection()
         .execute_unprepared(&format!("DROP TRIGGER {table}_portable_owner"))
         .await?;
+    m.get_connection()
+        .execute_unprepared(&format!("DROP TRIGGER {table}_portable_insert"))
+        .await?;
     for field in fields {
         for suffix in ["logical", "replace", "delete"] {
             m.get_connection()
@@ -91,6 +99,13 @@ pub(super) async fn down(m: &SchemaManager<'_>, table: &str, fields: &[&str]) ->
         )
         .await?;
     }
+    m.alter_table(
+        Table::alter()
+            .table(Alias::new(table))
+            .drop_column(Alias::new("portable_identity"))
+            .to_owned(),
+    )
+    .await?;
     m.alter_table(
         Table::alter()
             .table(Alias::new(table))

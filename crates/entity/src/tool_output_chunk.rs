@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 #[sea_orm(table_name = "tool_output_chunk")]
 pub struct Model {
     pub portable_revision: i64,
+    #[sea_orm(column_type = "Text")]
+    pub portable_identity: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub text_payload_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
