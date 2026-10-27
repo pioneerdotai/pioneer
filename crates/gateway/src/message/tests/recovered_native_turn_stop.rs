@@ -2014,6 +2014,15 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                 for payload in &children {
                     let child_thread = payload["dispatch"]["thread_id"].as_str().unwrap();
                     let child_turn = payload["dispatch"]["turn_id"].as_str().unwrap();
+                    // Keep the child loaded for the memory/projection comparison
+                    // after Stop. Terminal cleanup can unload an idle thread
+                    // that has no subscribers.
+                    assert!(
+                        processor
+                            .thread_manager
+                            .subscribe_connection(child_thread, connection)
+                            .await
+                    );
                     assert_eq!(
                         processor
                             .agent_manager
